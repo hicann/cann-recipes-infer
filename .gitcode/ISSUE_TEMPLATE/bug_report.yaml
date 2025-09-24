@@ -1,0 +1,41 @@
+name: Bug-Report|缺陷反馈
+description: 当您需要反馈BUG时，请使用此模板。
+title: "[Bug-Report|缺陷反馈]: "
+labels: ["bug-report"]
+
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for sending an issue! Please fill in the following template to help quickly solve your problem.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: Describe the current behavior / 问题描述
+      description: 请尽可能详细地描述问题
+      placeholder: 请在这里输入详细信息
+    validations:
+      required: true
+
+  - type: dropdown
+    id: version
+    attributes:
+      label: Version Info / 触发场景
+      description: 请选择问题触发的场景
+      options:
+        - 使用仓库提供的脚本和readme中对应的CANN版本
+        - 使用自己修改的脚本或其他CANN版本
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: terms
+    attributes:
+      label: Checklists / 确认项
+      description: 请确认以下信息。
+      options:
+        - label: 我已经搜索过现有的Issue，确认这是一个新问题
+          required: true
+        - label: 我已经阅读了相关文档
+          required: false

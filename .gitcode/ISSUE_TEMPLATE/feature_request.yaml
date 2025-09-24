@@ -1,0 +1,22 @@
+name: Requirement|需求建议
+description: 您需要反馈或实现一个新需求/新样例时，请使用此模板。
+title: "[Requirement|需求建议]: "
+labels: ["requirement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for sending a requirement! Please fill in the following template to help quickly solve your problem.
+
+  - type: textarea
+    attributes:
+      label: Background / 背景信息
+      description: 请描述下新需求/新样例的目标是什么，期望解决什么问题
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Design / 设计方案（选填）
+      description: 请描述/解释设计的总体思路（可以使用伪代码）
+    validations:
+      required: false
