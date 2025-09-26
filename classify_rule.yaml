@@ -1,0 +1,12 @@
+cann-recipes-infer:
+  commiter:
+    "zhangky_gitcode"
+  team: "cann-recipes"
+  src:
+    release:
+      - models
+      - modules
+    unrelease:
+  llt:
+    ut_check: false
+    st_check: false
