@@ -1,11 +1,10 @@
 # coding=utf-8
-# This program is free software, you can redistribute it and/or modify.
+# This program is free software, you can redistribute it and/or modify it.
 # Copyright (c) 2025 Huawei Technologies Co., Ltd.
 # This file is a part of the CANN Open Software.
 # Licensed under CANN Open Software License Agreement Version 2.0 (the "License").
 # Please refer to the License for details. You may not use this file except in compliance with the License.
 # THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
-
 # See LICENSE in the root of the software repository for the full text of the License.
 
 import os
@@ -85,7 +84,7 @@ def test_indexer():
     d = 128
     top_k = 2048
 
-    func = indexer(b, n2, g, s1, s2, d, top_k, 512, 32, 128, 128, 128)
+    func = indexer(b, n2, g, s1, s2, d, top_k)
 
     q = torch.randn(b, s1, n2, g, d).half()
     k = torch.randn(b, s2, n2, d).half()

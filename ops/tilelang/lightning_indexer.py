@@ -1,11 +1,10 @@
 # coding=utf-8
-# This program is free software, you can redistribute it and/or modify.
+# This program is free software, you can redistribute it and/or modify it.
 # Copyright (c) 2025 Huawei Technologies Co., Ltd.
 # This file is a part of the CANN Open Software.
 # Licensed under CANN Open Software License Agreement Version 2.0 (the "License").
 # Please refer to the License for details. You may not use this file except in compliance with the License.
 # THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
-
 # See LICENSE in the root of the software repository for the full text of the License.
 
 import os
@@ -23,8 +22,14 @@ os.environ["TVM_BACKTRACE"] = "1"
 
 
 @tilelang.jit(out_idx=[-1])
-def indexer(b_param, n2_param, g_param, s1_param, s2_param, d_param, 
-            top_k_param, vector_basen, vector_baseg, block_m, block_n, block_k, input_dtype="float16", calc_dtype="float"):
+def indexer(b_param, n2_param, g_param, s1_param, s2_param, d_param,
+            top_k_param, input_dtype="float16", calc_dtype="float"):
+    vector_basen = 512
+    vector_baseg = 32
+    block_m = 128
+    block_n = 128
+    block_k = 128
+
     @T.prim_func
     def main(
         query: T.Tensor((b_param, s1_param, n2_param, g_param * d_param), input_dtype),
@@ -61,7 +66,8 @@ def indexer(b_param, n2_param, g_param, s1_param, s2_param, d_param,
                                 T.barrier_all()
                                 T.gemm_v0(q_l1, k_l1, c_l0, transpose_B=True, init=True)
                                 T.barrier_all()
-                                T.copy(c_l0, qk_res[cid, n2_serial, m_serial * block_m, n_serial * block_n + g_serial * s2_param], srcN=-1, enable_relu=True)
+                                T.copy(c_l0, qk_res[cid, n2_serial, m_serial * block_m,
+                                       n_serial * block_n + g_serial * s2_param], srcN=-1, enable_relu=True)
                                 T.barrier_all()
                 T.set_cross_flag("FIX", 0)
 
@@ -121,7 +127,8 @@ def indexer(b_param, n2_param, g_param, s1_param, s2_param, d_param,
                         for g_id in T.serial(g_param // vector_baseg):
                             T.barrier_all()
                             T.copy(
-                                qk_res[cid, n2_id, s1_id, g_id * vector_baseg * s2_param + s2_id * vector_basen], mm_res_ub, s2_param)
+                                qk_res[cid, n2_id, s1_id, g_id * vector_baseg * s2_param + s2_id * vector_basen],
+                                       mm_res_ub, s2_param)
                             T.barrier_all()
                             T.copy(
                                 weights[cid, s1_id, n2_id, g_id * vector_baseg], weight_ub)
@@ -143,7 +150,8 @@ def indexer(b_param, n2_param, g_param, s1_param, s2_param, d_param,
                         T.add(sort_indice_tmp_ub,
                                 topk_indices_tmp_ub, T.int32(s2_id * vector_basen))
                         T.barrier_all()
-                        T.sort(topk_global_ub1[(s2_id % merge_sort_times), :], reduce_g_ub, sort_indice_tmp_ub_uint, mm_res_ub, vector_basen // 32)
+                        T.sort(topk_global_ub1[(s2_id % merge_sort_times), :], reduce_g_ub,
+                               sort_indice_tmp_ub_uint, mm_res_ub, vector_basen // 32)
                         T.barrier_all()
 
                         if s2_id % merge_sort_times == merge_sort_times - 1:

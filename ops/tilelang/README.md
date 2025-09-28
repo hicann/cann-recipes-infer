@@ -32,7 +32,7 @@ NPU TileLang 使用指南
       --net=host \
       --shm-size=128g \
       --privileged \
-      swr.cn-east-4.myhuaweicloud.com/cann_recipes/cann_recipes-a3-arm:v202509221500 /bin/bash
+      cann8.3.rc1.alpha002_pt2.5.1_dsv3.2_aarch_image:v0.1 /bin/bash
   ```
   进入容器：
   ```
@@ -107,12 +107,13 @@ sparse_fa_func = sparse_attention_fwd(
 
 下面的代码来生成算子的golden值。
 
-    def ref_sparse_attention_fwd_interface(q, kv, indices, q_start_index_s, kv_stride=4, sm_scale=None, is_casual=True):
-        q = q.float()
+    def ref_sparse_attention_fwd_interface(q_param, kv, indices, q_start_index_s, kv_stride=4,
+                                           sm_scale_param=None, is_casual=True):
+        q = q_param.float()
         kv = kv.float()
         indices = indices.transpose(1, 2)
         b, sq, h, dim_q = q.shape
-        b, sk, g, _ = kv.shape
+        _, sk, g, _ = kv.shape
         if q_start_index_s is None:
             q_start_index_s = sk * kv_stride - sq
     
@@ -125,7 +126,8 @@ sparse_fa_func = sparse_attention_fwd(
     num_kv_per_index = 1
     g_index = g
     h_index = h // g
-    compressed_casual_mask = torch.arange(q_start_index_s, sq + q_start_index_s, dtype=torch.int32).view(-1, 1) >= torch.arange(kv_stride-1, sk * kv_stride, kv_stride, dtype=torch.int32).view(1, -1)
+    compressed_casual_mask = torch.arange(q_start_index_s, sq + q_start_index_s, dtype=torch.int32).view(-1, 1)
+                           >= torch.arange(kv_stride - 1, sk * kv_stride, kv_stride, dtype=torch.int32).view(1, -1)
     
     mask = q.new_zeros(b, g_index, sq, sk + 1, dtype=torch.bool).scatter(3, indices.long(), 1)
     mask = mask[..., :-1]
@@ -182,5 +184,4 @@ ref_output = ref_sparse_attention_fwd_interface(q, kv, indices, q_start_s_index,
 torch.npu.synchronize()
 torch.testing.assert_close(ref_output, output, rtol=1e-2, atol=1e-2)
 ```
-
 
