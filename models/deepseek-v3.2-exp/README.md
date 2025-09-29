@@ -21,7 +21,7 @@ DeepSeek团队发布了最新的模型DeepSeek-V3.2-Exp，在各项指标上都�
 
 
 ### 下载源码
-  
+
   在各个节点上执行如下命令下载 cann-recipes-infer 源码。
   ```shell
   mkdir -p /home/code; cd /home/code/
@@ -68,7 +68,7 @@ DeepSeek团队发布了最新的模型DeepSeek-V3.2-Exp，在各项指标上都�
       --net=host \
       --shm-size=128g \
       --privileged \
-      cann8.3.rc1.alpha002_pt2.5.1_dsv3.2_aarch_image:v0.1 /bin/bash
+      cann8.3.rc1.alpha002_pt2.5.1_dsv3.2_aarch_image:v0.2 /bin/bash
   ```
   在各个节点上通过如下命令进入容器：
   ```
@@ -84,6 +84,10 @@ DeepSeek团队发布了最新的模型DeepSeek-V3.2-Exp，在各项指标上都�
   # 转换为bf16权重
   cd models/deepseek-v3.2-exp
   python utils/convert_model.py --input_fp8_hf_path /data/models/DeepSeek-V3.2-Exp-fp8 --output_hf_path /data/models/DeepSeek-V3.2-Exp-bf16
+
+  # 转换为int8权重
+  cd models/deepseek-v3.2-exp
+  python utils/convert_model.py --input_fp8_hf_path /data/models/DeepSeek-V3.2-Exp-fp8 --output_hf_path /data/models/DeepSeek-V3.2-Exp-Int8 --is_quant_int8
   ```
 
 ### 修改代码
@@ -101,9 +105,9 @@ DeepSeek团队发布了最新的模型DeepSeek-V3.2-Exp，在各项指标上都�
   ```
   export YAML_FILE_NAME=deepseek_v3.2_exp_rank_64_64ep_prefill.yaml
   ```
- 
+
   > **Note**: 本样例Prefill支持32-128卡，Decode支持32-128卡，可分别在config下的deepseek_v3.2_exp_rank_64_64ep_prefill.yaml和deepseek_v3.2_exp_rank_128_128ep_decode.yaml文件中修改world_size配置。
-    
+
 ### 拉起多卡推理
   在各个节点上同步执行如下命令即可拉起多卡推理任务。
   ```shell
