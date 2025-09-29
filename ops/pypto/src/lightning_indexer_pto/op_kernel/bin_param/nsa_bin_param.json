@@ -1,0 +1,36 @@
+{
+    "op_type": "LightningIndexerPto",
+    "op_list": [
+        {
+            "bin_filename": "LightningIndexerPto_fatbin_v2",
+            "inputs": [
+                [
+                    {
+                        "name": "inputs",
+                        "index": 0,
+                        "dtype": "bfloat16",
+                        "format": "ND",
+                        "paramType": "dynamic",
+                        "shape": [-2],
+                        "format_match_mode": "FormatAgnostic",
+                        "dtype_match_mode": "DtypeByte"
+                    }
+                ]
+            ],
+            "outputs": [
+                [
+                    {
+                        "name": "outputs",
+                        "index": 0,
+                        "dtype": "int32",
+                        "format": "ND",
+                        "paramType": "dynamic",
+                        "shape": [-2],
+                        "format_match_mode": "FormatAgnostic",
+                        "dtype_match_mode": "DtypeByte"
+                    }
+                ]
+            ]
+        }
+    ]
+}
