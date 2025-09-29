@@ -84,6 +84,10 @@ DeepSeek团队发布了最新的模型DeepSeek-V3.2-Exp，在各项指标上都�
   # 转换为bf16权重
   cd models/deepseek-v3.2-exp
   python utils/convert_model.py --input_fp8_hf_path /data/models/DeepSeek-V3.2-Exp-fp8 --output_hf_path /data/models/DeepSeek-V3.2-Exp-bf16
+
+  # 转换为int8权重
+  cd models/deepseek-v3.2-exp
+python utils/convert_model.py --input_fp8_hf_path /data/models/DeepSeek-V3.2-Exp-fp8 --output_hf_path /data/models/DeepSeek-V3.2-Exp-Int8 --is_quant_int8
   ```
 
 ### 修改代码
