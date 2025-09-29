@@ -2,7 +2,7 @@
 
 DeepSeek团队发布了最新的模型DeepSeek-V3.2-Exp，可利用稀疏架构 **DeepSeek Sparse Attention(DSA)** 来提高长序列的计算效率，降低推理成本。长上下文场景和其新颖的DSA结构，共同对推理优化系统提出了新诉求。
 
-本文主要介绍基于A3集群的DeepSeek-V3.2-Exp模型的Prefill和Decode推理优化，首先分析了DeepSeek-V3.2-Exp模型的结构特点，实现了长序列亲和模型并行策略，并设计了新的NPU融合Kernel和多流并行优化。基于这些优化点，本实践0day实现了DeepSeek-V3.2-Exp BF16模型部署，未来将持续完成Int8和Int4量化算法。4~8K常规序列继承原有DeepSeek-V3.1优化，16K~166K长序列推理场景结合DSA稀疏收益，性能超越DeepSeek-V3.1，模型和融合Kernel均已开源。
+本文主要介绍基于A3集群的DeepSeek-V3.2-Exp模型的Prefill和Decode推理优化，首先分析了DeepSeek-V3.2-Exp模型的结构特点，实现了长序列亲和模型并行策略，并设计了新的NPU融合Kernel和多流并行优化。基于这些优化点，本实践0day实现了DeepSeek-V3.2-Exp BF16模型部署，1day实现Int8模型部署，未来将持续完成低比特量化/KVCache压缩算法。4~8K常规序列继承原有DeepSeek-V3.1优化，16K~166K长序列推理场景结合DSA稀疏收益，性能超越DeepSeek-V3.1，模型和融合Kernel均已开源。
 
 针对该模型涉及到的DSA结构中的**Lightning Indexer(LI)**和**Sparse Flash Attention(SFA)**新算子，本次开源不仅包含**AscendC**实现，并且首次公布了自研**PyPTO**实现，仅需几百行代码即可完成动态Shape算子编程。PyPTO是CANN 推出的大融合算子的编程体系，提供面向 MegaKernel 的编程范式。其核心思想是使用 Tensor/Tile 作为数据的基本表达方式，借助一系列对 Tensor 的基本运算来描述和组装完整的计算流程，采用human-in-the-loop和白盒化的方式能够充分利用SRAM的空间，实现对多核的高效利用。
 
@@ -20,6 +20,7 @@ DeepSeek团队发布了最新的模型DeepSeek-V3.2-Exp，可利用稀疏架构 
 - [DeepSeek-V3.2-Exp vs V3.1](##DeepSeek-V3.2-Exp-vs-V3.1)
 - [并行策略](##并行策略)
 - [MTP](##MTP)
+- [量化](#量化策略)
 - [融合Kernel](##融合Kernel)
 - [多流并行优化](##多流并行优化)
 - [Future Plan](##Future-Plan)
@@ -53,39 +54,39 @@ DeepSeek团队发布了最新的模型DeepSeek-V3.2-Exp，可利用稀疏架构 
   在Prefill阶段，以1batch 64K推理为例，Lightning Indexer为每个q token选择TopK=2048个kv token，MLA的计算流程可以有三种选择：
 
   **方案一：** MLA Naive + Sparse Mask，Prefill MLA使用Naive模式，和原始DeepSeek V3保持一致。每个q token和所有的历史kv token计算Attention，仅在softmax前通过Attention Mask将不属于TopK的token过滤掉。Attention中的两个BatchMatmul Shape如下：
-  
+
   |   方案一    | Batch |  M   |  K   |  N   |
   | :---------: | :---: | :--: | :--: | :--: |
   | BMM1(Q*K^T) | 1*128 | 64K  | 192  | 64K  |
   |  BMM2(P*V)  | 1*128 | 64K  | 64K  | 128  |
-  
+
   该方案计算量和原始的Full Attention一致，但是无法拿到DSA的稀疏计算收益，长序列场景下性能不佳。
-  
+
   **方案二：** MLA Naive + Sparse Attention，Prefill MLA使用Naive模式，每个q token与TopK=2048个kv token计算Attention。
-  
+
   |   方案二    |   Batch    |  M   |  K   |  N   |
   | :---------: | :--------: | :--: | :--: | :--: |
   | BMM1(Q*K^T) | 1\*64K*128 |  1   | 192  | 2048 |
   |  BMM2(P*V)  | 1\*64K*128 |  1   | 2048 | 128  |
-  
+
   方案二的优点在于BMM的计算量较小，相对原始的Full Attention计算量减小了64K/2048=32倍，但是存在以下问题：
-  
+
   - BMM的M轴为1，矩阵乘法计算效率较低
   - BMM的HBM访存量相较原始的Full Attention激增2048倍，将会面临访存瓶颈
-  
+
   **方案三：** MLA Absorb + Sparse Attention，Prefill MLA使用Absorb模式，与Decode保持一致。同样地，每个q token与TopK=2048个kv token计算Attention。
-  
+
   |   方案三    | Batch  |  M   |  K   |  N   |
   | :---------: | :----: | :--: | :--: | :--: |
   | BMM1(Q*K^T) | 1\*64K | 128  | 576  | 2048 |
   |  BMM2(P*V)  | 1\*64K | 128  | 2048 | 512  |
-  
+
   方案三与方案二对比如下：
-  
+
   - 方案三的计算量增加了3倍左右，但其BMM的M轴为128，对于矩阵乘法更为友好
-  
+
   - 方案三的HBM访存量相对方案二降低几十倍，访存耗时更低
-  
+
 
 综合考虑计算和访存耗时，以及长序列应用场景，本实践选择基于方案三(MLA Absorb + Sparse Attention)来完成Prefill部署，从而Prefill和Decode的MLA计算流可以归一。
 
@@ -136,7 +137,7 @@ Prefill的并行策略可以设计为下图形式：
 - LM Head并行策略
 
   为了节省LM Head的内存占用，LM Head选用TP切分，tp_size控制在单Node内。
-  
+
   LM_Head模块采用TP切分，同样需要在TP域内做AllGather，但此处为整个CP域内的AllGather，并通过Token重排将最终输入LM_Head的feature map还原到原始序列排布。
 
 ### Decode并行策略
@@ -212,6 +213,27 @@ DeepSeek-V3.2-Exp由于采用了新的DSA结构，MTP加速相对于DeepSeek-V3.
 
 尽管Sparse Flash Attention很难利用MTP实现可观的加速效果，但是Lightning Indexer算子在长序列场景中耗时占比更高，其K Cache搬运与稠密MLA相似，可以利用MTP机制提高计算访存比。另一方面，由于DSA稀疏计算显著降低了长序列的计算量，削弱了Attention在整个推理的占比，而剩下的算子（如Matmul等）都能达到更好的计算访存比，因此使用MTP对整个推理有比较可观的加速。
 
+## 量化策略
+
+相对于BF16推理，Int8量化可以有效降低端到端时延，提升系统吞吐量。
+
+为了权衡精度和性能，本版优化主要针对Matmul使用W8A8量化。同时，为了最大化NPU矩阵计算效率,  数据使用动态Per-Token量化，权重使用静态Per-Channel量化。量化架构如下：
+
+- MLAProlog: 考虑到`kv_b_proj`会被拆分，除了`kv_b_proj` 不量化，其他Linear全量化到W8A8
+- Sparse Flash Attention: 目前暂未量化
+- IndexerProlog和Lightning Indexer: 目前暂未量化
+- MoE: 路由专家和共享专家量化到W8A8
+- LM_Head：目前暂未量化
+
+本实践已经实现W8A8C16量化， 精度接近无损的情况下，权重内存占用优化2倍, TTFT和TPOP也同步优化。
+
+**W8A8C16量化模型精度表现**
+
+| 模型 | MMLU | GPQA | DROP | MGSM |
+| ---- | ---- | ---- | ---- | ---- |
+| BF16 | 89.9 | 73.6 | 88.9 | 92.4 |
+| Int8 | 89.8 | 73.5 | 88.7 | 92.3 |
+
 ## 融合Kernel
 
 DSA的计算过程可分为MLAProlog、IndexerProlog、Lightning Indexer、Sparse Flash Attention、MLAEpilog五部分，如下图所示：
@@ -264,7 +286,7 @@ hidden_states = hidden_states_share + hidden_states_router
 
 ## Future Plan
 
-- 量化：目前仅实现BF16版本的推理，待支持Int8和Int4量化版本
+- 量化：目前支持BF16/Int8版本推理。未来进一步开发低比特量化版本，探索KVCache量化压缩算法，软硬协同优化NPU计算效率，降低系统时延
 - KVCache Offload：长序列场景会面临KVCache的内存瓶颈，可参考Shadow KV和Infinite LLM，达到类似的KVCache Offload效果
 - MegaKernel：Decode阶段仍然存在较多流水并行空间，可通过PyPTO实现更大范围的MegaKernel，完成多核MPMD并行调度，提升计算效率
 
