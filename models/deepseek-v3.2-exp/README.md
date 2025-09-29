@@ -21,7 +21,7 @@ DeepSeek团队发布了最新的模型DeepSeek-V3.2-Exp，在各项指标上都�
 
 
 ### 下载源码
-  
+
   在各个节点上执行如下命令下载 cann-recipes-infer 源码。
   ```shell
   mkdir -p /home/code; cd /home/code/
@@ -39,7 +39,7 @@ DeepSeek团队发布了最新的模型DeepSeek-V3.2-Exp，在各项指标上都�
   下载[DeepSeek-V3.2-Exp原始fp8权重](https://huggingface.co/deepseek-ai/DeepSeek-V3.2-Exp)，并上传到Atlas A3各节点某个固定的路径下，比如`/data/models/DeepSeek-V3.2-Exp-fp8`。
 
 ### 获取 docker 镜像
-  从[ARM镜像地址](https://ascend-cann.obs.cn-north-4.myhuaweicloud.com/cann8.3.rc1.alpha002/pt2.5.1/aarch/ascendc/cann8.3.rc1.alpha002_pt2.5.1_dsv3.2_aarch_image.tar)中下载 docker 镜像，然后上传到A3服务器的每个节点上，并通过命令导入镜像 `docker load -i cann8.3.rc1.alpha002_pt2.5.1_dsv3.2_aarch_image.tar`。
+  从[ARM镜像地址](https://ascend-cann.obs.cn-north-4.myhuaweicloud.com/cann8.3.rc1.alpha002/pt2.5.1/aarch/ascendc/cann8.3.rc1.alpha002_pt2.5.1_dsv3.2_aarch_image_v0.2.tar)中下载 docker 镜像，然后上传到A3服务器的每个节点上，并通过命令导入镜像 `docker load -i cann8.3.rc1.alpha002_pt2.5.1_dsv3.2_aarch_image.tar`。
 
 ### 拉起 docker 容器
 
@@ -68,7 +68,7 @@ DeepSeek团队发布了最新的模型DeepSeek-V3.2-Exp，在各项指标上都�
       --net=host \
       --shm-size=128g \
       --privileged \
-      cann8.3.rc1.alpha002_pt2.5.1_dsv3.2_aarch_image:v0.1 /bin/bash
+      cann8.3.rc1.alpha002_pt2.5.1_dsv3.2_aarch_image:v0.2 /bin/bash
   ```
   在各个节点上通过如下命令进入容器：
   ```
@@ -84,6 +84,10 @@ DeepSeek团队发布了最新的模型DeepSeek-V3.2-Exp，在各项指标上都�
   # 转换为bf16权重
   cd models/deepseek-v3.2-exp
   python utils/convert_model.py --input_fp8_hf_path /data/models/DeepSeek-V3.2-Exp-fp8 --output_hf_path /data/models/DeepSeek-V3.2-Exp-bf16
+
+  # 转换为int8权重
+  cd models/deepseek-v3.2-exp
+  python utils/convert_model.py --input_fp8_hf_path /data/models/DeepSeek-V3.2-Exp-fp8 --output_hf_path /data/models/DeepSeek-V3.2-Exp-int8 --is_quant_int8
   ```
 
 ### 修改代码
@@ -91,19 +95,31 @@ DeepSeek团队发布了最新的模型DeepSeek-V3.2-Exp，在各项指标上都�
   ```shell
   export IPs=('xxx.xxx.xxx.xxx' 'xxx.xxx.xxx.xxx') # 所有节点的IP，确保第1个IP是master，多个节点的ip通过空格分开
   ```
-
 - 在各个节点上修改 config/ 路径下需要执行的yaml文件中的model_path路径。关于YAML文件中的更多配置说明可参见[YAML参数描述](./config/README.md)。
+
   ```
+  # BF16
   model_path: "/data/models/DeepSeek-V3.2-Exp-bf16/"
+  # Int8
+  model_path: "/data/models/DeepSeek-V3.2-Exp-int8/"
   ```
 
 - 在各个节点上修改 infer.sh 文件中的YAML_FILE_NAME，指定为上一步需要执行的yaml文件名。默认的yaml路径为32卡推理。
+
   ```
+  # BF16 prefill
   export YAML_FILE_NAME=deepseek_v3.2_exp_rank_64_64ep_prefill.yaml
+  # BF16 decode
+  export YAML_FILE_NAME=deepseek_v3.2_exp_rank_128_128ep_decode.yaml
+
+  # Int8 prefill
+  export YAML_FILE_NAME=deepseek_v3.2_exp_rank_64_64ep_prefill_w8a8.yaml
+  # Int8 decode
+  export YAML_FILE_NAME=deepseek_v3.2_exp_rank_128_128ep_decode_w8a8.yaml
   ```
- 
-  > **Note**: 本样例Prefill支持32-128卡，Decode支持32-128卡，可分别在config下的deepseek_v3.2_exp_rank_64_64ep_prefill.yaml和deepseek_v3.2_exp_rank_128_128ep_decode.yaml文件中修改world_size配置。
-    
+
+  > **Note**: 本样例BF16场景Prefill支持32-128卡，Decode支持32-128卡，Int8场景Prefill支持8-128卡，Decode支持8-128卡，可分别在config下的yaml文件中修改world_size配置。
+
 ### 拉起多卡推理
   在各个节点上同步执行如下命令即可拉起多卡推理任务。
   ```shell

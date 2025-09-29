@@ -1,0 +1,33 @@
+model_name: "deepseek_v3.2_exp"
+model_path: "/data/models/DeepSeek-V3.2-Exp-int8/"
+exe_mode: "ge_graph"          # ["ge_graph", "eager"], mode of decode
+world_size: 64                # world_size = 2 * chip_num in A3
+
+model_config:
+  mm_quant_mode: A8W8
+  gmm_quant_mode: A8W8
+  next_n: 1
+  pa_block_size: 128
+  enable_weight_nz: True
+  with_ckpt: True                   # [False, True]
+  enable_multi_streams: True        # [False, True]
+  enable_profiler: False            # [False, True]
+  perfect_eplb: False               # [False, True]
+  enable_cache_compile: False       # [False, True]
+  enable_online_split_weight: True  # [False, True]
+  prefill_mini_batch_size: 1
+
+data_config:
+  dataset: InfiniteBench
+  input_max_len: 65536
+  max_new_tokens: 256
+  batch_size: 64
+
+parallel_config:
+  cp_size: 64                 # only active at prefill stage
+  oproj_tp_size: 8
+  attn_tp_size: 1
+  dense_tp_size: 1
+  moe_tp_size: 1
+  embed_tp_size: 16
+  lmhead_tp_size: 16
