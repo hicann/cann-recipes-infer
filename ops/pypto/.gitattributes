@@ -1,0 +1,7 @@
+# 强制所有文件使用 LF 换行符
+* text eol=lf
+
+# （可选）排除二进制文件（如图片、压缩包），避免误处理
+*.png binary
+*.jpg binary
+*.zip binary
