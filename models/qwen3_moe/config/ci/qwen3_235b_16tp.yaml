@@ -1,0 +1,22 @@
+model_name: "qwen3_moe"
+model_path: "/data/models/origin/Qwen3-235B-A22B"
+exe_mode: "ge_graph"        # ["ge_graph", "eager"]
+world_size: 16
+
+model_config:
+  enable_profiler: False  # [False, True]
+  with_ckpt: True # [False, True]
+  enable_cache_compile: False
+  enable_online_split_weight: True # [False, True]
+
+data_config:
+  dataset: "LongBench"  # ["default", "LongBench"]
+  input_max_len: 4080
+  max_new_tokens: 16
+  batch_size: 1  # global batch_size, should be divisible by ep_size
+
+parallel_config:
+  attn_tp_size: 16 # attn_dp_size = world_size // attn_tp_size
+  moe_tp_size: 16 # moe_ep_size = world_size // moe_tp_size
+  embed_tp_size: 16
+  lmhead_tp_size: 16
