@@ -95,11 +95,6 @@ class Qwen3MoeRMSNorm(nn.Module):
                 f"insupportable Qwen3MoeRMSNorm for input_args len as (include hid): {len(args) + 1}"
             )
 
-    def __forward(self, hidden_states, *args):
-        if len(args) == 0:
-            return self.ln_npu(hidden_states)
-        else:
-            return self.ln_npu(hidden_states), hidden_states
 
 
 ALL_LAYERNORM_LAYERS.append(Qwen3MoeRMSNorm)
@@ -157,16 +152,6 @@ class Qwen3MoeRotaryEmbedding(nn.Module):
         emb = torch.cat((freqs, freqs), dim=-1)
         self.register_buffer("cos_cached", emb.cos().to(dtype), persistent=False)
         self.register_buffer("sin_cached", emb.sin().to(dtype), persistent=False)
-
-    def __forward(self, x, kv_len=None):
-        # x shape is [bs, num_attention_heads, seq_len, head_size]
-        if self.max_seq_len_cached is None or kv_len > self.max_seq_len_cached:
-            self._set_cos_sin_cache(seq_len=kv_len, device=x.device, dtype=x.dtype)
-
-        return (
-            self.cos_cached[:kv_len].to(dtype=x.dtype),
-            self.sin_cached[:kv_len].to(dtype=x.dtype),
-        )
 
 
 # Copied from transformers.models.llama.modeling_llama.LlamaLinearScalingRotaryEmbedding with Llama->Qwen3Moe
