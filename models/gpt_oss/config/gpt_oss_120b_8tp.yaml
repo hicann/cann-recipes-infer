@@ -1,0 +1,17 @@
+model_name: "gpt_oss_120b_8tp"
+model_path: "your_model_path"
+exe_mode: "eager"        # ["eager"]
+world_size: 8
+
+model_config:
+  enable_profiler: False  # [False, True]
+  enable_online_split_weight: True
+
+data_config:
+  dataset: "LongBench"  # ["default", "LongBench"]
+  input_max_len: 4096
+  max_new_tokens: 100
+  batch_size: 1
+
+parallel_config:
+  tp_size: 8

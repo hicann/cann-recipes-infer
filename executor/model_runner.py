@@ -214,6 +214,29 @@ class ModelRunner:
             self.tokenizer.pad_token = self.tokenizer.eos_token
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
 
+    def tokenize_prompts(self, prompts):
+        kwargs = {
+            "return_tensors": "pt", "truncation": True, "padding": "max_length", "max_length": self.input_max_len
+        }
+        inputs = self.tokenizer(prompts, **kwargs).to(self.device)
+
+        # To more intuitively demonstrate the model's performance on the LongBench dataset, we provide a fixed prompt
+        # before and after the text.
+        if self.runner_settings.get("data_config").get("dataset", "default") != "default":
+            from executor.utils.data_utils import build_dataset_input
+            new_prompts = build_dataset_input(self.tokenizer, inputs, self.input_max_len)
+            inputs = self.tokenizer(new_prompts, **kwargs).to(self.device)
+
+        return inputs
+
+    def tokenizer_decode(self, generate_ids):
+        res = self.tokenizer.batch_decode(generate_ids, skip_special_tokens=True)
+        if isinstance(res, list):
+            logging.info("Inference decode result for batch 0: \n%s", res[0])
+        else:
+            logging.info("Inference decode result: \n%s", res)
+        return res
+
     def compile_model(self):
         logging.info("The final model structure is: \n %s", self.model)
         if "graph" in self.execute_mode:
