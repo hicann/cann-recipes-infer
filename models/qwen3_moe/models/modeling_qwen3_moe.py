@@ -632,11 +632,8 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         combine_tokens = combine_tokens.view(2, self.moe_ep_size, -1).sum(2)
         all_tokens = combine_tokens[0].sum()
         combine_tokens_cpu = combine_tokens.cpu().tolist()
-        # alltoall input splits, 大小为当前rank路由到其他rank的tokens数总和
         input_splits = combine_tokens_cpu[1]
-        # alltoall output splits, 每个rank拿到的其他rank的tokens数
         output_splits = combine_tokens_cpu[0]
-        # alltoall output, 展开成一维，大小为其他卡路由到当前rank的tokens数总和
         gathered_tokens = expanded_x.new_empty(all_tokens.item(), expanded_x.shape[1])
         dist.all_to_all_single(gathered_tokens, expanded_x, output_splits, input_splits, group=moe_ep_group)
         return tokens_per_expert_group, gathered_tokens, input_splits, output_splits
@@ -660,7 +657,6 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             self.dispatch_double_routing(tokens_per_expert, expanded_x)
 
         # reroute
-        # 按专家归并后的tokens，按专家归并后的scales，给FinalizeRouting用的索引，每个专家处理的token数
         hidden_states_ordered_by_experts, _, gathered_ids_unsort, tokens_per_local_expert = \
             torch_npu.npu_moe_re_routing(gathered_tokens, tokens_per_expert_group.view(self.moe_ep_size, -1))
 
