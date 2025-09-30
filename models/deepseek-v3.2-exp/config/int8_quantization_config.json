@@ -1,7 +1,7 @@
 {
-    "config_groups":{
+    "config_groups": {
         "group_0": {
-            "input_activations":{
+            "input_activations": {
                 "actorder": null,
                 "block_structure": null,
                 "dynamic": true,
@@ -13,10 +13,11 @@
                 "symmetric": true,
                 "type": "int"
             },
-            "out_activations": null,
-            "targets": ["Linear"]
-        },
-        "weights": {
+            "output_activations": null,
+            "targets": [
+                "Linear"
+            ],
+            "weights": {
                 "actorder": null,
                 "block_structure": null,
                 "dynamic": false,
@@ -27,6 +28,7 @@
                 "strategy": "channel",
                 "symmetric": true,
                 "type": "int"
+            }
         }
     },
     "format": "int-quantized",
