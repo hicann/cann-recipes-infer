@@ -43,7 +43,6 @@ def run_qwen3_moe(runner_settings):
     attn_tp_size = runner_settings.get("parallel_config").get("attn_tp_size", 1)
     preset_prompts, _ = generate_prompt(runner_settings, attn_tp_size)
     model_runner = Qwen3MoeRunner(runner_settings)
-    # 表示在图模式下开启算子二进制复用，提高图模式下编译阶段性能
     torch.npu.set_compile_mode(jit_compile=False)
     model_runner.init_model()
     # warmup
