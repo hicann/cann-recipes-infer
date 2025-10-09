@@ -1,7 +1,7 @@
 # coding=utf-8
 # Adapted from
 # https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt_oss/modeling_gpt_oss.py
-# Copyright (c) 2025 Huawei Technologies Co., Ltd.
+# Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
 # Copyright 2025 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -36,7 +36,8 @@ from module.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
     RowParallelLinear,
-    VocabParallelEmbedding
+    VocabParallelEmbedding,
+    QKVParallelLinear
     )
 from executor.model_loader.weight_utils import default_weight_loader
 from .configuration_gpt_oss import GptOssConfig
@@ -112,10 +113,10 @@ class GptOssExperts(nn.Module):
         else:
             self.commute_type = "no_commute"
 
-    def forward(self, hidden_states: torch.Tensor, expert_tokens) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, expert_tokens) -> torch.Tensor:      
         mm1_mm3 = torch_npu.npu_grouped_matmul([hidden_states], [self.gate_up_proj],
             group_list=expert_tokens, split_item=3, group_type=0, bias=[self.gate_up_proj_bias])[0]
-        #swiglu
+        #swiglu 
         gate, up = mm1_mm3[..., ::2], mm1_mm3[..., 1::2]
         gate = gate.clamp(min=None, max=self.limit)
         up = up.clamp(min=-self.limit, max=self.limit)
@@ -151,7 +152,7 @@ class GptOssMLP(nn.Module):
         hidden_states_ordered_by_experts, routing_weights, expanded_row_idx, expert_idx \
                 = self.moe_infer_fusion(hidden_states, router_indices, router_scores, row_idx)
         hidden_states = torch_npu.npu_moe_finalize_routing(
-                hidden_states_ordered_by_experts,
+                hidden_states_ordered_by_experts, 
                 skip1=None, skip2=None,
                 bias=None,
                 scales=routing_weights,
@@ -177,7 +178,7 @@ class GptOssMLP(nn.Module):
         expert_idx = topk_ids.int()
         if row_idx is None:
             # decode
-            if sequence_length == 1:
+            if sequence_length == 1: 
                 row_idx = self.row_idx_decode
             else:
                 row_idx_prefill_len = batch_size * sequence_length * self.top_k
@@ -315,20 +316,22 @@ class GptOssAttention(nn.Module):
             self.commute_type = "no_commute"
         self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
         self.num_key_value_heads_per_rank = max(config.num_key_value_heads // self.tp_size, 1)
-        self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
         self.num_attention_heads_per_rank = config.num_attention_heads // self.tp_size
+        self.num_key_value_groups = self.num_attention_heads_per_rank // self.num_key_value_heads_per_rank
         self.scaling = self.head_dim**-0.5
         self.attention_dropout = config.attention_dropout
         self.is_causal = True
-        self.merged_qkv_proj = MergedColumnParallelLinear(
-            input_size=config.hidden_size,
-            output_sizes=[config.num_attention_heads * self.head_dim,
-            config.num_key_value_heads * self.head_dim,
-            config.num_key_value_heads * self.head_dim],
+        self.merged_qkv_proj = QKVParallelLinear(
+            hidden_size=config.hidden_size,
+            head_size=self.head_dim,
+            total_num_heads=config.num_attention_heads,
+            total_num_kv_heads=config.num_key_value_heads,
             bias=True,
             tp_size=self.tp_size,
             tp_rank=dist.get_rank() if self.tp_size > 1 else 0,
+            quant_config=None,
             prefix=f"{prefix}.merged_qkv_proj",
+            return_bias=False
         )
         self.o_proj = RowParallelLinear(
             input_size=config.num_attention_heads * self.head_dim,
@@ -361,7 +364,7 @@ class GptOssAttention(nn.Module):
             self.num_key_value_heads_per_rank * self.head_dim), dim=2)
         input_shape = hidden_states.shape[:-1]
         # (bz, q_len, -1, head_dim)
-        hidden_shape = (*input_shape, -1, self.head_dim)
+        hidden_shape = (*input_shape, -1, self.head_dim) 
 
         query_states = query_states.view(hidden_shape).transpose(1, 2)
         key_states = key_states.view(hidden_shape).transpose(1, 2)
@@ -428,7 +431,7 @@ class GptOssDecoderLayer(GradientCheckpointingLayer):
         past_key_values: Optional[List[torch.FloatTensor]] = None,
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
-        past_residual: Optional[torch.Tensor] = None,
+        past_residual: Optional[torch.Tensor] = None, 
         **kwargs: Unpack[TransformersKwargs],
     ) -> Tuple[torch.FloatTensor]:
         hidden_states, residual = self.input_layernorm(hidden_states, past_residual)
@@ -643,9 +646,9 @@ class GptOssForCausalLM(GptOssPreTrainedModel, GenerationMixin):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
-            ("merged_qkv_proj", "q_proj", 0),
-            ("merged_qkv_proj", "k_proj", 1),
-            ("merged_qkv_proj", "v_proj", 2),
+            ("merged_qkv_proj", "q_proj", "q"),
+            ("merged_qkv_proj", "k_proj", "k"),
+            ("merged_qkv_proj", "v_proj", "v"),
         ]
 
         tp_rank = dist.get_rank() if self.lm_head_tp_size > 1 else 0
@@ -667,7 +670,7 @@ class GptOssForCausalLM(GptOssPreTrainedModel, GenerationMixin):
         for name, weight in weights:
             if name.endswith(".gate_up_proj"):
                 # Handle MLP gate and up projection weights
-                # Extract gate and up projection parts
+                # Extract gate and up projection parts               
                 narrow_weight = weight[:, :, 2 * tp_rank_start:2 * tp_rank_end]
                 narrow_weight = narrow_weight.contiguous()
                 param = params_dict[name]
@@ -741,7 +744,7 @@ class GptOssForCausalLM(GptOssPreTrainedModel, GenerationMixin):
         past_key_value = ()
         cache_shape = (
             batch_size,
-            self.config.num_key_value_heads // self.attn_tp_size,
+            max(self.config.num_key_value_heads // self.attn_tp_size, 1),
             cache_seq_len,
             self.config.head_dim
         )
@@ -769,7 +772,7 @@ class GptOssForCausalLM(GptOssPreTrainedModel, GenerationMixin):
         model_inputs = {}
         if past_key_values is None:
             past_key_values = self.init_cache(input_ids)
-
+        
         if is_prefill:
             if cache_position is None:
                 past_seen_tokens = 0
@@ -782,7 +785,7 @@ class GptOssForCausalLM(GptOssPreTrainedModel, GenerationMixin):
             position_ids = kv_len.unsqueeze(1)
 
         model_inputs = super().prepare_inputs_for_generation(
-            input_ids=input_ids,
+            input_ids=input_ids, 
             attention_mask=attention_mask,
             past_key_values=past_key_values,
             position_ids=position_ids,

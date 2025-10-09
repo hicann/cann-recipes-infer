@@ -1,10 +1,10 @@
 # coding=utf-8
-# This program is free software, you can redistribute it and/or modify it.
-# Copyright (c) 2025 Huawei Technologies Co., Ltd.
+# Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
 # This file is a part of the CANN Open Software.
 # Licensed under CANN Open Software License Agreement Version 2.0 (the "License").
 # Please refer to the License for details. You may not use this file except in compliance with the License.
-# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 
 import logging
@@ -17,6 +17,7 @@ import torch_npu
 from executor.model_runner import ModelRunner
 from models.modeling_gpt_oss import GptOssForCausalLM
 from models.configuration_gpt_oss import GptOssConfig
+from module.quantization import QuantizeMethodBase
 
 root_logger = logging.getLogger()
 root_logger.handlers.clear()
@@ -66,38 +67,12 @@ class GptOssRunner(ModelRunner):
     @override
     def _process_weight_after_loading(self):
         self.to_device()
-        self.cast_format()
+        for module_name, module in self.model.named_modules():
+            quant_method = getattr(module, "quant_method", None)
+            is_nz = False
+            if isinstance(quant_method, QuantizeMethodBase):
+                quant_method.process_weights_after_loading(module, is_nz=is_nz)
 
-    @override
-    def cast_format(self):
-        def for_each_to_transpose(weights, parent, layer_idx=""):
-            prefix = "transpose"
-            for name in weights:
-                try:
-                    getter = attrgetter(name)
-                    tensor = getter(parent)
-                except AttributeError:
-                    logging.info(f"[WARN] weightName {name} not exist in parent layer.{layer_idx}")
-                    continue
-                logging.debug("Before %s; size: %s, dtype %s, format %d",
-                             f"{prefix} layer.{layer_idx}.{name}", tensor.size(),
-                             tensor.dtype, torch_npu.get_npu_format(tensor))
-
-                setattr(tensor, "data", tensor.data.transpose(-2, -1).contiguous())
-
-                logging.debug("After %s; size: %s, dtype %s, format %d",
-                             f"{prefix} layer.{layer_idx}.{name}", getter(parent).size(),
-                             getter(parent).dtype, torch_npu.get_npu_format(tensor))
-
-        weights = [
-            "self_attn.merged_qkv_proj.weight",
-            "self_attn.o_proj.weight",
-            "mlp.router.weight"
-        ]
-        for_each_to_transpose(["lm_head.weight"], self.model)
-        # cast format for model layers
-        for layer_idx, layer in enumerate(self.model.model.layers):
-            for_each_to_transpose(weights, layer, layer_idx)
 
     @override
     def model_input_prepare(self, input_dict):

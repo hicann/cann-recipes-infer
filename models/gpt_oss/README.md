@@ -1,12 +1,12 @@
 # GPT-OSS模型在NPU上推理
 
 ## 概述
-本样例基于Transformers库的[gpt-oss](https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt_oss/modeling_gpt_oss.py)模型，在<term>Atlas A3 系列产品</term>实现了单机单batch低时延推理。
+本样例基于Transformers库的[gpt-oss](https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt_oss/modeling_gpt_oss.py)模型，在<term>Atlas A3 训练系列产品</term>/<term>Atlas A3 推理系列产品</term>实现了单机单batch低时延推理。
 
 下面详细介绍gpt-oss的推理样例在NPU上的执行步骤。
 
 ## 支持的产品型号
-<term>Atlas A3 系列产品</term>
+<term>Atlas A3 训练系列产品</term>/<term>Atlas A3 推理系列产品</term>
 
 ## 环境准备
 
@@ -96,7 +96,7 @@
 
 ## 优化点参考
 
-本样例采用的详细优化点介绍可参见[基于Atlas A3的GPT-OSS模型推理性能优化实践](../../docs/gpt_oss_optimization.md)。
+本样例采用的详细优化点介绍可参见[基于Atlas A3训练/推理集群的GPT-OSS模型推理性能优化实践](../../docs/gpt_oss_optimization.md)。
 
 ## 附录
 

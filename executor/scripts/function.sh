@@ -202,7 +202,6 @@ function launch_split_weight_task()
 
 function save_key_info()
 {
-    wait
     if [ ${ON_CLOUD} -eq 1 ]; then
         mv ./extra-info ${WORK_DIR}/extra-info_${VC_TASK_INDEX}
         mv /root/ascend/atrace ${WORK_DIR}/atrace_${VC_TASK_INDEX}

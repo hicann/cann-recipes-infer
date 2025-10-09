@@ -254,17 +254,34 @@ class ModelRunner:
         npu_backend = tng.get_npu_backend(compiler_config=compiler_config)
         self.model = torch.compile(self.model, dynamic=True, fullgraph=True, backend=npu_backend)
 
-    def mark_inputs(self, model_inputs):
-        if "graph" in self.execute_mode:
-            pass
+    @staticmethod
+    def mark_detail(model_inputs, item_key, is_cache=False):
+        item = model_inputs.get(item_key, None)
+        if item is None:
+            return
+        if is_cache:
+            for item_sub in item:
+                for sub_item in item_sub:
+                    if isinstance(sub_item, torch.Tensor):
+                        torch._dynamo.mark_static(sub_item)
+        elif isinstance(item, torch.Tensor):
+            torch._dynamo.mark_static(item)
+    
+    def mark_inputs(self, model_inputs, sub_dict=None):
+        # prefill with dynamic sequence length, decode with static sequence length
+        if sub_dict is None:
+            sub_dict = []
+        for input_key, _ in model_inputs.items():
+            is_cache = True if input_key in sub_dict else False
+            self.mark_detail(model_inputs, input_key, is_cache=is_cache)
 
     def model_input_prepare(self, input_dict):
         pass
 
-    def model_inference(self, model_inputs, warm_up=False):
+    def model_inference(self, model_inputs, warm_up=False, sub_dict=None):
         torch.npu.synchronize()
         if warm_up:
-            self.mark_inputs(model_inputs)
+            self.mark_inputs(model_inputs, sub_dict)
         start_time = time.time()
         with torch.no_grad():
             logits = self.model(**model_inputs)
