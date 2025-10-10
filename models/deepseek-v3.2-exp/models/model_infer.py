@@ -42,6 +42,11 @@ class Infer(nn.Module):
         self.tmp_indexer_kv = None
 
     def inference(self, model_runner, model_inputs, cycle_idx=None, is_prefill=False, warm_up=False, prefix=''):
+        if not warm_up:
+            self.logits_wp, self.prev_hidden_states_wp, self.inference_time_wp = None, None, None
+        if warm_up and (cycle_idx is not None) and cycle_idx > 0:
+            return self.logits_wp, self.prev_hidden_states_wp, self.inference_time_wp
+
         torch.npu.synchronize()
         start_time = time.time()
         with torch.no_grad():
@@ -62,9 +67,14 @@ class Infer(nn.Module):
                 mode_prefix_str = "prefill minibatch " + str(cycle_idx)
             else:
                 mode_prefix_str = "prefill"
-        if not warm_up:
-            logging.info(f"{prefix} {prof_prefix_str} {model_runner.model_name} " + 
-                         f"[{mode_prefix_str}] inference time cost {(inference_time)*1000:.2f} ms")
+        warm_up_prefix = "[warm up] " if warm_up else ""
+        logging.info(f"{prefix} {prof_prefix_str} {model_runner.model_name} {warm_up_prefix}" + 
+                        f"[{mode_prefix_str}] inference time cost {(inference_time)*1000:.2f} ms")
+        if warm_up and (cycle_idx is not None) and cycle_idx == 0:
+            self.logits_wp = logits
+            self.prev_hidden_states_wp = prev_hidden_states 
+            self.inference_time_wp = inference_time
+            
         return logits, prev_hidden_states, inference_time
 
     def model_input_prepare(self, model, input_dict):
