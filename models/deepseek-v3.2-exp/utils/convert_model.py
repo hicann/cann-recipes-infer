@@ -245,6 +245,7 @@ if __name__ == "__main__":
     parser.add_argument("--input_fp8_hf_path", type=str, required=True)
     parser.add_argument("--output_hf_path", type=str, required=True)
     parser.add_argument("--is_quant_int8", action='store_true')
+    parser.add_argument("--c8", action='store_true')
     args = parser.parse_args()
     main(args.input_fp8_hf_path, args.output_hf_path, args.is_quant_int8)
 
