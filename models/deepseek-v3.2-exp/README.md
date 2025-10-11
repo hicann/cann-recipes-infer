@@ -78,16 +78,20 @@ DeepSeek团队发布了最新的模型DeepSeek-V3.2-Exp，在各项指标上都�
 
 ### 转换权重
 
-  在各个节点上使用`convert_model.py` 脚本完成FP8到bfloat16权重转换。脚本输入参数*input_fp8_hf_path*为原始fp8权重路径，*output_hf_path*为转换后的bfloat16权重路径。
+  在各个节点上使用`convert_model.py` 脚本完成FP8到bfloat16/int8权重转换。脚本输入参数*input_fp8_hf_path*为原始fp8权重路径，*output_hf_path*为转换后的bfloat16/int8权重路径。
 
   ```
   # 转换为bf16权重
   cd models/deepseek-v3.2-exp
   python utils/convert_model.py --input_fp8_hf_path /data/models/DeepSeek-V3.2-Exp-fp8 --output_hf_path /data/models/DeepSeek-V3.2-Exp-bf16
 
-  # 转换为int8权重
+  # 转换为W8A8C16权重
   cd models/deepseek-v3.2-exp
   python utils/convert_model.py --input_fp8_hf_path /data/models/DeepSeek-V3.2-Exp-fp8 --output_hf_path /data/models/DeepSeek-V3.2-Exp-int8 --is_quant_int8
+
+  # 转换为W8A8C8权重
+  cd models/deepseek-v3.2-exp
+  python utils/convert_model.py --input_fp8_hf_path /data/models/DeepSeek-V3.2-Exp-fp8 --output_hf_path /data/models/DeepSeek-V3.2-Exp-int8 --is_quant_int8 --c8
   ```
 
 ### 修改代码
