@@ -1,7 +1,7 @@
 # GPT-OSS模型在NPU上推理
 
 ## 概述
-本样例基于Transformers库的[gpt-oss](https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt_oss/modeling_gpt_oss.py)模型，在<term>Atlas A3 训练系列产品</term>/<term>Atlas A3 推理系列产品</term>实现了单机单batch低时延推理。
+本样例基于Transformers库的[gpt-oss](https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt_oss/modeling_gpt_oss.py)模型，在<term>Atlas A3 训练系列产品</term>/<term>Atlas A3 推理系列产品</term>实现了单机单batch推理。
 
 下面详细介绍gpt-oss的推理样例在NPU上的执行步骤。
 

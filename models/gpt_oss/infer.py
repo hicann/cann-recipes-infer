@@ -32,8 +32,7 @@ def parse_args():
 
 
 def run_gpt_oss(runner_settings):
-    tp_size = runner_settings.get("parallel_config").get("tp_size", 1)
-    preset_prompts, _ = generate_prompt(runner_settings, tp_size)
+    preset_prompts, _ = generate_prompt(runner_settings)
     model_runner = GptOssRunner(runner_settings)
     model_runner.init_model()
     # generate perf data

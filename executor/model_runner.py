@@ -219,14 +219,12 @@ class ModelRunner:
         kwargs = {
             "return_tensors": "pt", "truncation": True, "padding": "max_length", "max_length": self.input_max_len
         }
-        inputs = self.tokenizer(prompts, **kwargs).to(self.device)
-
         # To more intuitively demonstrate the model's performance on the LongBench dataset, we provide a fixed prompt
         # before and after the text.
         if self.runner_settings.get("data_config").get("dataset", "default") != "default":
             from executor.utils.data_utils import build_dataset_input
-            new_prompts = build_dataset_input(self.tokenizer, inputs, self.input_max_len)
-            inputs = self.tokenizer(new_prompts, **kwargs).to(self.device)
+            prompts = build_dataset_input(self.tokenizer, prompts, self.input_max_len)
+        inputs = self.tokenizer(prompts, **kwargs).to(self.device)
 
         return inputs
 
@@ -292,9 +290,7 @@ class ModelRunner:
         inference_time = end_time - start_time
         inference_stage = "prefill" if is_prefill else "decode"
         logging.info(f"{self.model_name} inference time cost of {inference_stage} is {(inference_time)*1000:.2f} ms")
-        # Only MTP models need to return a value for prev_hidden_states
-        prev_hidden_states = None
-        return logits, prev_hidden_states, inference_time
+        return (logits, inference_time)
 
     # Copied from vllm.config._parse_quant_hf_config
     def _parse_quant_hf_config(self):
@@ -345,9 +341,11 @@ class ModelRunner:
                     break
 
                 model_inputs = self.model_input_prepare(input_dict)
-                outputs, prev_hidden_states, inference_time = self.model_inference(model_inputs,
-                                                                  is_prefill=input_dict['is_prefill'], warm_up=warm_up)
-                self.model_output_process(model_inputs, outputs, input_dict)
+                outputs = self.model_inference(model_inputs, is_prefill=input_dict['is_prefill'], warm_up=warm_up)
+                # The outputs is a tuple containing logits, inference_time and other necessary return values.
+                logits = outputs[0]
+                inference_time = outputs[1]
+                self.model_output_process(model_inputs, logits, input_dict)
                 prof.step()
                 generate_tokens += 1
                 cnt += 1
