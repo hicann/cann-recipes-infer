@@ -45,19 +45,22 @@ def weight_dequant(weight: torch.Tensor, scale: torch.Tensor, block_size: int = 
         AssertionError: If `scale` dimensions do not align with `weight` shape after scaling.
     """
 
-    #Get the original dimensions of weight
+    # Get the original dimensions of weight
     M, N = weight.shape
 
     # Compute the effective block dimensions for scale
     scale_m, scale_n = scale.shape
-    assert scale_m == (M + block_size - 1) // block_size, "Mismatch in scale rows and weight rows."
-    assert scale_n == (N + block_size - 1) // block_size, "Mismatch in scale columns and weight columns."
+    assert scale_m == (
+        M + block_size - 1) // block_size, "Mismatch in scale rows and weight rows."
+    assert scale_n == (
+        N + block_size - 1) // block_size, "Mismatch in scale columns and weight columns."
 
     # Convert weight to float32 for calculations
     weight = weight.to(torch.float32)
 
     # Expand scale to match the weight tensor's shape
-    scale_expanded = scale.repeat_interleave(block_size, dim=0).repeat_interleave(block_size, dim=1)
+    scale_expanded = scale.repeat_interleave(
+        block_size, dim=0).repeat_interleave(block_size, dim=1)
 
     # Trim scale_expanded to match weight's shape if necessary
     scale_expanded = scale_expanded[:M, :N]
@@ -83,6 +86,9 @@ def int8_weight_quant(tensor: torch.Tensor):
 
 
 def is_ignore_quant(weight_name, quant_ignore_layers_name):
+    """
+    Check if a layer should be ignored during quantization based on its name.
+    """
     is_ignore = False
     for layer in quant_ignore_layers_name:
         if layer in weight_name:
@@ -92,15 +98,57 @@ def is_ignore_quant(weight_name, quant_ignore_layers_name):
     return is_ignore
 
 
-def generate_ignore_item():
+def generate_ignore_item(c8=False):
+    """
+    Generate a list of layer names to be ignored during quantization.
+    """
     ignore = []
-    for i in range(0, 62):
-        ignore.append(f'model.layers.{i}.self_attn.indexer')
-        ignore.append(f'model.layers.{i}.self_attn.kv_b_proj')
-        if i >= 3:
-            ignore.append(f'model.layers.{i}.mlp.gate')
+    if c8:
+        for i in range(0, 62):
+            ignore.append(f'model.layers.{i}.self_attn.indexer.wk')
+            ignore.append(f'model.layers.{i}.self_attn.indexer.weights_proj')
+            ignore.append(f'model.layers.{i}.self_attn.kv_b_proj')
+            ignore.append(f'model.layers.{i}.self_attn.kv_a_proj_with_mqa')
+            ignore.append(f'model.layers.{i}.self_attn.q_a_proj')
+            if i >= 3:
+                ignore.append(f'model.layers.{i}.mlp.gate')
+    else:
+        for i in range(0, 62):
+            ignore.append(f'model.layers.{i}.self_attn.indexer')
+            ignore.append(f'model.layers.{i}.self_attn.kv_b_proj')
+            if i >= 3:
+                ignore.append(f'model.layers.{i}.mlp.gate')
     ignore.append('lm_head')
     return ignore
+
+
+def generate_quant_config(c8=False):
+    # For W8A8C16
+    if not c8:
+        num_bits = {"self_attn.kv_a_proj_with_mqa": 8, "self_attn.q_a_proj": 8, "self_attn.q_b_proj": 8,
+                    "self_attn.o_proj": 8, "mlp.down_proj": 8, "mlp.gate_up_proj": 8, "mlp.shared_experts": 8,
+                    "mlp.experts": 8}
+    # For W8A8C8
+    else:
+        num_bits = {"self_attn.q_b_proj": 8, "self_attn.o_proj": 8,
+                    "mlp.down_proj": 8, "mlp.gate_up_proj": 8, "mlp.shared_experts": 8,
+                    "mlp.experts": 8, "indexer.wq_b": 8}
+    ignores = generate_ignore_item(c8)
+    quant_config = {"config_groups": {"group_0": {}}, "format": "int-quantized",
+                    "global_compression_ratio": 1, "ignore": ignores, "kv_cache_scheme": None,
+                    "quant_method": "compressed-tensors", "quantization_status": "compressed"}
+    quant_config["config_groups"]["group_0"]["input_activations"] = {"actorder": None, "block_structure": None,
+                                                                     "dynamic": True, "group_size": None, "num_bits": 8,
+                                                                     "observer": "memoryless", "observer_kwargs": {},
+                                                                     "strategy": "token", "symmetric": True,
+                                                                     "type": "int"}
+    quant_config["config_groups"]["group_0"]["output_activations"] = None
+    quant_config["config_groups"]["group_0"]["targets"] = ["Linear"]
+    quant_config["config_groups"]["group_0"]["weights"] = {"actorder": None, "block_structure": None, "dynamic": False,
+                                                           "group_size": None, "num_bits": num_bits,
+                                                           "observer": "minmax", "observer_kwargs": {},
+                                                           "strategy": "channel", "symmetric": True, "type": "int"}
+    return quant_config
 
 
 def copy_py_json(src, target):
@@ -115,7 +163,7 @@ def copy_py_json(src, target):
                 shutil.copy2(src_path, dst_path)
 
 
-def main(fp8_path, output_path, is_quant_int8):
+def main(fp8_path, output_path, is_quant_int8, c8=False):
     """
     Converts FP8 weights to BF16 and saves the converted weights.
 
@@ -127,6 +175,7 @@ def main(fp8_path, output_path, is_quant_int8):
     fp8_path (str): The path to the directory containing the FP8 weights and model index file.
     output_path (str): The path to the directory where the converted BF16/INT8 weights will be saved.
     is_quant_int8 (bool): Quantize the model to INT8.
+    c8 (bool): Use W8A8C8 quantization scheme if True, otherwise use W8A8C16.
 
     Raises:
     KeyError: If a required scale_inv tensor is missing for a weight.
@@ -146,19 +195,20 @@ def main(fp8_path, output_path, is_quant_int8):
         config = json.load(f)
     if 'quantization_config' in config:
         config.pop('quantization_config')
-    
-    if is_quant_int8:
-        with open('config/int8_quantization_config.json', "r") as f:
-            quantization_config = json.load(f)
-            quantization_config['ignore'] = generate_ignore_item()
-        config['quantization_config'] = quantization_config
+
     weight_map = model_index["weight_map"]
     new_weight_map = {}
+    quant_ignore_layers = []
+    if is_quant_int8:
+        quantization_config = generate_quant_config(c8)
+        config['quantization_config'] = quantization_config
+        quant_ignore_layers = generate_ignore_item(c8)
 
     # Cache for loaded safetensor files
     loaded_files = {}
 
     # Helper function to get tensor from the correct file
+
     def get_tensor(tensor_name):
         """
         Retrieves a tensor from the cached safetensor files or loads it from disk if not cached.
@@ -197,11 +247,14 @@ def main(fp8_path, output_path, is_quant_int8):
                     scale_inv = get_tensor(scale_inv_name)
                     bf16_weight = weight_dequant(weight, scale_inv)
                     if is_quant_int8:
-                        is_ignore_layer = is_ignore_quant(weight_name, quant_ignore_layers)
+                        is_ignore_layer = is_ignore_quant(
+                            weight_name, quant_ignore_layers)
                         if not is_ignore_layer:
-                            int8_weight, scale_inv = int8_weight_quant(bf16_weight)
-                            new_scale_name = scale_inv_name.replace('_scale_inv', '_scale')
-                            
+                            int8_weight, scale_inv = int8_weight_quant(
+                                bf16_weight)
+                            new_scale_name = scale_inv_name.replace(
+                                '_scale_inv', '_scale')
+
                             new_state_dict[weight_name] = int8_weight
                             new_state_dict[new_scale_name] = scale_inv
 
@@ -209,12 +262,13 @@ def main(fp8_path, output_path, is_quant_int8):
                             new_weight_map[new_scale_name] = file_name
                         else:
                             new_state_dict[weight_name] = bf16_weight
-                            new_weight_map[weight_name] = file_name 
+                            new_weight_map[weight_name] = file_name
                     else:
                         new_state_dict[weight_name] = bf16_weight
                         new_weight_map[weight_name] = file_name
                 except KeyError:
-                    print(f"Warning: Missing scale_inv tensor for {weight_name}, skipping conversion")
+                    print(
+                        f"Warning: Missing scale_inv tensor for {weight_name}, skipping conversion")
                     new_state_dict[weight_name] = weight
                     new_weight_map[weight_name] = file_name
             else:
@@ -222,23 +276,26 @@ def main(fp8_path, output_path, is_quant_int8):
                 new_weight_map[weight_name] = file_name
 
         new_safetensor_file = os.path.join(output_path, file_name)
-        save_file(new_state_dict, new_safetensor_file, metadata={'format': 'pt'})
+        save_file(new_state_dict, new_safetensor_file,
+                  metadata={'format': 'pt'})
 
         # Memory management: keep only the 2 most recently used files
         if len(loaded_files) > 2:
             oldest_file = next(iter(loaded_files))
             del loaded_files[oldest_file]
-    
+
     copy_py_json(fp8_path, output_path)
 
     # Update model index
-    new_model_index_file = os.path.join(output_path, "model.safetensors.index.json")
+    new_model_index_file = os.path.join(
+        output_path, "model.safetensors.index.json")
     new_config_file = os.path.join(output_path, "config.json")
     with open(new_model_index_file, "w") as f:
         json.dump({"metadata": {}, "weight_map": new_weight_map}, f, indent=2)
 
     with open(new_config_file, "w") as f:
         json.dump(config, f, indent=2)
+
 
 if __name__ == "__main__":
     parser = ArgumentParser()
@@ -247,5 +304,5 @@ if __name__ == "__main__":
     parser.add_argument("--is_quant_int8", action='store_true')
     parser.add_argument("--c8", action='store_true')
     args = parser.parse_args()
-    main(args.input_fp8_hf_path, args.output_hf_path, args.is_quant_int8)
 
+    main(args.input_fp8_hf_path, args.output_hf_path, args.is_quant_int8, args.c8)
