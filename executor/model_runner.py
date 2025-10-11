@@ -17,7 +17,7 @@ import torch
 import torch_npu
 from transformers import AutoTokenizer
 
-from executor.utils import get_default_group
+from executor.utils import get_default_group, process_infer_time
 from executor.model_loader.default_loader import DefaultModelLoader
 from executor.model_loader.dummy_loader import DummyModelLoader
 from module.quantization import (QUANTIZATION_METHODS,
@@ -163,6 +163,7 @@ class ModelRunner:
                 ignore_mismatched_sizes=True,
                 runner_settings=self.runner_settings
             )
+        self.check_model_cfg()
         self._verify_quantization()
         if self.quantization is not None:
             self.hf_config.quant_config = get_quant_config(self.hf_config, self.quantization, self.model_path)
@@ -267,28 +268,33 @@ class ModelRunner:
         elif isinstance(item, torch.Tensor):
             torch._dynamo.mark_static(item)
     
-    def mark_inputs(self, model_inputs, sub_dict=None):
+    def mark_inputs(self, model_inputs, dict_inputs_names=None):
         # prefill with dynamic sequence length, decode with static sequence length
-        if sub_dict is None:
-            sub_dict = []
+        if dict_inputs_names is None:
+            dict_inputs_names = []
         for input_key, _ in model_inputs.items():
-            is_cache = True if input_key in sub_dict else False
+            is_cache = True if input_key in dict_inputs_names else False
             self.mark_detail(model_inputs, input_key, is_cache=is_cache)
 
     def model_input_prepare(self, input_dict):
         pass
+        return None
 
-    def model_inference(self, model_inputs, warm_up=False, sub_dict=None):
+    def model_inference(self, model_inputs, is_prefill, warm_up=False, dict_inputs_names=None):
         torch.npu.synchronize()
         if warm_up:
-            self.mark_inputs(model_inputs, sub_dict)
+            self.mark_inputs(model_inputs, dict_inputs_names)
         start_time = time.time()
         with torch.no_grad():
             logits = self.model(**model_inputs)
         torch.npu.synchronize()
         end_time = time.time()
-        logging.info(f"{self.model_name} inference time cost {(end_time - start_time)*1000:.2f} ms")
-        return logits
+        inference_time = end_time - start_time
+        inference_stage = "prefill" if is_prefill else "decode"
+        logging.info(f"{self.model_name} inference time cost of {inference_stage} is {(inference_time)*1000:.2f} ms")
+        # Only MTP models need to return a value for prev_hidden_states
+        prev_hidden_states = None
+        return logits, prev_hidden_states, inference_time
 
     # Copied from vllm.config._parse_quant_hf_config
     def _parse_quant_hf_config(self):
@@ -322,9 +328,50 @@ class ModelRunner:
                     f"Unknown quantization method: {self.quantization}. Must "
                     f"be one of {supported_quantization}.")
 
-    def model_generate(self, prompts, warm_up=False):
-        pass
+    def model_generate(self, input_dict, input_lens, warm_up=False):
+        logging.info("Prompt lens is : %d", input_lens)
+        profiler = self.define_profiler(
+            enable_profiler=self.enable_profiler and not warm_up,
+            profile_save_path=f"{self.res_path}/prof",
+        )
 
+        generate_tokens = 0
+        cnt = 0
+        infer_time_rec = []
+        with profiler as prof:
+            while True:
+                jump_flag = self.get_jump_flag(cnt, warm_up)
+                if jump_flag:
+                    break
+
+                model_inputs = self.model_input_prepare(input_dict)
+                outputs, prev_hidden_states, inference_time = self.model_inference(model_inputs,
+                                                                  is_prefill=input_dict['is_prefill'], warm_up=warm_up)
+                self.model_output_process(model_inputs, outputs, input_dict)
+                prof.step()
+                generate_tokens += 1
+                cnt += 1
+                infer_time_rec.append(inference_time)
+
+        if not warm_up:
+            avg_infer_time = process_infer_time(infer_time_rec, cnt)
+            logging.info(f"{self.model_name} average inference time cost is {(avg_infer_time)*1000:.2f} ms")
+
+        # detokenize outputs
+        generate_ids = input_dict["generate_ids"][:, input_lens:].clip(0, self.model.config.vocab_size - 1)
+        return self.tokenizer_decode(generate_ids)
+
+    def get_jump_flag(self, cnt, warm_up):
+        default_decode_dump = 2
+        # warm up only perform for 5 times(decode)
+        jump_flag_warm = warm_up and cnt >= default_decode_dump
+        # do not generate after max_token
+        jump_flag_oversize = cnt >= self.max_new_tokens
+        jump_flag = jump_flag_oversize or jump_flag_warm
+        return jump_flag
 
     def model_output_process(self, model_inputs, outputs, input_dict):
+        pass
+
+    def check_model_cfg(self):
         pass

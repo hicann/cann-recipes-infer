@@ -1,10 +1,10 @@
 # coding=utf-8
-# Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
+# This program is free software, you can redistribute it and/or modify it.
+# Copyright (c) 2025 Huawei Technologies Co., Ltd.
 # This file is a part of the CANN Open Software.
 # Licensed under CANN Open Software License Agreement Version 2.0 (the "License").
 # Please refer to the License for details. You may not use this file except in compliance with the License.
-# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
-# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 
 import logging
@@ -120,8 +120,6 @@ class GptOssRunner(ModelRunner):
     def model_generate(self, prompts, warm_up=False, **kwargs):
         inputs = self.tokenize_prompts(prompts)
         input_lens = copy.deepcopy(inputs.input_ids.size()[1])
-        logging.info("Prompt lens is : %d", input_lens)
-        profiler = self.define_profiler(enable_profiler=self.enable_profiler, profile_save_path=f"{self.res_path}/prof")
 
         mask = create_init_attn_mask(
             mask_length=self.runner_settings.get("data_config").get("max_position_embeddings", 4196),
@@ -145,30 +143,14 @@ class GptOssRunner(ModelRunner):
             "curr_position": input_lens - 1,
             "causal_mask_mapping": causal_mask_mapping,
         }
-
-        generate_tokens = 0
-        cnt = 0
-        with profiler as prof:
-            while True:
-                jump_flag = self.get_jump_flag(cnt, warm_up, generate_tokens)
-                if jump_flag:
-                    break
-
-                model_inputs = self.model_input_prepare(input_dict)
-                outputs = self.model_inference(model_inputs, warm_up=warm_up)
-                self.model_output_process(model_inputs, outputs, input_dict)
-                prof.step()
-                generate_tokens += 1
-                cnt += 1
-
-        generate_ids = input_dict["generate_ids"][0:1, input_lens:].clip(0, self.model.config.vocab_size - 1)
-        return self.tokenizer_decode(generate_ids)
-
-    def get_jump_flag(self, cnt, warm_up, generate_tokens):
-        default_decode_dump = 2
-        # warm up only perform for 5 times(decode)
-        jump_flag_warm = warm_up and cnt >= default_decode_dump
-        # do not generate after max_token
-        jump_flag_oversize = generate_tokens >= self.max_new_tokens
-        jump_flag = jump_flag_oversize or jump_flag_warm
-        return jump_flag
+        super().model_generate(input_dict, input_lens)
+    
+    @override
+    def check_model_cfg(self):
+        tp_size = self.runner_settings.get("parallel_config").get("tp_size", 1)
+        if self.hf_config.num_key_value_heads % tp_size != 0:
+            raise ValueError(f"num_key_value_heads={self.hf_config.num_key_value_heads} is not divisible by {tp_size=}")
+        if self.hf_config.intermediate_size % tp_size != 0:
+            raise ValueError(f"intermediate_size={self.hf_config.intermediate_size} is not divisible by {tp_size=}")
+        if self.hf_config.num_attention_heads % tp_size != 0:
+            raise ValueError(f"num_attention_heads={self.hf_config.num_attention_heads} is not divisible by {tp_size=}")
