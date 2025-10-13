@@ -147,10 +147,14 @@ class GptOssRunner(ModelRunner):
     
     @override
     def check_model_cfg(self):
-        tp_size = self.runner_settings.get("parallel_config").get("tp_size", 1)
-        if self.hf_config.num_key_value_heads % tp_size != 0:
-            raise ValueError(f"num_key_value_heads={self.hf_config.num_key_value_heads} is not divisible by {tp_size=}")
-        if self.hf_config.intermediate_size % tp_size != 0:
-            raise ValueError(f"intermediate_size={self.hf_config.intermediate_size} is not divisible by {tp_size=}")
-        if self.hf_config.num_attention_heads % tp_size != 0:
-            raise ValueError(f"num_attention_heads={self.hf_config.num_attention_heads} is not divisible by {tp_size=}")
+        attn_tp_size = self.runner_settings.get("parallel_config").get("attn_tp_size", 1)
+        moe_tp_size = self.runner_settings.get("parallel_config").get("moe_tp_size", 1)
+        lm_head_tp_size = self.runner_settings.get("parallel_config").get("lmhead_tp_size", 1)
+        if self.hf_config.num_key_value_heads % attn_tp_size != 0:
+            raise ValueError(f"num_key_value_heads={self.hf_config.num_key_value_heads} is not divisible by {attn_tp_size=}")
+        if self.hf_config.intermediate_size % moe_tp_size != 0:
+            raise ValueError(f"intermediate_size={self.hf_config.intermediate_size} is not divisible by {moe_tp_size=}")
+        if self.hf_config.num_attention_heads % attn_tp_size != 0:
+            raise ValueError(f"num_attention_heads={self.hf_config.num_attention_heads} is not divisible by {attn_tp_size=}")
+        if self.hf_config.vocab_size % lm_head_tp_size !=0:
+            raise ValueError(f"vocab_size={self.hf_config.vocab_size} is not divisible by {lm_head_tp_size=}")

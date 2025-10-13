@@ -84,7 +84,7 @@ class GptOssRMSNorm(nn.Module):
 class GptOssExperts(nn.Module):
     def __init__(self, config, runner_settings):
         super().__init__()
-        self.tp_size = runner_settings.get("parallel_config").get("tp_size", 1)
+        self.tp_size = runner_settings.get("parallel_config").get("moe_tp_size", 1)
         self.intermediate_size = config.intermediate_size
         self.num_experts = config.num_local_experts
         self.hidden_size = config.hidden_size
@@ -309,7 +309,7 @@ class GptOssAttention(nn.Module):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
-        self.tp_size = runner_settings.get("parallel_config").get("tp_size", 1)
+        self.tp_size = runner_settings.get("parallel_config").get("attn_tp_size", 1)
         if self.tp_size > 1:
             self.commute_type = "all_reduce"
         else:
@@ -557,8 +557,8 @@ class GptOssForCausalLM(GptOssPreTrainedModel, GenerationMixin):
         self.runner_settings = runner_settings
         self.model = GptOssModel(config, runner_settings, prefix)
         self.vocab_size = config.vocab_size
-        self.lm_head_tp_size = runner_settings.get("parallel_config").get("tp_size", 1)
-        self.attn_tp_size = runner_settings.get("parallel_config").get("tp_size", 1)
+        self.lm_head_tp_size = runner_settings.get("parallel_config").get("lmhead_tp_size", 1)
+        self.attn_tp_size = runner_settings.get("parallel_config").get("attn_tp_size", 1)
         self.lm_head = ColumnParallelLinear(
             input_size=config.hidden_size,
             output_size=self.vocab_size,
@@ -651,8 +651,8 @@ class GptOssForCausalLM(GptOssPreTrainedModel, GenerationMixin):
             ("merged_qkv_proj", "v_proj", "v"),
         ]
 
-        tp_rank = dist.get_rank() if self.lm_head_tp_size > 1 else 0
-        tp_size = self.lm_head_tp_size
+        tp_rank = dist.get_rank() if self.attn_tp_size > 1 else 0
+        tp_size = self.attn_tp_size
 
         # Attention heads per rank
         heads_per_rank = self.config.num_attention_heads // tp_size

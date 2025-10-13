@@ -114,7 +114,9 @@ class GptOssRunner(ModelRunner): # 定义GptOssRunner类，继承自ModelRunner
 
    `model_generate`方法是模型推理的核心，如下图所示，`model_generate`负责处理输入prompt，准备输入，执行推理循环，直到满足终止条件。具体实现细节可参考[gpt_oss](../models/gpt_oss/runner_gpt_oss.py)中的`model_generate`方法。
 
-   <img src=./figures/model_generate.png width=250></img>
+   <p align="center">
+     <img src="./figures/model_generate.png" width="30%" alt="model_generate process]">
+   </p>
 
    - 处理输入提示词：将tokenizer输入最大长度设置为input_max_len，超过这个长度会做截断处理，小于这个长度会做填充处理，使用tokenizer将输入prompt变成token ID 。
    - 执行推理循环：在循环中调用`get_jump_prepare`方法判断是否终止推理，调用`model_input_prepare`方法准备模型输入，执行模型推理`model_inference`方法，获取的输出结果调用`model_output_process`方法进行处理。
