@@ -9,12 +9,12 @@
  */
 
 /*!
- * \file lightning_indexer_tiling.h
+ * \file lightning_indexer_quant_tiling.h
  * \brief
  */
 
-#ifndef LIGHTNING_INDEXER_TILING_H_
-#define LIGHTNING_INDEXER_TILING_H_
+#ifndef LIGHTNING_INDEXER_QUANT_TILING_H_
+#define LIGHTNING_INDEXER_QUANT_TILING_H_
 
 #include "exe_graph/runtime/tiling_context.h"
 #include "tiling/platform/platform_ascendc.h"
@@ -39,7 +39,7 @@ struct TilingOptionalParaInfo {
 enum class DataLayout : uint32_t {
     BSND = 0,
     TND = 1,
-    BnBsND = 2
+    PA_BSND = 2
 };
 
 // ------------------算子原型索引常量定义----------------
@@ -47,15 +47,19 @@ enum class DataLayout : uint32_t {
 constexpr uint32_t QUERY_INDEX = 0;
 constexpr uint32_t KEY_INDEX = 1;
 constexpr uint32_t WEIGTHS_INDEX = 2;
-constexpr uint32_t ACTUAL_SEQ_Q_INDEX = 3;
-constexpr uint32_t ACTUAL_SEQ_K_INDEX = 4;
-constexpr uint32_t BLOCK_TABLE_INDEX = 5;
-constexpr uint32_t LIGHTNING_INDEXER = 0;
+constexpr uint32_t QUERY_DEQUANT_SCALE_INDEX = 3;
+constexpr uint32_t KEY_DEQUANT_SCALE_INDEX = 4;
+constexpr uint32_t ACTUAL_SEQ_Q_INDEX = 5;
+constexpr uint32_t ACTUAL_SEQ_K_INDEX = 6;
+constexpr uint32_t BLOCK_TABLE_INDEX = 7;
+constexpr uint32_t LIGHTNING_INDEXER_QUANT = 0;
 // Attributes Index
-constexpr uint32_t ATTR_QUERY_LAYOUT_INDEX = 0;
-constexpr uint32_t ATTR_KEY_LAYOUT_INDEX = 1;
-constexpr uint32_t ATTR_SPARSE_COUNT_INDEX = 2;
-constexpr uint32_t ATTR_SPARSE_MODE_INDEX = 3;
+constexpr uint32_t ATTR_QUERY_QUANT_MODE_INDEX = 0;
+constexpr uint32_t ATTR_KEY_QUANT_MODE_INDEX = 1;
+constexpr uint32_t ATTR_QUERY_LAYOUT_INDEX = 2;
+constexpr uint32_t ATTR_KEY_LAYOUT_INDEX = 3;
+constexpr uint32_t ATTR_SPARSE_COUNT_INDEX = 4;
+constexpr uint32_t ATTR_SPARSE_MODE_INDEX = 5;
 // Dim Index
 constexpr uint32_t DIM_IDX_TWO = 2;
 constexpr uint32_t DIM_IDX_THREE = 3;
@@ -66,10 +70,13 @@ constexpr uint32_t DIM_NUM_FOUR = 4;
 // 入参限制常量
 constexpr uint32_t HEAD_DIM_LIMIT = 128;
 constexpr uint32_t SPARSE_LIMIT = 2048;
+constexpr uint32_t G_SIZE_LIMIT = 64;
+constexpr uint32_t BLOCK_SIZE_LIMIT = 1024;
+constexpr uint32_t BLOCK_SIZE_FACTOR = 16;
 constexpr uint32_t SPARSE_MODE_LOWER = 3;
 
 // -----------算子TilingData定义---------------
-BEGIN_TILING_DATA_DEF(LITilingData)
+BEGIN_TILING_DATA_DEF(LIQTilingData)
 TILING_DATA_FIELD_DEF(uint32_t, bSize)
 TILING_DATA_FIELD_DEF(uint32_t, n2Size)
 TILING_DATA_FIELD_DEF(uint32_t, gSize)
@@ -81,22 +88,26 @@ TILING_DATA_FIELD_DEF(uint32_t, blockSize)
 TILING_DATA_FIELD_DEF(uint32_t, maxBlockNumPerBatch)
 TILING_DATA_FIELD_DEF(uint32_t, sparseMode)
 END_TILING_DATA_DEF
-REGISTER_TILING_DATA_CLASS(LightningIndexer, LITilingData)
+REGISTER_TILING_DATA_CLASS(LightningIndexerQuant, LIQTilingData)
 
 // -----------算子CompileInfo定义-------------------
-struct LICompileInfo {};
+struct LIQCompileInfo {};
 
 // -----------算子Tiling入参结构体定义---------------
-struct LiParaInfo {
+struct LIQParaInfo {
     TilingRequiredParaInfo query = {nullptr, nullptr};
     TilingRequiredParaInfo key = {nullptr, nullptr};
     TilingRequiredParaInfo weights = {nullptr, nullptr};
+    TilingRequiredParaInfo query_dequant_scale = {nullptr, nullptr};
+    TilingRequiredParaInfo key_dequant_scale = {nullptr, nullptr};
     TilingOptionalParaInfo actualSeqLengthsQ = {nullptr, nullptr};
-    TilingOptionalParaInfo actualSeqLengths = {nullptr, nullptr};
+    TilingOptionalParaInfo actualSeqLengthsK = {nullptr, nullptr};
     TilingOptionalParaInfo blockTable = {nullptr, nullptr};
     TilingRequiredParaInfo attenOut = {nullptr, nullptr};
 
-    const char *layOut = nullptr;
+    const int32_t *queryQuantMode = nullptr;
+    const int32_t *keyQuantMode = nullptr;
+    const char *layOutQuery = nullptr;
     const char *layOutKey = nullptr;
     const int32_t *blockSize = nullptr;
     const int32_t *sparseMode = nullptr;
@@ -104,11 +115,11 @@ struct LiParaInfo {
 };
 
 // -----------算子Tiling入参信息类---------------
-class LITilingInfo {
+class LIQTilingInfo {
 public:
     const char *opName = nullptr;
     fe::PlatFormInfos *platformInfo = nullptr;
-    LiParaInfo opParamInfo;
+    LIQParaInfo opParamInfo;
     // Base Param
     platform_ascendc::SocVersion socVersion = platform_ascendc::SocVersion::ASCEND910B;
     uint32_t bSize = 0;
@@ -132,16 +143,16 @@ public:
     ge::DataType outputType = ge::DT_INT32;
     // Layout
     DataLayout inputQLayout = DataLayout::BSND;
-    DataLayout inputKLayout = DataLayout::BnBsND;
+    DataLayout inputKLayout = DataLayout::PA_BSND;
 };
 
 // -----------算子Tiling入参信息解析及Check类---------------
-class LIInfoParser {
+class LIQInfoParser {
 public:
-    explicit LIInfoParser(gert::TilingContext *context) : context_(context)
+    explicit LIQInfoParser(gert::TilingContext *context) : context_(context) 
     {
     }
-    ~LIInfoParser() = default;
+    ~LIQInfoParser() = default;
 
     ge::graphStatus CheckRequiredInOutExistence() const;
     ge::graphStatus CheckRequiredAttrExistence() const;
@@ -153,9 +164,11 @@ public:
     void GetOptionalInputParaInfo();
     void GetInputParaInfo();
     void GetOutputParaInfo();
-    ge::graphStatus GetAndCheckAttrParaInfo();
+    ge::graphStatus GetAttrParaInfo();
+    ge::graphStatus CheckAttrParaInfo();
     ge::graphStatus GetOpParaInfo();
     ge::graphStatus ValidateInputShapesMatch();
+    ge::graphStatus CheckScaleShape();
     ge::graphStatus GetAndCheckInOutDataType();
     ge::graphStatus GetBatchSize();
     ge::graphStatus GetHeadDim();
@@ -163,7 +176,6 @@ public:
     ge::graphStatus GetAndCheckOptionalInput();
     ge::graphStatus CheckShapeDim();
     ge::graphStatus GetAndCheckBlockSize();
-    ge::graphStatus CheckBlockCount();
     ge::graphStatus GetS2SizeForPageAttention();
     ge::graphStatus GetS2Size();
     ge::graphStatus GetQueryKeyAndOutLayout();
@@ -172,14 +184,14 @@ public:
     ge::graphStatus GetGSize();
     ge::graphStatus GetAttenMaskInfo();
     ge::graphStatus GetActualSeqInfo();
-    void GenerateInfo(LITilingInfo &liInfo);
-    ge::graphStatus ParseAndCheck(LITilingInfo &liInfo);
+    void GenerateInfo(LIQTilingInfo &liqInfo);
+    ge::graphStatus ParseAndCheck(LIQTilingInfo &liqInfo);
 
 public:
     gert::TilingContext *context_ = nullptr;
     const char *opName_;
     fe::PlatFormInfos *platformInfo_;
-    LiParaInfo opParamInfo_;
+    LIQParaInfo opParamInfo_;
 
     // BaseParams
     uint32_t bSize_ = 0;
@@ -191,29 +203,30 @@ public:
     uint32_t headDim_ = 0;
     // Layout
     DataLayout qLayout_ = DataLayout::BSND;
-    DataLayout kLayout_ = DataLayout::BnBsND;
+    DataLayout kLayout_ = DataLayout::PA_BSND;
     // PageAttention
     uint32_t maxBlockNumPerBatch_ = 0;
-    int32_t blockSize_ = 0;
+    uint32_t blockSize_ = 0;
     platform_ascendc::SocVersion socVersion_ = platform_ascendc::SocVersion::ASCEND910B;
     ge::DataType inputQType_ = ge::DT_FLOAT16;
     ge::DataType inputKType_ = ge::DT_FLOAT16;
     ge::DataType weightsType_ = ge::DT_FLOAT16;
+    ge::DataType inputQueryScaleType_ = ge::DT_FLOAT16;
+    ge::DataType inputKeyScaleType_ = ge::DT_FLOAT16;
     ge::DataType blockTableType_ = ge::DT_FLOAT16;
     ge::DataType inputKRopeType_ = ge::DT_FLOAT16;
     ge::DataType outputType_ = ge::DT_FLOAT16;
 };
 
 // ---------------算子Tiling类---------------
-class LightningIndexerTiling {
+class LightningIndexerQuantTiling {
 public:
-    explicit LightningIndexerTiling(gert::TilingContext *context) : context_(context){};
-    ge::graphStatus DoTiling(LITilingInfo *tilingInfo);
-
+    explicit LightningIndexerQuantTiling(gert::TilingContext *context) : context_(context){};
+    ge::graphStatus DoTiling(LIQTilingInfo *tilingInfo);
 private:
     gert::TilingContext *context_ = nullptr;
-    LITilingData tilingData_;
+    LIQTilingData tilingData_;
 };
 
 } // namespace optiling
-#endif // LIGHTNING_INDEXER_TILING_H_
+#endif // LIGHTNING_INDEXER_QUANT_TILING_H_
