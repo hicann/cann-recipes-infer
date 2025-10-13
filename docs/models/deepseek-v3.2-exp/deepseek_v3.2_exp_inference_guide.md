@@ -234,31 +234,13 @@ DSA的计算过程可分为MLAProlog、IndexerProlog、Lightning Indexer、Spars
 
 ## 量化策略
 
-相对于BF16推理，Int8量化可以有效降低端到端时延，提升系统吞吐量。本版量化已经支持`W8A8C16`和`W8A8C8`两个版本。
-
-### W8A8C16
-
-
-W8A8C16主要针对Matmul使用W8A8量化。数据使用动态Per-Token量化，权重使用静态Per-Channel量化。量化架构如下：
-
+相对于BF16推理，Int8量化可以有效降低端到端时延，提升系统吞吐量。本版量化已经支持`W8A8C8`。W8A8C8主要针对Matmul使用W8A8量化，KVCache/KCache使用C8量化。量化架构如下：
 
 <p align="center">
-  <img src="./figures/w8a8c16_quantization.png" width="70%" alt="decode_parallel">
+  <img src="./figures/w8a8c8_quantization.png" width="70%" alt="decode_parallel">
 </p>
 
-- MLAProlog: 考虑到`kv_b_proj`会被拆分，除了`kv_b_proj` 不量化，其他Linear全量化到W8A8
-- Sparse Flash Attention: 目前暂未量化
-- IndexerProlog和Lightning Indexer: 目前暂未量化
-- MoE: 路由专家和共享专家量化到W8A8
-- LM_Head：目前暂未量化
-
-
-**注：W8A8指权重做Per-Channel静态INT8量化，数据做动态Per-Token动态INT8量化。**
-
-W8A8C16量化精度接近无损，同时权重内存占用优化2倍, TTFT和TPOT也同步优化。
-
-### W8A8C8
-W8A8C8量化算法对MLA KVCache实现INT8压缩，对LightningIndexer BatchMatmul实现A8C8乘法。对应的量化架构如下：
+其中MLAProlog、IndexerProlog、LightningIndexer三个量化融合算子如下：
 
 <p align="center">
   <img src="./figures/w8a8c8_quantization_details.png" width="80%" alt="decode_parallel">
@@ -271,21 +253,24 @@ W8A8C8量化算法对MLA KVCache实现INT8压缩，对LightningIndexer BatchMatm
 - MoE：路由专家和共享专家GroupedMatmul量化到W8A8；
 - LM_Head：暂不量化；
 
-**注：W8指权重做Per-Channel静态INT8量化，A8指数据做动态Per-Token动态INT8量化。C8表示KVCache 做动态Per-Tile-128 INT8量化，KCache做动态Per-Head INT8量化**
+**注：
+W8A8：W8指权重做Per-Channel静态INT8量化，A8指数据做动态Per-Token动态INT8量化；
+A8C8：A8表示Lightning Indexer中的Q做动态Per-Token-Head INT8量化，KCache做动态Per-Token-Per-Head INT8量化；
+KVCache C8：表示KVCache 做动态Per-Token-Per-Head-Per-Tile-128 INT8量化；**
 
 
-W8A8C8量化策略对MLA和Indexer的Linear量化数量更少，其中MLA线性层只量化了`q_b_proj`和`w_o_proj`，Indexer线性层只量化`wq_b_proj`。主要原因是IndexerProlog融合算子要求`weights_proj`出fp16,且不做量化，因此MLA输入关联的Linear统一不做量化，好处还能使用同一份输入的BF16数据（即使做量化收益也不大）。
 
-另一方面，由于SparseFlashAttention是耗时瓶颈点主要在于离散聚合访存，即使实现存8算8，端到端时延依旧无法提升，因此本版的MLA部分的KVCache版本使用动态存8算16。
+W8A8C8对线性层量化数量较少，MLA线性层只量化了`q_b_proj`和`w_o_proj`，Indexer线性层只量化`wq_b_proj`。主要原因是IndexerProlog融合算子设计成`weights_proj`出fp16,且不做量化，因此MLA输入关联的Linear统一不做量化，好处是可将同一份BF16数据输入IndexerProlog和MLAProlog。
 
-在超长序列情况下，MLA C8算16获取内存收益，可以打高吞吐量。另一方面，LightningIndexer的A8C8获取计算收益，降低LI计算时延。
+其次，MLAProlog KVCache使用动态存8算16，由于SparseFlashAttention耗时瓶颈点在离散聚合访存，即使实现存8算8，端到端时延依旧无法提升，。
+
+在超长序列情况下，W8A8C8量化精度接近无损，同时权重内存占用优化2倍。MLA C8算16获取内存收益，可以打高吞吐量。另一方面，LightningIndexer的A8C8获取计算收益，降低LI计算时延,TTFT和TPOT也同步优化。
 
 **量化模型精度表现**
 
 | 模型 | MMLU | GPQA | DROP | MGSM |
 | ---- | ---- | ---- | ---- | ---- |
 | BF16 | 89.9 | 73.6 | 88.9 | 92.4 |
-| W8A8C16 | 89.8 | 73.5 | 88.7 | 92.3 |
 | W8A8C8 | 89.8 | 74 | 88.4 | 92 |
 
 
