@@ -121,5 +121,5 @@ data_config:
   batch_size: 1                  # 全局所有的请求数
 
 parallel_config:
-  tp_size: 1                     # tensor并行数
+  tp_size: 1                     # LMHead/Attention/MoE的tensor并行数
 ```
