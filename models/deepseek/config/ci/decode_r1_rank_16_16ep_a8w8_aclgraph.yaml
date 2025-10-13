@@ -1,0 +1,35 @@
+model_name: "deepseek_r1"
+model_path: "/data/models/origin/DeepSeek-R1-w8a8-vllm-fusion/"
+exe_mode: "acl_graph"                # ["ge_graph", "acl_graph", "eager"], mode of decode
+world_size: 16
+
+model_config:
+  mm_quant_mode: A8W8               # ["A16W16", "A8W8"]
+  gmm_quant_mode: A8W8              # ["A16W16", "A8W8"]
+  next_n: 0
+  enable_pa: True                   # [False, True]
+  pa_block_size: 128
+  enable_mla_prolog: True           # [False, True]
+  enable_weight_nz: True            # [False, True]
+  with_ckpt: True                   # [False, True]
+  enable_multi_streams: True        # [False, True]
+  enable_profiler: False            # [False, True]
+  perfect_eplb: False               # [False, True]
+  enable_cache_compile: False       # [False, True]
+  enable_prefill_multi_cycle: True  # [False, True]
+  enable_online_split_weight: True   # [False, True]
+  moe_chunk_max_len: 1024
+  enable_superkernel: False         # [False, True]
+
+data_config:
+  dataset: "default"                # ["default", "LongBench"]
+  input_max_len: 32
+  max_new_tokens: 100
+  batch_size: 64
+
+parallel_config:
+  attn_tp_size: 1
+  dense_tp_size: 1
+  moe_tp_size: 1
+  embed_tp_size: 16
+  lmhead_tp_size: 16

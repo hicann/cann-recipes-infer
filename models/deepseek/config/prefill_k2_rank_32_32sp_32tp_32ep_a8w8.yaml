@@ -1,0 +1,35 @@
+model_name: "kimi_k2"
+model_path: "/data/models/origin/kimi-k2-int8-pertoken/"
+exe_mode: "ge_graph"                # ["ge_graph", "acl_graph", "eager"], mode of decode
+world_size: 32
+
+model_config:
+  mm_quant_mode: A8W8               # ["A16W16", "A8W8"]
+  gmm_quant_mode: A8W8              # ["A16W16", "A8W8"]
+  enable_pa: True                   # [False, True]
+  pa_block_size: 128
+  enable_weight_nz: True
+  enable_mla_prolog: True
+  with_ckpt: True                   # [False, True]
+  enable_multi_streams: True        # [False, True]
+  enable_profiler: False            # [False, True]
+  perfect_eplb: False               # [False, True]
+  enable_cache_compile: False       # [False, True]
+  enable_prefill_multi_cycle: False # [False, True]
+  enable_superkernel: False         # [False, True]
+  enable_online_split_weight: True   # [False, True]
+  moe_chunk_max_len: 65536
+
+data_config:
+  dataset: "LongBench"                # ["default", "LongBench"]
+  input_max_len: 65536
+  max_new_tokens: 10
+  batch_size: 1
+
+parallel_config:
+  attn_tp_size: 32 # attn_dp_size = world_size // attn_tp_size
+  dense_tp_size: 32
+  moe_tp_size: 1 # moe_dp_size = world_size // moe_tp_size
+  embed_tp_size: 32
+  lmhead_tp_size: 32
+  enable_o_proj_alltoall: True

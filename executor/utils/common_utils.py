@@ -149,3 +149,37 @@ def remove_padding_left(tensor, pad_id):
         output_tensorlist.append(processed_row)
 
     return output_tensorlist
+
+
+def check_common_parallel_settings(world_size, runner_settings):
+    if world_size <= 0:
+        raise ValueError(f"{world_size=} must greater than 0")
+    parallel_config = runner_settings.get("parallel_config", {})
+    batch_size = runner_settings.get("data_config").get("batch_size", 1)
+    for key, value in parallel_config.items():
+        if ("tp_size" in key or "ep_size" in key) and world_size % value != 0:
+            raise ValueError(f"{world_size=} is not divisible by {key}={value}")
+        if "dp_size" in key and batch_size % value != 0:
+            raise ValueError(f"{batch_size=} is not divisible by {key}={value}")
+
+
+def update_common_vars(world_size, runner_settings):
+    attn_dp_size = world_size // runner_settings.get("parallel_config").get("attn_tp_size", 1)
+    moe_dp_size = world_size // runner_settings.get("parallel_config").get("moe_tp_size", 1)
+    moe_ep_size = moe_dp_size
+    embed_dp_size = world_size // runner_settings.get("parallel_config").get("embed_tp_size", 1)
+
+    batch_size = runner_settings.get("data_config").get("batch_size", 1)
+    batch_size_per_rank = batch_size // attn_dp_size
+
+    runner_settings = update_settings(runner_settings, "data_config", "batch_size_per_rank", batch_size_per_rank)
+    runner_settings = update_settings(runner_settings, "parallel_config", "attn_dp_size", attn_dp_size)
+    runner_settings = update_settings(runner_settings, "parallel_config", "moe_dp_size", moe_dp_size)
+    runner_settings = update_settings(runner_settings, "parallel_config", "moe_ep_size", moe_ep_size)
+    runner_settings = update_settings(runner_settings, "parallel_config", "embed_dp_size", embed_dp_size)
+
+    input_max_len = runner_settings.get("data_config").get("input_max_len", 32)
+    max_new_tokens = runner_settings.get("data_config").get("max_new_tokens", 32)
+    next_n = runner_settings.get("model_config").get("next_n", 0)
+    max_len_bound = max_new_tokens * (next_n + 1) + input_max_len
+    runner_settings = update_settings(runner_settings, "data_config", "max_position_embeddings", max_len_bound)
