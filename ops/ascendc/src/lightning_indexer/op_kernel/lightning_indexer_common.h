@@ -1,5 +1,5 @@
 /**
- * This program is free software, you can redistribute it and/or modify it.
+ * This program is free software, you can redistribute it and/or modify.
  * Copyright (c) 2025 Huawei Technologies Co., Ltd.
  * This file is a part of the CANN Open Software.
  * Licensed under CANN Open Software License Agreement Version 2.0 (the "License").
@@ -89,7 +89,7 @@ struct ConstInfo {
     uint64_t qHeadNum = 0ULL;
     uint64_t kHeadNum;
     uint64_t headDim;
-    uint64_t sparseCount;           // topK选取大小
+    uint64_t sparseCount;             // topK选取大小
     uint64_t kSeqSize = 0ULL;         // kv最大S长度
     uint64_t qSeqSize = 1ULL;         // q最大S长度
     uint32_t kCacheBlockSize = 0;     // PA场景的block size
@@ -110,7 +110,7 @@ struct SplitCoreInfo {
     uint32_t bN2End = 0U;
     uint32_t gS1Start = 0U;
     uint32_t gS1End = 0U;
-    bool isLD = false; // 当前核是否需要进行Decode归约任务
+    bool isLD = false;     // 当前核是否需要进行Decode归约任务
 };
 
 template <typename T>

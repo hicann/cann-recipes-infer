@@ -1,5 +1,5 @@
 /**
- * This program is free software, you can redistribute it and/or modify it.
+ * This program is free software, you can redistribute it and/or modify.
  * Copyright (c) 2025 Huawei Technologies Co., Ltd.
  * This file is a part of the CANN Open Software.
  * Licensed under CANN Open Software License Agreement Version 2.0 (the "License").
@@ -139,7 +139,7 @@ public:
     __aicore__ inline void FreeEventID();
     __aicore__ inline void CalcTopKBlockInfo(const RunInfo &info, uint32_t &curTopKIdx,
                                              uint64_t &curOffsetInSparseBlock, uint32_t curSeqIdx,
-                                             uint32_t &copyRowCnt, uint64_t &idInTopK);
+                                             uint32_t &copyRowCnt, int64_t &idInTopK);
     __aicore__ inline void ComputeMm1(const RunInfo &info, const MSplitInfo mSplitInfo);
     __aicore__ inline void ComputeMm2(const RunInfo &info, const MSplitInfo mSplitInfo);
 
@@ -525,34 +525,8 @@ __aicore__ inline void SFAMatmulService<SFAT>::CopyInMm2BToL1(
 
 template <typename SFAT>
 __aicore__ inline void SFAMatmulService<SFAT>::CalcTopKBlockInfo(
-    const RunInfo &info, uint32_t &curTopKIdx, uint64_t &curOffsetInSparseBlock,
-    uint32_t curSeqIdx, uint32_t &copyRowCnt, uint64_t &idInTopK)
+    const RunInfo &info, uint32_t &curTopKIdx, uint64_t &curOffsetInSparseBlock, uint32_t curSeqIdx, uint32_t &copyRowCnt, int64_t &idInTopK)
 {
-    if (curTopKIdx == 0 && curOffsetInSparseBlock == 0 && copyRowCnt == 0) {
-        uint64_t sparseLen = 0;
-        for (uint64_t topkidx = 0; topkidx < constInfo.sparseBlockCount; topkidx++) {
-            int32_t sparseIndices = topKGm.GetValue(info.topKBaseOffset + topkidx);
-            if (sparseIndices == -1) {
-                break;
-            }
-            uint64_t blockBegin = sparseIndices * constInfo.sparseBlockSize;
-            if (blockBegin >= info.threshold) {
-                continue;
-            }
-            uint64_t blockEnd = (blockBegin + constInfo.sparseBlockSize > info.curActualSeqLenOri) ?
-                                info.curActualSeqLenOri : blockBegin + constInfo.sparseBlockSize;
-            uint64_t blockLen = (blockEnd <= info.threshold) ? blockEnd - blockBegin : info.threshold - blockBegin;
-            sparseLen += blockLen;
-            if (sparseLen >= curSeqIdx + 1) {
-                curTopKIdx = topkidx;
-                idInTopK = sparseIndices;
-                curOffsetInSparseBlock = blockLen - (sparseLen - curSeqIdx);
-                copyRowCnt = sparseLen - curSeqIdx;
-                break;
-            }
-        }
-        return;
-    }
     uint64_t blockBegin = idInTopK * constInfo.sparseBlockSize;
     uint64_t blockEnd = (blockBegin + constInfo.sparseBlockSize > info.threshold) ?
                         info.threshold : blockBegin + constInfo.sparseBlockSize;
@@ -609,6 +583,16 @@ __aicore__ inline void SFAMatmulService<SFAT>::ComputeMm1(const RunInfo &info, c
     LocalTensor<KV_T> kTensor;
     // ka表示左矩阵4buf选择哪一块buf, kb表示右矩阵3buf选择哪一块buf
     uint32_t ka = 0, kb = 0;
+    
+    uint32_t curTopKIdx = info.curTopKIdx;
+    uint64_t curOffsetInSparseBlock = info.curOffsetInSparseBlock; //sparse Block块内偏移
+    uint32_t copyRowCnt = 0;
+    int64_t idInTopK = topKGm.GetValue(info.topKBaseOffset + curTopKIdx);
+
+    uint32_t curTopKIdxTmp = 0;
+    uint64_t curOffsetInSparseBlockTmp = 0;
+    uint32_t copyRowCntTmp = 0;
+    int64_t idInTopKTmp = 0;
 
     // L1 切n切k切m
     for (uint32_t nL1 = 0; nL1 < nL1Loops; nL1++) { // L1切n, 512/128=4
@@ -617,6 +601,10 @@ __aicore__ inline void SFAMatmulService<SFAT>::ComputeMm1(const RunInfo &info, c
             nL1Size = nSize - (nL1Loops - 1) * N_SPLIT_SIZE;
             nL1SizeAlign = SFAAlign(nL1Size, 16U);
         }
+        curTopKIdxTmp = curTopKIdx;
+        curOffsetInSparseBlockTmp = curOffsetInSparseBlock;
+        copyRowCntTmp = copyRowCnt;
+        idInTopKTmp = idInTopK;
 
         for (uint32_t kL1 = 0; kL1 < kL1Loops; kL1++) { // L1切k, 576/288, 这里不考虑d泛化
             kvL1BufIter++;
@@ -625,12 +613,13 @@ __aicore__ inline void SFAMatmulService<SFAT>::ComputeMm1(const RunInfo &info, c
             // 从k当中取当前的块
             bL1Tensor = l1KVTensor[kb * L1_BLOCK_OFFSET];
                 // mm1拷贝主流程
-                uint32_t curTopKIdx = 0;
+ 
                 uint32_t curSeqIdx = info.s2BatchOffset + nL1 * N_SPLIT_SIZE;
                 uint32_t copyFinishRowCnt = 0;
-                uint64_t curOffsetInSparseBlock = 0;  //sparse Block块内偏移
-                uint32_t copyRowCnt = 0;
-                uint64_t idInTopK = 0;
+                curTopKIdx = curTopKIdxTmp;
+                curOffsetInSparseBlock = curOffsetInSparseBlockTmp;
+                copyRowCnt = copyRowCntTmp;
+                idInTopK = idInTopKTmp;
                 if constexpr (PAGE_ATTENTION && TEMPLATE_MODE == V_TEMPLATE) {
                     if (kL1 == 0) {
                         Nd2NzParams nd2nzPara;
@@ -895,6 +884,12 @@ __aicore__ inline void SFAMatmulService<SFAT>::ComputeMm2(const RunInfo &info, c
         // k l1写成一个循环, 和mm1保持一致
         kL1Size = 256;
         kL1SizeAlign = SFAAlign(kL1Size, 16U);
+
+        uint32_t curTopKIdx = info.curTopKIdx;
+        uint64_t curOffsetInSparseBlock = info.curOffsetInSparseBlock;
+        uint32_t copyRowCnt = 0;
+        int64_t idInTopK = topKGm.GetValue(info.topKBaseOffset + curTopKIdx);
+
         for (uint32_t k1 = 0; k1 < kL1Loops; k1++) { // k切L1, 这里套了一层l0来操作
             if (k1 == (kL1Loops - 1)) {
                 // 尾块
@@ -917,12 +912,8 @@ __aicore__ inline void SFAMatmulService<SFAT>::ComputeMm2(const RunInfo &info, c
                     kL0SizeAlign = SFAAlign(kL0Size, 16U);
                 }
 
-                uint32_t curTopKIdx = 0;
                 uint32_t curSeqIdx = info.s2BatchOffset + (kL1 - kOffset) * 128 + k1 * 256;
                 uint32_t copyFinishRowCnt = 0;
-                uint64_t curOffsetInSparseBlock = 0;
-                uint32_t copyRowCnt = 0;
-                uint64_t idInTopK = 0;
                 if constexpr (PAGE_ATTENTION && TEMPLATE_MODE == V_TEMPLATE) {
                     Nd2NzParams nd2nzPara;
                     nd2nzPara.ndNum = 1;
@@ -1019,27 +1010,27 @@ __aicore__ inline void SFAMatmulService<SFAT>::ComputeMm2(const RunInfo &info, c
                     WaitFlag<HardEvent::M_MTE1>(Mte1MmABEventId(abL0BufIter % 2));
                     LocalTensor<KV_T> bL0Tensor = bL0TensorPingPong[(abL0BufIter % 2) * (L0B_PP_SIZE / sizeof(KV_T))];
                     LoadData3DParamsV2<KV_T> loadData3DParamsForB;
-                    loadData3DParamsForB.l1H = kL0SizeAlign / 16; // 源操作数height
-                    loadData3DParamsForB.l1W = 16;                // 源操作数weight=16，目的height=l1H*L1W
+                    loadData3DParamsForB.l1H = kL0SizeAlign / 16;    // 源操作数height
+                    loadData3DParamsForB.l1W = 16;                   // 源操作数weight=16，目的height=l1H*L1W
                     loadData3DParamsForB.padList[0] = 0;
                     loadData3DParamsForB.padList[1] = 0;
                     loadData3DParamsForB.padList[2] = 0;
-                    loadData3DParamsForB.padList[3] = 255;        // 尾部数据不影响滑窗的结果
+                    loadData3DParamsForB.padList[3] = 255;           // 尾部数据不影响滑窗的结果
 
-                    loadData3DParamsForB.mExtension = kL0SizeAlign; // 在目的操作数height维度的传输长度
-                    loadData3DParamsForB.kExtension = nL1SizeAlign; // 在目的操作数width维度的传输长度
-                    loadData3DParamsForB.mStartPt = 0;              // 卷积核在目的操作数width维度的起点
-                    loadData3DParamsForB.kStartPt = 0;              // 卷积核在目的操作数height维度的起点
+                    loadData3DParamsForB.mExtension = kL0SizeAlign;  // 在目的操作数height维度的传输长度
+                    loadData3DParamsForB.kExtension = nL1SizeAlign;  // 在目的操作数width维度的传输长度
+                    loadData3DParamsForB.mStartPt = 0;               // 卷积核在目的操作数width维度的起点
+                    loadData3DParamsForB.kStartPt = 0;               // 卷积核在目的操作数height维度的起点
                     loadData3DParamsForB.strideW = 1;
                     loadData3DParamsForB.strideH = 1;
                     loadData3DParamsForB.filterW = 1;
-                    loadData3DParamsForB.filterSizeW = false; // 是否在filterW的基础上将卷积核width增加256个元素
+                    loadData3DParamsForB.filterSizeW = false;        // 是否在filterW的基础上将卷积核width增加256个元素
                     loadData3DParamsForB.filterH = 1;
-                    loadData3DParamsForB.filterSizeH = false; // 是否在filterH的基础上将卷积核height增加256个元素
-                    loadData3DParamsForB.dilationFilterW = 1; // 卷积核width膨胀系数
-                    loadData3DParamsForB.dilationFilterH = 1; // 卷积核height膨胀系数
-                    loadData3DParamsForB.enTranspose = 1;     // 是否启用转置功能
-                    loadData3DParamsForB.fMatrixCtrl = 0;     // 使用FMATRIX_LEFT还是使用FMATRIX_RIGHT，=0使用FMATRIX_LEFT，=1使用FMATRIX_RIGHT 1
+                    loadData3DParamsForB.filterSizeH = false;        // 是否在filterH的基础上将卷积核height增加256个元素
+                    loadData3DParamsForB.dilationFilterW = 1;        // 卷积核width膨胀系数
+                    loadData3DParamsForB.dilationFilterH = 1;        // 卷积核height膨胀系数
+                    loadData3DParamsForB.enTranspose = 1;            // 是否启用转置功能
+                    loadData3DParamsForB.fMatrixCtrl = 0;            // 使用FMATRIX_LEFT还是使用FMATRIX_RIGHT，=0使用FMATRIX_LEFT，=1使用FMATRIX_RIGHT 1
                     loadData3DParamsForB.channelSize = nL1SizeAlign; // 源操作数的通道数。膨胀系数为1时，目的weight为filterW*filterH*channelSize
                     LoadData<KV_T, LOAD3DV2_CONFIG>(bL0Tensor, bL1Tensor[kL0 * baseK * baseN], loadData3DParamsForB);
 
@@ -1088,7 +1079,7 @@ __aicore__ inline void SFAMatmulService<SFAT>::ComputeMm2(const RunInfo &info, c
                     abL0BufIter++;
                 }
 
-                if (nL1 == (nL1Loops - 1)) { // nL1最后一轮, 需要将B驻留在L1中, 用于下一轮的计算？
+                if (nL1 == (nL1Loops - 1)) {    // nL1最后一轮, 需要将B驻留在L1中, 用于下一轮的计算？
                     SetFlag<HardEvent::MTE1_MTE2>(mte21QPIds[ka]); // 反向同步, 表示L1中的A已经被mte1消费完
                 }
 

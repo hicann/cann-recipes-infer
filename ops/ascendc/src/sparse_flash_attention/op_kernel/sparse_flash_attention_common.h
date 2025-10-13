@@ -1,5 +1,5 @@
 /**
- * This program is free software, you can redistribute it and/or modify it.
+ * This program is free software, you can redistribute it and/or modify.
  * Copyright (c) 2025 Huawei Technologies Co., Ltd.
  * This file is a part of the CANN Open Software.
  * Licensed under CANN Open Software License Agreement Version 2.0 (the "License").
@@ -107,6 +107,8 @@ struct RunInfo {
     bool isLastS2Loop;
     int32_t nextTokensPerBatch = 0;
     int64_t threshold;
+    uint32_t curTopKIdx = 0;
+    uint64_t curOffsetInSparseBlock = 0;
 };
 
 struct ConstInfo {
@@ -138,9 +140,9 @@ struct ConstInfo {
     uint32_t syncC2V2 = 0U;
     uint32_t syncC2V1 = 0U;
 
-    uint32_t mmResUbSize = 0U;   // Matmul1输出结果GM上的大小
-    uint32_t vec1ResUbSize = 0U; // Vector1输出结果GM上的大小
-    uint32_t bmm2ResUbSize = 0U; // Matmul2输出结果GM上的大小
+    uint32_t mmResUbSize = 0U;        // Matmul1输出结果GM上的大小
+    uint32_t vec1ResUbSize = 0U;      // Vector1输出结果GM上的大小
+    uint32_t bmm2ResUbSize = 0U;      // Matmul2输出结果GM上的大小
     uint64_t batchSize = 0ULL;
     uint64_t gSize = 0ULL;
     uint64_t qHeadNum = 0ULL;
@@ -149,7 +151,7 @@ struct ConstInfo {
     uint64_t headDimRope;
     uint64_t kvSeqSize = 0ULL;        // kv最大S长度
     uint64_t qSeqSize = 1ULL;         // q最大S长度
-    uint32_t kvCacheBlockSize = 0;    // PA场景的block size
+    int64_t kvCacheBlockSize = 0;    // PA场景的block size
     uint32_t maxBlockNumPerBatch = 0; // PA场景的最大单batch block number
     uint32_t splitKVNum = 0U;         // S2核间切分的切分份数
     SFA_LAYOUT outputLayout;          // 输出的Transpose格式
@@ -161,26 +163,26 @@ struct ConstInfo {
     uint64_t combineLseOffset = 0ULL;
     uint64_t combineAccumOutOffset = 0ULL;
 
-    uint32_t actualLenDimsQ = 0U;   // query的actualSeqLength 的维度
-    uint32_t actualLenDimsKV = 0U;  // KV 的actualSeqLength 的维度
+    uint32_t actualLenDimsQ = 0U;        // query的actualSeqLength 的维度
+    uint32_t actualLenDimsKV = 0U;       // KV 的actualSeqLength 的维度
 
     // TND
-    uint32_t s2Start = 0U; // TND场景下，S2的起始位置
-    uint32_t s2End = 0U;   // 单核TND场景下S2循环index上限
+    uint32_t s2Start = 0U;               // TND场景下，S2的起始位置
+    uint32_t s2End = 0U;                 // 单核TND场景下S2循环index上限
 
     uint32_t bN2Start = 0U;
     uint32_t bN2End = 0U;
     uint32_t gS1Start = 0U;
     uint32_t gS1End = 0U;
 
-    uint32_t tndFDCoreArrLen = 0U;     // TNDFlashDecoding相关分核信息array的长度
-    uint32_t coreStartKVSplitPos = 0U; // TNDFlashDecoding kv起始位置
+    uint32_t tndFDCoreArrLen = 0U;       // TNDFlashDecoding相关分核信息array的长度
+    uint32_t coreStartKVSplitPos = 0U;   // TNDFlashDecoding kv起始位置
 
     uint32_t mBaseSize = 1ULL;
     uint32_t s2BaseSize = 1ULL;
 
     // sparse attr
-    uint32_t sparseBlockSize = 0;
+    int64_t sparseBlockSize = 0;
     uint32_t sparseBlockCount = 0;
 };
 

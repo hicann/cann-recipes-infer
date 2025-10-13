@@ -1,5 +1,5 @@
 /**
- * This program is free software, you can redistribute it and/or modify it.
+ * This program is free software, you can redistribute it and/or modify.
  * Copyright (c) 2025 Huawei Technologies Co., Ltd.
  * This file is a part of the CANN Open Software.
  * Licensed under CANN Open Software License Agreement Version 2.0 (the "License").
@@ -39,11 +39,12 @@ struct TempLoopInfo {
     uint32_t bIdx = 0U;
     uint32_t n2Idx = 0U;
     uint32_t gS1Idx = 0U;
-    uint32_t gS1LoopEnd = 0U;  // gS1方向循环的结束Idx
-    uint32_t s2LoopEnd = 0U;   // S2方向循环的结束Idx
-    uint32_t actS1Size = 1ULL; // 当前Batch循环处理的S1轴的实际大小
+    uint32_t gS1LoopEnd = 0U;      // gS1方向循环的结束Idx
+    uint32_t s2LoopEnd = 0U;       // S2方向循环的结束Idx
+    uint32_t actS1Size = 1ULL;     // 当前Batch循环处理的S1轴的实际大小
     uint32_t actS2Size = 0ULL;
     bool curActSeqLenIsZero = false;
+    bool needDealActS1LessThanS1 = false; // S1的实际长度小于shape的S1长度时，是否需要清理输出
     uint32_t actMBaseSize = 0U;    // m轴(gS1)方向实际大小
     uint32_t mBasicSizeTail = 0U;  // gS1方向循环的尾基本块大小
     uint32_t s2BasicSizeTail = 0U; // S2方向循环的尾基本块大小
@@ -140,7 +141,7 @@ protected:
     __aicore__ inline void GetS1S2ActualSeqLen(uint32_t bIdx, uint32_t &actS1Size, uint32_t &actS2Size);
     __aicore__ inline void CalcS2LoopParams(uint32_t bN2LoopIdx, uint32_t gS1LoopIdx);
     __aicore__ inline void CalcRunInfo(uint32_t loop, uint32_t s2LoopIdx, LICommon::RunInfo &runInfo);
-    __aicore__ inline void DealActSeqLenIsZero(uint32_t bIdx, uint32_t n2Idx);
+    __aicore__ inline void DealActSeqLenIsZero(uint32_t bIdx, uint32_t n2Idx, uint32_t s1Start);
 };
 
 template <typename LIT>
@@ -277,10 +278,26 @@ __aicore__ void inline LIPreload<LIT>::SplitCore(uint32_t curCoreIdx, uint32_t &
         if (bN2Idx % constInfo.kHeadNum == 0) {
             GetS1S2ActualSeqLen(bIdx, actS1Size, actS2Size);
             s1GBaseNum = CeilDiv(actS1Size, constInfo.s1BaseSize);
-            s2BaseNum = constInfo.attenMaskFlag ? 0 : CeilDiv(actS2Size, constInfo.s2BaseSize);
+            s2BaseNum = CeilDiv(actS2Size, constInfo.s2BaseSize);
+        }
+        if constexpr (LAYOUT_T == LI_LAYOUT::BSND) {
+            if (findLastCoreEnd && (s1GBaseNum == 0U || s2BaseNum == 0U)) {
+                info.bN2Start = bN2Idx;
+                info.gS1Start = 0;
+                info.s2Start = 0;
+                findLastCoreEnd = false;
+            }
         }
         for (uint32_t gS1Idx = 0; gS1Idx < s1GBaseNum; gS1Idx++) {
-            s2BaseNum = constInfo.attenMaskFlag ? GetS2BaseBlockNumOnMask(gS1Idx, actS1Size, actS2Size) : s2BaseNum;
+            if (constInfo.attenMaskFlag) {
+                s2BaseNum = GetS2BaseBlockNumOnMask(gS1Idx, actS1Size, actS2Size);
+                if (findLastCoreEnd && s2BaseNum == 0U) {
+                    info.bN2Start = bN2Idx;
+                    info.gS1Start = gS1Idx;
+                    info.s2Start = 0;
+                    findLastCoreEnd = false;
+                }
+            }
             for (uint32_t s2Idx = 0; s2Idx < s2BaseNum;) {
                 if (findLastCoreEnd) {
                     info.bN2Start = bN2Idx;
@@ -299,6 +316,12 @@ __aicore__ void inline LIPreload<LIT>::SplitCore(uint32_t curCoreIdx, uint32_t &
                         if (s2Idx == 0 && info.s2End + 1 < s2BaseNum) {
                             info.isLD = true;
                         }
+                        // 最后一个核处理的不是最后一个Batch，表明后面的Batch为空块(S2=0), 调整终点坐标以便清理输出
+                        if (coreIdx == coreNum - 1 && info.bN2End != constInfo.batchSize -1) {
+                            info.bN2End = constInfo.batchSize -1;
+                            info.gS1End = 0;
+                            info.s2End = 0;
+                        }
                         return;
                     }
                     coreIdx++;
@@ -316,7 +339,7 @@ __aicore__ void inline LIPreload<LIT>::SplitCore(uint32_t curCoreIdx, uint32_t &
 }
 
 template <typename LIT>
-__aicore__ inline void LIPreload<LIT>::DealActSeqLenIsZero(uint32_t bIdx, uint32_t n2Idx)
+__aicore__ inline void LIPreload<LIT>::DealActSeqLenIsZero(uint32_t bIdx, uint32_t n2Idx, uint32_t s1Start)
 {
     if ASCEND_IS_AIV {
         if (constInfo.outputLayout == LI_LAYOUT::TND) {
@@ -324,14 +347,14 @@ __aicore__ inline void LIPreload<LIT>::DealActSeqLenIsZero(uint32_t bIdx, uint32
             uint32_t tBase = bIdx == 0 ? 0 : actualSeqLengthsGmQ.GetValue(bIdx - 1);
             uint32_t s1Count = tempLoopInfo.actS1Size;
 
-            for (int s1Idx = 0; s1Idx < s1Count; s1Idx++) {
+            for (uint32_t s1Idx = s1Start; s1Idx < s1Count; s1Idx++) {
                 uint64_t indiceOutOffset =
                     (tBase + s1Idx) * constInfo.kHeadNum * constInfo.sparseCount + // T轴、s1轴偏移
                     n2Idx * constInfo.sparseCount;                                 // N2轴偏移
                 vectorService.CleanInvalidOutput(indiceOutOffset);
             }
         } else if (constInfo.outputLayout == LI_LAYOUT::BSND) {
-            for (int s1Idx = 0; s1Idx < constInfo.qSeqSize; s1Idx++) {
+            for (uint32_t s1Idx = s1Start; s1Idx < constInfo.qSeqSize; s1Idx++) {
                 // B,S1,N2,K
                 uint64_t indiceOutOffset = bIdx * constInfo.qSeqSize * constInfo.kHeadNum * constInfo.sparseCount +
                                            s1Idx * constInfo.kHeadNum * constInfo.sparseCount + // B轴、S1轴偏移
@@ -449,6 +472,11 @@ __aicore__ inline void LIPreload<LIT>::CalcGS1LoopParams(uint32_t bN2LoopIdx)
 
     uint32_t gS1SplitNum = (tempLoopInfo.actS1Size * constInfo.gSize + constInfo.mBaseSize - 1) / constInfo.mBaseSize;
     tempLoopInfo.gS1LoopEnd = (bN2LoopIdx == splitCoreInfo.bN2End) ? splitCoreInfo.gS1End : gS1SplitNum - 1;
+    if constexpr (LAYOUT_T == LI_LAYOUT::BSND) {
+        if (tempLoopInfo.gS1LoopEnd == gS1SplitNum - 1 && constInfo.qSeqSize > tempLoopInfo.actS1Size) {
+            tempLoopInfo.needDealActS1LessThanS1 = true;
+        }
+    }
 }
 
 template <typename LIT>
@@ -550,7 +578,7 @@ __aicore__ inline void LIPreload<LIT>::ProcessMain()
     for (uint32_t bN2LoopIdx = splitCoreInfo.bN2Start; bN2LoopIdx <= splitCoreInfo.bN2End; bN2LoopIdx++) {
         CalcGS1LoopParams(bN2LoopIdx);
         if (tempLoopInfo.curActSeqLenIsZero) {
-            DealActSeqLenIsZero(tempLoopInfo.bIdx, tempLoopInfo.n2Idx);
+            DealActSeqLenIsZero(tempLoopInfo.bIdx, tempLoopInfo.n2Idx, 0U);
             continue;
         }
         for (uint32_t gS1LoopIdx = splitCoreInfo.gS1Start; gS1LoopIdx <= tempLoopInfo.gS1LoopEnd; gS1LoopIdx++) {
@@ -560,6 +588,9 @@ __aicore__ inline void LIPreload<LIT>::ProcessMain()
                 ++gloop;
             }
             splitCoreInfo.s2Start = 0;
+        }
+        if (tempLoopInfo.needDealActS1LessThanS1) {
+            DealActSeqLenIsZero(tempLoopInfo.bIdx, tempLoopInfo.n2Idx, tempLoopInfo.actS1Size);
         }
         splitCoreInfo.gS1Start = 0;
     }

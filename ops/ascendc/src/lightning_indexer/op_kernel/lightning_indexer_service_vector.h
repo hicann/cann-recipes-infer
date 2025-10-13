@@ -1,5 +1,5 @@
 /**
- * This program is free software, you can redistribute it and/or modify it.
+ * This program is free software, you can redistribute it and/or modify.
  * Copyright (c) 2025 Huawei Technologies Co., Ltd.
  * This file is a part of the CANN Open Software.
  * Licensed under CANN Open Software License Agreement Version 2.0 (the "License").
@@ -76,7 +76,6 @@ private:
     TBuf<TPosition::VECCALC> paramBuf_;
 
     // tmp buff for LD
-    TBuf<> ldParamBuf_;
     TBuf<> ldToBeMrgBuf_;
     TBuf<> ldTmpBuf_;
     TBuf<> ldOutValueBuf_;
@@ -152,7 +151,6 @@ template <typename LIT>
 __aicore__ inline void LIVector<LIT>::InitLDBuffers(TPipe *pipe)
 {
     pipe->Reset();
-    pipe->InitBuffer(ldParamBuf_, s1BaseSize_ * 2 * paramNum_ * sizeof(int64_t)); // 2: 头尾规约
     pipe->InitBuffer(ldToBeMrgBuf_, 2 * BASE_TOPK * mrgListNum_ * sizeof(float)); // 2：value + index
     pipe->InitBuffer(ldTmpBuf_, 2 * BASE_TOPK * mrgListNum_ * sizeof(float));     // 2：value + index
     pipe->InitBuffer(ldOutValueBuf_, BASE_TOPK * sizeof(float));
@@ -378,14 +376,15 @@ __aicore__ inline void LIVector<LIT>::ProcessVec(const LICommon::RunInfo &info)
                 // vec1Param Gm = [aic, s1BaseSize_, 2, 16] int64
                 //     16 = [needFd, s2AcSeq, s2Start, s2End, isS2End, bn2idx, s1Idx, S1ProcNum, ......]
 
-                int64_t wsOffset = (blockId_ / 2) * s1BaseSize_ * 2 * 2 * BASE_TOPK + // 2个AIV共同地址偏移
+                int64_t wsOffset = (blockId_ / 2) * s1BaseSize_ * 2 * 2 * BASE_TOPK +       // 2个AIV共同地址偏移
                                    (blockId_ % 2) * (s1BaseSize_ / 2) * 2 * 2 * BASE_TOPK + // 每个AIV的地址偏移，S1方向
                                    (ldS1Offset + innerS1Idx) * 2 * 2 * BASE_TOPK;
-                int64_t wsInfoOffset = (blockId_ / 2) * s1BaseSize_ * 2 * paramNum_ + // 2个AIV共同地址偏移
+                int64_t wsInfoOffset = (blockId_ / 2) * s1BaseSize_ * 2 * paramNum_ +       // 2个AIV共同地址偏移
                                        (blockId_ % 2) * (s1BaseSize_ / 2) * 2 * paramNum_ + // 每个AIV的地址偏移，S1方向
                                        (ldS1Offset + innerS1Idx) * 2 * paramNum_;
 
                 LocalTensor<int64_t> tmpiBuff = paramBuf_.Get<int64_t>();
+                SetWaitFlag<HardEvent::MTE3_S>(HardEvent::MTE3_S);
                 tmpiBuff.SetValue(0, static_cast<int64_t>(1));
                 tmpiBuff.SetValue(1, static_cast<int64_t>(cuRealAcSeq));
                 tmpiBuff.SetValue(2, static_cast<int64_t>(blockS2StartIdx_));
@@ -474,19 +473,14 @@ __aicore__ inline void LIVector<LIT>::ProcessLD()
     LocalTensor<float> tmpUb = ldTmpBuf_.Get<float>();
 
     // S2开头信息
-    LocalTensor<int64_t> curParamUbHead = ldParamBuf_.Get<int64_t>();
-    DataCopyPad(curParamUbHead, vec1ParamGm[tmpCubeId * s1BaseSize_ * 2 * paramNum_],
-                {1, static_cast<uint16_t>(s1BaseSize_ * 2 * paramNum_ * sizeof(int64_t)), 0, 0}, {true, 0, 0, 0});
-    SetWaitFlag<HardEvent::MTE2_S>(HardEvent::MTE2_S);
     // 开始必然没有头规约，因此从尾规约开始处理，while循环读取下一个核的头规约
     // 存满4个list或者遇到S2结尾，则做merge，直到做完S2
-
     // 每个核都忽略自己的头规约，因为必然由前面的核做完
     uint32_t s1LdStartIdx = 0;
     uint32_t s1ProcNum = 0;
+    uint64_t paramGmCoreOffset = tmpCubeId * s1BaseSize_ * 2 * paramNum_;
     for (uint32_t innerS1Idx = 0; innerS1Idx < s1BaseSize_; innerS1Idx++) {
-        LocalTensor<int64_t> curParamUbTail = curParamUbHead[innerS1Idx * 2 * paramNum_ + paramNum_];
-        needFd = curParamUbTail.GetValue(0);
+        needFd = vec1ParamGm.GetValue(paramGmCoreOffset + innerS1Idx * 2 * paramNum_ + paramNum_);
         if (needFd == 1) {
             s1LdStartIdx = (s1ProcNum == 0) ? innerS1Idx : s1LdStartIdx;
             s1ProcNum++;
@@ -512,6 +506,7 @@ __aicore__ inline void LIVector<LIT>::ProcessLD()
         // 搬入数据
         wsOffset = tmpCubeId * s1BaseSize_ * 2 * 2 * BASE_TOPK + // 2个AIV共同地址偏移
                    innerS1Idx * 2 * 2 * BASE_TOPK + 2 * BASE_TOPK;
+        SetWaitFlag<HardEvent::V_MTE2>(HardEvent::V_MTE2);
         DataCopyPad(curValueIdxUb, vec1ResGm[wsOffset],
                     {1, static_cast<uint16_t>(2 * BASE_TOPK * sizeof(int32_t)), 0, 0}, {true, 0, 0, 0});
         SetWaitFlag<HardEvent::MTE2_V>(HardEvent::MTE2_V);
@@ -521,13 +516,10 @@ __aicore__ inline void LIVector<LIT>::ProcessLD()
         // 获取下一个核规约信息
         tmpCubeId++;
         wsInfoOffset = tmpCubeId * s1BaseSize_ * 2 * paramNum_ + innerS1Idx * 2 * paramNum_;
-        DataCopyPad(curParamUbHead, vec1ParamGm[wsInfoOffset],
-                    {1, static_cast<uint16_t>(2 * paramNum_ * sizeof(int64_t)), 0, 0}, {true, 0, 0, 0});
-        SetWaitFlag<HardEvent::MTE2_S>(HardEvent::MTE2_S);
-        needFd = curParamUbHead.GetValue(0);
-        isS2End = curParamUbHead.GetValue(4);
-        s1Idx = curParamUbHead.GetValue(6);
-        outOffset = curParamUbHead.GetValue(8);
+        needFd = vec1ParamGm.GetValue(wsInfoOffset);
+        isS2End = vec1ParamGm.GetValue(wsInfoOffset + 4);
+        s1Idx = vec1ParamGm.GetValue(wsInfoOffset + 6);
+        outOffset = vec1ParamGm.GetValue(wsInfoOffset + 8);
 
         while (needFd == 1) {
             // 搬入头规约数据
@@ -573,13 +565,9 @@ __aicore__ inline void LIVector<LIT>::ProcessLD()
             }
 
             tmpCubeId++;
-            SetWaitFlag<HardEvent::S_MTE2>(HardEvent::S_MTE2);
             wsInfoOffset = tmpCubeId * s1BaseSize_ * 2 * paramNum_ + innerS1Idx * 2 * paramNum_;
-            DataCopyPad(curParamUbHead, vec1ParamGm[wsInfoOffset],
-                        {1, static_cast<uint16_t>(2 * paramNum_ * sizeof(int64_t)), 0, 0}, {true, 0, 0, 0});
-            SetWaitFlag<HardEvent::MTE2_S>(HardEvent::MTE2_S);
-            needFd = curParamUbHead.GetValue(0);
-            isS2End = curParamUbHead.GetValue(4);
+            needFd = vec1ParamGm.GetValue(wsInfoOffset);
+            isS2End = vec1ParamGm.GetValue(wsInfoOffset + 4);
         }
 
         // mrg不足4个list的数据
@@ -614,8 +602,7 @@ __aicore__ inline void LIVector<LIT>::ProcessLD()
         LocalTensor<uint32_t> outIdxUb = ldOutIdxBuf_.Get<uint32_t>();
 
         Extract(outValueUb, outIdxUb, curValueIdxUb, (BASE_TOPK / 32));
-        PipeBarrier<PIPE_V>();
-
+        SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
         LocalTensor<int32_t> idxULocal1 = outIdxUb.template ReinterpretCast<int32_t>();
         DataCopyPad(indiceOutGm[outOffset], idxULocal1,
                     {1, static_cast<uint16_t>(constInfo_.sparseCount * sizeof(int32_t)), 0, 0});

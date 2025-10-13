@@ -1,4 +1,4 @@
-# This program is free software, you can redistribute it and/or modify it.
+# This program is free software, you can redistribute it and/or modify.
 # Copyright (c) 2025 Huawei Technologies Co., Ltd.
 # This file is a part of the CANN Open Software.
 # Licensed under CANN Open Software License Agreement Version 2.0 (the "License").
@@ -14,7 +14,7 @@ __all__ = list(module for _, module, _ in pkgutil.iter_modules([os.path.dirname(
 
 # 导入so 和 python
 from . import custom_ops_lib
-from .converter import npu_lightning_indexer, npu_sparse_flash_attention
+from .converter import npu_lightning_indexer, npu_sparse_flash_attention, npu_lightning_indexer_quant, npu_mla_prolog_v3
 
 """
 import custom ops as torch_npu ops to support the following usage:

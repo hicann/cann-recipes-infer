@@ -1,5 +1,5 @@
 /**
- * This program is free software, you can redistribute it and/or modify it.
+ * This program is free software, you can redistribute it and/or modify.
  * Copyright (c) 2025 Huawei Technologies Co., Ltd.
  * This file is a part of the CANN Open Software.
  * Licensed under CANN Open Software License Agreement Version 2.0 (the "License").
@@ -27,6 +27,12 @@ at::Tensor construct_lightning_indexer_output_tensor(const at::Tensor& query, co
     const c10::optional<at::Tensor> &actual_seq_lengths_query, int64_t sparse_count, std::string query_layout_str)
 {
     at::SmallVector<int64_t, SIZE> output_size;
+    for (auto i = 0; i < query.sizes().size(); i++) {
+        TORCH_CHECK(query.size(i) > 0, "All values within query's shape should be greater "
+            "than 0, but shape[", i, "] is ", query.size(i));
+    }
+    TORCH_CHECK(sparse_count > 0, "sparse count should be greater than 0, but now is ", sparse_count);
+    
     if (query_layout_str == "BSND") {
         output_size = {query.size(DIM_0), query.size(DIM_1), key.size(DIM_2), sparse_count};
     } else {

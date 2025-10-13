@@ -1,5 +1,5 @@
 /**
- * This program is free software, you can redistribute it and/or modify it.
+ * This program is free software, you can redistribute it and/or modify.
  * Copyright (c) 2025 Huawei Technologies Co., Ltd.
  * This file is a part of the CANN Open Software.
  * Licensed under CANN Open Software License Agreement Version 2.0 (the "License").
@@ -253,10 +253,8 @@ ge::graphStatus LIInfoParser::CheckShapeDim()
     OPS_ERR_IF((opParamInfo_.blockTable.tensor != nullptr) &&
                    (opParamInfo_.blockTable.tensor->GetStorageShape().GetDimNum() != DIM_NUM_TWO),
                OPS_LOG_E(opName_, "the dim num of block_table's shape should be 2"), return ge::GRAPH_FAILED);
-    OPS_ERR_IF((kLayout_ == DataLayout::BnBsND) &&
-                   (opParamInfo_.key.shape->GetStorageShape().GetDimNum() != DIM_NUM_FOUR),
-               OPS_LOG_E(opName_, "the dim num of key's shape should be 4"), return ge::GRAPH_FAILED);
 
+    uint32_t kShapeDim = opParamInfo_.key.shape->GetStorageShape().GetDimNum();
     uint32_t qShapeDim = opParamInfo_.query.shape->GetStorageShape().GetDimNum();
     uint32_t weightsShapeDim = opParamInfo_.weights.shape->GetStorageShape().GetDimNum();
     uint32_t outShapeDim = opParamInfo_.attenOut.shape->GetStorageShape().GetDimNum();
@@ -264,16 +262,19 @@ ge::graphStatus LIInfoParser::CheckShapeDim()
     if (qLayout_ == DataLayout::TND) {
         expectShapeDim = DIM_NUM_THREE;
     }
+    OPS_ERR_IF((kLayout_ == DataLayout::BnBsND) && (kShapeDim != DIM_NUM_FOUR),
+               OPS_LOG_E(opName_, "the dim num of key's shape should be 4, but now is %u", kShapeDim),
+               return ge::GRAPH_FAILED);
     OPS_ERR_IF(qShapeDim != expectShapeDim,
-               OPS_LOG_E(opName_, "the dim num of query's shape should be %u", expectShapeDim),
+               OPS_LOG_E(opName_, "the dim num of query's shape should be %u, but now is %u", expectShapeDim, qShapeDim),
                return ge::GRAPH_FAILED);
     OPS_ERR_IF(outShapeDim != expectShapeDim,
-               OPS_LOG_E(opName_, "the dim num of sparse_indices's shape should be %u", expectShapeDim),
+               OPS_LOG_E(opName_, "the dim num of sparse_indices's shape should be %u, but now is %u", expectShapeDim, outShapeDim),
                return ge::GRAPH_FAILED);
     OPS_ERR_IF(!((weightsShapeDim == (expectShapeDim - 1)) ||
                  ((weightsShapeDim == expectShapeDim) &&
                   (opParamInfo_.weights.shape->GetStorageShape().GetDim(expectShapeDim - 1) == 1))),
-               OPS_LOG_E(opName_, "the dim num of weights's shape should be %u", expectShapeDim),
+               OPS_LOG_E(opName_, "the dim num of weights's shape should be %u, but now is %u", expectShapeDim - 1, weightsShapeDim),
                return ge::GRAPH_FAILED);
 
     return ge::GRAPH_SUCCESS;
@@ -319,7 +320,8 @@ ge::graphStatus LIInfoParser::GetGSize()
         return ge::GRAPH_FAILED;
     }
     gSize_ = n1Size_ / n2Size_;
-    OPS_ERR_IF(gSize_ != 64, OPS_LOG_E(opName_, "n1 divided by n2 must equals 64."), return ge::GRAPH_FAILED);
+    OPS_ERR_IF(gSize_ != 64, OPS_LOG_E(opName_, "N1 is %u, N2 is %u, N1 divided by N2 must equal 64.", n1Size_, n2Size_), 
+        return ge::GRAPH_FAILED);
 
     return ge::GRAPH_SUCCESS;
 }
@@ -375,16 +377,28 @@ ge::graphStatus LIInfoParser::GetAndCheckBlockSize()
     blockSize_ = static_cast<uint32_t>(opParamInfo_.key.shape->GetStorageShape().GetDim(1));
     OPS_LOG_I(context_->GetNodeName(), "blockSize_ is %d", blockSize_);
 
-    OPS_ERR_IF(((blockSize_ % 16 != 0) || (blockSize_ > 1024)),
-               OPS_LOG_E(opName_, "input key's block_size must be a multiple of 16 and no greater than 1024."),
+    OPS_ERR_IF(((blockSize_ % 16 != 0) || (blockSize_ == 0) || (blockSize_ > 1024)),
+               OPS_LOG_E(opName_, "input key's block_size must be a multiple of 16 and belong to (0, 1024]."),
                return ge::GRAPH_FAILED);
 
+    return ge::GRAPH_SUCCESS;
+}
+
+ge::graphStatus LIInfoParser::CheckBlockCount()
+{
+    int32_t blockCount_ = static_cast<uint32_t>(opParamInfo_.key.shape->GetStorageShape().GetDim(0));
+    OPS_ERR_IF((blockCount_ == 0),
+                OPS_LOG_E(opName_, "input key's block_count cannot be 0."),
+                return ge::GRAPH_FAILED);
     return ge::GRAPH_SUCCESS;
 }
 
 ge::graphStatus LIInfoParser::GetS2SizeForPageAttention()
 {
     if (GetAndCheckBlockSize() != ge::GRAPH_SUCCESS) {
+        return ge::GRAPH_FAILED;
+    }
+    if (CheckBlockCount() != ge::GRAPH_SUCCESS) {
         return ge::GRAPH_FAILED;
     }
     maxBlockNumPerBatch_ = opParamInfo_.blockTable.tensor->GetStorageShape().GetDim(1);
@@ -433,13 +447,15 @@ ge::graphStatus LIInfoParser::ValidateInputShapesMatch()
                 (opParamInfo_.blockTable.tensor->GetStorageShape().GetDim(0) != bSize_),
             OPS_LOG_E(
                 opName_,
-                "TND case input actual_seq_lengths_query, actual_seq_lengths_key, block_table dim 0 must be same."),
+                "TND case input actual_seq_lengths_query, actual_seq_lengths_key, block_table dim 0 are %u, %u, %u respectively, they must be same.",
+                bSize_, opParamInfo_.actualSeqLengths.tensor->GetShapeSize(), opParamInfo_.blockTable.tensor->GetStorageShape().GetDim(0)),
             return ge::GRAPH_FAILED);
         // -----------------------check T-------------------
         uint32_t qTsize = opParamInfo_.query.shape->GetStorageShape().GetDim(0);
         OPS_ERR_IF((opParamInfo_.weights.shape->GetStorageShape().GetDim(0) != qTsize) ||
                        (opParamInfo_.attenOut.shape->GetStorageShape().GetDim(0) != qTsize),
-                   OPS_LOG_E(opName_, "TND case input query, weights, sparse_indices dim 0 must be same."),
+                   OPS_LOG_E(opName_, "TND case input query, weights, sparse_indices dim 0 are %u, %u, %u respectively, they must be same.",
+                        qTsize, opParamInfo_.weights.shape->GetStorageShape().GetDim(0), opParamInfo_.attenOut.shape->GetStorageShape().GetDim(0)),
                    return ge::GRAPH_FAILED);
     } else {
         // -----------------------check BatchSize-------------------
@@ -448,18 +464,18 @@ ge::graphStatus LIInfoParser::ValidateInputShapesMatch()
                        (opParamInfo_.blockTable.tensor->GetStorageShape().GetDim(0) != bSize_) ||
                        (opParamInfo_.actualSeqLengths.tensor->GetShapeSize() != bSize_) ||
                        (opParamInfo_.attenOut.shape->GetStorageShape().GetDim(0) != bSize_),
-                   OPS_LOG_E(opName_, "BSND case input query, weight, "
-                                      "actual_seq_lengths_key, block_table, sparse_indices dim 0 must be same."),
+                   OPS_LOG_E(opName_, "BSND case input query, weight, actual_seq_lengths_key, block_table, sparse_indices dim 0 must be same."),
                    return ge::GRAPH_FAILED);
         OPS_ERR_IF((opParamInfo_.actualSeqLengthsQ.tensor != nullptr) &&
                        (opParamInfo_.actualSeqLengthsQ.tensor->GetShapeSize() != bSize_),
-                   OPS_LOG_E(opName_, "BSND case input query, actual_seq_lengths_query dim 0 must be same"),
+                   OPS_LOG_E(opName_, "BSND case input query, actual_seq_lengths_query dim 0 are %u, %u respectively, they must be same",
+                        bSize_, opParamInfo_.actualSeqLengthsQ.tensor->GetShapeSize()),
                    return ge::GRAPH_FAILED);
         // -----------------------check S1-------------------
         OPS_ERR_IF((opParamInfo_.weights.shape->GetStorageShape().GetDim(1) != s1Size_) ||
                        (opParamInfo_.attenOut.shape->GetStorageShape().GetDim(1) != s1Size_),
-                   OPS_LOG_E(opName_, "BSND case input query, weight, "
-                                      "sparse_indices dim 1 must be same."),
+                   OPS_LOG_E(opName_, "BSND case input query, weight, sparse_indices dim 1 are %u, %u, %u, they must be same.",
+                        s1Size_, opParamInfo_.weights.shape->GetStorageShape().GetDim(1), opParamInfo_.attenOut.shape->GetStorageShape().GetDim(1)),
                    return ge::GRAPH_FAILED);
         queryWeightsN1Dim = DIM_IDX_TWO;
         outN2Dim = DIM_IDX_TWO;
@@ -523,8 +539,8 @@ ge::graphStatus LIInfoParser::ParseAndCheck(LITilingInfo &liInfo)
         return ge::GRAPH_FAILED;
     }
 
-    if (ge::GRAPH_SUCCESS != GetN1Size() || ge::GRAPH_SUCCESS != GetAndCheckN2Size() ||
-        ge::GRAPH_SUCCESS != GetGSize()) {
+    if (ge::GRAPH_SUCCESS != CheckShapeDim() || ge::GRAPH_SUCCESS != GetN1Size() ||
+        ge::GRAPH_SUCCESS != GetAndCheckN2Size() || ge::GRAPH_SUCCESS != GetGSize()) {
         return ge::GRAPH_FAILED;
     }
 

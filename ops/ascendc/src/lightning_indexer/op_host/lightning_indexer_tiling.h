@@ -1,5 +1,5 @@
 /**
- * This program is free software, you can redistribute it and/or modify it.
+ * This program is free software, you can redistribute it and/or modify.
  * Copyright (c) 2025 Huawei Technologies Co., Ltd.
  * This file is a part of the CANN Open Software.
  * Licensed under CANN Open Software License Agreement Version 2.0 (the "License").
@@ -163,6 +163,7 @@ public:
     ge::graphStatus GetAndCheckOptionalInput();
     ge::graphStatus CheckShapeDim();
     ge::graphStatus GetAndCheckBlockSize();
+    ge::graphStatus CheckBlockCount();
     ge::graphStatus GetS2SizeForPageAttention();
     ge::graphStatus GetS2Size();
     ge::graphStatus GetQueryKeyAndOutLayout();

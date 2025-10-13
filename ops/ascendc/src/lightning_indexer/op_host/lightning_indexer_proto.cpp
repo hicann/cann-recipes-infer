@@ -1,5 +1,5 @@
 /**
- * This program is free software, you can redistribute it and/or modify it.
+ * This program is free software, you can redistribute it and/or modify.
  * Copyright (c) 2025 Huawei Technologies Co., Ltd.
  * This file is a part of the CANN Open Software.
  * Licensed under CANN Open Software License Agreement Version 2.0 (the "License").
@@ -50,13 +50,21 @@ static ge::graphStatus InferShapeLightningIndexer(gert::InferShapeContext *conte
 
     outShape->SetDimNum(queryShape->GetDimNum());
     if (inputLayoutQueryPtrStr == "BSND") {
+        OPS_ERR_IF(
+            queryShape->GetDimNum() != 4,
+            OPS_LOG_E(context, "Layout BSND, queryDims (%zu) must be 4!", queryShape->GetDimNum()),
+            return ge::GRAPH_FAILED);
         outShape->SetDim(0, queryShape->GetDim(0)); // 0:Dim B
         outShape->SetDim(1, queryShape->GetDim(1)); // 1:Dim S
         outShape->SetDim(2, keyShape->GetDim(2));   // 2:Dim N
         outShape->SetDim(3, *seleced_count);        // 3:Dim K
     } else {
+        OPS_ERR_IF(
+            queryShape->GetDimNum() != 3,
+            OPS_LOG_E(context, "Layout TND, queryDims (%zu) must be 3!", queryShape->GetDimNum()),
+            return ge::GRAPH_FAILED);
         outShape->SetDim(0, queryShape->GetDim(0)); // 0:Dim T
-        outShape->SetDim(1, keyShape->GetDim(2));   // 1:Dim N
+        outShape->SetDim(1, keyShape->GetDim(2));   // 1:Dim N; 2:Key Dim N
         outShape->SetDim(2, *seleced_count);        // 2:Dim K
     }
     OPS_LOG_D(context->GetNodeName(), "LightningIndexer InferShape end.");
@@ -70,7 +78,7 @@ static ge::graphStatus InferDataTypeLightningIndexer(gert::InferDataTypeContext 
                return ge::GRAPH_FAILED);
     OPS_LOG_D(context->GetNodeName(), "Enter LightningIndexer InferDataType impl.");
     // default set q's dtype as fia's output type
-    ge::DataType outputType = context->GetInputDataType(ACTUAL_SEQ_K_INDEX);
+    ge::DataType outputType = context->GetInputDataType(ge::DT_INT32);
     // attention_out, outidx:0
     context->SetOutputDataType(0, outputType);
     OPS_LOG_D(context->GetNodeName(), "LightningIndexer InferDataType end.");

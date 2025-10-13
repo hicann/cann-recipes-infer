@@ -1,5 +1,5 @@
 /**
- * This program is free software, you can redistribute it and/or modify it.
+ * This program is free software, you can redistribute it and/or modify.
  * Copyright (c) 2025 Huawei Technologies Co., Ltd.
  * This file is a part of the CANN Open Software.
  * Licensed under CANN Open Software License Agreement Version 2.0 (the "License").
@@ -22,10 +22,6 @@
 #include "register/tilingdata_base.h"
 #include "exe_graph/runtime/tiling_context.h"
 
-using std::map;
-using std::string;
-using std::pair;
-
 namespace optiling {
 // ------------------算子原型索引常量定义----------------
 // Inputs Index
@@ -47,6 +43,7 @@ constexpr uint32_t LAYOUT_QUERY_ATTR_INDEX = 2;
 constexpr uint32_t LAYOUT_KV_ATTR_INDEX = 3;
 constexpr uint32_t SPARSE_MODE_ATTR_INDEX = 4;
 // Dim Num
+constexpr size_t DIM_NUM_TWO = 2;
 constexpr size_t DIM_NUM_THREE = 3;
 constexpr size_t DIM_NUM_FOUR = 4;
 // 常量
@@ -122,11 +119,9 @@ struct SFAParaInfo {
 
     const char *layoutQuery = nullptr;
     const char *layoutKV = nullptr;
-    const uint32_t *sparseBlockSize = nullptr;
-    const uint32_t *sparseBlockCount = nullptr;
-    const uint32_t *blockSize = nullptr;
+    const int64_t *sparseBlockSize = nullptr;
     const float *scaleValue = nullptr;
-    const uint32_t *sparseMode = nullptr;
+    const int64_t *sparseMode = nullptr;
 };
 
 struct InnerSplitParams {
@@ -139,7 +134,7 @@ BEGIN_TILING_DATA_DEF(SparseFlashAttentionBaseParamsMla)
 TILING_DATA_FIELD_DEF(uint32_t, batchSize)
 TILING_DATA_FIELD_DEF(uint32_t, seqSize)
 TILING_DATA_FIELD_DEF(uint32_t, qSeqSize)
-TILING_DATA_FIELD_DEF(uint32_t, blockSize)
+TILING_DATA_FIELD_DEF(int64_t, blockSize)
 TILING_DATA_FIELD_DEF(uint32_t, maxBlockNumPerBatch)
 TILING_DATA_FIELD_DEF(float, scaleValue)
 TILING_DATA_FIELD_DEF(uint32_t, nNumOfQInOneGroup)
@@ -147,8 +142,7 @@ TILING_DATA_FIELD_DEF(uint32_t, actualLenDimsQ)
 TILING_DATA_FIELD_DEF(uint32_t, actualLenDimsKV)
 TILING_DATA_FIELD_DEF(uint32_t, outputLayout)
 TILING_DATA_FIELD_DEF(uint32_t, sparseMode)
-TILING_DATA_FIELD_DEF(uint32_t, needInit)
-TILING_DATA_FIELD_DEF(uint32_t, sparseBlockSize)
+TILING_DATA_FIELD_DEF(int64_t, sparseBlockSize)
 TILING_DATA_FIELD_DEF(uint32_t, sparseBlockCount)
 END_TILING_DATA_DEF
 REGISTER_TILING_DATA_CLASS(SparseFlashAttentionBaseParamsMlaOp, SparseFlashAttentionBaseParamsMla)
@@ -209,8 +203,8 @@ std::string SFAShape2String(const T &shape)
 
 static std::string GetShapeStr(gert::Shape shape);
 static std::string SFADataTypeToSerialString(ge::DataType type);
-string SFATensorDesc2String(const gert::StorageShape *shape, const gert::CompileTimeTensorDesc *tensor);
-string SFADebugTilingContext(const gert::TilingContext *context);
+std::string SFATensorDesc2String(const gert::StorageShape *shape, const gert::CompileTimeTensorDesc *tensor);
+std::string SFADebugTilingContext(const gert::TilingContext *context);
 std::string SFALayoutToSerialString(SFALayout layout);
 
 // -----------算子Tiling入参信息类---------------
@@ -235,11 +229,11 @@ struct SFATilingInfo {
     float scaleValue = 0;
     uint32_t innerPrecise = 0;
     uint32_t l2CacheOffFlag = 0;
-    uint32_t sparseBlockSize = 0;
-    uint32_t sparseBlockCount = 0;
+    int64_t sparseBlockSize = 0;
+    int64_t sparseBlockCount = 0;
 
     bool pageAttentionFlag = false;
-    uint32_t blockSize = 0;
+    int64_t blockSize = 0;
     uint32_t blockTypeSize = 0;
     uint32_t maxBlockNumPerBatch = 0;
     uint32_t totalBlockNum = 0;
@@ -254,8 +248,6 @@ struct SFATilingInfo {
     std::vector<int64_t> kvListSeqLens {};
 
     uint32_t sparseMode = 0;
-
-    bool needInit = false;
 
     ge::DataType inputQType = ge::DT_FLOAT16;
     ge::DataType inputKvType = ge::DT_FLOAT16;
@@ -367,10 +359,12 @@ private:
         const std::string &name) const;
     template <typename T> void LogErrorNumberSupport(const std::vector<T> &expectNumberList,
         const T &actualValue, const std::string &name, const std::string subName) const;
-    template <typename T> void LogErrorAttrValueSupport(const std::vector<T> &expectNumberList,
+    template <typename T> void LogErrorDimNumSupport(const std::vector<T> &expectNumberList,
         const T &actualValue, const std::string &name) const;
     ge::graphStatus CheckDimNumSupport(const gert::StorageShape *shape,
         const std::vector<size_t> &expectDimNumList, const std::string &name) const;
+    ge::graphStatus CheckDimNumInLayoutSupport(const SFALayout &layout,
+        const gert::StorageShape *shape, const std::string &name) const;
     void LogErrorLayoutSupport(const std::vector<SFALayout> &expectLayoutList,
         const SFALayout &actualLayout, const std::string &name) const;
     ge::graphStatus GetExpectedShape(gert::Shape &shapeExpected,
@@ -388,8 +382,10 @@ private:
     ge::graphStatus CheckSingleParaKvHeadNums() const;
     ge::graphStatus CheckSingleParaLayout() const;
     ge::graphStatus CheckSingleParaSparseMode() const;
+    ge::graphStatus CheckSingleParaSparseBlockSize() const;
     ge::graphStatus CheckSingleParaSparseIndices() const;
     ge::graphStatus CheckSinglePara() const;
+    ge::graphStatus CheckMultiParaConsistency() const;
     ge::graphStatus CheckRopeExistence();
     ge::graphStatus CheckExists(const void *pointer, const std::string &name) const;
     ge::graphStatus CheckNotExists(const void *pointer, const std::string &name) const;
@@ -406,29 +402,28 @@ private:
     ge::graphStatus GetActualSeqLenSize(uint32_t &size, const gert::Tensor *tensor,
         const SFALayout &layout, const std::string &name);
     void SetSFAShapeCompare();
-    ge::graphStatus CheckQAndQRope();
-    ge::graphStatus CheckQAndQRopeShape();
-    ge::graphStatus CheckQAndQRopeDType();
-    ge::graphStatus CheckQShape();
+    ge::graphStatus CheckQRope();
     ge::graphStatus CheckQRopeShape();
-    ge::graphStatus CheckKVDType();
-    ge::graphStatus CheckKVShapeForBatchContinuous();
+    ge::graphStatus CheckVAndKRopeShapeForBatchContinuous();
     uint32_t GetTypeSize(ge::DataType dtype) const;
-    ge::graphStatus CheckKVShapeForPageAttention();
-    ge::graphStatus CheckKVShape();
-    ge::graphStatus CheckKV();
+    ge::graphStatus CheckVAndKRopeShapeForPageAttention();
+    ge::graphStatus CheckVAndKRopeShape();
+    ge::graphStatus CheckVAndKRope();
     ge::graphStatus CheckTopK();
     ge::graphStatus CheckTopkShape();
+    ge::graphStatus CheckBlockTable() const;
+    ge::graphStatus CheckDTypeConsistency(const ge::DataType &actualDtype,
+    const ge::DataType &expectDtype, const std::string &name) const;
 
     ge::graphStatus CheckAttenOut();
+    ge::graphStatus CheckAttenOutShape();
     ge::graphStatus CheckActualSeqLensQ();
     ge::graphStatus CheckActualSeqLensQShape();
     ge::graphStatus CheckActualSeqLensQDType();
     ge::graphStatus CheckActualSeqLens();
     ge::graphStatus CheckActualSeqLensDType();
     ge::graphStatus CheckActualSeqLensShape();
-    ge::graphStatus CheckActualSeqLensMulti();
-    ge::graphStatus CheckMuiltPara();
+    ge::graphStatus CheckMultiParaConsistency();
 
     ge::graphStatus CheckFeatureMlaNoQuantShape() const;
     ge::graphStatus CheckFeatureMlaNoQuantLayout() const;
@@ -457,7 +452,7 @@ private:
     uint32_t kvTSize_ = 0; // 仅TND时生效
     KvStorageMode kvStorageMode_ = KvStorageMode::BATCH_CONTINUOUS;
     uint32_t sparseBlockCount_ = 0;
-    uint32_t sparseBlockSize_ = 0;
+    int64_t sparseBlockSize_ = 0;
 
     SFALayout qLayout_ = SFALayout::BSND;
     SFALayout topkLayout_ = SFALayout::BSND;
@@ -465,7 +460,7 @@ private:
     SFALayout kvLayout_ = SFALayout::BSND;
 
     uint32_t maxBlockNumPerBatch_ = 0;
-    uint32_t blockSize_ = 0;
+    int64_t blockSize_ = 0;
 
     uint32_t aicNum_ = 0;
     uint32_t aivNum_ = 0;
@@ -535,7 +530,7 @@ public:
     ge::graphStatus Parse(SFATilingInfo &sfaInfo);
 
 public:
-    bool HasAxis(const SFAAxis &axis, const SFALayout &layout) const;
+    bool HasAxis(const SFAAxis &axis, const SFALayout &layout, const gert::Shape &shape) const;
     size_t GetAxisIdx(const SFAAxis &axis, const SFALayout &layout) const;
     uint32_t GetAxisNum(const gert::Shape &shape, const SFAAxis &axis,const SFALayout &layout) const;
 
@@ -581,7 +576,6 @@ public:
     bool isSameSeqAllKVTensor_ = true;
     bool isSameActualseq_ = true;
     uint32_t maxActualseq_ = 0;
-    bool needInit_ = false;
 
     uint32_t actualLenDimsQ_ = 0;
     uint32_t actualLenDimsKV_ = 0;
