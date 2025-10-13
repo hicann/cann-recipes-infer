@@ -72,6 +72,49 @@ typedef int (*_aclDestroyScalarList)(const aclScalarList *array);
 using OpApiFunc = int (*)(void *, uint64_t, aclOpExecutor *, const aclrtStream);
 
 
+struct NPUStorageDesc {
+public:
+  struct use_byte_size_t {};
+
+  c10::SmallVector<int64_t, 5> base_sizes_;
+  c10::SmallVector<int64_t, 5> base_strides_;
+  c10::SmallVector<int64_t, 5> storage_sizes_;
+  int64_t base_offset_ = 0;
+  use_byte_size_t base_dtype_ = {};
+  aclFormat origin_format_ = ACL_FORMAT_UNDEFINED;
+  aclFormat npu_format_ = ACL_FORMAT_ND;
+  caffe2::TypeMeta data_type_ = caffe2::TypeMeta::Make<uint8_t>();
+};
+
+struct NPUStorageImpl : public c10::StorageImpl {
+  explicit NPUStorageImpl(
+    use_byte_size_t use_byte_size,
+    size_t size_bytes,
+    at::DataPtr data_ptr,
+    at::Allocator* allocator,
+    bool resizable);
+  ~NPUStorageImpl() override = default;
+  void release_resources() override;
+
+  // not private
+  NPUStorageDesc npu_desc_;
+
+  NPUStorageDesc get_npu_desc() const
+  {
+    return npu_desc_;
+  }
+
+  uint64_t unique_id_{0};
+
+  uint64_t get_unique_id()
+  {
+    return unique_id_;
+  }
+
+  std::mutex unique_id_mutex_;
+
+};
+
 const int N = 32;
 // npu tensor max size
 const int SIZE = 8;
@@ -169,7 +212,7 @@ inline std::vector<std::string> get_custom_lib_path()
     char *ascend_custom_opppath = std::getenv("ASCEND_CUSTOM_OPP_PATH");
     std::vector<std::string> custom_lib_path_list;
 
-    if (ascend_custom_opppath == NULL) {
+    if (ascend_custom_opppath == nullptr) {
         ASCEND_LOGW("ASCEND_CUSTOM_OPP_PATH is not exists");
         return std::vector<std::string>();
     }
@@ -192,7 +235,7 @@ inline std::vector<std::string> get_default_custom_lib_path()
     char *ascend_opp_path = std::getenv("ASCEND_OPP_PATH");
     std::vector<std::string> default_vendors_list;
 
-    if (ascend_opp_path == NULL) {
+    if (ascend_opp_path == nullptr) {
         ASCEND_LOGW("ASCEND_OPP_PATH is not exists");
         return std::vector<std::string>();
     }
@@ -393,6 +436,15 @@ inline at::Tensor CopyScalarToDevice(const c10::Scalar &cpu_scalar,
       scalar_to_tensor(cpu_scalar).to(scalar_data_type));
 }
 
+static bool IsOpInputBaseFormatCommon(const at::Tensor &at_tensor)
+{
+  if (!torch_npu::utils::is_npu(at_tensor)) {
+    return true;
+  }
+  const auto format = static_cast<NPUStorageImpl *>(at_tensor.storage().unsafeGetStorageImpl())->npu_desc_.npu_format_;
+  return (format == ACL_FORMAT_ND) || (format == ACL_FORMAT_NCHW) || (format == ACL_FORMAT_NHWC) ||
+      (format == ACL_FORMAT_NCDHW);
+}
 
 inline aclTensor *ConvertType(const at::Tensor &at_tensor) {
   static const auto aclCreateTensor = GET_OP_API_FUNC(aclCreateTensor);
@@ -409,31 +461,34 @@ inline aclTensor *ConvertType(const at::Tensor &at_tensor) {
   TORCH_CHECK(
       acl_data_type != ACL_DT_UNDEFINED,
       std::string(c10::toString(scalar_data_type)) + " has not been supported")
-  c10::SmallVector<int64_t, 5> storageDims;
-  // if acl_data_type is ACL_STRING, storageDims is empty.
-  auto itemsize = at_tensor.itemsize();
-  if (itemsize == 0) {
-    AT_ERROR("When ConvertType, tensor item size of cannot be zero.");
-    return nullptr;
-  }
-  if (acl_data_type != ACL_STRING) {
-    storageDims.push_back(at_tensor.storage().nbytes() / itemsize);
-  }
+  c10::SmallVector<int64_t, SIZE> storageDims;
 
   const auto dimNum = at_tensor.sizes().size();
   aclFormat format = ACL_FORMAT_ND;
-  switch (dimNum) {
-    case 3:
-      format = ACL_FORMAT_NCL;
-      break;
-    case 4:
-      format = ACL_FORMAT_NCHW;
-      break;
-    case 5:
-      format = ACL_FORMAT_NCDHW;
-      break;
-    default:
-      format = ACL_FORMAT_ND;
+  if (!IsOpInputBaseFormatCommon(at_tensor)) {
+    format = static_cast<NPUStorageImpl *>(at_tensor.storage().unsafeGetStorageImpl())->npu_desc_.npu_format_;
+    if (acl_data_type != ACL_STRING) {
+        TORCH_CHECK(at_tensor.itemsize() > 0, "the itemsize of tensor must be greater than 0.");
+        storageDims = static_cast<NPUStorageImpl *>(at_tensor.storage().unsafeGetStorageImpl())->npu_desc_.storage_sizes_;
+    }
+  } else {
+      switch (dimNum) {
+      case 3:
+        format = ACL_FORMAT_NCL;
+        break;
+      case 4:
+        format = ACL_FORMAT_NCHW;
+        break;
+      case 5:
+        format = ACL_FORMAT_NCDHW;
+        break;
+      default:
+        format = ACL_FORMAT_ND;
+    }
+    if (acl_data_type != ACL_STRING) {
+        TORCH_CHECK(at_tensor.itemsize() > 0, "the itemsize of tensor must be greater than 0.");
+        storageDims.push_back(at_tensor.storage().nbytes() / at_tensor.itemsize());
+    }
   }
 
   if (at_tensor.unsafeGetTensorImpl()->is_wrapped_number()) {
