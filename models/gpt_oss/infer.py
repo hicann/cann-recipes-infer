@@ -14,8 +14,7 @@ import logging
 from runner_gpt_oss import GptOssRunner
 from executor.utils import read_yaml
 from executor.utils.data_utils import generate_prompt
-from executor.utils.common_utils import check_common_parallel_settings
-from models.model_setting import update_vars
+from models.model_setting import update_vars, check_vars
 
 root_logger = logging.getLogger()
 root_logger.handlers.clear()
@@ -44,7 +43,7 @@ if __name__ == "__main__":
     yaml_file_path = args.yaml_file_path
     runner_settings = read_yaml(yaml_file_path)
     world_size = int(os.getenv("WORLD_SIZE", "1"))
-    check_common_parallel_settings(world_size, runner_settings)
+    check_vars(world_size, runner_settings)
     update_vars(world_size, runner_settings)
     logging.info(f"runner_settings is: {runner_settings}")
     run_gpt_oss(runner_settings)

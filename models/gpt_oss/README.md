@@ -121,7 +121,7 @@ data_config:
   batch_size: 1                  # 全局所有的请求数
 
 parallel_config:
-  attn_tp_size: 1                # Attention的tensor并行数
+  attn_tp_size: 1                # Attention的tensor并行数，要求attn_tp_size = moe_tp_size = lmhead_tp_size
   moe_tp_size: 1                 # MoE的tensor并行数
   lmhead_tp_size: 1              # LMHead的tensor并行数
 ```

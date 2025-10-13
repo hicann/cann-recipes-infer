@@ -8,6 +8,15 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 
 from executor.utils import update_settings
+from executor.utils.common_utils import check_common_parallel_settings
+
+def check_vars(world_size, runner_settings):
+    check_common_parallel_settings(world_size, runner_settings)
+    attn_tp_size = runner_settings.get("parallel_config").get("attn_tp_size", 1)
+    moe_tp_size = runner_settings.get("parallel_config").get("moe_tp_size", 1)
+    lmhead_tp_size = runner_settings.get("parallel_config").get("lmhead_tp_size", 1)
+    if not world_size == attn_tp_size == moe_tp_size == lmhead_tp_size:
+        raise ValueError("The values of world_size, attn_tp_size, moe_tp_size and lmhead_tp_size must be equal.")
 
 
 def update_vars(world_size, runner_settings):
