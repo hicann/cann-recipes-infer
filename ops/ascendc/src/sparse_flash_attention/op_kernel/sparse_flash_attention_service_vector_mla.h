@@ -169,13 +169,13 @@ private:
     GlobalTensor<int32_t> kvValidSizeGm_;
 
     // ================================Local Buffer区====================================
-    TBuf<> inputBuff1;  // 32K
-    TBuf<> inputBuff2;  // 16K
-    TBuf<> outputBuff1; // 32K
-    TBuf<> outputBuff2; // 4K
+    TBuf<> inputBuff1;            // 32K
+    TBuf<> inputBuff2;            // 16K
+    TBuf<> outputBuff1;           // 32K
+    TBuf<> outputBuff2;           // 4K
 
-    TBuf<> tmpBuff1;         // 32K
-    TBuf<> v0ValidSizeBuff;  // 8K
+    TBuf<> tmpBuff1;              // 32K
+    TBuf<> v0ValidSizeBuff;       // 8K
 
     TBuf<> nValueBuff;
     TBuf<> cofValueBuff;
@@ -369,9 +369,7 @@ __aicore__ inline void SFAVectorService<SFAT>::ElewiseCompute(const RunInfo &inf
         uint64_t s2ValidSizeFirstPart = v0ValidSizeUb_.GetValue(128 + info.loop % MERGE_CACHE_GM_BUF_NUM);
         uint64_t s2ValidSizeSecondPart = v0ValidSizeUb_.GetValue(256 + info.loop % MERGE_CACHE_GM_BUF_NUM);
 
-        int64_t s2ProcessSize = info.s2Idx * constInfo.s2BaseSize + constInfo.s2BaseSize > info.actS2Size ?
-                                    info.actS2Size - info.s2Idx * constInfo.s2BaseSize :
-                                    constInfo.s2BaseSize;
+        int64_t s2ProcessSize = info.actualSingleProcessSInnerSize;
         int64_t s2Pair = CeilDiv(s2ProcessSize, 2L * constInfo.sparseBlockSize);
         int64_t s2Mid = CeilDiv(s2Pair, 2L) * 2 * constInfo.sparseBlockSize;
         if (s2Mid > s2ProcessSize) {
@@ -530,7 +528,7 @@ __aicore__ inline void SFAVectorService<SFAT>::AmlaVecCompute(
     pipe_barrier(PIPE_V);
     Exp(nTmp, nTmp, calCount);
     pipe_barrier(PIPE_V);
-    Cast(nTmp_KvT, nTmp, RoundMode::CAST_ROUND, calCount); // fp32->fp16/bf16
+    Cast(nTmp_KvT, nTmp, RoundMode::CAST_ROUND, calCount);       // fp32->fp16/bf16
     pipe_barrier(PIPE_V);
     Cast(nUpdateTmp2, nTmp_KvT, RoundMode::CAST_NONE, calCount); // fp16/bf16->fp32
     pipe_barrier(PIPE_V);
@@ -549,9 +547,9 @@ __aicore__ inline void SFAVectorService<SFAT>::AmlaVecCompute(
 
     Div(tmpCofUb, nTmp, nUpdateTmp2, calCount); // cof(i)=tmpS32/tmpS16
     if (info.isFirstSInnerLoop) {
-        Duplicate(cofValueUb[softmaxOutOffset], (T)1.0, calCount); // cof_0=1
+        Duplicate(cofValueUb[softmaxOutOffset], (T)1.0, calCount);       // cof_0=1
         pipe_barrier(PIPE_V);
-        Div(epsUb, cofValueUb[softmaxOutOffset], tmpCofUb, calCount); // 1 / cof(i)
+        Div(epsUb, cofValueUb[softmaxOutOffset], tmpCofUb, calCount);    // 1 / cof(i)
     } else {
         pipe_barrier(PIPE_V);
         Div(epsUb, cofValueUb[PreSoftmaxOutOffset], tmpCofUb, calCount); // cof(i - 1) / cof(i)
@@ -561,7 +559,7 @@ __aicore__ inline void SFAVectorService<SFAT>::AmlaVecCompute(
     Adds(cofValueUb[softmaxOutOffset], tmpCofUb, ConstInfo::FLOAT_ZERO, calCount); // store cof(i)
     Adds(epsUb, epsUb, (T)(-1.0), calCount); // cof(i - 1) / cof(i) - 1
     pipe_barrier(PIPE_V);
-    Muls(epsUb, epsUb, (T)1.5, calCount); // (cof(i - 1) - cof(i)) / cof(i) * 1.5
+    Muls(epsUb, epsUb, (T)1.5, calCount);    // (cof(i - 1) - cof(i)) / cof(i) * 1.5
 
     Maxs(nUpdateTmp, nUpdateTmp, (T)(-30.0), calCount); // N = max(n(i) - n(i-1), -30)
     pipe_barrier(PIPE_V);
@@ -633,7 +631,7 @@ __aicore__ inline void SFAVectorService<SFAT>::DealBmm1ResBaseBlock(
 template <typename SFAT>
 __aicore__ inline void SFAVectorService<SFAT>::ProcessAmlaNupdate(const RunInfo &info, const MSplitInfo &mSplitInfo)
 {
-    if (mSplitInfo.vecDealM == 0) {
+    if (mSplitInfo.vecDealM == 0 || info.actualSingleProcessSInnerSize == 0) {
         return;
     }
     if (info.isFirstSInnerLoop) {
@@ -680,10 +678,10 @@ __aicore__ inline void SFAVectorService<SFAT>::ProcessAmlaNupdate(const RunInfo 
         DataCopyParams dataCopyParams;
         dataCopyParams.blockCount = static_cast<uint16_t>(processMSize);
         dataCopyParams.blockLen = dGroupSize * sizeof(int32_t) / ONE_BLOCK_SIZE; // 每个block是128个元素，单位为32B
-        dataCopyParams.srcStride = 0; // 前面一个数据块的尾与后面数据块的头的间隔
+        dataCopyParams.srcStride = 0;                                            // 前面一个数据块的尾与后面数据块的头的间隔
         dataCopyParams.dstStride = static_cast<uint16_t>((constInfo.headDim - dGroupSize) *
                                                          sizeof(int32_t) / ONE_BLOCK_SIZE); // 单位为32B
-        for (uint32_t i = 0; i < constInfo.headDim / dGroupSize; i++) { // 4=512/128
+        for (uint32_t i = 0; i < constInfo.headDim / dGroupSize; i++) {          // 4=512/128
             DataCopy(mm2ResInt32Gm[baseoffset + i * dGroupSize] ,tmpQue, dataCopyParams);
         }
         SetAtomicNone();
@@ -741,6 +739,10 @@ __aicore__ inline void SFAVectorService<SFAT>::GetRealS2Idx(int64_t s2GmOffset, 
                                                             int64_t topkGmBaseOffset, const RunInfo &runInfo)
 {
     int64_t topkGmIdx = (s2GmOffset + runInfo.s2Idx * constInfo.s2BaseSize) / constInfo.sparseBlockSize;
+    if (unlikely(topkGmIdx >= constInfo.sparseBlockCount)) {
+        realS2Idx = -1;
+        return;
+    }
     realS2Idx = topkGm_.GetValue(topkGmBaseOffset + topkGmIdx) * static_cast<int64_t>(constInfo.sparseBlockSize) +
                 static_cast<int64_t>((s2GmOffset + runInfo.s2Idx * constInfo.s2BaseSize) % constInfo.sparseBlockSize);
 }
@@ -865,9 +867,7 @@ __aicore__ inline void SFAVectorService<SFAT>::CopyOutMrgeResult(int64_t mte2Siz
 template <typename SFAT>
 __aicore__ inline void SFAVectorService<SFAT>::MergeKv(const RunInfo &runInfo)
 {
-    int64_t s2ProcessSize = runInfo.s2Idx * constInfo.s2BaseSize + constInfo.s2BaseSize > runInfo.actS2Size ?
-                                runInfo.actS2Size - runInfo.s2Idx * constInfo.s2BaseSize :
-                                constInfo.s2BaseSize;
+    int64_t s2ProcessSize = runInfo.actualSingleProcessSInnerSize;
     int64_t s2Pair = CeilDiv(s2ProcessSize, 2L * constInfo.sparseBlockSize);
     int64_t topkGmBaseOffset = 0;
 

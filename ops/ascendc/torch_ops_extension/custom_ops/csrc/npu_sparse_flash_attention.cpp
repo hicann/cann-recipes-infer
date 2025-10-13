@@ -15,17 +15,18 @@
 namespace custom {
 using namespace at_npu::native;
 
+// npu tensor max size
+const int SIZE = 8;
+
 // 工具函数，推导输出shape
 at::Tensor construct_sparse_infer_output_tensor(
     const at::Tensor& query, const at::Tensor& value, std::string layout)
 {
-    at::SmallVector<int64_t, 8> output_size;
-    if (layout == "TND") {
-        output_size = {query.size(DIM_0), query.size(DIM_1), query.size(DIM_2)};
-    } else {
-        output_size = {query.size(DIM_0), query.size(DIM_1), query.size(DIM_2), query.size(DIM_3)};
+    for (auto i = 0; i < query.sizes().size(); i++) {
+        TORCH_CHECK(query.size(i) > 0, "All values within query's shape should be greater "
+            "than 0, but shape[", i, "] is ", query.size(i));
     }
-    at::Tensor output = at::empty(output_size, query.options().dtype(query.dtype()));
+    at::Tensor output = at::empty(query.sizes(), query.options().dtype(query.dtype()));
 
     return output;
 }
