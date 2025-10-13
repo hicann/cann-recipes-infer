@@ -5,8 +5,8 @@
 ## 性能优化
 ### Attention Tensor Parallel (TP)优化
 对Attention的张量切分策略可以分为对QKV头的切分和对线性层的切分。
-在对QKV头切分时，attention的多头计算机制可以方便进行张量切分，每个头先独立计算，再将结果concat起来。假设模型的attention层需要对`num_heads`个query按照切分数量`tp_size`进行切分，要求`num_heads`必须能被`tp_size`整除，每张卡放置query头个数为`num_heads_per_rank = num_heads // tp_size`；key和value头数相等，且可能小于等于query头个数（在MQA和GQA的场景下会小于）。为了确保每张卡至少放置一个key和value头，每张卡放置的key或value头数计算方法为
-`num_key_value_heads_per_rank = max(num_key_value_heads // tp_size, 1)`。QKV头在卡上排布情况如下图所示。
+在对QKV头切分时，attention的多头计算机制可以方便进行张量切分，每个头先独立计算，再将结果concat起来。假设模型的attention层需要对`num_heads`个query按照切分数量`attn_tp_size`进行切分，要求`num_heads`必须能被`attn_tp_size`整除，每张卡放置query头个数为`num_heads_per_rank = num_heads // attn_tp_size`；key和value头数相等，且可能小于等于query头个数（在MQA和GQA的场景下会小于）。为了确保每张卡至少放置一个key和value头，每张卡放置的key或value头数计算方法为
+`num_key_value_heads_per_rank = max(num_key_value_heads // attn_tp_size, 1)`。QKV头在卡上排布情况如下图所示。
 
    <p align="center">
      <img src="./figures/attention_tp.png" width="70%" alt="attention tp process]">
@@ -15,7 +15,7 @@
 针对`q_proj`、`k_proj`和`v_proj`三个线性层，可以进一步合并为一个线性层`merged_qkv_proj`，即在推理中将三个矩阵乘替换为一个矩阵乘，可以最大化使用NPU的计算能力提升性能。随后将结果切分得到Q、K、V，并进行attention计算，最后通过`o_proj`层输出。
 
 ### MoE Tensor Parallel优化
-假设模型的MoE层的切分数量为`tp_size`，专家个数为expert_num。对MoE层进行张量切分时，对`gate_up_proj`进行列切分，对`down_proj`进行行切分。
+假设模型的MoE层的切分数量为`moe_tp_size`，专家个数为expert_num。对MoE层进行张量切分时，对`gate_up_proj`进行列切分，对`down_proj`进行行切分。
 
 ### 固定KV Cache大小
 - 首先申请一块固定大小的KV Cache tensor，以优化源码动态申请内存的性能损失。KV Cache的大小为`(batch * seq_len * num_key_value_heads_per_rank * head_dim)`，其中`seq_len`至少为输入和输出的最大总和，以保证在推理过程中KV Cache的更新不会越界。具体实现体现在`GptOssForCausalLM`类的`init_cache`函数中。

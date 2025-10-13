@@ -57,7 +57,6 @@ def create_sliding_window_attention_mask(mask, window_size, device=None):
 class GptOssRunner(ModelRunner):
     def __init__(self, runner_settings):
         super().__init__(runner_settings)
-        self.tp_size = runner_settings.get("parallel_config").get("tp_size", 1)
 
     def init_model(self):
         self.use_pretrained_model = True

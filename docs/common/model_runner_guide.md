@@ -76,7 +76,9 @@ ModelRunner类是一个用于模型推理的基类，主要负责模型的初始
    - batch_size：每个批次处理的样本数量。
 
 4. 并行配置：Parallel Config
-   - tp_size：多卡推理中的模型张量并行数。
+   - attn_tp_size:多卡推理中的Attention张量并行数。
+   - moe_tp_size:多卡推理中的MoE张量并行数。
+   - lmhead_tp_size:多卡推理中的LMHead张量并行数。
 
 ## 实现步骤
 ### 获取并使用 runner_settings 参数
@@ -103,7 +105,6 @@ ModelRunner类是一个用于模型推理的基类，主要负责模型的初始
 class GptOssRunner(ModelRunner): # 定义GptOssRunner类，继承自ModelRunner
     def __init__(self, runner_settings):
         super().__init__(runner_settings) # 调用父类初始化方法，传递runner_settings参数
-        self.tp_size = runner_settings.get("parallel_config").get("tp_size", 1) # 从runner_settings中获取配置信息
         # 其他初始化操作
 ```
 #### 重写关键方法
@@ -144,7 +145,7 @@ class GptOssForCausalLM(GptOssPreTrainedModel, GenerationMixin):
         super().__init__(config)
         self.runner_settings = runner_settings
         self.model = GptOssModel(config, runner_settings)
-        self.lm_head_tp_size = runner_settings.get("parallel_config").get("tp_size", 1)
+        self.lm_head_tp_size = runner_settings.get("parallel_config").get("lmhead_tp_size", 1)
         # 其他初始化操作
 ```
 
