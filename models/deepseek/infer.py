@@ -36,8 +36,7 @@ def parse_args():
 
 
 def run_deepseek(runner_settings):
-    attn_tp_size = runner_settings.get("parallel_config").get("attn_tp_size", 1)
-    preset_prompts, _ = generate_prompt(runner_settings, attn_tp_size)
+    preset_prompts, _ = generate_prompt(runner_settings)
     model_runner = DeepSeekRunner(runner_settings)
     # 表示在图模式下开启算子二进制复用，提高图模式下编译阶段性能
     torch.npu.set_compile_mode(jit_compile=False)
@@ -51,8 +50,7 @@ def run_deepseek(runner_settings):
 
 
 def run_deepseek_mtp(runner_settings):
-    attn_tp_size = runner_settings.get("parallel_config").get("attn_tp_size", 1)
-    preset_prompts, query_id_list = generate_prompt(runner_settings, attn_tp_size)
+    preset_prompts, query_id_list = generate_prompt(runner_settings)
     model_runner_main = DeepSeekRunner(runner_settings)
     model_runner_mtp = DeepSeekRunner(runner_settings)
     # to accelerate the compiling process for torch dynamo

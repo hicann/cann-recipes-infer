@@ -57,9 +57,7 @@ class InferMTP(nn.Module):
                 outputs = self.main_model.model_inference(model_inputs,
                                                             is_prefill=input_dict_main['is_prefill'], warm_up=warm_up)
                 # The outputs is a tuple containing logits, inference_time and prev_hidden_states.
-                logits = outputs[0]
-                infer_time_main = outputs[1]
-                prev_hidden_states = outputs[2]
+                logits, infer_time_main, prev_hidden_states = outputs
                 step_time += infer_time_main
                 main_next_tokens = torch.argmax(logits, dim=-1)
                 accepted_num = self.verify_spec_tokens(input_dict_main, input_dict_mtp, main_next_tokens)
@@ -79,9 +77,7 @@ class InferMTP(nn.Module):
                     outputs = self.mtp_model.model_inference(model_inputs,
                                                             is_prefill=input_dict_mtp['is_prefill'], warm_up=warm_up)
                     # The outputs is a tuple containing logits, inference_time and prev_hidden_states.
-                    logits = outputs[0]
-                    infer_time_spec = outputs[1]
-                    prev_hidden_states = outputs[2]
+                    logits, infer_time_spec, prev_hidden_states = outputs
                     # mtp model output process
                     input_dict_mtp = self.mtp_model_output_process(model_inputs, input_dict_mtp,
                                                                     logits, prev_hidden_states)

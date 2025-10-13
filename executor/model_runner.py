@@ -343,7 +343,8 @@ class ModelRunner:
                 model_inputs = self.model_input_prepare(input_dict)
                 outputs = self.model_inference(model_inputs, is_prefill=input_dict['is_prefill'], warm_up=warm_up)
                 # The outputs is a tuple containing logits, inference_time and other necessary return values.
-                logits, inference_time = outputs
+                logits = outputs[0]
+                inference_time = outputs[1]
                 self.model_output_process(model_inputs, logits, input_dict)
                 prof.step()
                 generate_tokens += 1
