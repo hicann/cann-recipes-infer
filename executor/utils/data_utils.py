@@ -66,9 +66,9 @@ def get_prompts_for_cur_rank(preset_prompts, global_bs, batch_size_per_rank, glo
     return (preset_prompts, query_id_list)
 
 
-def generate_prompt(runner_settings, tp_size=None):
+def generate_prompt(runner_settings):
     batch_size = runner_settings.get("data_config").get("batch_size", 1)
-    attn_tp_size = runner_settings.get("parallel_config").get("attn_tp_size")
+    attn_tp_size = runner_settings.get("parallel_config").get("attn_tp_size", 1)
     cp_size = runner_settings.get("parallel_config").get("cp_size", 1)
     global_rank = int(os.getenv("RANK_ID", 0))
     global_dp_rank = global_rank // cp_size // attn_tp_size
@@ -85,6 +85,8 @@ def generate_prompt(runner_settings, tp_size=None):
         dataset_path = os.path.abspath(os.path.join(dataset_path, f"{dataset}"))
         if os.path.isdir(dataset_path): # use local LongBench dataset first
             dataset = dataset_path
+        else:
+            dataset = "THUDM/LongBench"
         preset_prompts = load_longbench_dataset(dataset)
     elif dataset == "InfiniteBench":
         dataset_path = os.path.abspath(os.path.join(dataset_path, f"{dataset}"))

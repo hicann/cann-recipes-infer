@@ -1,0 +1,19 @@
+model_name: "gpt_oss"
+model_path: "/data/models/origin/gpt-oss-20b-bf16"
+exe_mode: "eager"        # ["eager"]
+world_size: 1
+
+model_config:
+  enable_profiler: False  # [False, True]
+  enable_online_split_weight: True
+
+data_config:
+  dataset: "default"  # ["default", "LongBench"]
+  input_max_len: 32
+  max_new_tokens: 100
+  batch_size: 1
+
+parallel_config:
+  attn_tp_size: 1
+  moe_tp_size: 1
+  lmhead_tp_size: 1
