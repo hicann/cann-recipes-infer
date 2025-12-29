@@ -273,7 +273,7 @@ class Indexer(nn.Module):
 
             q_pe = q_pe.view(-1, self.n_heads, 1, self.rope_head_dim)
             # [b,s,n,d]
-            q_pe = torch_npu.npu_interleave_rope(q_pe, cos, sin).view(bsz, -1, self.n_heads, self.rope_head_dim)
+            q_pe = torch_npu.npu_rotary_mul(q_pe, cos, sin).view(bsz, -1, self.n_heads, self.rope_head_dim)
             q = torch.cat([q_pe, q_nope], dim=-1)
         with npu_stream_switch(enable_multi_streams, "33"):
             if enable_multi_streams:
@@ -288,7 +288,7 @@ class Indexer(nn.Module):
         # [b,s,64+64]
         k_pe, k_nope = torch.split(k, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1)
         k_pe = k_pe.view(-1, 1, 1, self.rope_head_dim)
-        k_pe = torch_npu.npu_interleave_rope(k_pe, cos, sin).view(bsz, -1, 1, self.rope_head_dim) # [b,s,1,d]
+        k_pe = torch_npu.npu_rotary_mul(k_pe, cos, sin).view(bsz, -1, 1, self.rope_head_dim) # [b,s,1,d]
         k = torch.cat([k_pe, k_nope.unsqueeze(2)], dim=-1)  # [b,s,1,128]
         key_dequant_scale = None
         indexer_input = {}
