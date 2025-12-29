@@ -1,0 +1,154 @@
+From 01df772a54f393ac2ddbdac457bfc2ea5f6e1ea7 Mon Sep 17 00:00:00 2001
+From: zqh923 <zhouqinghong1@hisilicon.com>
+Date: Tue, 9 Dec 2025 21:22:23 +0800
+Subject: [PATCH 2/9] [feat] support qwen3 moe forced eplb
+
+Signed-off-by: zqh923 <zhouqinghong1@hisilicon.com>
+---
+ .../srt/model_executor/forward_batch_info.py  |  4 ++
+ python/sglang/srt/models/qwen3_moe.py         | 37 +++++++++++++++++--
+ python/sglang/srt/models/qwen3_moe_nextn.py   | 12 +++++-
+ python/sglang/srt/server_args.py              |  6 +++
+ 4 files changed, 54 insertions(+), 5 deletions(-)
+
+diff --git a/python/sglang/srt/model_executor/forward_batch_info.py b/python/sglang/srt/model_executor/forward_batch_info.py
+index a74f23e76..7743c2a81 100644
+--- a/python/sglang/srt/model_executor/forward_batch_info.py
++++ b/python/sglang/srt/model_executor/forward_batch_info.py
+@@ -226,6 +226,10 @@ class ForwardBatch:
+     # Position information
+     positions: torch.Tensor = None
+ 
++    # For perfect eplb
++    perfect_eplb: bool = False
++    cur_topk_list: torch.Tensor = None
++
+     # For extend
+     extend_num_tokens: Optional[int] = None
+     extend_seq_lens: Optional[torch.Tensor] = None
+diff --git a/python/sglang/srt/models/qwen3_moe.py b/python/sglang/srt/models/qwen3_moe.py
+index 495034de6..b2f9e41a1 100644
+--- a/python/sglang/srt/models/qwen3_moe.py
++++ b/python/sglang/srt/models/qwen3_moe.py
+@@ -39,7 +39,7 @@ from sglang.srt.distributed import (
+ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+ from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+ from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
+-from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
++from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size, get_attention_dp_size
+ from sglang.srt.layers.layernorm import RMSNorm
+ from sglang.srt.layers.linear import (
+     QKVParallelLinear,
+@@ -195,11 +195,11 @@ class Qwen3MoeSparseMoeBlockNPU(nn.Module):
+                 "comm_quant_mode": 0
+             }
+ 
+-    def forward(self, hidden_states, forward_batch, cur_topk_list=None):
++    def forward(self, hidden_states, forward_batch):
+         if hidden_states.shape[0] > 0:
+             topk_idx, topk_weight, _, row_idx = self.gate(hidden_states)
+-            if self.perfect_eplb:
+-                topk_idx = cur_topk_list
++            if forward_batch.perfect_eplb and forward_batch.cur_topk_list is not None:
++                topk_idx = forward_batch.cur_topk_list
+             topk_idx = topk_idx.to(torch.int32)
+             if self.moe_tp_size > 1:
+                 # MoE TP scene
+@@ -1144,6 +1144,10 @@ class Qwen3MoeForCausalLM(nn.Module):
+         )
+         self.logits_processor = LogitsProcessor(config)
+         self.capture_aux_hidden_states = False
++        self.moe_ep_size = get_moe_expert_parallel_world_size()
++        self.moe_tp_size = get_moe_tensor_parallel_world_size()
++        self.attn_tp_size = get_attention_tp_size()
++        self.attn_dp_size = get_attention_dp_size()
+ 
+     def get_input_embeddings(self) -> nn.Embedding:
+         return self.model.embed_tokens
+@@ -1418,4 +1422,29 @@ class Qwen3MoeForCausalLM(nn.Module):
+         )
+ 
+ 
++    def gen_cur_topk_idx(
++        self,
++        seq_len
++    ):
++        global_rank = dist.get_rank()
++        if self.moe_tp_size > 1:
++            expanded_tokens = self.config.num_experts_per_tok * seq_len
++            cur_topk_list_decode = []
++            for offset in range(self.moe_ep_size):
++                expert_start = offset * self.experts_per_rank
++                expert_end = expert_start + expanded_tokens
++                cur_topk_list_decode = cur_topk_list_decode + [i for i in range(expert_start, expert_end)]
++            cur_topk_list = torch.Tensor(cur_topk_list_decode).int().view(seq_len, -1).npu()
++        else:
++            expanded_tokens = self.config.num_experts_per_tok * seq_len * self.attn_dp_size // self.moe_ep_size
++            step_gap = self.config.num_experts // self.moe_ep_size if expanded_tokens < self.config.num_experts \
++                    else 1
++            cur_topk_list_decode = [
++                ((i + global_rank // step_gap * step_gap) * step_gap +
++                global_rank % step_gap) % self.config.num_experts for i in range(expanded_tokens)
++            ]
++            cur_topk_list = torch.Tensor(cur_topk_list_decode).int().view(seq_len * self.attn_dp_size // self.moe_ep_size, -1).npu()
++        return cur_topk_list
++
++
+ EntryClass = Qwen3MoeForCausalLM
+diff --git a/python/sglang/srt/models/qwen3_moe_nextn.py b/python/sglang/srt/models/qwen3_moe_nextn.py
+index 3f6550170..bd3d58e42 100644
+--- a/python/sglang/srt/models/qwen3_moe_nextn.py
++++ b/python/sglang/srt/models/qwen3_moe_nextn.py
+@@ -33,7 +33,13 @@ from sglang.srt.layers.vocab_parallel_embedding import (
+ from sglang.srt.server_args import get_global_server_args
+ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+ from sglang.srt.models.qwen3_moe import Qwen3MoeForCausalLM, Qwen3MoeDecoderLayer, Qwen3MoeRotaryEmbedding
+-from sglang.srt.utils import BumpAllocator, add_prefix, is_cuda, is_npu
++from sglang.srt.utils import add_prefix, is_cuda, is_npu
++from sglang.srt.layers.dp_attention import get_attention_tp_size, get_attention_dp_size
++from sglang.srt.distributed import (
++    get_moe_expert_parallel_world_size,
++    get_moe_tensor_parallel_world_size,
++)
++
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -141,6 +147,10 @@ class Qwen3MoeForCausalLMNextN(Qwen3MoeForCausalLM):
+         self.quant_config = quant_config
+         # if not set, model load will be broken in Qwen3NextForCausalLM load_weights()
+         self.pp_group = get_pp_group()
++        self.moe_ep_size = get_moe_expert_parallel_world_size()
++        self.moe_tp_size = get_moe_tensor_parallel_world_size()
++        self.attn_tp_size = get_attention_tp_size()
++        self.attn_dp_size = get_attention_dp_size()
+ 
+         # TODO mtp cache, sglang\python\sglang\srt\configs\model_config.py, which make
+         # self.hf_config.num_hidden_layers = self.hf_config.num_nextn_predict_layers, check to delete the follow line
+diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
+index 1aa9e7c8c..a662d30f6 100644
+--- a/python/sglang/srt/server_args.py
++++ b/python/sglang/srt/server_args.py
+@@ -296,6 +296,7 @@ class ServerArgs:
+     base_gpu_id: int = 0
+     gpu_id_step: int = 1
+     sleep_on_idle: bool = False
++    perfect_eplb: bool = False
+ 
+     # Logging
+     log_level: str = "info"
+@@ -2017,6 +2018,11 @@ class ServerArgs:
+             action="store_true",
+             help="If set, skip warmup.",
+         )
++        parser.add_argument(
++            "--perfect-eplb",
++            action="store_true",
++            help="If set, enable perfect eplb.",
++        )
+         parser.add_argument(
+             "--warmups",
+             type=str,
+-- 
+2.50.0.windows.1
+

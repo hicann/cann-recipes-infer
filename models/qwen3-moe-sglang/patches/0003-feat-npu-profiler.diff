@@ -1,0 +1,105 @@
+From 09228c3054abb1da9bb8487eee04b26d838683c0 Mon Sep 17 00:00:00 2001
+From: zqh923 <zhouqinghong1@hisilicon.com>
+Date: Tue, 9 Dec 2025 19:49:30 +0800
+Subject: [PATCH 3/9] [feat] npu profiler
+
+Signed-off-by: zqh923 <zhouqinghong1@hisilicon.com>
+---
+ python/sglang/srt/utils/profiler.py | 85 +++++++++++++++++++++++++++++
+ 1 file changed, 85 insertions(+)
+ create mode 100644 python/sglang/srt/utils/profiler.py
+
+diff --git a/python/sglang/srt/utils/profiler.py b/python/sglang/srt/utils/profiler.py
+new file mode 100644
+index 000000000..cee59fdf0
+--- /dev/null
++++ b/python/sglang/srt/utils/profiler.py
+@@ -0,0 +1,85 @@
++import os
++import time
++import torch
++import torch_npu
++import torch.distributed as dist
++from sglang.srt.model_executor.forward_batch_info import ForwardMode, ForwardBatch
++
++
++def time_decorator(func):
++    def wrapper(*args, **kwargs):
++        dist.barrier()
++        torch.npu.synchronize()
++        start_time = time.time()
++        output = func(*args, **kwargs)
++        torch.npu.synchronize()
++        end_time = time.time()
++        inference_time = end_time - start_time
++        return output, inference_time
++
++    return wrapper
++
++
++class FakeContextManager:
++    def __enter__(self):
++        return self
++
++    def __exit__(self, exc_type, exc_value, traceback):
++        pass
++
++    @staticmethod
++    def step():
++        return
++
++
++class NpuProfiler:
++    def __init__(self, profiler_warm_up_step = 10, profiler_step = 10, profiler_skip_first = 1):
++        self.profiler_warm_up_step = profiler_warm_up_step
++        self.profiler_step = profiler_step
++        self.profiler_skip_first = profiler_skip_first
++
++    def get_profiler(self, enable_profiler=False, profile_save_path="prof"):
++        if enable_profiler:
++            os.makedirs(profile_save_path, exist_ok=True)
++            experimental_config = torch_npu.profiler._ExperimentalConfig(
++                profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
++                aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization
++            )
++            repeat = 1
++            profiler = torch_npu.profiler.profile(
++                activities=[
++                    torch_npu.profiler.ProfilerActivity.NPU,
++                    torch_npu.profiler.ProfilerActivity.CPU,
++                ],
++                with_stack=False,
++                record_shapes=False,
++                profile_memory=False,
++                experimental_config=experimental_config,
++                schedule=torch_npu.profiler.schedule(
++                    wait=0,
++                    warmup=0,
++                    active=self.profiler_step,
++                    repeat=repeat,
++                    skip_first=self.profiler_skip_first
++                ),
++                on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(profile_save_path)
++            )
++        else:
++            profiler = FakeContextManager()
++
++        return profiler
++
++
++forward_mode_mapper = {
++    ForwardMode.EXTEND: "EXTEND",
++    ForwardMode.DECODE: "DECODE",
++    ForwardMode.MIXED: "MIXED",
++    ForwardMode.IDLE: "IDLE",
++    ForwardMode.TARGET_VERIFY: "TARGET_VERIFY",
++    ForwardMode.DRAFT_EXTEND: "DRAFT_EXTEND",
++    ForwardMode.DRAFT_EXTEND_V2: "DRAFT_EXTEND_V2",
++    ForwardMode.SPLIT_PREFILL: "SPLIT_PREFILL",
++}
++
++def get_execute_stage(forward_batch: ForwardBatch):
++    return forward_mode_mapper[forward_batch.forward_mode]
+-- 
+2.50.0.windows.1
+

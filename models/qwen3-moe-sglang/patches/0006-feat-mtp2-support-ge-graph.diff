@@ -1,0 +1,457 @@
+From d0ba7b20f837a0a2ee28bc9e296469371d10097d Mon Sep 17 00:00:00 2001
+From: zqh923 <zhouqinghong1@hisilicon.com>
+Date: Tue, 9 Dec 2025 19:58:17 +0800
+Subject: [PATCH 6/9] [feat] mtp2 support ge graph
+
+Signed-off-by: zqh923 <zhouqinghong1@hisilicon.com>
+---
+ .../eagle_draft_cuda_graph_runner.py          |   3 +
+ .../eagle_draft_npu_graph_runner.py           | 356 +++++++++++++++++-
+ python/sglang/srt/speculative/eagle_worker.py |   8 +-
+ 3 files changed, 362 insertions(+), 5 deletions(-)
+
+diff --git a/python/sglang/srt/speculative/eagle_draft_cuda_graph_runner.py b/python/sglang/srt/speculative/eagle_draft_cuda_graph_runner.py
+index 2038ba4d9..97ad87e61 100644
+--- a/python/sglang/srt/speculative/eagle_draft_cuda_graph_runner.py
++++ b/python/sglang/srt/speculative/eagle_draft_cuda_graph_runner.py
+@@ -129,6 +129,9 @@ class EAGLEDraftCudaGraphRunner:
+                 self.global_num_tokens_for_logprob_gpu = None
+ 
+         # Capture
++        self.initialize()
++
++    def initialize(self):
+         try:
+             with model_capture_mode():
+                 self.capture()
+diff --git a/python/sglang/srt/speculative/eagle_draft_npu_graph_runner.py b/python/sglang/srt/speculative/eagle_draft_npu_graph_runner.py
+index 11ce91489..d224561c4 100644
+--- a/python/sglang/srt/speculative/eagle_draft_npu_graph_runner.py
++++ b/python/sglang/srt/speculative/eagle_draft_npu_graph_runner.py
+@@ -17,20 +17,44 @@ from __future__ import annotations
+ 
+ import logging
+ import threading
+-from typing import TYPE_CHECKING
++from typing import TYPE_CHECKING, List
+ 
+ import torch
++import torchair as tng
++import tqdm
+ 
+ from sglang.srt.configs.model_config import is_deepseek_nsa
+ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+ from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
+     EAGLEDraftCudaGraphRunner,
+ )
++from sglang.srt.distributed import get_tensor_model_parallel_rank
++from sglang.srt.speculative.eagle_info import EagleDraftInput
++from sglang.srt.layers.dp_attention import (
++    DpPaddingMode,
++    set_dp_buffer_len,
++    set_is_extend_in_batch,
++)
++from sglang.srt.model_executor.forward_batch_info import (
++    CaptureHiddenMode,
++    ForwardBatch,
++    ForwardMode,
++)
++from sglang.srt.utils import get_available_gpu_memory, get_compiler_backend, get_bool_env_var, get_compiler_config
++from sglang.srt.speculative.spec_utils import (
++    detect_nan,
++    fast_topk,
++    select_top_k_tokens,
++)
++from sglang.srt.speculative.eagle_utils import (
++    organize_draft_results,
++)
+ 
+ if TYPE_CHECKING:
+     from sglang.srt.speculative.eagle_worker import EAGLEWorker
+ 
+ from sglang.srt.utils import is_npu
++from sglang.srt.utils.profiler import time_decorator, NpuProfiler, get_execute_stage
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -42,10 +66,23 @@ if is_npu():
+     torch.cuda.Stream = torch.npu.Stream
+     torch.cuda.current_stream = torch.npu.current_stream
+ 
++_GE_CACHE_DIR: str = "compile_cache/draft"
++
+ 
+ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
+     def __init__(self, eagle_worker: EAGLEWorker):
+         super().__init__(eagle_worker)
++        self.speculative_num_draft_tokens = self.model_runner.server_args.speculative_num_draft_tokens
++        self.compile_bs = [self.model_runner.server_args.max_running_requests // self.dp_size]
++        self.perfect_eplb = self.model_runner.server_args.perfect_eplb
++        self.forward_batch = {}
++        self.enable_cache_compile = self.model_runner.server_args.enable_cache_compile
++        if self.enable_torch_compile:
++            self.warm_up()
++
++    def initialize(self):
++        if not self.enable_torch_compile:
++            super().initialize()
+ 
+     def _create_graph(self):
+         return torch.npu.NPUGraph()
+@@ -79,3 +116,320 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
+             thread.join()
+         else:
+             self.graphs[self.bs].replay()
++
++    def prepare_forward_batch(self, bs: int, num_seqs: int) -> ForwardBatch:
++        num_tokens = bs * self.num_tokens_per_bs
++
++        # Graph inputs
++        input_ids = self.input_ids[:num_tokens]
++        req_pool_indices = self.req_pool_indices[:num_seqs]
++        seq_lens = self.seq_lens[:num_seqs]
++        seq_lens.fill_(self.num_tokens_per_bs)
++        seq_lens_cpu = self.seq_lens_cpu[:num_seqs]
++        extend_seq_lens = self.extend_seq_lens[:num_seqs]
++        extend_seq_lens_cpu = self.extend_seq_lens_cpu[:num_seqs]
++        out_cache_loc = self.out_cache_loc[: num_tokens]
++        positions = self.positions[:num_tokens]
++        mrope_positions = self.mrope_positions[:, :num_tokens]
++        topk_p = self.topk_p[:num_seqs]
++        topk_index = self.topk_index[:num_seqs]
++        hidden_states = self.hidden_states[:num_seqs]
++
++        if self.require_mlp_tp_gather:
++            global_num_tokens = torch.tensor(
++                    [
++                    num_tokens // self.dp_size + (i < (num_tokens % self.dp_size))
++                    for i in range(self.dp_size)
++                    ],
++                    dtype=torch.int64,
++                    device=self.input_ids.device,
++                )
++            self.global_num_tokens_for_logprob_gpu = torch.tensor(
++                    [
++                    num_tokens // self.dp_size + (i < (num_tokens % self.dp_size))
++                    for i in range(self.dp_size)
++                    ],
++                    dtype=torch.int64,
++                    device=self.input_ids.device,
++                )
++            global_dp_buffer_len = num_tokens * self.dp_size
++        elif self.require_attn_tp_gather:
++            global_num_tokens = torch.tensor(
++                    [num_tokens],
++                    dtype=torch.int64,
++                    device=self.input_ids.device,
++                )
++            self.global_num_tokens_for_logprob_gpu = torch.tensor(
++                    [num_tokens],
++                    dtype=torch.int64,
++                    device=self.input_ids.device,
++                )
++            global_dp_buffer_len = num_tokens
++        else:
++            global_num_tokens = None
++            global_dp_buffer_len = None
++
++        if self.perfect_eplb and hasattr(self.model_runner.model, "gen_cur_topk_idx"):
++            cur_topk_list = self.model_runner.model.gen_cur_topk_idx(num_tokens)
++        else:
++            cur_topk_list = None
++
++        spec_info = EagleDraftInput(
++            topk_p=topk_p,
++            topk_index=topk_index,
++            hidden_states=hidden_states,
++            capture_hidden_mode=CaptureHiddenMode.LAST,
++        )
++        spec_info.positions = None
++
++        # Forward batch
++        forward_batch = ForwardBatch(
++            forward_mode=ForwardMode.DECODE,
++            batch_size=num_seqs,
++            input_ids=input_ids,
++            req_pool_indices=req_pool_indices,
++            seq_lens=seq_lens,
++            seq_lens_cpu=seq_lens_cpu,
++            extend_seq_lens=extend_seq_lens,
++            extend_seq_lens_cpu=extend_seq_lens_cpu,
++            req_to_token_pool=self.model_runner.req_to_token_pool,
++            token_to_kv_pool=self.model_runner.token_to_kv_pool,
++            out_cache_loc=out_cache_loc,
++            seq_lens_sum=seq_lens.sum().item(),
++            return_logprob=False,
++            positions=positions,
++            perfect_eplb=self.perfect_eplb,
++            cur_topk_list=cur_topk_list,
++            mrope_positions=mrope_positions,
++            global_num_tokens_gpu=global_num_tokens,
++            dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
++            global_dp_buffer_len=global_dp_buffer_len,
++            spec_algorithm=self.model_runner.spec_algorithm,
++            spec_info=spec_info,
++            capture_hidden_mode=(
++                spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
++            ),
++            global_num_tokens_for_logprob_gpu=self.global_num_tokens_for_logprob_gpu,
++        )
++        return forward_batch
++
++    def warm_up(self):
++        @torch.compile(dynamic=True, backend=get_compiler_backend())
++        def run_for_init(input):
++            return input + 1
++
++        input = torch.zeros([1]).to(self.model_runner.device)
++        run_for_init(input)
++
++        backend = get_compiler_backend()
++        if self.enable_cache_compile:
++            self.model_runner.model.compile_forward_draft = tng.inference.cache_compile(
++                self.model_runner.model.draft,
++                cache_dir=_GE_CACHE_DIR,
++                config=get_compiler_config(),
++                dynamic=False,
++                fullgraph=True,
++                ge_cache=True
++            )
++        else:
++            self.model_runner.model.compile_forward_draft = torch.compile(
++                torch.no_grad()(self.model_runner.model.forward),
++                fullgraph=True,
++                dynamic=False,
++                backend=backend,
++            )
++        self.model_runner.model.time_decorator_forward_draft = \
++            time_decorator(self.model_runner.model.compile_forward_draft)
++
++        compile_range = (
++            tqdm.tqdm(list(reversed(self.compile_bs)))
++            if get_tensor_model_parallel_rank() == 0
++            else reversed(self.compile_bs)
++        )
++
++        for bs in compile_range:
++            if get_tensor_model_parallel_rank() == 0:
++                avail_mem = get_available_gpu_memory(
++                    self.model_runner.device,
++                    self.model_runner.gpu_id,
++                    empty_cache=False,
++                )
++                compile_range.set_description(
++                    f"Capturing draft model batches ({bs=} {avail_mem=:.2f} GB)"
++                )
++            num_tokens = bs * self.num_tokens_per_bs
++            self.forward_batch[bs] = self.prepare_forward_batch(bs, num_tokens)
++
++            set_dp_buffer_len(self.forward_batch[bs].global_dp_buffer_len, num_tokens, dp_max_padding=True)
++            set_is_extend_in_batch(False)
++            self.model_runner.draft_attn_backend.init_forward_metadata(self.forward_batch[bs], can_run_graph=True)
++            self.forward_batch[bs].attn_backend = self.model_runner.draft_attn_backend.attn_backends[0]
++
++            # Run and compile
++            def run_once():
++                # Clean intermediate result cache for DP attention
++                self.forward_batch[bs].dp_local_start_pos = self.forward_batch[bs].dp_local_num_tokens = None
++
++                # Backup two fields, which will be modified in-place in `draft_forward`.
++                output_cache_loc_backup = self.forward_batch[bs].out_cache_loc
++                hidden_states_backup = self.forward_batch[bs].spec_info.hidden_states
++
++                with torch.no_grad():
++                    ret = self.model_runner.model.compile_forward_draft(
++                        self.forward_batch[bs].input_ids,
++                        self.forward_batch[bs].positions,
++                        self.forward_batch[bs],
++                    )
++                self.forward_batch[bs].out_cache_loc = output_cache_loc_backup
++                self.forward_batch[bs].spec_info.hidden_states = hidden_states_backup
++                return ret
++
++            torch.npu.synchronize()
++            self.model_runner.tp_group.barrier()
++            run_once()
++
++    def can_run(self, forward_batch: ForwardBatch):
++        if not self.enable_torch_compile:
++            return super().can_run(forward_batch)
++
++        return (
++            not forward_batch.is_extend_in_batch
++        )
++
++    def forward(self, input_ids, position, forward_batch):
++        out = self.eagle_worker.draft_model_runner.model.forward(input_ids, position, forward_batch)
++        return out
++
++    def draft_forward(self, forward_batch):
++        # Parse args
++        spec_info = self.forward_batch[self.bs].spec_info
++        assert isinstance(spec_info, EagleDraftInput)
++        topk_p, topk_index, hidden_states = (
++            spec_info.topk_p,
++            spec_info.topk_index,
++            spec_info.hidden_states,
++        )
++        if self.eagle_worker.hot_token_id is not None:
++            topk_index = self.eagle_worker.hot_token_id[topk_index]
++
++        out_cache_loc = forward_batch.out_cache_loc.reshape(
++            self.raw_bs, self.topk, self.speculative_num_steps
++        )
++        out_cache_loc = out_cache_loc.permute((2, 0, 1)).reshape(
++            self.speculative_num_steps, -1
++        )
++
++        # Return values
++        score_list: List[torch.Tensor] = []
++        token_list: List[torch.Tensor] = []
++        parents_list: List[torch.Tensor] = []
++
++        # Forward multiple steps
++        scores = None
++        for i in range(self.speculative_num_steps):
++            input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
++                i, topk_p, topk_index, hidden_states, scores, self.topk
++            )
++            score_list.append(tree_info[0])
++            token_list.append(tree_info[1])
++            parents_list.append(tree_info[2])
++
++            # We don't need to run the last forward. we get 1 token from draft prefill and (#spec steps - 1) tokens here
++            if i == self.speculative_num_steps - 1:
++                break
++
++            # Set inputs
++            self.forward_batch[self.bs].input_ids[:self.raw_num_token].copy_(input_ids[:self.raw_num_token])
++            # This is a temporary fix for the case that the user is using standalone
++            # speculative decoding and the draft model architecture is gpt-oss. gpt-oss
++            # rope kernel needs cache_loc to be contiguous.
++            if (
++                self.eagle_worker.server_args.speculative_algorithm == "STANDALONE"
++                and self.eagle_worker.model_config.hf_config.architectures[0] == "GptOssForCausalLM"
++            ):
++                out_cache_loc = out_cache_loc.contiguous()
++            self.forward_batch[self.bs].out_cache_loc[: self.raw_num_token].copy_(
++                out_cache_loc[i]
++            )
++            self.forward_batch[self.bs].positions.add_(1)
++            self.forward_batch[self.bs].attn_backend = self.model_runner.draft_attn_backend.attn_backends[i]
++            self.forward_batch[self.bs].spec_info.hidden_states[:self.raw_num_token].copy_(hidden_states[:self.raw_num_token])
++
++            # Run forward
++            with torch.no_grad():
++                logits_output, inference_time = self.model_runner.model.time_decorator_forward_draft(
++                    self.forward_batch[self.bs].input_ids,
++                    self.forward_batch[self.bs].positions,
++                    self.forward_batch[self.bs],
++                )
++                logging.info(f"For forward_mode: {get_execute_stage(forward_batch)},\
++                                draft inference time cost {(inference_time)*1000:.2f} ms")
++
++            if self.eagle_worker.server_args.enable_nan_detection:
++                detect_nan(logits_output)
++            probs = torch.softmax(logits_output.next_token_logits, dim=-1)
++            topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
++            if self.eagle_worker.hot_token_id is not None:
++                topk_index = self.eagle_worker.hot_token_id[topk_index]
++            hidden_states = logits_output.hidden_states
++
++        parent_list, top_scores_index, draft_tokens = organize_draft_results(
++            score_list, token_list, parents_list, self.speculative_num_draft_tokens
++        )
++
++        return parent_list, top_scores_index, draft_tokens
++
++    def replay_prepare(self, forward_batch: ForwardBatch):
++        if not self.enable_torch_compile:
++            return super().replay(forward_batch)
++
++        # pad, similar with front part in replay of parent class
++        raw_bs = forward_batch.batch_size
++        raw_num_token = raw_bs * self.num_tokens_per_bs
++
++        bs = self.compile_bs[0]
++        if bs != raw_bs:
++            self.forward_batch[bs].seq_lens.fill_(self.seq_len_fill_value)
++            self.forward_batch[bs].out_cache_loc.zero_()
++            self.forward_batch[bs].positions.zero_()
++
++        # Common inputs
++        self.forward_batch[bs].req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
++        self.forward_batch[bs].seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
++        self.forward_batch[bs].positions[:raw_num_token].copy_(forward_batch.positions)
++        self.forward_batch[bs].spec_info.topk_p[:raw_bs].copy_(forward_batch.spec_info.topk_p)
++        self.forward_batch[bs].spec_info.topk_index[:raw_bs].copy_(forward_batch.spec_info.topk_index)
++        self.forward_batch[bs].spec_info.hidden_states[:raw_bs].copy_(forward_batch.spec_info.hidden_states)
++
++        # TODO(ch-wan): support num_token_non_padded
++        if self.require_gathered_buffer:
++            self.forward_batch[bs].global_num_tokens_gpu.fill_(bs * self.num_tokens_per_bs)
++            self.forward_batch[bs].global_num_tokens_for_logprob_gpu.fill_(bs * self.num_tokens_per_bs)
++
++
++        if forward_batch.seq_lens_cpu is not None:
++            if bs != raw_bs:
++                self.forward_batch[bs].seq_lens_cpu.fill_(self.seq_len_fill_value)
++            self.forward_batch[bs].seq_lens_cpu[:raw_bs].copy_(forward_batch.seq_lens_cpu)
++
++        self.model_runner.draft_attn_backend.init_forward_metadata(self.forward_batch[bs], can_run_graph=True)
++        set_dp_buffer_len(self.forward_batch[bs].global_dp_buffer_len, bs * self.num_tokens_per_bs, dp_max_padding=True)
++        self.raw_bs = raw_bs
++        self.bs = bs
++        self.raw_num_token = raw_num_token
++
++    def replay(self, forward_batch):
++        self.replay_prepare(forward_batch)
++        out = self.draft_forward(forward_batch)
++        if self.bs != self.raw_bs:
++            out = self._postprocess_output_to_raw_bs(out, self.raw_bs)
++            forward_batch.batch_size = self.raw_bs
++            forward_batch.positions = self.forward_batch[self.bs].positions[:self.raw_num_token]
++            forward_batch.seq_lens = self.forward_batch[self.bs].seq_lens[:self.raw_bs]
++            forward_batch.req_pool_indices = self.forward_batch[self.bs].req_pool_indices[:self.raw_bs]
++            if forward_batch.seq_lens_cpu is not None:
++                forward_batch.seq_lens_cpu = self.forward_batch[self.bs].seq_lens_cpu[:self.raw_bs]
++
++        return out
++
++
+diff --git a/python/sglang/srt/speculative/eagle_worker.py b/python/sglang/srt/speculative/eagle_worker.py
+index b97d6feef..9d5ab8b5c 100644
+--- a/python/sglang/srt/speculative/eagle_worker.py
++++ b/python/sglang/srt/speculative/eagle_worker.py
+@@ -88,6 +88,7 @@ class EAGLEWorker(TpModelWorker):
+         self.server_args = server_args
+         self.topk = server_args.speculative_eagle_topk
+         self.speculative_num_steps = server_args.speculative_num_steps
++        self.enable_torch_compile = server_args.enable_torch_compile
+         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
+         self.enable_nan_detection = server_args.enable_nan_detection
+         self.gpu_id = gpu_id
+@@ -517,9 +518,9 @@ class EAGLEWorker(TpModelWorker):
+             forward_batch
+         )
+         if can_cuda_graph:
+-            parent_list, top_scores_index, draft_tokens = self.cuda_graph_runner.replay(
+-                forward_batch
+-            )
++                parent_list, top_scores_index, draft_tokens = self.cuda_graph_runner.replay(
++                    forward_batch
++                )
+         else:
+             forward_batch.can_run_dp_cuda_graph = False
+             if (
+@@ -629,7 +630,6 @@ class EAGLEWorker(TpModelWorker):
+             forward_batch.attn_backend = self.draft_attn_backend.attn_backends[i]
+             spec_info.hidden_states = hidden_states
+ 
+-            # Run forward
+             logits_output, _ = self.draft_model_runner.forward(
+                 forward_batch, skip_attn_backend_init=True
+             )
+-- 
+2.50.0.windows.1
+

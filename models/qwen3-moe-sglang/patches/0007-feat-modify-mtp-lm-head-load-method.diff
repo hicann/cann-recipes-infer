@@ -1,0 +1,108 @@
+From 44ab016c04917edfe9bd5edc2399fcd5de27f074 Mon Sep 17 00:00:00 2001
+From: zqh923 <zhouqinghong1@hisilicon.com>
+Date: Mon, 8 Dec 2025 14:12:54 +0800
+Subject: [PATCH 7/9] [feat] modify mtp lm head load method
+
+Signed-off-by: zqh923 <zhouqinghong1@hisilicon.com>
+---
+ python/sglang/srt/models/qwen3_moe.py         | 19 ++++++++++++++++---
+ python/sglang/srt/models/qwen3_moe_nextn.py   |  7 ++++---
+ python/sglang/srt/speculative/eagle_worker.py |  8 +++++++-
+ 3 files changed, 27 insertions(+), 7 deletions(-)
+
+diff --git a/python/sglang/srt/models/qwen3_moe.py b/python/sglang/srt/models/qwen3_moe.py
+index b2f9e41a1..e5324a3e6 100644
+--- a/python/sglang/srt/models/qwen3_moe.py
++++ b/python/sglang/srt/models/qwen3_moe.py
+@@ -1242,9 +1242,19 @@ class Qwen3MoeForCausalLM(nn.Module):
+ 
+     def set_embed_and_head(self, embed, head):
+         del self.model.embed_tokens.weight
+-        del self.lm_head.weight
++        del self.shared_head.weight
++        self.model.embed_tokens.weight = embed
++        self.shared_head.weight = head
++        if _is_npu:
++            torch.npu.empty_cache()
++            torch.npu.synchronize()
++        else:
++            torch.cuda.empty_cache()
++            torch.cuda.synchronize()
++
++    def set_embed(self, embed):
++        del self.model.embed_tokens.weight
+         self.model.embed_tokens.weight = embed
+-        self.lm_head.weight = head
+         if _is_npu:
+             torch.npu.empty_cache()
+             torch.npu.synchronize()
+@@ -1319,8 +1329,11 @@ class Qwen3MoeForCausalLM(nn.Module):
+                 if not name.startswith(mtp_layer_prefix) and not \
+                     any(shared_weight_name in name for shared_weight_name in shared_weight_names):
+                     continue
+-
+                 is_decoder = True
++                if "shared_head.head" in name:
++                    self.load_lm_head_from_target = False
++                    name = name.replace(mtp_layer_prefix+".shared_head.head", "shared_head")
++                    is_decoder = False
+                 # For nextn specific weights
+                 for weight_name in mtp_spec_weight_names:
+                     if weight_name in name:
+diff --git a/python/sglang/srt/models/qwen3_moe_nextn.py b/python/sglang/srt/models/qwen3_moe_nextn.py
+index bd3d58e42..125d20189 100644
+--- a/python/sglang/srt/models/qwen3_moe_nextn.py
++++ b/python/sglang/srt/models/qwen3_moe_nextn.py
+@@ -151,6 +151,7 @@ class Qwen3MoeForCausalLMNextN(Qwen3MoeForCausalLM):
+         self.moe_tp_size = get_moe_tensor_parallel_world_size()
+         self.attn_tp_size = get_attention_tp_size()
+         self.attn_dp_size = get_attention_dp_size()
++        self.load_lm_head_from_target = True
+ 
+         # TODO mtp cache, sglang\python\sglang\srt\configs\model_config.py, which make
+         # self.hf_config.num_hidden_layers = self.hf_config.num_nextn_predict_layers, check to delete the follow line
+@@ -159,11 +160,11 @@ class Qwen3MoeForCausalLMNextN(Qwen3MoeForCausalLM):
+         self.model = Qwen3MoeModelNextN(
+             config, quant_config, prefix=add_prefix("model", prefix)
+         )
+-        self.lm_head = ParallelLMHead(
++        self.shared_head = ParallelLMHead(
+             config.vocab_size,
+             config.hidden_size,
+             quant_config=quant_config,
+-            prefix=add_prefix("lm_head", prefix),   # shared lm_head
++            prefix=add_prefix("shared_head", prefix),   # shared lm_head
+             use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+         )
+         self.logits_processor = LogitsProcessor(config)
+@@ -177,7 +178,7 @@ class Qwen3MoeForCausalLMNextN(Qwen3MoeForCausalLM):
+     ) -> torch.Tensor:
+         hidden_states = self.model(input_ids, positions, forward_batch)
+         return self.logits_processor(
+-            input_ids, hidden_states, self.lm_head, forward_batch
++            input_ids, hidden_states, self.shared_head, forward_batch
+         )
+ 
+     def extend(
+diff --git a/python/sglang/srt/speculative/eagle_worker.py b/python/sglang/srt/speculative/eagle_worker.py
+index 9d5ab8b5c..8f9bc6d7b 100644
+--- a/python/sglang/srt/speculative/eagle_worker.py
++++ b/python/sglang/srt/speculative/eagle_worker.py
+@@ -172,7 +172,13 @@ class EAGLEWorker(TpModelWorker):
+                 head.data = head.data[self.hot_token_id]
+ 
+             # Share the embedding and lm_head
+-            self.draft_model_runner.model.set_embed_and_head(embed, head)
++            if (
++                hasattr(self.draft_model_runner.model, "load_lm_head_from_target")
++                and not self.draft_model_runner.model.load_lm_head_from_target
++            ):
++                self.draft_model_runner.model.set_embed(embed)
++            else:
++                self.draft_model_runner.model.set_embed_and_head(embed, head)
+ 
+         # Init attention backend and cuda graphs
+         self.draft_model_runner.server_args.disable_cuda_graph = (
+-- 
+2.50.0.windows.1
+

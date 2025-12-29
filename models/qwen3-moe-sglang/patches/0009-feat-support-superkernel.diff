@@ -1,0 +1,197 @@
+From 6a8b560a05749d4728d7b06b231342646a3bae79 Mon Sep 17 00:00:00 2001
+From: zqh923 <zhouqinghong1@hisilicon.com>
+Date: Mon, 22 Dec 2025 14:07:25 +0800
+Subject: [PATCH 9/9] [feat] support superkernel
+
+Signed-off-by: zqh923 <zhouqinghong1@hisilicon.com>
+---
+ .../srt/model_executor/npu_graph_runner.py    |  2 ++
+ python/sglang/srt/models/qwen3_moe.py         | 36 +++++++++++++------
+ .../eagle_draft_extend_npu_graph_runner.py    |  2 ++
+ .../eagle_draft_npu_graph_runner.py           |  2 ++
+ python/sglang/srt/utils/common.py             | 20 +++++++++++
+ 5 files changed, 51 insertions(+), 11 deletions(-)
+
+diff --git a/python/sglang/srt/model_executor/npu_graph_runner.py b/python/sglang/srt/model_executor/npu_graph_runner.py
+index 4636c93f0..048c3c077 100644
+--- a/python/sglang/srt/model_executor/npu_graph_runner.py
++++ b/python/sglang/srt/model_executor/npu_graph_runner.py
+@@ -61,6 +61,7 @@ class NPUGraphRunner(CudaGraphRunner):
+         self.compile_bs = [model_runner.server_args.max_running_requests // self.dp_size]
+         self.forward_batch = {}
+         self.perfect_eplb = model_runner.server_args.perfect_eplb
++        self.enable_superkernel = model_runner.server_args.enable_superkernel
+         if model_runner.server_args.speculative_num_draft_tokens:
+             self.num_tokens_per_bs = model_runner.server_args.speculative_num_draft_tokens
+         self.enable_cache_compile = model_runner.server_args.enable_cache_compile
+@@ -354,6 +355,7 @@ class NPUGraphRunner(CudaGraphRunner):
+             mm_inputs=[None] * bs,
+             lora_ids=[None] * bs,
+             perfect_eplb=self.perfect_eplb,
++            enable_superkernel = self.enable_superkernel,
+             cur_topk_list=cur_topk_list,
+             global_num_tokens_cpu=[num_tokens],
+             global_num_tokens_for_logprob_cpu=[num_tokens // self.dp_size for _ in range(self.dp_size)],
+diff --git a/python/sglang/srt/models/qwen3_moe.py b/python/sglang/srt/models/qwen3_moe.py
+index e5324a3e6..4aa0bd6a1 100644
+--- a/python/sglang/srt/models/qwen3_moe.py
++++ b/python/sglang/srt/models/qwen3_moe.py
+@@ -76,6 +76,7 @@ from sglang.srt.utils import (
+     is_npu,
+     is_flashinfer_available,
+     is_non_idle_and_non_empty,
++    superkernel_scope,
+ )
+ from sglang.srt.two_batch_overlap import model_forward_maybe_tbo
+ from sglang.srt.layers.communicator import (
+@@ -198,6 +199,7 @@ class Qwen3MoeSparseMoeBlockNPU(nn.Module):
+     def forward(self, hidden_states, forward_batch):
+         if hidden_states.shape[0] > 0:
+             topk_idx, topk_weight, _, row_idx = self.gate(hidden_states)
++            topk_weight = topk_weight.to(torch.float32)
+             if forward_batch.perfect_eplb and forward_batch.cur_topk_list is not None:
+                 topk_idx = forward_batch.cur_topk_list
+             topk_idx = topk_idx.to(torch.int32)
+@@ -364,7 +366,7 @@ class Qwen3MoeSparseMoeBlockNPU(nn.Module):
+             "expand_x": hidden_states_ordered_by_experts,
+             "expert_ids": topk_ids,
+             "assist_info_for_combine": expand_idx,
+-            "expert_scales": topk_weight.to(torch.float32), # [n*topk]
++            "expert_scales": topk_weight, # [n*topk]
+             "ep_send_counts": ep_recv_counts,
+             "tp_send_counts": tp_recv_counts,
+             **self.combine_kwargs
+@@ -933,12 +935,13 @@ class Qwen3MoeDecoderLayer(nn.Module):
+         )
+ 
+         if hidden_states.shape[0] != 0:
+-            hidden_states = self.self_attn(
+-                positions=positions,
+-                hidden_states=hidden_states,
+-                forward_batch=forward_batch,
+-                cos_sin=cos_sin,
+-            )
++            with superkernel_scope(forward_batch.enable_superkernel, f"scope_{self.layer_id}_attn", ""):
++                hidden_states = self.self_attn(
++                    positions=positions,
++                    hidden_states=hidden_states,
++                    forward_batch=forward_batch,
++                    cos_sin=cos_sin,
++                )
+ 
+         hidden_states, residual = self.layer_communicator.prepare_mlp(
+             hidden_states, residual, forward_batch
+@@ -954,10 +957,10 @@ class Qwen3MoeDecoderLayer(nn.Module):
+         use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+             forward_batch
+         )
+-
+-        hidden_states = self.mlp(
+-            hidden_states, forward_batch
+-        )
++        with superkernel_scope(forward_batch.enable_superkernel, f"scope_{self.layer_id}_moe", ""):
++            hidden_states = self.mlp(
++                hidden_states, forward_batch
++            )
+ 
+         if should_allreduce_fusion:
+             hidden_states._sglang_needs_allreduce_fusion = True
+@@ -968,6 +971,17 @@ class Qwen3MoeDecoderLayer(nn.Module):
+ 
+         return hidden_states, residual
+ 
++    def sk_forward(
++        self,
++        positions: torch.Tensor,
++        hidden_states: torch.Tensor,
++        forward_batch: ForwardBatch,
++        residual: Optional[torch.Tensor],
++        cos_sin: Optional[Tuple] = None,
++    ) -> Tuple[torch.Tensor, torch.Tensor]:
++        with superkernel_scope(forward_batch.enable_superkernel, f"scope_{self.layer_id}_layer", ""):
++            return self.forward(positions, hidden_states, forward_batch, residual, cos_sin=cos_sin)
++
+     def op_comm_prepare_attn(
+         self,
+         state,
+diff --git a/python/sglang/srt/speculative/eagle_draft_extend_npu_graph_runner.py b/python/sglang/srt/speculative/eagle_draft_extend_npu_graph_runner.py
+index 077cb9e4c..6ec7d8c44 100644
+--- a/python/sglang/srt/speculative/eagle_draft_extend_npu_graph_runner.py
++++ b/python/sglang/srt/speculative/eagle_draft_extend_npu_graph_runner.py
+@@ -57,6 +57,7 @@ class EAGLEDraftExtendNpuGraphRunner(EAGLEDraftExtendCudaGraphRunner):
+         super().__init__(eagle_worker)
+         self.compile_bs = [self.model_runner.server_args.max_running_requests // self.dp_size]
+         self.perfect_eplb = self.model_runner.server_args.perfect_eplb
++        self.enable_superkernel = self.model_runner.server_args.enable_superkernel
+         self.forward_batch = {}
+         self.enable_cache_compile = self.model_runner.server_args.enable_cache_compile
+         self.enable_profiler = get_bool_env_var("ENABLE_PROFILER", "false")
+@@ -292,6 +293,7 @@ class EAGLEDraftExtendNpuGraphRunner(EAGLEDraftExtendCudaGraphRunner):
+             spec_algorithm=self.model_runner.spec_algorithm,
+             spec_info=spec_info,
+             perfect_eplb=self.perfect_eplb,
++            enable_superkernel = self.enable_superkernel,
+             cur_topk_list=cur_topk_list,
+             capture_hidden_mode=CaptureHiddenMode.LAST,
+             attn_backend=self.eagle_worker.draft_extend_attn_backend,
+diff --git a/python/sglang/srt/speculative/eagle_draft_npu_graph_runner.py b/python/sglang/srt/speculative/eagle_draft_npu_graph_runner.py
+index d224561c4..8ad26b4fb 100644
+--- a/python/sglang/srt/speculative/eagle_draft_npu_graph_runner.py
++++ b/python/sglang/srt/speculative/eagle_draft_npu_graph_runner.py
+@@ -75,6 +75,7 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
+         self.speculative_num_draft_tokens = self.model_runner.server_args.speculative_num_draft_tokens
+         self.compile_bs = [self.model_runner.server_args.max_running_requests // self.dp_size]
+         self.perfect_eplb = self.model_runner.server_args.perfect_eplb
++        self.enable_superkernel = self.model_runner.server_args.enable_superkernel
+         self.forward_batch = {}
+         self.enable_cache_compile = self.model_runner.server_args.enable_cache_compile
+         if self.enable_torch_compile:
+@@ -199,6 +200,7 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
+             return_logprob=False,
+             positions=positions,
+             perfect_eplb=self.perfect_eplb,
++            enable_superkernel = self.enable_superkernel,
+             cur_topk_list=cur_topk_list,
+             mrope_positions=mrope_positions,
+             global_num_tokens_gpu=global_num_tokens,
+diff --git a/python/sglang/srt/utils/common.py b/python/sglang/srt/utils/common.py
+index 4411fd751..d692457ca 100644
+--- a/python/sglang/srt/utils/common.py
++++ b/python/sglang/srt/utils/common.py
+@@ -81,6 +81,7 @@ import torch.distributed
+ import torch.distributed as dist
+ import triton
+ import zmq
++import torchair as tng
+ from fastapi.responses import ORJSONResponse
+ from packaging import version as pkg_version
+ from PIL import Image
+@@ -624,6 +625,25 @@ def get_cmo_stream():
+     return cmo_stream
+ 
+ 
++class FakeContextManager:
++    def __init__(self) -> None:
++        pass
++
++    def __enter__(self):
++        pass
++
++    def __exit__(self, exc_type, exc_value, traceback):
++        pass
++
++
++
++def superkernel_scope(enable: bool, scope: str, options: str = None):
++    if enable:
++        return tng.scope.super_kernel(scope, options)
++    else:
++        return FakeContextManager()
++
++
+ def prepare_weight_cache(handle, cache):
+     import torch_npu
+ 
+-- 
+2.50.0.windows.1
+
