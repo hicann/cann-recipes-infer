@@ -42,6 +42,7 @@ from .posemb_layers import apply_rotary_emb
 from .mlp_layers import MLP, MLPEmbedder, FinalLayer
 from .modulate_layers import ModulateDiT, modulate, apply_gate
 from .token_refiner import SingleTokenRefiner
+from .....module.dit_cache_step import cache_manager
 
 
 class MMDoubleStreamBlock(nn.Module):
@@ -505,10 +506,6 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
         self.unpatchify_channels = self.out_channels
         self.guidance_embed = guidance_embed
         self.rope_dim_list = rope_dim_list
-        self.enable_teacache = False
-        self.use_cache = False
-        if args.teacache:
-            self.enable_teacache = True
 
         # Text projection. Default to linear projection.
         # Alternative: TokenRefiner. See more details (LI-DiT): http://arxiv.org/abs/2406.11831
@@ -684,33 +681,25 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
 
         freqs_cis = (freqs_cos, freqs_sin) if freqs_cos is not None else None
 
-        #TeaCache
-        if self.enable_teacache:
-            self.use_cache = True
-            # TeaCache forward
-            should_calc = self.is_should_calc(img, vec, txt)
-            if not should_calc:
-                img += self.previous_residual
-                self.teacache_cnt += 1
-            else:
-                ori_img = img.clone()
-                # --------------------- Pass through DiT blocks ------------------------
-        if not self.use_cache or should_calc:
-            for _, block in enumerate(self.double_blocks):
-                double_block_args = [
-                    img,
-                    txt,
-                    vec,
-                    cu_seqlens_q,
-                    cu_seqlens_kv,
-                    max_seqlen_q,
-                    max_seqlen_kv,
-                    freqs_cis,
-                ]
+        # --------------------- Pass through DiT blocks ------------------------
+        for i, block in enumerate(self.double_blocks):
+            double_block_args = [
+                img,
+                txt,
+                vec,
+                cu_seqlens_q,
+                cu_seqlens_kv,
+                max_seqlen_q,
+                max_seqlen_kv,
+                freqs_cis,
+            ]
 
-                img, txt = block(*double_block_args)
+            img, txt = block(*double_block_args)
+            if i == 0 and cache_manager.cache_step.should_skip:
+                break
 
-            # Merge txt and img to pass through single stream blocks.
+        # Merge txt and img to pass through single stream blocks.
+        if not cache_manager.cache_step.should_skip:
             x = torch.cat((img, txt), 1)
             if len(self.single_blocks) > 0:
                 for _, block in enumerate(self.single_blocks):
@@ -728,10 +717,9 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
                     x = block(*single_block_args)
 
             img = x[:, :img_seq_len, ...]
-            if self.enable_teacache:
-                self.previous_residual = img - ori_img
 
         # ---------------------------- Final layer ------------------------------
+        cache_manager.cache_step.post_cache_update(img)
         img = self.final_layer(img, vec)  # (N, T, patch_size ** 2 * out_channels)
 
         img = self.unpatchify(img, tt, th, tw)

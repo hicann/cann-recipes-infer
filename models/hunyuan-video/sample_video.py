@@ -35,7 +35,9 @@ import hyvideo.monkey_patch
 from hyvideo.utils.file_utils import save_videos_grid, load_json
 from hyvideo.config import parse_args
 from hyvideo.inference import HunyuanVideoSampler
-from hyvideo.cache.teacache import add_teacache_class
+from hyvideo.cache import first_block_forward
+from module.dit_cache_step.cache_step import cache_manager
+
 
 torch_npu.npu.set_compile_mode(jit_compile=False)
 torch.npu.config.allow_internal_format = False
@@ -64,10 +66,11 @@ def main():
     
     # Get the updated args
     args = hunyuan_video_sampler.args
-    
-    #TeaCache
-    if args.teacache:
-        add_teacache_class(hunyuan_video_sampler.pipeline.transformer, args)
+
+    # cache init
+    cache_manager.from_config(args.cache_config)
+    cache_block = hunyuan_video_sampler.pipeline.transformer.double_blocks[0]
+    cache_block.forward = first_block_forward.__get__(cache_block, type(cache_block))
 
     # Start sampling
     # TODO: batch inference check
@@ -97,9 +100,7 @@ def main():
         )
         samples = outputs['samples']
 
-        if args.teacache:
-            skip_cnt = hunyuan_video_sampler.pipeline.transformer.teacache_cnt
-            logger.info(f'Total skip {skip_cnt}/{args.infer_steps} iter by TeaCache')
+        cache_manager.cache_step.print_statistics()
         
         # Save samples
         if 'LOCAL_RANK' not in os.environ or int(os.environ['LOCAL_RANK']) == 0:

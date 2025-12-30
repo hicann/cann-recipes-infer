@@ -21,6 +21,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 export ASCEND_RT_VISIBLE_DEVICES=0
+source scripts/set_env.sh
 python sample_video.py \
     --video-size 720 1280 \
     --video-length 129 \

@@ -1,0 +1,20 @@
+{
+    "cache_forward": "NoCache",
+    "comment": "choose from FBCache/TeaCache, otherwise use NoCache",
+    "FBCache":{
+            "cache_name": "FBCache",
+            "rel_l1_thresh": 0.05,
+            "latent": "latent",
+            "judge_input": "cache_latent"
+    },
+    "TeaCache":{
+            "cache_name" : "TeaCache",
+            "rel_l1_thresh": 0.1,
+            "coefficients": [733.226126,-401.131952,67.5869174,-3.149879,0.0961237896],
+            "latent": "latent",
+            "judge_input": "modulated_inp"
+    },
+    "NoCache":{
+        "cache_name" : "NoCache"
+}
+}

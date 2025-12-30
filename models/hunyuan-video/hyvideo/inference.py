@@ -694,7 +694,7 @@ class HunyuanVideoSampler(Inference):
             data_type="video" if target_video_length > 1 else "image",
             is_progress_bar=True,
             vae_ver=self.args.vae,
-            enable_tiling=self.args.vae_tiling,
+            enable_tiling=self.args.vae_tiling
         )[0]
         out_dict["samples"] = samples
         out_dict["prompts"] = prompt

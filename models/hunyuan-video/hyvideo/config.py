@@ -434,28 +434,10 @@ def add_cache_args(parser: argparse.ArgumentParser):
     group = parser.add_argument_group(title="Cache args")
 
     group.add_argument(
-        "--teacache",
-        action="store_true",
-        help="Enable TeaCache.",
-    )
-
-    group.add_argument(
-        "--rel_l1_thresh",
-        type=float,
-        default="0.1",
-        help="For TeaCache, 0.1 for 1.6x speedup, 0.15 for 2.1x speedup.",
-    )
-
-    group.add_argument(
-        "--adacache",
-        action="store_true",
-        help="Enable AdaCache.",
-    )
-
-    group.add_argument(
-        "--fbcache",
-        action="store_true",
-        help="Enable First-Block Cache.",
+        "--cache-config",
+        type=str,
+        default="hyvideo/cache/cache_config.json",
+        help="Path to cache config."
     )
 
     return parser
