@@ -111,7 +111,7 @@ Prefill阶段路由专家采用**Double-Routing**的计算策略完成计算,具
 基于Atlas A3，本实践对Longcat-Flash W8A8量化版本进行了性能Benchmark测试。
 |Quant Mode| Global Batch Size | Seq Length | Chips | TPOT (ms) | Throughput (tokens/p/s) |
 |-------| ----------------- | ---------- | ----- | --------- | ----------------------- |
-|W8A8 |    512           | 4608       | 128   | 10.37      |   771.46                 |
+|W8A8 |    512           | 4608       | 64   | 10.37      |   771.46                 |
 
 > 1. 性能数据基于 MTP2 与 perfect eplb 配置采集。
 > 2. 当前CANN软件版本（CANN 8.5.0.alpha002）下，SuperKernel标记范围内的部分算子尚不支持完全融合。该限制将在后续社区版本中得到解决，以进一步提升模型性能。
