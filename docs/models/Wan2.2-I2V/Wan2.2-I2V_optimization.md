@@ -178,3 +178,54 @@ for step_idx, t in enumerate(tqdm(timesteps)):
 ```
 
 当检测到CFG并行环境时，它会将条件生成和无条件生成这两个任务分配到两个不同的进程上同时执行，每个进程只需要运行一次模型推理，然后通过all_gather通信操作让两个进程互相获取对方的计算结果，最后使用CFG公式将条件预测和无条件预测按照引导系数混合，得到最终的噪声预测结果，如果没有启用并行环境则会退化到传统模式顺序执行两次模型推理。
+
+### Dit Cache
+
+DIT-Cache作为扩散模型推理加速的缓存框架，通过复用/预测已有的结果，减少冗余前向计算。其加速逻辑可清晰的分为Step-level和Block-level范式，Step-level通过判断不同采样步数step间的特定特征差异，通过阈值比较，决定是否跳过完整的step计算，直接复用或者预测缓存结果；Block-level以block为粒度（通常是attention模块和mlp模块）判断是否直接复用或者预测缓存结果。
+
+本样例集成了Step-level的dit cache方案，支持[FBCache](https://github.com/chengzeyi/ParaAttention)
+
+
+**Step-level典型方法：** 在Step-level加速范畴内，[FBCache](https://arxiv.org/pdf/2411.19108)的原理是基于First Block L1误差，比较第一个Block输出残差与上一步的第一个Block输出残差之间的差异，如果首块输出误差与上一轮首块输出误差差异小于指定阈值，就跳过当前步计算，复用残差，对当前步的输出进行估计。
+
+
+**启动方式：** 本代码模块通过修改cache_config.json文件决定是否使用Cache，Cache范式，Cache相关参数均在[`models\Wan2.2-I2V\wan\cache\cache_config.json`](../../../models/Wan2.2-I2V/wan/cache/cache_config.json) 中直接修改，同时，在run.sh里面使用如下指令可以自定义cache_config.json位置
+```python
+--cache_config './wan/cache/cache_config.json'  #cache_config.json位置
+```      
+其中参数意义如下
+```python
+{
+    "cache_forward": "NoCache",# 直接设置Cache方案，目前支持FBCache,默认启动NOCache，也就是无ditcache方法，只需按照下面的提示将FBCache代替NoCache即可启动
+    "comment": "choose from FBCache/TeaCache, otherwise use NoCache", 
+    "FBCache":{
+            "cache_name": "FBCache",
+            "rel_l1_thresh": 0.05,  # FBCache阈值，阈值越大跳过越多，精度损失越大，需要平衡性能和精度
+            "latent": "latent",
+            "judge_input": "cache_latent"
+    },
+    "TeaCache":{
+            "cache_name" : "TeaCache",
+            "rel_l1_thresh": 0.1,  # TeaCache阈值，阈值越大跳过越多，精度损失越大，需要平衡性能和精度
+            "coefficients": [733.226126,-401.131952,67.5869174,-3.149879,0.0961237896],  #  TeaCache多项式拟合，通过输入输出进行拟合
+            "latent": "latent",
+            "judge_input": "modulated_inp"
+    },
+    "NoCache":{
+        "cache_name" : "NoCache"
+}
+}
+```
+- **框架位置：** 使用dit_cache_step作为自定义库，在模型forward处导入，具体如下：
+```  
+    cann-recipes-spatial-intelligence
+        +--- models #模型目录
+            +--- WAN2.2-I2V
+                +--- set_env.sh #激活module环境
+                +--- wan
+                    +--- cache #cache适配模型口
+                        +--- cache_block.py #dit-cache适配双流模块
+                        +--- cache_config.json #默认cache参数位置
+        +--- module
+            +--- dit_cache_step #step_level实现逻辑
+ ```

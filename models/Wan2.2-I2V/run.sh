@@ -20,6 +20,7 @@ export PYTORCH_NPU_ALLOC_CONF='expandable_segments:True'
 export TASK_QUEUE_ENABLE=2
 export CPU_AFFINITY_CONF=1
 export TOKENIZERS_PARALLELISM=false
+source set_env.sh
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 
 torchrun --nproc_per_node=8 generate.py \

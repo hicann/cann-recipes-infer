@@ -42,7 +42,9 @@ from wan.distributed.util import init_distributed_group
 from wan.utils.prompt_extend import DashScopePromptExpander, QwenPromptExpander
 from wan.utils.utils import save_video, str2bool
 from wan.distributed.parallel_mgr import ParallelConfig, init_parallel_env, finalize_parallel_env
-
+from wan.cache import first_block_forward
+import wan.cache.cache_block
+from module.dit_cache_step.cache_step import cache_manager, NoCache
 
 EXAMPLE_PROMPT = {
     "t2v-A14B": {
@@ -265,8 +267,12 @@ def _parse_args():
         default="./output/quant_data",
         help="Path for calibration data or weight export.")
 
+    parser.add_argument(
+        "--cache_config",
+        type=str,
+        default="./wan/cache/cache_config.json",
+        help="Path for cache_config")
     args = parser.parse_args()
-
     _validate_args(args)
 
     return args
@@ -291,7 +297,6 @@ def generate(args):
     device = local_rank
     _init_logging(rank)
     stream = torch.npu.Stream()
-
     if args.offload_model is None:
         args.offload_model = False if world_size > 1 else True
         logging.info(
@@ -545,10 +550,17 @@ def generate(args):
             convert_model_dtype=args.convert_model_dtype,
             use_vae_parallel=args.vae_parallel,
         )
-        
+        cache_manager.from_config(args.cache_config)
+        if world_size > 1 and cache_manager.cache_step.cache_name != "NoCache":
+            logging.info("Cannot enable both Multi-NPU and DIT-Cache. DIT-Cache has been disabled")
+            cache_manager.cache_step = NoCache(args.cache_config)
+        else:
+            cache_block = wan_i2v.high_noise_model.blocks[0]
+            cache_block.forward = first_block_forward.__get__(cache_block, type(cache_block))
+            cache_block = wan_i2v.low_noise_model.blocks[0]
+            cache_block.forward = first_block_forward.__get__(cache_block, type(cache_block))
         transformer_low = wan_i2v.low_noise_model
         transformer_high = wan_i2v.high_noise_model
-        
         if args.tp_size > 1:
             logging.info("Initializing Tensor Parallel ...")
             applicator = TensorParallelApplicator(args.tp_size, device_map="cpu")
@@ -609,7 +621,7 @@ def generate(args):
             normalize=True,
             value_range=(-1, 1))
     del video
-
+    cache_manager.cache_step.print_statistics()
     finalize_parallel_env()
     logging.info("Finished.")
 

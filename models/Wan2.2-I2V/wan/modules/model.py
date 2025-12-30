@@ -23,8 +23,8 @@ import torch_npu
 import torch.nn as nn
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
-
-from .attention import attention
+from wan.modules.attention import attention
+from module.dit_cache_step import cache_manager
 
 
 __all__ = ['WanModel']
@@ -60,6 +60,7 @@ def rope_params(max_seq_len, dim, theta=10000):
 def rope_apply(x, grid_sizes, freqs_list):
     s, n, c = x.size(1), x.size(2), x.size(3)
     output = []
+    original_dtype = x.dtype
     for i, (f, h, w) in enumerate(grid_sizes.tolist()):
         x_i = x[i, :s].reshape(1, s, n, c)
         if not x_i.is_contiguous():
@@ -67,12 +68,8 @@ def rope_apply(x, grid_sizes, freqs_list):
         
         cos, sin = freqs_list[i]
 
-        if cos.dim() == 3:
-            cos = cos.unsqueeze(0)
-            sin = sin.unsqueeze(0)
-
-        cos = cos.to(dtype=x_i.dtype, device=x_i.device)
-        sin = sin.to(dtype=x_i.dtype, device=x_i.device)
+        cos = cos.to(dtype=x_i.dtype)
+        sin = sin.to(dtype=x_i.dtype)
 
         x_i = torch_npu.npu_rotary_mul(
             input=x_i,
@@ -83,7 +80,7 @@ def rope_apply(x, grid_sizes, freqs_list):
 
         output.append(x_i)
 
-    return torch.cat(output).float()
+    return torch.cat(output).to(original_dtype)
 
 
 class WanRMSNorm(nn.Module):
@@ -461,7 +458,6 @@ class WanModel(ModelMixin, ConfigMixin):
 
         self.freqs_list = None
 
-
     def forward(
         self,
         x,
@@ -565,9 +561,12 @@ class WanModel(ModelMixin, ConfigMixin):
             context_lens=context_lens,
         )
 
-        for block in self.blocks:
+        for i, block in enumerate(self.blocks):
             x = block(x, **kwargs)
-
+            if i == 0 and cache_manager.cache_step.should_skip:
+                break
+        
+        cache_manager.cache_step.post_cache_update(x)
         # head
         x = self.head(x, e)
 
