@@ -186,10 +186,9 @@ def apply_rotary_emb(
     """
     xk_out = None
     if isinstance(freqs_cis, tuple):
-        cos, sin = reshape_for_broadcast(freqs_cis, xq, head_first)  # [S, D]
-        cos, sin = cos.to(xq.device), sin.to(xq.device)
-        xq_out = torch_npu.npu_rotary_mul(xq, cos, sin)
-        xk_out = torch_npu.npu_rotary_mul(xk, cos, sin)
+        cos, sin = freqs_cis
+        xq_out = torch_npu.npu_rotary_mul(xq, cos, sin, rotary_mode="interleave")
+        xk_out = torch_npu.npu_rotary_mul(xk, cos, sin, rotary_mode="interleave")
     else:
         # view_as_complex will pack [..., D/2, 2](real) to [..., D/2](complex)
         xq_ = torch.view_as_complex(

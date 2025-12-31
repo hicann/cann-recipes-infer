@@ -99,11 +99,11 @@ def parallelize_transformer(pipe):
         dim_thw = freqs_cos.shape[-1]
         freqs_cos = freqs_cos.reshape(temporal_size, h, w, dim_thw)
         freqs_cos = torch.chunk(freqs_cos, get_sequence_parallel_world_size(), dim=split_dim - 1)[get_sequence_parallel_rank()]
-        freqs_cos = freqs_cos.reshape(-1, dim_thw)
+        freqs_cos = freqs_cos.reshape(1, -1, 1, dim_thw)
         dim_thw = freqs_sin.shape[-1]
         freqs_sin = freqs_sin.reshape(temporal_size, h, w, dim_thw)
         freqs_sin = torch.chunk(freqs_sin, get_sequence_parallel_world_size(), dim=split_dim - 1)[get_sequence_parallel_rank()]
-        freqs_sin = freqs_sin.reshape(-1, dim_thw)
+        freqs_sin = freqs_sin.reshape(1, -1, 1, dim_thw)
         
         for block in transformer.double_blocks + transformer.single_blocks:
             block.hybrid_seq_parallel_attn = xFuserLongContextAttention()
@@ -654,6 +654,10 @@ class HunyuanVideoSampler(Inference):
             target_video_length, target_height, target_width
         )
         n_tokens = freqs_cos.shape[0]
+
+        # reshape for rope broadcast
+        freqs_cos = freqs_cos.to(self.device).unsqueeze(-2).unsqueeze(0)
+        freqs_sin = freqs_sin.to(self.device).unsqueeze(-2).unsqueeze(0)
 
         # ========================================================================
         # Print infer args
