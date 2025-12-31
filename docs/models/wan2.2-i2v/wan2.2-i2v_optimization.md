@@ -1,7 +1,7 @@
 ## NPU Wan2.2-I2V模型推理优化实践
 
-本文档主要介绍Wan2.2-I2V模型基于NPU的推理优化策略。
-###  NPU npu_fusion_attention算子适配
+本文档主要介绍Wan2.2-I2V模型基于NPU的推理优化策略和实现。
+###  NPU npu_fused_infer_attention_score算子适配
 首先需要`import torch_npu`以及相关package，在`generate.py`(L30)后加上：
 ```
 import torch_npu
@@ -9,31 +9,24 @@ torch_npu.npu.set_compile_mode(jit_compile=False)
 torch.npu.config.allow_internal_format=False
 from torch_npu.contrib import transfer_to_npu
 ```
-本样例使用torch_npu内置的npu_fusion_attention融合算子替代FlashAttention算子，该算子详细可见[Ascend社区文档](https://www.hiascend.com/document/detail/zh/Pytorch/710/apiref/torchnpuCustomsapi/context/torch_npu-npu_fusion_attention.md)。在`wan/modules/attention.py`(L217)的attention函数中，使能fusion_attention算子：
+本样例使用torch_npu内置的npu_fused_infer_attention_score融合算子替代FlashAttention算子，该算子详细可见[Ascend社区文档](https://www.hiascend.com/document/detail/zh/Pytorch/720/apiref/torchnpuCustomsapi/context/torch_npu-npu_fused_infer_attention_score.md)。在`wan/modules/attention.py`(L69)的npu_fused_attention函数中，使能fused_infer_attention_score算子：
 ```
-npu_outputs = torch_npu.npu_fusion_attention(
-            query=q,
-            key=k,
-            value=v,
-            head_num=head_num,
-            input_layout=input_layout,
-            pse=None,
-            padding_mask=None,
-            attn_mask=atten_mask,
-            scale=scale,
-            keep_prob=keep_prob,
-            pre_tockens=2147483647,
-            next_tockens=2147483647,
-            inner_precise=0,
-            prefix=None,
-            actual_seq_qlen=actual_seq_qlen,
-            actual_seq_kvlen=actual_seq_kvlen,
-            sparse_mode=0,
-            gen_mask_parallel=True,
-            sync=False
-        ) 
-        attention_out = npu_outputs[0].transpose(1,2).contiguous()
-        return attention_out.type(out_dtype)
+    attention_out, _ = torch_npu.npu_fused_infer_attention_score(
+        q, k, v,
+        actual_seq_lengths=actual_seq_lengths,
+        actual_seq_lengths_kv=actual_seq_lengths_kv,
+        num_heads=N,
+        scale=float(softmax_scale),
+        input_layout="BNSD",
+        num_key_value_heads=num_key_value_heads,
+        pre_tokens=65535,
+        next_tokens=65535 if not causal else 0,
+        sparse_mode=0,
+        inner_precise=0,
+    )
+    
+    attention_out = attention_out.transpose(1, 2).contiguous()
+    return attention_out.to(out_dtype)
 ```
 
 
@@ -179,6 +172,13 @@ for step_idx, t in enumerate(tqdm(timesteps)):
 
 当检测到CFG并行环境时，它会将条件生成和无条件生成这两个任务分配到两个不同的进程上同时执行，每个进程只需要运行一次模型推理，然后通过all_gather通信操作让两个进程互相获取对方的计算结果，最后使用CFG公式将条件预测和无条件预测按照引导系数混合，得到最终的噪声预测结果，如果没有启用并行环境则会退化到传统模式顺序执行两次模型推理。
 
+
+###  Ring Attention Overlap
+
+在多卡Ring Attention中，通过异步启动AllGather收集其他卡的KV数据，同时立即使用本地KV计算第一个FA，让NPU计算与网络通信并行执行以掩盖通信延迟；待AllGather完成后，将其他多个远程chunks合并为一个长序列一次性计算第二个FA，最后用LSE（Log-Sum-Exp）算法正确合并两次attention输出，[达成将通信时间隐藏在本地计算中](https://gitcode.com/weixin_45381022/cann-recipes-infer_wan_overlap/blob/master/module/unified_sp/core.py)。
+
+![](figures/overlap.png)
+=======
 ### Dit Cache
 
 DIT-Cache作为扩散模型推理加速的缓存框架，通过复用/预测已有的结果，减少冗余前向计算。其加速逻辑可清晰的分为Step-level和Block-level范式，Step-level通过判断不同采样步数step间的特定特征差异，通过阈值比较，决定是否跳过完整的step计算，直接复用或者预测缓存结果；Block-level以block为粒度（通常是attention模块和mlp模块）判断是否直接复用或者预测缓存结果。

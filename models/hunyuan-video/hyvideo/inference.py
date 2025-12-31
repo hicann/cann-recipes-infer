@@ -42,6 +42,7 @@ from hyvideo.modules.posemb_layers import get_nd_rotary_pos_embed
 from hyvideo.modules.fp8_optimization import convert_fp8_linear
 from hyvideo.diffusion.schedulers import FlowMatchDiscreteScheduler
 from hyvideo.diffusion.pipelines import HunyuanVideoPipeline
+from module.unified_sp.core import UnifiedSPAttention
 
 try:
     import xfuser
@@ -65,25 +66,29 @@ except ImportError:
 def parallelize_transformer(pipe):
     transformer = pipe.transformer
     original_forward = transformer.forward
+    
+    sp_attn = UnifiedSPAttention(
+        ulysses_group=get_sp_group().ulysses_group,
+        ring_group=get_sp_group().ring_group,
+        use_ring_overlap=True,
+    )
 
     @functools.wraps(transformer.__class__.forward)
     def new_forward(
         self,
         x: torch.Tensor,
-        t: torch.Tensor,  # Should be in range(0, 1000).
+        t: torch.Tensor,
         text_states: torch.Tensor = None,
-        text_mask: torch.Tensor = None,  # Now we don't use it.
-        text_states_2: Optional[torch.Tensor] = None,  # Text embedding for modulation.
+        text_mask: torch.Tensor = None,
+        text_states_2: Optional[torch.Tensor] = None,
         freqs_cos: Optional[torch.Tensor] = None,
         freqs_sin: Optional[torch.Tensor] = None,
-        guidance: torch.Tensor = None,  # Guidance for modulation, should be cfg_scale x 1000.
+        guidance: torch.Tensor = None,
         return_dict: bool = True,
     ):
         if x.shape[-2] // 2 % get_sequence_parallel_world_size() == 0:
-            # try to split x by height
             split_dim = -2
         elif x.shape[-1] // 2 % get_sequence_parallel_world_size() == 0:
-            # try to split x by width
             split_dim = -1
         else:
             raise ValueError(
@@ -91,10 +96,10 @@ def parallelize_transformer(pipe):
                 f"({get_sequence_parallel_world_size()}) parts evenly"
             )
 
-        # patch sizes for the temporal, height, and width dimensions are 1, 2, and 2.
         temporal_size, h, w = x.shape[2], x.shape[3] // 2, x.shape[4] // 2
-
-        x = torch.chunk(x, get_sequence_parallel_world_size(), dim=split_dim)[get_sequence_parallel_rank()]
+        x = torch.chunk(x, get_sequence_parallel_world_size(), dim=split_dim)[
+            get_sequence_parallel_rank()
+        ]
 
         dim_thw = freqs_cos.shape[-1]
         freqs_cos = freqs_cos.reshape(temporal_size, h, w, dim_thw)
@@ -106,24 +111,17 @@ def parallelize_transformer(pipe):
         freqs_sin = freqs_sin.reshape(1, -1, 1, dim_thw)
         
         for block in transformer.double_blocks + transformer.single_blocks:
-            block.hybrid_seq_parallel_attn = xFuserLongContextAttention()
-
+            block.hybrid_seq_parallel_attn = sp_attn.forward
+        
         output = original_forward(
-            x,
-            t,
-            text_states,
-            text_mask,
-            text_states_2,
-            freqs_cos,
-            freqs_sin,
-            guidance,
-            return_dict,
+            x, t, text_states, text_mask, text_states_2,
+            freqs_cos, freqs_sin, guidance, return_dict,
         )
 
-        return_dict = not isinstance(output, tuple)
         sample = output["x"]
         sample = get_sp_group().all_gather(sample, dim=split_dim)
         output["x"] = sample
+        
         return output
 
     new_forward = new_forward.__get__(transformer)

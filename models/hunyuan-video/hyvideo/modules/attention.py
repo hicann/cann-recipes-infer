@@ -208,39 +208,36 @@ def attention(
 
 
 def parallel_attention(
-    hybrid_seq_parallel_attn,
-    q,
-    k,
-    v,
+    hybrid_seq_parallel_attn,  
+    q, k, v,
     img_q_len,
     img_kv_len,
     cu_seqlens_q,
     cu_seqlens_kv
 ):
     b, s, n, d = q.shape
+    
     attn1 = hybrid_seq_parallel_attn(
-        None,
-        q[:, :img_q_len, :, :],
-        k[:, :img_kv_len, :, :],
-        v[:, :img_kv_len, :, :],
-        dropout_p=0.0,
+        q=q[:, :img_q_len, :, :],
+        k=k[:, :img_kv_len, :, :],
+        v=v[:, :img_kv_len, :, :],
         causal=False,
         joint_tensor_query=q[:, img_q_len:cu_seqlens_q[1]],
         joint_tensor_key=k[:, img_kv_len:cu_seqlens_kv[1]],
         joint_tensor_value=v[:, img_kv_len:cu_seqlens_kv[1]],
         joint_strategy="rear",
     )
+    
     attn2 = torch_npu.npu_fused_infer_attention_score(
-            q[:, cu_seqlens_q[1]:], 
-            k[:, cu_seqlens_kv[1]:], 
-            v[:, cu_seqlens_kv[1]:],
-            num_heads=n,
-            input_layout="BSND",
-            scale=q.shape[-1] ** (-0.5),
-        )[0]
+        q[:, cu_seqlens_q[1]:].transpose(1, 2).contiguous(), 
+        k[:, cu_seqlens_kv[1]:].transpose(1, 2).contiguous(), 
+        v[:, cu_seqlens_kv[1]:].transpose(1, 2).contiguous(),
+        num_heads=n,
+        input_layout="BNSD",
+        scale=1.0 / math.sqrt(d),
+    )[0].transpose(1, 2)
 
     attn = torch.cat([attn1, attn2], dim=1)
-    b, s, a, d = attn.shape
     attn = attn.reshape(b, s, -1)
-
+    
     return attn
