@@ -16,8 +16,8 @@ Model Config
 
 Data Config
   dataset: "default"  # Support ["default", "LongBench"]
-  input_max_len: 5120 # The input max length
-  max_new_tokens: 100 # The max new tokens
+  input_max_len: 4096 # The input max length
+  max_new_tokens: 256 # The max new tokens
   batch_size: 128     # The global batch size
 
 Parallel Config

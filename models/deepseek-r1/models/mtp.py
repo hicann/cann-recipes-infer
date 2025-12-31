@@ -104,7 +104,6 @@ class InferMTP(nn.Module):
         if not warm_up:
             avg_infer_time = self.obtain_mtp_stats(total_accepted_num, cnt, infer_time_rec)
 
-        logging.info("Finish inference, cnt = %d, total_accepted_num = %d", cnt, total_accepted_num[0])
         # detokenize outputs
         generate_ids = input_dict_main["generate_ids"].clip(0,\
                             self.main_model.model.config.vocab_size - 1)
@@ -259,7 +258,7 @@ class InferMTP(nn.Module):
             prev_hidden_states = prev_hidden_states.view(batch_size, -1, prev_hidden_states.shape[-1]) # (B, S, H)
 
         input_dict['prev_hidden_states'] = torch.cat([input_dict['prev_hidden_states'], 
-                    prev_hidden_states[:, -1:, :]], dim=1)[:, -prev_hidden_states.shape[1]:, :]
+                    prev_hidden_states[:, -1:, :]], dim=1)[:, -prev_hidden_states.shape[1]:, :].contiguous()
         input_dict['input_ids'] = torch.cat([input_dict['input_ids'], spec_token], dim=-1)[:, 1:]
 
         return input_dict
@@ -310,9 +309,9 @@ class InferMTP(nn.Module):
                      f"draft token per batch is {cnt}*{self.next_n}, "
                      f"average accepted num per batch is {avg_accpeted_num}")
 
-        total_tokens = total_accepted_num + cnt
-        equivalent_infer_time = process_infer_time(infer_time_rec, total_tokens[0]) # logging for the first batch
-        avg_infer_time = process_infer_time(infer_time_rec, len(infer_time_rec)) # logging for the first batch
+        total_tokens = avg_accpeted_num + cnt
+        equivalent_infer_time = process_infer_time(infer_time_rec, total_tokens)
+        avg_infer_time = process_infer_time(infer_time_rec, len(infer_time_rec))
         logging.info(f"{self.main_model.model_name} average inference time cost is {(avg_infer_time)*1000:.2f} ms")
         logging.info(
             f"{self.main_model.model_name} model average equivalent latency of MTP{self.next_n}"

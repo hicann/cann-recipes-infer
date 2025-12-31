@@ -305,8 +305,8 @@ class DeepSeekRunner(ModelRunner):
         inference_time = end_time - start_time
         warm_up_prefix = "[warm up] " if warm_up else ""
         inference_stage = "prefill" if is_prefill else "decode"
-        logging.info(f"{prefix} {self.model_name} {warm_up_prefix}inference time cost of \
-                     {inference_stage} is {(inference_time)*1000:.2f} ms")
+        logging.info(f"{prefix} {self.model_name} {warm_up_prefix}inference time cost of " + \
+                     f"{inference_stage} is {(inference_time)*1000:.2f} ms")
         return (logits, inference_time, prev_hidden_states)
 
     @override

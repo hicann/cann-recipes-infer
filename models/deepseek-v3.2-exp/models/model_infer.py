@@ -405,9 +405,9 @@ class Infer(nn.Module):
                      f"draft token per batch is {cnt}*{self.next_n}, "
                      f"average accepted num per batch is {avg_accpeted_num}")
 
-        total_tokens = total_accepted_num + cnt
-        equivalent_infer_time = process_infer_time(infer_time_rec, total_tokens[0]) # logging for the first batch
-        avg_infer_time = process_infer_time(infer_time_rec, len(infer_time_rec)) # logging for the first batch
+        total_tokens = avg_accpeted_num + cnt
+        equivalent_infer_time = process_infer_time(infer_time_rec, total_tokens) 
+        avg_infer_time = process_infer_time(infer_time_rec, len(infer_time_rec)) 
 
         logging.info(
             f"{self.main_model.model_name} main and mtp model decode average inference time cost"

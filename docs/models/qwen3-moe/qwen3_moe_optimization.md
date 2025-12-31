@@ -20,7 +20,7 @@
 
 ### MoE TP优化
 #### 切分策略
-假设模型的MoE层的切分数量为`moe_tp_size`，专家个数为expert_num。对MoE层进行张量切分，每个专家相当于一个mlp层，切分方法与mlp的张量切分方法相似。具体做法是对`gate_proj`与`up_proj`进行列切分，对`down_proj`进行行切分。同时对`gate_proj`与`up_proj`线性层采用合并计算的优化方式，得到`w13_weight`。
+假设模型的MoE层的切分数量为`moe_tp_size`，专家个数为`expert_num`。对MoE层进行张量切分，每个专家相当于一个mlp层，切分方法与mlp的张量切分方法相似。具体做法是对`gate_proj`与`up_proj`进行列切分，对`down_proj`进行行切分。同时对`gate_proj`与`up_proj`线性层采用合并计算的优化方式，得到`w13_weight`。
 
 #### 计算分解
 每个专家层存在gate_proj、up_proj与down_proj三个matmul运算，具体运算为 x = down( SiLU(gate(x))*up(x) )。本优化将张量切分后的gate_proj和up_proj进行concat操作，再使能[torch_npu.npu_swiglu](https://www.hiascend.com/document/detail/zh/Pytorch/710/apiref/torchnpuCustomsapi/context/%EF%BC%88beta%EF%BC%89torch_npu-npu_swiglu.md)融合算子接口优化，该算子能完成以下两步计算：
@@ -32,7 +32,7 @@
 ![moe_calcu](./figures/moe_opt.png)
 
 ## 使能融合算子
-### GMM使能&&Routing优化
+### GMM使能和Routing优化
 在MoE模块中，如果通过for循环处理每个专家，单独计算`expert_num`个前馈神经网络（FFN），容易导致计算效率较低。CANN提供了`GroupedMatmul`算子，可以同时计算多个专家，从而提高计算和搬运效率。具体实现可参考在`Qwen3MoeSparseMoeBlock`类中的`moe_infer_tp`和`moe_infer_fusion`函数。
 
 - 快速选择专家：在计算专家和token之间的路由分数时，可以使用[torch_npu.npu_moe_gating_top_k_softmax](https://www.hiascend.com/document/detail/zh/Pytorch/710/apiref/torchnpuCustomsapi/context/torch_npu-npu_moe_gating_top_k_softmax.md)融合算子，代替原来先topk再softmax多算子操作，可以更快速地计算出token和专家的分数。

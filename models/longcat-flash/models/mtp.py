@@ -241,7 +241,7 @@ class InferMTP(nn.Module):
         input_dict["past_key_values"] = past_key_values
         input_dict['kv_len'] = kv_len
         input_dict['input_lens'] = input_dict['input_lens'] + 1
-        input_dict['prev_hidden_states'] = prev_hidden_states[:, -self.spec_len:, :]
+        input_dict['prev_hidden_states'] = prev_hidden_states[:, -self.spec_len:, :].contiguous()
 
         # for next_n > 1, need to pad inputs for the first decode step
         if (next_tokens.shape[1] < self.spec_len) and (self.next_n > 1):
