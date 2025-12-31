@@ -69,10 +69,6 @@ from hunyuan_image_3.hunyuan import (
     UNetUp
 )
 from executor.utils import init_comm_group, get_default_group
-from module.linear import (
-    RowParallelLinear,
-    QKVParallelLinear
-)
 from module.fuse_moe_gmm import FusedMoEGMM
 
 local_rank = int(os.environ['LOCAL_RANK'])
@@ -335,25 +331,25 @@ def spda_attention_init(self, config: HunyuanImage3Config, layer_idx: int, **kwa
 
 def npu_fas(q, k, v, attn_mask_npu, causal=False):
     b, n, s, d = q.shape
+    n_kv = k.shape[1]
     scale = 1.0 / math.sqrt(d)
     if not causal:
-        attn_out = torch_npu.npu_fusion_attention(
+        attn_out = torch_npu.npu_fused_infer_attention_score(
             q, k, v,
-            head_num=n,
+            num_heads=n,
             input_layout="BNSD",
-            scale=scale
+            scale=scale,
+            num_key_value_heads=n_kv
         )[0]
     else:
-        if attn_mask_npu is None:
-            attn_mask_npu = torch.triu(torch.ones([2048, 2048]), diagonal=1).bool().to(q.device)
-        attn_out = torch_npu.npu_fusion_attention(
+        attn_out = torch_npu.npu_fused_infer_attention_score(
             q, k, v, 
-            pse=None,
             atten_mask=attn_mask_npu,
             sparse_mode=2,
-            head_num=n,
+            num_heads=n,
             input_layout="BNSD",
-            scale=scale
+            scale=scale,
+            num_key_value_heads=n_kv
         )[0]
     return attn_out
 

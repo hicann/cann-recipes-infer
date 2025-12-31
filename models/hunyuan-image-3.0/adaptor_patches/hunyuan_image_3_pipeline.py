@@ -290,7 +290,6 @@ def text2_image_pipeline_call(
                 torch_npu.profiler.ProfilerActivity.CPU,
                 torch_npu.profiler.ProfilerActivity.NPU
             ],
-            # schedule=torch_npu.profiler.schedule(wait=0, warmup=4, active=1, repeat=1, skip_first=1),
             schedule=torch_npu.profiler.schedule(wait=0, warmup=0, active=2, repeat=1, skip_first=0),
             on_trace_ready=torch_npu.profiler.tensorboard_trace_handler("./prof/"),
             record_shapes=False,

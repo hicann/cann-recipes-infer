@@ -1,7 +1,7 @@
-# 在昇腾Atlas A3环境上适配HunyuanImage-3.0模型的推理
+# 在NPU环境上适配HunyuanImage-3.0模型的推理
 
 ## 概述
-HunyuanImage-3.0 是腾讯于2025年9月28日正式开源的一个突破性的原生多模态模型，它在自回归框架内统一了多模态理解和生成任务。它的文生图能力实现了与领先的闭源模型相当或更优的性能。本项目旨在提供HunyuanImage-3.0的昇腾适配版本。
+[HunyuanImage-3.0](https://github.com/Tencent-Hunyuan/HunyuanImage-3.0/blob/main/assets/HunyuanImage_3_0.pdf)是腾讯于2025年9月28日正式开源的一个突破性的原生多模态模型，它在自回归框架内统一了多模态理解和生成任务。它的文生图能力实现了与领先的闭源模型相当或更优的性能。本项目旨在提供HunyuanImage-3.0的昇腾适配版本。
 
 ## 支持的产品型号
 <term>Atlas A2/A3 系列产品</term>
@@ -116,7 +116,7 @@ bash weight_convert.sh
 
    |            Model             |   Environment  |    TP    | CFG Parallel | VAE Parallel |     E2E      |
    | :--------------------------: | :------------: | :------: | :----------: | :----------: | :----------: |
-   |       hunyuan-image-3.0      |       A3       |    8     |    enable    |    enable    |    11.13s    |
+   |       hunyuan-image-3.0      |       A3       |    8     |    enable    |    enable    |    10.6s     |
 
 ## 优化点参考
 
