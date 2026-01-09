@@ -49,7 +49,7 @@ class Infer(nn.Module):
         self.enable_offload = runner_settings.get("model_config").get("enable_offload", False)
 
         self.exe_mode = runner_settings.get("exe_mode", "ge_graph")
-        self.enable_cache_compile = runner_settings.get("model_config").get("enable_cache_compile", False)
+        self.enable_skip_guard = runner_settings.get("model_config").get("enable_skip_guard", False)
     
     def inference(self, model_runner, model_inputs, cycle_idx=None, is_prefill=False, warm_up=False, prefix=''):
         if not warm_up:
@@ -93,7 +93,7 @@ class Infer(nn.Module):
                     except ImportError:
                         logging.warning(f"custom op reinplace needs to update torch_npu version 7.3.0")
                 # warm-up phase, compilation is required; subsequent runs will skip the guard check.        
-                if self.exe_mode == "acl_graph" and self.enable_cache_compile and not warm_up:
+                if self.exe_mode == "acl_graph" and self.enable_skip_guard and not warm_up:
                     with torch.compiler.set_stance(skip_guard_eval_unsafe=True):  
                         logits, prev_hidden_states = model_runner.model.decode(**model_inputs)
                 else:

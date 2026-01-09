@@ -11,10 +11,11 @@ model_config:
   enable_multi_streams: True  # [False, True]
   enable_profiler: False      # [False, True]
   perfect_eplb: False         # [False, True]
-  enable_cache_compile: False  # [False, True]
+  enable_cache_compile: False  # [False, True] only False in acl_graph
   enable_online_split_weight: True # [False, True]
   prefill_mini_batch_size: 1
   enable_static_kernel: True  # [False, True] only support acl_graph
+  enable_skip_guard: True  # [False, True] only support acl_graph
 
 data_config:
   dataset: InfiniteBench
