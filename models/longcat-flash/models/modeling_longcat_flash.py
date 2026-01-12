@@ -175,6 +175,7 @@ class LongcatFlashMLP(nn.Module):
             if config.quant_config is not None
             else "w16a16")
         self.dense_tp_size = self.runner_settings.get("parallel_config").get("dense_tp_size", 1)
+        self.kvp_size = self.runner_settings.get("parallel_config").get("kvp_size", 1)
         self.config = config
         self.hidden_size = config.hidden_size if hidden_size is None else hidden_size
         self.intermediate_size = config.ffn_hidden_size if intermediate_size is None else intermediate_size
@@ -209,7 +210,7 @@ class LongcatFlashMLP(nn.Module):
             npu_prefetch(enable_prefetch, self.gate_up_proj.weight.data, o_proj, \
                          self.up_gate_prefetch_size, 0)
         # dense tp
-        if self.dense_tp_size > 1:
+        if self.dense_tp_size > 1 and self.kvp_size == 1:
             bsz, q_len, _ = x.size()
             x_output = torch.empty([bsz * q_len * self.dense_tp_size, self.hidden_size], \
                                    dtype=x.dtype, device="npu")
@@ -218,9 +219,12 @@ class LongcatFlashMLP(nn.Module):
 
         down_proj, dsq = self.mlp_forward(x, enable_prefetch)
 
-        if self.dense_tp_size > 1:
+        if self.dense_tp_size > 1 and self.kvp_size == 1:
             mlp_res = down_proj.new_empty(bsz, q_len, down_proj.shape[-1])
             dist.reduce_scatter_tensor(mlp_res, down_proj, group=self.hccl_comm_dict.get("dense_tp_group", None))
+        elif self.dense_tp_size > 1 and self.kvp_size > 1:
+            dist.all_reduce(down_proj, group=self.hccl_comm_dict.get("dense_tp_group", None))
+            mlp_res = down_proj
         else:
             mlp_res = down_proj
 
@@ -547,12 +551,13 @@ class LongcatFlashAttention(nn.Module):
         self.config = config
         self.runner_settings = runner_settings
         self.batch_size = self.runner_settings.get("data_config").get("batch_size", 16)
-        self.batch_size_per_rank = self.runner_settings.get("data_config").get("batch_size_per_rank", 1)
         self.attn_tp_size = self.runner_settings.get("parallel_config").get("attn_tp_size", 1)
         self.attn_dp_size = self.runner_settings.get("parallel_config").get("attn_dp_size", 1)
         self.o_proj_tp_size = self.runner_settings.get("parallel_config").get("o_proj_tp_size", 1)
         self.moe_tp_size = self.runner_settings.get("parallel_config").get("moe_tp_size", 1)
         self.moe_ep_size = self.runner_settings.get("parallel_config").get("moe_ep_size", 1)
+        self.kvp_size = self.runner_settings.get("parallel_config").get("kvp_size", 1)
+        self.batch_size_per_rank = self.runner_settings.get("data_config").get("batch_size_per_rank", 1)
         self.layer_idx = layer_idx
         # mtp layer is the last layer, with an index of 0
         if layer_idx == config.num_hidden_layers * 2:
@@ -580,6 +585,8 @@ class LongcatFlashAttention(nn.Module):
 
         self.is_causal = True
         self.hccl_comm_dict = kwargs.get("hccl_comm_dict", None)
+        self.kvp_group = self.hccl_comm_dict.get("kvp_group", None)
+        self.kvp_rank = dist.get_rank(self.kvp_group) if self.kvp_group is not None else 0
 
         if self.q_lora_rank is None:
             self.q_proj = ColumnParallelLinear(self.hidden_size,
@@ -639,7 +646,6 @@ class LongcatFlashAttention(nn.Module):
             [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
         self.kv_b_proj_w_k_data = self.kv_b_proj_w_k_data.permute(1, 2, 0)
         self.kv_b_proj_w_v_data = self.kv_b_proj_w_v_data.transpose(0, 1)
-
         self.o_proj = RowParallelLinear(self.num_heads * self.v_head_dim,
                                         self.hidden_size,
                                         tp_size=self.o_proj_tp_size,
@@ -682,7 +688,7 @@ class LongcatFlashAttention(nn.Module):
     ):
         bsz, q_len, _ = attn_output.shape
         bsz = (bsz + self.attn_tp_size - 1) // self.attn_tp_size
-        if self.o_proj_tp_size > 1 and self.attn_tp_size == 1:
+        if self.kvp_size == 1 and self.o_proj_tp_size > 1 and self.attn_tp_size == 1:
             attn_output = attn_output.view(bsz * q_len, self.o_proj_tp_size, -1).transpose(1, 0).contiguous().view(-1)
             all2all_output = torch.empty_like(attn_output)
             # after all2all: (o_proj_tp_size * bs*q_len * num_heads // o_proj_tp_size * v_head_dim)
@@ -690,15 +696,17 @@ class LongcatFlashAttention(nn.Module):
                                    group=self.hccl_comm_dict.get("o_proj_tp_group", None))
             attn_output = all2all_output
 
-        # after view: (o_proj_tp_size * bs*q_len, num_heads // o_proj_tp_size * v_head_dim)
-        attn_output = self.o_proj(attn_output.view(-1, self.num_heads // self.o_proj_tp_size * self.v_head_dim))
+        # after view: (o_proj_tp_size * bs*q_len, num_heads // self.o_proj.tp_size * v_head_dim)
+        attn_output = self.o_proj(attn_output.view(-1, self.num_heads // self.o_proj.tp_size * self.v_head_dim))
         o_proj = attn_output
-        if self.o_proj_tp_size > 1:
+        if self.kvp_size == 1 and self.o_proj_tp_size > 1:
             reduce_scatter_output = torch.empty((attn_output.size()[0] // self.o_proj_tp_size, attn_output.size()[1]),
                                                 dtype=attn_output.dtype, device=attn_output.device)
             dist.reduce_scatter_tensor(reduce_scatter_output, attn_output,
                                        group=self.hccl_comm_dict.get("o_proj_tp_group", None))
             attn_output = reduce_scatter_output
+        if self.kvp_size > 1:
+            dist.all_reduce(attn_output, group=self.kvp_group)
 
         return attn_output.view(bsz, q_len, -1), o_proj
 
@@ -762,7 +770,7 @@ class LongcatFlashAttention(nn.Module):
             self.kv_a_layernorm.weight,
             cos,
             sin,
-            slot_mapping,
+            slot_mapping.view(-1),
             rope_cache,
             nope_cache,
             epsilon=self.kv_a_layernorm.variance_epsilon,
@@ -779,11 +787,15 @@ class LongcatFlashAttention(nn.Module):
         # NTD foramt, repeat in N
         k_rope = k_rope.view(1, -1, self.qk_rope_head_dim).repeat(self.num_heads_per_rank, 1, 1)
 
+        rank = self.kvp_rank
+        heads = self.num_heads_per_rank // self.kvp_size
+        indices = slice(rank * heads, (rank + 1) * heads)
+
         attn_output, _ = torch.ops.npu.npu_fused_infer_attention_score(
-            query_states[0].flatten(0, 1).permute(1, 0, 2), k_nope_out, v_out,
-            query_rope=query_states[1].flatten(0, 1).permute(1, 0, 2), key_rope=k_rope,
-            num_heads=self.num_heads_per_rank,
-            num_key_value_heads=self.num_heads_per_rank,
+            query_states[0].flatten(0, 1).permute(1, 0, 2)[indices], k_nope_out[indices], v_out[indices],
+            query_rope=query_states[1].flatten(0, 1).permute(1, 0, 2)[indices], key_rope=k_rope[indices],
+            num_heads=heads,
+            num_key_value_heads=heads,
             input_layout="NTD_TND",
             atten_mask=attention_mask, sparse_mode=3,
             actual_seq_lengths=actual_seq_lengths_kv,
@@ -812,6 +824,7 @@ class LongcatFlashAttention(nn.Module):
             hidden_states=hidden_states,
             position_embeddings=position_embeddings,
             kv_len=kv_len,
+            slot_mapping=slot_mapping,
             past_key_value=past_key_value,
         )
 
@@ -830,6 +843,7 @@ class LongcatFlashAttention(nn.Module):
         hidden_states: torch.Tensor,
         position_embeddings: torch.Tensor = None,
         kv_len: torch.IntTensor = None,
+        slot_mapping: torch.IntTensor = None,
         past_key_value: Optional[Cache] = None,
     ):
         if self.attn_tp_size > 1:
@@ -842,6 +856,7 @@ class LongcatFlashAttention(nn.Module):
             "hidden_states": hidden_states,
             "position_embeddings": position_embeddings,
             "kv_len": kv_len,
+            "slot_mapping": slot_mapping,
             "past_key_value": past_key_value,
         }
         if self.enable_mla_prolog:
@@ -855,6 +870,7 @@ class LongcatFlashAttention(nn.Module):
         hidden_states: torch.Tensor,
         position_embeddings: torch.Tensor = None,
         kv_len: torch.IntTensor = None,
+        slot_mapping: torch.IntTensor = None,
         past_key_value: Optional[Cache] = None,
     ):
         bsz, q_len, _ = hidden_states.size()
@@ -895,7 +911,6 @@ class LongcatFlashAttention(nn.Module):
         q_pe = q_pe.view(bsz, self.num_heads_per_rank, -1, self.qk_rope_head_dim).transpose(1, 2) # (b, s, n, d)
         query_states = [q_nope, q_pe]  # (b, s, n, D)
 
-        tmp_slot_mapping = kv_len.view(-1)
         latent_cache = latent_cache.view(
             bsz * q_len, 1, 1, self.kv_lora_rank + self.qk_rope_head_dim
         )  # (b*s, n, 1, d)
@@ -910,7 +925,7 @@ class LongcatFlashAttention(nn.Module):
             self.kv_a_layernorm.weight,
             cos,
             sin,
-            tmp_slot_mapping,
+            slot_mapping.view(-1),
             rope_cache,
             nope_cache,
             epsilon=self.kv_a_layernorm.variance_epsilon,
@@ -935,13 +950,13 @@ class LongcatFlashAttention(nn.Module):
         hidden_states: torch.Tensor,
         position_embeddings: torch.Tensor = None,
         kv_len: torch.IntTensor = None,
+        slot_mapping: torch.IntTensor = None,
         past_key_value: Optional[Cache] = None,
     ):
         bsz, q_len, _ = hidden_states.size()
         cos, sin = position_embeddings
         cos = cos.view(bsz, 1, -1, self.qk_rope_head_dim)
         sin = sin.view(bsz, 1, -1, self.qk_rope_head_dim)
-        cache_index = kv_len.view(bsz, -1)
         nope_cache = past_key_value[self.layer_idx][0]
         rope_cache = past_key_value[self.layer_idx][1]
         block_num, block_size, key_head_num, cache_dim = nope_cache.size()
@@ -953,7 +968,7 @@ class LongcatFlashAttention(nn.Module):
             rmsnorm_gamma_cq=self.q_a_layernorm.weight,
             rmsnorm_gamma_ckv=self.kv_a_layernorm.weight,
             rope_sin=sin.squeeze(1), rope_cos=cos.squeeze(1),
-            cache_index=cache_index,
+            cache_index=slot_mapping,
             kv_cache=nope_cache,
             kr_cache=rope_cache,
             rmsnorm_epsilon_cq=self.q_a_layernorm.variance_epsilon,
@@ -990,7 +1005,7 @@ class LongcatFlashAttention(nn.Module):
             sparse_mode = 0
             attention_mask = None
 
-        attn_output, _ = self.fa_ops.npu_fused_infer_attention_score(
+        attn_partial, lse_partial = self.fa_ops.npu_fused_infer_attention_score(
             query_states[0], k_nope, k_nope,
             query_rope=query_states[1], key_rope=k_rope,
             num_heads=self.num_heads_per_rank,
@@ -1002,14 +1017,36 @@ class LongcatFlashAttention(nn.Module):
             actual_seq_lengths_kv=actual_seq_lengths_kv,
             scale=self.softmax_scale,
             antiquant_mode=0, antiquant_scale=None,
-            sparse_mode=sparse_mode
+            sparse_mode=sparse_mode,
+            softmax_lse_flag=self.kvp_size > 1,
         )
-        attn_output = attn_output.view(self.num_heads_per_rank, -1, self.kv_lora_rank)
-        attn_output = (
-            torch.matmul(attn_output, self.kv_b_proj_w_v)
-            .transpose(1, 0)
-            .reshape(bsz, q_len, -1)
+        attn_partial = attn_partial.view(self.num_heads_per_rank, -1, self.kv_lora_rank)
+        attn_partial = (
+            torch.matmul(attn_partial, self.kv_b_proj_w_v)
+            .reshape(self.num_heads_per_rank, bsz, q_len, -1)
         )
+        if self.kvp_size > 1:
+            def _all_to_all_along_headdim(partial: torch.Tensor, group: dist.ProcessGroup):
+                scattered = partial.new_empty(self.kvp_size, self.num_heads_per_rank // self.kvp_size,
+                                              *partial.shape[1:])
+                dist.all_to_all_single(scattered.view(-1), partial.view(-1),
+                                       group=group)
+                return scattered
+
+            # AllToAll of attn_partial(NBSD) along N-axis.
+            attn_scatter = _all_to_all_along_headdim(attn_partial, self.kvp_group)
+
+            # Transpose(BNSD->NBSD) and AllToAll of lse_partial along N-axis.
+            # This AllToAll can't be merged with the previous one, due to the
+            # dtype difference between attn and lse.
+            # BNSD -> NBSD
+            lse_partial = lse_partial.transpose(0, 1).contiguous()                    
+            lse_scatter = _all_to_all_along_headdim(lse_partial, self.kvp_group)            
+            attn_output = (attn_scatter * lse_scatter.softmax(dim=0)).sum(dim=0).to(torch.bfloat16)
+        else:
+            attn_output = attn_partial
+        # (N, B, S, D) -> (B, S, N, D) -> (B, S, N * D)
+        attn_output = attn_output.permute(1, 2, 0, 3).reshape(bsz, q_len, -1)
         attn_output, o_proj = self.o_proj_forward(attn_output)
         return attn_output, o_proj
 
@@ -1174,6 +1211,7 @@ class LongcatFlashDecoderLayer(GradientCheckpointingLayer):
                 hidden_states=hidden_states,
                 position_embeddings=position_embeddings,
                 kv_len=kv_len,
+                slot_mapping=slot_mapping,
                 past_key_value=past_key_value,
             )
 
@@ -1212,6 +1250,7 @@ class LongcatFlashDecoderLayer(GradientCheckpointingLayer):
                     hidden_states=hidden_states,
                     position_embeddings=position_embeddings,
                     kv_len=kv_len,
+                    slot_mapping=slot_mapping,
                     past_key_value=past_key_value,
                 )
 
@@ -1292,24 +1331,31 @@ class LongcatFlashModel(LongcatFlashPreTrainedModel):
         _init_rope(self)
         self.gradient_checkpointing = False
 
+        kvp_group = self.hccl_comm_dict["kvp_group"]
+        self.kvp_size = dist.get_world_size(kvp_group) if kvp_group is not None else 1
+        self.kvp_rank = dist.get_rank(kvp_group) if kvp_group is not None else 0
+
         # Initialize weights and apply final processing
         self.post_init()
 
     def get_slot_mapping(self, input_ids, kv_len, is_prefill, device):
-        if not is_prefill:
-            return None
-        all_tensors = []
         batch_size, seq_len = input_ids.size()
-        for i in range(batch_size * self.attn_tp_size):
-            new_index = torch.arange(self.pa_max_length * i, seq_len + self.pa_max_length * i,
-                                     dtype=kv_len.dtype, device=device)
-            all_tensors.append(new_index)
-        return torch.cat(all_tensors)
+        if not is_prefill:
+            slot_mapping = kv_len.view(batch_size * self.attn_tp_size, -1)
+        else:
+            slot_mapping = (
+                torch.arange(seq_len, dtype=kv_len.dtype, device=device)
+                .unsqueeze(0)
+                .expand(batch_size * self.attn_tp_size, -1)
+                )
+        mask = slot_mapping % self.kvp_size != self.kvp_rank
+        return torch.where(mask, -1, 
+                            slot_mapping // self.kvp_size + self.kv_len_offset[:batch_size * self.attn_tp_size])
 
     def prepare_inputs_for_layer(self, input_ids, kv_len, position_ids, actual_seq_lengths_kv, is_prefill):
         batch_size, seq_length = input_ids.shape
 
-        if self.embed_tp_size > 1:
+        if self.embed_tp_size > 1 and self.kvp_size == 1:
             embed_tp_group = self.hccl_comm_dict.get("embed_tp_group", None)
             all_input_ids = input_ids.new_empty(batch_size * self.embed_tp_size, seq_length)
             dist.all_gather_into_tensor(all_input_ids, input_ids, group=embed_tp_group)
@@ -1325,6 +1371,17 @@ class LongcatFlashModel(LongcatFlashPreTrainedModel):
             inputs_embeds_attn = inputs_embeds.new_empty(batch_size, seq_length, inputs_embeds.shape[-1])
             dist.reduce_scatter_tensor(inputs_embeds_attn, inputs_embeds, group=embed_tp_group)
             inputs_embeds = inputs_embeds_attn
+            
+        elif self.embed_tp_size > 1 and self.kvp_size > 1:
+            embed_tp_group = self.hccl_comm_dict.get("embed_tp_group", None)            
+            # Map the token IDs in input_ids to the vocab shard range assigned to the current rank
+            new_input_ids = input_ids - (self.global_rank % self.embed_tp_size) * self.vocab_size_per_rank
+            # Mark which tokens belong to the current rank's vocab shard
+            mask = (new_input_ids >= 0) & (new_input_ids < self.vocab_size_per_rank) # (bs, qlen)
+            # Set out-of-bounds parts to 0, keeping valid IDs within [0, vocab_size_per_rank)
+            new_input_ids_per_rank = new_input_ids * mask
+            inputs_embeds = self.embed_tokens(new_input_ids_per_rank) * mask.unsqueeze(-1)
+            dist.all_reduce(inputs_embeds, group=embed_tp_group)
         else:
             inputs_embeds = self.embed_tokens(input_ids)
         hidden_states = inputs_embeds
@@ -1332,9 +1389,6 @@ class LongcatFlashModel(LongcatFlashPreTrainedModel):
         position_embeddings = self.rotary_emb(hidden_states, kv_len, self.config.max_position_embeddings, \
                                               is_prefill=is_prefill, attn_tp_size=self.attn_tp_size)
 
-        if not is_prefill:
-            kv_len = kv_len.view(batch_size * self.attn_tp_size, -1) + \
-                self.kv_len_offset[:batch_size * self.attn_tp_size]
         residual = None
         slot_mapping = self.get_slot_mapping(input_ids, kv_len, is_prefill, position_ids.device)
         return hidden_states, residual, kv_len, position_embeddings, slot_mapping, actual_seq_lengths_kv
@@ -1392,8 +1446,8 @@ class LongcatFlashForCausalLM(LongcatFlashPreTrainedModel, GenerationMixin):
         self.top_k = config.moe_topk
         self.perfect_eplb = self.runner_settings.get("model_config").get("perfect_eplb", False)
         self.is_mtp = is_mtp
-        self.lmhead_tp_size = runner_settings.get("parallel_config").get("lmhead_tp_size", 1)
-        self.moe_ep_size = runner_settings.get("parallel_config").get("moe_ep_size", 1)
+        self.lmhead_tp_size = self.runner_settings.get("parallel_config").get("lmhead_tp_size", 1)
+        self.moe_ep_size = self.runner_settings.get("parallel_config").get("moe_ep_size", 1)
 
         self.num_experts = (
             config.n_routed_experts
@@ -1408,7 +1462,10 @@ class LongcatFlashForCausalLM(LongcatFlashPreTrainedModel, GenerationMixin):
             if dist.get_world_size() > 1:
                 self.hccl_comm_dict = self.init_parallel_comm_group()
                 kwargs.update({"hccl_comm_dict": self.hccl_comm_dict})
-
+                
+        kvp_group = self.hccl_comm_dict["kvp_group"]
+        self.kvp_size = dist.get_world_size(kvp_group) if kvp_group is not None else 1
+        self.kvp_rank = dist.get_rank(kvp_group) if kvp_group is not None else 0
         batch_size_per_rank = self.runner_settings.get("data_config").get("batch_size_per_rank", 1)
         self.pa_max_length = self.runner_settings.get("model_config").get("pa_max_length", 2048)
         self.block_size = self.runner_settings.get("model_config").get("pa_block_size", 128)
@@ -1481,6 +1538,7 @@ class LongcatFlashForCausalLM(LongcatFlashPreTrainedModel, GenerationMixin):
         self.lmhead_tp_size = self.runner_settings.get("parallel_config").get("lmhead_tp_size", self.embed_tp_size)
         self.moe_dp_size = self.runner_settings.get("parallel_config").get("moe_dp_size", 1)
         self.dense_tp_size = self.runner_settings.get("parallel_config").get("dense_tp_size", 1)
+        self.kvp_size = self.runner_settings.get("parallel_config").get("kvp_size", 1)
 
     def init_parallel_comm_group(self):
         world_size = dist.get_world_size()
@@ -1526,6 +1584,10 @@ class LongcatFlashForCausalLM(LongcatFlashPreTrainedModel, GenerationMixin):
             global_rank=global_rank, group_num=self.moe_tp_size, world_size=world_size,
             group_stride=self.moe_tp_size, group_name="moe_ep_group", return_name=True)
 
+        kvp_group = init_comm_group(
+            global_rank=global_rank, group_num=world_size // self.kvp_size, world_size=world_size,
+            group_name="kvp_group")
+
         hccl_comm_dict = {
                 "default_pg": get_default_group(),
                 "attn_tp_group": attn_tp_group, "embed_tp_group": embed_tp_group,
@@ -1534,6 +1596,7 @@ class LongcatFlashForCausalLM(LongcatFlashPreTrainedModel, GenerationMixin):
                 "moe_ep_group_name": moe_ep_group_name,
                 "lmhead_tp_group": lmhead_tp_group,
                 "dense_tp_group": dense_tp_group,
+                "kvp_group": kvp_group,
             }
         return hccl_comm_dict
 
@@ -1751,21 +1814,21 @@ class LongcatFlashForCausalLM(LongcatFlashPreTrainedModel, GenerationMixin):
             if kv_len.shape[0] == batch_size:
                 kv_len = self._repeat_batch(kv_len, self.attn_tp_size)
             if seq_len > 1: # fa requires sparse mode 3 and 2048 * 2048 mask for mtp
-                attention_mask = get_init_attn_mask(2048, kv_len.device)
+                attention_mask = share_mask_tril
                 last_kv = torch.max(kv_len, axis=1)[0]
-                if self.runner_settings.get("exe_mode") == "ge_graph":
-                    # dynamo use fa_tensor
-                    actual_seq_lengths_kv = (last_kv + 1)
-                else:
-                    actual_seq_lengths_kv = (last_kv + 1).cpu().detach().tolist()
-
+                actual_seq_lengths_kv = last_kv + 1
             else:
                 attention_mask = None
-                if self.runner_settings.get("exe_mode") == "ge_graph":
-                    # dynamo use fa_tensor
-                    actual_seq_lengths_kv = (kv_len + 1)
-                else:
-                    actual_seq_lengths_kv = (kv_len + 1).cpu().detach().tolist()
+                actual_seq_lengths_kv = kv_len + 1
+
+            actual_seq_lengths_kv = (
+                actual_seq_lengths_kv // self.kvp_size +
+                (actual_seq_lengths_kv % self.kvp_size > self.kvp_rank)
+            )
+
+            if self.runner_settings.get("exe_mode") != "ge_graph":
+                # dynamo use fa_tensor
+                actual_seq_lengths_kv = actual_seq_lengths_kv.cpu().detach().tolist()
             position_ids = kv_len.view(-1, 1)
 
         model_inputs = {
@@ -1955,15 +2018,18 @@ class LongcatFlashModelMTP(LongcatFlashForCausalLM):
         self.eh_proj = ReplicatedLinear(2 * config.hidden_size, config.hidden_size, bias=False)
 
     def get_slot_mapping(self, input_ids, kv_len, is_prefill, device):
+        batch_size, seq_len = input_ids.size()            
         if not is_prefill:
-            return None
-        all_tensors = []
-        batch_size, seq_len = input_ids.size()
-        for i in range(batch_size * self.attn_tp_size):
-            new_index = torch.arange(self.pa_max_length * i, seq_len + self.pa_max_length * i,
-                                     dtype=kv_len.dtype, device=device)
-            all_tensors.append(new_index)
-        return torch.cat(all_tensors)
+            kv_len = kv_len.view(batch_size * self.attn_tp_size, -1) + \
+                self.kv_len_offset[:batch_size * self.attn_tp_size]
+            return kv_len
+        else:
+            all_tensors = []        
+            for i in range(batch_size * self.attn_tp_size):
+                new_index = torch.arange(self.pa_max_length * i, seq_len + self.pa_max_length * i,
+                                        dtype=kv_len.dtype, device=device)
+                all_tensors.append(new_index)
+            return torch.cat(all_tensors)
 
     @override
     def forward(

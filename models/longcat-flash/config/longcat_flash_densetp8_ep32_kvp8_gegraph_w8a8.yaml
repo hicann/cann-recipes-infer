@@ -1,0 +1,30 @@
+model_name: "longcat_flash"
+model_path: "/data/models/origin/LongCat-Flash-Chat-W8A8/"
+exe_mode: "ge_graph"                # ["ge_graph", "eager"], mode of decode
+world_size: 32
+
+model_config:
+  enable_profiler: True  # [False, True]
+  with_ckpt: True # [False, True]
+  enable_online_split_weight: True
+  pa_block_size: 128
+  perfect_eplb: False     # [False, True]
+  moe_chunk_max_len: 1024
+  enable_multi_stream: 1
+  enable_mla_prolog: True
+  decode_only: True      # [False, True], for TPOT test only, this will influence accuracy
+
+data_config:
+  dataset: "default"                # ["default", "LongBench"]
+  input_max_len: 131072
+  max_new_tokens: 112
+  batch_size: 4
+
+parallel_config:
+  attn_tp_size: 1 # attn_dp_size = world_size // attn_tp_size, when kvp_size > 1 attn_tp_size should be equal to 1
+  o_proj_tp_size: 8 # when kvp_size > 1, o_proj_tp_size should be equal to kvp_size
+  moe_tp_size: 1 # moe_ep_size = world_size // moe_tp_size
+  dense_tp_size: 8
+  embed_tp_size: 1
+  lmhead_tp_size: 1
+  kvp_size: 8

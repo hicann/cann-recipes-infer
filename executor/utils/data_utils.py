@@ -72,11 +72,15 @@ def generate_prompt(runner_settings):
     attn_tp_size = runner_settings.get("parallel_config").get("attn_tp_size", 1)
     cp_size = runner_settings.get("parallel_config").get("cp_size", 1)
     global_rank = int(os.getenv("RANK_ID", 0))
-    global_dp_rank = global_rank // cp_size // attn_tp_size
     bs_per_cp_group = runner_settings.get("data_config").get("bs_per_cp_group", 1)
-    batch_size_per_rank = bs_per_cp_group if cp_size > 1 \
-        else runner_settings.get("data_config").get("batch_size_per_rank", 1)
     dataset = runner_settings.get("data_config").get("dataset", "default")
+    kvp_size = runner_settings.get("parallel_config").get("kvp_size", 1)
+    world_size = int(os.getenv("WORLD_SIZE", "1"))
+    global_dp_rank = global_rank // max(cp_size, kvp_size) // attn_tp_size
+    if cp_size > 1:
+        batch_size_per_rank = bs_per_cp_group
+    else:
+        batch_size_per_rank = runner_settings.get("data_config").get("batch_size_per_rank", 1)
 
     cur_dir = os.path.dirname(__file__)
     dataset_path = os.path.join(cur_dir, "../../dataset")

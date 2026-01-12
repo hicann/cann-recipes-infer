@@ -20,13 +20,17 @@ from executor.utils.common_utils import update_common_vars, check_common_paralle
 
 def update_vars(world_size, runner_settings):
     update_common_vars(world_size, runner_settings)
+    kvp_size = runner_settings.get("parallel_config").get("kvp_size", 1)
     batch_size = runner_settings.get("data_config").get("batch_size", 1)
     max_position_embeddings = runner_settings.get("data_config").get("max_position_embeddings", 64)
     pa_block_size = runner_settings.get("model_config").get("pa_block_size", 128)
-    batch_size_per_rank = max(batch_size // world_size, 1)
+    if kvp_size > 1:
+        batch_size_per_rank = (batch_size * kvp_size) // world_size
+    else:
+        batch_size_per_rank = max(batch_size // world_size, 1)
     runner_settings = update_settings(runner_settings, "data_config", "batch_size_per_rank", batch_size_per_rank)
     runner_settings = update_settings(runner_settings, "model_config", "pa_max_length",
-                                        align_up(max_position_embeddings, pa_block_size)
+                                        align_up(align_up(max_position_embeddings, kvp_size) // kvp_size, pa_block_size)
                                         )
 
     enable_multi_stream = runner_settings.get("model_config").get("enable_multi_stream", 0)
@@ -52,6 +56,7 @@ def check_model_settings(world_size, runner_settings):
     enable_multi_stream = runner_settings.get("model_config").get("enable_multi_stream", 0)
     enable_superkernel = runner_settings.get("model_config").get("enable_superkernel", False)
     next_n = runner_settings.get("model_config").get("next_n", 0)
+    kvp_size = runner_settings.get("parallel_config").get("kvp_size", 1)
 
     if exe_mode not in ["ge_graph", "eager"]:
         raise ValueError(f"{exe_mode=} does not supported!")
@@ -62,6 +67,8 @@ def check_model_settings(world_size, runner_settings):
         raise ValueError(f"{exe_mode=} does not support cache compile, aclgraph, multi_streams or superkernel!")
     if next_n > 2:
         raise ValueError(f"{next_n=}, currently only support 0 or 1 or 2")
+    if kvp_size > 1 and next_n > 0:
+        raise ValueError(f"{kvp_size=}, currently only support next_n = 0")
 
 
 def check_parallel_settings(world_size, runner_settings):
@@ -69,12 +76,22 @@ def check_parallel_settings(world_size, runner_settings):
     attn_tp_size = runner_settings.get("parallel_config").get("attn_tp_size")
     attn_dp_size = world_size // attn_tp_size
     o_proj_tp_size = runner_settings.get("parallel_config").get("o_proj_tp_size")
+    cp_size = runner_settings.get("parallel_config").get("cp_size", 1)
     batch_size = runner_settings.get("data_config").get("batch_size", 1)
+    kvp_size = runner_settings.get("parallel_config").get("kvp_size", 1)
 
-    if batch_size % attn_dp_size != 0:
+    if batch_size % attn_dp_size != 0 and (batch_size * kvp_size) % attn_dp_size != 0:
         raise ValueError(f"{batch_size=} is not divisible by {attn_dp_size=}")
     if attn_tp_size > 1 and attn_tp_size != o_proj_tp_size:
         raise ValueError(f"when attn_tp_size > 1, {attn_tp_size=} must be equal to {o_proj_tp_size=}")
+    if kvp_size > 1 and attn_tp_size != 1:
+        raise ValueError(f"when kvp_size > 1, {attn_tp_size=} must be equal to 1")
+    if kvp_size * batch_size // world_size < 1:
+        raise ValueError(f"{kvp_size=} must be larger than {world_size // batch_size}")
+    if kvp_size > 1 and o_proj_tp_size != kvp_size:
+        raise ValueError(f"when kvp_size > 1, {o_proj_tp_size=} must be equal to {kvp_size=}")
+    if kvp_size > 1 and cp_size != 1:
+        raise ValueError(f"when kvp_size > 1, {cp_size=} must be equal to 1")
 
 
 def check_vars(world_size, runner_settings):

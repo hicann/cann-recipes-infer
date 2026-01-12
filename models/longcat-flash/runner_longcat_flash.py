@@ -61,6 +61,9 @@ class LongcatFlashRunner(ModelRunner):
         self.with_ckpt = runner_settings.get("model_config").get("with_ckpt", True)
         self.enable_multi_stream = runner_settings.get("model_config").get("enable_multi_stream", 0)
         self.enable_cache_compile = runner_settings.get("model_config").get("enable_cache_compile", False)
+        self.batch_size_per_rank = runner_settings.get("data_config").get("batch_size_per_rank")
+        self.decode_only = runner_settings.get("model_config").get("decode_only", False)
+        self.input_max_len = runner_settings.get("data_config").get("input_max_len")
 
     @override
     def init_model(self, is_mtp=False):
@@ -287,10 +290,27 @@ class LongcatFlashRunner(ModelRunner):
         input_lens = copy.deepcopy(inputs.input_ids.size()[1])
         position_ids = inputs.attention_mask.long().cumsum(-1) - 1
         position_ids.masked_fill_(inputs.attention_mask == 0, 1)
-        input_dict = {
-            "input_ids": inputs.input_ids, "generate_ids": inputs.input_ids,
-            "input_lens": input_lens, "kv_len": None,
-            "past_key_values": None, "attention_mask": inputs.attention_mask, "share_mask_tril": share_mask_tril,
-            "is_prefill": True
-        }
+        if not self.decode_only:
+            input_dict = {
+                "input_ids": inputs.input_ids, 
+                "generate_ids": inputs.input_ids,
+                "input_lens": input_lens, 
+                "kv_len": None,
+                "past_key_values": None, 
+                "attention_mask": inputs.attention_mask, 
+                "share_mask_tril": share_mask_tril,
+                "is_prefill": True
+            }
+        else:
+            # default padding to input_max_len by tokenize_prompts
+            input_dict = {
+                "input_ids": torch.full((self.batch_size_per_rank, 1), self.tokenizer.pad_token_id, device='npu'), 
+                "generate_ids": inputs.input_ids, 
+                "input_lens": input_lens, 
+                "kv_len": torch.full((self.batch_size_per_rank,), self.input_max_len, device='npu'),
+                "past_key_values": None, 
+                "attention_mask": inputs.attention_mask, 
+                "share_mask_tril": share_mask_tril, 
+                "is_prefill": False
+            }
         super().model_generate(input_dict, input_lens, warm_up)

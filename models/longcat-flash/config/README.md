@@ -20,6 +20,7 @@ Model Config
   enable_cache_compile: False # Whether enable cache compile for better performance. Support [False, True]
   enable_superkernel: False   # Whether enable superkernel. Support [False, True]
   enable_prefetch: True       # Whether enable prefetch. support [False, True]
+  decode_only: False          # Whether enable decode-only test for long-sequence scenarios. Support [False, True]
 
 data_config:
   dataset: "LongBench"       # Support ["default", "LongBench"]
@@ -33,4 +34,5 @@ parallel_config:
   dense_tp_size: 8    # Dense MLP TP Number
   embed_tp_size: 1    # Embed TP Number
   lmhead_tp_size: 1   # LMHead TP Number
+  kvp_size: 1         # KVCache KVP Number
 ```
