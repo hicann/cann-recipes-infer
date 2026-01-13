@@ -2,7 +2,7 @@
 # https://github.com/Tencent-Hunyuan/HunyuanVideo,
 # https://github.com/ali-vilab/TeaCache,
 # https://github.com/chengzeyi/ParaAttention.
-# Copyright (c) Huawei Technologies Co., Ltd. 2025.
+# Copyright (c) Huawei Technologies Co., Ltd. 2025 - 2026. All rights reserved.
 # Copyright (C) 2024 THL A29 Limited, a Tencent company. All rights reserved.
 # Copyright (C) 2025 ali-vilab.
 #
@@ -79,17 +79,26 @@ def first_block_forward(
     img_modulated = modulate(
         img_modulated, shift=img_mod1_shift, scale=img_mod1_scale
     )
-
+    enable_separate_cfg = cache_manager.enable_separate_cfg
+    if not hasattr(self, 'cfg_step'):
+        self.cfg_step = 0
+    is_cond = True
+    if enable_separate_cfg:
+        is_cond = (self.cfg_step == 0)
+        self.cfg_step = 1 - self.cfg_step
     # TeaCache
     if cache_manager.cache_step.cache_name == "TeaCache":
         judge_input = img_modulated
         args = {
             "latent": img,
-            "judge_input": judge_input
+            "judge_input": judge_input,
+            "is_cond": is_cond
         }
         should_calc, img = cache_manager.cache_step.pre_cache_process(args)
 
         if not should_calc:
+            cache_manager.cache_step.should_skip = True
+            cache_manager.cache_step.last_is_cond = is_cond
             cache_manager.cache_step.post_cache_update(img)
             return img, txt
 
@@ -188,7 +197,8 @@ def first_block_forward(
     if cache_manager.cache_step.cache_name == "FBCache":
         args = {
             "latent": img,
-            "judge_input": img.clone()
+            "judge_input": img.clone(),
+            "is_cond": is_cond
         }
         should_calc, img = cache_manager.cache_step.pre_cache_process(args)
 

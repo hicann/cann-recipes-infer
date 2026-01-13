@@ -1,7 +1,7 @@
 # Adapted from  
 # https://github.com/Tencent-Hunyuan/HunyuanVideo,
 # https://github.com/ali-vilab/TeaCache,
-# Copyright (c) Huawei Technologies Co., Ltd. 2025.
+# Copyright (c) Huawei Technologies Co., Ltd. 2025 - 2026. All rights reserved.
 # Copyright (C) 2024 THL A29 Limited, a Tencent company. All rights reserved.
 # Copyright (C) 2025 ali-vilab.
 #
@@ -33,6 +33,7 @@ import numpy as np
 
 from diffusers.models import ModelMixin
 from diffusers.configuration_utils import ConfigMixin, register_to_config
+from module.dit_cache_step import cache_manager
 
 from .activation_layers import get_activation_layer
 from .norm_layers import get_norm_layer
@@ -42,7 +43,7 @@ from .posemb_layers import apply_rotary_emb
 from .mlp_layers import MLP, MLPEmbedder, FinalLayer
 from .modulate_layers import ModulateDiT, modulate, apply_gate
 from .token_refiner import SingleTokenRefiner
-from .....module.dit_cache_step import cache_manager
+
 
 
 class MMDoubleStreamBlock(nn.Module):

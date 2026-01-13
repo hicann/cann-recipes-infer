@@ -1,7 +1,7 @@
 #!/bin/bash
 # Adapted from  
 # https://github.com/Tencent-Hunyuan/HunyuanVideo,
-# Copyright (c) Huawei Technologies Co., Ltd. 2025.
+# Copyright (c) Huawei Technologies Co., Ltd. 2024 - 2026. All rights reserved.
 # Copyright (C) 2024 THL A29 Limited, a Tencent company. All rights reserved.
 #
 # This code is based on Tencent-Hunyuan's HunyuanVideo library and the HunyuanVideo
@@ -21,6 +21,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+source scripts/set_env.sh
 torchrun --master_port=29600 --nproc_per_node=8 sample_video.py \
     --video-size 780 1280 \
     --video-length 129 \

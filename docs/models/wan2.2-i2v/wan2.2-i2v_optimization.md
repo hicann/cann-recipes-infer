@@ -179,36 +179,39 @@ for step_idx, t in enumerate(tqdm(timesteps)):
 
 ![](figures/overlap.png)
 =======
-### Dit Cache
+### Dit-Cache
 
 DIT-Cache作为扩散模型推理加速的缓存框架，通过复用/预测已有的结果，减少冗余前向计算。其加速逻辑可清晰的分为Step-level和Block-level范式，Step-level通过判断不同采样步数step间的特定特征差异，通过阈值比较，决定是否跳过完整的step计算，直接复用或者预测缓存结果；Block-level以block为粒度（通常是attention模块和mlp模块）判断是否直接复用或者预测缓存结果。
 
-本样例集成了Step-level的dit cache方案，支持[FBCache](https://github.com/chengzeyi/ParaAttention)
+本样例集成了Step-level的Dit-Cache方案，支持[FBCache](https://github.com/chengzeyi/ParaAttention) 以及 [TeaCache](https://liewfeng.github.io/TeaCache/)。
 
 
 **Step-level典型方法：** 在Step-level加速范畴内，[FBCache](https://arxiv.org/pdf/2411.19108)的原理是基于First Block L1误差，比较第一个Block输出残差与上一步的第一个Block输出残差之间的差异，如果首块输出误差与上一轮首块输出误差差异小于指定阈值，就跳过当前步计算，复用残差，对当前步的输出进行估计。
 
+[TeaCache](https://liewfeng.github.io/TeaCache/) 利用模型输入与输出的强相关性，通过Timestep Emebdding（输入）来估计输出差异：先利用该输入粗估输出变化，再通过多项式拟合修正缩放偏差，最终以累积差异作为判断标准，动态决定是否复用上一步被Cache的输出，避免冗余计算。由于WAN2.2具有CFG串行的特点，因此本项目采用teacache官方实现的cond/uncond分别管理的 [TeaCache](https://github.com/ali-vilab/TeaCache/tree/main/TeaCache4Wan2.1)。在本代码中详情见[`module/dit_cache_step/cache_step`](../../../module/dit_cache_step/cache_step.py)。
 
-**启动方式：** 本代码模块通过修改cache_config.json文件决定是否使用Cache，Cache范式，Cache相关参数均在[`models\Wan2.2-I2V\wan\cache\cache_config.json`](../../../models/Wan2.2-I2V/wan/cache/cache_config.json) 中直接修改，同时，在run.sh里面使用如下指令可以自定义cache_config.json位置
+**启动方式：** 本代码模块通过修改cache_config.json文件决定是否使用Cache，Cache范式，Cache相关参数均在[`models/Wan2.2-I2V/wan/cache/cache_config.json`](../../../models/Wan2.2-I2V/wan/cache/cache_config.json) 中直接修改，同时，在run.sh里面使用如下指令可以自定义cache_config.json位置。
 ```python
---cache_config './wan/cache/cache_config.json'  #cache_config.json位置
+--cache_config './wan/cache/cache_config.json'  #cache_config.json位置。
 ```      
-其中参数意义如下
+其中参数意义如下：
 ```python
 {
-    "cache_forward": "NoCache",# 直接设置Cache方案，目前支持FBCache,默认启动NOCache，也就是无ditcache方法，只需按照下面的提示将FBCache代替NoCache即可启动
+    "cache_forward": "NoCache",# 直接设置Cache方案，目前支持FBCache/TeaCache,默认启动NOCache，也就是无Dit-Cache方法，只需按照下面的提示将FBCache/TeaCache_double代替NoCache即可启动。
     "comment": "choose from FBCache/TeaCache, otherwise use NoCache", 
+    "enable_separate_cfg": true,# CFG适配开关，如果启动CFG分离，需要true开启，进行cond/uncond分开管理。
     "FBCache":{
             "cache_name": "FBCache",
-            "rel_l1_thresh": 0.05,  # FBCache阈值，阈值越大跳过越多，精度损失越大，需要平衡性能和精度
+            "rel_l1_thresh": 0.05,  # FBCache阈值，阈值越大跳过越多，精度损失越大，需要平衡性能和精度。
             "latent": "latent",
             "judge_input": "cache_latent"
     },
     "TeaCache":{
             "cache_name" : "TeaCache",
             "rel_l1_thresh": 0.1,  # TeaCache阈值，阈值越大跳过越多，精度损失越大，需要平衡性能和精度
-            "coefficients": [733.226126,-401.131952,67.5869174,-3.149879,0.0961237896],  #  TeaCache多项式拟合，通过输入输出进行拟合
+            "coefficients": [733.226126,-401.131952,67.5869174,-3.149879,0.0961237896],  #  TeaCache多项式拟合，通过输入输出进行拟合。
             "latent": "latent",
+            "warmup": 2, # 预热步骤，由于部分视频模型在step的开始和结束阶段变换剧烈，因此设置warmup可以强制在开始前和最后的N个阶段计算。
             "judge_input": "modulated_inp"
     },
     "NoCache":{

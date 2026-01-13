@@ -1,7 +1,7 @@
 # coding=utf-8
 # Adapted from
 # https://github.com/Wan-Video/Wan2.2/blob/main/wan/modules/model.py
-# Copyright (c) Huawei Technologies Co., Ltd. 2025.
+# Copyright (c) Huawei Technologies Co., Ltd. 2025 - 2026. All rights reserved.
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -36,7 +36,7 @@ __all__ = ['WanModel']
 def sinusoidal_embedding_1d(dim, position):
     # preprocess
     if dim % 2 != 0:
-        raise ValueError(f"dim must be even, got {dim}")
+        raise ValueError(f"dim must be cond, got {dim}")
     half = dim // 2
     position = position.type(torch.float32)
 
@@ -50,7 +50,7 @@ def sinusoidal_embedding_1d(dim, position):
 @torch.amp.autocast('npu', enabled=False)
 def rope_params(max_seq_len, dim, theta=10000):
     if dim % 2 != 0:
-        raise ValueError(f"dim must be even, got {dim}")
+        raise ValueError(f"dim must be cond, got {dim}")
     freqs = torch.outer(
         torch.arange(max_seq_len),
         1.0 / torch.pow(theta,
@@ -246,6 +246,32 @@ def first_block_forward(
     # assert e.dtype == torch.float32
     with torch.amp.autocast('npu', dtype=torch.bfloat16):
         e = (self.modulation.unsqueeze(0) + e).chunk(6, dim=2)
+    enable_separate_cfg = cache_manager.enable_separate_cfg
+    if not hasattr(self, 'cfg_step'):
+        self.cfg_step = 0
+    is_cond = True
+    if enable_separate_cfg:
+        is_cond = (self.cfg_step == 0)
+        self.cfg_step = 1 - self.cfg_step
+    should_calc = True
+    reused_x = x
+    cache_step = cache_manager.cache_step
+    if cache_step.cache_name == "TeaCache":
+        img_mod1_scale = e[1].squeeze(2)
+        img_mod1_shift = e[0].squeeze(2)
+        norm_x = self.norm1(x, scale=img_mod1_scale, shift=img_mod1_shift)
+        judge_input = (1 + img_mod1_scale) * norm_x + img_mod1_shift
+        args = {
+            "latent": x,
+            "judge_input": judge_input,
+            "is_cond": is_cond
+        }
+        should_calc, reused_x = cache_step.pre_cache_process(args)
+
+        if not should_calc:
+            cache_step.should_skip = True
+            cache_step.last_is_cond = is_cond
+            return reused_x
     # assert e[0].dtype == torch.float32
     y = self.self_attn(
             x=self.norm1(x, scale=e[1].squeeze(2), shift=e[0].squeeze(2)),
@@ -267,11 +293,12 @@ def first_block_forward(
         return x
 
     x = cross_attn_ffn(x, context, context_lens, e)
-    if cache_manager.cache_step.cache_name == "FBCache":
+    if cache_step.cache_name == "FBCache":
         args = {
             "latent": x,
-            "judge_input": x.clone()
+            "judge_input": x.clone(),
+            "is_cond": is_cond
         }
-        should_calc, x = cache_manager.cache_step.pre_cache_process(args)
+        should_calc, x = cache_step.pre_cache_process(args)
 
     return x

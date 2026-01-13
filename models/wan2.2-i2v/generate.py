@@ -1,7 +1,7 @@
 # coding=utf-8
 # Adapted from
 # https://github.com/Wan-Video/Wan2.2/blob/main/generate.py
-# Copyright (c) Huawei Technologies Co., Ltd. 2025.
+# Copyright (c) Huawei Technologies Co., Ltd. 2025 - 2026. All rights reserved.
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -550,15 +550,19 @@ def generate(args):
             convert_model_dtype=args.convert_model_dtype,
             use_vae_parallel=args.vae_parallel,
         )
-        cache_manager.from_config(args.cache_config)
-        if world_size > 1 and cache_manager.cache_step.cache_name != "NoCache":
+        cache_manager.from_config(
+                config_path=args.cache_config,
+                cache_params={"num_steps": args.sample_steps})
+        if world_size > 1:
             logging.info("Cannot enable both Multi-NPU and DIT-Cache. DIT-Cache has been disabled")
-            cache_manager.cache_step = NoCache(args.cache_config)
+            logging.info("Now apply Dit-Cache method: NoCache!")
+            cache_manager.cache_step = NoCache()
         else:
             cache_block = wan_i2v.high_noise_model.blocks[0]
             cache_block.forward = first_block_forward.__get__(cache_block, type(cache_block))
             cache_block = wan_i2v.low_noise_model.blocks[0]
             cache_block.forward = first_block_forward.__get__(cache_block, type(cache_block))
+
         transformer_low = wan_i2v.low_noise_model
         transformer_high = wan_i2v.high_noise_model
         if args.tp_size > 1:

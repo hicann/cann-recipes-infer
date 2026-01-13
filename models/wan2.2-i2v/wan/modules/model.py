@@ -1,7 +1,7 @@
 # coding=utf-8
 # Adapted from
 # https://github.com/Wan-Video/Wan2.2/blob/main/wan/modules/model.py
-# Copyright (c) Huawei Technologies Co., Ltd. 2025.
+# Copyright (c) Huawei Technologies Co., Ltd. 2025 - 2026. All rights reserved.
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -33,7 +33,7 @@ __all__ = ['WanModel']
 def sinusoidal_embedding_1d(dim, position):
     # preprocess
     if dim % 2 != 0:
-        raise ValueError(f"dim must be even, got {dim}")
+        raise ValueError(f"dim must be cond, got {dim}")
     half = dim // 2
     position = position.type(torch.float32)
 
@@ -47,7 +47,7 @@ def sinusoidal_embedding_1d(dim, position):
 @torch.amp.autocast('npu', enabled=False)
 def rope_params(max_seq_len, dim, theta=10000):
     if dim % 2 != 0:
-        raise ValueError(f"dim must be even, got {dim}")
+        raise ValueError(f"dim must be cond, got {dim}")
     freqs = torch.outer(
         torch.arange(max_seq_len),
         1.0 / torch.pow(theta,
@@ -567,6 +567,7 @@ class WanModel(ModelMixin, ConfigMixin):
                 break
         
         cache_manager.cache_step.post_cache_update(x)
+        cache_manager.cache_step.should_skip = False
         # head
         x = self.head(x, e)
 
