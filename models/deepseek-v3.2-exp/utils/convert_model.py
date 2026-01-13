@@ -213,7 +213,7 @@ def generate_quant_config(c8, ignores, w4a8=False, clip=False):
     Generate a quantization configuration dictionary based on the specified parameters. 
     """
     kv_cache_scheme = {"num_bits": 8,
-                       "type": 'float',
+                       "type": 'int',
                        "strategy": 'group',
                        "group_size": 128,
                        "dynamic": 'true',
