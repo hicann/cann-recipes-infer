@@ -400,10 +400,10 @@ class Infer(nn.Module):
         return input_dict
 
     def obtain_mtp_stats(self, total_accepted_num, cnt, infer_time_rec):
-        avg_accpeted_num = torch.mean(total_accepted_num).to(torch.int32)
+        avg_accpeted_num = torch.mean(total_accepted_num)
         logging.info(f"Finish inference, number of loop step is {cnt}, "
                      f"draft token per batch is {cnt}*{self.next_n}, "
-                     f"average accepted num per batch is {avg_accpeted_num}")
+                     f"average accepted num per batch is {avg_accpeted_num.to(torch.int32)}")
 
         total_tokens = avg_accpeted_num + cnt
         equivalent_infer_time = process_infer_time(infer_time_rec, total_tokens) 

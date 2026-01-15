@@ -1,7 +1,7 @@
 model_name: "deepseek_v3.2_exp"
 model_path: "/data/models/DeepSeek-V3.2-Exp-W8A8C8" 
 exe_mode: "acl_graph"          # ["ge_graph", "eager", "acl_graph"], mode of decode
-world_size: 16               # world_size = 2 * chip_num in A3
+world_size: 64               # world_size = 2 * chip_num in A3
 
 model_config:
   next_n: 0
@@ -24,7 +24,7 @@ data_config:
   batch_size: 256
 
 parallel_config:
-  cp_size: 16
+  cp_size: 64
   oproj_tp_size: 8    # only support when attn_tp_size == 1
   attn_tp_size: 1
   dense_tp_size: 4

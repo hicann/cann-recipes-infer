@@ -1871,12 +1871,16 @@ class LongcatFlashForCausalLM(LongcatFlashPreTrainedModel, GenerationMixin):
                     cur_topk_list_decode = cur_topk_list_decode + [i for i in range(expert_start, expert_end)]
                 cur_topk_list = torch.Tensor(cur_topk_list_decode).int().view(batch_size * seq_len, -1).npu()
             else:
-                step_decode = batch_size * self.top_k * seq_len
-                step_gap = self.num_experts // self.moe_ep_size if step_decode < self.num_experts else 1
-                cur_topk_list_decode = [
-                    ((i + global_rank // step_gap * step_gap) * step_gap +
-                    global_rank % step_gap) % self.num_experts for i in range(step_decode)
-                ]
+                expanded_tokens = batch_size * self.top_k * seq_len  # Total tokens to be allocated to experts
+                step_gap = self.num_experts // self.moe_ep_size # Number of experts per rank
+                expanded_offset = expanded_tokens * global_rank + global_rank # Token count offset
+                cur_topk_list_decode = []
+                # Allocate experts using round-robin algorithm
+                for idx in range(expanded_tokens):
+                    col = (expanded_offset + idx) % self.moe_ep_size  # Column index
+                    row = (expanded_offset + idx) // self.moe_ep_size % step_gap  # Row index
+                    expert_idx = row + col * step_gap  # Final expert index
+                    cur_topk_list_decode.append(expert_idx)
                 cur_topk_list = torch.Tensor(cur_topk_list_decode).int().view(batch_size * seq_len, -1).npu()
         return cur_topk_list
 
