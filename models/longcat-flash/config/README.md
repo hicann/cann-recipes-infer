@@ -30,6 +30,7 @@ data_config:
 
 parallel_config:
   attn_tp_size: 1     # Attention TP Number
+  o_proj_tp_size: 8   # O_proj TP Number. When attn_tp_size > 1, attn_tp_size must be equal to o_proj_tp_size
   moe_tp_size: 1      # MoE TP Number
   dense_tp_size: 8    # Dense MLP TP Number
   embed_tp_size: 1    # Embed TP Number
