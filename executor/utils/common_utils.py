@@ -205,8 +205,10 @@ def check_common_parallel_settings(world_size, runner_settings):
         raise ValueError(f"{world_size=} must greater than 0")
     parallel_config = runner_settings.get("parallel_config", {})
     batch_size = runner_settings.get("data_config").get("batch_size", 1)
+    target_keys = ("tp_size", "ep_size", "kvp_size")
     for key, value in parallel_config.items():
-        if ("tp_size" in key or "ep_size" in key) and world_size % value != 0:
+        is_target_key = any(target_key in key for target_key in target_keys)
+        if is_target_key and world_size % value != 0:
             raise ValueError(f"{world_size=} is not divisible by {key}={value}")
         if "dp_size" in key and batch_size % value != 0:
             raise ValueError(f"{batch_size=} is not divisible by {key}={value}")

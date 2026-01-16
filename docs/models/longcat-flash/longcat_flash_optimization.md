@@ -94,8 +94,8 @@ Decode阶段参考[Deepseek论文](https://arxiv.org/pdf/2405.04434)中提及的
 ### MLA (Multi-Head Latent Attention) KVP切分优化
 - KVP特性旨在面向长序列推理场景，通过将KV Cache沿S维度切分到多个rank上，缓解单rank的KV Cache访存压力，从而降低时延。KVP特性暂未支持Multi-Token Prediction投机推理。
 - Prefill阶段使能KVP切分优化，将根据`kvp_size`和`kvp_rank`对slot_mapping进行切分，并将slot_mapping作为`npu_kv_rmsnorm_rope_cache`算子的index参数，将完整的KV Cache分片轮转写入到各个kvp_rank上，每个kvp_rank上存储`1/kvp_size`长度的KV Cache；此外，Prefill阶段在计算Attention时复用了`kvp_size`，同时约束`attn_tp_size = 1`，对`npu_fused_infer_attention_score`算子的输入Q、K、V按头维度进行TP切分。
-- Decode阶段使能KVP切分优化，启用`npu_fused_infer_attention_score`算子的`softmax_lse_flag`功能，输入Q、K、V头维度保持完整，与各个`kvp_rank`上存储的部分KV Cache进行Attention计算，并输出相应的softmax lse，每个`kvp_rank`拿到完整`num_heads_per_rank`对部分KV Cache的计算结果`attn_partial`和`lse_partial`；通过`_all_to_all_along_headdim`使得每个`kvp_rank`拿到切分的`num_heads_per_rank // kvp_size`对完整KV Cache的计算结果`attn_scatter`和`lse_scatter`；最后`npu_attention_update`算子利用`attn_scatter`和`lse_scatter`完成归约合并；Decode阶段`actual_seq_lengths_kv`表示当前`kvp_rank`实际存储的KV Cache长度，因此需要根据`kvp_size`和`kvp_rank`进行调整。
-- 使能KVP特性的场景下（`kvp_size > 1`）新增了`o_proj_tp_size = kvp_size`约束，经过`npu_fused_infer_attention_score`算子后复用`kvp_size`自然执行o_proj TP切分，后续在`o_proj_forward`内进行`all_reduce`通信。
+- Decode阶段使能KVP切分优化，启用`npu_fused_infer_attention_score`算子的`softmax_lse_flag`功能，输入Q、K、V头维度保持完整，与各个`kvp_rank`上存储的部分KV Cache进行Attention计算，并输出相应的softmax lse，每个`kvp_rank`拿到完整`num_heads_per_rank`个Q head对部分KV Cache的计算结果`attn_partial`和`lse_partial`；通过`_all_to_all_along_headdim`从各个`kvp_rank`拿到`kvp_size`份`num_heads_per_rank // kvp_size`个Q head对各个部分KV Cache的计算结果`attn_scatter`和`lse_scatter`，并通过`npu_attention_update`算子对`attn_scatter`和`lse_scatter`执行归约操作。Decode阶段`actual_seq_lengths_kv`表示当前`kvp_rank`实际存储的KV Cache长度，因此需要根据`kvp_size`和`kvp_rank`进行调整。
+- 使能KVP特性的场景下（`kvp_size > 1`）新增了`o_proj_tp_size = kvp_size`约束，在`o_proj_forward`中配合执行o_proj TP切分并后续执行`all_reduce`通信。
 
 <div align="center">
     <img src="./figures/kvp.png" width="400" />

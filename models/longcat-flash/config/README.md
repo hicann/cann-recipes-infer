@@ -35,5 +35,5 @@ parallel_config:
   dense_tp_size: 8    # Dense MLP TP Number
   embed_tp_size: 1    # Embed TP Number
   lmhead_tp_size: 1   # LMHead TP Number
-  kvp_size: 1         # KVCache KVP Number
+  kvp_size: 1         # KVCache KVP Number. When kvp_size > 1, o_proj_tp_size must be equal to kvp_size. Support kvp_size subject to world_size % kvp_size = 0, defaults to 1(disabled).
 ```

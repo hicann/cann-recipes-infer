@@ -74,20 +74,17 @@ def check_model_settings(world_size, runner_settings):
 def check_parallel_settings(world_size, runner_settings):
     check_common_parallel_settings(world_size, runner_settings)
     attn_tp_size = runner_settings.get("parallel_config").get("attn_tp_size")
-    attn_dp_size = world_size // attn_tp_size
     o_proj_tp_size = runner_settings.get("parallel_config").get("o_proj_tp_size")
     cp_size = runner_settings.get("parallel_config").get("cp_size", 1)
     batch_size = runner_settings.get("data_config").get("batch_size", 1)
     kvp_size = runner_settings.get("parallel_config").get("kvp_size", 1)
 
-    if batch_size % attn_dp_size != 0 and (batch_size * kvp_size) % attn_dp_size != 0:
-        raise ValueError(f"{batch_size=} is not divisible by {attn_dp_size=}")
     if attn_tp_size > 1 and attn_tp_size != o_proj_tp_size:
         raise ValueError(f"when attn_tp_size > 1, {attn_tp_size=} must be equal to {o_proj_tp_size=}")
+    if kvp_size > 1 and batch_size % (world_size // kvp_size) != 0:
+        raise ValueError(f"when kvp_size > 1, {batch_size=} is not divisible by {world_size // kvp_size=}")
     if kvp_size > 1 and attn_tp_size != 1:
         raise ValueError(f"when kvp_size > 1, {attn_tp_size=} must be equal to 1")
-    if kvp_size * batch_size // world_size < 1:
-        raise ValueError(f"{kvp_size=} must be larger than {world_size // batch_size}")
     if kvp_size > 1 and o_proj_tp_size != kvp_size:
         raise ValueError(f"when kvp_size > 1, {o_proj_tp_size=} must be equal to {kvp_size=}")
     if kvp_size > 1 and cp_size != 1:

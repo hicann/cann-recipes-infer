@@ -696,8 +696,8 @@ class LongcatFlashAttention(nn.Module):
                                    group=self.hccl_comm_dict.get("o_proj_tp_group", None))
             attn_output = all2all_output
 
-        # after view: (o_proj_tp_size * bs*q_len, num_heads // self.o_proj.tp_size * v_head_dim)
-        attn_output = self.o_proj(attn_output.view(-1, self.num_heads // self.o_proj.tp_size * self.v_head_dim))
+        # after view: (o_proj_tp_size * bs*q_len, num_heads // self.o_proj_tp_size * v_head_dim)
+        attn_output = self.o_proj(attn_output.view(-1, self.num_heads // self.o_proj_tp_size * self.v_head_dim))
         o_proj = attn_output
         if self.kvp_size == 1 and self.o_proj_tp_size > 1:
             reduce_scatter_output = torch.empty((attn_output.size()[0] // self.o_proj_tp_size, attn_output.size()[1]),
