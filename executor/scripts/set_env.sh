@@ -20,5 +20,3 @@ cann_path="your_cann_pkgs_path"
 source $cann_path/bin/setenv.bash
 export ASCEND_HOME_PATH=$cann_path
 
-driver_path="your_driver_path" # default is in /usr/local/Ascend/driver
-source $driver_path/bin/setenv.bash
