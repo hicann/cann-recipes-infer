@@ -67,7 +67,7 @@ class LongcatFlashRunner(ModelRunner):
         self.decode_only = runner_settings.get("model_config").get("decode_only", False)
         self.input_max_len = runner_settings.get("data_config").get("input_max_len")
         self.enable_afd = runner_settings.get("model_config").get("enable_afd", False)
-        self.next_n = runner_settings.get("model_config").get("next_n", "0")
+        self.next_n = runner_settings.get("model_config").get("next_n", 0)
         self.spec_len = self.next_n + 1 # speculative len is one more than num of mtp modules
         self.is_attn_rank = check_is_attn_rank(runner_settings)
 

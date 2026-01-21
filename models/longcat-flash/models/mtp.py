@@ -33,7 +33,7 @@ class InferMTP(nn.Module):
         super().__init__()
         self.runner_settings = runner_settings
         self.enable_pa = runner_settings.get("model_config").get("enable_pa", False)
-        self.next_n = runner_settings.get("model_config").get("next_n", "0")
+        self.next_n = runner_settings.get("model_config").get("next_n", 0)
         self.spec_len = self.next_n + 1 # speculative len is one more than num of mtp modules
 
         self.main_model = main_model
