@@ -1,6 +1,7 @@
 # cann-recipes-infer
 
 ## 🚀Latest News
+- [2026/01] LongCat-Flash模型在昇腾Atlas A3系列上已支持Attention-FFN Disaggregation(AFD)部署模式。
 - [2025/12] HunyuanImage-3.0模型在昇腾Atlas A2/A3系列上已支持推理部署。
 - [2025/12] LongCat-Flash模型在昇腾Atlas A3系列上已支持低时延的推理部署。
 - [2025/12] GPT-OSS-20B/GPT-OSS-120B在昇腾Atlas A2系列上已支持推理部署。

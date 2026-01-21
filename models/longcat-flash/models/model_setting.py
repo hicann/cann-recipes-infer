@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import logging
+import os
 from executor.utils import update_settings, align_up
 from executor.utils.common_utils import update_common_vars, check_common_parallel_settings
 
@@ -94,3 +95,31 @@ def check_parallel_settings(world_size, runner_settings):
 def check_vars(world_size, runner_settings):
     check_parallel_settings(world_size, runner_settings)
     check_model_settings(world_size, runner_settings)
+
+
+def update_afd_settings(runner_settings):
+    enable_afd = runner_settings.get("model_config").get("enable_afd", False)
+    global_world_size = runner_settings.get("world_size", 1)
+    if enable_afd and global_world_size % 2 != 0:
+        raise ValueError(f"Afd is only supported when global_world_size % 2 == 0, but now {global_world_size=}!")
+
+    # If not in AFD scenario, every rank is treated as an attention rank.
+    ffn_world_size = global_world_size // 2 if enable_afd else 0
+    runner_settings.update({"ffn_world_size": ffn_world_size})
+    logging.info(f"add (ffn_world_size: {ffn_world_size}) to runner_settings.")
+
+
+def check_and_update_vars(runner_settings):
+    update_afd_settings(runner_settings)
+    world_size = runner_settings.get("world_size", 1) - runner_settings.get("ffn_world_size", 0)
+    check_vars(world_size, runner_settings)
+    update_vars(world_size, runner_settings)
+
+
+def check_is_attn_rank(runner_settings):
+    local_rank = int(os.getenv("LOCAL_RANK", "0"))
+    rank_offset = int(os.getenv("RANK_OFFSET", "0"))
+    global_rank = local_rank + rank_offset
+    ffn_world_size = runner_settings.get("ffn_world_size", 0)
+    # In AFD scenario, the first half of the ranks will serve as FFN, and the second half will serve as Attn.
+    return False if global_rank < ffn_world_size else True

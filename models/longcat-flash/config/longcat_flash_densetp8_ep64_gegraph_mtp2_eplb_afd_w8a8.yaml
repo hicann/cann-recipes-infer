@@ -1,0 +1,33 @@
+model_name: "longcat_flash"
+model_path: "/data/models/origin/LongCat-Flash-Chat-W8A8/"
+exe_mode: "ge_graph"                # ["ge_graph", "eager"], mode of decode
+world_size: 128
+
+model_config:
+  enable_profiler: True  # [False, True]
+  with_ckpt: True # [False, True]
+  enable_online_split_weight: True
+  pa_block_size: 128
+  perfect_eplb: True     # [False, True], for TPOT test only, this will influence accuracy
+  moe_chunk_max_len: 1024
+  next_n: 2
+  enable_multi_stream: 1 # AFD scenario will not take effect.
+  enable_mla_prolog: True
+  enable_cache_compile: True
+  enable_super_kernel: True
+  enable_prefetch: True
+  enable_afd: True # [False, True]. AFD: ATTN-FFN Disaggragation
+
+data_config:
+  dataset: "LongBench"                # ["default", "LongBench"]
+  input_max_len: 4608                 # 4.5K in
+  max_new_tokens: 128
+  batch_size: 256  # global batch_size, should be divisible by ep_size
+
+parallel_config:
+  attn_tp_size: 1 # attn_dp_size = attn_world_size // attn_tp_size
+  o_proj_tp_size: 8
+  moe_tp_size: 1 # moe_ep_size = ffn_world_size // moe_tp_size
+  dense_tp_size: 8
+  embed_tp_size: 1
+  lmhead_tp_size: 16

@@ -24,7 +24,7 @@ ROOT_DIR = os.path.realpath(os.path.join(CUR_DIR, ".."))
 sys.path.append(ROOT_DIR)
 from runner_longcat_flash import LongcatFlashRunner
 from models.mtp import InferMTP
-from models.model_setting import update_vars, check_vars
+from models.model_setting import check_is_attn_rank, check_and_update_vars
 from executor.utils import read_yaml
 from executor.utils.data_utils import generate_prompt
 
@@ -58,7 +58,6 @@ def run_longcat_flash(runner_settings):
 
 
 def run_longcat_flash_mtp(runner_settings):
-    attn_tp_size = runner_settings.get("parallel_config").get("attn_tp_size", 1)
     preset_prompts, _ = generate_prompt(runner_settings)
     model_runner_main = LongcatFlashRunner(runner_settings)
     model_runner_mtp = LongcatFlashRunner(runner_settings)
@@ -76,19 +75,28 @@ def run_longcat_flash_mtp(runner_settings):
     infer_mtp.model_generate_mtp(preset_prompts)
 
 
+def run_longcat_flash_ffn(runner_settings):
+    model_runner_ffn = LongcatFlashRunner(runner_settings)
+    model_runner_ffn.init_model()
+    # warmup
+    model_runner_ffn.ffn_server(warm_up=True)
+    # generate perf data
+    model_runner_ffn.ffn_server()
+
+
 if __name__ == "__main__":
     args = parse_args()
     yaml_file_path = args.yaml_file_path
     runner_settings = read_yaml(yaml_file_path)
-    world_size = int(os.getenv("WORLD_SIZE", "1"))
-    check_vars(world_size, runner_settings)
-    update_vars(world_size, runner_settings)
+
+    check_and_update_vars(runner_settings)
+    is_attn_rank = check_is_attn_rank(runner_settings)
     logging.info(f"runner_settings is: {runner_settings}")
 
     next_n = runner_settings.get("model_config").get("next_n", 0)
     if next_n > 0:
-        run_longcat_flash_mtp(runner_settings)
+        run_longcat_flash_mtp(runner_settings) if is_attn_rank else run_longcat_flash_ffn(runner_settings)
     else:
-        run_longcat_flash(runner_settings)
+        run_longcat_flash(runner_settings) if is_attn_rank else run_longcat_flash_ffn(runner_settings)
     logging.info("model run success")
 

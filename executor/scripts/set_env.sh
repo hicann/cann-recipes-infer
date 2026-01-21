@@ -13,10 +13,10 @@ export IPs=('xxx.xxx.xxx.xxx' 'xxx.xxx.xxx.xxx') # IPs of all servers. Please se
 
 rm -rf /root/atc_data/
 
-recipes_path="your_cann_recipes_path"
-export PYTHONPATH=$PYTHONPATH:$recipes_path
+CURRENT_PATH=$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
+RECIPES_PATH=$(dirname "$(dirname "$CURRENT_PATH")")
+export PYTHONPATH=$PYTHONPATH:$RECIPES_PATH
 
 cann_path="your_cann_pkgs_path"
 source $cann_path/bin/setenv.bash
 export ASCEND_HOME_PATH=$cann_path
-

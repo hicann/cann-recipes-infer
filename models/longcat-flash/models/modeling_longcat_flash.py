@@ -267,6 +267,7 @@ class LongcatFlashTopkRouter(nn.Module):
                                      quant_config=None,
                                      params_dtype=torch.float32,
                                      prefix=f"{prefix}.classifier")
+        self.prefetch_size = self.config.hidden_size * self.num_experts * 4 # 4: float32 weight
         # register_buffer not in named_parameters()
         self.e_score_correction_bias = nn.Parameter(
                 torch.empty((self.num_experts), dtype=torch.float32)
@@ -290,7 +291,7 @@ class LongcatFlashTopkRouter(nn.Module):
                 routed_scaling_factor=self.routed_scaling_factor,
                 eps=float(1e-20)
             )
-        return topk_indices.to(torch.int32), topk_weights, None
+        return topk_indices.to(torch.int32), topk_weights, router_logits
 
 
 class LongcatFlashMoE(nn.Module):
@@ -298,7 +299,7 @@ class LongcatFlashMoE(nn.Module):
     moe module.
     """
 
-    def __init__(self, config, runner_settings, prefix, **kwargs):
+    def __init__(self, config, runner_settings, layer_idx, prefix, **kwargs):
         super().__init__()
         self.config = config
         self.runner_settings = runner_settings
@@ -516,7 +517,7 @@ class LongcatFlashMoE(nn.Module):
         hidden_states = torch_npu.npu_moe_distribute_combine_v2(**combine_args)
 
         hidden_states = hidden_states.view(batch_size, sequence_length, self.hidden_size)
-        return hidden_states
+        return hidden_states, hidden_states_ordered_by_experts
 
     def _split_tensors(self, bs_qlen, x, topk_ids, topk_weight):
         if bs_qlen > self.moe_chunk_max_len:  # need to chunk moe seq_len dim to avoid OOM
@@ -539,7 +540,7 @@ class LongcatFlashMoE(nn.Module):
         if is_prefill:
             return self.moe_infer_double_routing(hidden_states, topk_indices, topk_weights)
         else:
-            return self.moe_infer_dispatch_combine(hidden_states, topk_indices, topk_weights)
+            return self.moe_infer_dispatch_combine(hidden_states, topk_indices, topk_weights)[0]
 
 
 class LongcatFlashAttention(nn.Module):
@@ -1088,10 +1089,18 @@ class LongcatFlashDecoderLayer(GradientCheckpointingLayer):
         self.layer_idx = layer_idx
         self.runner_settings = runner_settings
         self.hidden_size = config.hidden_size
-        self.mlp = LongcatFlashMoE(config, self.runner_settings, prefix=f"{prefix}.mlp", **kwargs)
+        self.enable_afd = self.runner_settings.get("model_config").get("enable_afd", False)
+        if not self.enable_afd:
+            self.mlp = LongcatFlashMoE(config, self.runner_settings, layer_idx, prefix=f"{prefix}.mlp", **kwargs)
         self.enable_multi_stream = self.runner_settings.get("model_config").get("enable_multi_stream", 0)
         self.enable_superkernel = self.runner_settings.get("model_config").get("enable_superkernel", False)
         self.enable_prefetch = self.runner_settings.get("model_config").get("enable_prefetch", False)
+        self.ffn_world_size = self.runner_settings.get("ffn_world_size", 0)
+        self.hccl_comm_dict = kwargs.get("hccl_comm_dict", None)
+        self.global_rank = dist.get_rank()
+        # ensure recv/send comm tags do not overlap. Attn send tag value should equal to FFN recv tag.
+        self.send_tag = layer_idx
+        self.recv_tag = layer_idx + config.num_hidden_layers
         if self.enable_multi_stream == 2: # takes effects only when enable_multi_stream > 0
             self.aic_num1 = "12"
             self.aiv_num1 = "24"
@@ -1177,8 +1186,13 @@ class LongcatFlashDecoderLayer(GradientCheckpointingLayer):
             hidden_states, residual = self.post_attention_layernorm[i](hidden_states, residual)
 
             if i == 0:
-                # shortcut output (MoE output)
-                shortcut_mlp_output = self.mlp(hidden_states, is_prefill, cur_topk_list=cur_topk_list)
+                if self.enable_afd:
+                    dist.send(hidden_states, dst=(self.global_rank - self.ffn_world_size), tag=self.send_tag)
+                    shortcut_mlp_output = torch.empty_like(hidden_states)
+                    dist.recv(shortcut_mlp_output, src=(self.global_rank - self.ffn_world_size), tag=self.recv_tag)
+                else:
+                    # shortcut output (MoE output)
+                    shortcut_mlp_output = self.mlp(hidden_states, is_prefill, cur_topk_list=cur_topk_list)
 
             hidden_states, _, _ = self.mlps[i](hidden_states)
             if i == 1:
@@ -1223,16 +1237,21 @@ class LongcatFlashDecoderLayer(GradientCheckpointingLayer):
                 actual_seq_lengths_kv=actual_seq_lengths_kv
             )
 
-            npu_prefetch(self.enable_prefetch, self.mlp.router.classifier.weight.data, o_proj, 18 * 1024 * 1024, 0)
             hidden_states_norm, residual = self.post_attention_layernorm[0](hidden_states, residual)
 
         # shortcut output (MoE output)
-        with npu_stream_switch(True, "1"):
-            with limit_core_num(True, self.aic_num1, self.aiv_num1):
-                with superkernel_scope(self.enable_superkernel, f"scope_{self.layer_idx}_part2_moe", ""):
-                    shortcut_mlp_output = self.mlp(hidden_states_norm, is_prefill, cur_topk_list=cur_topk_list)
+        if not self.enable_afd:
+            npu_prefetch(self.enable_prefetch, self.mlp.router.classifier.weight.data, o_proj, 18 * 1024 * 1024, 0)
+            with npu_stream_switch(True, "1"):
+                with limit_core_num(True, self.aic_num1, self.aiv_num1):
+                    with superkernel_scope(self.enable_superkernel, f"scope_{self.layer_idx}_part2_moe", ""):
+                        shortcut_mlp_output = self.mlp(hidden_states_norm, is_prefill, cur_topk_list=cur_topk_list)
+        else:
+            dist.send(hidden_states_norm, dst=(self.global_rank - self.ffn_world_size), tag=self.send_tag)
+            shortcut_mlp_output = torch.empty_like(hidden_states)
+            dist.recv(shortcut_mlp_output, src=(self.global_rank - self.ffn_world_size), tag=self.recv_tag)
 
-        with limit_core_num(True, self.aic_num2, self.aiv_num2):
+        with limit_core_num(not self.enable_afd, self.aic_num2, self.aiv_num2):
             with superkernel_scope(self.enable_superkernel, f"scope_{self.layer_idx}_part2_main", ""):
                 hidden_states, _, dsq = self.mlps[0](hidden_states_norm, self.enable_prefetch, o_proj)
 
@@ -1276,7 +1295,6 @@ class LongcatFlashDecoderLayer(GradientCheckpointingLayer):
         return outputs
 
 
-
 class LongcatFlashPreTrainedModel(PreTrainedModel):
     config: LongcatFlashConfig
     base_model_prefix = "model"
@@ -1302,6 +1320,7 @@ class LongcatFlashModel(LongcatFlashPreTrainedModel):
         self.config = config
         self.global_rank = dist.get_rank()
         self.runner_settings = runner_settings
+        self.ffn_world_size = self.runner_settings.get("ffn_world_size", 0)
         self.embed_tp_size = self.runner_settings.get("parallel_config").get("embed_tp_size", 1)
         self.attn_tp_size = self.runner_settings.get("parallel_config").get("attn_tp_size", 1)
 
@@ -1361,7 +1380,8 @@ class LongcatFlashModel(LongcatFlashPreTrainedModel):
             dist.all_gather_into_tensor(all_input_ids, input_ids, group=embed_tp_group)
 
             # Map the token IDs in all_input_ids to the vocab shard range assigned to the current rank
-            new_input_ids = all_input_ids - (self.global_rank % self.embed_tp_size) * self.vocab_size_per_rank
+            new_input_ids = all_input_ids - (
+                    (self.global_rank - self.ffn_world_size) % self.embed_tp_size) * self.vocab_size_per_rank
             # Mark which tokens belong to the current rank's vocab shard
             mask = (new_input_ids >= 0) & (new_input_ids < self.vocab_size_per_rank) # (bs, qlen)
             # Set out-of-bounds parts to 0, keeping valid IDs within [0, vocab_size_per_rank)
@@ -1445,6 +1465,7 @@ class LongcatFlashForCausalLM(LongcatFlashPreTrainedModel, GenerationMixin):
         self.runner_settings = runner_settings
         self.top_k = config.moe_topk
         self.perfect_eplb = self.runner_settings.get("model_config").get("perfect_eplb", False)
+        self.enable_afd = self.runner_settings.get("model_config").get("enable_afd", False)
         self.is_mtp = is_mtp
         self.lmhead_tp_size = self.runner_settings.get("parallel_config").get("lmhead_tp_size", 1)
         self.moe_ep_size = self.runner_settings.get("parallel_config").get("moe_ep_size", 1)
@@ -1529,14 +1550,12 @@ class LongcatFlashForCausalLM(LongcatFlashPreTrainedModel, GenerationMixin):
 
     def get_parallel_settings(self):
         self.embed_tp_size = self.runner_settings.get("parallel_config").get("embed_tp_size", 1)
-        self.embed_dp_size = self.runner_settings.get("parallel_config").get("embed_dp_size", 1)
         self.attn_dp_size = self.runner_settings.get("parallel_config").get("attn_dp_size", 1)
         self.attn_tp_size = self.runner_settings.get("parallel_config").get("attn_tp_size", 1)
         self.o_proj_tp_size = self.runner_settings.get("parallel_config").get("o_proj_tp_size", 1)
         self.moe_ep_size = self.runner_settings.get("parallel_config").get("moe_ep_size", 1)
         self.moe_tp_size = self.runner_settings.get("parallel_config").get("moe_tp_size", 1)
         self.lmhead_tp_size = self.runner_settings.get("parallel_config").get("lmhead_tp_size", self.embed_tp_size)
-        self.moe_dp_size = self.runner_settings.get("parallel_config").get("moe_dp_size", 1)
         self.dense_tp_size = self.runner_settings.get("parallel_config").get("dense_tp_size", 1)
         self.kvp_size = self.runner_settings.get("parallel_config").get("kvp_size", 1)
 
@@ -1545,7 +1564,7 @@ class LongcatFlashForCausalLM(LongcatFlashPreTrainedModel, GenerationMixin):
         global_rank = dist.get_rank()
 
         attn_tp_group = init_comm_group(
-            global_rank=global_rank, group_num=self.attn_dp_size, world_size=world_size,
+            global_rank=global_rank, group_num=world_size // self.attn_tp_size, world_size=world_size,
             group_stride=1, group_name="attn_tp_group")
 
         o_proj_tp_group = init_comm_group(
@@ -1556,7 +1575,7 @@ class LongcatFlashForCausalLM(LongcatFlashPreTrainedModel, GenerationMixin):
             embed_tp_group = attn_tp_group
         else:
             embed_tp_group = init_comm_group(
-                global_rank=global_rank, group_num=self.embed_dp_size, world_size=world_size,
+                global_rank=global_rank, group_num=world_size // self.embed_tp_size, world_size=world_size,
                 group_stride=1, group_name="embed_tp_group")
 
         if self.lmhead_tp_size == self.embed_tp_size:
@@ -1573,16 +1592,21 @@ class LongcatFlashForCausalLM(LongcatFlashPreTrainedModel, GenerationMixin):
                 global_rank=global_rank, group_num=world_size // self.dense_tp_size, world_size=world_size,
                 group_stride=1, group_name="dense_tp_group")
 
-        if self.moe_tp_size == self.attn_tp_size:
-            moe_tp_group = attn_tp_group
-        else:
-            moe_tp_group = init_comm_group(
-                global_rank=global_rank, group_num=self.moe_dp_size, world_size=world_size,
-                group_stride=1, group_name="moe_tp_group")
+        if not self.enable_afd:
+            if self.moe_tp_size == self.attn_tp_size:
+                moe_tp_group = attn_tp_group
+            else:
+                moe_tp_group = init_comm_group(
+                    global_rank=global_rank, group_num=world_size // self.moe_tp_size, world_size=world_size,
+                    group_stride=1, group_name="moe_tp_group")
 
-        moe_ep_group, moe_ep_group_name = init_comm_group(
-            global_rank=global_rank, group_num=self.moe_tp_size, world_size=world_size,
-            group_stride=self.moe_tp_size, group_name="moe_ep_group", return_name=True)
+            moe_ep_group, moe_ep_group_name = init_comm_group(
+                global_rank=global_rank, group_num=world_size // self.moe_ep_size, world_size=world_size,
+                group_stride=self.moe_tp_size, group_name="moe_ep_group", return_name=True)
+        else:
+            moe_tp_group = None
+            moe_ep_group = None
+            moe_ep_group_name = None
 
         kvp_group = init_comm_group(
             global_rank=global_rank, group_num=world_size // self.kvp_size, world_size=world_size,
@@ -1850,7 +1874,11 @@ class LongcatFlashForCausalLM(LongcatFlashPreTrainedModel, GenerationMixin):
     ):
         if not self.perfect_eplb:
             return None
-        # if use perfect_eplb
+        # in afd scenario, attn ranks have no MoE module, no need to generate topk idx.
+        if self.enable_afd:
+            return None
+
+        # if use perfect_eplb and disable afd
         global_rank = dist.get_rank()
         if is_prefill:
             if self.moe_ep_size != 1:

@@ -26,7 +26,9 @@ import torch.distributed as dist
 import torch_npu
 import torch.nn as nn
 from executor.model_runner import ModelRunner
+from models.model_setting import check_is_attn_rank
 from models.modeling_longcat_flash import LongcatFlashForCausalLM, LongcatFlashModelMTP
+from models.ffn import FFNForCausalLM
 from models.configuration_longcat_flash import LongcatFlashConfig
 from module.quantization import QuantizeMethodBase
 from module.quantization.compressed_tensors.compressed_tensors_moe_gmm import CompressedTensorW8A8Int8MoEGMMMethod
@@ -64,6 +66,10 @@ class LongcatFlashRunner(ModelRunner):
         self.batch_size_per_rank = runner_settings.get("data_config").get("batch_size_per_rank")
         self.decode_only = runner_settings.get("model_config").get("decode_only", False)
         self.input_max_len = runner_settings.get("data_config").get("input_max_len")
+        self.enable_afd = runner_settings.get("model_config").get("enable_afd", False)
+        self.next_n = runner_settings.get("model_config").get("next_n", "0")
+        self.spec_len = self.next_n + 1 # speculative len is one more than num of mtp modules
+        self.is_attn_rank = check_is_attn_rank(runner_settings)
 
     @override
     def init_model(self, is_mtp=False):
@@ -74,10 +80,15 @@ class LongcatFlashRunner(ModelRunner):
         else:
             self.use_pretrained_model = False
         logging.info(f"use_pretrained_model: {self.use_pretrained_model}")
-        if is_mtp:
-            super().init_model(LongcatFlashModelMTP, LongcatFlashConfig)
+        if self.is_attn_rank:
+            if is_mtp:
+                super().init_model(LongcatFlashModelMTP, LongcatFlashConfig)
+            else:
+                super().init_model(LongcatFlashForCausalLM, LongcatFlashConfig)
         else:
-            super().init_model(LongcatFlashForCausalLM, LongcatFlashConfig)
+            # Given that the MTP module in the Longcat model is a Dense MLP,
+            # therefore, in the AFD scenario there is no MTP module on the FFN Rank.
+            super().init_model(FFNForCausalLM, LongcatFlashConfig)
 
     @override
     def graph_compile(self):
@@ -158,17 +169,12 @@ class LongcatFlashRunner(ModelRunner):
                     for_each_to_offload_kv_b_weight(layer)
             else:
                 logging.info("INFO: MTP layers not found. Skipping")
-
-            if hasattr(self.model, 'model') and not hasattr(self.model.model, 'mtp'):
+        else:
+            if self.is_attn_rank:
                 for layer in self.model.model.layers:
                     for_each_to_init_splited_k_b_weight(layer)
                     for_each_to_init_splited_v_b_weight(layer)
                     for_each_to_offload_kv_b_weight(layer)
-        else:
-            for layer in self.model.model.layers:
-                for_each_to_init_splited_k_b_weight(layer)
-                for_each_to_init_splited_v_b_weight(layer)
-                for_each_to_offload_kv_b_weight(layer)
         gc.collect()
 
     @override
@@ -220,7 +226,6 @@ class LongcatFlashRunner(ModelRunner):
             self.scale_dtype_adapter()
             self.cast_format()
 
-
     @override
     def model_input_prepare(self, input_dict):
         input_ids = input_dict.get("input_ids")
@@ -250,9 +255,21 @@ class LongcatFlashRunner(ModelRunner):
                 self.model.gen_cur_topk_idx(is_prefill, input_ids_update.shape[0], input_ids_update.shape[1])
         return model_inputs
 
+    def ffn_input_prepare(self, is_prefill):
+        seq_len = self.input_max_len if is_prefill else self.spec_len
+        dumy_hid_shape = [self.batch_size_per_rank, seq_len, self.model.config.hidden_size]
+        dumy_hid = torch.ones(dumy_hid_shape, dtype=torch.bfloat16).npu()
+        model_inputs = dict()
+        model_inputs["hidden_states"] = dumy_hid
+
+        if self.model.perfect_eplb:
+            model_inputs["cur_topk_list"] = \
+                self.model.gen_cur_topk_idx(is_prefill, self.batch_size_per_rank, seq_len)
+        return model_inputs
+
     @override
     def model_inference(self, model_inputs, is_prefill=False, warm_up=False):
-        dist.barrier()
+        dist.barrier() if not self.enable_afd else None
         torch.npu.synchronize()
         if warm_up and self.execute_mode == "ge_graph":
             self.mark_inputs(model_inputs)
@@ -270,6 +287,24 @@ class LongcatFlashRunner(ModelRunner):
         logging.info(f"{self.model_name} inference time cost of {inference_stage} is {(inference_time)*1000:.2f} ms")
         return (logits, inference_time, prev_hidden_states)
 
+    def ffn_inference(self, model_inputs, is_prefill=False, warm_up=False):
+        torch.npu.synchronize()
+        if warm_up and self.execute_mode == "ge_graph":
+            self.mark_inputs(model_inputs)
+        start_time = time.time()
+        with torch.no_grad():
+            if is_prefill:
+                logits = self.model.prefill(**model_inputs)
+            else:
+                logits = self.model.decode(**model_inputs)
+
+        torch.npu.synchronize()
+        end_time = time.time()
+        inference_time = end_time - start_time
+        inference_stage = "prefill" if is_prefill else "decode"
+        logging.info(
+            f"{self.model_name} ffn inference time cost of {inference_stage} is {(inference_time) * 1000:.2f} ms")
+        return logits, inference_time
 
     @override
     def model_output_process(self, model_inputs, outputs, input_dict):
@@ -314,3 +349,31 @@ class LongcatFlashRunner(ModelRunner):
                 "is_prefill": False
             }
         super().model_generate(input_dict, input_lens, warm_up)
+
+    def ffn_server(self, warm_up=False):
+        cnt = 0
+        infer_time_rec = []
+        is_prefill = True
+
+        max_step = self.max_new_tokens
+        profiler = self.define_profiler(
+            enable_profiler=self.enable_profiler and not warm_up,
+            profile_save_path=f"{self.res_path}/prof_ffn",
+        )
+        with profiler as prof:
+            while cnt < max_step:
+                jump_flag = self.get_jump_flag(cnt, warm_up)
+                if jump_flag:
+                    break
+
+                model_inputs = self.ffn_input_prepare(is_prefill)
+                _, infer_time = self.ffn_inference(model_inputs, is_prefill=is_prefill, warm_up=warm_up)
+                prof.step()
+                if is_prefill:
+                    is_prefill = False
+                cnt += 1
+                infer_time_rec.append(infer_time)
+
+        if not warm_up:
+            avg_infer_time = process_infer_time(infer_time_rec, cnt)
+            logging.info(f"{self.model_name} ffn average inference time cost is {(avg_infer_time) * 1000:.2f} ms")

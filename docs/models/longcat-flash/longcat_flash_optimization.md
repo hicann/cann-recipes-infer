@@ -129,15 +129,95 @@ Prefill阶段路由专家采用**Double-Routing**的计算策略完成计算,具
 ### 支持Multi-Token Prediction (MTP)
 实现了MTP投机推理，在未达到计算bound的场景下，MTP计算可以实现较好的推理加速效果。可通过`next_n`参数使能MTP。当前支持了MTP1，MTP2。
 
+### Attention-FFN Disaggregation(AFD)优化
+#### 优化出发点
+在非分离场景中，Attention 模块和 MoE 模块部署在同一个卡上，由于 ScMoE 结构的固有特性，为了获取最佳的性能，在 [多流并行与控核](###多流并行与控核) 小节中对 Stage2 设计了多流并行策略，通过分配不同的核数将 Attention 计算流和 MoE 计算流进行了并行流水，达到最佳性能。
+
+然而，对 Stage2 通过控核后，由于两条计算流在计算时只能使用部分 Cube 和 Vector 核，算子执行时会受到算力的约束。在 Atlas A3 环境上实测对比发现，在不控核情况下，MLA_Prolog/FA/MM/TBMM/QBMM算子耗时相比控核时均有所下降，耗时对比如下表格。
+<table style="width:99%; border-collapse:collapse; margin:20px 0;">
+    <tr>
+        <th style="border:1px solid #ddd; padding:10px; text-align:center;"> Cube_Vector核数</th>
+        <th style="border:1px solid #ddd; padding:10px; text-align:center;">MLA_Prolog（us）</th>
+        <th style="border:1px solid #ddd; padding:10px; text-align:center;">FA（us）</th>
+        <th style="border:1px solid #ddd; padding:10px; text-align:center;">MM（us）</th>
+        <th style="border:1px solid #ddd; padding:10px; text-align:center;">TBMM（us）</th>
+        <th style="border:1px solid #ddd; padding:10px; text-align:center;">QBMM1（us）</th>
+        <th style="border:1px solid #ddd; padding:10px; text-align:center;">QBMM2（us）</th>
+    </tr>
+    <tr>
+        <td style="border:1px solid #ddd; padding:10px; text-align:center;">12C_24V</td>
+        <td style="border:1px solid #ddd; padding:10px; text-align:center;">68.1</td>
+        <td style="border:1px solid #ddd; padding:10px; text-align:center;">118</td>
+        <td style="border:1px solid #ddd; padding:10px; text-align:center;">18</td>
+        <td style="border:1px solid #ddd; padding:10px; text-align:center;">19.6</td>
+        <td style="border:1px solid #ddd; padding:10px; text-align:center;">18.7</td>
+        <td style="border:1px solid #ddd; padding:10px; text-align:center;">20.1</td>
+    </tr>
+    <tr>
+        <td style="border:1px solid #ddd; padding:10px; text-align:center;">24C_48V</td>
+        <td style="border:1px solid #ddd; padding:10px; text-align:center;">45.2</td>
+        <td style="border:1px solid #ddd; padding:10px; text-align:center;">91.8</td>
+        <td style="border:1px solid #ddd; padding:10px; text-align:center;">14.2</td>
+        <td style="border:1px solid #ddd; padding:10px; text-align:center;">12.5</td>
+        <td style="border:1px solid #ddd; padding:10px; text-align:center;">14.6</td>
+        <td style="border:1px solid #ddd; padding:10px; text-align:center;">16.3</td>
+    </tr>
+</table>
+
+> 以上数据除了核数不同，其他都在相同的配置情况下从整网中采集拆解得到的。
+
+根据以上分析，针对 LongCat-Flash-560B 模型，为了在 Decode 阶段进一步降低 TPOT 耗时，可采用 Attention-FFN Disaggretation(AFD) 技术方案，它将 MoE 模块从整网中剥离出来进行独立部署，也即 Attention 模块 和 MoE 模块单独部署在不同的节点上，中间通过 Send/Recv 算子进行节点间的数据交互，使能 AFD 技术前后的网络结构示意图如下。
+<p align="center">
+  <img src="./figures/w_afd.png" width="90%" alt="w_afd">
+</p>
+
+Attention 和 MoE 独立部署后的示意图如下：
+
+<p align="center">
+  <img src="./figures/afd_deploy.png" width="70%" alt="afd_deploy">
+</p>
+
+#### 计算流图
+使能 AFD 之后， Send/Recv 算子跨节点通信走 SDMA 不占用 Vector 核，Attention 模块中计算算子和 Send/Recv 并行时不再受控核的约束。
+
+计算流上，如下图所示 Attention 节点上，第一个 LayerNorm(LN) 算子的结果，一方面通过 Send 算子发送到 FFN 节点上；另外一方面，同时送给下一个算子完成后续的计算操作。在 Send 算子完成发送动作后，会同时通过 Recv 算子等待并接收从 FFN 节点发送回来的数据。Attention 节点上的 Send/Recv 算子在 Stream1 上和主流 Stream0 上的计算算子进行 overlap，达到通信计算隐藏的目的。
+
+<p align="center">
+  <img src="./figures/attn_ffn_stream.png" width="100%" alt="w_afd">
+</p>
+
+同理，FFN 节点作为服务端，任务执行时图上第一个是 Recv 算子，它一直等待直到 Attention 节点通过 Send 算子发数据过来。当前 FFN 节点接收到数据后，会进行 Router/Dispatch/MoE-GMM/Combine 等操作，最后再通过 Send 算子将数据发回 Attention 节点。
+
+#### FFN 权重预取
+非分离场景中，对 QuantBatchMatmul (QBMM)、MLA_Prolog、matmul 进行权重预取后，一方面由于 Stage2 里 Stream0 上算子的计算耗时与Stream1 上 Router/Dispatch/MoE-GMM/Combine 算子耗时相当，另一方面也没有较好的时间窗口对 MoE-GMM 进行权重预取，故对 MoE-GMM 算子没有采取权重预取。
+
+但使能 AFD 之后，Attention 侧再不控核后，MLA_Prolog/FA/MM/TBMM/QBMM 算子耗时降低，可能出现 FFN 侧计算瓶颈，导致 Attention 侧的 Recv 算子长时间没能收到 FFN 侧发来的数据，在计算流上出现 EVENT_WAIT 间隙的拖尾现象，如下图所示。
+<p align="center">
+  <img src="./figures/attn_event_wait.png" width="100%" alt="attn_event_wait">
+</p>
+
+针对 FFN 侧计算瓶颈问题，可对 GMM/MatMul 访存 Bound 类算子在通信间隙时提前预取对应的权重，从而降低 FFN 侧的整体耗时，示意图如下。
+<p align="center">
+  <img src="./figures/afd_ffn_cmo.png" width="100%" alt="afd_ffn_cmo">
+</p>
+
+> AFD场景下，Attention 侧的权重预取保持和非分离场景时一样，可参看[权重预取](###权重预取)小节。
+
+
 ## Benchmark
 
-基于Atlas A3，本实践对Longcat-Flash W8A8量化版本进行了性能Benchmark测试。
-|Quant Mode| Global Batch Size | Seq Length | Chips | TPOT (ms) | Throughput (tokens/p/s) |
-|-------| ----------------- | ---------- | ----- | --------- | ----------------------- |
-|W8A8 |    512           | 4608       | 64   | 10.37      |   771.46                 |
+基于 Atlas A3 环境，本实践对 Longcat-Flash W8A8量化版本进行了性能 Benchmark 测试。在使能 AFD 特性后，模型的 TPOT 迈入了 10 ms 之内, 并且相比于同样卡数和 global batch size 的不分离场景，拥有更优的 TPOT 和吞吐。
+|Enable AFD|Quant Mode| Global Batch Size | Seq Length | Chips | TPOT (ms) | Throughput (tokens/p/s) |
+|---|-------| ----------------- | ---------- | ----- | --------- | ----------------------- |
+| N |  W8A8 |    512            | 4608       | 64    | 10.37     |   771.46                |
+| N |  W8A8 |    256            | 4608       | 32    | 10.64     |   751.88                |
+| N |  W8A8 |    256            | 4608       | 64    | 9.95      |   402.01                |
+| Y |  W8A8 |    256            | 4608       | 64    | 9.5       |   421.05                |
+
 
 > 1. 性能数据基于 MTP2 与 perfect eplb 配置采集。
-> 2. 当前CANN软件版本（CANN 8.5.0.alpha002）下，SuperKernel标记范围内的部分算子尚不支持完全融合。该限制将在后续社区版本中得到解决，以进一步提升模型性能。
+> 2. 当前 CANN 软件版本（CANN 8.5.0）下，SuperKernel 标记范围内的部分算子尚不支持完全融合。该限制将在后续社区版本中得到解决，以进一步提升模型性能。
+> 3. 由于当前 Send/Recv 算子单次通信只支持1:1的发送/接收模式，不支持 M:N 模式，所以 AFD 场景部署时 Attention Instance 的 Node 个数 和 FFN Instance 的 Node 个数是一样，也即 M == N；后续会计划支持 M:N 的部署模式。
 ---
 ## 附录
 [环境部署以及样例执行](../../../models/longcat-flash/README.md)

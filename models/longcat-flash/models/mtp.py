@@ -130,7 +130,6 @@ class InferMTP(nn.Module):
         }
         return input_dict_main, input_dict_mtp, inputs, input_lens
 
-
     def verify_spec_tokens(self, input_dict_main, input_dict_mtp, main_next_tokens):
         '''
         Verify spec tokens with main model's output, stop accepting tokens if rejection occurs in a batch.
@@ -146,7 +145,6 @@ class InferMTP(nn.Module):
             invalid_pos = (token_mask == False).int().argmax(dim=-1)
             accepted_num = torch.where(has_invalid, invalid_pos, token_mask.shape[-1])
         return accepted_num
-
 
     def update_model_inputs_prefill(self, model_inputs, input_dict_main, input_dict_mtp, main_next_tokens, main_hidden):
         batch_size, _ = main_next_tokens.shape
@@ -174,7 +172,6 @@ class InferMTP(nn.Module):
         # update mtp inputs for mtp_prefill, append main model's output to mtp's input with slicing window
         input_dict_mtp['input_ids'] = input_dict_main['generate_ids'][:, 1:]
         return input_dict_main, input_dict_mtp
-
 
     def update_model_inputs_decode(self, input_dict_main, input_dict_mtp, main_next_tokens, main_hidden, accepted_num):
         batch_size = main_next_tokens.shape[0]
@@ -218,7 +215,6 @@ class InferMTP(nn.Module):
 
         return input_dict_main, input_dict_mtp
 
-
     def mtp_model_output_process(self, model_inputs, input_dict, outputs, prev_hidden_states):
         if input_dict['is_prefill']:
             # kv_len increase by one after prefill
@@ -256,7 +252,6 @@ class InferMTP(nn.Module):
             input_dict['is_prefill'] = False
 
         return input_dict
-
 
     def obtain_mtp_stats(self, total_accepted_num, cnt, infer_time_rec):
         avg_accpeted_num = torch.mean(total_accepted_num)
