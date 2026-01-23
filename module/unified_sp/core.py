@@ -179,30 +179,55 @@ class UnifiedSPAttention:
     ) -> torch.Tensor:
         
         q, k, v = params.q, params.k, params.v
+        original_seq_len = None
         
         if self.ulysses_world_size > 1:
+            # Check head divisibility
+            num_heads = q.shape[2]
+            if num_heads % self.ulysses_world_size != 0:
+                raise ValueError(
+                    f"Number of heads ({num_heads}) must be divisible by "
+                    f"ulysses_world_size ({self.ulysses_world_size}). "
+                    f"Please adjust your model configuration or Ulysses degree."
+                )
+            
+            # Pad sequence length to be divisible by ulysses_world_size
+            original_seq_len = q.shape[1]
+            if original_seq_len % self.ulysses_world_size != 0:
+                padded_seq_len = math.ceil(original_seq_len / self.ulysses_world_size) * self.ulysses_world_size
+                pad_len = padded_seq_len - original_seq_len
+                
+                # Pad Q, K, V
+                q = torch.nn.functional.pad(q, (0, 0, 0, 0, 0, pad_len), value=0.0)
+                k = torch.nn.functional.pad(k, (0, 0, 0, 0, 0, pad_len), value=0.0)
+                v = torch.nn.functional.pad(v, (0, 0, 0, 0, 0, pad_len), value=0.0)
+            
             q = self._all_to_all_head_to_seq(q)
             k = self._all_to_all_head_to_seq(k)
             v = self._all_to_all_head_to_seq(v)
         
+        # Create updated params with transformed q, k, v
+        updated_params = AttentionParams(
+            q=q, k=k, v=v,
+            causal=params.causal,
+            softmax_scale=params.softmax_scale,
+            per_head_compute=params.per_head_compute
+        )
+        
         if self.ring_world_size > 1:
-            # Update params with transformed tensors
-            params = AttentionParams(
-                q=q, k=k, v=v,
-                causal=params.causal,
-                softmax_scale=params.softmax_scale,
-                per_head_compute=params.per_head_compute
-            )
-            
             if self.use_ring_overlap:
-                out = self._ring_attention_overlap(params, **kwargs)
+                out = self._ring_attention_overlap(updated_params, **kwargs)
             else:
-                out = self._ring_attention_allgather(params, **kwargs)
+                out = self._ring_attention_allgather(updated_params, **kwargs)
         else:
-            out = self._compute_attention(params)
+            out = self._compute_attention(updated_params)
         
         if self.ulysses_world_size > 1:
             out = self._all_to_all_seq_to_head(out)
+            
+            # Remove padding
+            if original_seq_len is not None and out.shape[1] != original_seq_len:
+                out = out[:, :original_seq_len, :, :]
         
         return out
     
@@ -435,7 +460,6 @@ class UnifiedSPAttention:
         if num_heads == num_key_value_heads:
             num_key_value_heads = 0
         
-        # Create configuration object
         config = NPUAttentionConfig(
             num_heads=num_heads,
             scale=float(softmax_scale),
@@ -490,7 +514,6 @@ class UnifiedSPAttention:
         if num_heads == num_key_value_heads:
             num_key_value_heads = 0
         
-        # Create configuration object
         config = NPUAttentionConfig(
             num_heads=num_heads,
             scale=float(softmax_scale),
