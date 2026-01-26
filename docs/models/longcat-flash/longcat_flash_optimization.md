@@ -205,19 +205,7 @@ Attention 和 MoE 独立部署后的示意图如下：
 
 
 ## Benchmark
+详细的 benchmark 性能数据请参考[longcat-flash模型README](../../../models/longcat-flash/README.md#benchmark)。
 
-基于 Atlas A3 环境，本实践对 Longcat-Flash W8A8量化版本进行了性能 Benchmark 测试。在使能 AFD 特性后，模型的 TPOT 迈入了 10 ms 之内, 并且相比于同样卡数和 global batch size 的不分离场景，拥有更优的 TPOT 和吞吐。
-|Enable AFD|Quant Mode| Global Batch Size | Seq Length | Chips | TPOT (ms) | Throughput (tokens/p/s) |
-|---|-------| ----------------- | ---------- | ----- | --------- | ----------------------- |
-| N |  W8A8 |    512            | 4608       | 64    | 10.37     |   771.46                |
-| N |  W8A8 |    256            | 4608       | 32    | 10.64     |   751.88                |
-| N |  W8A8 |    256            | 4608       | 64    | 9.95      |   402.01                |
-| Y |  W8A8 |    256            | 4608       | 64    | 9.5       |   421.05                |
-
-
-> 1. 性能数据基于 MTP2 与 perfect eplb 配置采集。
-> 2. 当前 CANN 软件版本（CANN 8.5.0）下，SuperKernel 标记范围内的部分算子尚不支持完全融合。该限制将在后续社区版本中得到解决，以进一步提升模型性能。
-> 3. 由于当前 Send/Recv 算子单次通信只支持1:1的发送/接收模式，不支持 M:N 模式，所以 AFD 场景部署时 Attention Instance 的 Node 个数 和 FFN Instance 的 Node 个数是一样，也即 M == N；后续会计划支持 M:N 的部署模式。
----
 ## 附录
 [环境部署以及样例执行](../../../models/longcat-flash/README.md)

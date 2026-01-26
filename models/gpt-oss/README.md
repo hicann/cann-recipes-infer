@@ -40,7 +40,6 @@
 4. 配置样例运行所需环境信息。
 
    修改`executor/scripts/set_env.sh`脚本中的如下字段：
-   - `recipes_path`: 当前代码仓根目录，例如`/home/cann-recipes-infer`。
    - `cann_path`: CANN软件包安装路径，例如`/usr/local/Ascend/ascend-toolkit/latest`。
     > 说明：HCCL相关配置，如`HCCL_SOCKET_IFNAME`、`HCCL_OP_EXPANSION_MODE`，可以参考[集合通信文档](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/83RC1alpha002/maintenref/envvar/envref_07_0001.html#ZH-CN_TOPIC_0000002449945377__section163522499503)并在`executor/scripts/function.sh`中自定义配置。
 
