@@ -1807,7 +1807,6 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
         self.post_init()
 
         if self.enable_cache_compile:
-            assert not self.enable_aclgraph, "ACLGraph cache compilation is not implemented"
             self.cached_decode = self.get_cached_graph()
         self.enable_prefill_multi_cycle = self.runner_settings.get("model_config").get("prefill_mini_batch_size", 0) > 0
         self.enable_offload = self.runner_settings.get("model_config").get("enable_offload", False)
@@ -1873,9 +1872,13 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
         cache_model = self.main_decode
         if self.is_mtp:
             cache_model = self.main_decode_mtp
-        
+        if self.enable_aclgraph:
+            tng_config.mode = "reduce-overhead"
+            if self.enable_static_kernel:
+                tng_config.experimental_config.aclgraph._aclnn_static_shape_kernel = True
+
         cached_decode = tng.inference.cache_compile(cache_model, cache_dir=cache_dir, config=tng_config,
-                                                    dynamic=False, fullgraph=True, ge_cache=True)
+                                                    dynamic=False, fullgraph=True, ge_cache=not self.enable_aclgraph)
         return cached_decode
 
     def init_parallel_comm_group(self):
