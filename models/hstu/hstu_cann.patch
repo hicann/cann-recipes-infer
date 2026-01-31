@@ -1,0 +1,761 @@
+From 7345a8e37a7bcf564aa351414b5752c67308fe69 Mon Sep 17 00:00:00 2001
+From: Anonymous <anon@anon.com>
+Date: Fri, 30 Jan 2026 10:46:56 +0800
+Subject: [PATCH] after change
+
+From: chenyu10 <chenyu459@huawei.com>
+
+---
+ models/hstu/configs/inference_config.py       |   2 +-
+ models/hstu/dataset/inference_dataset.py      |   2 +-
+ models/hstu/dataset/sequence_dataset.py       |  28 ++-
+ models/hstu/model/__init__.py                 |  43 ----
+ .../hstu/modules/host_kv_storage_manager.py   |  99 ++++-----
+ models/hstu/modules/hstu_block_inference.py   |  24 ++-
+ models/hstu/modules/jagged_data.py            |   4 +-
+ models/hstu/modules/metrics/__init__.py       |   2 -
+ models/hstu/modules/metrics/metric_modules.py | 191 +-----------------
+ models/hstu/modules/mlp.py                    |  39 ++--
+ models/hstu/preprocessor.py                   |   1 +
+ 11 files changed, 114 insertions(+), 321 deletions(-)
+
+diff --git a/models/hstu/configs/inference_config.py b/models/hstu/configs/inference_config.py
+index ded0692..2af20be 100755
+--- a/models/hstu/configs/inference_config.py
++++ b/models/hstu/configs/inference_config.py
+@@ -240,7 +240,7 @@ def get_inference_hstu_config(
+ def get_kvcache_metadata_buffer(
+     hstu_config: InferenceHSTUConfig, kvcache_config: KVCacheConfig
+ ):
+-    device = torch.cuda.current_device()
++    device = torch.npu.current_device()
+     torch.bfloat16 if hstu_config.bf16 else torch.float16 if hstu_config.fp16 else torch.float32
+ 
+     max_new_history_seqlen = kvcache_config.max_batch_size * kvcache_config.max_seq_len
+diff --git a/models/hstu/dataset/inference_dataset.py b/models/hstu/dataset/inference_dataset.py
+index a5db144..63abdb5 100755
+--- a/models/hstu/dataset/inference_dataset.py
++++ b/models/hstu/dataset/inference_dataset.py
+@@ -99,7 +99,7 @@ class InferenceDataset(IterableDataset[Batch]):
+         batch_nrows: Optional[int] = None,
+     ) -> None:
+         super().__init__()
+-        self._device = torch.cuda.current_device()
++        self._device = torch.npu.current_device()
+ 
+         if seq_nrows is None or batch_nrows is None:
+             self._seq_logs_frame = pd.read_csv(seq_logs_file, delimiter=",")
+diff --git a/models/hstu/dataset/sequence_dataset.py b/models/hstu/dataset/sequence_dataset.py
+index 1a256dd..ad19a22 100755
+--- a/models/hstu/dataset/sequence_dataset.py
++++ b/models/hstu/dataset/sequence_dataset.py
+@@ -28,19 +28,41 @@
+ 
+ import json
+ import math
++import logging
+ from collections import defaultdict
+ from typing import Dict, Iterator, List, Optional, Tuple
+ 
+ import numpy as np
+ import pandas as pd
+ import torch
+-from commons.utils.logger import print_rank_0
++from rich.console import Console
++from rich.logging import RichHandler
+ from dataset.utils import Batch, RankingBatch, RetrievalBatch
+ from preprocessor import get_common_preprocessors
+ from torch.utils.data.dataset import IterableDataset
+ from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
+ 
+ 
++console = Console()
++_logger = logging.getLogger("rich_rank0")
++
++handler = RichHandler(
++    console=console, show_time=True, show_path=False, rich_tracebacks=True
++)
++_logger.addHandler(handler)
++_logger.propagate = False
++_logger.setLevel(logging.INFO)
++
++
++def print_rank_0(message):
++    """If distributed is initialized, print only on rank 0."""
++    if torch.distributed.is_initialized():
++        if torch.distributed.get_rank() == 0:
++            _logger.info(message)
++    else:
++        print(message, flush=True)
++
++
+ def load_seq(x: str):
+     if isinstance(x, str):
+         y = json.loads(x)
+@@ -181,7 +203,7 @@ class SequenceDataset(IterableDataset[Batch]):
+ 
+     # We do batching in our own
+     def __len__(self) -> int:
+-        return math.ceil(self._num_samples / self._global_batch_size)
++        return math.floor(self._num_samples / self._global_batch_size)
+ 
+     def __iter__(self) -> Iterator[Batch]:
+         for i in range(len(self)):
+@@ -252,6 +274,8 @@ class SequenceDataset(IterableDataset[Batch]):
+                         else action_seq
+                     )
+                     labels.extend(label)
++            if len(item_features_seqlen) == 0:
++                continue
+             if len(item_features_seqlen) < self._batch_size:
+                 padded_size = self._batch_size - len(item_features_seqlen)
+                 for name in self._contextual_feature_names:
+diff --git a/models/hstu/model/__init__.py b/models/hstu/model/__init__.py
+index e4fba4b..e69de29 100755
+--- a/models/hstu/model/__init__.py
++++ b/models/hstu/model/__init__.py
+@@ -1,43 +0,0 @@
+-from configs import HSTUConfig, RankingConfig, RetrievalConfig
+-from model.ranking_gr import RankingGR
+-from model.retrieval_gr import RetrievalGR
+-
+-from . import ranking_gr, retrieval_gr
+-
+-__all__ = ["ranking_gr", "retrieval_gr"]
+-
+-
+-def get_ranking_model(
+-    hstu_config: HSTUConfig,
+-    task_config: RankingConfig,
+-) -> RankingGR:
+-    """
+-    Get a ranking model.
+-
+-    Args:
+-        hstu_config (HSTUConfig): The HSTU configuration.
+-        task_config (RankingConfig): The ranking task configuration.
+-
+-    Returns:
+-        RankingGR: The ranking model.
+-    """
+-    assert isinstance(task_config, RankingConfig), "please provide a ranking config"
+-    return RankingGR(hstu_config=hstu_config, task_config=task_config)
+-
+-
+-def get_retrieval_model(
+-    hstu_config: HSTUConfig,
+-    task_config: RetrievalConfig,
+-) -> RetrievalGR:
+-    """
+-    Get a retrieval model.
+-
+-    Args:
+-        hstu_config (HSTUConfig): The HSTU configuration.
+-        task_config (RetrievalConfig): The retrieval task configuration.
+-
+-    Returns:
+-        RetrievalGR: The retrieval model.
+-    """
+-    assert isinstance(task_config, RetrievalConfig), "please provide a retrieval config"
+-    return RetrievalGR(hstu_config=hstu_config, task_config=task_config)
+diff --git a/models/hstu/modules/host_kv_storage_manager.py b/models/hstu/modules/host_kv_storage_manager.py
+index a236cab..2e1b730 100755
+--- a/models/hstu/modules/host_kv_storage_manager.py
++++ b/models/hstu/modules/host_kv_storage_manager.py
+@@ -14,14 +14,9 @@
+ # limitations under the License.
+ from typing import List, Optional, Tuple
+ 
+-import tensorrt_llm
+ import torch
+ from configs import InferenceHSTUConfig, KVCacheConfig
+ 
+-KVCacheManagerImpl = tensorrt_llm.bindings.internal.batch_manager.KVCacheManager
+-KvCacheConfigCpp = tensorrt_llm.bindings.KvCacheConfig
+-DataType = tensorrt_llm.bindings.DataType
+-
+ 
+ class HSTUHostKVStorageImpl:
+     def __init__(self):
+@@ -63,13 +58,7 @@ class DummyHSTUHostKVStorageImpl(HSTUHostKVStorageImpl):
+     def append_kvdata(
+         self, user_id: int, start_pos: int, length: int, kv_data: List[torch.Tensor]
+     ):
+-        old_start_pos, old_length = self.get_user_kvdata_info(user_id)
+-        # assert old_start_pos + old_length == start_pos, \
+-        #     "{0} new kvdata starting position is {1}, unmatching current {2} ~ {3}".format(
+-        #         user_id, start_pos, old_start_pos, old_start_pos + old_length)
+-        # assert self._num_layers == len(
+-        #     kv_data), "the given kv_data has wrong number of layers"
+-
++        # old_start_pos, old_length = self.get_user_kvdata_info(user_id)
+         if user_id not in self.sequence_start_pos:
+             self.sequence_start_pos[user_id] = start_pos
+             self.sequence_length[user_id] = 0
+@@ -78,24 +67,42 @@ class DummyHSTUHostKVStorageImpl(HSTUHostKVStorageImpl):
+         for layer_idx in range(self._num_layers):
+             storage = self.kv_data_storage[layer_idx]
+             if user_id not in storage:
+-                storage[user_id] = list()
++                storage[user_id] = []
+             storage[user_id].append(kv_data[layer_idx])
+ 
+     def get_kv_data(
+         self, user_id: int, length: int, layer_idx: int, output_buffer: torch.Tensor
+     ) -> torch.Tensor:
+-        kv_data_list = []
+-        current_length = 0
+-        for data_chunk in self.kv_data_storage[layer_idx][user_id]:
+-            if data_chunk.shape[0] * self._page_size + current_length > length:
+-                slice_length = (length - current_length) // self._page_size
+-                kv_data_list.append(data_chunk[:slice_length, ...])
++        if length <= 0:
++            return output_buffer[:0]
++        
++        storage = self.kv_data_storage[layer_idx]
++        if user_id not in storage:
++            return output_buffer[:0]
++        
++        chunks = storage[user_id]
++
++        total_paged_needed = length // self._page_size
++
++        if total_paged_needed == 0:
++            return output_buffer[:0]
++        
++        dst = output_buffer[:total_paged_needed, ...]
++        written_pages = 0
++
++        for data_chunk in chunks:
++            chunk_pages = data_chunk.shape[0]
++            remaining = total_paged_needed - written_pages
++            if remaining <= 0:
+                 break
+-            else:
+-                kv_data_list.append(data_chunk)
+-            current_length += kv_data_list[-1].shape[0] * self._page_size
+-        # assert sum([t.shape[0] for t in kv_data_list]) == output_buffer.shape[0]
+-        return torch.cat(kv_data_list, dim=0, out=output_buffer)
++            copy_pages = chunk_pages if chunk_pages <= remaining else remaining
++            dst[written_pages : written_pages + copy_pages, ...].copy_(
++                data_chunk[:copy_pages, ...]
++            )
++            written_pages += copy_pages
++            if written_pages >= total_paged_needed:
++                break
++        return dst
+ 
+     def evict_all_kvdata(self):
+         self.sequence_start_pos.clear()
+@@ -179,7 +186,7 @@ class HSTUHostKVStorageManager:
+         )
+         onload_length = onload_history_seqlen_offsets[-1].item()
+         if onload_length == 0:
+-            return (onload_length, None, None)
++            return (0, None, None)
+ 
+         # copy lookup results into buffer (compress into one)
+         for idx in range(user_ids.shape[0]):
+@@ -206,10 +213,10 @@ class HSTUHostKVStorageManager:
+             start=self.num_cache_pages,
+             end=onload_length // self.page_size + self.num_cache_pages,
+             dtype=torch.int32,
+-            device=torch.cuda.current_device(),
++            device=torch.npu.current_device(),
+         )
+         onload_kv_page_indptr = (onload_history_seqlen_offsets / self.page_size).to(
+-            dtype=torch.int32, device=torch.cuda.current_device()
++            dtype=torch.int32, device=torch.npu.current_device()
+         )
+ 
+         return onload_length, onload_kv_page_ids, onload_kv_page_indptr
+@@ -221,26 +228,28 @@ class HSTUHostKVStorageManager:
+         offload_start_pos: torch.Tensor,
+         offload_page_indptr: torch.Tensor,
+     ):
+-        for idx in range(len(user_ids)):
+-            uid = user_ids[idx].item()
+-            start_pos = offload_start_pos[idx].item()
+-            page_start = offload_page_indptr[idx].item()
+-            page_end = offload_page_indptr[idx + 1].item()
+-            length = (page_end - page_start) * self.page_size
+-            if length == 0:
++        num_users = user_ids.shape[0]
++        page_size = self.page_size
++        num_layers = self.num_layers
++
++        for idx in range(num_users):
++            uid = int(user_ids[idx])
++            start_pos = int(offload_start_pos[idx])
++
++            page_start = int(offload_page_indptr[idx])
++            page_end = int(offload_page_indptr[idx + 1])
++            num_pages = page_end - page_start
++
++            if num_pages <= 0:
+                 continue
++            length = num_pages * page_size
+ 
+-            self.impl.append_kvdata(
+-                uid,
+-                start_pos,
+-                length,
+-                [
+-                    offloaded_kv_data[layer_idx][page_start:page_end, ...]
+-                    .detach()
+-                    .clone()
+-                    for layer_idx in range(self.num_layers)
+-                ],
+-            )
++            kv_chunks = [
++                offloaded_kv_data[layer_idx][page_start:page_end, ...].clone()
++                for layer_idx in range(num_layers)
++            ]
++
++            self.impl.append_kvdata(uid, start_pos, length, kv_chunks)
+ 
+     def evict_all_kvdata(self):
+         self.impl.evict_all_kvdata()
+diff --git a/models/hstu/modules/hstu_block_inference.py b/models/hstu/modules/hstu_block_inference.py
+index c687f1d..b25de03 100755
+--- a/models/hstu/modules/hstu_block_inference.py
++++ b/models/hstu/modules/hstu_block_inference.py
+@@ -4,6 +4,7 @@ import math
+ from typing import Any, Dict, Optional
+ 
+ import torch
++import torch_npu
+ from configs import InferenceHSTUConfig, KVCacheConfig
+ from dataset.utils import Batch
+ from modules.hstu_processor import HSTUBlockPostprocessor, HSTUBlockPreprocessor
+@@ -72,6 +73,7 @@ class HSTUBlockInference(torch.nn.Module):
+     ) -> torch.Tensor:
+         if self._hstu_graph is None or not use_cudagraph or jd.scaling_seqlen != -1:
+             hidden_data = hidden_states
++            jd.seqlen_k = torch.max(jd.seqlen_offsets[:batch_size + 1]).item()
+             for hstu_layer in self._attention_layers:
+                 hidden_data = hstu_layer.forward_naive(
+                     batch_size,
+@@ -101,6 +103,7 @@ class HSTUBlockInference(torch.nn.Module):
+             jagged_metadata = JaggedData(
+                 values=None,
+                 max_seqlen=jd.max_seqlen,
++                seqlen_k=jd.seqlen_k,
+                 seqlen=jd.seqlen[:batch_size],
+                 seqlen_offsets=jd.seqlen_offsets[: batch_size + 1],
+                 max_num_candidates=jd.max_num_candidates,
+@@ -161,7 +164,7 @@ class HSTUBlockInference(torch.nn.Module):
+             self._hstu_graph[batch_size][num_tokens_padded][0].replay()  # type: ignore
+             for idx in range(1, self.config.num_layers + 1):
+                 kv_cache_metadata.onload_history_kv_events[idx - 1].wait(
+-                    torch.cuda.current_stream()
++                    torch_npu.npu.current_stream()
+                 )
+                 self._hstu_graph[batch_size][num_tokens_padded][idx].replay()  # type: ignore
+ 
+@@ -237,9 +240,9 @@ class HSTUBlockInference(torch.nn.Module):
+         static_kvcache_metadata,
+         memory_pool=None,
+     ):
+-        # Create CUDA stream
+-        graph_capture_warmup_stream = torch.cuda.Stream()
+-        graph_capture_warmup_stream.wait_stream(torch.cuda.current_stream())
++        torch_npu.npu.mem_get_info()[0]
++        graph_capture_warmup_stream = torch_npu.npu.Stream()
++        graph_capture_warmup_stream.wait_stream(torch_npu.npu.current_stream())
+ 
+         seqlen = num_tokens // batch_size
+         static_jagged_metadata.seqlen_offsets[: batch_size + 1].copy_(
+@@ -270,9 +273,10 @@ class HSTUBlockInference(torch.nn.Module):
+             static_jagged_metadata.num_candidates_offsets
+         )
+         static_kvcache_metadata.new_history_nnz = num_tokens
++        static_jagged_metadata.seqlen_k = torch.max(static_jagged_metadata.seqlen_offsets[:batch_size + 1]).item()
+ 
+         # Warmup
+-        with torch.cuda.stream(graph_capture_warmup_stream):
++        with torch_npu.npu.stream(graph_capture_warmup_stream):
+             for _ in range(3):
+                 static_output = self.predict_naive(
+                     batch_size,
+@@ -281,17 +285,17 @@ class HSTUBlockInference(torch.nn.Module):
+                     static_jagged_metadata,
+                     static_kvcache_metadata,
+                 )
+-                torch.cuda.synchronize()
++                torch_npu.npu.synchronize()
+ 
+         # Create and capture the graph
+         num_layers = self.config.num_layers
+-        graph = [torch.cuda.CUDAGraph() for _ in range(num_layers + 1)]
++        graph = [torch_npu.npu.NPUGraph() for _ in range(num_layers + 1)]
+         input_buffer = [static_hidden_states] + [
+             self._attention_layers[layer_idx].output_buffer_
+             for layer_idx in range(num_layers)
+         ]
+ 
+-        with torch.cuda.graph(graph[0], pool=memory_pool):
++        with torch_npu.npu.graph(graph[0], pool=memory_pool):
+             static_uvqk = self._attention_layers[0].forward_input(
+                 batch_size,
+                 num_tokens,
+@@ -304,7 +308,7 @@ class HSTUBlockInference(torch.nn.Module):
+             memory_pool = graph[0].pool()
+ 
+         for layer_idx in range(0, num_layers - 1):
+-            with torch.cuda.graph(graph[layer_idx + 1], pool=memory_pool):
++            with torch_npu.npu.graph(graph[layer_idx + 1], pool=memory_pool):
+                 static_output = self._attention_layers[layer_idx].forward_output(
+                     batch_size,
+                     num_tokens,
+@@ -320,7 +324,7 @@ class HSTUBlockInference(torch.nn.Module):
+                     static_kvcache_metadata,
+                 )
+ 
+-        with torch.cuda.graph(graph[num_layers], pool=memory_pool):
++        with torch_npu.npu.graph(graph[num_layers], pool=memory_pool):
+             static_output = self._attention_layers[-1].forward_output(
+                 batch_size,
+                 num_tokens,
+diff --git a/models/hstu/modules/jagged_data.py b/models/hstu/modules/jagged_data.py
+index 316ccda..9d8ba1f 100755
+--- a/models/hstu/modules/jagged_data.py
++++ b/models/hstu/modules/jagged_data.py
+@@ -16,8 +16,6 @@ import copy
+ import dataclasses
+ import pprint
+ from typing import Optional
+-
+-import fbgemm_gpu  # pylint: disable-unused-import
+ import torch
+ 
+ 
+@@ -54,7 +52,7 @@ class JaggedData:
+     contextual_max_seqlen: int = 0
+     contextual_seqlen: Optional[torch.Tensor] = None
+     contextual_seqlen_offsets: Optional[torch.Tensor] = None
+-
++    seqlen_k: Optional[torch.Tensor] = None
+     has_interleaved_action: bool = False
+     scaling_seqlen: int = -1
+     padding_length: int = (
+diff --git a/models/hstu/modules/metrics/__init__.py b/models/hstu/modules/metrics/__init__.py
+index 3c4db66..81d870a 100755
+--- a/models/hstu/modules/metrics/__init__.py
++++ b/models/hstu/modules/metrics/__init__.py
+@@ -4,7 +4,6 @@ import torch
+ 
+ from .metric_modules import (
+     MultiClassificationTaskMetric,
+-    RetrievalTaskMetricWithSampling,
+ )
+ 
+ 
+@@ -24,6 +23,5 @@ def get_multi_event_metric_module(
+ 
+ __all__ = [
+     "MultiClassificationTaskMetric",
+-    "RetrievalTaskMetricWithSampling",
+     "get_multi_event_metric_module",
+ ]
+diff --git a/models/hstu/modules/metrics/metric_modules.py b/models/hstu/modules/metrics/metric_modules.py
+index ffe6479..8ba9c0c 100755
+--- a/models/hstu/modules/metrics/metric_modules.py
++++ b/models/hstu/modules/metrics/metric_modules.py
+@@ -23,18 +23,7 @@ from typing import Any, Dict, List, Optional, Tuple
+ import numpy as np
+ import torch
+ import torchmetrics.classification as classification_metrics
+-from commons.utils.nvtx_op import output_nvtx_hook
+-from dynamicemb.planner import (
+-    DynamicEmbeddingShardingPlanner as DynamicEmbeddingShardingPlanner,
+-)
+-from ops.collective_ops import grouped_allgatherv_tensor_list
+-
+-try:
+-    from megatron.core import parallel_state
+-except ImportError:
+-    print("megatron.core is not installed, training is not supported.")
+-
+-# from torchrec.distributed import ModuleShardingPlan
++
+ from tqdm import tqdm
+ 
+ 
+@@ -196,7 +185,6 @@ class MultiClassificationTaskMetric(BaseTaskMetric):
+         self.training = False
+ 
+     # return a
+-    @output_nvtx_hook("ranking metrics", backward=False)
+     def forward(self, multi_task_logits, targets):
+         """
+         Forward one eval batch, this forward returns None object.
+@@ -237,179 +225,4 @@ class MultiClassificationTaskMetric(BaseTaskMetric):
+             ] = eval_module.compute()
+         for eval_module in self._eval_metrics_modules:
+             eval_module.reset()
+-        return ret_dict
+-
+-
+-# TODO, use torchmetrics instead
+-class RetrievalTaskMetricWithSampling(BaseTaskMetric):
+-    """
+-    This module is intended for retrieval task evaluation with sampling.
+-
+-    Args:
+-        metric_types (Tuple[str]): Tuple of metric types. A eval metric type str is composed of <MetricTypeStr>+'@'+<k> where k is designated as the top-k retrieval. Available values for <MetricTypeStr> : ``'NDCG'`` | ``'HR'`` | ``'MRR'``.
+-        MAX_K (int): Maximum value of K for top-K calculations.
+-
+-    Example:
+-        >>> metric = RetrievalTaskMetricWithSampling(metric_types=("NDCG@10", "HR@10", "MRR"), MAX_K=2500)
+-        >>> query_embeddings = torch.randn(10, 128)
+-        >>> target_ids = torch.randint(0, 100, (10,))
+-        >>> metric(query_embeddings, target_ids)
+-        >>> metric.compute()
+-        {'NDCG@10': 0.5, 'HR@10': 0.6, 'MRR': 0.7}
+-    """
+-
+-    def __init__(
+-        self,
+-        metric_types: Tuple[str, ...] = ("NDCG@10",),
+-        MAX_K: int = 2500,
+-    ):
+-        super().__init__()
+-        self._max_k = MAX_K
+-        self._device = torch.device(f"cuda:{torch.cuda.current_device()}")
+-        self._mtype_topk = []
+-        for metric_type in metric_types:
+-            tmp_str = metric_type.split("@")
+-            mtype, topk = MetricType(tmp_str[0]), 10 if len(tmp_str) < 2 else int(
+-                tmp_str[1]
+-            )
+-            self._mtype_topk.append((mtype, topk))
+-        self._cache_query_embeddings: List[torch.Tensor] = []
+-        self._cache_target_ids: List[torch.Tensor] = []
+-        self._chunk_size = 512
+-
+-    @output_nvtx_hook("retrieval metrics", backward=False)
+-    def forward(
+-        self,
+-        query_embeddings: torch.Tensor,  # preds, dense embedding tensor
+-        target_ids: torch.Tensor,  # targets,  dense id tensor
+-    ):
+-        """
+-        Forward pass for the retrieval task metric.
+-
+-        Args:
+-            query_embeddings (torch.Tensor): Query embeddings (predictions).
+-            target_ids (torch.Tensor): Target IDs (ground truth).
+-        """
+-        self._cache_query_embeddings.append(query_embeddings)
+-        self._cache_target_ids.append(target_ids)
+-
+-    def compute(
+-        self, keys_array: np.ndarray, values_array: np.ndarray
+-    ) -> Tuple[Dict[Any, Any], Any, Any]:
+-        """
+-        Compute the final retrieval metrics after all eval batches are done.
+-
+-        Args:
+-            item_embedding (ShardedEmbedding): Sharded embedding for items.
+-            table_name (str): The item embedding table name
+-
+-        Returns:
+-            Tuple[dict, torch.Tensor, torch.Tensor]: Dictionary containing the final metric scores,
+-                                                     global top-K logits, and global top-K keys.
+-        """
+-        # 1. export local embedding
+-        local_shard_rows = keys_array.size
+-        if local_shard_rows == 0:
+-            raise ValueError(
+-                f"No local shard on rank {torch.distributed.get_rank()}. Evaluation failed."
+-            )
+-        eval_dict_all: Dict[str, List] = defaultdict(list)
+-        for query_embeddings, target_ids in tqdm(
+-            zip(self._cache_query_embeddings, self._cache_target_ids)
+-        ):
+-            # 2. allgatherv query_embeddings and target_ids
+-            (
+-                global_query_embeddings,
+-                global_target_ids,
+-            ) = grouped_allgatherv_tensor_list(
+-                [query_embeddings, target_ids],
+-                pg=parallel_state.get_data_parallel_group(with_context_parallel=True),
+-            )
+-            # 3. calc topk largest in a streaming way
+-            local_topk_logits: torch.Tensor = None
+-            local_topk_keys: torch.Tensor = None
+-            for start in range(0, local_shard_rows, self._chunk_size):
+-                stop = min(local_shard_rows, start + self._chunk_size)
+-                chunk_keys = torch.tensor(
+-                    keys_array[start:stop], device=self._device
+-                )  # (T)
+-                chunk_embedding = torch.tensor(
+-                    values_array[start:stop, :], device=self._device
+-                )
+-                logits = torch.mm(global_query_embeddings, chunk_embedding.T)  # (Q, T)
+-                if local_topk_logits is None:
+-                    local_topk_logits = logits
+-                    local_topk_keys = chunk_keys.unsqueeze(0).expand(
+-                        local_topk_logits.size(0), -1
+-                    )  # (Q, T)
+-                else:
+-                    local_topk_logits = torch.cat([local_topk_logits, logits], dim=1)
+-                    chunk_keys = chunk_keys.unsqueeze(0).expand(
+-                        local_topk_keys.size(0), -1
+-                    )
+-                    local_topk_keys = torch.cat([local_topk_keys, chunk_keys], dim=1)
+-                k = min(self._max_k, logits.size(1))
+-                local_topk_logits, local_topk_indices = torch.topk(
+-                    local_topk_logits,
+-                    k=k,
+-                    dim=1,
+-                    sorted=False,
+-                    largest=True,
+-                )
+-                local_topk_keys = torch.gather(
+-                    local_topk_keys, dim=1, index=local_topk_indices
+-                )
+-
+-            # 4. allgatherv local_topk_* results
+-            t_local_topk_logits = local_topk_logits.T
+-            t_local_topk_keys = local_topk_keys.T
+-            (
+-                t_global_n_topk_logits,
+-                t_global_n_topk_keys,
+-            ) = grouped_allgatherv_tensor_list(
+-                [t_local_topk_logits, t_local_topk_keys],
+-                pg=torch.distributed.group.WORLD,
+-            )
+-
+-            global_n_topk_logits = t_global_n_topk_logits.T
+-            global_n_topk_keys = t_global_n_topk_keys.T
+-
+-            # 5. calc global topk
+-            k = min(self._max_k, global_n_topk_logits.size(1))
+-            global_topk_logits, global_topk_indices = torch.topk(
+-                global_n_topk_logits,
+-                k=k,
+-                dim=1,
+-                sorted=True,
+-                largest=True,
+-            )
+-
+-            global_topk_keys = torch.gather(
+-                global_n_topk_keys, dim=1, index=global_topk_indices
+-            )
+-            _, eval_rank_indices = torch.max(
+-                torch.cat([global_topk_keys, global_target_ids.unsqueeze(-1)], dim=1)
+-                == global_target_ids.unsqueeze(-1),
+-                dim=1,
+-            )
+-            eval_ranks = torch.where(
+-                eval_rank_indices == k, self._max_k + 1, eval_rank_indices + 1
+-            )
+-            output_dict: Dict[str, torch.Tensor] = defaultdict()
+-
+-            for mtype, topk in self._mtype_topk:
+-                if topk is not None:
+-                    output_dict[f"{mtype.value}@{topk}"] = _metric_type_to_cls_map[
+-                        mtype
+-                    ](eval_ranks, topk)
+-            for k, v in output_dict.items():
+-                eval_dict_all[k] = eval_dict_all[k] + [v]
+-
+-        final_eval_dict: Dict[str, float] = dict()
+-        for k, v in eval_dict_all.items():
+-            res = torch.cat(v, dim=-1)
+-            final_eval_dict[k] = res.sum() / res.numel()
+-
+-        self._cache_query_embeddings.clear()
+-        self._cache_target_ids.clear()
+-        return final_eval_dict, global_topk_logits, global_topk_keys
++        return ret_dict
+\ No newline at end of file
+diff --git a/models/hstu/modules/mlp.py b/models/hstu/modules/mlp.py
+index d2124e0..20e46fd 100755
+--- a/models/hstu/modules/mlp.py
++++ b/models/hstu/modules/mlp.py
+@@ -17,28 +17,20 @@ from typing import List, Optional
+ 
+ import torch
+ 
+-try:
+-    from commons.utils.nvtx_op import output_nvtx_hook
+-    from megatron.core.transformer.module import MegatronModule
+ 
+-    BaseModule = MegatronModule
+-except:
+-
+-    def output_nvtx_hook(nvtx_tag):
+-        def decorator(module):
+-            @wraps(module)
+-            def forward(*args, **kwags):
+-                return module(*args, **kwags)
+-
+-            return forward
+-
+-        return decorator
+-
+-    BaseModule = torch.nn.Module
+-from modules.utils import init_mlp_weights_optional_bias
++def init_mlp_weights_optional_bias(
++    m: torch.nn.Module,
++) -> None:
++    """
++    Initialize the weights of a linear layer and optionally the bias.
++    """
++    if isinstance(m, torch.nn.Linear):
++        torch.nn.init.xavier_uniform_(m.weight)
++        if m.bias is not None:
++            m.bias.data.fill_(0.0)
+ 
+ 
+-class MLP(BaseModule):  # type: ignore
++class MLP(torch.nn.Module):  # type: ignore
+     """
+     Multi-Layer Perceptron (MLP) module wrapper for processing jagged data.
+ 
+@@ -60,10 +52,7 @@ class MLP(BaseModule):  # type: ignore
+         device: Optional[torch.device] = None,
+         dtype: torch.dtype = torch.float32,
+     ) -> None:
+-        if BaseModule is torch.nn.Module:
+-            super().__init__()
+-        else:
+-            super(BaseModule, self).__init__()
++        super().__init__()
+ 
+         if activation == "relu":
+             activation_fn = torch.nn.ReLU
+@@ -92,7 +81,6 @@ class MLP(BaseModule):  # type: ignore
+         self._mlp = torch.nn.Sequential(*layers)
+         self._mlp.apply(init_mlp_weights_optional_bias)
+ 
+-    @output_nvtx_hook(nvtx_tag="mlp")
+     def forward(self, input: torch.Tensor) -> torch.Tensor:
+         """
+         Forward pass of the MLP module.
+@@ -103,5 +91,6 @@ class MLP(BaseModule):  # type: ignore
+         Returns:
+             torch.Tensor: The output tensor.
+         """
+-        assert input.dim() == 2, "Tensor must be 2-dimensional"
++        if input.dim() != 2:
++            raise ValueError("Tensor must be 2-dimensional")
+         return self._mlp(input)
+diff --git a/models/hstu/preprocessor.py b/models/hstu/preprocessor.py
+index b250d7b..9b46a7e 100755
+--- a/models/hstu/preprocessor.py
++++ b/models/hstu/preprocessor.py
+@@ -199,6 +199,7 @@ class DataProcessor:
+             self.preprocess_training()
+         if inference_data:
+             log.info("[========= Generating Inference Data =========]")
++            self.preprocess_training()
+             self.preprocess_inference(**kwargs)
+ 
+ 
+-- 
+2.39.5 (Apple Git-154)
+
