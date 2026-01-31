@@ -1,0 +1,144 @@
+From 754a6faf084d0080d2275dbc05de3a3dccc1e002 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E6=B4=AA=E7=82=9C=E6=9D=B0?= <xxx@xxx>
+Date: Fri, 5 Dec 2025 10:28:40 +0800
+Subject: [PATCH] add profiler
+
+---
+ .../sglang/srt/model_executor/model_runner.py | 91 ++++++++++++++++---
+ 1 file changed, 76 insertions(+), 15 deletions(-)
+
+diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
+index c6862f1e3..0f51bf887 100644
+--- a/python/sglang/srt/model_executor/model_runner.py
++++ b/python/sglang/srt/model_executor/model_runner.py
+@@ -246,8 +246,38 @@ if _is_npu:
+ 
+     torch.npu.config.allow_internal_format = True
+     torch_npu.npu.set_compile_mode(jit_compile=False)
++    experimental_config = torch_npu.profiler._ExperimentalConfig(
++        profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
++        aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization
++    )
+ 
+ 
++prof_mode = os.environ.get("PROFILER_MODE", "none").lower()
++
++# 判断是否需要采集
++prof_prefill = prof_mode in ["prefill", "all"]
++prof_decode = prof_mode in ["decode", "all"]
++output_dir = os.getenv("SGLANG_TORCH_PROFILER_DIR", "/tmp")
++
++profile = torch_npu.profiler.profile(
++    activities=[
++        torch_npu.profiler.ProfilerActivity.NPU,
++        torch_npu.profiler.ProfilerActivity.CPU
++    ],
++    with_stack=False,
++    record_shapes=False,
++    profile_memory=False,
++    experimental_config=experimental_config,
++    schedule=torch_npu.profiler.schedule(
++        wait=0,
++        warmup=0,
++        active=10,
++        repeat=1,
++        skip_first=3
++    ),
++    on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(output_dir)
++)
++
+ def resolve_language_model(model: nn.Module) -> nn.Module:
+     model_cls_name = model.__class__.__name__
+     if model_cls_name == "Qwen3OmniMoeForConditionalGeneration":
+@@ -2668,6 +2698,7 @@ class ModelRunner:
+         reinit_attn_backend: bool = False,
+         split_forward_count: int = 1,
+     ) -> Tuple[Union[LogitsProcessorOutput, PPProxyTensors], bool]:
++        global profile
+         mode_check = (
+             forward_batch.forward_mode.is_cpu_graph
+             if self.device == "cpu"
+@@ -2680,11 +2711,21 @@ class ModelRunner:
+         )
+ 
+         if can_run_graph:
+-            ret = self.graph_runner.replay(
+-                forward_batch,
+-                skip_attn_backend_init=skip_attn_backend_init,
+-                pp_proxy_tensors=pp_proxy_tensors,
+-            )
++            if self.gpu_id == 0 and prof_decode:
++                profile.on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(os.path.join(output_dir, "prof/decode"))
++                with profile as prof:
++                    ret = self.graph_runner.replay(
++                        forward_batch,
++                        skip_attn_backend_init=skip_attn_backend_init,
++                        pp_proxy_tensors=pp_proxy_tensors,
++                    )
++                    prof.step()
++            else:
++                ret = self.graph_runner.replay(
++                    forward_batch,
++                    skip_attn_backend_init=skip_attn_backend_init,
++                    pp_proxy_tensors=pp_proxy_tensors,
++                )
+             return ret, can_run_graph
+ 
+         # For MLP sync
+@@ -2694,11 +2735,21 @@ class ModelRunner:
+             forward_batch.prepare_attn_tp_scatter_input(self)
+ 
+         if forward_batch.forward_mode.is_decode():
+-            ret = self.forward_decode(
+-                forward_batch,
+-                skip_attn_backend_init=skip_attn_backend_init,
+-                pp_proxy_tensors=pp_proxy_tensors,
+-            )
++            if self.gpu_id == 0 and prof_decode:
++                profile.on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(os.path.join(output_dir, "prof/decode"))
++                with profile as prof:
++                    ret = self.forward_decode(
++                        forward_batch,
++                        skip_attn_backend_init=skip_attn_backend_init,
++                        pp_proxy_tensors=pp_proxy_tensors,
++                    )
++                    prof.step()
++            else:
++                ret = self.forward_decode(
++                    forward_batch,
++                    skip_attn_backend_init=skip_attn_backend_init,
++                    pp_proxy_tensors=pp_proxy_tensors,
++                )
+         elif forward_batch.forward_mode.is_split_prefill():
+             ret = self.forward_split_prefill(
+                 forward_batch,
+@@ -2706,11 +2757,21 @@ class ModelRunner:
+                 forward_count=split_forward_count,
+             )
+         elif forward_batch.forward_mode.is_extend(include_draft_extend_v2=True):
+-            ret = self.forward_extend(
+-                forward_batch,
+-                skip_attn_backend_init=skip_attn_backend_init,
+-                pp_proxy_tensors=pp_proxy_tensors,
+-            )
++            if self.gpu_id == 0 and prof_prefill:
++                profile.on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(os.path.join(output_dir, "prof/prefill"))
++                with profile as prof:
++                    ret = self.forward_extend(
++                        forward_batch,
++                        skip_attn_backend_init=skip_attn_backend_init,
++                        pp_proxy_tensors=pp_proxy_tensors,
++                    )
++                    prof.step()
++            else:
++                ret = self.forward_extend(
++                    forward_batch,
++                    skip_attn_backend_init=skip_attn_backend_init,
++                    pp_proxy_tensors=pp_proxy_tensors,
++                )
+         elif forward_batch.forward_mode.is_idle():
+             ret = self.forward_idle(forward_batch, pp_proxy_tensors=pp_proxy_tensors)
+         else:
+-- 
+GitCode
+

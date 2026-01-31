@@ -1,0 +1,1016 @@
+From e32d0a7a919076ef8a2e0238759021ce50996653 Mon Sep 17 00:00:00 2001
+From: AndyKong <xxx@xxx>
+Date: Thu, 22 Jan 2026 09:22:18 +0800
+Subject: [PATCH] [feat]GDN adaption and support MTP
+
+---
+ .../srt/layers/attention/ascend_backend.py    | 708 +++++++++++++++---
+ .../layers/attention/attention_registry.py    |   8 +-
+ .../attention/hybrid_linear_attn_backend.py   |  21 +-
+ python/sglang/srt/mem_cache/memory_pool.py    |   8 +-
+ .../srt/model_executor/npu_graph_runner.py    |   7 +-
+ python/sglang/srt/models/qwen3_next.py        |   4 +-
+ .../sglang/srt/speculative/eagle_worker_v2.py |  33 +
+ 7 files changed, 691 insertions(+), 98 deletions(-)
+
+diff --git a/python/sglang/srt/layers/attention/ascend_backend.py b/python/sglang/srt/layers/attention/ascend_backend.py
+index 5b6a09b5d..a49de37a3 100644
+--- a/python/sglang/srt/layers/attention/ascend_backend.py
++++ b/python/sglang/srt/layers/attention/ascend_backend.py
+@@ -1,18 +1,26 @@
+ from __future__ import annotations
+ 
++import logging
+ from dataclasses import dataclass
+-from typing import TYPE_CHECKING, List, Optional
++from typing import TYPE_CHECKING, List, Optional, Union
+ 
++import numpy as np
+ import torch
++import torch.nn.functional as F
+ import torch_npu
+ 
+ from sglang.srt.configs.model_config import AttentionArch
+ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
++from sglang.srt.layers.attention.fla.fused_gdn_gating import fused_gdn_gating_v3
++from sglang.srt.layers.attention.fla.l2norm import l2norm_fwd
++from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
+ from sglang.srt.layers.attention.npu_ops.mla_preprocess import is_mla_preprocess_enabled
+ from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
+ from sglang.srt.layers.dp_attention import get_attention_tp_size
+ from sglang.srt.layers.radix_attention import AttentionType
++from sglang.srt.mem_cache.memory_pool import MambaPool
+ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
++from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
+ from sglang.srt.speculative.spec_info import SpecInput
+ from sglang.srt.utils import get_bool_env_var
+ 
+@@ -20,9 +28,11 @@ if TYPE_CHECKING:
+     from sglang.srt.layers.radix_attention import RadixAttention
+     from sglang.srt.model_executor.model_runner import ModelRunner
+ 
+-import logging
+-
+-import numpy as np
++from sgl_kernel_npu.fla.chunk import chunk_gated_delta_rule_npu
++from sgl_kernel_npu.fla.fused_sigmoid_gating_recurrent import (
++    fused_sigmoid_gating_delta_rule_update_npu,
++)
++from sgl_kernel_npu.mamba.causal_conv1d import causal_conv1d_fn_npu
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -40,6 +50,8 @@ class ForwardMetadata:
+     seq_lens_list_cumsum: Optional[List[int]] = None
+     seq_lens: Optional[torch.Tensor] = None
+     actual_seq_lengths_q: Optional[torch.Tensor] = None
++    actual_seq_lengths: Optional[torch.Tensor] = None
++    actual_seq_lengths_kv: Optional[torch.Tensor] = None
+ 
+ 
+ class AscendAttnMaskBuilder:
+@@ -250,7 +262,6 @@ class AscendAttnBackend(AttentionBackend):
+ 
+     def init_forward_metadata(self, forward_batch: ForwardBatch):
+         """Init the metadata for a forward pass."""
+-        tp_size = get_attention_tp_size()
+         self.forward_metadata = ForwardMetadata()
+         seq_lens_max = forward_batch.seq_lens.max()
+         if forward_batch.forward_mode.is_target_verify():
+@@ -280,6 +291,33 @@ class AscendAttnBackend(AttentionBackend):
+             self.mix_mask = self.ascend_attn_mask_builder.update_mask(
+                 self.forward_metadata
+             )
++
++        if (
++            forward_batch.forward_mode.is_target_verify()
++            or forward_batch.forward_mode.is_draft_extend()
++            or forward_batch.forward_mode.is_draft_extend_v2()
++        ):
++            if self.forward_metadata.seq_lens_cpu_int is None:
++                self.forward_metadata.actual_seq_lengths_kv = (
++                    self.forward_metadata.seq_lens_cpu_list
++                )
++            else:
++                self.forward_metadata.actual_seq_lengths_kv = (
++                    self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
++                )
++            if forward_batch.forward_mode.is_draft_extend():
++                self.forward_metadata.actual_seq_lengths = (
++                    np.array(forward_batch.extend_seq_lens_cpu).cumsum().tolist()
++                )
++            else:
++                actual_len = forward_batch.input_ids[
++                    : forward_batch.num_token_non_padded_cpu
++                ].shape[0]
++                self.forward_metadata.actual_seq_lengths = np.arange(
++                    self.speculative_num_draft_tokens,
++                    self.speculative_num_draft_tokens + actual_len,
++                    self.speculative_num_draft_tokens,
++                ).tolist()
+         self.graph_mode = False
+ 
+     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+@@ -647,6 +685,7 @@ class AscendAttnBackend(AttentionBackend):
+         q_rope: Optional[torch.Tensor] = None,
+         k_rope: Optional[torch.Tensor] = None,
+     ):
++        forward_batch.out_cache_loc = forward_batch.out_cache_loc.to(dtype=torch.int32)
+         if save_kv_cache:
+             if self.use_mla:
+                 k = k.view(-1, layer.tp_k_head_num, self.kv_lora_rank)
+@@ -659,94 +698,140 @@ class AscendAttnBackend(AttentionBackend):
+                     layer, forward_batch.out_cache_loc, k, v
+                 )
+ 
+-        c_kv, k_rope = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+-        k_rope_cache = k_rope.view(
+-            -1, layer.tp_k_head_num, self.page_size, self.qk_rope_head_dim
+-        )
+-        c_kv_cache = c_kv.view(
+-            -1, layer.tp_v_head_num, self.page_size, self.kv_lora_rank
+-        )
++        if self.use_mla:
++            c_kv, k_rope = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
++            k_rope_cache = k_rope.view(
++                -1, layer.tp_k_head_num, self.page_size, self.qk_rope_head_dim
++            )
++            c_kv_cache = c_kv.view(
++                -1, layer.tp_v_head_num, self.page_size, self.kv_lora_rank
++            )
+ 
+-        q_nope = q.view(-1, layer.tp_q_head_num, self.kv_lora_rank).contiguous()
+-        q_rope = q_rope.view(-1, layer.tp_q_head_num, self.qk_rope_head_dim)
+-        if not self.graph_mode:
+-            num_token_padding = q.shape[0]
+-            q_nope = q_nope[: forward_batch.num_token_non_padded_cpu]
+-            q_rope = q_rope[: forward_batch.num_token_non_padded_cpu]
+-        if self.forward_metadata.seq_lens_cpu_int is None:
+-            actual_seq_lengths_kv = self.forward_metadata.seq_lens_cpu_list
+-        else:
+-            actual_seq_lengths_kv = (
+-                self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
++            q_nope = q.view(-1, layer.tp_q_head_num, self.kv_lora_rank).contiguous()
++            q_rope = q_rope.view(-1, layer.tp_q_head_num, self.qk_rope_head_dim)
++            if not self.graph_mode:
++                num_token_padding = q.shape[0]
++                q_nope = q_nope[: forward_batch.num_token_non_padded_cpu]
++                q_rope = q_rope[: forward_batch.num_token_non_padded_cpu]
++            if self.forward_metadata.seq_lens_cpu_int is None:
++                actual_seq_lengths_kv = self.forward_metadata.seq_lens_cpu_list
++            else:
++                actual_seq_lengths_kv = (
++                    self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
++                )
++            if forward_batch.forward_mode.is_draft_extend():
++                actual_seq_lengths = (
++                    np.array(forward_batch.extend_seq_lens_cpu).cumsum().tolist()
++                )
++            else:
++                actual_seq_lengths = np.arange(
++                    self.speculative_num_draft_tokens,
++                    self.speculative_num_draft_tokens + q_nope.shape[0],
++                    self.speculative_num_draft_tokens,
++                )
++            workspace = torch_npu._npu_fused_infer_attention_score_get_max_workspace(
++                q_nope,
++                c_kv_cache,
++                c_kv_cache,
++                query_rope=q_rope,
++                key_rope=k_rope_cache,
++                num_heads=layer.tp_q_head_num,
++                num_key_value_heads=layer.tp_k_head_num,
++                input_layout="TND",
++                scale=layer.scaling,
++                antiquant_mode=0,
++                antiquant_scale=None,
++                block_table=self.forward_metadata.block_tables,
++                block_size=self.page_size,
++                sparse_mode=3,
++                atten_mask=self.mtp_mask,
++                actual_seq_lengths=actual_seq_lengths,
++                actual_seq_lengths_kv=actual_seq_lengths_kv,
+             )
+-        if forward_batch.forward_mode.is_draft_extend():
+-            actual_seq_lengths = (
+-                np.array(forward_batch.extend_seq_lens_cpu).cumsum().tolist()
++            attn_output = torch.empty_like(q_nope, dtype=q.dtype, device=q.device)
++            softmax_lse = torch.empty(1, dtype=q.dtype, device=q.device)
++            torch_npu.npu_fused_infer_attention_score.out(
++                q_nope,
++                c_kv_cache,
++                c_kv_cache,
++                query_rope=q_rope,
++                key_rope=k_rope_cache,
++                num_heads=layer.tp_q_head_num,
++                num_key_value_heads=layer.tp_k_head_num,
++                input_layout="TND",
++                scale=layer.scaling,
++                antiquant_mode=0,
++                antiquant_scale=None,
++                block_table=self.forward_metadata.block_tables,
++                block_size=self.page_size,
++                sparse_mode=3,
++                atten_mask=self.mtp_mask,
++                actual_seq_lengths=actual_seq_lengths,
++                actual_seq_lengths_kv=actual_seq_lengths_kv,
++                workspace=workspace,
++                out=[attn_output, softmax_lse],
+             )
++            attn_output = attn_output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
++            if (
++                not self.graph_mode
++                and forward_batch.num_token_non_padded_cpu != num_token_padding
++            ):
++                attn_output = torch.cat(
++                    [
++                        attn_output,
++                        attn_output.new_zeros(
++                            num_token_padding - attn_output.shape[0],
++                            *attn_output.shape[1:],
++                        ),
++                    ],
++                    dim=0,
++                )
++            return attn_output
+         else:
+-            actual_seq_lengths = np.arange(
+-                self.speculative_num_draft_tokens,
+-                self.speculative_num_draft_tokens + q_nope.shape[0],
+-                self.speculative_num_draft_tokens,
++            q = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
++            num_token_padding = q.shape[0]
++            if (
++                not self.graph_mode
++            ) and forward_batch.num_token_non_padded_cpu != num_token_padding:
++                q = q[: forward_batch.num_token_non_padded_cpu]
++
++            k, v = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
++            k_cache = k.view(
++                -1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim
+             )
+-
+-        workspace = torch_npu._npu_fused_infer_attention_score_get_max_workspace(
+-            q_nope,
+-            c_kv_cache,
+-            c_kv_cache,
+-            query_rope=q_rope,
+-            key_rope=k_rope_cache,
+-            num_heads=layer.tp_q_head_num,
+-            num_key_value_heads=layer.tp_k_head_num,
+-            input_layout="TND",
+-            scale=layer.scaling,
+-            antiquant_mode=0,
+-            antiquant_scale=None,
+-            block_table=self.forward_metadata.block_tables,
+-            block_size=self.page_size,
+-            sparse_mode=3,
+-            atten_mask=self.mtp_mask,
+-            actual_seq_lengths=actual_seq_lengths,
+-            actual_seq_lengths_kv=actual_seq_lengths_kv,
+-        )
+-        attn_output = torch.empty_like(q_nope, dtype=q.dtype, device=q.device)
+-        softmax_lse = torch.empty(1, dtype=q.dtype, device=q.device)
+-        torch_npu.npu_fused_infer_attention_score.out(
+-            q_nope,
+-            c_kv_cache,
+-            c_kv_cache,
+-            query_rope=q_rope,
+-            key_rope=k_rope_cache,
+-            num_heads=layer.tp_q_head_num,
+-            num_key_value_heads=layer.tp_k_head_num,
+-            input_layout="TND",
+-            scale=layer.scaling,
+-            antiquant_mode=0,
+-            antiquant_scale=None,
+-            block_table=self.forward_metadata.block_tables,
+-            block_size=self.page_size,
+-            sparse_mode=3,
+-            atten_mask=self.mtp_mask,
+-            actual_seq_lengths=actual_seq_lengths,
+-            actual_seq_lengths_kv=actual_seq_lengths_kv,
+-            workspace=workspace,
+-            out=[attn_output, softmax_lse],
+-        )
+-        attn_output = attn_output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+-        if (
+-            not self.graph_mode
+-            and forward_batch.num_token_non_padded_cpu != num_token_padding
+-        ):
+-            attn_output = torch.cat(
+-                [
+-                    attn_output,
+-                    attn_output.new_zeros(
+-                        num_token_padding - attn_output.shape[0], *attn_output.shape[1:]
+-                    ),
+-                ],
+-                dim=0,
++            v_cache = v.view(-1, self.page_size, layer.tp_v_head_num * layer.v_head_dim)
++            q = q.view(
++                forward_batch.batch_size, -1, layer.tp_q_head_num, layer.qk_head_dim
+             )
+-        return attn_output
++            attn_output, _ = torch_npu.npu_fused_infer_attention_score(
++                q,
++                k_cache,
++                v_cache,
++                block_table=self.forward_metadata.block_tables,
++                block_size=self.page_size,
++                num_heads=layer.tp_q_head_num,
++                num_key_value_heads=layer.tp_k_head_num,
++                sparse_mode=3,
++                atten_mask=self.mtp_mask,
++                input_layout="BSND",
++                scale=layer.scaling,
++                actual_seq_lengths_kv=self.forward_metadata.actual_seq_lengths_kv,
++            )
++            attn_output = attn_output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
++            if (
++                not self.graph_mode
++            ) and forward_batch.num_token_non_padded_cpu != num_token_padding:
++                attn_output = torch.cat(
++                    [
++                        attn_output,
++                        attn_output.new_zeros(
++                            num_token_padding - attn_output.shape[0],
++                            *attn_output.shape[1:],
++                        ),
++                    ],
++                    dim=0,
++                )
++            return attn_output
+ 
+     def forward_decode_graph(
+         self,
+@@ -776,7 +861,7 @@ class AscendAttnBackend(AttentionBackend):
+         if not self.use_mla:
+             num_tokens = q.shape[0]
+             """PA will support bs<tp in the later version of CANN"""
+-            if num_tokens < get_attention_tp_size():
++            if self.use_fia or num_tokens < get_attention_tp_size():
+                 k_cache = forward_batch.token_to_kv_pool.get_key_buffer(
+                     layer.layer_id
+                 ).view(-1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim)
+@@ -1219,3 +1304,450 @@ class AscendAttnMultiStepDraftBackend:
+             )
+ 
+         self.common_template(forward_batch, call_fn)
++
++
++class AscendGDNAttnBackend(MambaAttnBackendBase):
++    """
++    Attention backend using Mamba kernel.
++    Adapted from layers.attention.hybrid_linear_attn_backend.GDNAttnBackend
++    """
++
++    def __init__(self, model_runner: ModelRunner):
++        super().__init__(model_runner)
++        self.enable_ascendc_fusion_gdn = get_bool_env_var(
++            "ENABLE_ASCENDC_FUSION_GDN", "false"
++        )
++        self.num_accepted_tokens = None
++        self.actual_seq_lengths = None
++        self.ssm_state_indices = None
++        self.graph_mode = False
++
++    def prepare_gdn_inputs(
++        self,
++        bs: int,
++        forward_mode: ForwardMode,
++        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
++    ):
++        cache_indices = self.forward_metadata.mamba_cache_indices
++        self.num_accepted_tokens = torch.ones(
++            [bs], dtype=torch.int32, device=cache_indices.device
++        )
++        self.actual_seq_lengths = torch.ones(
++            [bs], dtype=torch.int32, device=cache_indices.device
++        )
++        if forward_mode.is_target_verify():
++            seq_len = spec_info.draft_token_num
++            self.actual_seq_lengths = self.actual_seq_lengths * seq_len
++            # indices
++            start_indices = cache_indices * seq_len
++            offset = torch.arange(seq_len, device=start_indices.device)
++            ranges = start_indices.unsqueeze(1) + offset
++            self.ssm_state_indices = ranges.flatten().to(torch.int32)
++        else:
++            self.ssm_state_indices = cache_indices
++
++    def init_forward_metadata(self, forward_batch: ForwardBatch):
++        if forward_batch.forward_mode.is_draft_extend(True):
++            return
++        super().init_forward_metadata(forward_batch)
++        self.prepare_gdn_inputs(
++            forward_batch.batch_size,
++            forward_batch.forward_mode,
++            forward_batch.spec_info,
++        )
++        self.graph_mode = False
++
++    def init_forward_metadata_capture_cuda_graph(
++        self,
++        bs: int,
++        num_tokens: int,
++        req_pool_indices: torch.Tensor,
++        seq_lens: torch.Tensor,
++        encoder_lens: Optional[torch.Tensor],
++        forward_mode: ForwardMode,
++        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
++    ):
++        if forward_mode.is_draft_extend(True):
++            return
++        super().init_forward_metadata_capture_cuda_graph(
++            bs,
++            num_tokens,
++            req_pool_indices,
++            seq_lens,
++            encoder_lens,
++            forward_mode,
++            spec_info,
++        )
++        self.prepare_gdn_inputs(bs, forward_mode, spec_info)
++        self.graph_mode = True
++
++    def init_forward_metadata_replay_cuda_graph(
++        self,
++        bs: int,
++        req_pool_indices: torch.Tensor,
++        seq_lens: torch.Tensor,
++        seq_lens_sum: int,
++        encoder_lens: Optional[torch.Tensor],
++        forward_mode: ForwardMode,
++        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
++        seq_lens_cpu: Optional[torch.Tensor],
++    ):
++        if forward_mode.is_draft_extend(True):
++            return
++        super().init_forward_metadata_replay_cuda_graph(
++            bs,
++            req_pool_indices,
++            seq_lens,
++            seq_lens_sum,
++            encoder_lens,
++            forward_mode,
++            spec_info,
++            seq_lens_cpu,
++        )
++        self.prepare_gdn_inputs(bs, forward_mode, spec_info)
++        self.graph_mode = True
++
++    def torch_causal_conv1d_update_npu(
++        self,
++        hidden_state: torch.Tensor,
++        conv_state: torch.Tensor,
++        weight: torch.Tensor,
++        conv_state_update: Optional[torch.Tensor] = None,
++        bias: Optional[torch.Tensor] = None,
++    ):
++        bsz, hidden_size, seq_len = hidden_state.shape
++        state_len = conv_state.shape[-1]
++        hidden_states_new = torch.cat([conv_state, hidden_state], dim=-1).to(
++            weight.dtype
++        )
++        if conv_state_update is not None:
++            for i in range(seq_len):
++                end = i - seq_len + 1
++                start = end - state_len
++                slice_range = slice(start, end if end != 0 else None)
++                conv_state_update[:, i] = hidden_states_new[:, :, slice_range]
++        else:
++            conv_state_update = hidden_states_new[:, :, -state_len:]
++        kernel_size = weight.shape[-1]
++        # create windows for mtp steps with shape [bsz, hidden_size, seq_len, kernel_size]
++        windows = hidden_states_new.unfold(-1, kernel_size, 1)
++        out = (windows * weight[None, :, None, :]).sum(dim=-1)
++        if bias is not None:
++            out = out + bias[None, :, None]
++        out = F.silu(out[:, :, -seq_len:])
++        out = out.to(hidden_state.dtype)
++        return out, conv_state_update
++
++    def fused_recurrent_gated_delta_rule_update_npu(
++        self,
++        query: torch.Tensor,
++        key: torch.Tensor,
++        value: torch.Tensor,
++        recurrent_state: torch.Tensor,
++        beta: torch.Tensor,
++        g: torch.Tensor,
++        cache_indices: torch.Tensor,
++        intermediate_state: Optional[torch.Tensor] = None,
++    ):
++        _, num_heads, head_k_dim = query.shape  # T, N, D
++        _, num_value_heads, head_v_dim = value.shape
++        beta = beta.view(-1, num_value_heads).to(torch.bfloat16)
++        g = g.view(-1, num_value_heads).to(torch.float32)
++        batch_size = cache_indices.shape[0]
++        seq_len = query.shape[0] // batch_size
++        scale = 1 / (head_k_dim**0.5)
++
++        if intermediate_state is not None:
++            # MTP
++            intermediate_state[cache_indices, 0] = recurrent_state[cache_indices]
++            ssm_state = intermediate_state.view(
++                -1, num_value_heads, head_k_dim, head_v_dim
++            )
++        else:
++            ssm_state = recurrent_state
++
++        attn_core_out = torch_npu.npu_recurrent_gated_delta_rule(
++            query,
++            key,
++            value,
++            ssm_state,
++            beta=beta,
++            scale=scale,
++            actual_seq_lengths=self.actual_seq_lengths,
++            ssm_state_indices=self.ssm_state_indices,
++            num_accepted_tokens=self.num_accepted_tokens,
++            g=g,
++        )
++
++        if intermediate_state is not None:
++            intermediate_state = ssm_state.view(
++                -1, seq_len, num_value_heads, head_k_dim, head_v_dim
++            )
++        return attn_core_out
++
++    def forward_decode(
++        self,
++        q: torch.Tensor,
++        k: torch.Tensor,
++        v: torch.Tensor,
++        layer: RadixAttention,
++        forward_batch: ForwardBatch,
++        save_kv_cache: bool = True,
++        **kwargs,
++    ):
++        mixed_qkv = kwargs["mixed_qkv"]
++        conv_weights = kwargs["conv_weights"]
++        bias = kwargs["bias"]
++        activation = kwargs["activation"]
++        key_dim = kwargs["key_dim"]
++        value_dim = kwargs["value_dim"]
++        attn_tp_size = kwargs["attention_tp_size"]
++        head_k_dim = kwargs["head_k_dim"]
++        head_v_dim = kwargs["head_v_dim"]
++        a = kwargs["a"]
++        b = kwargs["b"]
++        A_log = kwargs["A_log"]
++        dt_bias = kwargs["dt_bias"]
++        layer_id = kwargs["layer_id"]
++
++        layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer_id)
++        conv_states = layer_cache.conv[0]
++        ssm_states = layer_cache.temporal
++        query_start_loc = self.forward_metadata.query_start_loc
++        cache_indices = self.forward_metadata.mamba_cache_indices
++
++        mixed_qkv = mixed_qkv.unsqueeze(-1)
++        conv_state_update = conv_states[cache_indices]
++        mixed_qkv, conv_states[cache_indices] = (
++            self.torch_causal_conv1d_update_npu(  # todo
++                mixed_qkv,
++                conv_state_update,
++                conv_weights,
++                bias=bias,
++            )
++        )
++        mixed_qkv = mixed_qkv.squeeze(-1)
++        query, key, value = torch.split(
++            mixed_qkv,
++            [
++                key_dim // attn_tp_size,
++                key_dim // attn_tp_size,
++                value_dim // attn_tp_size,
++            ],
++            dim=-1,
++        )
++        # Reshape from [l, h*d] to [1, l, h, d]
++        seq_len = query.shape[0]
++        num_heads = query.shape[1] // head_k_dim
++        num_value_heads = value.shape[1] // head_v_dim
++        g, beta = fused_gdn_gating_v3(A_log, a, b, dt_bias)
++
++        if self.enable_ascendc_fusion_gdn:
++            query = query.view(-1, num_heads, head_k_dim)
++            key = key.view(-1, num_heads, head_k_dim)
++            value = value.view(-1, num_value_heads, head_v_dim)
++            query = l2norm_fwd(
++                query.contiguous(), eps=1e-6, output_dtype=torch.bfloat16
++            )
++            key = l2norm_fwd(key.contiguous(), eps=1e-6, output_dtype=torch.bfloat16)
++
++            core_attn_out = self.fused_recurrent_gated_delta_rule_update_npu(
++                query,
++                key,
++                value,
++                recurrent_state=ssm_states,
++                beta=beta,
++                g=g,
++                cache_indices=cache_indices,
++            )
++        else:
++            query = query.view(1, seq_len, num_heads, head_k_dim)
++            key = key.view(1, seq_len, num_heads, head_k_dim)
++            value = value.view(1, seq_len, value.shape[1] // head_v_dim, head_v_dim)
++
++            core_attn_out = fused_sigmoid_gating_delta_rule_update_npu(
++                A_log=A_log,
++                dt_bias=dt_bias,
++                q=query,
++                k=key,
++                v=value,
++                a=a,
++                b=b,
++                initial_state_source=ssm_states,
++                initial_state_indices=cache_indices,
++                cu_seqlens=query_start_loc,
++                use_qk_l2norm_in_kernel=True,
++                softplus_beta=1.0,
++                softplus_threshold=20.0,
++            )
++
++        return core_attn_out
++
++    def forward_extend(
++        self,
++        q: torch.Tensor,
++        k: torch.Tensor,
++        v: torch.Tensor,
++        layer: RadixAttention,
++        forward_batch: ForwardBatch,
++        save_kv_cache: bool = True,
++        **kwargs,
++    ):
++        mixed_qkv = kwargs["mixed_qkv"]
++        conv_weights = kwargs["conv_weights"]
++        bias = kwargs["bias"]
++        activation = kwargs["activation"]
++        key_dim = kwargs["key_dim"]
++        value_dim = kwargs["value_dim"]
++        attn_tp_size = kwargs["attention_tp_size"]
++        head_k_dim = kwargs["head_k_dim"]
++        head_v_dim = kwargs["head_v_dim"]
++        a = kwargs["a"]
++        b = kwargs["b"]
++        A_log = kwargs["A_log"]
++        dt_bias = kwargs["dt_bias"]
++        layer_id = kwargs["layer_id"]
++        seq_len = kwargs["seq_len"]
++
++        is_target_verify = forward_batch.forward_mode.is_target_verify()
++
++        query_start_loc = self.forward_metadata.query_start_loc
++        cache_indices = self.forward_metadata.mamba_cache_indices
++
++        mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer_id)
++        conv_states = mamba_cache_params.conv[0]
++        ssm_states = mamba_cache_params.temporal
++        batch_size = cache_indices.shape[0]
++        if is_target_verify:
++            assert isinstance(mamba_cache_params, MambaPool.SpeculativeState)
++            assert self.enable_ascendc_fusion_gdn, (
++                "When enabling MTP, you must enable the Ascendc fusion "
++                + 'GDN operator. Please set the environment variable using `export ENABLE_ASCENDC_FUSION_GDN="true"`.'
++            )
++            intermediate_state_cache = mamba_cache_params.intermediate_ssm
++            intermediate_conv_window_cache = (
++                mamba_cache_params.intermediate_conv_window[0]
++            )
++        else:
++            has_initial_states = forward_batch.extend_prefix_lens > 0
++
++        if is_target_verify:
++            num_token_padding = mixed_qkv.shape[0]
++            if (
++                not self.graph_mode
++                and forward_batch.num_token_non_padded_cpu != num_token_padding
++            ):
++                mixed_qkv = mixed_qkv[: forward_batch.num_token_non_padded_cpu]
++                a = a[: forward_batch.num_token_non_padded_cpu]
++                b = b[: forward_batch.num_token_non_padded_cpu]
++                seq_len = forward_batch.num_token_non_padded_cpu
++            head_dim = mixed_qkv.shape[-1]
++            draft_token_num = forward_batch.spec_info.draft_token_num
++            mixed_qkv_reshaped = (
++                mixed_qkv.view(-1, draft_token_num, head_dim)
++                .transpose(1, 2)
++                .contiguous()
++            )
++            conv_states_to_use = conv_states[cache_indices]
++            intermediate_conv_cache = intermediate_conv_window_cache[cache_indices]
++            mixed_qkv_processed, conv_state_update = (
++                self.torch_causal_conv1d_update_npu(
++                    mixed_qkv_reshaped,
++                    conv_states_to_use,
++                    conv_weights,
++                    intermediate_conv_cache,
++                    bias,
++                )
++            )
++            intermediate_conv_window_cache[cache_indices] = conv_state_update
++            mixed_qkv = (
++                mixed_qkv_processed.transpose(1, 2).contiguous().view(seq_len, -1)
++            )
++        else:
++            mixed_qkv = causal_conv1d_fn_npu(
++                mixed_qkv.transpose(0, 1),
++                conv_weights,
++                bias,
++                activation=activation,
++                conv_states=conv_states,
++                has_initial_state=has_initial_states,
++                cache_indices=cache_indices,
++                query_start_loc=query_start_loc,
++                seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
++            ).transpose(0, 1)[:seq_len]
++
++        key_split_dim = key_dim // attn_tp_size
++        value_split_dim = value_dim // attn_tp_size
++
++        query, key, value = torch.split(
++            mixed_qkv,
++            [key_split_dim, key_split_dim, value_split_dim],
++            dim=-1,
++        )
++
++        actual_seq_len = query.shape[0]
++        num_heads = query.shape[1] // head_k_dim
++        num_value_heads = value.shape[1] // head_v_dim
++
++        query = query.view(1, actual_seq_len, num_heads, head_k_dim)
++        key = key.view(1, actual_seq_len, num_heads, head_k_dim)
++        value = value.view(1, actual_seq_len, num_value_heads, head_v_dim)
++
++        g, beta = fused_gdn_gating_v3(A_log, a, b, dt_bias)
++
++        if is_target_verify:
++            query = query.view(-1, num_heads, head_k_dim)
++            key = key.view(-1, num_heads, head_k_dim)
++            value = value.view(-1, num_value_heads, head_v_dim)
++            query = l2norm_fwd(
++                query.contiguous(), eps=1e-6, output_dtype=torch.bfloat16
++            )
++            key = l2norm_fwd(key.contiguous(), eps=1e-6, output_dtype=torch.bfloat16)
++
++            core_attn_out = self.fused_recurrent_gated_delta_rule_update_npu(
++                query,
++                key,
++                value,
++                recurrent_state=ssm_states,
++                beta=beta,
++                g=g,
++                cache_indices=cache_indices,
++                intermediate_state=intermediate_state_cache,
++            )
++            if (not self.graph_mode) and core_attn_out.shape[0] < num_token_padding:
++                core_attn_out = torch.cat(
++                    [
++                        core_attn_out,
++                        core_attn_out.new_zeros(
++                            num_token_padding - core_attn_out.shape[0],
++                            *core_attn_out.shape[1:],
++                        ),
++                    ],
++                    dim=0,
++                )
++        else:
++            recurrent_state = ssm_states[cache_indices]
++            core_attn_out, last_recurrent_state = chunk_gated_delta_rule_npu(
++                q=query,
++                k=key,
++                v=value,
++                g=g,
++                beta=beta,
++                initial_state=recurrent_state,
++                output_final_state=True,
++                cu_seqlens=query_start_loc,
++                head_first=False,
++                use_qk_l2norm_in_kernel=True,
++            )
++            if self.enable_ascendc_fusion_gdn:
++                # AscendC GDN fusion operator requires the shape of the recurrent_state to be [b, s, Dv, Dk]
++                last_recurrent_state = last_recurrent_state.transpose(-1, -2).to(
++                    ssm_states.dtype, copy=False
++                )
++            else:
++                last_recurrent_state = last_recurrent_state.to(
++                    ssm_states.dtype, copy=False
++                )
++            ssm_states[cache_indices] = last_recurrent_state
++
++        return core_attn_out
+diff --git a/python/sglang/srt/layers/attention/attention_registry.py b/python/sglang/srt/layers/attention/attention_registry.py
+index 41b37f08d..8f7f8f4b0 100644
+--- a/python/sglang/srt/layers/attention/attention_registry.py
++++ b/python/sglang/srt/layers/attention/attention_registry.py
+@@ -192,6 +192,7 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
+             KimiLinearAttnBackend,
+             Mamba2AttnBackend,
+         )
++        from sglang.srt.layers.attention.ascend_backend import AscendGDNAttnBackend
+         from sglang.srt.utils import is_blackwell, is_npu
+ 
+         check_environments()
+@@ -205,8 +206,11 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
+                 assert (
+                     runner.server_args.attention_backend == "ascend"
+                 ), "ascend backend is the only supported backend on NPU for hybrid GDN models, use --attention-backend ascend to specify the backend."
+-            logger.info(f"Using hybrid linear attention backend for hybrid GDN models.")
+-            linear_attn_backend = GDNAttnBackend(runner)
++                logger.info(f"Using hybrid linear attention backend for hybrid GDN models. Using Ascend GDN attention backend for linear attention.")
++                linear_attn_backend = AscendGDNAttnBackend(runner)
++            else:
++                logger.info(f"Using hybrid linear attention backend for hybrid GDN models.")
++                linear_attn_backend = GDNAttnBackend(runner)
+         elif runner.mamba2_config is not None:
+             linear_attn_backend = Mamba2AttnBackend(runner)
+         elif runner.kimi_linear_config is not None:
+diff --git a/python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py b/python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py
+index 6e23a4639..af90ae152 100644
+--- a/python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py
++++ b/python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py
+@@ -1,3 +1,4 @@
++import logging
+ from typing import Optional, Union
+ 
+ import torch
+@@ -35,6 +36,8 @@ from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
+ from sglang.srt.speculative.spec_info import SpecInput
+ from sglang.srt.utils import is_cuda, is_npu
+ 
++logger = logging.getLogger(__name__)
++
+ if is_cuda():
+     from sglang.srt.layers.attention.mamba.causal_conv1d import (
+         causal_conv1d_fn as causal_conv1d_fn_cuda,
+@@ -51,6 +54,9 @@ elif is_npu():
+         causal_conv1d_update_npu,
+     )
+ 
++    from sglang.srt.layers.attention.fla.fused_gdn_gating import fused_gdn_gating_v3
++
++    fused_gdn_gating = fused_gdn_gating_v3
+     chunk_gated_delta_rule = chunk_gated_delta_rule_npu
+     fused_sigmoid_gating_delta_rule_update = fused_sigmoid_gating_delta_rule_update_npu
+     causal_conv1d_fn = causal_conv1d_fn_npu
+@@ -83,7 +89,7 @@ class MambaAttnBackendBase(AttentionBackend):
+             query_start_loc = torch.arange(
+                 0, bs + 1, dtype=torch.int32, device=self.device
+             )
+-        elif forward_batch.forward_mode.is_extend():
++        elif forward_batch.forward_mode.is_extend(True):
+             if forward_batch.forward_mode.is_target_verify():
+                 query_start_loc = torch.arange(
+                     0,
+@@ -992,3 +998,16 @@ class HybridLinearAttnBackend(AttentionBackend):
+         conv_states[:, valid_state_indices, :, :] = intermediate_conv_window_cache[
+             :, valid_state_indices, last_steps
+         ].to(conv_states.dtype, copy=False)
++
++    def get_verify_buffers_to_fill_after_draft(self):
++        """
++        Return buffers for verify attention kernels that needs to be filled after draft.
++
++        Typically, these are tree mask and position buffers.
++        """
++        return [None, None]
++
++    def update_verify_buffers_to_fill_after_draft(
++        self, spec_info: SpecInput, cuda_graph_bs: Optional[int]
++    ):
++        pass
+diff --git a/python/sglang/srt/mem_cache/memory_pool.py b/python/sglang/srt/mem_cache/memory_pool.py
+index a7abab61f..6c0953784 100644
+--- a/python/sglang/srt/mem_cache/memory_pool.py
++++ b/python/sglang/srt/mem_cache/memory_pool.py
+@@ -205,7 +205,7 @@ class MambaPool:
+                         temporal_state_shape[2],
+                     ),
+                     dtype=ssm_dtype,
+-                    device="cuda",
++                    device=device,
+                 )
+                 # Cache intermediate conv windows (last K-1 inputs) per draft token during target verify
+                 # Shape: [num_layers, size + 1, speculative_num_draft_tokens, dim, K-1]
+@@ -219,7 +219,7 @@ class MambaPool:
+                             conv_shape[1],
+                         ),
+                         dtype=conv_dtype,
+-                        device="cuda",
++                        device=device,
+                     )
+                     for conv_shape in conv_state_shape
+                 ]
+@@ -242,8 +242,8 @@ class MambaPool:
+                 logger.info(
+                     f"Mamba Cache is allocated. "
+                     f"max_mamba_cache_size: {size}, "
+-                    f"conv_state size: {get_tensor_size_bytes(conv_state) / GB:.2f}GB, "
+-                    f"ssm_state size: {get_tensor_size_bytes(temporal_state) / GB:.2f}GB "
++                    f"conv_state size: {get_tensor_size_bytes(conv_state) / GB:.3f} GB, "
++                    f"ssm_state size: {get_tensor_size_bytes(temporal_state) / GB:.3f} GB"
+                 )
+             self.free_slots = torch.arange(
+                 self.size, dtype=torch.int64, device=self.device
+diff --git a/python/sglang/srt/model_executor/npu_graph_runner.py b/python/sglang/srt/model_executor/npu_graph_runner.py
+index aa9241a77..f0f84a0bf 100644
+--- a/python/sglang/srt/model_executor/npu_graph_runner.py
++++ b/python/sglang/srt/model_executor/npu_graph_runner.py
+@@ -27,7 +27,7 @@ import torch
+ from sglang.srt.configs.model_config import AttentionArch, is_deepseek_nsa
+ from sglang.srt.layers.dp_attention import get_attention_tp_size
+ from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
+-from sglang.srt.utils import is_npu
++from sglang.srt.utils import is_npu, get_bool_env_var
+ 
+ is_npu = is_npu()
+ 
+@@ -63,6 +63,7 @@ class NPUGraphRunner(CudaGraphRunner):
+             AttentionArch.MLA: [],
+             AttentionArch.MHA: torch.Tensor(),
+         }
++        self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
+ 
+     def _create_device_graph(self):
+         return torch.npu.NPUGraph()
+@@ -78,11 +79,15 @@ class NPUGraphRunner(CudaGraphRunner):
+         return out
+ 
+     def _get_update_attr_name(self, model_runner):
++        if self.use_fia:
++            return "actual_seq_lengths_kv"
+         if self.bs < get_attention_tp_size():
+             return self.attr_name[AttentionArch.MLA]
+         return self.attr_name[model_runner.model_config.attention_arch]
+ 
+     def _get_update_attr_type(self, model_runner):
++        if self.use_fia:
++            return []
+         if self.bs < get_attention_tp_size():
+             return self.attr_type[AttentionArch.MLA]
+         return self.attr_type[model_runner.model_config.attention_arch]
+diff --git a/python/sglang/srt/models/qwen3_next.py b/python/sglang/srt/models/qwen3_next.py
+index dbce64836..a4bd01a15 100644
+--- a/python/sglang/srt/models/qwen3_next.py
++++ b/python/sglang/srt/models/qwen3_next.py
+@@ -932,8 +932,8 @@ class Qwen3NextForCausalLM(nn.Module):
+         del self.lm_head.weight
+         self.model.embed_tokens.weight = embed
+         self.lm_head.weight = head
+-        torch.cuda.empty_cache()
+-        torch.cuda.synchronize()
++        torch.get_device_module().empty_cache()
++        torch.get_device_module().synchronize()
+ 
+     def load_weights(
+         self, weights: Iterable[Tuple[str, torch.Tensor]], is_mtp: bool = False
+diff --git a/python/sglang/srt/speculative/eagle_worker_v2.py b/python/sglang/srt/speculative/eagle_worker_v2.py
+index 663c4f341..34ce2b1e8 100644
+--- a/python/sglang/srt/speculative/eagle_worker_v2.py
++++ b/python/sglang/srt/speculative/eagle_worker_v2.py
+@@ -740,6 +740,39 @@ class EAGLEWorkerV2(BaseSpecWorker):
+             verify_done=verify_done,
+         )
+ 
++        # Copied from srt.speculative.eagle_worker.EAGLEWorker.verify
++        if self.target_worker.model_runner.hybrid_gdn_config is not None:
++            # If topk > 1, we need to use retrieve_next_token and retrieve_next_sibling to handle the eagle tree custom attention mask
++            # res.accepted_indices.shape[0] > 0 skips DP attn idle batch
++            if verify_input.topk > 1 and accept_index.shape[0] > 0:
++                # accepted_indices=[0,2,3,4,5,7,9,10,11], accepted_length=[4, 3, 2], cumulative_accepted_lengths=[4, 7, 9]
++                # first_token_indices_per_req=prepend(0, accepted_indices[cumulative_accepted_lengths[:-1]]) = [0, 5, 10]
++                # last_token_indices_per_req=accepted_indices[cumulative_accepted_lengths - 1] = [4, 9, 11] (last token ID of each req)
++                # max_relative_indices_per_req = [4,4,1]; those are the per-req spec-decoding step offsets that contain the correct mamba caches
++                cumulative_accepted_lengths = torch.cumsum(accept_length, dim=0)
++                req_start_positions = torch.cat(
++                    [
++                        torch.zeros(
++                            1,
++                            dtype=cumulative_accepted_lengths.dtype,
++                            device=cumulative_accepted_lengths.device,
++                        ),
++                        cumulative_accepted_lengths[:-1],
++                    ]
++                )
++                first_token_indices_per_req = accept_index[req_start_positions]
++                last_token_indices_per_req = accept_index[
++                    cumulative_accepted_lengths - 1
++                ]
++                max_relative_indices_per_req = (
++                    last_token_indices_per_req - first_token_indices_per_req
++                )
++            else:
++                max_relative_indices_per_req = accept_length - 1
++            self.target_worker.model_runner.attn_backend.update_mamba_state_after_mtp_verify(
++                max_relative_indices_per_req, self.target_worker.model_runner.model
++            )
++
+         return GenerationBatchResult(
+             logits_output=logits_output,
+             next_token_ids=predict,
+-- 
+2.50.1 (Apple Git-155)
+

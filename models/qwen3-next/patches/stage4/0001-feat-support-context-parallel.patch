@@ -1,0 +1,2200 @@
+From 582a350ae87b517a11917495997178ebbc08c584 Mon Sep 17 00:00:00 2001
+From: AndyKong <andy.kong@nuaa.edu.cn>
+Date: Thu, 22 Jan 2026 10:15:49 +0800
+Subject: [PATCH] [feat]support context parallel
+
+---
+ python/sglang/srt/configs/qwen3_next.py       |  11 +-
+ .../sglang/srt/disaggregation/common/conn.py  |  87 +++-
+ .../srt/disaggregation/mooncake/conn.py       |  20 +-
+ python/sglang/srt/disaggregation/prefill.py   |  20 +-
+ .../srt/distributed/communication_op.py       |  16 +-
+ .../sglang/srt/distributed/parallel_state.py  |  47 +-
+ python/sglang/srt/entrypoints/engine.py       |   5 +
+ .../srt/layers/attention/ascend_backend.py    | 160 ++++++-
+ python/sglang/srt/layers/communicator.py      |  87 +++-
+ python/sglang/srt/layers/dp_attention.py      |  18 +-
+ python/sglang/srt/layers/logits_processor.py  |   7 +-
+ python/sglang/srt/layers/rotary_embedding.py  |  23 +-
+ python/sglang/srt/layers/zigzag_cp_utils.py   | 452 ++++++++++++++++++
+ .../srt/managers/data_parallel_controller.py  |   1 +
+ python/sglang/srt/managers/scheduler.py       |  26 +-
+ .../srt/managers/scheduler_dp_attn_mixin.py   |   6 +-
+ python/sglang/srt/managers/tp_worker.py       |   5 +
+ python/sglang/srt/mem_cache/memory_pool.py    |   1 -
+ .../srt/model_executor/forward_batch_info.py  |  22 +-
+ .../sglang/srt/model_executor/model_runner.py |   5 +
+ .../sglang/srt/model_loader/weight_utils.py   |  13 +
+ python/sglang/srt/models/qwen3_next.py        |  57 ++-
+ python/sglang/srt/server_args.py              |  17 +
+ python/sglang/srt/speculative/eagle_worker.py |   2 +
+ .../sglang/srt/speculative/eagle_worker_v2.py |  12 +-
+ python/sglang/srt/utils/common.py             |   4 +-
+ 26 files changed, 1042 insertions(+), 82 deletions(-)
+ create mode 100644 python/sglang/srt/layers/zigzag_cp_utils.py
+
+diff --git a/python/sglang/srt/configs/qwen3_next.py b/python/sglang/srt/configs/qwen3_next.py
+index cd1b6f1ea..aec13c2c7 100644
+--- a/python/sglang/srt/configs/qwen3_next.py
++++ b/python/sglang/srt/configs/qwen3_next.py
+@@ -276,10 +276,17 @@ class Qwen3NextConfig(PretrainedConfig):
+ 
+     @property
+     def mamba2_cache_params(self) -> Mamba2CacheParams:
+-        from sglang.srt.layers.dp_attention import get_attention_tp_size
++        from sglang.srt.distributed import get_context_model_parallel_world_size
++        use_full_tp = get_context_model_parallel_world_size() > 1
++        if use_full_tp:
++            from sglang.srt.distributed import get_tensor_model_parallel_world_size
++            tp_world_size = get_tensor_model_parallel_world_size()
++        else:
++            from sglang.srt.layers.dp_attention import get_attention_tp_size
++            tp_world_size = get_attention_tp_size()
+ 
+         shape = Mamba2StateShape.create(
+-            tp_world_size=get_attention_tp_size(),
++            tp_world_size=tp_world_size,
+             intermediate_size=self.linear_value_head_dim * self.linear_num_value_heads,
+             n_groups=self.linear_num_key_heads,
+             num_heads=self.linear_num_value_heads,
+diff --git a/python/sglang/srt/disaggregation/common/conn.py b/python/sglang/srt/disaggregation/common/conn.py
+index 636ff72db..875b30e55 100644
+--- a/python/sglang/srt/disaggregation/common/conn.py
++++ b/python/sglang/srt/disaggregation/common/conn.py
+@@ -22,7 +22,11 @@ from sglang.srt.disaggregation.base.conn import (
+     KVPoll,
+ )
+ from sglang.srt.disaggregation.utils import DisaggregationMode
+-from sglang.srt.distributed import get_pp_group
++from sglang.srt.distributed import (
++    get_context_model_parallel_rank,
++    get_context_model_parallel_world_size,
++    get_pp_group,
++)
+ from sglang.srt.layers.dp_attention import (
+     get_attention_dp_rank,
+     get_attention_dp_size,
+@@ -60,6 +64,9 @@ class CommonKVManager(BaseKVManager):
+         self.attn_tp_rank = get_attention_tp_rank()
+         self.attn_dp_size = get_attention_dp_size()
+         self.attn_dp_rank = get_attention_dp_rank()
++        self.cp_size = get_context_model_parallel_world_size()
++        self.cp_rank = get_context_model_parallel_rank()
++
+         self.system_dp_size = (
+             1 if server_args.enable_dp_attention else server_args.dp_size
+         )
+@@ -92,6 +99,7 @@ class CommonKVManager(BaseKVManager):
+             self.prefill_attn_tp_size_table: Dict[str, int] = {}
+             self.prefill_dp_size_table: Dict[str, int] = {}
+             self.prefill_pp_size_table: Dict[str, int] = {}
++            self.prefill_cp_size_table: Dict[str, int] = {}
+         else:
+             raise ValueError(
+                 f"Unsupported DisaggregationMode: {self.disaggregation_mode}"
+@@ -121,6 +129,8 @@ class CommonKVManager(BaseKVManager):
+             "attn_tp_rank": self.attn_tp_rank,
+             "attn_dp_size": self.attn_dp_size,
+             "attn_dp_rank": self.attn_dp_rank,
++            "cp_size": self.cp_size,
++            "cp_rank": self.cp_rank,
+             "pp_size": self.pp_size,
+             "pp_rank": self.pp_rank,
+             "system_dp_size": self.system_dp_size,
+@@ -236,11 +246,13 @@ class CommonKVReceiver(BaseKVReceiver):
+                 self.prefill_attn_tp_size,
+                 self.prefill_dp_size,
+                 self.prefill_pp_size,
++                self.prefill_cp_size,
+             ) = self._get_prefill_parallel_info_from_server()
+             if (
+                 self.prefill_attn_tp_size is None
+                 or self.prefill_dp_size is None
+                 or self.prefill_pp_size is None
++                or self.prefill_cp_size is None
+             ):
+                 self.kv_mgr.record_failure(
+                     self.bootstrap_room,
+@@ -262,6 +274,9 @@ class CommonKVReceiver(BaseKVReceiver):
+                 self.kv_mgr.prefill_pp_size_table[self.bootstrap_addr] = (
+                     self.prefill_pp_size
+                 )
++                self.kv_mgr.prefill_cp_size_table[self.bootstrap_addr] = (
++                    self.prefill_cp_size
++                )
+         else:
+             self.prefill_attn_tp_size = self.kv_mgr.prefill_attn_tp_size_table[
+                 self.bootstrap_addr
+@@ -272,10 +287,17 @@ class CommonKVReceiver(BaseKVReceiver):
+             self.prefill_pp_size = self.kv_mgr.prefill_pp_size_table[
+                 self.bootstrap_addr
+             ]
++            self.prefill_cp_size = self.kv_mgr.prefill_cp_size_table[
++                self.bootstrap_addr
++            ]
+ 
+         # Currently, we don't allow prefill instance and decode instance to
+         # have different TP sizes per DP rank, except for models using MLA.
+-        if self.kv_mgr.attn_tp_size == self.prefill_attn_tp_size:
++        if self.prefill_cp_size > 1:
++            prefill_attn_tp_size = self.prefill_attn_tp_size * self.prefill_cp_size
++        else:
++            prefill_attn_tp_size = self.prefill_attn_tp_size
++        if self.kv_mgr.attn_tp_size == prefill_attn_tp_size:
+             self.target_tp_rank = (
+                 self.kv_mgr.kv_args.engine_rank % self.kv_mgr.attn_tp_size
+             )
+@@ -284,16 +306,16 @@ class CommonKVReceiver(BaseKVReceiver):
+                 self.prefill_pp_size // self.kv_mgr.pp_size
+             )
+             self.target_tp_ranks = [self.target_tp_rank]
+-        elif self.kv_mgr.attn_tp_size > self.prefill_attn_tp_size:
++        elif self.kv_mgr.attn_tp_size > prefill_attn_tp_size:
+             if not self.kv_mgr.is_mla_backend:
+                 logger.warning_once(
+                     "Performance is NOT guaranteed when using different TP sizes for non-MLA models. "
+                 )
+             self.target_tp_rank = (
+                 self.kv_mgr.kv_args.engine_rank % self.kv_mgr.attn_tp_size
+-            ) // (self.kv_mgr.attn_tp_size // self.prefill_attn_tp_size)
++            ) // (self.kv_mgr.attn_tp_size // prefill_attn_tp_size)
+             self.required_dst_info_num = (
+-                self.kv_mgr.attn_tp_size // self.prefill_attn_tp_size
++                self.kv_mgr.attn_tp_size // prefill_attn_tp_size
+             )
+             self.required_prefill_response_num = 1 * (
+                 self.prefill_pp_size // self.kv_mgr.pp_size
+@@ -309,9 +331,9 @@ class CommonKVReceiver(BaseKVReceiver):
+                 rank
+                 for rank in range(
+                     (self.kv_mgr.kv_args.engine_rank % self.kv_mgr.attn_tp_size)
+-                    * (self.prefill_attn_tp_size // self.kv_mgr.attn_tp_size),
++                    * (prefill_attn_tp_size // self.kv_mgr.attn_tp_size),
+                     (self.kv_mgr.kv_args.engine_rank % self.kv_mgr.attn_tp_size + 1)
+-                    * (self.prefill_attn_tp_size // self.kv_mgr.attn_tp_size),
++                    * (prefill_attn_tp_size // self.kv_mgr.attn_tp_size),
+                 )
+             ]
+ 
+@@ -326,7 +348,7 @@ class CommonKVReceiver(BaseKVReceiver):
+                 )
+             else:
+                 self.required_prefill_response_num = (
+-                    self.prefill_attn_tp_size // self.kv_mgr.attn_tp_size
++                    prefill_attn_tp_size // self.kv_mgr.attn_tp_size
+                 ) * (self.prefill_pp_size // self.kv_mgr.pp_size)
+ 
+         if prefill_dp_rank is not None:
+@@ -351,7 +373,10 @@ class CommonKVReceiver(BaseKVReceiver):
+             for target_tp_rank in self.target_tp_ranks:
+                 for target_pp_rank in range(self.prefill_pp_size):
+                     bootstrap_info = self._get_bootstrap_info_from_server(
+-                        target_tp_rank, self.target_dp_group, target_pp_rank
++                        target_tp_rank,
++                        self.target_dp_group,
++                        target_pp_rank,
++                        -1,
+                     )
+                     if bootstrap_info is not None:
+                         if self.kv_mgr.is_mla_backend:
+@@ -386,11 +411,11 @@ class CommonKVReceiver(BaseKVReceiver):
+         assert len(self.bootstrap_infos) > 0
+ 
+     def _get_bootstrap_info_from_server(
+-        self, engine_rank, target_dp_group, target_pp_rank
++        self, engine_rank, target_dp_group, target_pp_rank, target_cp_rank
+     ):
+         """Fetch the bootstrap info from the bootstrap server."""
+         try:
+-            url = f"http://{self.bootstrap_addr}/route?engine_rank={engine_rank}&target_dp_group={target_dp_group}&target_pp_rank={target_pp_rank}"
++            url = f"http://{self.bootstrap_addr}/route?engine_rank={engine_rank}&target_dp_group={target_dp_group}&target_pp_rank={target_pp_rank}&target_cp_rank={target_cp_rank}"
+             response = requests.get(url, timeout=5)
+             if response.status_code == 200:
+                 bootstrap_info = response.json()
+@@ -406,10 +431,10 @@ class CommonKVReceiver(BaseKVReceiver):
+ 
+     def _get_prefill_parallel_info_from_server(
+         self,
+-    ) -> Tuple[Optional[int], Optional[int], Optional[int]]:
++    ) -> Tuple[Optional[int], Optional[int], Optional[int], Optional[int]]:
+         """Fetch the prefill parallel info from the bootstrap server."""
+         try:
+-            url = f"http://{self.bootstrap_addr}/route?engine_rank={-1}&target_dp_group={-1}&target_pp_rank={-1}"
++            url = f"http://{self.bootstrap_addr}/route?engine_rank={-1}&target_dp_group={-1}&target_pp_rank={-1}&target_cp_rank={-1}"
+             response = requests.get(url)
+             if response.status_code == 200:
+                 prefill_parallel_info = response.json()
+@@ -417,15 +442,16 @@ class CommonKVReceiver(BaseKVReceiver):
+                     int(prefill_parallel_info["prefill_attn_tp_size"]),
+                     int(prefill_parallel_info["prefill_dp_size"]),
+                     int(prefill_parallel_info["prefill_pp_size"]),
++                    int(prefill_parallel_info["prefill_cp_size"]),
+                 )
+             else:
+                 logger.error(
+                     f"Failed to get prefill parallel info: {response.status_code}, {response.text}"
+                 )
+-                return None, None, None
++                return None, None, None, None
+         except Exception as e:
+             logger.error(f"Error fetching prefill parallel info from bootstrap: {e}")
+-            return None, None, None
++            return None, None, None, None
+ 
+     @classmethod
+     def _connect(cls, endpoint: str, is_ipv6: bool = False):
+@@ -467,6 +493,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
+         self.pp_size = None
+         self.attn_tp_size = None
+         self.dp_size = None
++        self.cp_size = None
+         self.prefill_port_table: Dict[
+             int, Dict[int, Dict[int, Dict[str, Union[str, int]]]]
+         ] = {}
+@@ -503,6 +530,8 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
+         attn_tp_rank = data["attn_tp_rank"]
+         attn_dp_size = data["attn_dp_size"]
+         attn_dp_rank = data["attn_dp_rank"]
++        cp_size = data["cp_size"]
++        cp_rank = data["cp_rank"]
+         pp_size = data["pp_size"]
+         pp_rank = data["pp_rank"]
+         system_dp_size = data["system_dp_size"]
+@@ -519,9 +548,12 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
+         if self.pp_size is None:
+             self.pp_size = pp_size
+ 
++        if self.cp_size is None:
++            self.cp_size = cp_size
++
+         if role == "Prefill":
+             if system_dp_size == 1:
+-                dp_group = attn_dp_rank
++                dp_group = cp_rank if cp_size > 1 else attn_dp_rank
+             else:
+                 dp_group = system_dp_rank
+ 
+@@ -546,7 +578,13 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
+         engine_rank = request.query.get("engine_rank")
+         target_dp_group = request.query.get("target_dp_group")
+         target_pp_rank = request.query.get("target_pp_rank")
+-        if not engine_rank or not target_dp_group or not target_pp_rank:
++        target_cp_rank = request.query.get("target_cp_rank")
++        if (
++            not engine_rank
++            or not target_dp_group
++            or not target_pp_rank
++            or not target_cp_rank
++        ):
+             return web.Response(text="Missing inputs for bootstrap server.", status=400)
+ 
+         # Currently we use engine_rank == -1 and target_dp_group == -1 to sync dp size
+@@ -554,19 +592,28 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
+             int(engine_rank) == -1
+             and int(target_dp_group) == -1
+             and int(target_pp_rank) == -1
++            and int(target_cp_rank) == -1
+         ):
+             prefill_parallel_info = {
+                 "prefill_attn_tp_size": self.attn_tp_size,
+                 "prefill_dp_size": self.dp_size,
+                 "prefill_pp_size": self.pp_size,
++                "prefill_cp_size": self.cp_size,
+             }
+             return web.json_response(prefill_parallel_info, status=200)
+ 
+         # Find corresponding prefill info
+         async with self.lock:
+-            bootstrap_info = self.prefill_port_table[int(target_dp_group)][
+-                int(engine_rank)
+-            ][int(target_pp_rank)]
++            if self.cp_size > 1:
++                target_cp_rank = (int(engine_rank) // self.attn_tp_size) % self.cp_size
++                target_tp_rank = int(engine_rank) % self.attn_tp_size
++                bootstrap_info = self.prefill_port_table[target_cp_rank][
++                    target_tp_rank
++                ][int(target_pp_rank)]
++            else:  # dp
++                bootstrap_info = self.prefill_port_table[int(target_dp_group)][
++                    int(engine_rank)
++                ][int(target_pp_rank)]
+ 
+         if bootstrap_info is not None:
+             return web.json_response(bootstrap_info, status=200)
+diff --git a/python/sglang/srt/disaggregation/mooncake/conn.py b/python/sglang/srt/disaggregation/mooncake/conn.py
+index 3fe895ed1..8111baa76 100644
+--- a/python/sglang/srt/disaggregation/mooncake/conn.py
++++ b/python/sglang/srt/disaggregation/mooncake/conn.py
+@@ -9,7 +9,7 @@ import struct
+ import threading
+ import time
+ from collections import defaultdict
+-from typing import Dict, List, Optional, Set, Tuple
++from typing import Dict, List, Optional, Tuple
+ 
+ import numpy as np
+ import numpy.typing as npt
+@@ -207,7 +207,7 @@ class MooncakeKVManager(CommonKVManager):
+             self.session_pool = defaultdict(requests.Session)
+             self.session_pool_lock = threading.Lock()
+             self.addr_to_rooms_tracker = defaultdict(set)
+-            self.prefill_response_tracker: Dict[int, Set[int]] = defaultdict(set)
++            self.prefill_response_tracker: Dict[int, List[int]] = defaultdict(list)
+             # Heartbeat interval should be at least 2 seconds
+             self.heartbeat_interval = max(
+                 float(os.getenv("SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL", 5.0)), 2.0
+@@ -746,7 +746,7 @@ class MooncakeKVManager(CommonKVManager):
+                             self.decode_kv_args_table[req.mooncake_session_id]
+                         )
+                         if self.is_mla_backend or (
+-                            self.attn_tp_size
++                            self.attn_tp_size * self.cp_size
+                             == target_rank_registration_info.dst_attn_tp_size
+                         ):
+                             ret = self.send_kvcache(
+@@ -793,7 +793,7 @@ class MooncakeKVManager(CommonKVManager):
+                         if kv_chunk.is_last:
+                             if kv_chunk.state_indices is not None:
+                                 if not self.is_mla_backend and (
+-                                    self.attn_tp_size
++                                    self.attn_tp_size * self.cp_size
+                                     != target_rank_registration_info.dst_attn_tp_size
+                                 ):
+                                     raise RuntimeError(
+@@ -897,7 +897,9 @@ class MooncakeKVManager(CommonKVManager):
+ 
+                 if status == KVPoll.Success:
+                     if bootstrap_room in self.request_status:
+-                        self.prefill_response_tracker[bootstrap_room].add(prefill_rank)
++                        self.prefill_response_tracker[bootstrap_room].append(
++                            prefill_rank
++                        )
+                         expected_response_num = (
+                             self.required_prefill_response_num_table[bootstrap_room]
+                         )
+@@ -917,7 +919,11 @@ class MooncakeKVManager(CommonKVManager):
+             while True:
+                 time.sleep(self.heartbeat_interval)
+                 with self.connection_lock:
+-                    addresses = list(self.prefill_dp_size_table.keys())
++                    addresses = (
++                        list(self.prefill_cp_size_table.keys())
++                        if self.cp_size > 1
++                        else list(self.prefill_dp_size_table.keys())
++                    )
+ 
+                 for bootstrap_addr in addresses:
+                     session = None
+@@ -1048,6 +1054,8 @@ class MooncakeKVManager(CommonKVManager):
+                 del self.prefill_attn_tp_size_table[failed_bootstrap_addr]
+             if failed_bootstrap_addr in self.prefill_dp_size_table:
+                 del self.prefill_dp_size_table[failed_bootstrap_addr]
++            if failed_bootstrap_addr in self.prefill_cp_size_table:
++                del self.prefill_cp_size_table[failed_bootstrap_addr]
+             if failed_bootstrap_addr in self.prefill_pp_size_table:
+                 del self.prefill_pp_size_table[failed_bootstrap_addr]
+ 
+diff --git a/python/sglang/srt/disaggregation/prefill.py b/python/sglang/srt/disaggregation/prefill.py
+index 952374ed5..ef846df0b 100644
+--- a/python/sglang/srt/disaggregation/prefill.py
++++ b/python/sglang/srt/disaggregation/prefill.py
+@@ -42,6 +42,10 @@ from sglang.srt.disaggregation.utils import (
+     poll_and_all_reduce,
+     prepare_abort,
+ )
++from sglang.srt.distributed import (
++    get_context_model_parallel_world_size,
++    get_world_group,
++)
+ from sglang.srt.managers.schedule_batch import (
+     FINISH_LENGTH,
+     Req,
+@@ -105,6 +109,7 @@ class PrefillBootstrapQueue:
+         self.bootstrap_port = bootstrap_port
+         self.queue: List[Req] = []
+         self.gloo_group = gloo_group
++        self.world_group = get_world_group()
+         self.max_total_num_tokens = max_total_num_tokens
+         self.scheduler = scheduler
+         self.transfer_backend = transfer_backend
+@@ -243,8 +248,15 @@ class PrefillBootstrapQueue:
+             else:
+                 return [], []
+ 
++        cp_size = get_context_model_parallel_world_size()
++        if cp_size > 1:
++            cpu_group = self.world_group.cpu_group  # world_group -> cp * attn_tp
++        else:
++            cpu_group = self.gloo_group
++
+         polls = poll_and_all_reduce(
+-            [req.disagg_kv_sender for req in self.queue], self.gloo_group
++            [req.disagg_kv_sender for req in self.queue],
++            cpu_group,
+         )
+ 
+         for i, (req, poll) in enumerate(zip(self.queue, polls)):
+@@ -517,7 +529,11 @@ class SchedulerDisaggregationPrefillMixin:
+ 
+         polls = poll_and_all_reduce(
+             [req.disagg_kv_sender for req in self.disagg_prefill_inflight_queue],
+-            self.attn_tp_cpu_group,
++            (
++                get_world_group().cpu_group
++                if self.server_args.cp_size > 1
++                else self.attn_tp_cpu_group
++            ),
+         )
+ 
+         undone_reqs: List[Req] = []
+diff --git a/python/sglang/srt/distributed/communication_op.py b/python/sglang/srt/distributed/communication_op.py
+index 95600edfb..949ce6fd8 100644
+--- a/python/sglang/srt/distributed/communication_op.py
++++ b/python/sglang/srt/distributed/communication_op.py
+@@ -5,7 +5,7 @@ from typing import Any, Dict, Optional, Union
+ import torch
+ import torch.distributed
+ 
+-from .parallel_state import get_tp_group
++from .parallel_state import get_cp_group, get_tp_group
+ 
+ 
+ def tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
+@@ -27,6 +27,20 @@ def tensor_model_parallel_gather(
+     return get_tp_group().gather(input_, dst, dim)
+ 
+ 
++def context_model_parallel_all_gather(
++    input_: torch.Tensor, dim: int = -1
++) -> torch.Tensor:
++    """All-gather the input tensor across context parallel group."""
++    return get_cp_group().all_gather(input_, dim)
++
++
++def context_model_parallel_broadcast(
++    input_: torch.Tensor, src: int = -1
++) -> torch.Tensor:
++    """Broadcast the input tensor across context parallel group"""
++    return get_cp_group().broadcast(input_, src)
++
++
+ def broadcast_tensor_dict(
+     tensor_dict: Optional[Dict[Any, Union[torch.Tensor, Any]]] = None, src: int = 0
+ ):
+diff --git a/python/sglang/srt/distributed/parallel_state.py b/python/sglang/srt/distributed/parallel_state.py
+index cf90f6fe0..68afbfd4a 100644
+--- a/python/sglang/srt/distributed/parallel_state.py
++++ b/python/sglang/srt/distributed/parallel_state.py
+@@ -1440,6 +1440,17 @@ def get_pp_group() -> GroupCoordinator:
+ # kept for backward compatibility
+ get_pipeline_model_parallel_group = get_pp_group
+ 
++_CP: Optional[GroupCoordinator] = None
++
++
++def get_cp_group() -> GroupCoordinator:
++    assert _CP is not None, "context parallel group is not initialized"
++    return _CP
++
++
++# kept for backward compatibility
++get_context_model_parallel_group = get_cp_group
++
+ 
+ @contextmanager
+ def graph_capture(stream: Optional[torch.cuda.Stream] = None):
+@@ -1554,6 +1565,7 @@ def initialize_model_parallel(
+     tensor_model_parallel_size: int = 1,
+     expert_model_parallel_size: int = 1,
+     pipeline_model_parallel_size: int = 1,
++    context_model_parallel_size: int = 1,
+     backend: Optional[str] = None,
+     duplicate_tp_group: bool = False,
+     torch_compile: Optional[bool] = None,
+@@ -1696,6 +1708,24 @@ def initialize_model_parallel(
+         group_name="pp",
+     )
+ 
++    num_context_model_parallel_groups: int = world_size // context_model_parallel_size
++    global _CP
++    assert _CP is None, "context model parallel group is already initialized"
++    group_ranks = []
++
++    for i in range(num_context_model_parallel_groups):
++        ranks = list(range(i, world_size, num_context_model_parallel_groups))
++        group_ranks.append(ranks)
++
++    logger.info(f"cp: {group_ranks}, {get_world_group().local_rank}")
++    _CP = init_model_parallel_group(
++        group_ranks,
++        get_world_group().local_rank,
++        backend,
++        use_custom_allreduce=False,
++        group_name="cp",
++    )
++
+ 
+ def ensure_model_parallel_initialized(
+     tensor_model_parallel_size: int,
+@@ -1732,7 +1762,7 @@ def ensure_model_parallel_initialized(
+ 
+ def model_parallel_is_initialized():
+     """Check if tensor and pipeline parallel groups are initialized."""
+-    return _TP is not None and _PP is not None
++    return _TP is not None and _PP is not None and _CP is not None
+ 
+ 
+ _TP_STATE_PATCHED = False
+@@ -1813,6 +1843,16 @@ def get_moe_tensor_parallel_rank():
+     return get_moe_tp_group().rank_in_group
+ 
+ 
++def get_context_model_parallel_world_size():
++    """Return world size for the context model parallel group."""
++    return get_cp_group().world_size
++
++
++def get_context_model_parallel_rank():
++    """Return my rank for the context model parallel group."""
++    return get_cp_group().rank_in_group
++
++
+ def destroy_model_parallel():
+     """Set the groups to none and destroy them."""
+     global _TP
+@@ -1830,6 +1870,11 @@ def destroy_model_parallel():
+         _PDMUX_PREFILL_TP_GROUP.destroy()
+     _PDMUX_PREFILL_TP_GROUP = None
+ 
++    global _CP
++    if _CP:
++        _CP.destroy()
++    _CP = None
++
+ 
+ def destroy_distributed_environment():
+     global _WORLD
+diff --git a/python/sglang/srt/entrypoints/engine.py b/python/sglang/srt/entrypoints/engine.py
+index b35fe5135..4232cfcee 100644
+--- a/python/sglang/srt/entrypoints/engine.py
++++ b/python/sglang/srt/entrypoints/engine.py
+@@ -834,6 +834,10 @@ def _launch_subprocesses(
+                 moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
+ 
+                 with maybe_reindex_device_id(gpu_id) as gpu_id:
++                    attn_tp_size = server_args.tp_size // server_args.cp_size
++                    attn_cp_rank = (
++                        tp_rank // attn_tp_size if server_args.cp_size > 1 else None
++                    )
+                     proc = mp.Process(
+                         target=run_scheduler_process,
+                         args=(
+@@ -844,6 +848,7 @@ def _launch_subprocesses(
+                             moe_ep_rank,
+                             pp_rank,
+                             None,
++                            attn_cp_rank,
+                             writer,
+                         ),
+                     )
+diff --git a/python/sglang/srt/layers/attention/ascend_backend.py b/python/sglang/srt/layers/attention/ascend_backend.py
+index a49de37a3..eb398cb66 100644
+--- a/python/sglang/srt/layers/attention/ascend_backend.py
++++ b/python/sglang/srt/layers/attention/ascend_backend.py
+@@ -8,8 +8,15 @@ import numpy as np
+ import torch
+ import torch.nn.functional as F
+ import torch_npu
++import torch.distributed as dist
+ 
+ from sglang.srt.configs.model_config import AttentionArch
++from sglang.srt.distributed import (
++    get_context_model_parallel_rank,
++    get_context_model_parallel_world_size,
++    context_model_parallel_all_gather,
++    get_tp_group,
++)
+ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+ from sglang.srt.layers.attention.fla.fused_gdn_gating import fused_gdn_gating_v3
+ from sglang.srt.layers.attention.fla.l2norm import l2norm_fwd
+@@ -18,6 +25,11 @@ from sglang.srt.layers.attention.npu_ops.mla_preprocess import is_mla_preprocess
+ from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
+ from sglang.srt.layers.dp_attention import get_attention_tp_size
+ from sglang.srt.layers.radix_attention import AttentionType
++from sglang.srt.layers.zigzag_cp_utils import (
++    cp_all_gather_rearrange_output,
++    get_prev_block_slices,
++    get_next_block_slices,
++)
+ from sglang.srt.mem_cache.memory_pool import MambaPool
+ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+ from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
+@@ -403,6 +415,74 @@ class AscendAttnBackend(AttentionBackend):
+     def get_cuda_graph_seq_len_fill_value(self):
+         return 0
+ 
++    @staticmethod
++    def swap_kv(tensor):
++        """
++        reorder kv between ranks when cp&pd_disaggregation
++        """
++        tp_group = get_tp_group()
++        rank = tp_group.rank_in_group
++        world_size = tp_group.world_size
++        cp_size = get_context_model_parallel_world_size()
++        block_size = world_size // (2 * cp_size)
++        blocks_per_half = cp_size
++        curr_block_idx = rank // block_size
++        is_first_half = curr_block_idx < blocks_per_half
++        peer_rank = None
++        if is_first_half:
++            if curr_block_idx % 2 == 1:
++                peer_block = curr_block_idx + blocks_per_half - 1
++                peer_rank = peer_block * block_size + (rank % block_size)
++        else:
++            if curr_block_idx % 2 == 0:
++                peer_block = curr_block_idx - blocks_per_half + 1
++                peer_rank = peer_block * block_size + (rank % block_size)
++        if peer_rank is None:
++            return tensor, []
++        is_active_sender = rank < peer_rank
++
++        recv_buffer = torch.empty_like(tensor)
++        backend_group = tp_group.device_group
++        works = []
++
++        if is_active_sender:
++            send_work = dist.isend(tensor, dst=peer_rank, group=backend_group)
++            works.append(send_work)
++
++            recv_work = dist.irecv(recv_buffer, src=peer_rank, group=backend_group)
++            works.append(recv_work)
++        else:
++            recv_work = dist.irecv(recv_buffer, src=peer_rank, group=backend_group)
++            works.append(recv_work)
++
++            send_work = dist.isend(tensor, dst=peer_rank, group=backend_group)
++            works.append(send_work)
++
++        return recv_buffer, works
++
++    @staticmethod
++    def get_cp_slices(seq_lens, rank_id, local_seq_len):
++        """
++        extract q and kv slices of each batch
++        """
++        rank_start = rank_id * local_seq_len
++        rank_end = rank_start + local_seq_len
++        slices = []
++        global_cursor = 0
++        for seq_len in seq_lens:
++            seq_global_start = global_cursor
++            seq_global_end = global_cursor + seq_len
++            inter_start = max(seq_global_start, rank_start)
++            inter_end = min(seq_global_end, rank_end)
++            if inter_start < inter_end:
++                q_slice = slice(inter_start - rank_start, inter_end - rank_start)
++                kv_slice = slice(seq_global_start, inter_end)
++                slices.append((q_slice, kv_slice))
++            global_cursor += seq_len
++            if global_cursor >= rank_end:
++                break
++        return slices
++
+     def forward_sparse(
+         self,
+         q: torch.Tensor,
+@@ -531,17 +611,27 @@ class AscendAttnBackend(AttentionBackend):
+                 k_rope=k_rope,
+             )
+ 
+-        if not self.use_mla:
+-            if save_kv_cache:
+-                k_scale = layer.k_scale if self.enable_c8 else None
+-                v_scale = layer.v_scale if self.enable_c8 else None
+-                forward_batch.token_to_kv_pool.set_kv_buffer(
+-                    layer, forward_batch.out_cache_loc, k, v, k_scale, v_scale
++        cp_size = get_context_model_parallel_world_size()
++        k_to_be_cached = k
++        v_to_be_cached = v
++        k_works = []
++        v_works = []
++        if cp_size > 1:
++            if forward_batch.use_zigzag:
++                k = cp_all_gather_rearrange_output(k, cp_size, forward_batch)
++                v = cp_all_gather_rearrange_output(v, cp_size, forward_batch)
++            else:
++                k = context_model_parallel_all_gather(
++                    k.contiguous(), dim=0
+                 )
++                v = context_model_parallel_all_gather(
++                    v.contiguous(), dim=0
++                )
++            # comm compute overlap start
++            k_to_be_cached, k_works = self.swap_kv(k)
++            v_to_be_cached, v_works = self.swap_kv(v)
+ 
+-            k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+-            v_cache = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
+-
++        if not self.use_mla:
+             if self.use_fia:
+                 """FIA will support multi-bs in the later version of CANN"""
+                 q = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
+@@ -550,28 +640,62 @@ class AscendAttnBackend(AttentionBackend):
+                     device=q.device,
+                     dtype=q.dtype,
+                 )
+-                q_len_offset = 0
+-                for q_len in forward_batch.extend_seq_lens_cpu:
+-                    attn_output[q_len_offset : q_len_offset + q_len] = (
++                if forward_batch.use_zigzag:
++                    local_slices = get_prev_block_slices(forward_batch) + get_next_block_slices(forward_batch)
++                else:
++                    local_slices = self.get_cp_slices(seq_lens=forward_batch.extend_seq_lens_cpu,
++                                                      rank_id=get_context_model_parallel_rank(),
++                                                      local_seq_len=q.size(0))
++                for i, (q_slice, kv_slice) in enumerate(local_slices):
++                    if q_slice.stop - q_slice.start == 1:  # fake decode
++                        atten_mask = None
++                    else:
++                        atten_mask = self.fia_mask.unsqueeze(0)
++                    attn_output[q_slice] = (
+                         torch.ops.npu.npu_fused_infer_attention_score(
+-                            q[None, q_len_offset : q_len_offset + q_len],
+-                            k[None, q_len_offset : q_len_offset + q_len],
+-                            v[None, q_len_offset : q_len_offset + q_len],
++                            q[None, q_slice],
++                            k[None, kv_slice],
++                            v[None, kv_slice],
+                             num_heads=layer.tp_q_head_num,
+                             num_key_value_heads=layer.tp_k_head_num,
+                             input_layout="BSND",  # todo, TND not supports q_heads!=k_heads
+-                            atten_mask=self.fia_mask.unsqueeze(0),
+-                            sparse_mode=3 if q_len != 1 else 0,
++                            atten_mask=atten_mask,
++                            sparse_mode=3,
+                             scale=layer.scaling,
+                             next_tokens=0,
+                         )[0]
+                     )
+-                    q_len_offset += q_len
+                 attn_output = attn_output.view(
+                     -1, layer.tp_q_head_num * layer.v_head_dim
+                 )
+ 
++                if cp_size > 1:
++                    if k_works:
++                        for w in k_works: w.wait()
++                    if v_works:
++                        for w in v_works: w.wait()
++                    k_to_be_cached = k_to_be_cached.contiguous()
++                    v_to_be_cached = v_to_be_cached.contiguous()
++                # comm compute overlap end
++
++                if save_kv_cache:
++                    k_scale = layer.k_scale if self.enable_c8 else None
++                    v_scale = layer.v_scale if self.enable_c8 else None
++                    forward_batch.token_to_kv_pool.set_kv_buffer(
++                        layer, forward_batch.out_cache_loc, k_to_be_cached, v_to_be_cached, k_scale, v_scale
++                    )
++
+             else:
++                if save_kv_cache:
++                    k_scale = layer.k_scale if self.enable_c8 else None
++                    v_scale = layer.v_scale if self.enable_c8 else None
++                    forward_batch.token_to_kv_pool.set_kv_buffer(
++                        layer, forward_batch.out_cache_loc, k_to_be_cached, v_to_be_cached, k_scale, v_scale
++                    )
++
++                k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
++                v_cache = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
++
+                 if layer.qk_head_dim <= 128:
+                     query = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
+                     attn_output = torch.empty(
+diff --git a/python/sglang/srt/layers/communicator.py b/python/sglang/srt/layers/communicator.py
+index 29d3ac8af..af3a9e57f 100644
+--- a/python/sglang/srt/layers/communicator.py
++++ b/python/sglang/srt/layers/communicator.py
+@@ -25,6 +25,9 @@ from sglang.srt.distributed import (
+     get_tensor_model_parallel_world_size,
+     get_tp_group,
+     tensor_model_parallel_all_reduce,
++    tensor_model_parallel_all_gather,
++    context_model_parallel_all_gather,
++    get_context_model_parallel_world_size,
+ )
+ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+     use_symmetric_memory,
+@@ -47,6 +50,10 @@ from sglang.srt.layers.moe import (
+     get_moe_a2a_backend,
+     should_use_flashinfer_cutlass_moe_fp4_allgather,
+ )
++from sglang.srt.layers.zigzag_cp_utils import (
++    linear_to_zigzag_all_to_all,
++    zigzag_to_linear_all_to_all,
++)
+ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+ from sglang.srt.server_args import get_global_server_args
+ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+@@ -207,6 +214,9 @@ ATTN_TP_CONTEXT = AttnTpContext()
+ def get_attn_tp_context():
+     return ATTN_TP_CONTEXT
+ 
++class AttnTPMode(Enum):
++    TP_ATTENTION = auto()
++    TP_FULL = auto()
+ 
+ @dataclass
+ class _LayerModeComputationContext:
+@@ -214,6 +224,7 @@ class _LayerModeComputationContext:
+     layer_id: int
+     is_layer_sparse: bool
+     is_previous_layer_sparse: Optional[bool]
++    attn_tp_mode: AttnTPMode = AttnTPMode.TP_ATTENTION
+ 
+     def previous_layer(self):
+         assert self.is_previous_layer_sparse is not None
+@@ -222,6 +233,7 @@ class _LayerModeComputationContext:
+             is_layer_sparse=self.is_previous_layer_sparse,
+             is_previous_layer_sparse=None,
+             num_layers=self.num_layers,
++            attn_tp_mode=self.attn_tp_mode,
+         )
+ 
+ 
+@@ -239,7 +251,7 @@ class LayerScatterModes:
+         context = _LayerModeComputationContext(**kwargs)
+         return cls(
+             layer_input_mode=cls._compute_layer_input_mode(context),
+-            attn_mode=ScatterMode.TP_ATTN_FULL,
++            attn_mode=cls._compute_attn_mode(context),
+             mlp_mode=cls._compute_mlp_mode(context),
+             middle_residual_mode=cls._compute_middle_residual_mode(context),
+             layer_output_mode=cls._compute_layer_output_mode(context),
+@@ -251,6 +263,14 @@ class LayerScatterModes:
+             return ScatterMode.model_input_output()
+         return cls._compute_layer_output_mode(context.previous_layer())
+ 
++    @classmethod
++    def _compute_attn_mode(cls, context: _LayerModeComputationContext):
++        if context.attn_tp_mode == AttnTPMode.TP_ATTENTION:
++            return ScatterMode.TP_ATTN_FULL
++        elif context.attn_tp_mode == AttnTPMode.TP_FULL:
++            return ScatterMode.FULL
++        return ScatterMode.TP_ATTN_FULL
++
+     @classmethod
+     def _compute_mlp_mode(cls, context: _LayerModeComputationContext):
+         if context.is_layer_sparse:
+@@ -619,6 +639,16 @@ class CommunicateSimpleFn:
+         ):
+             return CommunicateSimpleFn._scattered_to_tp_attn_full
+ 
++        if (input_mode == ScatterMode.TP_ATTN_FULL) and (
++            output_mode == ScatterMode.FULL
++        ):
++            return CommunicateSimpleFn._tp_attn_full_to_full
++
++        if (input_mode == ScatterMode.SCATTERED) and (
++            output_mode == ScatterMode.FULL
++        ):
++            return CommunicateSimpleFn._scattered_to_full
++
+         raise NotImplementedError(f"{input_mode=} {output_mode=}")
+ 
+     @staticmethod
+@@ -635,6 +665,8 @@ class CommunicateSimpleFn:
+         forward_batch: ForwardBatch,
+         context: CommunicateContext,
+     ) -> torch.Tensor:
++        if get_context_model_parallel_world_size() > 1 and forward_batch.use_zigzag:
++            hidden_states = linear_to_zigzag_all_to_all(hidden_states, forward_batch)
+         hidden_states, local_hidden_states = (
+             get_local_dp_buffer(),
+             hidden_states,
+@@ -645,6 +677,23 @@ class CommunicateSimpleFn:
+         )
+         return hidden_states
+ 
++    @staticmethod
++    def _tp_attn_full_to_full(
++        hidden_states: torch.Tensor,
++        forward_batch: ForwardBatch,
++        context: CommunicateContext,
++    ) -> torch.Tensor:
++        hidden_states = context_model_parallel_all_gather(hidden_states, dim=0)
++        return hidden_states
++
++    @staticmethod
++    def _scattered_to_full(
++        hidden_states: torch.Tensor,
++        forward_batch: ForwardBatch,
++        context: CommunicateContext,
++    ) -> torch.Tensor:
++        hidden_states = tensor_model_parallel_all_gather(hidden_states, dim=0)
++        return hidden_states
+ 
+ class CommunicateWithAllReduceAndLayerNormFn:
+     """Besides communication, needs to
+@@ -696,6 +745,19 @@ class CommunicateWithAllReduceAndLayerNormFn:
+                 residual_input_mode=residual_input_mode,
+             )
+ 
++        if (
++            (hidden_states_input_mode == ScatterMode.FULL)
++            and (
++                residual_input_mode in [ScatterMode.SCATTERED, ScatterMode.TP_ATTN_FULL]
++            )
++            and (hidden_states_output_mode == ScatterMode.SCATTERED)
++            and (residual_output_mode == ScatterMode.SCATTERED)
++        ):
++            return partial(
++                CommunicateWithAllReduceAndLayerNormFn._scatter_hidden_states_and_residual_from_full,
++                residual_input_mode=residual_input_mode,
++            )
++
+         raise NotImplementedError(
+             f"{hidden_states_input_mode=} {residual_input_mode=} {hidden_states_output_mode=} {residual_output_mode=}"
+         )
+@@ -796,6 +858,29 @@ class CommunicateWithAllReduceAndLayerNormFn:
+             context.attn_tp_rank
+         ]
+         attn_tp_reduce_scatter_tensor(hidden_states, input_hidden_states)
++        if get_context_model_parallel_world_size() > 1 and forward_batch.use_zigzag:
++            hidden_states = zigzag_to_linear_all_to_all(hidden_states, forward_batch)
++        if residual_input_mode == ScatterMode.TP_ATTN_FULL:
++            residual = residual.tensor_split(context.attn_tp_size)[context.attn_tp_rank]
++        if hidden_states.shape[0] != 0:
++            hidden_states, residual = layernorm(hidden_states, residual)
++        return hidden_states, residual
++
++    @staticmethod
++    def _scatter_hidden_states_and_residual_from_full(
++        hidden_states: torch.Tensor,
++        residual: torch.Tensor,
++        forward_batch: ForwardBatch,
++        layernorm: torch.nn.Module,
++        context: CommunicateContext,
++        *,
++        residual_input_mode,
++    ):
++        input_hidden_states = hidden_states
++        hidden_states = hidden_states.tensor_split(context.tp_size)[
++            context.tp_rank
++        ]
++        get_tp_group().reduce_scatter_tensor(hidden_states, input_hidden_states)
+         if residual_input_mode == ScatterMode.TP_ATTN_FULL:
+             residual = residual.tensor_split(context.attn_tp_size)[context.attn_tp_rank]
+         if hidden_states.shape[0] != 0:
+diff --git a/python/sglang/srt/layers/dp_attention.py b/python/sglang/srt/layers/dp_attention.py
+index 1d79819e5..b8eede0cb 100644
+--- a/python/sglang/srt/layers/dp_attention.py
++++ b/python/sglang/srt/layers/dp_attention.py
+@@ -12,6 +12,7 @@ import triton.language as tl
+ 
+ from sglang.srt.distributed import (
+     GroupCoordinator,
++    get_context_model_parallel_world_size,
+     get_tensor_model_parallel_rank,
+     get_tensor_model_parallel_world_size,
+     get_tp_group,
+@@ -20,7 +21,7 @@ from sglang.srt.distributed import (
+ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+     use_symmetric_memory,
+ )
+-from sglang.srt.utils import get_bool_env_var, is_hip
++from sglang.srt.utils import get_bool_env_var, is_hip, is_npu
+ 
+ if TYPE_CHECKING:
+     from sglang.srt.configs.model_config import ModelConfig
+@@ -41,6 +42,7 @@ _LOCAL_ATTN_DP_RANK: Optional[int] = None
+ _ENABLE_DP_ATTENTION_FLAG: bool = False
+ 
+ _is_hip = is_hip()
++_is_npu = is_npu()
+ _USE_ROCM700A_WA = _is_hip and get_bool_env_var("SGLANG_USE_ROCM700A")
+ 
+ 
+@@ -61,6 +63,9 @@ class DpPaddingMode(IntEnum):
+     def get_dp_padding_mode(
+         cls, is_extend_in_batch, global_num_tokens: List[int]
+     ) -> DpPaddingMode:
++        if _is_npu and get_context_model_parallel_world_size() > 1:
++            return DpPaddingMode.MAX_LEN
++
+         if is_extend_in_batch:
+             return DpPaddingMode.SUM_LEN
+ 
+@@ -263,7 +268,7 @@ def initialize_dp_attention(
+ 
+     enable_dp_attention = server_args.enable_dp_attention
+     tp_size = server_args.tp_size
+-    dp_size = server_args.dp_size
++    dp_size = max(server_args.dp_size, server_args.cp_size)
+     moe_dense_tp_size = server_args.moe_dense_tp_size
+     pp_size = server_args.pp_size
+ 
+@@ -300,13 +305,13 @@ def initialize_dp_attention(
+         ],
+         tp_group.local_rank,
+         torch.distributed.get_backend(tp_group.device_group),
+-        use_pynccl=use_pynccl,
++        use_pynccl=use_pynccl if not _is_npu else False,
+         use_pymscclpp=False,
+         use_custom_allreduce=False,
+         use_torch_symm_mem_all_reduce=False,
+         use_hpu_communicator=False,
+         use_xpu_communicator=False,
+-        use_npu_communicator=False,
++        use_npu_communicator=_is_npu,
+         group_name="attention_tp",
+     )
+ 
+@@ -534,6 +539,11 @@ def dp_scatter(
+ ):
+     # local_num_tokens is not necessarily the same as local_tokens.shape[0],
+     # since local_tokens may be padded for cuda graph
++    if get_context_model_parallel_world_size() > 1:
++        local_tokens[...] = global_tokens.tensor_split(get_attention_dp_size())[
++            get_attention_dp_rank()
++        ]
++        return
+     local_start_pos, local_num_tokens = get_dp_local_info(forward_batch)
+ 
+     local_tokens.fill_(0)
+diff --git a/python/sglang/srt/layers/logits_processor.py b/python/sglang/srt/layers/logits_processor.py
+index 522865765..53f2391fa 100644
+--- a/python/sglang/srt/layers/logits_processor.py
++++ b/python/sglang/srt/layers/logits_processor.py
+@@ -23,6 +23,8 @@ import triton.language as tl
+ from torch import nn
+ 
+ from sglang.srt.distributed import (
++    context_model_parallel_all_gather,
++    get_context_model_parallel_world_size,
+     get_tensor_model_parallel_world_size,
+     tensor_model_parallel_all_gather,
+ )
+@@ -408,7 +410,10 @@ class LogitsProcessor(nn.Module):
+             and not logits_metadata.extend_return_logprob
+         ):
+             # Prefill without input logprobs.
+-            if logits_metadata.padded_static_len < 0:
++            if get_context_model_parallel_world_size() > 1:
++                hidden_states = context_model_parallel_all_gather(hidden_states, 0)
++                last_index = torch.cumsum(logits_metadata.extend_seq_lens, dim=0) - 1
++            elif logits_metadata.padded_static_len < 0:
+                 last_index = torch.cumsum(logits_metadata.extend_seq_lens, dim=0) - 1
+             else:
+                 # If padding_static length is 5 and extended_seq_lens is [2, 3],
+diff --git a/python/sglang/srt/layers/rotary_embedding.py b/python/sglang/srt/layers/rotary_embedding.py
+index 0cdb7e1ae..8dba3d5a1 100644
+--- a/python/sglang/srt/layers/rotary_embedding.py
++++ b/python/sglang/srt/layers/rotary_embedding.py
+@@ -11,6 +11,10 @@ import triton
+ import triton.language as tl
+ 
+ from sglang.srt.custom_op import CustomOp
++from sglang.srt.distributed import (
++    get_context_model_parallel_rank,
++    get_context_model_parallel_world_size,
++)
+ from sglang.srt.server_args import get_global_server_args
+ from sglang.srt.utils import (
+     cpu_has_amx_support,
+@@ -917,19 +921,26 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
+         if self.rotary_dim < self.head_size:
+             query_pass = query[..., self.rotary_dim :]
+             key_pass = key[..., self.rotary_dim :]
+-
++        if positions.numel() != num_tokens:
++            cp_size = get_context_model_parallel_world_size()
++            cp_rank = get_context_model_parallel_rank()
++            cos_split = cos.tensor_split(cp_size)[cp_rank]
++            sin_split = sin.tensor_split(cp_size)[cp_rank]
++        else:
++            cos_split, sin_split = cos, sin
+         query_rot = torch_npu.npu_interleave_rope(
+             query_rot.reshape(num_tokens, num_q_heads, 1, self.rotary_dim),
+-            cos,
+-            sin,
++            cos_split,
++            sin_split,
+         )
+         key_rot = torch_npu.npu_interleave_rope(
+-            key_rot.reshape(num_tokens, num_k_heads, 1, self.rotary_dim),
++            key_rot.reshape(-1, num_k_heads, 1, self.rotary_dim),
+             cos,
+             sin,
+         )
+-        query_rot = query_rot.reshape(num_tokens, -1, self.rotary_dim)
+-        key_rot = key_rot.reshape(num_tokens, -1, self.rotary_dim)
++
++        query_rot = query_rot.reshape(num_tokens, num_q_heads, self.rotary_dim)
++        key_rot = key_rot.reshape(-1, num_k_heads, self.rotary_dim)
+ 
+         if self.rotary_dim < self.head_size:
+             query = torch.cat((query_rot, query_pass), dim=-1)
+diff --git a/python/sglang/srt/layers/zigzag_cp_utils.py b/python/sglang/srt/layers/zigzag_cp_utils.py
+new file mode 100644
+index 000000000..9f17db999
+--- /dev/null
++++ b/python/sglang/srt/layers/zigzag_cp_utils.py
+@@ -0,0 +1,452 @@
++from collections import deque
++from dataclasses import dataclass
++from itertools import accumulate
++from typing import List, Tuple, Union
++
++import torch
++import torch.nn.functional as F
++import torch.distributed as dist
++
++from sglang.srt.distributed import (
++    context_model_parallel_all_gather,
++    get_tensor_model_parallel_rank,
++    get_tensor_model_parallel_world_size,
++    get_tp_group,
++)
++
++
++@dataclass
++class ZigzagContextParallelMetadata:
++    split_list: List[int] = None
++    max_rank_len: List[int] = None
++    zigzag_index: List[int] = None
++    global_zigzag_block_order: List[int] = None
++    per_rank_actual_token: List[int] = None
++    reverse_split_len: List[int] = None
++    cp_reverse_index: List[int] = None
++    kv_len_prev: int = -1
++    kv_len_next: int = -1
++    actual_seq_q_prev: int = -1
++    actual_seq_q_next: int = -1
++    total_seq_lens: torch.Tensor = None
++
++def linear_to_zigzag_all_to_all(local_tokens, forward_batch) -> torch.Tensor:
++    rank = get_tensor_model_parallel_rank()
++    world_size = get_tensor_model_parallel_world_size()
++    chunk_size = local_tokens.size(0)
++    group = get_tp_group().device_group
++
++    zigzag_order = forward_batch.zigzag_cp_metadata.global_zigzag_block_order
++
++    target_rank = zigzag_order.index(rank)
++
++    source_rank = zigzag_order[rank]
++
++    input_split_sizes = [0] * world_size
++    input_split_sizes[target_rank] = chunk_size
++
++    output_split_sizes = [0] * world_size
++    output_split_sizes[source_rank] = chunk_size
++
++    output_tokens = torch.empty_like(local_tokens)
++    dist.all_to_all_single(
++        output_tokens,
++        local_tokens,
++        output_split_sizes=output_split_sizes,
++        input_split_sizes=input_split_sizes,
++        group=group
++    )
++    return output_tokens
++
++
++def zigzag_to_linear_all_to_all(local_tokens, forward_batch) -> torch.Tensor:
++    rank = get_tensor_model_parallel_rank()
++    world_size = get_tensor_model_parallel_world_size()
++    chunk_size = local_tokens.size(0)
++    group = get_tp_group().device_group
++
++    zigzag_order = forward_batch.zigzag_cp_metadata.global_zigzag_block_order
++
++    target_rank = zigzag_order[rank]
++
++    source_rank = zigzag_order.index(rank)
++
++    input_split_sizes = [0] * world_size
++    input_split_sizes[target_rank] = chunk_size
++
++    output_split_sizes = [0] * world_size
++    output_split_sizes[source_rank] = chunk_size
++
++    output_tokens = torch.empty_like(local_tokens)
++    dist.all_to_all_single(
++        output_tokens,
++        local_tokens,
++        output_split_sizes=output_split_sizes,
++        input_split_sizes=input_split_sizes,
++        group=group
++    )
++    return output_tokens
++
++def cp_all_gather_reorganized_into_tensor(
++    input_: torch.Tensor, total_len, cp_size, forward_batch
++):
++    """
++    Allgather communication for context_parallel(kv_cache, index_k, hidden_states).
++    This implementation mainly consists of three parts:
++    Step 1, padding the input shape to unify the shape for allgather communication (the shape must be the same).
++    Step 2, allgather communication(async).
++    Step 3, removing the padding and reassembling the data according to the actual tokens.
++    """
++    max_len = (total_len + cp_size - 1) // cp_size
++    pad_size = max_len - input_.shape[0]
++    if pad_size > 0:
++        pad_config = [0] * (2 * (input_.dim() - 1)) + [0, pad_size]
++        input_ = F.pad(input_, tuple(pad_config), mode="constant", value=0)
++
++    input_tensor_all = context_model_parallel_all_gather(
++        input_.contiguous(), dim=0
++    )
++
++    outputs_list_max = list(
++        torch.split(input_tensor_all, forward_batch.zigzag_cp_metadata.max_rank_len, dim=0)
++    )
++    outputs = torch.cat(
++        [
++            outputs_list_max[index][:per_rank_len]
++            for index, per_rank_len in enumerate(
++                forward_batch.zigzag_cp_metadata.per_rank_actual_token
++            )
++        ],
++        dim=0,
++    )
++    return outputs
++
++
++def cp_all_gather_rearrange_output(input_tensor, cp_size, forward_batch):
++    """
++    |   +-----------before allgather------------+|
++    |   | cp0: block0, block7 |
++    |   | cp1: block1, block6 |
++    |   | cp2: block2, block5 |
++    |   | cp3: block3, block4 |
++    |
++    |   +----------before rerange---------------+|
++    | block0 | block7 | block1 | block6 | block2 | block5 | block3 | block4 |
++    |
++    |   +--------------result-------------------+
++    | block0 | block1 | block2 | block3 | block4 | block5 | block6 | block7 |
++    |   +-------------------------+
++    """
++    output_tensor = cp_all_gather_reorganized_into_tensor(
++        input_tensor,
++        forward_batch.zigzag_cp_metadata.total_seq_lens,
++        cp_size,
++        forward_batch,
++    )
++    outputs_list = list(
++        torch.split(
++            output_tensor, forward_batch.zigzag_cp_metadata.reverse_split_len, dim=0
++        )
++    )
++    output_tensor = torch.cat(
++        [outputs_list[i] for i in forward_batch.zigzag_cp_metadata.cp_reverse_index], dim=0
++    )
++    return output_tensor
++
++
++def get_prev_block_slices(forward_batch) -> List[Tuple[slice, slice]]:
++    """
++        Computes Q and KV slices for the Previous block in Zigzag CP.
++
++        This function accesses the Zigzag metadata to determine the exact range
++        of the first block assigned to the current rank.
++
++        Args:
++            forward_batch: The forward batch object containing `zigzag_cp_metadata`.
++
++        Returns:
++            List[Tuple[slice, slice]]: Slicing indices for the head block.
++        """
++    metadata = forward_batch.zigzag_cp_metadata
++    if metadata is None:
++        return []
++    block_len = metadata.actual_seq_q_prev
++    block_end_idx = metadata.kv_len_prev
++    block_start_idx = block_end_idx - block_len
++    return get_block_qkv_slices(
++        seq_lens=forward_batch.extend_seq_lens_cpu,
++        block_start_idx=block_start_idx,
++        block_len=block_len
++    )
++
++
++def get_next_block_slices(forward_batch) -> List[Tuple[slice, slice]]:
++    """
++    Computes Q and KV slices for the Next block in Zigzag CP.
++
++    This function accesses the Zigzag metadata to determine the exact range
++    of the second block assigned to the current rank.
++
++    Args:
++        forward_batch: The forward batch object containing `zigzag_cp_metadata`.
++
++    Returns:
++        List[Tuple[slice, slice]]: Slicing indices for the tail block.
++    """
++    metadata = forward_batch.zigzag_cp_metadata
++    if metadata is None:
++        return []
++    block_len = metadata.actual_seq_q_next
++    block_end_idx = metadata.kv_len_next
++    block_start_idx = block_end_idx - block_len
++    return get_block_qkv_slices(
++        seq_lens=forward_batch.extend_seq_lens_cpu,
++        block_start_idx=block_start_idx,
++        block_len=block_len,
++        query_offset=metadata.actual_seq_q_prev
++    )
++
++
++def get_block_qkv_slices(
++    seq_lens: Union[List[int], torch.Tensor],
++    block_start_idx: int,
++    block_len: int,
++    query_offset: int = 0,
++) -> List[Tuple[slice, slice]]:
++    """
++    Computes slicing indices for a specific data block across a batch of sequences.
++
++    This utility maps a contiguous physical block of tokens (defined by a global
++    start offset and length) to the corresponding logical sequences within a batch.
++    It calculates the intersection between the target block's range and each
++    sequence's range in the global token stream.
++
++    Visual Explanation:
++    -------------------
++    Imagine a batch of 2 sequences: Seq A (len 4) and Seq B (len 4).
++    The global stream is: [A0, A1, A2, A3, B0, B1, B2, B3]
++
++    Suppose we are processing a Block defined as: start=2, len=4.
++    Target Block covers global indices [2, 6): [A2, A3, B0, B1]
++
++    Global View:
++    Indices:       0   1   2   3   4   5   6   7
++    Stream:      [ A0  A1  A2  A3  B0  B1  B2  B3 ]
++    Sequence A:  |=======|-------|                  (Range: 0-4)
++    Sequence B:                  |-------|=======|  (Range: 4-8)
++    Target Block:        |===================|      (Range: 2-6)
++                         ^                   ^
++                     block_start         block_end
++
++    Intersections:
++    1. Seq A Intersection: [2, 4) -> [A2, A3]
++       - q_slice (relative to block start 2):  slice(0, 2)  -> indices 0, 1 in Block
++       - kv_slice (relative to global stream): slice(0, 4)  *See Note below
++         (Usually kv_slice maps to the sequence's local context or global cache)
++
++    2. Seq B Intersection: [4, 6) -> [B0, B1]
++       - q_slice (relative to block start 2):  slice(2, 4)  -> indices 2, 3 in Block
++       - kv_slice (relative to global stream): slice(4, 6)
++
++    Args:
++        seq_lens: A list or tensor containing the lengths of each sequence in the batch.
++        block_start_idx: The global starting index of the block in the flattened
++            token stream.
++        block_len: The length of the block.
++        query_offset: The starting index of this block within the actual
++            concatenated Query tensor. Defaults to 0.
++
++    Returns:
++        A list of tuples, where each tuple contains:
++        - q_slice (slice): Indices relative to the *local block buffer* (0 to block_len).
++          Used to extract the relevant query tokens for this sequence from the block.
++        - kv_slice (slice): Indices relative to the *global context*.
++          Used to index into the global KV cache or attention mask for this sequence.
++    """
++    block_start = block_start_idx
++    block_end = block_start + block_len
++
++    slices = []
++    global_cursor = 0
++
++    for seq_len in seq_lens:
++        seq_global_start = global_cursor
++        seq_global_end = global_cursor + seq_len
++
++
++        inter_start = max(seq_global_start, block_start)
++        inter_end = min(seq_global_end, block_end)
++
++        if inter_start < inter_end:
++
++            local_start = inter_start - block_start + query_offset
++            local_end = inter_end - block_start + query_offset
++
++            q_slice = slice(local_start, local_end)
++
++            kv_slice = slice(seq_global_start, inter_end)
++
++            slices.append((q_slice, kv_slice))
++
++        global_cursor += seq_len
++
++        if global_cursor >= block_end:
++            break
++
++    return slices
++
++def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):
++    input_list = list(
++        torch.split(input_, forward_batch.zigzag_cp_metadata.split_list, dim=0)
++    )
++    result = torch.cat(
++        [input_list[i] for i in forward_batch.zigzag_cp_metadata.zigzag_index], dim=0
++    ).view(-1, input_.shape[-1])
++    return result
++
++
++def cp_split_and_rebuild_position(forward_batch, positions: torch.Tensor):
++    position_id_list = list(
++        torch.split(positions, forward_batch.zigzag_cp_metadata.split_list, dim=-1)
++    )
++    positions = torch.cat(
++        [position_id_list[i] for i in forward_batch.zigzag_cp_metadata.zigzag_index],
++        dim=-1,
++    )
++    return positions
++
++def get_block_zigzag_order(n, block_size):
++    """
++    Generate Block Zigzag Index
++    Args:
++        n: world_size (e.g., 8)
++        block_size: (e.g., 2)
++    Returns:
++        permuted_ranks: [0, 1, 6, 7, 2, 3, 4, 5]
++    """
++    if n % block_size != 0:
++        raise ValueError(f"World size {n} must be divisible by block_size {block_size}")
++
++    blocks = []
++    for i in range(0, n, block_size):
++        blocks.append(list(range(i, i + block_size)))
++
++    dq = deque(blocks)
++    ordered_blocks = []
++    while dq:
++        ordered_blocks.append(dq.popleft())
++        if dq:
++            ordered_blocks.append(dq.pop())
++
++    flat_order = []
++    for b in ordered_blocks:
++        flat_order.extend(b)
++
++    return flat_order
++
++def prepare_zigzag_context_parallel_metadata(
++    kv_len,
++    cp_rank,
++    cp_size,
++    seqs_len,
++) -> ZigzagContextParallelMetadata:
++    """prepare_zigzag_context_parallel_metadata - Zigzag Load Balancing
++
++    Example (CP_SIZE == 4):
++    Description:
++    1. Start with a full-length sequence (kv_len).
++    2. Split the sequence into 2 * CP_SIZE blocks (block0 to block7).
++    3. Assign blocks to different CP ranks using a zigzag strategy to
++       balance the causal attention computation load.
++
++    +---------------------------------+
++    |        cp_split_tokens          |
++    +---------------------------------+
++    |                                 |
++    |    sequence_with_full_length    |
++    |             | split (cp_size * 2) |
++    |   +-------------------------+   |
++    |   | block0 | block1 | block2 | block3 | block4 | block5 | block6 | block7 |
++    |   +-------------------------+   |
++    |             | zigzag assign     |
++    |   +---------------------------------------+
++    |   | cp_rank0 (rank_prev/next): block0, block7 | (Lightest + Heaviest)
++    |   | cp_rank1 (rank_prev/next): block1, block6 |
++    |   | cp_rank2 (rank_prev/next): block2, block5 |
++    |   | cp_rank3 (rank_prev/next): block3, block4 | (Medium + Medium)
++    |   +---------------------------------------+
++
++    Why zigzag assign?
++    - Causal Attention Load Imbalance:
++        In standard chunking, attention calculation load increases quadratically
++        or linearly with position index (depending on implementation):
++        * The first rank handles early tokens (short history -> low compute).
++        * The last rank handles late tokens (long history -> high compute).
++    - Zigzag Solution:
++        * By assigning one "head" block (early position, low load) and one
++          "tail" block (late position, high load) to each CP rank, the total
++          computational load is roughly balanced across all devices.
++
++    Args:
++        kv_len: Total sequence length.
++        cp_rank: Current rank ID in the Context Parallel group.
++        cp_size: Size of the Context Parallel group.
++        seqs_len: Reserved for batch processing (currently supports bs=1).
++    """
++    cp_segment_num = cp_size * 2
++    base_block_len = kv_len // cp_segment_num
++    remainder = kv_len % cp_segment_num
++    world_size = get_tensor_model_parallel_world_size()
++
++    split_list = [base_block_len] * cp_segment_num
++
++    for i in range(remainder):
++        split_list[i] += 1
++
++    idx_prev = cp_rank
++    idx_next = cp_segment_num - cp_rank - 1
++    zigzag_index = [idx_prev, idx_next]
++
++    global_zigzag_block_order = get_block_zigzag_order(world_size, world_size // cp_segment_num)
++
++    seq_max_rank_len = (kv_len + cp_size - 1) // cp_size
++    max_rank_len = [seq_max_rank_len] * cp_size
++
++    per_rank_actual_token = []
++    for r in range(cp_size):
++        r_prev = r
++        r_next = cp_segment_num - r - 1
++        per_rank_actual_token.append(split_list[r_prev] + split_list[r_next])
++
++    reverse_split_len = [
++        length
++        for i in range(cp_size)
++        for length in (split_list[i], split_list[cp_segment_num - i - 1])
++    ]
++
++    evens = list(range(0, cp_segment_num, 2))
++    odds_reversed = list(range(cp_segment_num - 1, 0, -2))
++    cp_reverse_index = evens + odds_reversed
++
++    prefix_sum_list = list(accumulate(split_list))
++
++    kv_len_prev = prefix_sum_list[idx_prev]
++    kv_len_next = prefix_sum_list[idx_next]
++
++    actual_seq_q_prev = split_list[idx_prev]
++    actual_seq_q_next = split_list[idx_next]
++
++    return ZigzagContextParallelMetadata(
++        split_list=split_list,
++        max_rank_len=max_rank_len,
++        zigzag_index=zigzag_index,
++        global_zigzag_block_order=global_zigzag_block_order,
++        per_rank_actual_token=per_rank_actual_token,
++        reverse_split_len=reverse_split_len,
++        cp_reverse_index=cp_reverse_index,
++        kv_len_prev=kv_len_prev,
++        kv_len_next=kv_len_next,
++        actual_seq_q_prev=actual_seq_q_prev,
++        actual_seq_q_next=actual_seq_q_next,
++        total_seq_lens=torch.tensor(kv_len, dtype=torch.int32),
++    )
+diff --git a/python/sglang/srt/managers/data_parallel_controller.py b/python/sglang/srt/managers/data_parallel_controller.py
+index 4ed72a8c0..a65cadffb 100644
+--- a/python/sglang/srt/managers/data_parallel_controller.py
++++ b/python/sglang/srt/managers/data_parallel_controller.py
+@@ -438,6 +438,7 @@ class DataParallelController:
+                             moe_ep_rank,
+                             pp_rank,
+                             dp_rank,
++                            None,
+                             writer,
+                         ),
+                     )
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index 59ac30e5b..4e2793855 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -168,6 +168,7 @@ from sglang.srt.tracing.trace import (
+     trace_slice_end,
+     trace_slice_start,
+ )
++from sglang.srt.batch_overlap.two_batch_overlap import TboDPAttentionPreparer
+ from sglang.srt.utils import (
+     DynamicGradMode,
+     broadcast_pyobj,
+@@ -182,6 +183,7 @@ from sglang.srt.utils import (
+     numa_bind_to_node,
+     point_to_point_pyobj,
+     require_mlp_sync,
++    require_mlp_tp_gather,
+     set_gpu_proc_affinity,
+     set_random_seed,
+     suppress_other_loggers,
+@@ -231,6 +233,7 @@ class Scheduler(
+         moe_ep_rank: int,
+         pp_rank: int,
+         dp_rank: Optional[int],
++        cp_rank: Optional[int],
+     ):
+         # Parse args
+         self.server_args = server_args
+@@ -238,10 +241,12 @@ class Scheduler(
+         self.moe_ep_rank = moe_ep_rank
+         self.pp_rank = pp_rank
+         self.dp_rank = dp_rank
++        self.cp_rank = cp_rank if cp_rank is not None else 0
+         self.tp_size = server_args.tp_size
+         self.moe_ep_size = server_args.ep_size
+         self.pp_size = server_args.pp_size
+         self.dp_size = server_args.dp_size
++        self.cp_size = server_args.cp_size
+         self.schedule_policy = server_args.schedule_policy
+         self.enable_priority_scheduling = server_args.enable_priority_scheduling
+         self.abort_on_priority_when_disabled = (
+@@ -282,7 +287,7 @@ class Scheduler(
+                 server_args.enable_dp_attention,
+                 self.tp_rank,
+                 self.tp_size,
+-                self.dp_size,
++                max(self.dp_size, self.cp_size),
+             )
+         )
+ 
+@@ -320,6 +325,7 @@ class Scheduler(
+             moe_ep_rank=moe_ep_rank,
+             pp_rank=pp_rank,
+             dp_rank=dp_rank,
++            cp_rank=cp_rank,
+             nccl_port=port_args.nccl_port,
+         )
+ 
+@@ -332,6 +338,7 @@ class Scheduler(
+             nccl_port=port_args.nccl_port,
+             target_worker=self.tp_worker,
+             dp_rank=dp_rank,
++            cp_rank=cp_rank,
+         )
+ 
+         if server_args.speculative_draft_load_format is not None:
+@@ -612,7 +619,7 @@ class Scheduler(
+ 
+                 self.socket.send_pyobj(output)
+ 
+-        if self.pp_rank == 0 and self.attn_tp_rank == 0:
++        if self.pp_rank == 0 and self.attn_tp_rank == 0 and self.cp_rank == 0:
+             self.recv_from_tokenizer = get_zmq_socket(
+                 context, zmq.PULL, port_args.scheduler_input_ipc_name, False
+             )
+@@ -1067,7 +1074,7 @@ class Scheduler(
+                 return []
+ 
+         if self.pp_rank == 0:
+-            if self.attn_tp_rank == 0:
++            if self.attn_tp_rank == 0 and self.cp_rank == 0:
+                 recv_reqs = []
+ 
+                 while True:
+@@ -1105,7 +1112,14 @@ class Scheduler(
+         if self.input_blocker is not None:
+             recv_reqs = self.input_blocker.handle(recv_reqs)
+ 
+-        if self.server_args.enable_dp_attention:
++        if self.cp_size != 1:
++            recv_reqs = broadcast_pyobj(
++                recv_reqs,
++                self.world_group.rank,
++                self.world_group.cpu_group,
++                src=self.world_group.ranks[0],
++            )
++        elif self.server_args.enable_dp_attention:
+             if self.attn_tp_rank == 0:
+                 work_reqs = [
+                     req
+@@ -2602,6 +2616,7 @@ def run_scheduler_process(
+     moe_ep_rank: int,
+     pp_rank: int,
+     dp_rank: Optional[int],
++    cp_rank: Optional[int],
+     pipe_writer,
+ ):
+     # Generate the logger prefix
+@@ -2611,6 +2626,8 @@ def run_scheduler_process(
+         dp_rank = int(os.environ["SGLANG_DP_RANK"])
+     if dp_rank is not None:
+         prefix += f" DP{dp_rank}"
++    if cp_rank is not None:
++        prefix += f" CP{cp_rank}"
+     if server_args.pp_size > 1:
+         prefix += f" PP{pp_rank}"
+     if server_args.tp_size > 1:
+@@ -2658,6 +2675,7 @@ def run_scheduler_process(
+             moe_ep_rank,
+             pp_rank,
+             dp_rank,
++            cp_rank,
+         )
+         pipe_writer.send(
+             {
+diff --git a/python/sglang/srt/managers/scheduler_dp_attn_mixin.py b/python/sglang/srt/managers/scheduler_dp_attn_mixin.py
+index 16be97703..875dfb5c1 100644
+--- a/python/sglang/srt/managers/scheduler_dp_attn_mixin.py
++++ b/python/sglang/srt/managers/scheduler_dp_attn_mixin.py
+@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Callable
+ 
+ import torch
+ 
++from sglang.srt.distributed import get_context_model_parallel_world_size
+ from sglang.srt.batch_overlap.two_batch_overlap import TboDPAttentionPreparer
+ from sglang.srt.managers.schedule_batch import ScheduleBatch
+ from sglang.srt.utils.common import require_mlp_tp_gather
+@@ -49,8 +50,9 @@ class MLPSyncBatchInfo:
+ 
+     def all_gather(self, device, group: torch.distributed.ProcessGroup):
+         local_info_tensor = self._get_local_tensor(device=device)
++        cp_size = get_context_model_parallel_world_size()
+         global_info_tensor = torch.empty(
+-            (self.dp_size, self.tp_size, 6),
++            (max(self.dp_size, cp_size), self.tp_size, 6),
+             dtype=torch.int64,
+             device=device,
+         )
+@@ -131,6 +133,8 @@ def prepare_mlp_sync_batch_raw(
+     ) and not disable_cuda_graph
+ 
+     is_extend_in_batch = local_batch.forward_mode.is_extend() if local_batch else False
++    if local_batch is not None:
++        local_batch.is_extend_in_batch = is_extend_in_batch
+ 
+     tbo_preparer = TboDPAttentionPreparer()
+     if len(offload_tags) == 0 and disable_overlap_schedule:
+diff --git a/python/sglang/srt/managers/tp_worker.py b/python/sglang/srt/managers/tp_worker.py
+index f37138a72..2b3b67e12 100644
+--- a/python/sglang/srt/managers/tp_worker.py
++++ b/python/sglang/srt/managers/tp_worker.py
+@@ -212,6 +212,7 @@ class TpModelWorker(BaseTpWorker):
+         moe_ep_rank: int,
+         pp_rank: int,
+         dp_rank: Optional[int],
++        cp_rank: Optional[int],
+         nccl_port: int,
+         is_draft_worker: bool = False,
+         req_to_token_pool: Optional[ReqToTokenPool] = None,
+@@ -219,9 +220,11 @@ class TpModelWorker(BaseTpWorker):
+     ):
+         # Parse args
+         self.tp_size = server_args.tp_size
++        self.pp_size = server_args.pp_size
+         self.tp_rank = tp_rank
+         self.moe_ep_rank = moe_ep_rank
+         self.pp_rank = pp_rank
++        self.cp_rank = cp_rank if cp_rank is not None else 0
+ 
+         # Init model and tokenizer
+         self.model_config = ModelConfig.from_server_args(
+@@ -252,6 +255,8 @@ class TpModelWorker(BaseTpWorker):
+             moe_ep_size=server_args.ep_size,
+             pp_rank=pp_rank,
+             pp_size=server_args.pp_size,
++            cp_rank=cp_rank if cp_rank is not None else 0,
++            cp_size=server_args.cp_size,
+             nccl_port=nccl_port,
+             dp_rank=dp_rank,
+             server_args=server_args,
+diff --git a/python/sglang/srt/mem_cache/memory_pool.py b/python/sglang/srt/mem_cache/memory_pool.py
+index 6c0953784..5349e0e13 100644
+--- a/python/sglang/srt/mem_cache/memory_pool.py
++++ b/python/sglang/srt/mem_cache/memory_pool.py
+@@ -1358,7 +1358,6 @@ class AscendTokenToKVPool(MHATokenToKVPool):
+             layer_id = layer_id_override
+         else:
+             layer_id = layer.layer_id
+-
+         if self.enable_c8:
+             cache_k = torch_npu.npu_quantize(cache_k, torch.reciprocal(k_scale), None, torch.qint8, -1, False)
+             cache_v = torch_npu.npu_quantize(cache_v, torch.reciprocal(v_scale), None, torch.qint8, -1, False)
+diff --git a/python/sglang/srt/model_executor/forward_batch_info.py b/python/sglang/srt/model_executor/forward_batch_info.py
+index 8baddc56f..5b8cbfad2 100644
+--- a/python/sglang/srt/model_executor/forward_batch_info.py
++++ b/python/sglang/srt/model_executor/forward_batch_info.py
+@@ -39,6 +39,7 @@ import triton
+ import triton.language as tl
+ 
+ from sglang.srt.distributed.parallel_state import (
++    get_context_model_parallel_world_size,
+     get_moe_expert_parallel_world_size,
+     get_tensor_model_parallel_world_size,
+ )
+@@ -51,6 +52,7 @@ from sglang.srt.layers.dp_attention import (
+     set_dp_buffer_len,
+     set_is_extend_in_batch,
+ )
++from sglang.srt.layers.zigzag_cp_utils import ZigzagContextParallelMetadata
+ from sglang.srt.utils import get_compiler_backend, is_npu, support_triton
+ 
+ if TYPE_CHECKING:
+@@ -354,6 +356,10 @@ class ForwardBatch:
+     # Record the split metadata of the sequence number of NSA context parallels.
+     nsa_cp_metadata: Optional[NSAContextParallelMetadata] = None
+ 
++    # Record the split metadata of the sequence number of zigzag context parallels strategy.
++    zigzag_cp_metadata: Optional[ZigzagContextParallelMetadata] = None
++    use_zigzag: Optional[bool] = False
++
+     @classmethod
+     def init_new(
+         cls,
+@@ -727,13 +733,19 @@ class ForwardBatch:
+         global_num_tokens = self.global_num_tokens_cpu
+         sync_group_size = len(global_num_tokens)
+         attn_tp_size = get_attention_tp_size()
+-
++        tp_size = get_tensor_model_parallel_world_size()
++        cp_size = get_context_model_parallel_world_size()
+         for i in range(sync_group_size):
+             # make sure that the padded length is divisible by attn_tp_size because we may need reduce-scatter across attn_tp dim.
+             # there is no reduce-scatter in LM logprob, so we do not need to adjust the padded length for logprob
+-            global_num_tokens[i] = (
+-                (global_num_tokens[i] - 1) // attn_tp_size + 1
+-            ) * attn_tp_size
++            if cp_size > 1:
++                global_num_tokens[i] = (
++                    (global_num_tokens[i] - 1) // tp_size + 1
++                ) * tp_size
++            else:
++                global_num_tokens[i] = (
++                    (global_num_tokens[i] - 1) // attn_tp_size + 1
++                ) * attn_tp_size
+ 
+         dp_padding_mode = DpPaddingMode.get_dp_padding_mode(
+             self.is_extend_in_batch, global_num_tokens
+@@ -758,7 +770,7 @@ class ForwardBatch:
+ 
+         self.global_dp_buffer_len = buffer_len
+         set_dp_buffer_len(
+-            buffer_len, num_tokens, dp_padding_mode.is_max_len(), global_num_tokens
++            buffer_len // cp_size, num_tokens // cp_size, dp_padding_mode.is_max_len(), global_num_tokens
+         )
+         set_is_extend_in_batch(self.is_extend_in_batch)
+ 
+diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
+index c6862f1e3..8e97d8acc 100644
+--- a/python/sglang/srt/model_executor/model_runner.py
++++ b/python/sglang/srt/model_executor/model_runner.py
+@@ -282,6 +282,8 @@ class ModelRunner:
+         moe_ep_size: int,
+         pp_rank: int,
+         pp_size: int,
++        cp_rank: int,
++        cp_size: int,
+         nccl_port: int,
+         server_args: ServerArgs,
+         dp_rank: Optional[int] = None,
+@@ -300,6 +302,8 @@ class ModelRunner:
+         self.dp_size = server_args.dp_size
+         self.pp_rank = pp_rank
+         self.pp_size = pp_size
++        self.cp_rank = cp_rank
++        self.cp_size = cp_size
+         self.model_config = model_config
+         self.dist_port = nccl_port
+         self.server_args = server_args
+@@ -690,6 +694,7 @@ class ModelRunner:
+             initialize_model_parallel(
+                 tensor_model_parallel_size=self.tp_size,
+                 pipeline_model_parallel_size=self.pp_size,
++                context_model_parallel_size=self.cp_size,
+                 expert_model_parallel_size=self.moe_ep_size,
+                 duplicate_tp_group=self.server_args.enable_pdmux,
+                 torch_compile=self.server_args.enable_piecewise_cuda_graph,
+diff --git a/python/sglang/srt/model_loader/weight_utils.py b/python/sglang/srt/model_loader/weight_utils.py
+index ab4d42fda..78668289e 100644
+--- a/python/sglang/srt/model_loader/weight_utils.py
++++ b/python/sglang/srt/model_loader/weight_utils.py
+@@ -886,6 +886,19 @@ def sharded_weight_loader(shard_axis: int) -> LoaderFunction:
+ 
+     return loader
+ 
++def sharded_weight_loader_with_full_tp_group(shard_axis: int) -> LoaderFunction:
++    """Create a weight loader that shards the weights along the given axis"""
++
++    def loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
++        tp_rank = get_tensor_model_parallel_rank()
++
++        shard_size = param.data.shape[shard_axis]
++        start_idx = tp_rank * shard_size
++        loaded_weight = loaded_weight.narrow(shard_axis, start_idx, shard_size)
++
++        return default_weight_loader(param, loaded_weight)
++
++    return loader
+ 
+ def composed_weight_loader(
+     loader: LoaderFunction, fn: Callable[[torch.Tensor], torch.Tensor]
+diff --git a/python/sglang/srt/models/qwen3_next.py b/python/sglang/srt/models/qwen3_next.py
+index a4bd01a15..aa2cb4598 100644
+--- a/python/sglang/srt/models/qwen3_next.py
++++ b/python/sglang/srt/models/qwen3_next.py
+@@ -12,7 +12,14 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
+ from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+ from sglang.srt.layers.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
+ from sglang.srt.layers.attention.mamba.mamba import mamba_v2_sharded_weight_loader
+-from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
++from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes, AttnTPMode
++from sglang.srt.distributed import (
++    get_context_model_parallel_rank,
++    get_context_model_parallel_world_size,
++    get_pp_group,
++    get_tensor_model_parallel_world_size,
++    get_tensor_model_parallel_rank,
++)
+ from sglang.srt.layers.dp_attention import (
+     get_attention_tp_rank,
+     get_attention_tp_size,
+@@ -33,11 +40,13 @@ from sglang.srt.layers.vocab_parallel_embedding import (
+     ParallelLMHead,
+     VocabParallelEmbedding,
+ )
++from sglang.srt.layers.zigzag_cp_utils import prepare_zigzag_context_parallel_metadata, cp_split_and_rebuild_position
+ from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+ from sglang.srt.model_loader.weight_utils import (
+     default_weight_loader,
+     sharded_weight_loader,
++    sharded_weight_loader_with_full_tp_group,
+ )
+ from sglang.srt.models.qwen2_moe import Qwen2MoeMLP, Qwen2MoeSparseMoeBlock
+ from sglang.srt.server_args import get_global_server_args
+@@ -48,6 +57,7 @@ from sglang.srt.utils import (
+     is_npu,
+     make_layers,
+     set_weight_attrs,
++    get_bool_env_var,
+ )
+ 
+ logger = logging.getLogger(__name__)
+@@ -202,11 +212,13 @@ class Qwen3GatedDeltaNet(nn.Module):
+         layer_id: int,
+         quant_config: Optional[QuantizationConfig] = None,
+         alt_stream: Optional[torch.cuda.Stream] = None,
++        use_full_tp: Optional[bool] = False,
+     ) -> None:
+         super().__init__()
+         self.config = config
+-        self.attn_tp_rank = get_attention_tp_rank()
+-        self.attn_tp_size = get_attention_tp_size()
++        self.use_full_tp = use_full_tp
++        self.attn_tp_rank = get_tensor_model_parallel_rank() if self.use_full_tp else get_attention_tp_rank()
++        self.attn_tp_size = get_tensor_model_parallel_world_size() if self.use_full_tp else get_attention_tp_size()
+         self.hidden_size = config.hidden_size
+         self.num_v_heads = config.linear_num_value_heads
+         self.num_k_heads = config.linear_num_key_heads
+@@ -284,8 +296,12 @@ class Qwen3GatedDeltaNet(nn.Module):
+         self.A_log = nn.Parameter(torch.log(A))
+         self.A_log._no_weight_decay = True
+ 
+-        set_weight_attrs(self.A_log, {"weight_loader": sharded_weight_loader(0)})
+-        set_weight_attrs(self.dt_bias, {"weight_loader": sharded_weight_loader(0)})
++        if self.use_full_tp:
++            set_weight_attrs(self.A_log, {"weight_loader": sharded_weight_loader_with_full_tp_group(0)})
++            set_weight_attrs(self.dt_bias, {"weight_loader": sharded_weight_loader_with_full_tp_group(0)})
++        else:
++            set_weight_attrs(self.A_log, {"weight_loader": sharded_weight_loader(0)})
++            set_weight_attrs(self.dt_bias, {"weight_loader": sharded_weight_loader(0)})
+ 
+         self.norm = RMSNormGated(
+             self.head_v_dim,
+@@ -460,7 +476,7 @@ class Qwen3GatedDeltaNet(nn.Module):
+         z = z.reshape(-1, z.shape[-1])
+ 
+         # Add padding for DP-Attn
+-        if is_dp_attention_enabled():
++        if _is_npu or is_dp_attention_enabled():
+             core_attn_out_pad = torch.zeros_like(z)
+             core_attn_out_pad[: core_attn_out.shape[0], :] = core_attn_out
+             core_attn_out = core_attn_out_pad
+@@ -485,8 +501,10 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
+     ) -> None:
+         super().__init__()
+         self.config = config
++        server_args_cp = get_context_model_parallel_world_size()
++        self.use_full_tp = server_args_cp > 1
+         self.linear_attn = Qwen3GatedDeltaNet(
+-            config, layer_id, quant_config, alt_stream
++            config, layer_id, quant_config, alt_stream, self.use_full_tp
+         )
+ 
+         # Qwen3Next all layers are sparse and have no nextn now
+@@ -498,6 +516,7 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
+             layer_id=layer_id,
+             num_layers=config.num_hidden_layers,
+             is_layer_sparse=self.is_layer_sparse,
++            attn_tp_mode=AttnTPMode.TP_FULL if self.use_full_tp else AttnTPMode.TP_ATTENTION,
+             is_previous_layer_sparse=is_previous_layer_sparse,
+         )
+ 
+@@ -574,6 +593,7 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
+         super().__init__()
+         self.config = config
+         self.hidden_size = config.hidden_size
++        self.cp_size = get_context_model_parallel_world_size()
+         self.attn_tp_rank = get_attention_tp_rank()
+         self.attn_tp_size = get_attention_tp_size()
+         self.total_num_heads = config.num_attention_heads
+@@ -842,6 +862,29 @@ class Qwen3NextModel(nn.Module):
+         else:
+             hidden_states = self.embed_tokens(input_ids)
+ 
++        cp_size = get_context_model_parallel_world_size()
++        cp_rank = get_context_model_parallel_rank()
++        if cp_size > 1:
++            forward_batch.use_zigzag = get_bool_env_var("CP_USE_ZIGZAG", "False")
++            if forward_batch.use_zigzag:
++                forward_batch.zigzag_cp_metadata = prepare_zigzag_context_parallel_metadata(
++                    torch.tensor(len(input_ids)),
++                    cp_rank,
++                    cp_size,
++                    forward_batch.seq_lens_cpu.tolist(),
++                )
++                hidden_states = (
++                    hidden_states.tensor_split(cp_size)[cp_rank]
++                )
++                positions = cp_split_and_rebuild_position(forward_batch, positions)
++            else:
++                hidden_states = (
++                    hidden_states.tensor_split(cp_size)[cp_rank]
++                )
++                positions = (
++                    positions.tensor_split(cp_size)[cp_rank]
++                )
++
+         residual = None
+         for i in range(len(self.layers)):
+             layer = self.layers[i]
+diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
+index 526465ee5..b96a894f9 100644
+--- a/python/sglang/srt/server_args.py
++++ b/python/sglang/srt/server_args.py
+@@ -347,6 +347,9 @@ class ServerArgs:
+     # FIXME: remove this after dp rank scheduling is fully supported with PD-Disaggregation
+     prefill_round_robin_balance: bool = False
+ 
++    # Context parallelism
++    cp_size: int = 1
++
+     # Multi-node distributed serving
+     dist_init_addr: Optional[str] = None
+     nnodes: int = 1
+@@ -1501,6 +1504,10 @@ class ServerArgs:
+                 f"DP attention is enabled. The chunked prefill size is adjusted to {self.chunked_prefill_size} to avoid MoE kernel issues. "
+             )
+ 
++        if self.cp_size > 1 and self.disaggregation_mode != "decode":
++            self.enable_dp_attention = True
++            assert self.tp_size % self.cp_size == 0
++
+         if self.enable_dp_lm_head:
+             assert (
+                 self.enable_dp_attention
+@@ -2760,6 +2767,15 @@ class ServerArgs:
+             help="Prefill is round robin balanced. This is used to promise decode server can get the correct dp rank.",
+         )
+ 
++        # Context parallelism
++        parser.add_argument(
++            "--context-parallel-size",
++            "--cp-size",
++            type=int,
++            default=ServerArgs.cp_size,
++            help="The context parallelism size.",
++        )
++
+         # Multi-node distributed serving
+         parser.add_argument(
+             "--dist-init-addr",
+@@ -3918,6 +3934,7 @@ class ServerArgs:
+         args.tp_size = args.tensor_parallel_size
+         args.pp_size = args.pipeline_parallel_size
+         args.dp_size = args.data_parallel_size
++        args.cp_size = args.context_parallel_size
+         args.ep_size = args.expert_parallel_size
+ 
+         attrs = [attr.name for attr in dataclasses.fields(cls)]
+diff --git a/python/sglang/srt/speculative/eagle_worker.py b/python/sglang/srt/speculative/eagle_worker.py
+index fd60d358a..e94737748 100644
+--- a/python/sglang/srt/speculative/eagle_worker.py
++++ b/python/sglang/srt/speculative/eagle_worker.py
+@@ -80,6 +80,7 @@ class EAGLEWorker(TpModelWorker):
+         tp_rank: int,
+         dp_rank: Optional[int],
+         moe_ep_rank: int,
++        cp_rank: int,
+         nccl_port: int,
+         target_worker: TpModelWorker,
+     ):
+@@ -138,6 +139,7 @@ class EAGLEWorker(TpModelWorker):
+                 pp_rank=0,  # FIXME
+                 dp_rank=dp_rank,
+                 moe_ep_rank=moe_ep_rank,
++                cp_rank=cp_rank,
+                 nccl_port=nccl_port,
+                 is_draft_worker=True,
+                 req_to_token_pool=self.req_to_token_pool,
+diff --git a/python/sglang/srt/speculative/eagle_worker_v2.py b/python/sglang/srt/speculative/eagle_worker_v2.py
+index 34ce2b1e8..92811357a 100644
+--- a/python/sglang/srt/speculative/eagle_worker_v2.py
++++ b/python/sglang/srt/speculative/eagle_worker_v2.py
+@@ -74,6 +74,7 @@ class EagleDraftWorker(BaseDraftWorker):
+         tp_rank: int,
+         dp_rank: int,
+         moe_ep_rank: int,
++        cp_rank: int,
+         nccl_port: int,
+         target_worker: TpModelWorker,
+     ):
+@@ -119,6 +120,7 @@ class EagleDraftWorker(BaseDraftWorker):
+                 pp_rank=0,  # FIXME
+                 dp_rank=dp_rank,
+                 moe_ep_rank=moe_ep_rank,
++                cp_rank=cp_rank,
+                 nccl_port=nccl_port,
+                 is_draft_worker=True,
+                 req_to_token_pool=self.req_to_token_pool,
+@@ -547,6 +549,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
+         tp_rank: int,
+         dp_rank: Optional[int],
+         moe_ep_rank: int,
++        cp_rank: Optional[int],
+         nccl_port: int,
+         target_worker: TpModelWorker,
+     ):
+@@ -573,7 +576,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
+         server_args.context_length = target_worker.model_runner.model_config.context_len
+ 
+         self._draft_worker = EagleDraftWorker(
+-            server_args, gpu_id, tp_rank, dp_rank, moe_ep_rank, nccl_port, target_worker
++            server_args,
++            gpu_id,
++            tp_rank,
++            dp_rank,
++            moe_ep_rank,
++            cp_rank,
++            nccl_port,
++            target_worker,
+         )
+ 
+         # Some dummy tensors
+diff --git a/python/sglang/srt/utils/common.py b/python/sglang/srt/utils/common.py
+index 55d11f1bf..6d1ef2b81 100644
+--- a/python/sglang/srt/utils/common.py
++++ b/python/sglang/srt/utils/common.py
+@@ -2851,7 +2851,9 @@ def require_mlp_tp_gather(server_args: ServerArgs):
+     Check if the input of MLP is obtained by all-gather rather than all-reduce. This only happens when each MLP TP group contains multiple attention DP groups.
+     """
+     if server_args.enable_dp_attention:
+-        assert server_args.dp_size > 1, "dp_size must be greater than 1"
++        assert (
++            server_args.dp_size > 1 or server_args.cp_size > 1
++        ), "dp_size or cp_size must be greater than 1"
+         if (
+             server_args.moe_dense_tp_size is None
+         ):  # TODO(ch-wan): some MoE models do not have dense layers
+-- 
+2.50.1 (Apple Git-155)
+

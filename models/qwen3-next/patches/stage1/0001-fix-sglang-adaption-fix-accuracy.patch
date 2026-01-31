@@ -1,0 +1,131 @@
+From 8a1f8a2c0202f0fc7927d6e8dc6ef90e88d3de09 Mon Sep 17 00:00:00 2001
+From: AndyKong <xxx@xxx>
+Date: Wed, 21 Jan 2026 17:25:10 +0800
+Subject: [PATCH 1/3] [fix]sglang adaption & fix accuracy
+
+---
+ .../sglang/srt/disaggregation/ascend/conn.py  |  7 --
+ .../layers/attention/fla/fused_gdn_gating.py  | 75 +++++++++++++++++++
+ .../sglang/srt/model_executor/model_runner.py |  5 +-
+ 3 files changed, 79 insertions(+), 8 deletions(-)
+
+diff --git a/python/sglang/srt/disaggregation/ascend/conn.py b/python/sglang/srt/disaggregation/ascend/conn.py
+index 661a0cc4e..885ce913f 100644
+--- a/python/sglang/srt/disaggregation/ascend/conn.py
++++ b/python/sglang/srt/disaggregation/ascend/conn.py
+@@ -28,13 +28,6 @@ class AscendKVManager(MooncakeKVManager):
+             disaggregation_mode=self.disaggregation_mode,
+         )
+ 
+-    def register_buffer_to_engine(self):
+-        self.engine.batch_register(self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens)
+-        # The Ascend backend optimize batch registration for small memory blocks.
+-        self.engine.batch_register(
+-            self.kv_args.aux_data_ptrs, self.kv_args.aux_data_lens
+-        )
+-
+     def send_kvcache(
+         self,
+         mooncake_session_id: str,
+diff --git a/python/sglang/srt/layers/attention/fla/fused_gdn_gating.py b/python/sglang/srt/layers/attention/fla/fused_gdn_gating.py
+index 6e92208ec..d37e5682e 100644
+--- a/python/sglang/srt/layers/attention/fla/fused_gdn_gating.py
++++ b/python/sglang/srt/layers/attention/fla/fused_gdn_gating.py
+@@ -67,3 +67,78 @@ def fused_gdn_gating(
+         num_warps=1,
+     )
+     return g, beta_output
++
++
++@triton.jit
++def fused_gdn_gating_kernel_v3(
++    g,
++    A_log,
++    a,
++    dt_bias,
++    batch,
++    seq_len,
++    NUM_HEADS: tl.constexpr,
++    beta: tl.constexpr,
++    threshold: tl.constexpr,
++    BLK_BATCHES: tl.constexpr,
++    BLK_HEADS: tl.constexpr,
++):
++    i_b, i_s, i_d = tl.program_id(0), tl.program_id(1), tl.program_id(2)
++
++    batch_off = i_b * BLK_BATCHES + tl.arange(0, BLK_BATCHES)
++    head_off = i_d * BLK_HEADS + tl.arange(0, BLK_HEADS)
++    head_mask = head_off < NUM_HEADS
++
++    a_off = (
++        batch_off[:, None] * seq_len * NUM_HEADS + i_s * NUM_HEADS + head_off[None, :]
++    )
++    a_mask = (batch_off[:, None] < batch) & head_mask[None, :]
++
++    blk_A_log = tl.load(A_log + head_off, mask=head_mask)
++    blk_bias = tl.load(dt_bias + head_off, mask=head_mask)
++
++    blk_a = tl.load(a + a_off, mask=a_mask)
++
++    x = blk_a.to(tl.float32) + blk_bias.to(tl.float32)
++    softplus_x = tl.where(
++        beta * x <= threshold, (1 / beta) * tl.log(1 + tl.exp(beta * x)), x
++    )
++    blk_g = -tl.exp(blk_A_log.to(tl.float32)) * softplus_x
++    tl.store(g + a_off, blk_g.to(g.dtype.element_ty), mask=a_mask)
++
++
++def fused_gdn_gating_v3(
++    A_log: torch.Tensor,
++    a: torch.Tensor,
++    b: torch.Tensor,
++    dt_bias: torch.Tensor,
++    beta: float = 1.0,
++    threshold: float = 20.0,
++) -> Tuple[torch.Tensor, torch.Tensor]:
++    batch, num_heads = a.shape
++    seq_len = 1
++    g = torch.empty_like(a, dtype=torch.float32)
++
++    # import triton.runtime.driver as driver
++    # device = torch.npu.current_device()
++    # num_cores = driver.active.utils.get_device_properties(device)["num_vectorcore"]
++    num_cores = 48
++    NUM_BLK_BATCHES = triton.cdiv(num_cores, triton.cdiv(num_heads, 8))
++    BLK_BATCHES = triton.cdiv(batch, NUM_BLK_BATCHES)
++    grid = (NUM_BLK_BATCHES, seq_len, triton.cdiv(num_heads, 8))
++    fused_gdn_gating_kernel_v3[grid](
++        g,
++        A_log,
++        a,
++        dt_bias,
++        batch,
++        seq_len,
++        num_heads,
++        beta,
++        threshold,
++        BLK_BATCHES=BLK_BATCHES,
++        BLK_HEADS=8,
++        num_warps=1,
++    )
++    g = g.unsqueeze(0)
++    return g, b.sigmoid().unsqueeze(0)
+diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
+index de74275d6..c6862f1e3 100644
+--- a/python/sglang/srt/model_executor/model_runner.py
++++ b/python/sglang/srt/model_executor/model_runner.py
+@@ -1812,7 +1812,10 @@ class ModelRunner:
+ 
+         # Initialize token_to_kv_pool
+         is_nsa_model = is_deepseek_nsa(self.model_config.hf_config)
+-        if self.server_args.attention_backend == "ascend":
++        if (
++            self.server_args.attention_backend == "ascend"
++            and self.mambaish_config is None
++        ):
+             if self.use_mla_backend:
+                 self.token_to_kv_pool = AscendMLAPagedTokenToKVPool(
+                     self.max_total_num_tokens,
+-- 
+2.50.1 (Apple Git-155)
+

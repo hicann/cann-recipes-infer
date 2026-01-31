@@ -1,0 +1,213 @@
+From 14c196d51cec62bedd9da7c0456be1ab9be61873 Mon Sep 17 00:00:00 2001
+From: AndyKong <xxx@xxx>
+Date: Wed, 21 Jan 2026 17:40:23 +0800
+Subject: [PATCH 3/3] [feat]moe multi-stream
+
+---
+ .../srt/layers/moe/token_dispatcher/deepep.py |  1 -
+ python/sglang/srt/layers/moe/utils.py         |  9 ++
+ .../srt/layers/quantization/w8a8_int8.py      |  4 +-
+ python/sglang/srt/models/qwen2_moe.py         | 88 +++++++++++++++----
+ 4 files changed, 83 insertions(+), 19 deletions(-)
+
+diff --git a/python/sglang/srt/layers/moe/token_dispatcher/deepep.py b/python/sglang/srt/layers/moe/token_dispatcher/deepep.py
+index c73f2ce8b..5e6db0fd6 100644
+--- a/python/sglang/srt/layers/moe/token_dispatcher/deepep.py
++++ b/python/sglang/srt/layers/moe/token_dispatcher/deepep.py
+@@ -541,7 +541,6 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
+     ):
+         buffer = self._get_buffer()
+         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
+-        topk_ids = topk_ids.to(torch.int64)
+         expected_m = (
+             hidden_states.shape[0] * buffer.group_size * topk_ids.shape[1]
+             + self.num_experts
+diff --git a/python/sglang/srt/layers/moe/utils.py b/python/sglang/srt/layers/moe/utils.py
+index 85d28b148..d37b2ce62 100644
+--- a/python/sglang/srt/layers/moe/utils.py
++++ b/python/sglang/srt/layers/moe/utils.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+ import logging
++import torch
+ from contextlib import contextmanager
+ from enum import Enum, IntEnum
+ from functools import lru_cache
+@@ -17,6 +18,7 @@ if TYPE_CHECKING:
+     from sglang.srt.server_args import ServerArgs
+ 
+ logger = logging.getLogger(__name__)
++shared_expert_stream = None
+ 
+ 
+ class MoeA2ABackend(Enum):
+@@ -275,3 +277,10 @@ class RoutingMethodType(IntEnum):
+     TopK = (5,)
+     # Unspecified
+     Unspecified = 6
++
++
++def get_npu_shared_expert_stream():
++    global shared_expert_stream
++    if shared_expert_stream is None:
++        shared_expert_stream = torch.npu.Stream()
++    return shared_expert_stream
+diff --git a/python/sglang/srt/layers/quantization/w8a8_int8.py b/python/sglang/srt/layers/quantization/w8a8_int8.py
+index afb7d4e6c..519dbc8a0 100644
+--- a/python/sglang/srt/layers/quantization/w8a8_int8.py
++++ b/python/sglang/srt/layers/quantization/w8a8_int8.py
+@@ -1099,6 +1099,8 @@ class NPU_W8A8MoEMethod(FusedMoEMethodBase):
+         layer.w2_weight_scale = Parameter(
+             layer.w2_weight_scale.data.squeeze(-1).contiguous(), requires_grad=False
+         )
++        if _is_npu:
++            layer.w2_weight_scale.data = layer.w2_weight_scale.data.to(torch.bfloat16)
+         layer.w13_weight_offset = Parameter(
+             layer.w13_weight_offset.data.squeeze(-1).contiguous(), requires_grad=False
+         )
+@@ -1177,7 +1179,7 @@ class NPU_W8A8MoEMethod(FusedMoEMethodBase):
+         hidden_states = torch_npu.npu_grouped_matmul(
+             x=[hidden_states],
+             weight=[layer.w2_weight],
+-            scale=[layer.w2_weight_scale.to(output_dtype)],
++            scale=[layer.w2_weight_scale],
+             per_token_scale=[swiglu_out_scale],
+             split_item=2,
+             group_list_type=group_list_type,
+diff --git a/python/sglang/srt/models/qwen2_moe.py b/python/sglang/srt/models/qwen2_moe.py
+index 656968192..23d50e4b8 100644
+--- a/python/sglang/srt/models/qwen2_moe.py
++++ b/python/sglang/srt/models/qwen2_moe.py
+@@ -58,7 +58,7 @@ from sglang.srt.layers.moe import get_moe_a2a_backend
+ from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
+ from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+ from sglang.srt.layers.moe.topk import TopK
+-from sglang.srt.layers.moe.utils import RoutingMethodType
++from sglang.srt.layers.moe.utils import RoutingMethodType, get_npu_shared_expert_stream
+ from sglang.srt.layers.quantization.base_config import QuantizationConfig
+ from sglang.srt.layers.radix_attention import RadixAttention
+ from sglang.srt.layers.rotary_embedding import get_rope
+@@ -71,11 +71,13 @@ from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+ from sglang.srt.model_loader.weight_utils import default_weight_loader
+ from sglang.srt.server_args import get_global_server_args
+-from sglang.srt.utils import add_prefix, is_cuda, make_layers
++from sglang.srt.utils import add_prefix, is_cuda, is_npu, make_layers, get_bool_env_var
++
+ 
+ logger = logging.getLogger(__name__)
+ 
+ _is_cuda = is_cuda()
++_is_npu = is_npu()
+ 
+ 
+ class Qwen2MoeMLP(nn.Module):
+@@ -198,6 +200,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
+                 config.num_experts + get_global_server_args().ep_num_redundant_experts
+             )
+             self.top_k = config.num_experts_per_tok
++        self.enable_npu_deepep_moe_multi_stream = get_bool_env_var("ENABLE_NPU_DEEPEP_MOE_MULTI_STREAM", "false")
+ 
+     def get_moe_weights(self):
+         return [
+@@ -219,23 +222,32 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
+     def _forward_deepep(self, hidden_states: torch.Tensor, forward_batch: ForwardBatch):
+         shared_output = None
+         if hidden_states.shape[0] > 0:
+-            # router_logits: (num_tokens, n_experts)
+-            router_logits, _ = self.gate(hidden_states)
+-            shared_output = self._forward_shared_experts(hidden_states)
+-            topk_output = self.topk(
+-                hidden_states,
+-                router_logits,
+-                num_token_non_padded=forward_batch.num_token_non_padded,
+-                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
+-                    layer_id=self.layer_id,
+-                ),
+-            )
++            if _is_npu and self.shared_expert is not None and self.enable_npu_deepep_moe_multi_stream:
++                shared_expert_stream = get_npu_shared_expert_stream()
++                final_hidden_states, shared_output = self.npu_forward_normal_dual_stream(
++                    hidden_states, forward_batch, shared_expert_stream)
++            else:
++                # router_logits: (num_tokens, n_experts)
++                router_logits, _ = self.gate(hidden_states)
++                shared_output = self._forward_shared_experts(hidden_states)
++                topk_output = self.topk(
++                    hidden_states,
++                    router_logits,
++                    num_token_non_padded=forward_batch.num_token_non_padded,
++                    expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
++                        layer_id=self.layer_id,
++                    ),
++                )
++                final_hidden_states = self.experts(
++                    hidden_states=hidden_states,
++                    topk_output=topk_output,
++                )
+         else:
+             topk_output = self.topk.empty_topk_output(hidden_states.device)
+-        final_hidden_states = self.experts(
+-            hidden_states=hidden_states,
+-            topk_output=topk_output,
+-        )
++            final_hidden_states = self.experts(
++                hidden_states=hidden_states,
++                topk_output=topk_output,
++            )
+ 
+         if shared_output is not None:
+             final_hidden_states.add_(shared_output)
+@@ -263,6 +275,48 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
+ 
+         return router_output, shared_output
+ 
++    def npu_forward_normal_dual_stream(
++        self,
++        hidden_states: torch.Tensor,
++        forward_batch: ForwardBatch,
++        shared_expert_stream: torch.npu.Stream,
++    ) -> torch.Tensor:
++        current_stream = torch.npu.current_stream()
++        router_logits, _ = self.gate(hidden_states)
++        shared_expert_stream.wait_stream(current_stream)
++        with torch.npu.stream(shared_expert_stream):
++            hidden_states_copy = hidden_states.clone()
++            shared_output = self.shared_expert_gate(hidden_states_copy)
++            gate_up, _ = self.shared_expert.gate_up_proj(hidden_states_copy)
++
++        topk_output = self.topk(
++                hidden_states,
++                router_logits,
++                num_token_non_padded=forward_batch.num_token_non_padded,
++                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
++                    layer_id=self.layer_id,
++                ),
++            )
++        dispatch_output = self.experts.dispatcher.dispatch(hidden_states=hidden_states, topk_output=topk_output)
++
++        shared_expert_stream.wait_stream(current_stream)
++        with torch.npu.stream(shared_expert_stream):
++            shared_output = F.sigmoid(shared_output)
++            gate_up = self.shared_expert.act_fn(gate_up)
++
++        combine_input = self.experts.run_moe_core(dispatch_output)
++
++        shared_expert_stream.wait_stream(current_stream)
++        with torch.npu.stream(shared_expert_stream):
++            shared_expert_output, _ = self.shared_expert.down_proj(gate_up)
++            shared_output = (
++                shared_output * shared_expert_output
++            )
++
++        router_output = self.experts.dispatcher.combine(combine_input=combine_input)
++        current_stream.wait_stream(shared_expert_stream)
++        return router_output, shared_output
++
+     def forward(
+         self,
+         hidden_states: torch.Tensor,
+-- 
+2.50.1 (Apple Git-155)
+

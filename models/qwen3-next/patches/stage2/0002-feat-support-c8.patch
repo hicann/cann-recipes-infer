@@ -1,0 +1,167 @@
+From 49a1a5e2cd6e62b3341552638c1b000a49ad2a5d Mon Sep 17 00:00:00 2001
+From: AndyKong <xxx@xxx>
+Date: Wed, 21 Jan 2026 17:54:28 +0800
+Subject: [PATCH 2/2] [feat]support c8
+
+---
+ .../srt/layers/attention/ascend_backend.py    | 19 ++++++++++--
+ python/sglang/srt/mem_cache/memory_pool.py    | 31 ++++++++++++-------
+ python/sglang/srt/models/qwen3_next.py        |  6 ++++
+ 3 files changed, 42 insertions(+), 14 deletions(-)
+
+diff --git a/python/sglang/srt/layers/attention/ascend_backend.py b/python/sglang/srt/layers/attention/ascend_backend.py
+index 458e98016..5b6a09b5d 100644
+--- a/python/sglang/srt/layers/attention/ascend_backend.py
++++ b/python/sglang/srt/layers/attention/ascend_backend.py
+@@ -221,6 +221,7 @@ class AscendAttnBackend(AttentionBackend):
+         self.req_to_token = model_runner.req_to_token_pool.req_to_token
+         self.graph_mode = False
+         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
++        self.enable_c8 = get_bool_env_var("ASCEND_USE_C8", "False")
+         self.speculative_num_draft_tokens = (
+             model_runner.server_args.speculative_num_draft_tokens
+         )
+@@ -494,8 +495,10 @@ class AscendAttnBackend(AttentionBackend):
+ 
+         if not self.use_mla:
+             if save_kv_cache:
++                k_scale = layer.k_scale if self.enable_c8 else None
++                v_scale = layer.v_scale if self.enable_c8 else None
+                 forward_batch.token_to_kv_pool.set_kv_buffer(
+-                    layer, forward_batch.out_cache_loc, k, v
++                    layer, forward_batch.out_cache_loc, k, v, k_scale, v_scale
+                 )
+ 
+             k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+@@ -764,8 +767,10 @@ class AscendAttnBackend(AttentionBackend):
+                     layer, forward_batch.out_cache_loc, k, k_rope
+                 )
+             else:
++                k_scale = layer.k_scale if self.enable_c8 else None
++                v_scale = layer.v_scale if self.enable_c8 else None
+                 forward_batch.token_to_kv_pool.set_kv_buffer(
+-                    layer, forward_batch.out_cache_loc, k, v
++                    layer, forward_batch.out_cache_loc, k, v, k_scale, v_scale
+                 )
+ 
+         if not self.use_mla:
+@@ -798,6 +803,8 @@ class AscendAttnBackend(AttentionBackend):
+                         input_layout="BSH",
+                         scale=layer.scaling,
+                         actual_seq_lengths_kv=actual_seq_len_kv,
++                        key_antiquant_scale=k_scale,
++                        value_antiquant_scale=v_scale,
+                     )
+                 )
+                 output = torch.empty(
+@@ -819,6 +826,8 @@ class AscendAttnBackend(AttentionBackend):
+                     actual_seq_lengths_kv=actual_seq_len_kv,
+                     workspace=workspace,
+                     out=[output, softmax_lse],
++                    key_antiquant_scale=k_scale,
++                    value_antiquant_scale=v_scale,
+                 )
+                 return output.view(num_tokens, layer.tp_q_head_num * layer.v_head_dim)
+             else:
+@@ -957,9 +966,11 @@ class AscendAttnBackend(AttentionBackend):
+             )
+ 
+         if not self.use_mla:
++            k_scale = layer.k_scale if self.enable_c8 else None
++            v_scale = layer.v_scale if self.enable_c8 else None
+             if save_kv_cache:
+                 forward_batch.token_to_kv_pool.set_kv_buffer(
+-                    layer, forward_batch.out_cache_loc, k, v
++                    layer, forward_batch.out_cache_loc, k, v, k_scale, v_scale
+                 )
+             num_tokens = q.shape[0]
+             k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+@@ -986,6 +997,8 @@ class AscendAttnBackend(AttentionBackend):
+                     block_table=self.forward_metadata.block_tables,
+                     actual_seq_lengths_kv=self.forward_metadata.seq_lens_cpu_int,
+                     scale=layer.scaling,
++                    key_antiquant_scale=k_scale,
++                    value_antiquant_scale=v_scale,
+                 )
+             else:
+                 query = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
+diff --git a/python/sglang/srt/mem_cache/memory_pool.py b/python/sglang/srt/mem_cache/memory_pool.py
+index e61a5540e..a7abab61f 100644
+--- a/python/sglang/srt/mem_cache/memory_pool.py
++++ b/python/sglang/srt/mem_cache/memory_pool.py
+@@ -50,7 +50,7 @@ from sglang.srt.mem_cache.utils import (
+     set_mla_kv_buffer_triton,
+     set_mla_kv_scale_buffer_triton,
+ )
+-from sglang.srt.utils import is_cuda, is_npu, next_power_of_2
++from sglang.srt.utils import is_cuda, is_npu, next_power_of_2, get_bool_env_var
+ 
+ if TYPE_CHECKING:
+     from sglang.srt.managers.cache_controller import LayerDoneCounter
+@@ -442,9 +442,13 @@ class KVCache(abc.ABC):
+         self.page_size = page_size
+         self.dtype = dtype
+         self.device = device
++        self.enable_c8 = get_bool_env_var("ASCEND_USE_C8", "False")
+         if dtype in (torch.float8_e5m2, torch.float8_e4m3fn):
+             # NOTE: Store as torch.uint8 because Tensor.index_put is not implemented for torch.float8_e5m2
+             self.store_dtype = torch.uint8
++        elif self.enable_c8:
++            self.store_dtype = torch.int8
++            self.dtype = torch.int8
+         else:
+             self.store_dtype = dtype
+         self.layer_num = layer_num
+@@ -1354,17 +1358,22 @@ class AscendTokenToKVPool(MHATokenToKVPool):
+             layer_id = layer_id_override
+         else:
+             layer_id = layer.layer_id
+-        if cache_k.dtype != self.dtype:
+-            if k_scale is not None:
+-                cache_k.div_(k_scale)
+-            if v_scale is not None:
+-                cache_v.div_(v_scale)
+-            cache_k = cache_k.to(self.dtype)
+-            cache_v = cache_v.to(self.dtype)
+ 
+-        if self.store_dtype != self.dtype:
+-            cache_k = cache_k.view(self.store_dtype)
+-            cache_v = cache_v.view(self.store_dtype)
++        if self.enable_c8:
++            cache_k = torch_npu.npu_quantize(cache_k, torch.reciprocal(k_scale), None, torch.qint8, -1, False)
++            cache_v = torch_npu.npu_quantize(cache_v, torch.reciprocal(v_scale), None, torch.qint8, -1, False)
++        else:
++            if cache_k.dtype != self.dtype:
++                if k_scale is not None:
++                    cache_k.div_(k_scale)
++                if v_scale is not None:
++                    cache_v.div_(v_scale)
++                cache_k = cache_k.to(self.dtype)
++                cache_v = cache_v.to(self.dtype)
++
++            if self.store_dtype != self.dtype:
++                cache_k = cache_k.view(self.store_dtype)
++                cache_v = cache_v.view(self.store_dtype)
+ 
+         torch_npu._npu_reshape_and_cache(
+             key=cache_k,
+diff --git a/python/sglang/srt/models/qwen3_next.py b/python/sglang/srt/models/qwen3_next.py
+index 9db1daea9..dbce64836 100644
+--- a/python/sglang/srt/models/qwen3_next.py
++++ b/python/sglang/srt/models/qwen3_next.py
+@@ -644,6 +644,12 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
+             prefix=f"{prefix}.attn",
+         )
+ 
++        if _is_npu:
++            self.k_scale = torch.nn.Parameter(torch.ones(1, dtype=torch.bfloat16), requires_grad=False)
++            self.v_scale = torch.nn.Parameter(torch.ones(1, dtype=torch.bfloat16), requires_grad=False)
++            self.attn.k_scale = self.k_scale
++            self.attn.v_scale = self.v_scale
++
+         # Qwen3Next all layers are sparse and have no nextn now
+         self.is_layer_sparse = True
+         is_previous_layer_sparse = True
+-- 
+2.50.1 (Apple Git-155)
+
