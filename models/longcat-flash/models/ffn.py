@@ -106,7 +106,7 @@ class FFNModel(PreTrainedModel):
         self.config = config
         self.global_rank = dist.get_rank()
         self.runner_settings = runner_settings
-        self.enable_super_kernel = runner_settings.get("model_config").get("enable_super_kernel", False)
+        self.enable_superkernel = runner_settings.get("model_config").get("enable_superkernel", False)
         self.enable_prefetch = runner_settings.get("model_config").get("enable_prefetch", False)
         self.moe_layer_num = config.num_hidden_layers
 
@@ -131,7 +131,7 @@ class FFNModel(PreTrainedModel):
             if is_prefill:
                 hidden_states = self.layers[i](hidden_states, is_prefill, cur_topk_list=cur_topk_list)
             else:
-                with superkernel_scope(self.enable_super_kernel, f"scope_{i}_moe", ""):
+                with superkernel_scope(self.enable_superkernel, f"scope_{i}_moe", ""):
                     hidden_states, gmm2_out = self.layers[i](hidden_states, is_prefill, cur_topk_list=cur_topk_list)
                 if i < self.moe_layer_num - 1:
                     npu_prefetch(self.enable_prefetch, self.layers[i + 1].mlp.router.classifier.weight.data, \

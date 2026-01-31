@@ -14,7 +14,7 @@ model_config:
   enable_multi_stream: 1 # AFD scenario will not take effect.
   enable_mla_prolog: True
   enable_cache_compile: True
-  enable_super_kernel: True
+  enable_superkernel: True
   enable_prefetch: True
   enable_afd: True # [False, True]. AFD: ATTN-FFN Disaggragation
 
