@@ -1,6 +1,7 @@
 # cann-recipes-infer
 
 ## 🚀Latest News
+- [2026/01] Qwen3-next模型支持SGLang框架下序列并行、MTP、GDN融合算子、W8A8C8量化。
 - [2026/01] HSTU模型在昇腾Atlas A2系列上已支持推理部署。
 - [2026/01] DeepSeek-OCR-2模型在昇腾Atlas A2系列上已支持推理部署。
 - [2026/01] LongCat-Flash模型在昇腾Atlas A3系列上已支持Attention-FFN Disaggregation(AFD)部署模式。
