@@ -12,13 +12,10 @@
 
    本样例的编译执行依赖CANN开发套件包（cann-toolkit）与CANN二进制算子包（A3-ops）。支持的CANN软件版本为`CANN 8.5.0`。
 
-   请从[软件包下载地址](https://www.hiascend.com/developer/download/community/result?module=cann&cann=8.5.0)下载`Ascend-cann-toolkit_${version}_linux-${arch}.run`与`Ascend-cann-A3-ops_${version}_linux-${arch}.run`软件包，并参考[CANN安装文档](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/850/softwareinst/instg/instg_0001.html?Mode=PmIns&OS=Debian&Software=cannToolKit)进行安装。
+   请从[软件包下载地址](https://ascend.devcloud.huaweicloud.com/artifactory/cann-run-release/software/master)下载`Ascend-cann-toolkit_${version}_linux-${arch}.run`与`Ascend-cann-A3-ops_${version}_linux-${arch}.run`软件包，并参考[CANN安装文档](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/850/softwareinst/instg/instg_0001.html?Mode=PmIns&OS=Debian&Software=cannToolKit)进行安装。
 
     - `${version}`表示CANN包版本号，如8.5.0。
     - `${arch}`表示CPU架构，如aarch64、x86_64。
-
-    > [!NOTE]说明 
-    > 当前若想使能Attention-FFN Disaggregation(AFD)优化，需要更新`cann-hcomm`包（CommitID `a43e7e9cf42fa264d465147e710eeb6d262f01f4`），参考[hcomm源码编译安装](https://gitcode.com/cann/hcomm/blob/master/docs/build.md)。
 
 2. 安装Ascend Extension for PyTorch（torch_npu）。
 
