@@ -12,4 +12,4 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-from .cache_step import cache_manager
+from .cache_method import cache_manager

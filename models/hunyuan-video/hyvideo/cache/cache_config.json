@@ -1,22 +1,30 @@
 {
-    "cache_forward": "NoCache",
-    "comment": "choose from FBCache/TeaCache, otherwise use NoCache",
-    "enable_separate_cfg": false,
-    "FBCache":{
-            "cache_name": "FBCache",
-            "rel_l1_thresh": 0.05,
-            "latent": "latent",
-            "judge_input": "cache_latent"
-    },
-    "TeaCache":{
-            "cache_name" : "TeaCache",
-            "rel_l1_thresh": 0.1,
-            "warmup": 0,
-            "coefficients": [733.226126,-401.131952,67.5869174,-3.149879,0.0961237896],
-            "latent": "latent",
-            "judge_input": "modulated_inp"
-    },
-    "NoCache":{
-        "cache_name" : "NoCache"
-}
+        "cache_forward": "NoCache",
+        "comment": "choose from FBCache/TeaCache/TaylorSeer, otherwise use NoCache",
+        "enable_separate_cfg": true,
+        "FBCache":{
+                "cache_name": "FBCache",
+                "rel_l1_thresh": 0.05,
+                "latent": "latent",
+                "judge_input": "cache_latent"
+        },
+        "TeaCache":{
+                "cache_name" : "TeaCache",
+                "rel_l1_thresh": 0.1,
+                "coefficients": [733.226126,-401.131952,67.5869174,-3.149879,0.0961237896],
+                "warmup": 2,
+                "latent": "latent",
+                "judge_input": "modulated_inp"
+        },
+        "TaylorSeer":{
+                "cache_name" : "TaylorSeer",
+                "n_derivatives": 3,
+                "skip_interval_steps": 4,
+                "warmup": 3,
+                "cutoff_steps": 1,
+                "offload": true
+        },
+        "NoCache":{
+            "cache_name" : "NoCache"
+    }
 }

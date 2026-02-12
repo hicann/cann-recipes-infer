@@ -27,7 +27,7 @@ from diffusers.models.modeling_utils import ModelMixin
 
 from wan.modules.attention import attention
 
-from module.dit_cache_step.cache_step import cache_manager
+from module.dit_cache.cache_method import cache_manager
 
 
 __all__ = ['WanModel']
@@ -255,8 +255,8 @@ def first_block_forward(
         self.cfg_step = 1 - self.cfg_step
     should_calc = True
     reused_x = x
-    cache_step = cache_manager.cache_step
-    if cache_step.cache_name == "TeaCache":
+    cache_method = cache_manager.cache_method
+    if cache_method.cache_name == "TeaCache":
         img_mod1_scale = e[1].squeeze(2)
         img_mod1_shift = e[0].squeeze(2)
         norm_x = self.norm1(x, scale=img_mod1_scale, shift=img_mod1_shift)
@@ -266,11 +266,11 @@ def first_block_forward(
             "judge_input": judge_input,
             "is_cond": is_cond
         }
-        should_calc, reused_x = cache_step.pre_cache_process(args)
+        should_calc, reused_x = cache_method.pre_cache_process(args)
 
         if not should_calc:
-            cache_step.should_skip = True
-            cache_step.last_is_cond = is_cond
+            cache_method.should_skip = True
+            cache_method.last_is_cond = is_cond
             return reused_x
     # assert e[0].dtype == torch.float32
     y = self.self_attn(
@@ -293,12 +293,12 @@ def first_block_forward(
         return x
 
     x = cross_attn_ffn(x, context, context_lens, e)
-    if cache_step.cache_name == "FBCache":
+    if cache_method.cache_name == "FBCache":
         args = {
             "latent": x,
             "judge_input": x.clone(),
             "is_cond": is_cond
         }
-        should_calc, x = cache_step.pre_cache_process(args)
+        should_calc, x = cache_method.pre_cache_process(args)
 
     return x

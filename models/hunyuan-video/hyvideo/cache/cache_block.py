@@ -35,6 +35,7 @@ import numpy as np
 from diffusers.models import ModelMixin
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 
+from module.dit_cache.cache_method import cache_manager
 from ..modules.activation_layers import get_activation_layer
 from ..modules.norm_layers import get_norm_layer
 from ..modules.embed_layers import TimestepEmbedder, PatchEmbed, TextProjection
@@ -43,7 +44,286 @@ from ..modules.posemb_layers import apply_rotary_emb
 from ..modules.mlp_layers import MLP, MLPEmbedder, FinalLayer
 from ..modules.modulate_layers import ModulateDiT, modulate, apply_gate
 from ..modules.token_refiner import SingleTokenRefiner
-from module.dit_cache_step.cache_step import cache_manager
+
+
+def _double_block_full_compute(
+    self, 
+    block_args: dict,
+    cache_dic: dict, 
+    current: dict
+):
+    img = block_args['img']
+    txt = block_args['txt']
+    freqs_cis = block_args['freqs_cis']
+
+    # Image Attention
+    current['module'] = 'img_attn'
+    img_modulated = self.img_norm1(img)
+    img_modulated = modulate(img_modulated, shift=block_args['img_mod1_shift'], scale=block_args['img_mod1_scale'])
+    img_qkv = self.img_attn_qkv(img_modulated)
+    img_q, img_k, img_v = rearrange(img_qkv, "B L (K H D) -> K B L H D", K=3, H=self.heads_num)
+    img_q = self.img_attn_q_norm(img_q).to(img_v.dtype)
+    img_k = self.img_attn_k_norm(img_k).to(img_v.dtype)
+    
+    if freqs_cis is not None:
+        img_q, img_k = apply_rotary_emb(img_q, img_k, freqs_cis, head_first=False)
+    
+    # Text Attention
+    current['module'] = 'txt_attn'
+    txt_modulated = self.txt_norm1(txt)
+    txt_modulated = modulate(txt_modulated, shift=block_args['txt_mod1_shift'], scale=block_args['txt_mod1_scale'])
+    txt_qkv = self.txt_attn_qkv(txt_modulated)
+    txt_q, txt_k, txt_v = rearrange(txt_qkv, "B L (K H D) -> K B L H D", K=3, H=self.heads_num)
+    txt_q = self.txt_attn_q_norm(txt_q).to(txt_v.dtype)
+    txt_k = self.txt_attn_k_norm(txt_k).to(txt_v.dtype)
+    # Combined Attention
+    q = torch.cat((img_q, txt_q), dim=1)
+    k = torch.cat((img_k, txt_k), dim=1)
+    v = torch.cat((img_v, txt_v), dim=1)
+
+    attn = attention(q, k, v, 
+                    mode='flash', 
+                    cu_seqlens_q=block_args['cu_seqlens_q'], 
+                    cu_seqlens_kv=block_args['cu_seqlens_kv'], 
+                    max_seqlen_q=block_args['max_seqlen_q'], 
+                    max_seqlen_kv=block_args['max_seqlen_kv'], 
+                    batch_size=img.shape[0]
+                )
+    
+    img_attn, txt_attn = attn[:, :img.shape[1]], attn[:, img.shape[1]:]
+    # Image Attn Update
+    current['module'] = 'img_attn'
+    img_attn_out = self.img_attn_proj(img_attn)
+    img = img + apply_gate(img_attn_out, gate=block_args['img_mod1_gate'])
+    cache_manager.cache_method.derivative_approximation(cache_dic, current, img_attn_out)
+
+    current['module'] = 'img_mlp'
+    img_mlp_in = modulate(self.img_norm2(img), shift=block_args['img_mod2_shift'], scale=block_args['img_mod2_scale'])
+    img_mlp_out = self.img_mlp(img_mlp_in)
+    img = img + apply_gate(img_mlp_out, gate=block_args['img_mod2_gate'])
+    cache_manager.cache_method.derivative_approximation(cache_dic, current, img_mlp_out)
+
+    # Text Attn Update
+    current['module'] = 'txt_attn'
+    txt_attn_out = self.txt_attn_proj(txt_attn)
+    txt = txt + apply_gate(txt_attn_out, gate=block_args['txt_mod1_gate'])
+    cache_manager.cache_method.derivative_approximation(cache_dic, current, txt_attn_out)
+
+    # Text MLP
+    current['module'] = 'txt_mlp'
+    txt_mlp_in = modulate(self.txt_norm2(txt), shift=block_args['txt_mod2_shift'], scale=block_args['txt_mod2_scale'])
+    txt_mlp_out = self.txt_mlp(txt_mlp_in)
+    txt = txt + apply_gate(txt_mlp_out, gate=block_args['txt_mod2_gate'])
+    cache_manager.cache_method.derivative_approximation(cache_dic, current, txt_mlp_out)
+    
+    return img, txt
+
+
+def _double_block_taylor_compute(
+    self,
+    block_args: dict,
+    cache_dic: dict, 
+    current: dict
+):
+    img = block_args['img']
+    txt = block_args['txt']
+
+    # Taylor approximation for each module
+    current['module'] = 'img_attn'
+    img_attn_out = cache_manager.cache_method.taylor_formula(cache_dic, current)
+    img = img + apply_gate(img_attn_out, gate=block_args['img_mod1_gate'])
+
+    current['module'] = 'img_mlp'
+    img_mlp_out = cache_manager.cache_method.taylor_formula(cache_dic, current)
+    img = img + apply_gate(img_mlp_out, gate=block_args['img_mod2_gate'])
+
+    current['module'] = 'txt_attn'
+    txt_attn_out = cache_manager.cache_method.taylor_formula(cache_dic, current)
+    txt = txt + apply_gate(txt_attn_out, gate=block_args['txt_mod1_gate'])
+
+    current['module'] = 'txt_mlp'
+    txt_mlp_out = cache_manager.cache_method.taylor_formula(cache_dic, current)
+    txt = txt + apply_gate(txt_mlp_out, gate=block_args['txt_mod2_gate'])
+
+    return img, txt
+
+
+def double_block_forward(
+    self,
+    img: torch.Tensor,
+    txt: torch.Tensor,
+    vec: torch.Tensor,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
+    cu_seqlens_kv: Optional[torch.Tensor] = None,
+    max_seqlen_q: Optional[int] = None,
+    max_seqlen_kv: Optional[int] = None,
+    freqs_cis: tuple = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    cache_dic = cache_manager.cache_method.cache_dic
+    current = cache_manager.cache_method.current
+    double_stream_layers = cache_manager.cache_method.double_stream_layers
+    current_layer_idx = cache_manager.cache_method.layer_counter - 1
+    current_layer_idx = current_layer_idx % double_stream_layers
+    current.update({
+        "stream": "double_stream",
+        "layer": current_layer_idx,
+        "step": cache_manager.cache_method.num_steps
+    })
+    cache_manager.cache_method.update_layer_counter()
+    (
+        img_mod1_shift,
+        img_mod1_scale,
+        img_mod1_gate,
+        img_mod2_shift,
+        img_mod2_scale,
+        img_mod2_gate,
+    ) = self.img_mod(vec).chunk(6, dim=-1)
+    (
+        txt_mod1_shift,
+        txt_mod1_scale,
+        txt_mod1_gate,
+        txt_mod2_shift,
+        txt_mod2_scale,
+        txt_mod2_gate,
+    ) = self.txt_mod(vec).chunk(6, dim=-1)
+
+    block_args = {
+        'img': img,
+        'txt': txt,
+        'img_mod1_shift': img_mod1_shift,
+        'img_mod1_scale': img_mod1_scale,
+        'freqs_cis': freqs_cis,
+        'txt_mod1_shift': txt_mod1_shift,
+        'txt_mod1_scale': txt_mod1_scale,
+        'cu_seqlens_q': cu_seqlens_q,
+        'cu_seqlens_kv': cu_seqlens_kv,
+        'max_seqlen_q': max_seqlen_q,
+        'max_seqlen_kv': max_seqlen_kv,
+        'img_mod1_gate': img_mod1_gate,
+        'img_mod2_shift': img_mod2_shift,
+        'img_mod2_scale': img_mod2_scale,
+        'img_mod2_gate': img_mod2_gate,
+        'txt_mod1_gate': txt_mod1_gate,
+        'txt_mod2_shift': txt_mod2_shift,
+        'txt_mod2_scale': txt_mod2_scale,
+        'txt_mod2_gate': txt_mod2_gate
+    }
+
+    if current.get('type') == 'full':
+        img, txt = _double_block_full_compute(
+            self, block_args, cache_dic, current
+        )
+
+    elif current.get('type') == 'taylor_cache':
+        img, txt = _double_block_taylor_compute(
+            self, block_args, cache_dic, current
+        )
+
+    return img, txt
+
+
+def _single_block_full_compute(
+    self, 
+    block_args: dict,
+    cache_dic: dict, 
+    current: dict
+):
+    x = block_args['x']
+    txt_len = block_args['txt_len']
+    freqs_cis = block_args['freqs_cis']
+
+    current['module'] = 'total'
+    x_mod = modulate(self.pre_norm(x), shift=block_args['mod_shift'], scale=block_args['mod_scale'])
+    qkv, mlp = torch.split(self.linear1(x_mod), [3 * self.hidden_size, self.mlp_hidden_dim], dim=-1)
+    
+    q, k, v = rearrange(qkv, "B L (K H D) -> K B L H D", K=3, H=self.heads_num)
+    q = self.q_norm(q).to(v.dtype)
+    k = self.k_norm(k).to(v.dtype)
+    
+    if freqs_cis is not None:
+        img_q, txt_q = q[:, :-txt_len], q[:, -txt_len:]
+        img_k, txt_k = k[:, :-txt_len], k[:, -txt_len:]
+        img_q, img_k = apply_rotary_emb(img_q, img_k, freqs_cis, head_first=False)
+        q = torch.cat((img_q, txt_q), dim=1)
+        k = torch.cat((img_k, txt_k), dim=1)
+    
+    attn = attention(q, k, v, 
+                mode='flash', 
+                cu_seqlens_q=block_args['cu_seqlens_q'], 
+                cu_seqlens_kv=block_args['cu_seqlens_kv'], 
+                max_seqlen_q=block_args['max_seqlen_q'], 
+                max_seqlen_kv=block_args['max_seqlen_kv'], 
+                batch_size=x.shape[0]
+            )
+    
+    output = self.linear2(torch.cat((attn, self.mlp_act(mlp)), dim=2))
+    cache_manager.cache_method.derivative_approximation(cache_dic, current, output)
+    x = x + apply_gate(output, gate=block_args['mod_gate'])
+
+    return x
+
+
+def _single_block_taylor_compute(
+    self, 
+    block_args: dict,
+    cache_dic: dict, 
+    current: dict
+):
+    x = block_args['x']
+
+    current['module'] = 'total'
+    output = cache_manager.cache_method.taylor_formula(cache_dic, current)
+    x = x + apply_gate(output, gate=block_args['mod_gate'])
+
+    return x
+
+
+def single_block_forward(
+    self,
+    x: torch.Tensor,
+    vec: torch.Tensor,
+    txt_len: int,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
+    cu_seqlens_kv: Optional[torch.Tensor] = None,
+    max_seqlen_q: Optional[int] = None,
+    max_seqlen_kv: Optional[int] = None,
+    freqs_cis: Tuple[torch.Tensor, torch.Tensor] = None,
+) -> torch.Tensor:
+    cache_dic = cache_manager.cache_method.cache_dic
+    current = cache_manager.cache_method.current
+    double_stream_layers = cache_manager.cache_method.double_stream_layers
+    current_layer_idx = cache_manager.cache_method.layer_counter - 1
+    single_layer_idx = (current_layer_idx - double_stream_layers) % cache_manager.cache_method.single_stream_layers
+    current.update({
+        "stream": "single_stream",
+        "layer": single_layer_idx,
+        "step": cache_manager.cache_method.num_steps
+    })
+    cache_manager.cache_method.update_layer_counter()
+    mod_shift, mod_scale, mod_gate = self.modulation(vec).chunk(3, dim=-1)
+    block_args = {
+        'x': x,
+        'mod_shift': mod_shift,
+        'mod_scale': mod_scale,
+        'txt_len': txt_len,
+        'mod_gate': mod_gate,
+        'freqs_cis': freqs_cis,
+        'cu_seqlens_q': cu_seqlens_q,
+        'cu_seqlens_kv': cu_seqlens_kv,
+        'max_seqlen_q': max_seqlen_q,
+        'max_seqlen_kv': max_seqlen_kv
+    }
+    if current.get('type') == 'full':
+        x = _single_block_full_compute(
+            self, block_args, cache_dic, current
+        )
+        
+    elif current.get('type') == 'taylor_cache':
+        x = _single_block_taylor_compute(
+        self, block_args, cache_dic, current
+    )
+        
+    return x
 
 
 def first_block_forward(
@@ -79,27 +359,18 @@ def first_block_forward(
     img_modulated = modulate(
         img_modulated, shift=img_mod1_shift, scale=img_mod1_scale
     )
-    enable_separate_cfg = cache_manager.enable_separate_cfg
-    if not hasattr(self, 'cfg_step'):
-        self.cfg_step = 0
-    is_cond = True
-    if enable_separate_cfg:
-        is_cond = (self.cfg_step == 0)
-        self.cfg_step = 1 - self.cfg_step
+
     # TeaCache
-    if cache_manager.cache_step.cache_name == "TeaCache":
+    if cache_manager.cache_method.cache_name == "TeaCache":
         judge_input = img_modulated
         args = {
             "latent": img,
-            "judge_input": judge_input,
-            "is_cond": is_cond
+            "judge_input": judge_input
         }
-        should_calc, img = cache_manager.cache_step.pre_cache_process(args)
+        should_calc, img = cache_manager.cache_method.pre_cache_process(args)
 
         if not should_calc:
-            cache_manager.cache_step.should_skip = True
-            cache_manager.cache_step.last_is_cond = is_cond
-            cache_manager.cache_step.post_cache_update(img)
+            cache_manager.cache_method.post_cache_update(img)
             return img, txt
 
 
@@ -194,12 +465,11 @@ def first_block_forward(
         ),
         gate=txt_mod2_gate,
     )
-    if cache_manager.cache_step.cache_name == "FBCache":
+    if cache_manager.cache_method.cache_name == "FBCache":
         args = {
             "latent": img,
-            "judge_input": img.clone(),
-            "is_cond": is_cond
+            "judge_input": img.clone()
         }
-        should_calc, img = cache_manager.cache_step.pre_cache_process(args)
+        should_calc, img = cache_manager.cache_method.pre_cache_process(args)
 
     return img, txt

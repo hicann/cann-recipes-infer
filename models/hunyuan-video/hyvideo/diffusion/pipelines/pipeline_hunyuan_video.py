@@ -52,12 +52,12 @@ from diffusers.utils.torch_utils import randn_tensor
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 from diffusers.utils import BaseOutput
 
+from module.dit_cache.cache_method import cache_manager
 from ...constants import PRECISION_TO_TYPE
 from ...vae.autoencoder_kl_causal_3d import AutoencoderKLCausal3D
 from ...text_encoder import TextEncoder
 from ...modules import HYVideoDiffusionTransformer
 
-# logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 EXAMPLE_DOC_STRING = """"""
 
@@ -997,7 +997,7 @@ class HunyuanVideoPipeline(DiffusionPipeline):
                     torch_npu.profiler.ProfilerActivity.CPU,
                     torch_npu.profiler.ProfilerActivity.NPU
                     ],
-                schedule=torch_npu.profiler.schedule(wait=0, warmup=4, active=1, repeat=1, skip_first=0),
+                schedule=torch_npu.profiler.schedule(wait=0, warmup=4, active=8, repeat=1, skip_first=0),
                 on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(os.path.join("./prof/DiT_prof/", 
                                                                                 self.args.prof_prefix)),
                 record_shapes=False,
@@ -1010,6 +1010,7 @@ class HunyuanVideoPipeline(DiffusionPipeline):
 
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
+                torch.npu.synchronize()
                 if self.interrupt:
                     continue
 
@@ -1086,6 +1087,7 @@ class HunyuanVideoPipeline(DiffusionPipeline):
                     )
                 
                 if self.args.prof_dit:
+                    torch.npu.synchronize()
                     prof.step()
 
                 # call the callback, if provided
@@ -1104,6 +1106,10 @@ class HunyuanVideoPipeline(DiffusionPipeline):
         torch.npu.synchronize()
         dit_end_time = time.time()
         logger.success(f"DiT end, totally cost {dit_end_time - dit_start_time}")
+
+        if hasattr(cache_manager.cache_method, "cache_dic"):
+            del cache_manager.cache_method.cache_dic
+        torch.npu.empty_cache()
 
         if not output_type == "latent":
             expand_temporal_dim = False

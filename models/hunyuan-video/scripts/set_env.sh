@@ -1,5 +1,5 @@
 #!/bin/bash
-# Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
+# Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 #
 # This code is based on Tencent-Hunyuan's HunyuanVideo library and the HunyuanVideo
 # implementations in this library. It has been modified from its

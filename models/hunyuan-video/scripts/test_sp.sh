@@ -1,7 +1,7 @@
 #!/bin/bash
 # Adapted from  
 # https://github.com/Tencent-Hunyuan/HunyuanVideo,
-# Copyright (c) Huawei Technologies Co., Ltd. 2024 - 2026. All rights reserved.
+# Copyright (c) Huawei Technologies Co., Ltd. 2026.
 # Copyright (C) 2024 THL A29 Limited, a Tencent company. All rights reserved.
 #
 # This code is based on Tencent-Hunyuan's HunyuanVideo library and the HunyuanVideo
@@ -34,4 +34,5 @@ torchrun --master_port=29600 --nproc_per_node=8 sample_video.py \
 	--use-cpu-offload \
 	--ulysses-degree=8 \
 	--ring-degree=1 \
+	--use-vae-parallel \
 	--save-path ./results

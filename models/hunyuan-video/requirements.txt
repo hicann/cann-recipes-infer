@@ -1,5 +1,5 @@
 opencv-python==4.9.0.80
-diffusers==0.33.0
+diffusers==0.36.0
 transformers==4.46.3
 tokenizers==0.20.3
 accelerate==1.1.1
@@ -12,3 +12,5 @@ imageio==2.34.0
 imageio-ffmpeg==0.5.1
 safetensors==0.4.3
 gradio==5.0.0
+xfuser==0.4.5
+yunchang==0.6.4

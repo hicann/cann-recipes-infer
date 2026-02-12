@@ -24,7 +24,7 @@ import torch.nn as nn
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 from wan.modules.attention import attention
-from module.dit_cache_step import cache_manager
+from module.dit_cache import cache_manager
 
 
 __all__ = ['WanModel']
@@ -563,11 +563,11 @@ class WanModel(ModelMixin, ConfigMixin):
 
         for i, block in enumerate(self.blocks):
             x = block(x, **kwargs)
-            if i == 0 and cache_manager.cache_step.should_skip:
+            if i == 0 and cache_manager.cache_method.should_skip:
                 break
         
-        cache_manager.cache_step.post_cache_update(x)
-        cache_manager.cache_step.should_skip = False
+        cache_manager.cache_method.post_cache_update(x)
+        cache_manager.cache_method.should_skip = False
         # head
         x = self.head(x, e)
 

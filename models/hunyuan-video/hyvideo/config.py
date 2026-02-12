@@ -95,6 +95,11 @@ def add_extra_models_args(parser: argparse.ArgumentParser):
         help="Precision mode for the VAE model.",
     )
     group.add_argument(
+        "--use-vae-parallel",
+        action="store_true",
+        help="Enable tiling for the VAE model to save npu memory.",
+    )
+    group.add_argument(
         "--vae-tiling",
         action="store_true",
         help="Enable tiling for the VAE model to save npu memory.",

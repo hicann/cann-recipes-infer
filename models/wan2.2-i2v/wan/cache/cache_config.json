@@ -1,6 +1,6 @@
 {
         "cache_forward": "NoCache",
-        "comment": "choose from FBCache/TeaCache, otherwise use NoCache", 
+        "comment": "choose from FBCache/TeaCache/TaylorSeer, otherwise use NoCache",
         "enable_separate_cfg": true,
         "FBCache":{
                 "cache_name": "FBCache",
@@ -10,13 +10,21 @@
         },
         "TeaCache":{
                 "cache_name" : "TeaCache",
-                "rel_l1_thresh": 0.1, 
-                "coefficients": [-3.02331670e+02,  2.23948934e+02, -5.25463970e+01,  5.87348440e+00, -2.01973289e-01], 
+                "rel_l1_thresh": 0.1,
+                "coefficients": [733.226126,-401.131952,67.5869174,-3.149879,0.0961237896],
                 "warmup": 2,
                 "latent": "latent",
                 "judge_input": "modulated_inp"
         },
+        "TaylorSeer":{
+                "cache_name" : "TaylorSeer",
+                "n_derivatives": 3,
+                "skip_interval_steps": 4,
+                "warmup": 3,
+                "cutoff_steps": 1,
+                "offload": true
+        },
         "NoCache":{
             "cache_name" : "NoCache"
     }
-    }
+}

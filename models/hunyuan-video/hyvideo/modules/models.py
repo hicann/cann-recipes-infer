@@ -1,7 +1,7 @@
 # Adapted from  
 # https://github.com/Tencent-Hunyuan/HunyuanVideo,
 # https://github.com/ali-vilab/TeaCache,
-# Copyright (c) Huawei Technologies Co., Ltd. 2025 - 2026. All rights reserved.
+# Copyright (c) Huawei Technologies Co., Ltd. 2025.
 # Copyright (C) 2024 THL A29 Limited, a Tencent company. All rights reserved.
 # Copyright (C) 2025 ali-vilab.
 #
@@ -33,8 +33,8 @@ import numpy as np
 
 from diffusers.models import ModelMixin
 from diffusers.configuration_utils import ConfigMixin, register_to_config
-from module.dit_cache_step import cache_manager
 
+from module.dit_cache import cache_manager
 from .activation_layers import get_activation_layer
 from .norm_layers import get_norm_layer
 from .embed_layers import TimestepEmbedder, PatchEmbed, TextProjection
@@ -43,7 +43,6 @@ from .posemb_layers import apply_rotary_emb
 from .mlp_layers import MLP, MLPEmbedder, FinalLayer
 from .modulate_layers import ModulateDiT, modulate, apply_gate
 from .token_refiner import SingleTokenRefiner
-
 
 
 class MMDoubleStreamBlock(nn.Module):
@@ -696,11 +695,11 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
             ]
 
             img, txt = block(*double_block_args)
-            if i == 0 and cache_manager.cache_step.should_skip:
+            if i == 0 and cache_manager.cache_method.should_skip:
                 break
 
         # Merge txt and img to pass through single stream blocks.
-        if not cache_manager.cache_step.should_skip:
+        if not cache_manager.cache_method.should_skip:
             x = torch.cat((img, txt), 1)
             if len(self.single_blocks) > 0:
                 for _, block in enumerate(self.single_blocks):
@@ -718,9 +717,12 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
                     x = block(*single_block_args)
 
             img = x[:, :img_seq_len, ...]
+            
+        #=========================================================
+
 
         # ---------------------------- Final layer ------------------------------
-        cache_manager.cache_step.post_cache_update(img)
+        cache_manager.cache_method.post_cache_update(img)
         img = self.final_layer(img, vec)  # (N, T, patch_size ** 2 * out_channels)
 
         img = self.unpatchify(img, tt, th, tw)

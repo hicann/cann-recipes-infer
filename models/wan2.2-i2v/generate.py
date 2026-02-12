@@ -44,7 +44,7 @@ from wan.utils.utils import save_video, str2bool
 from wan.distributed.parallel_mgr import ParallelConfig, init_parallel_env, finalize_parallel_env
 from wan.cache import first_block_forward
 import wan.cache.cache_block
-from module.dit_cache_step.cache_step import cache_manager, NoCache
+from module.dit_cache.cache_method import cache_manager, NoCache
 
 EXAMPLE_PROMPT = {
     "t2v-A14B": {
@@ -556,7 +556,7 @@ def generate(args):
         if world_size > 1:
             logging.info("Cannot enable both Multi-NPU and DIT-Cache. DIT-Cache has been disabled")
             logging.info("Now apply Dit-Cache method: NoCache!")
-            cache_manager.cache_step = NoCache()
+            cache_manager.cache_method = NoCache()
         else:
             cache_block = wan_i2v.high_noise_model.blocks[0]
             cache_block.forward = first_block_forward.__get__(cache_block, type(cache_block))
@@ -625,7 +625,7 @@ def generate(args):
             normalize=True,
             value_range=(-1, 1))
     del video
-    cache_manager.cache_step.print_statistics()
+    cache_manager.cache_method.print_statistics()
     finalize_parallel_env()
     logging.info("Finished.")
 

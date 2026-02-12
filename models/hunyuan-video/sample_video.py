@@ -1,7 +1,7 @@
 # coding=utf-8
 # Adapted from  
 # https://github.com/Tencent-Hunyuan/HunyuanVideo,
-# Copyright (c) Huawei Technologies Co., Ltd. 2025 - 2026. All rights reserved.
+# Copyright (c) Huawei Technologies Co., Ltd.
 # Copyright (C) 2024 THL A29 Limited, a Tencent company. All rights reserved.
 #
 # This code is based on Tencent-Hunyuan's HunyuanVideo library and the HunyuanVideo
@@ -31,15 +31,19 @@ from torch_npu.contrib import transfer_to_npu
 import torch.distributed as dist
 from loguru import logger
 
+import hyvideo.monkey_patch
 from hyvideo.utils.file_utils import save_videos_grid, load_json
 from hyvideo.config import parse_args
 from hyvideo.inference import HunyuanVideoSampler
-from hyvideo.cache import first_block_forward
-from module.dit_cache_step.cache_step import cache_manager, NoCache
+from hyvideo.cache import first_block_forward, double_block_forward, single_block_forward
+from module.dit_cache.cache_method import cache_manager
 
 
 torch_npu.npu.set_compile_mode(jit_compile=False)
 torch.npu.config.allow_internal_format = False
+
+
+WORLD_SIZE = int(os.getenv("WORLD_SIZE", 1))
 
 
 def main():
@@ -65,18 +69,34 @@ def main():
     
     # Get the updated args
     args = hunyuan_video_sampler.args
-    world_size = int(os.getenv("WORLD_SIZE", 1))
+
     # cache init
-    cache_manager.from_config(
-        config_path=args.cache_config,
-        cache_params={"num_steps": args.infer_steps})
-    if world_size > 1 and cache_manager.cache_step.cache_name != "NoCache":
-        raise Exception("Cannot enable both Multi-NPU and DIT-Cache")
-    else:
+    double_layer_num = len(hunyuan_video_sampler.pipeline.transformer.double_blocks)
+    single_layer_num = len(hunyuan_video_sampler.pipeline.transformer.single_blocks)
+
+    cache_params = {
+        "num_steps": args.infer_steps,
+        "double_stream_layers": double_layer_num,
+        "single_stream_layers": single_layer_num,
+    }
+
+    cache_manager.from_config(args.cache_config, cache_params=cache_params)
+
+    if WORLD_SIZE > 1 and cache_manager.cache_method.cache_name != "NoCache":
+        raise Exception("Cannot enable both Multi-NPU and DIT-Cache!")
+
+    elif cache_manager.cache_method.cache_name == "TaylorSeer":
+        for block in hunyuan_video_sampler.pipeline.transformer.double_blocks:
+            block.forward = double_block_forward.__get__(block, type(block))
+
+        for block in hunyuan_video_sampler.pipeline.transformer.single_blocks:
+            block.forward = single_block_forward.__get__(block, type(block))
+
+    elif cache_manager.cache_method.cache_name in ["FBCache", "TeaCache"]:
         cache_block = hunyuan_video_sampler.pipeline.transformer.double_blocks[0]
         cache_block.forward = first_block_forward.__get__(cache_block, type(cache_block))
+
     # Start sampling
-    # TODO: batch inference check
     if args.prompt_path:
         full_prompts_info = load_json(args.prompt_path)
         prompts = []
@@ -103,7 +123,7 @@ def main():
         )
         samples = outputs['samples']
 
-        cache_manager.cache_step.print_statistics()
+        cache_manager.cache_method.print_statistics()
         
         # Save samples
         if 'LOCAL_RANK' not in os.environ or int(os.environ['LOCAL_RANK']) == 0:
