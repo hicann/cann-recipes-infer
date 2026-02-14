@@ -74,6 +74,7 @@ class DeepSeekRunner(ModelRunner):
         else:
             model = DeepseekV3ForCausalLM
             super().init_model(DeepseekV3ForCausalLM, config)
+        self.tokenizer.add_special_tokens({"eos_token": "<|im_end|>"})
 
     @override
     def _process_weight_after_loading(self):
