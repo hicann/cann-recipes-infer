@@ -415,7 +415,7 @@ def _init_rope(self):
         self.rotary_emb = DeepseekV3RotaryEmbedding(
             self.config.qk_rope_head_dim,
             max_position_embeddings=self.config.max_position_embeddings,
-            base=self.config.rope_theta,
+            base=self.config.rope_theta if self.config.rope_theta else self.config.rope_parameters['rope_theta'],
         )
     else:
         scaling_type = self.config.rope_scaling["type"]

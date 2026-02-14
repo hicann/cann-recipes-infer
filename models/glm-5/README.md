@@ -1,0 +1,140 @@
+# GLM-5 Inference on NPU
+## 概述
+智谱团队发布了最新的模型GLM-5，本样例基于GLM-5开源代码进行迁移，并在CANN平台上完成对应的优化适配，可在华为 Atlas A3 集群上运行起来。
+
+- GLM-5 模型结构与 DeepSeek-V3.2-Exp 保持一致，本样例的并行策略与性能优化方案均沿用 DeepSeek-V3.2-Exp。详细方案请参考[NPU DeepSeek-V3.2-Exp推理优化实践](../../docs/models/deepseek-v3.2-exp/deepseek_v3.2_exp_inference_guide.md)。
+
+---
+
+## 硬件要求
+产品型号：Atlas A3 系列
+
+操作系统：Linux ARM
+
+镜像版本：cann8.5_pt2.8.0_glm_aarch_image_v0.1.tar
+
+驱动版本：Ascend HDK 25.2.0
+> npu-smi info 检查Ascend NPU固件和驱动是否正确安装。如果已安装，通过命令`npu-smi info`确认版本是否为 25.2.0。如果未安装或者版本不是 25.2.0，请先下载[固件和驱动包](https://www.hiascend.com/hardware/firmware-drivers/community?product=7&model=33&cann=All&driver=Ascend+HDK+25.2.0)，然后根据[指导](https://hiascend.com/document/redirect/CannCommunityInstSoftware)自行安装。
+
+
+## 快速启动
+
+
+### 下载源码
+
+  在各个节点上执行如下命令下载 cann-recipes-infer 源码。
+  ```shell
+  mkdir -p /home/code; cd /home/code/
+  git clone https://gitcode.com/cann/cann-recipes-infer.git
+  cd cann-recipes-infer
+  ```
+### 下载数据集
+  从[链接](https://huggingface.co/datasets/xinrongzhang2022/InfiniteBench/blob/main/longbook_qa_eng.jsonl)中下载长序列输入数据集longbook_qa_eng，并上传到各个节点上新建的路径 dataset/InfiniteBench下。
+  ```shell
+  mkdir -p dataset/InfiniteBench
+  ```
+
+### 下载权重
+
+  下载[GLM-5原始FP8权重](https://huggingface.co/zai-org/GLM-5-FP8)，并上传到Atlas A3各节点某个固定的路径下，比如`/data/models/GLM-5-FP8`。
+
+### 获取 docker 镜像
+  从[ARM镜像地址](https://cann-ai.obs.cn-north-4.myhuaweicloud.com/cann-quantization/GLM/cann8.5_pt2.8.0_glm_aarch_image_v0.1.tar)中下载 docker 镜像，然后上传到A3服务器的每个节点上，并通过命令导入镜像 `docker load -i cann8.5_pt2.8.0_glm_aarch_image_v0.1.tar`。
+
+### 拉起 docker 容器
+
+  在各个节点上通过如下脚本拉起容器，默认容器名为 cann_recipes_infer。注意：需要将权重路径和源码路径挂载到容器里。
+  ```
+  docker run -u root -itd --name cann_recipes_infer --ulimit nproc=65535:65535 --ipc=host \
+      --device=/dev/davinci0     --device=/dev/davinci1 \
+      --device=/dev/davinci2     --device=/dev/davinci3 \
+      --device=/dev/davinci4     --device=/dev/davinci5 \
+      --device=/dev/davinci6     --device=/dev/davinci7 \
+      --device=/dev/davinci8     --device=/dev/davinci9 \
+      --device=/dev/davinci10    --device=/dev/davinci11 \
+      --device=/dev/davinci12    --device=/dev/davinci13 \
+      --device=/dev/davinci14    --device=/dev/davinci15 \
+      --device=/dev/davinci_manager --device=/dev/devmm_svm \
+      --device=/dev/hisi_hdc \
+      -v /home/:/home \
+      -v /data:/data \
+      -v /etc/localtime:/etc/localtime \
+      -v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
+      -v /etc/ascend_install.info:/etc/ascend_install.info -v /var/log/npu/:/usr/slog \
+      -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi -v /sys/fs/cgroup:/sys/fs/cgroup:ro \
+      -v /usr/local/dcmi:/usr/local/dcmi -v /usr/local/sbin:/usr/local/sbin \
+      -v /etc/hccn.conf:/etc/hccn.conf -v /root/.pip:/root/.pip -v /etc/hosts:/etc/hosts \
+      -v /usr/bin/hostname:/usr/bin/hostname \
+      --net=host \
+      --shm-size=128g \
+      --privileged \
+      cann8.5_pt2.8.0_glm_aarch_image:v0.1 /bin/bash
+  ```
+  在各个节点上通过如下命令进入容器：
+  ```
+  docker attach cann_recipes_infer
+  cd /home/code/cann-recipes-infer/models/glm-5
+  ```
+
+### 转换权重
+
+  在各个节点上使用`weight_convert.sh` 脚本完成FP8到Int8权重转换。
+
+  >入参介绍：`input_fp8_hf_path`：原始fp8权重路径；`output_hf_path`：转换后输出的权重路径；`quant_mode`：量化模式
+
+如果权重转换的运行环境为NPU，需要先执行：
+
+```shell
+cann_path=/usr/local/Ascend/ascend-toolkit/latest  # CANN包安装路径
+source ${cann_path}/bin/setenv.bash
+```
+
+  权重转换拉起示例：
+
+  ```shell
+  # 转换为W8A8C16权重
+  bash utils/weight_convert.sh --input_fp8_hf_path /data/models/GLM-5-FP8 --output_hf_path /data/models/GLM-5-W8A8 --quant_mode w8a8c16
+  ```
+
+### 修改代码
+- 修改`cann-recipes-infer/executor/scripts/set_env.sh`中的如下字段:
+  ```shell
+  export IPs=('xxx.xxx.xxx.xxx' 'xxx.xxx.xxx.xxx') # 所有节点的IP，确保第1个IP是master，多个节点的ip通过空格分开
+  cann_path="your_cann_pkgs_path" # CANN软件包安装路径，镜像默认CANN包路径为`/usr/local/Ascend/ascend-toolkit/latest`
+  ```
+- 在各个节点上修改 `config/` 路径下需要执行的yaml文件中的model_path路径。关于YAML文件中的更多配置说明可参见[YAML参数描述](./config/README.md)。
+
+  ```
+  # W8A8
+  model_path: "/data/models/GLM-5-W8A8"
+  ```
+
+- 在各个节点上修改 infer.sh 文件中的YAML_FILE_NAME，指定为上一步需要执行的yaml文件名。默认的yaml路径为32卡推理。
+
+  ```
+  # W8A8 prefill
+  export YAML_FILE_NAME=glm_5_rank_64_64ep_w8a8_prefill_benchmark.yaml
+  # W8A8 decode
+  export YAML_FILE_NAME=glm_5_rank_128_128ep_w8a8_decode_benchmark.yaml
+  ```
+
+  > **Note**: 本样例Int8场景Prefill支持8-128卡，Decode支持8-128卡，可分别在config下的yaml文件中修改world_size配置。
+
+### 拉起多卡推理
+  在各个节点上同步执行如下命令即可拉起多卡推理任务。
+  ```shell
+  bash infer.sh
+  ```
+
+## Benchmark
+基于Atlas A3，本实践使用`config/glm_5_rank_128_128ep_w8a8_decode_benchmark.yaml`作为运行配置文件，对GLM-5 W8A8 量化版本进行了性能Benchmark测试。
+|Quant Mode| Global Batch Size | Seq Length | Chips | TPOT (ms) | Throughput (tokens/p/s) |
+|-------| ----------------- | ---------- | ----- | --------- | ----------------------- |
+|W8A8 |    256           | 65536       | 64   | 22.54      |177.46                     |
+
+> 注：性能数据基于 MTP3 与 perfect eplb 配置采集，平均 1 个 draft token 中 accept token 为 0.8 个。
+
+## 附录
+### FAQ
+- **HCCL_BUFFSIZE不足问题**：如果报错日志中出现关键字"HCCL_BUFFSIZE is too SMALL, ..., NEEDED_HCCL_BUFFSIZE..., HCCL_BUFFSIZE=200MB, ..."，可通过配置环境变量 `export HCCL_BUFFSIZE=实际需要的大小` 解决，所有Rank上的该环境变量需保持一致。HCCL_BUFFSIZE参数介绍可参考[昇腾资料](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/83RC1alpha003/maintenref/envvar/envref_07_0080.html)中的详细描述。
+- **自定义算子导入失败**：如果报错日志中出现类似关键字"'_OpNamespace' 'custom' object has no attribute"，可参考[自定义算子指南](../../ops/ascendc/README.md)编译所需算子。

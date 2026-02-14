@@ -150,7 +150,7 @@ class DeepseekV3Config(PretrainedConfig):
         bos_token_id=0,
         eos_token_id=1,
         tie_word_embeddings=False,
-        rope_theta=10000.0,
+        rope_theta=None,
         rope_scaling=None,
         attention_bias=False,
         attention_dropout=0.0,
