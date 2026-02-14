@@ -38,7 +38,7 @@ import custom_ops
 from executor.utils import npu_stream_switch, get_had_pow2
 from module.linear import ReplicatedLinear
 
-indexer_npu_events = [tng.ops.npu_create_tagged_event(tag=f"indexer_evt_{i}") for i in range(2)]
+indexer_npu_events = [tng.ops.npu_create_tagged_event(tag=f"indexer_evt_{i}") for i in range(4)]
 
 
 class LayerNorm(nn.Module):
@@ -271,6 +271,8 @@ class Indexer(nn.Module):
             # [b,s,n,d]
             q_pe = torch_npu.npu_rotary_mul(q_pe, cos, sin).view(bsz, -1, self.n_heads, self.rope_head_dim)
             q = torch.cat([q_pe, q_nope], dim=-1)
+            if enable_multi_streams and self.enable_aclgraph:
+                tng.ops.npu_tagged_event_record(indexer_npu_events[2])
         with npu_stream_switch(enable_multi_streams, "33"):
             if enable_multi_streams:
                 if self.enable_aclgraph:
@@ -278,6 +280,8 @@ class Indexer(nn.Module):
                 else:
                     tng.scope.npu_wait_tensor(x, q_b)
             weights = self.weights_proj(x.view(-1, self.dim))
+            if enable_multi_streams and self.enable_aclgraph:
+                tng.ops.npu_tagged_event_record(indexer_npu_events[3])
 
         k_proj = self.wk(x)  # [b,s,7168] @ [7168,128] = [b,s,128]
         k = self.k_norm(k_proj)
@@ -289,6 +293,8 @@ class Indexer(nn.Module):
         key_dequant_scale = None
         indexer_input = {}
 
+        if enable_multi_streams and self.enable_aclgraph:
+            tng.ops.npu_tagged_event_wait(indexer_npu_events[2])
         if self.kv_cache_quant_mode == "int8":
             with npu_stream_switch(enable_multi_streams, "22"):
                 # q quant
@@ -362,6 +368,9 @@ class Indexer(nn.Module):
                             "k_proj": k_proj,
                             "is_prefill": is_prefill,
                             })
+
+        if enable_multi_streams and self.enable_aclgraph:
+            tng.ops.npu_tagged_event_wait(indexer_npu_events[3])
         if self.cp_size > 1 and is_prefill:
             # [B, S, N, D] -> [T, N, D]
             x = x.flatten(0, 1).unsqueeze(0)
