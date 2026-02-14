@@ -118,7 +118,7 @@ def tokenizer_in_loop(tokenizer, prompts, input_max_len=32, section_size=1024):
         input_ids_list.extend(prompts_input_ids)
         logging.info(f"{len(input_ids_list)} of {total_num} prompts have been tokenized...")
     return input_ids_list
-        
+
 
 def build_dataset_input(tokenizer, prompts, input_max_len, max_new_tokens=32, is_chat=False):
     # Provide system prompt for the text; the default is aritcle continuation, which can be modified as needed.
@@ -128,16 +128,17 @@ def build_dataset_input(tokenizer, prompts, input_max_len, max_new_tokens=32, is
             f"First, tell me the title and the author, and then tell the story in {max_new_tokens} words.\n\n "
     if is_chat:
         system_prompt_chat = [{"role": "user", "content": prefix + suffix}]
-        system_prompt_len = len(tokenizer.apply_chat_template(system_prompt_chat, add_generation_prompt=True))
+        system_prompt_len = \
+            len(tokenizer.apply_chat_template(system_prompt_chat, add_generation_prompt=True, return_dict=False))
     else:
         system_prompt_len = len(tokenizer(prefix + suffix).input_ids)
     if system_prompt_len > input_max_len:
         logging.info("The parameter 'input_max_len' should be greater than the length of system prompt. " + \
          "Please modify the input_max_len in the YAML file or modify system prompt in executor/utils/data_utils.py.")
-    
+
     # use tokenizer loop to avoid host oom when query num is large
     input_ids_list = tokenizer_in_loop(tokenizer, prompts, input_max_len)
-    
+
     out_prompts = []
     for prompt_input_ids in input_ids_list:
         prompt = prefix + \

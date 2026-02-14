@@ -136,6 +136,9 @@ class QuantizationConfig(ABC):
     def get_cache_scale(self, name: str) -> Optional[str]:
         return None
 
+    def set_quant_mode(self, name: str, value: str) -> None:
+        setattr(self, name, value)
+
 
 # Adapted from vllm.model_executor.layers.quantization.get_quantization_config
 def get_quantization_config(quantization: str) -> type[QuantizationConfig]:

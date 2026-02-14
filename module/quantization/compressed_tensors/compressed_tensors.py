@@ -75,7 +75,7 @@ class CompressedTensorsConfig(QuantizationConfig):
         prefix: str,
     ) -> Optional["QuantizeMethodBase"]:
         if should_ignore_layer(layer_name=prefix, ignore=self.ignore):
-            return UnquantizedLinearMethod()    
+            return UnquantizedLinearMethod()
         if isinstance(layer, LinearBase):
             scheme = self.get_scheme(layer=layer, layer_name=prefix)
             layer.scheme = scheme
@@ -100,6 +100,7 @@ class CompressedTensorsConfig(QuantizationConfig):
                                     sparsity_ignore_list=None,
                                     config=config
         )
+
         quant_config_instance.mm_quant_mode = quant_config_instance._get_quant_mode(
             target_scheme_map=target_scheme_map,
             target="Linear")
@@ -190,7 +191,7 @@ class CompressedTensorsConfig(QuantizationConfig):
         # Both symmetric and asymmetric input quantization supported.
         # Only symmetric weight quantization supported.
         return is_8_bits and is_token and weight_quant.symmetric and is_dynamic
-    
+
     def is_wNa16_group_channel(self,
                             weight_quant: BaseModel,
                             input_quant: BaseModel,) -> bool:
@@ -203,7 +204,7 @@ class CompressedTensorsConfig(QuantizationConfig):
         is_static = not weight_quant.dynamic
 
         return is_channel_group and input_quant_none and is_symmetric and is_static
-    
+
     def is_dynamic_token_w4a8(self,
                                weight_quant: BaseModel,
                                input_quant: BaseModel,) -> bool:
