@@ -18,7 +18,7 @@ export SGLANG_SET_CPU_AFFINITY=1
 export PYTHONPATH=${PWD}/python:$PYTHONPATH
 
 # CANN 相关
-source /usr/local/Ascend/8.5.0/bisheng_toolkit/set_env.sh
+source /usr/local/Ascend/cann-8.5.0/set_env.sh
 which bishengir-compile
 
 # 内存碎片

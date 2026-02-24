@@ -778,7 +778,7 @@ index 5b6a09b5d..a49de37a3 100644
 +                )
 +        else:
 +            recurrent_state = ssm_states[cache_indices]
-+            core_attn_out, last_recurrent_state = chunk_gated_delta_rule_npu(
++            core_attn_out, last_recurrent_state, _ = chunk_gated_delta_rule_npu( # version of sgl-kernel-npu before 25.12.22 only returns the first 2 values
 +                q=query,
 +                k=key,
 +                v=value,
