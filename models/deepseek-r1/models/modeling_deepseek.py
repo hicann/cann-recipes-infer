@@ -925,9 +925,11 @@ class DeepseekV3Attention(nn.Module):
             and self.enable_pa
             and self.enable_weight_nz
         )
+        self.ckv_scale = None
+        self.ckv_scale_reci = None
+        self.ckv_scale_reci_repeat = None
         if self.kv_cache_quant_mode == "int8":
             self.ckv_scale = nn.Parameter(torch.rand(1, dtype=torch.float), requires_grad=False)
-            self.ckv_scale_reci = None
         self.enable_aclgraph = runner_settings.get("exe_mode", "eager") == "acl_graph"
         self.enable_gegraph = runner_settings.get("exe_mode", "eager") == "ge_graph"
         self.fa_ops = torch.ops.npu
@@ -1123,17 +1125,18 @@ class DeepseekV3Attention(nn.Module):
             latent_cache = latent_cache_output
 
         latent_cache = latent_cache.view(-1, 1, 1, self.kv_lora_rank + self.qk_rope_head_dim)  # (B,N,S,D)
-        nope_cache = past_key_value[self.layer_idx][0].unsqueeze(2)
-        rope_cache = past_key_value[self.layer_idx][1].unsqueeze(2)
+        nope_cache = past_key_value[self.layer_idx][0]
+        rope_cache = past_key_value[self.layer_idx][1]
         block_num, block_size, key_head_num, cache_dim = nope_cache.size()
         # prefill stage needs to view shapes as the following.
         cos = cos.view(-1, 1, 1, self.qk_rope_head_dim)
         sin = sin.view(-1, 1, 1, self.qk_rope_head_dim)
 
-        if self.kv_cache_quant_mode == "int8":
-            self.ckv_scale_reci = torch.reciprocal(self.ckv_scale).repeat(self.kv_lora_rank).view(1, -1) \
-                .to(hidden_states.device)
-        _, _, k_rope, k_nope = torch_npu.npu_kv_rmsnorm_rope_cache(
+        if self.kv_cache_quant_mode == "int8" and self.ckv_scale_reci is None:
+            self.ckv_scale_reci = torch.reciprocal(self.ckv_scale)
+            self.ckv_scale_reci_repeat = self.ckv_scale_reci.repeat(self.kv_lora_rank).view(1, -1)
+
+        k_rope, k_nope = torch_npu.npu_kv_rmsnorm_rope_cache_v2(
             latent_cache,
             self.kv_a_layernorm.weight,
             cos,
@@ -1141,7 +1144,7 @@ class DeepseekV3Attention(nn.Module):
             slot_mapping,
             rope_cache,
             nope_cache,
-            c_kv_scale=self.ckv_scale_reci if self.kv_cache_quant_mode == "int8" else None,
+            c_kv_scale=self.ckv_scale_reci_repeat if self.kv_cache_quant_mode == "int8" else None,
             epsilon=self.kv_a_layernorm.variance_epsilon,
             cache_mode="PA_NZ",
             is_output_kv=True
@@ -1242,11 +1245,11 @@ class DeepseekV3Attention(nn.Module):
         )  # (b*s, n, 1, d)
         cos = cos.view(-1, 1, 1, self.qk_rope_head_dim)  # (b*s, n, 1, d)
         sin = sin.view(-1, 1, 1, self.qk_rope_head_dim)  # (b*s, n, 1, d)
-        nope_cache = past_key_value[self.layer_idx][0].unsqueeze(2)
-        rope_cache = past_key_value[self.layer_idx][1].unsqueeze(2)
+        nope_cache = past_key_value[self.layer_idx][0]
+        rope_cache = past_key_value[self.layer_idx][1]
         block_num, block_size, _, _ = nope_cache.size()
 
-        k_rope, k_nope, _, _ = torch_npu.npu_kv_rmsnorm_rope_cache(
+        torch_npu.npu_kv_rmsnorm_rope_cache_v2(
             latent_cache,
             self.kv_a_layernorm.weight,
             cos,
@@ -1257,6 +1260,7 @@ class DeepseekV3Attention(nn.Module):
             epsilon=self.kv_a_layernorm.variance_epsilon,
             cache_mode="PA_NZ"
         )
+        k_rope, k_nope = rope_cache, nope_cache
 
         # adapter nz
         KV_CACHE_NZ_DIM = 16  # bf16 dtype is 16 for nz format, avoid dynamic shape in high torch version
@@ -1325,8 +1329,8 @@ class DeepseekV3Attention(nn.Module):
         cos = cos.view(bsz, 1, -1, self.qk_rope_head_dim)
         sin = sin.view(bsz, 1, -1, self.qk_rope_head_dim)
         cache_index = kv_len.view(bsz, -1)
-        nope_cache = past_key_value[self.layer_idx][0].unsqueeze(2)
-        rope_cache = past_key_value[self.layer_idx][1].unsqueeze(2)
+        nope_cache = past_key_value[self.layer_idx][0]
+        rope_cache = past_key_value[self.layer_idx][1]
         block_num, block_size, key_head_num, cache_dim = nope_cache.size()
 
         enable_mm_quant_a8w8 = "a8" in self.mm_quant_mode
@@ -1335,7 +1339,7 @@ class DeepseekV3Attention(nn.Module):
             hidden_states_int8 = hidden_states_int8.view(bsz, q_len, -1)
             pertoken_scale = pertoken_scale.view(-1, 1)
 
-        q_nope, q_pe, k_nope, k_rope, dequant_scale_q_nope = torch.ops.npu.npu_mla_prolog_v2(
+        q_nope, q_pe, dequant_scale_q_nope, _, _ = torch.ops.npu.npu_mla_prolog_v3(
             token_x=hidden_states_int8 if enable_mm_quant_a8w8 else hidden_states,
             weight_dq=self.q_a_proj.weight, weight_uq_qr=self.q_b_proj.weight,
             weight_uk=self.kv_b_proj_w_k, weight_dkv_kr=self.kv_a_proj_with_mqa.weight,
@@ -1354,8 +1358,22 @@ class DeepseekV3Attention(nn.Module):
             smooth_scales_cq=None,
             rmsnorm_epsilon_cq=self.q_a_layernorm.variance_epsilon,
             rmsnorm_epsilon_ckv=self.kv_a_layernorm.variance_epsilon,
-            cache_mode="PA_NZ"
+            cache_mode="PA_NZ",
+            # weight_quant_mode
+            #   0: non-quant;
+            #   1: weight_uq_qr int8-quant; 2: weight_dq,weight_uq_qr,weight_dkv_kr int8-quant;
+            #   3: weight_dq,weight_uq_qr,weight_dkv_kr mxfp8-quant
+            weight_quant_mode=2 if enable_mm_quant_a8w8 else 0,
+            # kv_cache_quant_mode
+            #   0:non-quant;
+            #   1:per-tensor quant; 2: per-channel quant; 3: per-tile quant
+            kv_cache_quant_mode=1 if self.kv_cache_quant_mode == "int8" else 0,
+            # query_quant_mode
+            #   0: non-quant;
+            #   1: per-token-head quant
+            query_quant_mode=1 if enable_mm_quant_a8w8 and self.kv_cache_quant_mode == "int8" else 0,
         )
+        k_nope, k_rope = nope_cache, rope_cache
 
         # adapter nz
         factor = 2 if self.kv_cache_quant_mode == "int8" else 1
@@ -2472,12 +2490,14 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
             cache_nope_shape = (
                             self.kv_cache_num_block,
                             self.block_size,
+                            1,
                             self.config.kv_lora_rank
                         )
 
             cache_rope_shape = (
                             self.kv_cache_num_block,
                             self.block_size,
+                            1,
                             self.config.qk_rope_head_dim
                         )
 
