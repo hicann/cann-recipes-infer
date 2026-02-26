@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright (c) 2025 Huawei Technologies Co., Ltd.
+# Copyright (c) Huawei Technologies Co., Ltd. 2025-2026.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -57,6 +57,8 @@ class AttentionParams:
     causal: bool = False
     softmax_scale: Optional[float] = None
     per_head_compute: bool = False
+    joint_tensor_key: Optional[torch.Tensor] = None
+    joint_tensor_value: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -134,12 +136,8 @@ class UnifiedSPAttention:
         
         if params.joint_strategy == "rear" and params.joint_tensor_query is not None:
             q = torch.cat([q, params.joint_tensor_query], dim=1)
-            k = torch.cat([k, params.joint_tensor_key], dim=1)
-            v = torch.cat([v, params.joint_tensor_value], dim=1)
         elif params.joint_strategy == "front" and params.joint_tensor_query is not None:
             q = torch.cat([params.joint_tensor_query, q], dim=1)
-            k = torch.cat([params.joint_tensor_key, k], dim=1)
-            v = torch.cat([params.joint_tensor_value, v], dim=1)
         
         if params.seq_lens is not None and params.seq_lens < q.shape[1]:
             q_main, q_pad = q[:, :params.seq_lens], q[:, params.seq_lens:]
@@ -168,7 +166,9 @@ class UnifiedSPAttention:
             q=q, k=k, v=v,
             causal=params.causal, 
             softmax_scale=params.softmax_scale,
-            per_head_compute=params.per_head_compute
+            per_head_compute=params.per_head_compute,
+            joint_tensor_key=params.joint_tensor_key,
+            joint_tensor_value=params.joint_tensor_value,
         )
         return self._forward_core(attn_params, **kwargs)
     
@@ -180,6 +180,8 @@ class UnifiedSPAttention:
         
         q, k, v = params.q, params.k, params.v
         original_seq_len = None
+        joint_tensor_key = params.joint_tensor_key
+        joint_tensor_value = params.joint_tensor_value
         
         if self.ulysses_world_size > 1:
             # Check head divisibility
@@ -191,27 +193,34 @@ class UnifiedSPAttention:
                     f"Please adjust your model configuration or Ulysses degree."
                 )
             
-            # Pad sequence length to be divisible by ulysses_world_size
             original_seq_len = q.shape[1]
-            if original_seq_len % self.ulysses_world_size != 0:
-                padded_seq_len = math.ceil(original_seq_len / self.ulysses_world_size) * self.ulysses_world_size
-                pad_len = padded_seq_len - original_seq_len
-                
-                # Pad Q, K, V
-                q = torch.nn.functional.pad(q, (0, 0, 0, 0, 0, pad_len), value=0.0)
-                k = torch.nn.functional.pad(k, (0, 0, 0, 0, 0, pad_len), value=0.0)
-                v = torch.nn.functional.pad(v, (0, 0, 0, 0, 0, pad_len), value=0.0)
             
             q = self._all_to_all_head_to_seq(q)
             k = self._all_to_all_head_to_seq(k)
             v = self._all_to_all_head_to_seq(v)
-        
+
+            if params.joint_tensor_key is not None:
+                ulysses_rank = dist.get_rank(self.ulysses_pg)
+                attn_heads_per_ulysses_rank = (
+                    params.joint_tensor_key.shape[-2] // self.ulysses_world_size
+                )
+                start_idx = attn_heads_per_ulysses_rank * ulysses_rank
+                end_idx = start_idx + attn_heads_per_ulysses_rank
+                joint_tensor_key = joint_tensor_key[..., start_idx:end_idx, :]
+                joint_tensor_value = joint_tensor_value[..., start_idx:end_idx, :]
+
+        if self.ring_world_size == 1:
+            k = torch.cat([k, joint_tensor_key], dim=1)
+            v = torch.cat([v, joint_tensor_value], dim=1)
+
         # Create updated params with transformed q, k, v
         updated_params = AttentionParams(
             q=q, k=k, v=v,
             causal=params.causal,
             softmax_scale=params.softmax_scale,
-            per_head_compute=params.per_head_compute
+            per_head_compute=params.per_head_compute,
+            joint_tensor_key=joint_tensor_key,
+            joint_tensor_value=joint_tensor_value
         )
         
         if self.ring_world_size > 1:
@@ -224,10 +233,6 @@ class UnifiedSPAttention:
         
         if self.ulysses_world_size > 1:
             out = self._all_to_all_seq_to_head(out)
-            
-            # Remove padding
-            if original_seq_len is not None and out.shape[1] != original_seq_len:
-                out = out[:, :original_seq_len, :, :]
         
         return out
     
@@ -335,9 +340,10 @@ class UnifiedSPAttention:
         
         k_others = torch.index_select(k_gathered, dim=0, index=other_indices)
         v_others = torch.index_select(v_gathered, dim=0, index=other_indices)
-        
-        k_others = k_others.permute(1, 0, 2, 3, 4).contiguous().reshape(b, -1, n, d)
-        v_others = v_others.permute(1, 0, 2, 3, 4).contiguous().reshape(b, -1, n, d)
+
+        target_shape = (b, n, d)
+        k_others = self._kv_post_process(k_others, params.joint_tensor_key, target_shape)
+        v_others = self._kv_post_process(v_others, params.joint_tensor_value, target_shape)
         
         params_others = AttentionParams(
             q=q, k=k_others, v=v_others,
@@ -375,8 +381,9 @@ class UnifiedSPAttention:
         dist.all_gather_into_tensor(k_gathered, k.contiguous(), group=self.ring_pg)
         dist.all_gather_into_tensor(v_gathered, v.contiguous(), group=self.ring_pg)
         
-        k_full = k_gathered.permute(1, 0, 2, 3, 4).reshape(b, -1, n, d)
-        v_full = v_gathered.permute(1, 0, 2, 3, 4).reshape(b, -1, n, d)
+        target_shape = (b, n, d)
+        k_full = self._kv_post_process(k_gathered, params.joint_tensor_key, target_shape)
+        v_full = self._kv_post_process(v_gathered, params.joint_tensor_value, target_shape)
         
         params_full = AttentionParams(
             q=params.q, k=k_full, v=v_full,
@@ -385,6 +392,12 @@ class UnifiedSPAttention:
             per_head_compute=params.per_head_compute
         )
         return self._compute_attention(params_full)
+    
+    @staticmethod
+    def _kv_post_process(tensor, joint_tensor, target_shape, dim=1):
+        b, n, d = target_shape
+        tensor = tensor.permute(1, 0, 2, 3, 4).reshape(b, -1, n, d)
+        return torch.cat([tensor, joint_tensor], dim=dim)
     
     def _compute_attention(
         self,

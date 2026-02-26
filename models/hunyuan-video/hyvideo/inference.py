@@ -1,7 +1,7 @@
 # coding=utf-8
 # Adapted from  
 # https://github.com/Tencent-Hunyuan/HunyuanVideo,
-# Copyright (c) Huawei Technologies Co., Ltd. 2025.
+# Copyright (c) Huawei Technologies Co., Ltd. 2025-2026.
 # Copyright (C) 2024 THL A29 Limited, a Tencent company. All rights reserved.
 #
 # This code is based on Tencent-Hunyuan's HunyuanVideo library and the HunyuanVideo
@@ -46,7 +46,6 @@ from hyvideo.diffusion.schedulers import FlowMatchDiscreteScheduler
 from hyvideo.diffusion.pipelines import HunyuanVideoPipeline
 from hyvideo.vae.vae_parallel import decode
 from module.unified_sp.core import UnifiedSPAttention
-from module.vae_patch_parallel import VAE_patch_parallel, set_vae_patch_parallel
 
 try:
     import xfuser
@@ -70,6 +69,12 @@ except ImportError:
 def parallelize_transformer(pipe):
     transformer = pipe.transformer
     original_forward = transformer.forward
+
+    sp_attn = UnifiedSPAttention(
+        ulysses_group=get_sp_group().ulysses_group,
+        ring_group=get_sp_group().ring_group,
+        use_ring_overlap=True,
+    )
 
     @functools.wraps(transformer.__class__.forward)
     def new_forward(
@@ -112,7 +117,7 @@ def parallelize_transformer(pipe):
         freqs_sin = freqs_sin.reshape(1, -1, 1, dim_thw)
         
         for block in transformer.double_blocks + transformer.single_blocks:
-            block.hybrid_seq_parallel_attn = xFuserLongContextAttention()
+            block.hybrid_seq_parallel_attn = sp_attn.forward
 
         output = original_forward(
             x,

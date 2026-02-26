@@ -80,6 +80,7 @@ def decode(
     gather_list = list(torch.chunk(gather_tensor, world_size, dim=0))
     dist.all_gather(gather_list, decoded_local)
     decoded = torch.cat(gather_list, dim=-1).contiguous()
+    decoded = decoded.squeeze(0)
 
     if not return_dict:
         return (decoded,)

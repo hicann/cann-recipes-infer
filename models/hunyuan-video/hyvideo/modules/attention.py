@@ -1,7 +1,7 @@
 # coding=utf-8
 # Adapted from  
 # https://github.com/Tencent-Hunyuan/HunyuanVideo,
-# Copyright (c) Huawei Technologies Co., Ltd. 2025.
+# Copyright (c) Huawei Technologies Co., Ltd. 2025-2026.
 # Copyright (C) 2024 THL A29 Limited, a Tencent company. All rights reserved.
 #
 # This code is based on Tencent-Hunyuan's HunyuanVideo library and the HunyuanVideo
@@ -220,10 +220,9 @@ def parallel_attention(
     b, s, n, d = q.shape	 
 
     attn1 = hybrid_seq_parallel_attn(	 
-        None,	 
-        q[:, :img_q_len, :, :],	 
-        k[:, :img_kv_len, :, :],	 
-        v[:, :img_kv_len, :, :], 
+        q=q[:, :img_q_len, :, :],
+        k=k[:, :img_kv_len, :, :],
+        v=v[:, :img_kv_len, :, :],
         dropout_p=0.0, 
         causal=False,	 
         joint_tensor_query=q[:, img_q_len:cu_seqlens_q[1]],	 
