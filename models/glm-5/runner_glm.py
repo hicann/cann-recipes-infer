@@ -28,7 +28,7 @@ import torch
 import torch.distributed as dist
 import torch_npu
 import torch.nn as nn
-from models.modeling_deepseek import DeepseekV3ForCausalLM, DeepseekV3ModelMTP
+from models.modeling_glm import GlmMoeDsaForCausalLM, GlmMoeDsaModelMTP
 from executor.utils import override, get_init_attn_mask
 from executor.model_runner import ModelRunner
 from executor.model_loader.default_loader import DefaultModelLoader
@@ -50,7 +50,7 @@ torch.manual_seed(42)
 torch.npu.manual_seed_all(42)
 
 
-class DeepSeekRunner(ModelRunner):
+class GlmRunner(ModelRunner):
     def __init__(self, runner_settings):
         super().__init__(runner_settings)
         self.batch_size = runner_settings.get("data_config").get("batch_size")
@@ -75,14 +75,14 @@ class DeepSeekRunner(ModelRunner):
             config = None
         else:
             self.use_pretrained_model = False
-        from models.configuration_deepseek import DeepseekV3Config as config
+        from models.configuration_glm import GlmMoeDsaConfig as config
         logging.info(f"use_pretrained_model: {self.use_pretrained_model}")
         if is_mtp:
-            model = DeepseekV3ModelMTP
-            super().init_model(DeepseekV3ModelMTP, config)
+            model = GlmMoeDsaModelMTP
+            super().init_model(GlmMoeDsaModelMTP, config)
         else:
-            model = DeepseekV3ForCausalLM
-            super().init_model(DeepseekV3ForCausalLM, config)
+            model = GlmMoeDsaForCausalLM
+            super().init_model(GlmMoeDsaForCausalLM, config)
 
     @override
     def _process_weight_after_loading(self):

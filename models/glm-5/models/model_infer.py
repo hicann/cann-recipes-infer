@@ -43,6 +43,10 @@ class Infer(nn.Module):
         self.main_model = main_model
         self.mtp_model = mtp_model
 
+        # Glm-5 has three eos_token; [154820, 154827, 154829]; ['<|endoftext|>', '<|user|>', '<|observation|>']
+        self.eos_token_id = main_model.model.config.eos_token_id
+        self.eos_tokens = main_model.tokenizer.convert_ids_to_tokens(self.eos_token_id)
+
         self.kv_cache_quant_mode = main_model.model.config.quant_config.kv_cache_quant_mode \
             if main_model.model.config.quant_config is not None else "unquant"
 
@@ -822,8 +826,8 @@ class Infer(nn.Module):
 
             for generate_ids in generate_ids_list:
                 res = self.main_model.tokenizer.decode(generate_ids[input_lens:], skip_special_tokens=False)
-                if self.main_model.tokenizer.eos_token in res:
-                    res = res.split(self.main_model.tokenizer.eos_token)[0]
+                for eos_token in self.eos_tokens:
+                    res = res.split(eos_token)[0]
                 logging.info("Inference decode result: \n%s", res)
 
         return input_dict_main, input_dict_mtp

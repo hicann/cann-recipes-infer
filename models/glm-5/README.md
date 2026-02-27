@@ -35,8 +35,9 @@
   ```
 
 ### 下载权重
-
-  下载[GLM-5原始FP8权重](https://huggingface.co/zai-org/GLM-5-FP8)，并上传到Atlas A3各节点某个固定的路径下，比如`/data/models/GLM-5-FP8`。
+  智谱团队开源了GLM-5模型的Bfloat16与FP8两种格式权重, 可按需选择下载。
+  - 下载[GLM-5原始Bfloat16权重](https://huggingface.co/zai-org/GLM-5)，并上传到Atlas A3各节点某个固定的路径下，比如`/data/models/GLM-5`。
+  - 下载[GLM-5原始FP8权重](https://huggingface.co/zai-org/GLM-5-FP8)，并上传到Atlas A3各节点某个固定的路径下，比如`/data/models/GLM-5-FP8`。
 
 ### 获取 docker 镜像
   从[ARM镜像地址](https://cann-ai.obs.cn-north-4.myhuaweicloud.com/cann-quantization/GLM/cann8.5_pt2.8.0_glm_aarch_image_v0.1.tar)中下载 docker 镜像，然后上传到A3服务器的每个节点上，并通过命令导入镜像 `docker load -i cann8.5_pt2.8.0_glm_aarch_image_v0.1.tar`。

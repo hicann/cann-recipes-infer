@@ -1,13 +1,9 @@
 # coding=utf-8
 # Adapted from
-# https://huggingface.co/deepseek-ai/DeepSeek-V3/blob/main/modeling_deepseek.py
+# https://github.com/huggingface/transformers/blob/main/src/transformers/models/glm_moe_dsa/modeling_glm_moe_dsa.py
 # Copyright (c) 2026 Huawei Technologies Co., Ltd.
-# Copyright 2023 DeepSeek-AI and The HuggingFace Inc. team. All rights reserved.
+# Copyright 2024 The GLM & ZhipuAI team and HuggingFace Inc. team. All rights reserved.
 #
-# This code is based on EleutherAI's GPT-NeoX library and the GPT-NeoX
-# and OPT implementations in this library. It has been modified from its
-# original forms to accommodate minor architectural differences compared
-# to GPT-NeoX and OPT used by the Meta AI team that trained the model.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -37,7 +33,7 @@ import torchair as tng
 from executor.utils import npu_stream_switch, get_had_pow2
 from module.linear import ReplicatedLinear
 
-indexer_npu_events = [tng.ops.npu_create_tagged_event(tag=f"indexer_evt_{i}") for i in range(2)]
+indexer_npu_events = [tng.ops.npu_create_tagged_event(tag=f"indexer_evt_{i}") for i in range(4)]
 
 
 class LayerNorm(nn.Module):
@@ -52,7 +48,7 @@ class LayerNorm(nn.Module):
         return F.layer_norm(x, (self.dim,), self.weight, self.bias, self.eps)
 
 
-class Indexer(nn.Module):
+class GlmMoeDsaIndexer(nn.Module):
     def __init__(self, config, runner_settings, layer_idx: Optional[int] = None,
                  prefix: Optional[str] = "", **kwargs):
         super().__init__()
@@ -173,6 +169,10 @@ class Indexer(nn.Module):
         enable_multi_streams = self.enable_multi_streams and not is_prefill
 
         if enable_multi_streams and self.enable_aclgraph:
+            tng.ops.npu_record_tagged_stream(qr, "22")
+            tng.ops.npu_record_tagged_stream(query_states[0], "22")
+            tng.ops.npu_record_tagged_stream(cos, "22")
+            tng.ops.npu_record_tagged_stream(sin, "22")
             tng.ops.npu_tagged_event_record(indexer_npu_events[0])
         with npu_stream_switch(enable_multi_streams, "22"):
             # prolog for kv use multi streams
@@ -185,6 +185,8 @@ class Indexer(nn.Module):
             q_b = self.wq_b(qr, c8_input_dict.get("pertoken_scale", None)) # [b,s,1536] @ [1536,64*128] = [b,s,64*128]
 
             if enable_multi_streams and self.enable_aclgraph:
+                tng.ops.npu_record_tagged_stream(q_b, "33")
+                tng.ops.npu_record_tagged_stream(x, "33")
                 tng.ops.npu_tagged_event_record(indexer_npu_events[1])
 
             q = q_b.view(bsz, seqlen, self.n_heads, self.head_dim)  # [b,s,64,128]
@@ -195,6 +197,8 @@ class Indexer(nn.Module):
             # [b,s,n,d]
             q_pe = torch_npu.npu_interleave_rope(q_pe, cos, sin).view(bsz, -1, self.n_heads, self.rope_head_dim)
             q = torch.cat([q_pe, q_nope], dim=-1)
+            if enable_multi_streams and self.enable_aclgraph:
+                tng.ops.npu_tagged_event_record(indexer_npu_events[2])
         with npu_stream_switch(enable_multi_streams, "33"):
             if enable_multi_streams:
                 if self.enable_aclgraph:
@@ -202,6 +206,8 @@ class Indexer(nn.Module):
                 else:
                     tng.scope.npu_wait_tensor(x, q_b)
             weights = self.weights_proj(x.view(-1, self.dim))
+            if enable_multi_streams and self.enable_aclgraph:
+                tng.ops.npu_tagged_event_record(indexer_npu_events[3])
 
         k_proj = self.wk(x)  # [b,s,7168] @ [7168,128] = [b,s,128]
         k = self.k_norm(k_proj)
@@ -213,6 +219,8 @@ class Indexer(nn.Module):
         key_dequant_scale = None
         indexer_input = {}
 
+        if enable_multi_streams and self.enable_aclgraph:
+            tng.ops.npu_tagged_event_wait(indexer_npu_events[2])
         if self.li_cache_quant_mode == "int8":
             with npu_stream_switch(enable_multi_streams, "22"):
                 # q quant
@@ -286,6 +294,8 @@ class Indexer(nn.Module):
                             "k_proj": k_proj,
                             "is_prefill": is_prefill,
                             })
+        if enable_multi_streams and self.enable_aclgraph:
+            tng.ops.npu_tagged_event_wait(indexer_npu_events[3])
         if self.cp_size > 1 and is_prefill:
             # [B, S, N, D] -> [T, N, D]
             x = x.flatten(0, 1).unsqueeze(0)

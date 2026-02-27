@@ -1,13 +1,9 @@
 # coding=utf-8
 # Adapted from
-# https://huggingface.co/deepseek-ai/DeepSeek-V3/blob/main/modeling_deepseek.py
-# Copyright (c) 2025 Huawei Technologies Co., Ltd.
-# Copyright 2023 DeepSeek-AI and The HuggingFace Inc. team. All rights reserved.
+# https://github.com/huggingface/transformers/blob/main/src/transformers/models/glm_moe_dsa/modeling_glm_moe_dsa.py
+# Copyright (c) 2026 Huawei Technologies Co., Ltd.
+# Copyright 2024 The GLM & ZhipuAI team and HuggingFace Inc. team. All rights reserved.
 #
-# This code is based on EleutherAI's GPT-NeoX library and the GPT-NeoX
-# and OPT implementations in this library. It has been modified from its
-# original forms to accommodate minor architectural differences compared
-# to GPT-NeoX and OPT used by the Meta AI team that trained the model.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -21,7 +17,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-""" PyTorch DeepSeek model."""
 import os
 from typing import List, Optional, Tuple, Union, Dict, Iterable, Set
 
@@ -36,11 +31,8 @@ import torch_npu
 import torchair as tng
 
 from transformers.cache_utils import Cache
-from transformers.utils import (
-    add_start_docstrings,
-    add_start_docstrings_to_model_forward,
-    logging,
-)
+from transformers.modeling_utils import PreTrainedModel
+from transformers.utils import logging
 
 from executor.utils import (
     override, get_init_attn_mask, align_up, calc_moe_hccl_buffer_size,
@@ -56,19 +48,16 @@ from module.linear import (
     VocabParallelEmbedding
     )
 from module.fuse_moe_gmm import FusedMoEGMM
-from .configuration_deepseek import DeepseekV3Config
-from .modules import (one_hot, yarn_get_mscale,
-                      DeepseekV3RMSNorm, apply_rotary_pos_emb, _init_rope, DEEPSEEKV3_START_DOCSTRING,
-                      DEEPSEEKV3_INPUTS_DOCSTRING, DeepseekV3PreTrainedModel
-                    )
-from .indexer import Indexer
+from .configuration_glm import GlmMoeDsaConfig
+from .modules import one_hot, DeepseekV3RMSNorm, apply_rotary_pos_emb, _init_rope
+from .indexer import GlmMoeDsaIndexer
 from .offload_cache import OffloadCache
 
 logger = logging.get_logger(__name__)
 moe_npu_events = [tng.ops.npu_create_tagged_event(tag=f"moe_evt_{i}") for i in range(2)]
 
 
-class DeepseekV3DenseMLP(nn.Module):
+class GlmMoeDsaMLP(nn.Module):
     def __init__(self, config, runner_settings, prefix, **kwargs):
         super().__init__()
         self.runner_settings = runner_settings
@@ -139,7 +128,7 @@ class DeepseekV3DenseMLP(nn.Module):
         return self.down_proj(intermediate_hidden_states, pertoken_scale)
 
 
-class DeepseekV3SharedExpert(nn.Module):
+class GlmMoeDsaSharedExpert(nn.Module):
     def __init__(self, config, runner_settings, is_moe_layer=False, prefix="", **kwargs):
         super().__init__()
         self.runner_settings = runner_settings
@@ -194,7 +183,7 @@ class DeepseekV3SharedExpert(nn.Module):
         return self.down_proj(intermediate_hidden_states, pertoken_scale)
 
 
-class DeepseekV3MoE(nn.Module):
+class GlmMoeDsaMoE(nn.Module):
     """
     A mixed expert module containing shared experts.
     """
@@ -243,7 +232,7 @@ class DeepseekV3MoE(nn.Module):
 
         self._init_gate(prefix)
         if config.n_shared_experts is not None:
-            self.shared_experts = DeepseekV3SharedExpert(config, self.runner_settings,
+            self.shared_experts = GlmMoeDsaSharedExpert(config, self.runner_settings,
                                         is_moe_layer=True, prefix=f"{prefix}.shared_experts", **kwargs)
 
         self.dispatch_kwargs = None
@@ -417,6 +406,7 @@ class DeepseekV3MoE(nn.Module):
             enable_multi_streams = self.enable_multi_streams and not is_prefill
             use_aclgraph_event = enable_multi_streams and self.enable_aclgraph
             if use_aclgraph_event:
+                tng.ops.npu_record_tagged_stream(hidden_states, "11")
                 tng.ops.npu_tagged_event_record(moe_npu_events[0])
             with npu_stream_switch(enable_multi_streams, "11"):
                 if use_aclgraph_event:
@@ -667,9 +657,8 @@ class DeepseekV3MoE(nn.Module):
         return hidden_states
 
 
-# Copied from transformers.models.llama.modeling_llama.LlamaAttention with Llama->DeepseekV3
-class DeepseekIndexerAttention(nn.Module):
-    def __init__(self, config: DeepseekV3Config, runner_settings: Dict, layer_idx: Optional[int] = None,
+class GlmMoeDsaAttention(nn.Module):
+    def __init__(self, config: GlmMoeDsaConfig, runner_settings: Dict, layer_idx: Optional[int] = None,
                  prefix: Optional[str] = "", **kwargs):
         super().__init__()
         self.config = config
@@ -703,7 +692,6 @@ class DeepseekIndexerAttention(nn.Module):
         self.num_heads = config.num_attention_heads
         self.num_heads_per_rank = self.num_heads // self.attn_tp_size
         self.num_key_value_heads_per_rank = 1
-        self.rope_theta = config.rope_theta
         self.q_lora_rank = config.q_lora_rank
         self.qk_rope_head_dim = config.qk_rope_head_dim
         self.kv_lora_rank = config.kv_lora_rank
@@ -814,7 +802,7 @@ class DeepseekIndexerAttention(nn.Module):
 
         self.enable_weight_nz = runner_settings.get("model_config").get("enable_weight_nz", True)
 
-        self.indexer = Indexer(self.config, runner_settings, layer_idx, prefix=f"{prefix}.indexer", **kwargs)
+        self.indexer = GlmMoeDsaIndexer(self.config, runner_settings, layer_idx, prefix=f"{prefix}.indexer", **kwargs)
         self.attn_func = self.apply_attention_fusion
         self.select_block_count = config.index_topk
         self.exe_mode = self.runner_settings.get("exe_mode", "eager")
@@ -1017,8 +1005,8 @@ class DeepseekIndexerAttention(nn.Module):
         # while enable cp, attention calc needs to split in half
         q_nope, q_rope = query_states
         bsz, seq_len, num_heads, _ = q_nope.shape
-        q_nope_prev, q_nope_next = torch.split(q_nope.view(1, bsz*seq_len, num_heads, -1), bsz * seq_len // 2, dim=1)
-        q_rope_prev, q_rope_next = torch.split(q_rope.view(1, bsz*seq_len, num_heads, -1), bsz * seq_len // 2, dim=1)
+        q_nope_prev, q_nope_next = torch.split(q_nope.view(1, bsz * seq_len, num_heads, -1), bsz * seq_len // 2, dim=1)
+        q_rope_prev, q_rope_next = torch.split(q_rope.view(1, bsz * seq_len, num_heads, -1), bsz * seq_len // 2, dim=1)
         topk_indices_prev, topk_indices_next = topk_indices
         query_states_prev = q_nope_prev, q_rope_prev
         query_states_next = q_nope_next, q_rope_next
@@ -1305,92 +1293,6 @@ class DeepseekIndexerAttention(nn.Module):
 
         return query_states, topk_indices
 
-    def prepare_qkv_native(
-        self,
-        hidden_states: torch.Tensor,
-        cos_sin: torch.Tensor = None,
-        kv_len: torch.IntTensor = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Cache] = None,
-        past_key_values_indexer: Optional[Cache] = None,
-        past_key_scales_indexer: Optional[Cache] = None,
-        actual_seq_lengths_kv: Optional[torch.Tensor] = None,
-        actual_seq_lengths_q: Optional[torch.Tensor] = None,
-        is_prefill: bool = True,
-        slot_mapping: Optional[torch.Tensor] = None,
-        prefill_extra_input_dict: Optional[Dict] = None,
-        offload_cache: Optional[OffloadCache] = None,
-        **kwargs,
-    ):
-        bsz, q_len, _ = hidden_states.size()
-        qr = self.q_a_layernorm(self.q_a_proj(hidden_states))
-        q = self.q_b_proj(qr)
-        q = q.view(bsz, q_len, self.num_heads_per_rank, self.q_head_dim)
-        q_nope, q_pe = torch.split(
-            q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
-        )
-        q_nope = q_nope.view(-1, self.num_heads_per_rank, self.qk_nope_head_dim)
-
-        q_nope = (
-            torch.matmul(q_nope.transpose(0, 1), self.kv_b_proj_w_k)
-            .transpose(0, 1)
-            .view(bsz, q_len, self.num_heads_per_rank, self.kv_lora_rank)
-        )
-
-        enable_multi_streams = self.enable_multi_streams and not is_prefill
-        with npu_stream_switch(enable_multi_streams, '11'):
-            latent_cache = self.kv_a_proj_with_mqa(hidden_states)
-            if self.cp_size > 1 and is_prefill:
-                kv_all = latent_cache.new_empty([bsz * q_len * self.cp_size, latent_cache.shape[-1]])
-                dist.all_gather_into_tensor(kv_all, latent_cache.view(bsz * q_len, -1), \
-                                        group=self.hccl_comm_dict.get("cp_group", None))
-                outputs_list = list(torch.split(kv_all, prefill_extra_input_dict["reverse_split_list"], dim=0))
-                latent_cache = torch.cat(
-                    [outputs_list[i] for i in prefill_extra_input_dict["cp_reverse_index"]], dim=0
-                ).view(bsz, -1, latent_cache.shape[-1])
-
-            latent_cache = latent_cache.view(-1, 1, 1, self.kv_lora_rank + self.qk_rope_head_dim)  # (B,S,N,D)
-            nope_cache = past_key_value[self.layer_idx][0]
-            rope_cache = past_key_value[self.layer_idx][1]
-            # rope
-            if self.cp_size > 1 and is_prefill:
-                cos, sin, cos_q, sin_q = cos_sin
-            else:
-                cos, sin = cos_sin
-                cos_q, sin_q = cos, sin
-            cos = cos.view(-1, 1, 1, self.qk_rope_head_dim)
-            sin = sin.view(-1, 1, 1, self.qk_rope_head_dim)
-            k_pe, k_nope = torch_npu.npu_kv_rmsnorm_rope_cache_v2(
-                latent_cache, self.kv_a_layernorm.weight,
-                cos, sin, slot_mapping.view(-1),
-                rope_cache, nope_cache,
-                epsilon=self.kv_a_layernorm.variance_epsilon,
-                cache_mode="PA",
-                is_output_kv=is_prefill
-            )
-            q_pe = q_pe.view(-1, self.num_heads_per_rank, 1, self.qk_rope_head_dim)
-            q_pe = torch_npu.npu_interleave_rope(q_pe, cos_q, sin_q).view(
-                bsz, -1, self.num_heads_per_rank, self.qk_rope_head_dim)  # (B,S,N,D)
-
-        bsz = actual_seq_lengths_kv.shape[0]
-        query_states = (q_nope.view(bsz, -1, self.num_heads_per_rank, self.kv_lora_rank), \
-                        q_pe.view(bsz, -1, self.num_heads_per_rank, self.qk_rope_head_dim))  # 1,B*S,N,D -> B,S,N,D
-
-        block_table = self.prefill_block_table if is_prefill else self.block_table
-
-        c8_input_dict = {}
-        if self.li_cache_quant_mode == "int8":
-            qr, qr_scale = torch_npu.npu_dynamic_quant(qr)
-            c8_input_dict.update({'pertoken_scale': qr_scale})
-        topk_indices = self.indexer(hidden_states, qr, actual_seq_lengths_kv, kv_len, cos_sin, position_ids, \
-                                    query_states,\
-                                    past_key_values_indexer, past_key_scales_indexer, \
-                                    slot_mapping, block_table, \
-                                    actual_seq_lengths_q, prefill_extra_input_dict, c8_input_dict,
-                                    is_prefill)
-
-        return query_states, topk_indices
-
     def apply_attention_fusion(
         self,
         query_states, topk_indices,
@@ -1412,8 +1314,8 @@ class DeepseekIndexerAttention(nn.Module):
 
         bsz, q_len, num_heads, _ = q_nope.shape  # B,S,N,D
 
-        q_nope = q_nope.contiguous().view(bsz*q_len, num_heads, -1) # B,S,N,D -> B*S,N,D
-        q_pe = q_pe.contiguous().view(bsz*q_len, num_heads, -1) # B,S,N,D -> B*S,N,D
+        q_nope = q_nope.contiguous().view(bsz * q_len, num_heads, -1) # B,S,N,D -> B*S,N,D
+        q_pe = q_pe.contiguous().view(bsz * q_len, num_heads, -1) # B,S,N,D -> B*S,N,D
         block_table = self.prefill_block_table if is_prefill else self.block_table
 
         if self.enable_offload and not is_prefill:
@@ -1501,15 +1403,15 @@ class DeepseekIndexerAttention(nn.Module):
         return slc_fa_fusion
 
 
-class DeepseekV3DecoderLayer(nn.Module):
-    def __init__(self, config: DeepseekV3Config, runner_settings: Dict, layer_idx: int, prefix: str, **kwargs):
+class GlmMoeDsaDecoderLayer(nn.Module):
+    def __init__(self, config: GlmMoeDsaConfig, runner_settings: Dict, layer_idx: int, prefix: str, **kwargs):
         super().__init__()
         self.layer_idx = layer_idx
         self.runner_settings = runner_settings
         self.hidden_size = config.hidden_size
         self.enable_offload = self.runner_settings.get("model_config").get("enable_offload", False)
 
-        self.self_attn = DeepseekIndexerAttention(
+        self.self_attn = GlmMoeDsaAttention(
             config=config,
             runner_settings=self.runner_settings,
             layer_idx=layer_idx,
@@ -1521,9 +1423,9 @@ class DeepseekV3DecoderLayer(nn.Module):
                 layer_idx % config.moe_layer_freq == 0
 
         self.mlp = (
-            DeepseekV3MoE(config, self.runner_settings, layer_idx=layer_idx, prefix=f"{prefix}.mlp", **kwargs)
+            GlmMoeDsaMoE(config, self.runner_settings, layer_idx=layer_idx, prefix=f"{prefix}.mlp", **kwargs)
             if self.is_moe
-            else DeepseekV3DenseMLP(config, self.runner_settings, prefix=f"{prefix}.mlp", **kwargs)
+            else GlmMoeDsaMLP(config, self.runner_settings, prefix=f"{prefix}.mlp", **kwargs)
         )
         self.input_layernorm = DeepseekV3RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
@@ -1584,19 +1486,39 @@ class DeepseekV3DecoderLayer(nn.Module):
         return outputs
 
 
-@add_start_docstrings(
-    "The bare DeepseekV3 Model outputting raw hidden-states without any specific head on top.",
-    DEEPSEEKV3_START_DOCSTRING,
-)
-class DeepseekV3Model(DeepseekV3PreTrainedModel):
+class GlmMoeDsaPreTrainedModel(PreTrainedModel):
+    config: GlmMoeDsaConfig
+    base_model_prefix = "model"
+    supports_gradient_checkpointing = True
+    _no_split_modules = ["GlmMoeDsaDecoderLayer"]
+    _skip_keys_device_placement = ["past_key_values"]
+    _supports_flash_attn = False  # flash-mla kernels need a bit more work in the way we enable them!
+    _supports_sdpa = True
+    _supports_flex_attn = False
+
+    _can_compile_fullgraph = True
+    _supports_attention_backend = True
+    _can_record_outputs = {
+        "hidden_states": GlmMoeDsaDecoderLayer,
+        "attentions": GlmMoeDsaAttention,
+    }
+    _keep_in_fp32_modules_strict = ["e_score_correction_bias"]
+    _keys_to_ignore_on_load_unexpected = [r"model\.layers\.78.*"]
+    # NOTE: FP8 quantization uses `_keep_in_fp32_modules` (not `_strict`) to decide which modules to NOT convert.
+    # We must keep `indexer.weights_proj` as a plain Linear to match the checkpoint (no `weight_scale_inv`).
+    _keep_in_fp32_modules = ["indexer.weights_proj"]
+    _compatible_flash_implementations = ["kernels-community/flash-mla"]
+
+
+class GlmMoeDsaModel(GlmMoeDsaPreTrainedModel):
     """
-    Transformer decoder consisting of *config.num_hidden_layers* layers. Each layer is a [`DeepseekV3DecoderLayer`]
+    Transformer decoder consisting of *config.num_hidden_layers* layers. Each layer is a [`GlmMoeDsaDecoderLayer`]
 
     Args:
-        config: DeepseekV3Config
+        config: GlmMoeDsaConfig
     """
 
-    def __init__(self, config: DeepseekV3Config, runner_settings: Dict, prefix: str, **kwargs):
+    def __init__(self, config: GlmMoeDsaConfig, runner_settings: Dict, prefix: str, **kwargs):
         super().__init__(config)
         self.config = config
         self.runner_settings = runner_settings
@@ -1631,7 +1553,7 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
 
         self.layers = nn.ModuleList(
             [
-                DeepseekV3DecoderLayer(
+                GlmMoeDsaDecoderLayer(
                     config,
                     self.runner_settings,
                     layer_idx,
@@ -1704,7 +1626,6 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
 
         return hidden_states
 
-    @add_start_docstrings_to_model_forward(DEEPSEEKV3_INPUTS_DOCSTRING)
     def forward(
         self,
         input_ids: torch.LongTensor,
@@ -1774,14 +1695,14 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
         return hidden_states
 
 
-class DeepseekV3ModelMTPLayer(DeepseekV3Model):
-    def __init__(self, config: DeepseekV3Config, runner_settings: Dict, layer_idx: int, prefix: str, **kwargs):
+class GlmMoeDsaModelMTPLayer(GlmMoeDsaModel):
+    def __init__(self, config: GlmMoeDsaConfig, runner_settings: Dict, layer_idx: int, prefix: str, **kwargs):
         super().__init__(config, runner_settings, prefix=prefix, **kwargs)
         self.mtp_start_layer_idx = config.num_hidden_layers
         self.layers = nn.ModuleDict(
             {
                 str(self.mtp_start_layer_idx + i):
-                DeepseekV3DecoderLayer(
+                GlmMoeDsaDecoderLayer(
                     config,
                     runner_settings,
                     layer_idx,
@@ -1829,7 +1750,7 @@ class DeepseekV3ModelMTPLayer(DeepseekV3Model):
         )
 
 
-class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
+class GlmMoeDsaForCausalLM(GlmMoeDsaPreTrainedModel):
     _tied_weights_keys = ["lm_head.weight"]
 
     def __init__(self, config, runner_settings, is_mtp=False, prefix: str = ""):
@@ -1877,8 +1798,8 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
                         self.pa_max_length, dtype=torch.int64, device="npu").view(-1, 1)
 
         mtp_layer_idx = config.num_hidden_layers # MTP is the last layer
-        self.model = DeepseekV3ModelMTPLayer(config, self.runner_settings, mtp_layer_idx, prefix, **kwargs) \
-                    if is_mtp else DeepseekV3Model(config, self.runner_settings, prefix, **kwargs)
+        self.model = GlmMoeDsaModelMTPLayer(config, self.runner_settings, mtp_layer_idx, prefix, **kwargs) \
+                    if is_mtp else GlmMoeDsaModel(config, self.runner_settings, prefix, **kwargs)
         self.vocab_size = config.vocab_size
         if not is_mtp:
             self.lm_head = ColumnParallelLinear(
@@ -2474,7 +2395,7 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
             if "rotary_emb.inv_freq" in name:
                 continue
 
-            if self.config.architectures[0] == 'DeepseekV3ForCausalLM' and self.config.num_nextn_predict_layers > 0:
+            if self.config.architectures[0] == 'GlmMoeDsaForCausalLM' and self.config.num_nextn_predict_layers > 0:
                 mtp_prefix = [f"model.layers.{self.config.num_hidden_layers + layer_idx}"
                               for layer_idx in range(self.config.num_nextn_predict_layers)]
                 if name.startswith(tuple(mtp_prefix)):
@@ -2547,9 +2468,9 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
         return loaded_params
 
 
-class DeepseekV3ModelMTP(DeepseekV3ForCausalLM):
+class GlmMoeDsaModelMTP(GlmMoeDsaForCausalLM):
 
-    def __init__(self, config: DeepseekV3Config, runner_settings: Dict, **kwargs):
+    def __init__(self, config: GlmMoeDsaConfig, runner_settings: Dict, **kwargs):
         super().__init__(config, runner_settings, is_mtp=True)
         self.mtp_start_layer_idx = config.num_hidden_layers
         self.local_rank = int(os.getenv("LOCAL_RANK", "0"))
@@ -2576,7 +2497,6 @@ class DeepseekV3ModelMTP(DeepseekV3ForCausalLM):
             quant_config=None,
             prefix=f"model.layers.{self.mtp_start_layer_idx}.eh_proj")
 
-    @add_start_docstrings_to_model_forward(DEEPSEEKV3_INPUTS_DOCSTRING)
     @override
     def forward(
         self,

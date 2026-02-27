@@ -18,7 +18,7 @@ import argparse
 import logging
 import torch
 
-from runner_deepseek import DeepSeekRunner
+from runner_glm import GlmRunner
 from models.model_infer import Infer
 from executor.utils import update_settings, align_up, read_yaml
 from executor.utils.data_utils import generate_prompt
@@ -40,9 +40,9 @@ def parse_args():
     return parser_args
 
 
-def run_deepseek(runner_settings):
+def run_glm(runner_settings):
     preset_prompts, query_id_list = generate_prompt(runner_settings)
-    model_runner_main = DeepSeekRunner(runner_settings)
+    model_runner_main = GlmRunner(runner_settings)
     # to accelerate the compiling process for torch dynamo
     torch.npu.set_compile_mode(jit_compile=False)
     model_runner_main.init_model()
@@ -50,7 +50,7 @@ def run_deepseek(runner_settings):
     model_runner_mtp = None
     next_n = runner_settings.get("model_config").get("next_n", 0)
     if next_n > 0:
-        model_runner_mtp = DeepSeekRunner(runner_settings)
+        model_runner_mtp = GlmRunner(runner_settings)
         model_runner_mtp.init_model(is_mtp=True)
         # the mtp modules share embed, lm_head, rotary_emb with the main model
         model_runner_mtp.model.model.embed_tokens = model_runner_main.model.model.embed_tokens
@@ -202,5 +202,5 @@ if __name__ == "__main__":
     runner_settings = update_vars(world_size, runner_settings)
     logging.info(f"runner_settings is: {runner_settings}")
 
-    run_deepseek(runner_settings)
+    run_glm(runner_settings)
     logging.info("model run success")
