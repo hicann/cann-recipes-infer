@@ -25,7 +25,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_sequence
 
-from executor.utils import get_init_attn_mask, process_infer_time, remove_padding_left, detokenize_outputs
+from executor.utils import get_init_attn_mask, process_infer_time, remove_padding_left, detokenize_outputs, \
+    obtain_mtp_stats
 
 
 class InferMTP(nn.Module):
@@ -93,7 +94,8 @@ class InferMTP(nn.Module):
                 infer_time_rec.append(step_time)
 
         if not warm_up:
-            avg_infer_time = self.obtain_mtp_stats(total_accepted_num, cnt, infer_time_rec)
+            avg_infer_time = obtain_mtp_stats(
+                self.next_n, self.main_model.model_name, total_accepted_num, cnt, infer_time_rec)
 
         # to modify to print for each batch
         logging.info("Finish inference, cnt = %d, total_accepted_num = %d", cnt, total_accepted_num[0])
@@ -252,13 +254,3 @@ class InferMTP(nn.Module):
             input_dict['is_prefill'] = False
 
         return input_dict
-
-    def obtain_mtp_stats(self, total_accepted_num, cnt, infer_time_rec):
-        avg_accpeted_num = torch.mean(total_accepted_num)
-        logging.info("Finish inference, cnt is %d, average accepted num per batch is %d", cnt, avg_accpeted_num)
-
-        total_tokens = total_accepted_num + cnt
-        avg_infer_time = process_infer_time(infer_time_rec, total_tokens[0]) # logging for the first batch
-        logging.info(f"{self.main_model.model_name} average inference time cost is {(avg_infer_time)*1000:.2f} ms")
-
-        return avg_infer_time

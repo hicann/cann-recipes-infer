@@ -21,7 +21,8 @@ import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_sequence
 import torch.distributed as dist
 
-from executor.utils import get_init_attn_mask, process_infer_time, build_dataset_input, remove_padding_left
+from executor.utils import get_init_attn_mask, process_infer_time, build_dataset_input, remove_padding_left, \
+    obtain_mtp_stats
 
 
 class Infer(nn.Module):
@@ -317,24 +318,6 @@ class Infer(nn.Module):
         input_dict['input_ids'] = torch.cat([input_dict['input_ids'], spec_token], dim=-1)[:, 1:]
 
         return input_dict
-
-    def obtain_mtp_stats(self, total_accepted_num, cnt, infer_time_rec):
-        avg_accpeted_num = torch.mean(total_accepted_num).to(torch.int32)
-        logging.info(f"Finish inference, number of loop step is {cnt}, "
-                     f"draft token per batch is {cnt}*{self.next_n}, "
-                     f"average accepted num per batch is {avg_accpeted_num}")
-
-        total_tokens = total_accepted_num + cnt
-        equivalent_infer_time = process_infer_time(infer_time_rec, total_tokens[0]) # logging for the first batch
-        avg_infer_time = process_infer_time(infer_time_rec, len(infer_time_rec)) # logging for the first batch
-
-        logging.info(
-            f"{self.main_model.model_name} main and mtp model decode average inference time cost"
-            f" is {(avg_infer_time)*1000:.2f} ms")
-        logging.info(
-            f"{self.main_model.model_name} model average equivalent latency of MTP{self.next_n}"
-            f" is {(equivalent_infer_time)*1000:.2f} ms")
-        return avg_infer_time
 
     def get_prefill_profile_cycle(self, enable_profiler):
         if not enable_profiler:
@@ -663,8 +646,8 @@ class Infer(nn.Module):
                 logging.info(f"{self.main_model.model_name} decode " + \
                              f" average inference time cost is {(avg_infer_time)*1000:.2f} ms")
             else:
-                avg_infer_time = self.obtain_mtp_stats(mtp_argdict['total_accepted_num'],
-                                                       decode_cnt, decode_infer_time_rec)
+                avg_infer_time = obtain_mtp_stats(self.next_n, self.main_model.model_name,
+                    mtp_argdict['total_accepted_num'], decode_cnt, decode_infer_time_rec)
 
             # detokenize outputs
             generate_ids_list = remove_padding_left(

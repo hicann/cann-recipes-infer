@@ -235,3 +235,21 @@ def update_common_vars(world_size, runner_settings):
     max_position_embeddings = max_new_tokens * (next_n + 1) + input_max_len
     runner_settings = update_settings(runner_settings, "data_config", "max_position_embeddings",
                                       max_position_embeddings)
+
+
+def obtain_mtp_stats(next_n, model_name, total_accepted_num, cnt, infer_time_rec):
+    avg_accepted_num = torch.mean(total_accepted_num)
+    logging.info(f"Finished inference, number of loop step is {cnt}, "
+                    f"draft tokens per batch is {cnt}*{next_n}, "
+                    f"average accepted number per batch is {avg_accepted_num.to(torch.int32)}")
+
+    total_tokens = avg_accepted_num + cnt
+    equivalent_infer_time = process_infer_time(infer_time_rec, total_tokens)
+    avg_infer_time = process_infer_time(infer_time_rec, len(infer_time_rec))
+    logging.info(
+        f"{model_name} main and mtp model average inference time cost is {(avg_infer_time)*1000:.2f} ms")
+    logging.info(
+        f"{model_name} model average equivalent latency of MTP{next_n}"
+        f" is {(equivalent_infer_time)*1000:.2f} ms")
+
+    return avg_infer_time
