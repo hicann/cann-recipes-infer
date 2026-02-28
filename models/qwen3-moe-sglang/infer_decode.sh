@@ -25,7 +25,7 @@ sysctl -w vm.swappiness=10
 sysctl -w kernel.numa_balancing=0
 
 ## variables need to modify
-# IP of the all servers
+# IP of the all decode servers
 IPs=('IP0' 'IP1' 'IP2' 'IP3')
 # Socket prefix, to obtain Host IP for HCCL and HCCL group; modify to enp/eth accordingly
 IFNAMES=('IFNAMES1' 'IFNAMES2' 'IFNAMES3' 'IFNAMES4')
@@ -46,13 +46,13 @@ unset HTTPS_PROXY
 unset HTTP_PROXY
 unset ASCEND_LAUNCH_BLOCKING
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
-source /usr/local/Ascend/nnal/atb/set_env.sh
-source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
 export ASCEND_HOME_PATH=/usr/local/Ascend/ascend-toolkit/latest
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export STREAMS_PER_DEVICE=32
 export ASCEND_USE_FIA=True
 export HCCL_BUFFSIZE=1000
+export HCCL_CONNECT_TIMEOUT=1200
+export HCCL_EXEC_TIMEOUT=1200
 
 # SGLang environment variables
 export SGLANG_SET_CPU_AFFINITY=1

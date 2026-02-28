@@ -43,14 +43,14 @@ unset HTTPS_PROXY
 unset HTTP_PROXY
 unset ASCEND_LAUNCH_BLOCKING
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
-source /usr/local/Ascend/nnal/atb/set_env.sh
-source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
 export ASCEND_HOME_PATH=/usr/local/Ascend/ascend-toolkit/latest
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export STREAMS_PER_DEVICE=32
 
 export HCCL_BUFFSIZE=600
 export HCCL_OP_EXPANSION_MODE=AIV
+export HCCL_CONNECT_TIMEOUT=1200
+export HCCL_EXEC_TIMEOUT=1200
 
 export INF_NAN_MODE_FORCE_DISABLE=1
 export ASCEND_USE_FIA=True
