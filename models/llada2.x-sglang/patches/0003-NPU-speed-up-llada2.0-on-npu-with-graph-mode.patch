@@ -1,0 +1,829 @@
+From b447a92723e2ec535534403494eb9f3970b69ef1 Mon Sep 17 00:00:00 2001
+From: Yuan Yuan <soc.yuan@gmail.com>
+Date: Mon, 9 Feb 2026 14:10:15 +0700
+Subject: [PATCH 03/16] [NPU] speed up llada2.0 on npu with graph mode
+
+---
+ .../srt/dllm/algorithm/low_confidence.py      | 125 +++++++-
+ .../npu/attention/ascend_backend.py           |  13 +-
+ python/sglang/srt/layers/rotary_embedding.py  | 296 ++++++++++++++++++
+ python/sglang/srt/managers/scheduler.py       |   4 +-
+ .../scheduler_output_processor_mixin.py       |  45 +++
+ .../srt/model_executor/forward_batch_info.py  |   2 +-
+ python/sglang/srt/models/llada2.py            |  94 +++---
+ python/sglang/srt/server_args.py              |  12 +-
+ 8 files changed, 538 insertions(+), 53 deletions(-)
+
+diff --git a/python/sglang/srt/dllm/algorithm/low_confidence.py b/python/sglang/srt/dllm/algorithm/low_confidence.py
+index 6acdcc7f8..e0a1778f5 100644
+--- a/python/sglang/srt/dllm/algorithm/low_confidence.py
++++ b/python/sglang/srt/dllm/algorithm/low_confidence.py
+@@ -1,6 +1,7 @@
+-from typing import List, Tuple, Union
++from typing import List, Tuple, Union, Optional
+ 
+ import numpy as np
++import math
+ import torch
+ import torch.nn.functional as F
+ 
+@@ -9,6 +10,102 @@ from sglang.srt.dllm.config import DllmConfig
+ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+ from sglang.srt.model_executor.model_runner import ModelRunner
++from sglang.srt.utils import is_npu
++
++_is_npu = is_npu()
++
++def parallel_decoding_update_input_ids_vectorized(
++    input_ids_1d: torch.Tensor,          # [B*blk]
++    full_logits_2d: torch.Tensor,         # [B*blk, V]
++    mask_id: int,
++    block_size: int,
++    threshold: float,
++    finished: Optional[torch.Tensor] = None,  # [B] bool, True means do NOT update this row
++    force_at_least_one: bool = True,
++) -> None:
++    """
++    Vectorized update for parallel decoding:
++      - reshape to [B, blk] and update each row in-place
++      - replaces per-batch Python loop + .item() sync points
++      - optionally gates out finished rows
++
++    Semantics (matches your old code):
++      - Only positions where input_ids == mask_id are candidates for replacement
++      - Replace with argmax token if its confidence > threshold
++      - If a row has any mask positions but none pass threshold, force select 1 position (max confidence)
++      - Rows with no mask positions are left unchanged (equivalent to `continue`)
++      - If `finished` is provided, finished rows are always left unchanged
++    """
++    assert input_ids_1d.dim() == 1, f"input_ids_1d must be 1D, got {tuple(input_ids_1d.shape)}"
++    assert full_logits_2d.dim() == 2, f"full_logits_2d must be 2D, got {tuple(full_logits_2d.shape)}"
++    assert input_ids_1d.shape[0] == full_logits_2d.shape[0], \
++        f"len mismatch: {input_ids_1d.shape[0]} vs {full_logits_2d.shape[0]}"
++    assert input_ids_1d.shape[0] % block_size == 0, \
++        f"len(input_ids_1d) must be divisible by block_size, got {input_ids_1d.shape[0]}, block_size={block_size}"
++    assert 0.0 < threshold <= 1.0, f"threshold should be in (0,1], got {threshold}"
++
++    B = input_ids_1d.shape[0] // block_size
++    blk = block_size
++    V = full_logits_2d.shape[1]
++    dev = input_ids_1d.device
++
++    # Views (no copy)
++    input_ids = input_ids_1d.view(B, blk)                 # [B, blk]
++    logits = full_logits_2d.view(B, blk, V)               # [B, blk, V]
++
++    # Candidate mask
++    mask = input_ids.eq(mask_id)                          # [B, blk]
++    if finished is not None:
++        assert finished.shape == (B,), f"finished must be shape [B]={B}, got {tuple(finished.shape)}"
++        alive = (~finished).view(B, 1)                    # [B,1]
++        eff_mask = mask & alive
++    else:
++        eff_mask = mask
++
++    # Argmax token id per position and its log-prob.
++    # logp = log softmax(logits)[argmax] = max_logit - logsumexp(logits)
++    max_logit, x = logits.max(dim=-1)                     # [B, blk], [B, blk]
++    lse = torch.logsumexp(logits, dim=-1)                 # [B, blk]
++    logp = max_logit - lse                                # [B, blk]
++
++    neg_inf = torch.full_like(logp, float("-inf"))
++    confidence = torch.where(eff_mask, logp, neg_inf)     # [B, blk]
++
++    log_thr = math.log(threshold)
++    transfer = confidence > log_thr                       # [B, blk] bool
++
++    # Apply threshold updates first
++    new_ids = torch.where(transfer, x, input_ids)         # [B, blk]
++
++    # Force-at-least-one (graph-friendly): unconditional sparse per-row write, gated to no-op when not needed
++    if force_at_least_one:
++        row_has_any = eff_mask.any(dim=1)                 # [B]
++        hit_any = transfer.any(dim=1)                     # [B]
++        need_force = row_has_any & (~hit_any)             # [B]
++
++        # Best idx per row (even if all -inf -> 0); gated by need_force
++        best_idx = confidence.argmax(dim=1)               # [B] long
++
++        # idx2: where to write per row:
++        #   - need_force: best_idx
++        #   - else: 0 (safe position)
++        zero_idx = torch.zeros_like(best_idx)
++        idx2 = torch.where(need_force, best_idx, zero_idx)  # [B]
++
++        rows = torch.arange(B, device=dev)                # [B]
++
++        # val2: what to write per row:
++        #   - need_force: x[row, best_idx]
++        #   - else: new_ids[row, 0] (no-op)
++        force_val = x[rows, best_idx]                     # [B]
++        noop_val = new_ids[rows, zero_idx]                # [B] == new_ids[:,0]
++        val2 = torch.where(need_force, force_val, noop_val)  # [B]
++
++        # Single-point update per row (typically much cheaper than [B,blk] one-hot scatter_)
++        new_ids[rows, idx2] = val2
++
++    # In-place write-back (preserve storage / better for graph capture)
++    input_ids.copy_(new_ids)
+ 
+ 
+ class LowConfidence(DllmAlgorithm):
+@@ -48,14 +145,33 @@ class LowConfidence(DllmAlgorithm):
+             start = self.block_size - torch.sum(block_mask_index).item()
+             start_list.append(start)
+ 
++        if _is_npu:
++            skip_attn_backend_init = False
++
+         for _ in range(self.block_size):
+             mask_index = forward_batch.input_ids == self.mask_id
+             if torch.sum(mask_index).item() == 0:
+                 break
+ 
+-            out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
++            if _is_npu:
++                out = model_runner.forward(forward_batch, skip_attn_backend_init, pp_proxy_tensors=None)
++                skip_attn_backend_init = True
++            else:
++                out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
+             logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
+             assert batch_size == forward_batch.input_ids.shape[0] // self.block_size
++            if _is_npu:
++                parallel_decoding_update_input_ids_vectorized(
++                    input_ids_1d=forward_batch.input_ids,
++                    full_logits_2d=logits_output.full_logits,
++                    mask_id=self.mask_id,
++                    block_size=self.block_size,
++                    threshold=self.threshold,
++                    finished=None,                 # 如果你有 finished mask，就传进来
++                    force_at_least_one=True,
++                )
++                continue
++
+             for batch_id in range(batch_size):
+                 curr_block_start = batch_id * self.block_size
+                 curr_block_end = curr_block_start + self.block_size
+@@ -89,7 +205,10 @@ class LowConfidence(DllmAlgorithm):
+ 
+                 block_input_ids[transfer_index] = x[transfer_index]
+ 
+-        out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
++        if _is_npu:
++            out = model_runner.forward(forward_batch, skip_attn_backend_init, pp_proxy_tensors=None)
++        else:
++            out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
+         logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
+         # Here next token ids is tricky to implement the dynamic lengths,
+         # so we return a list of tensors
+diff --git a/python/sglang/srt/hardware_backend/npu/attention/ascend_backend.py b/python/sglang/srt/hardware_backend/npu/attention/ascend_backend.py
+index c8f9e396e..131f676f8 100644
+--- a/python/sglang/srt/hardware_backend/npu/attention/ascend_backend.py
++++ b/python/sglang/srt/hardware_backend/npu/attention/ascend_backend.py
+@@ -392,7 +392,6 @@ class AscendAttnBackend(AttentionBackend):
+                 device=seq_lens.device,
+             )
+         if forward_mode.is_dllm_extend():
+-            extend_seq_lens = self.dllm_block_size
+             extend_seq_lens_cpu_int = torch.tensor(
+                 [self.dllm_block_size for i in range(bs)],
+                 dtype=torch.int32,
+@@ -425,13 +424,15 @@ class AscendAttnBackend(AttentionBackend):
+         max_seq_pages = (max_len + self.page_size - 1) // self.page_size
+ 
+         metadata.block_tables[:bs, :max_seq_pages].copy_(
+-            self.req_to_token[req_pool_indices[:bs], :max_len][:, :: self.page_size]
+-            // self.page_size
++           self.req_to_token[req_pool_indices[:bs], :max_len][:, :: self.page_size]
++           // self.page_size
+         )
++
+         metadata.block_tables[:bs, max_seq_pages:].fill_(0)
+         metadata.block_tables[bs:, :].fill_(0)
++
+         if forward_mode.is_target_verify():
+-            seq_lens = seq_lens + self.speculative_num_draft_tokens
++           seq_lens = seq_lens + self.speculative_num_draft_tokens
+         metadata.seq_lens[:bs].copy_(seq_lens[:bs])
+ 
+         self.forward_metadata = metadata
+@@ -1886,3 +1887,7 @@ class AscendAttnMultiStepDraftBackend:
+             )
+ 
+         self.common_template(forward_batch, call_fn)
++
++
++
++
+diff --git a/python/sglang/srt/layers/rotary_embedding.py b/python/sglang/srt/layers/rotary_embedding.py
+index 752974499..37d0522f6 100644
+--- a/python/sglang/srt/layers/rotary_embedding.py
++++ b/python/sglang/srt/layers/rotary_embedding.py
+@@ -3201,3 +3201,299 @@ def get_rope_wrapper(
+         partial_rotary_factor,
+         device,
+     )
++
++
++@triton.jit
++def fp32_to_bf16_rne(x):
++    """Deterministic FP32 -> BF16 (round-to-nearest-even). Keep ONLY for RMSNorm cast."""
++    u = tl.cast(x, tl.uint32, bitcast=True)
++    lsb = (u >> 16) & 1
++    u = (u + (0x7FFF + lsb)) & 0xFFFF0000
++    return tl.cast(u, tl.float32, bitcast=True).to(tl.bfloat16)
++
++
++@triton.jit
++def split_qkv_rmsnorm_rope_half_pos_cache_kernel(
++    input_ptr,
++    pos_ptr,                  # [B]
++    cos_sin_cache_ptr,        # [max_seq, ROPE_DIM] layout: [cos_half, sin_half]
++    q_ptr,
++    k_ptr,
++    v_ptr,
++    q_weight_ptr,
++    q_bias_ptr,
++    k_weight_ptr,
++    k_bias_ptr,
++    batch_size,
++
++    q_hidden_size: tl.constexpr,
++    kv_hidden_size: tl.constexpr,
++    total_hidden_size: tl.constexpr,
++    eps: tl.constexpr,
++
++    Q_BLOCK_SIZE: tl.constexpr,
++    KV_BLOCK_SIZE: tl.constexpr,
++    Q_BLOCK_N: tl.constexpr,          # Q_BLOCK_SIZE // HEAD_DIM
++    K_BLOCK_N: tl.constexpr,          # KV_BLOCK_SIZE // HEAD_DIM
++
++    BIAS: tl.constexpr,
++    NORMS: tl.constexpr,
++    HEAD_DIM: tl.constexpr,
++
++    ROPE_DIM: tl.constexpr,
++    HALF_ROPE_DIM: tl.constexpr,
++    COS_SIN_STRIDE0: tl.constexpr,
++
++    CAST_NORM_TO_BF16: tl.constexpr,  # ONLY this cast uses fp32_to_bf16_rne
++):
++    row_pid = tl.program_id(0)
++    col_pid = tl.program_id(1)
++    row_step = tl.num_programs(0)
++
++    Q_TY = q_ptr.dtype.element_ty
++    K_TY = k_ptr.dtype.element_ty
++    V_TY = v_ptr.dtype.element_ty
++
++    # =========================
++    # Q
++    # =========================
++    if NORMS:
++        q_w = tl.load(q_weight_ptr + tl.arange(0, HEAD_DIM)).to(tl.float32)
++    if BIAS:
++        q_b = tl.load(q_bias_ptr + tl.arange(0, HEAD_DIM)).to(tl.float32)
++
++    in_off = row_pid * total_hidden_size
++    outq_off = row_pid * q_hidden_size
++    in_off_step = row_step * total_hidden_size
++    outq_off_step = row_step * q_hidden_size
++
++    for row_idx in tl.range(row_pid, batch_size, row_step):
++        col = col_pid * Q_BLOCK_SIZE + tl.arange(0, Q_BLOCK_SIZE)
++        mask = col < q_hidden_size
++
++        x = tl.load(input_ptr + in_off + col, mask=mask, other=0.0).to(tl.float32)
++        x = x.reshape(Q_BLOCK_N, HEAD_DIM)
++
++        # RMSNorm (fp32)
++        if NORMS:
++            var = tl.sum(x * x, axis=1) / (1.0 * HEAD_DIM)
++            inv_std = tl.rsqrt(var + eps).reshape(Q_BLOCK_N, 1)
++            y = x * inv_std
++            if BIAS:
++                y = y * q_w + q_b
++            else:
++                y = y * q_w
++        else:
++            y = x
++
++        # y_base: fp32 or bf16
++        if CAST_NORM_TO_BF16:
++            # keep strict RNE here ONLY
++            y_base = fp32_to_bf16_rne(y)   # bf16
++        else:
++            y_base = y                     # fp32
++
++        # ---- load cos/sin half (fp32) ----
++        p = tl.load(pos_ptr + row_idx).to(tl.int32)
++        base = p * COS_SIN_STRIDE0
++        offs = tl.arange(0, HALF_ROPE_DIM)
++        cos_f = tl.load(cos_sin_cache_ptr + base + offs).to(tl.float32).reshape(1, HALF_ROPE_DIM)
++        sin_f = tl.load(cos_sin_cache_ptr + base + HALF_ROPE_DIM + offs).to(tl.float32).reshape(1, HALF_ROPE_DIM)
++
++        # ---- RoPE half on first ROPE_DIM (fp32 math; casts use .to(bf16)) ----
++        y_rot = tl.extract_slice(y_base, offsets=(0, 0), sizes=(Q_BLOCK_N, ROPE_DIM), strides=(1, 1))
++        y_rot_f = y_rot.to(tl.float32)
++
++        x1 = tl.extract_slice(y_rot_f, offsets=(0, 0), sizes=(Q_BLOCK_N, HALF_ROPE_DIM), strides=(1, 1))
++        x2 = tl.extract_slice(y_rot_f, offsets=(0, HALF_ROPE_DIM), sizes=(Q_BLOCK_N, HALF_ROPE_DIM), strides=(1, 1))
++
++        o1 = x1 * cos_f - x2 * sin_f
++        o2 = x2 * cos_f + x1 * sin_f
++        ro1 = o1.to(tl.bfloat16)
++        ro2 = o2.to(tl.bfloat16)
++
++        roped = tl.zeros((Q_BLOCK_N, ROPE_DIM), dtype=tl.bfloat16)
++        roped = tl.insert_slice(roped, ro1, offsets=(0, 0), sizes=(Q_BLOCK_N, HALF_ROPE_DIM), strides=(1, 1))
++        roped = tl.insert_slice(roped, ro2, offsets=(0, HALF_ROPE_DIM), sizes=(Q_BLOCK_N, HALF_ROPE_DIM), strides=(1, 1))
++
++        # output base bf16 (tail passthrough)
++        if CAST_NORM_TO_BF16:
++            y_out = y_base                 # already bf16
++        else:
++            y_out = y_base.to(tl.bfloat16) # fast cast
++
++        y_out = tl.insert_slice(y_out, roped, offsets=(0, 0), sizes=(Q_BLOCK_N, ROPE_DIM), strides=(1, 1))
++        tl.store(q_ptr + outq_off + col, y_out.reshape(Q_BLOCK_SIZE).to(Q_TY), mask=mask)
++
++        in_off += in_off_step
++        outq_off += outq_off_step
++
++    # =========================
++    # K
++    # =========================
++    if NORMS:
++        k_w = tl.load(k_weight_ptr + tl.arange(0, HEAD_DIM)).to(tl.float32)
++    if BIAS:
++        k_b = tl.load(k_bias_ptr + tl.arange(0, HEAD_DIM)).to(tl.float32)
++
++    in_off = row_pid * total_hidden_size + q_hidden_size
++    outk_off = row_pid * kv_hidden_size
++    outk_off_step = row_step * kv_hidden_size
++
++    for row_idx in tl.range(row_pid, batch_size, row_step):
++        col = col_pid * KV_BLOCK_SIZE + tl.arange(0, KV_BLOCK_SIZE)
++        mask = col < kv_hidden_size
++
++        x = tl.load(input_ptr + in_off + col, mask=mask, other=0.0).to(tl.float32)
++        x = x.reshape(K_BLOCK_N, HEAD_DIM)
++
++        if NORMS:
++            var = tl.sum(x * x, axis=1) / (1.0 * HEAD_DIM)
++            inv_std = tl.rsqrt(var + eps).reshape(K_BLOCK_N, 1)
++            y = x * inv_std
++            if BIAS:
++                y = y * k_w + k_b
++            else:
++                y = y * k_w
++        else:
++            y = x
++
++        if CAST_NORM_TO_BF16:
++            y_base = fp32_to_bf16_rne(y)   # strict here only
++        else:
++            y_base = y
++
++        # cos/sin half
++        p = tl.load(pos_ptr + row_idx).to(tl.int32)
++        base = p * COS_SIN_STRIDE0
++        offs = tl.arange(0, HALF_ROPE_DIM)
++        cos_f = tl.load(cos_sin_cache_ptr + base + offs).to(tl.float32).reshape(1, HALF_ROPE_DIM)
++        sin_f = tl.load(cos_sin_cache_ptr + base + HALF_ROPE_DIM + offs).to(tl.float32).reshape(1, HALF_ROPE_DIM)
++
++        # rope
++        y_rot = tl.extract_slice(y_base, offsets=(0, 0), sizes=(K_BLOCK_N, ROPE_DIM), strides=(1, 1))
++        y_rot_f = y_rot.to(tl.float32)
++
++        x1 = tl.extract_slice(y_rot_f, offsets=(0, 0), sizes=(K_BLOCK_N, HALF_ROPE_DIM), strides=(1, 1))
++        x2 = tl.extract_slice(y_rot_f, offsets=(0, HALF_ROPE_DIM), sizes=(K_BLOCK_N, HALF_ROPE_DIM), strides=(1, 1))
++
++        o1 = x1 * cos_f - x2 * sin_f
++        o2 = x2 * cos_f + x1 * sin_f
++        ro1 = o1.to(tl.bfloat16)
++        ro2 = o2.to(tl.bfloat16)
++
++        roped = tl.zeros((K_BLOCK_N, ROPE_DIM), dtype=tl.bfloat16)
++        roped = tl.insert_slice(roped, ro1, offsets=(0, 0), sizes=(K_BLOCK_N, HALF_ROPE_DIM), strides=(1, 1))
++        roped = tl.insert_slice(roped, ro2, offsets=(0, HALF_ROPE_DIM), sizes=(K_BLOCK_N, HALF_ROPE_DIM), strides=(1, 1))
++
++        if CAST_NORM_TO_BF16:
++            y_out = y_base
++        else:
++            y_out = y_base.to(tl.bfloat16)
++
++        y_out = tl.insert_slice(y_out, roped, offsets=(0, 0), sizes=(K_BLOCK_N, ROPE_DIM), strides=(1, 1))
++        tl.store(k_ptr + outk_off + col, y_out.reshape(KV_BLOCK_SIZE).to(K_TY), mask=mask)
++
++        in_off += in_off_step
++        outk_off += outk_off_step
++
++    # =========================
++    # V
++    # =========================
++    in_off = row_pid * total_hidden_size + q_hidden_size + kv_hidden_size
++    outv_off = row_pid * kv_hidden_size
++    outv_off_step = row_step * kv_hidden_size
++
++    for _ in tl.range(row_pid, batch_size, row_step):
++        col = col_pid * KV_BLOCK_SIZE + tl.arange(0, KV_BLOCK_SIZE)
++        mask = col < kv_hidden_size
++        v = tl.load(input_ptr + in_off + col, mask=mask, other=0.0)
++        tl.store(v_ptr + outv_off + col, v.to(V_TY), mask=mask)
++        in_off += in_off_step
++        outv_off += outv_off_step
++
++
++def split_qkv_rmsnorm_rope_pos_cache_half_npu(
++    input: torch.Tensor,            # [B, q_hidden + 2*kv_hidden]
++    positions: torch.Tensor,        # [B]
++    cos_sin_cache: torch.Tensor,    # [max_seq, rope_dim] layout [cos_half, sin_half]
++    q_hidden_size: int,
++    kv_hidden_size: int,
++    head_dim: int,
++    eps: float = None,
++    q_weight: torch.Tensor = None,
++    k_weight: torch.Tensor = None,
++    q_bias: torch.Tensor = None,
++    k_bias: torch.Tensor = None,
++    rope_dim: int = None,
++    cast_norm_to_bf16: bool = True,
++):
++    from sgl_kernel_npu.utils.triton_utils import get_device_properties
++    _, num_vectorcore = get_device_properties()
++    assert input.dim() == 2
++    B, total_hidden = input.shape
++
++    if rope_dim is None:
++        rope_dim = head_dim
++    assert rope_dim % 2 == 0 and rope_dim <= head_dim
++
++    expected_total = q_hidden_size + 2 * kv_hidden_size
++    assert total_hidden == expected_total
++
++    pos = positions
++    assert pos.numel() == B, f"positions must be [B], got numel={pos.numel()} B={B}"
++    if pos.dtype not in (torch.int32, torch.int64):
++        pos = pos.to(torch.int32)
++    pos = pos.contiguous()
++
++    cache = cos_sin_cache.contiguous()
++    stride0 = cache.stride(0)
++
++    KV_BLOCK_SIZE = triton.next_power_of_2(head_dim)
++    assert KV_BLOCK_SIZE == head_dim, "this kernel assumes head_dim is power-of-2"
++    assert q_hidden_size % kv_hidden_size == 0
++    Q_BLOCK_SIZE = (q_hidden_size // kv_hidden_size) * head_dim
++
++    Q_BLOCK_N = Q_BLOCK_SIZE // head_dim
++    K_BLOCK_N = KV_BLOCK_SIZE // head_dim  # usually 1
++
++    q_out = torch.empty((B, q_hidden_size), device=input.device, dtype=input.dtype)
++    k_out = torch.empty((B, kv_hidden_size), device=input.device, dtype=input.dtype)
++    v_out = torch.empty((B, kv_hidden_size), device=input.device, dtype=input.dtype)
++
++    n_cols = kv_hidden_size // KV_BLOCK_SIZE
++    n_rows = (num_vectorcore + n_cols - 1) // n_cols
++
++    BIAS = q_bias is not None
++    NORMS = eps is not None
++
++    split_qkv_rmsnorm_rope_half_pos_cache_kernel[(n_rows, n_cols, 1)](
++        input,
++        pos,
++        cache,
++        q_out,
++        k_out,
++        v_out,
++        q_weight,
++        q_bias,
++        k_weight,
++        k_bias,
++        B,
++        q_hidden_size=q_hidden_size,
++        kv_hidden_size=kv_hidden_size,
++        total_hidden_size=expected_total,
++        eps=eps if eps is not None else 0.0,
++        Q_BLOCK_SIZE=Q_BLOCK_SIZE,
++        KV_BLOCK_SIZE=KV_BLOCK_SIZE,
++        Q_BLOCK_N=Q_BLOCK_N,
++        K_BLOCK_N=K_BLOCK_N,
++        BIAS=BIAS,
++        NORMS=NORMS,
++        HEAD_DIM=head_dim,
++        ROPE_DIM=rope_dim,
++        HALF_ROPE_DIM=rope_dim // 2,
++        COS_SIN_STRIDE0=stride0,
++        CAST_NORM_TO_BF16=cast_norm_to_bf16,
++    )
++
++    return q_out, k_out, v_out
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index 5b1a90e94..40fd9d8e4 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -210,6 +210,7 @@ from sglang.srt.utils.hf_transformers_utils import (
+ )
+ from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+ from sglang.utils import TypeBasedDispatcher, get_exception_traceback
++from sglang.srt.utils.common import is_npu
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -218,6 +219,7 @@ TEST_RETRACT = envs.SGLANG_TEST_RETRACT.get()
+ TEST_RETRACT_INTERVAL = envs.SGLANG_TEST_RETRACT_INTERVAL.get()
+ TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
+ 
++_is_npu = is_npu()
+ 
+ @dataclass
+ class EmbeddingBatchResult:
+@@ -403,7 +405,7 @@ class Scheduler(
+             if self.server_args.dllm_algorithm is not None
+             else None
+         )
+-        if self.dllm_config:
++        if _is_npu and self.dllm_config:
+             # make sure the page size is not larger than block_size and chunked_prefill_size
+             if self.dllm_config.block_size < self.page_size:
+                 logger.warning(
+diff --git a/python/sglang/srt/managers/scheduler_output_processor_mixin.py b/python/sglang/srt/managers/scheduler_output_processor_mixin.py
+index ae2459708..f98d39b47 100644
+--- a/python/sglang/srt/managers/scheduler_output_processor_mixin.py
++++ b/python/sglang/srt/managers/scheduler_output_processor_mixin.py
+@@ -26,6 +26,7 @@ from sglang.srt.managers.schedule_batch import (
+ from sglang.srt.mem_cache.common import release_kv_cache
+ from sglang.srt.server_args import get_global_server_args
+ from sglang.srt.tracing.trace import trace_slice, trace_slice_batch, trace_slice_end
++from sglang.srt.utils import is_npu
+ 
+ if TYPE_CHECKING:
+     from sglang.srt.managers.scheduler import (
+@@ -35,6 +36,8 @@ if TYPE_CHECKING:
+         Scheduler,
+     )
+ 
++_is_npu=is_npu()
++
+ logger = logging.getLogger(__name__)
+ 
+ DEFAULT_FORCE_STREAM_INTERVAL = 50
+@@ -387,6 +390,43 @@ class SchedulerOutputProcessorMixin:
+             batch.reqs, batch.return_logprob, is_idle_batch=True
+         )
+ 
++    def _append_block_and_finalize_req(
++        self: Scheduler,
++        req,
++        next_token_ids: list[int],
++    ):
++        """
++        Minimal-intrusion replacement for the per-token loop:
++          - append all tokens once
++          - check_finished once with new_accepted_len=len(block)
++          - truncate via finished_len if set
++          - then do release/cache exactly once (same net effect as original loop)
++        """
++        if not next_token_ids:
++            return
++    
++        # If already finished, do nothing (matches check_finished early return behavior)
++        if req.finished():
++            return
++    
++        # Append all at once
++        req.output_ids.extend(next_token_ids)
++    
++        # Single finished check: treat the whole block as newly accepted
++        req.check_finished(new_accepted_len=len(next_token_ids))
++    
++        # Truncate to stop position if finished_len is provided
++        if req.finished_len is not None and len(req.output_ids) > req.finished_len:
++            del req.output_ids[req.finished_len:]
++    
++        # Now mirror the original post-check behavior:
++        if req.finished():
++            release_kv_cache(req, self.tree_cache)
++            req.time_stats.completion_time = time.perf_counter()
++        else:
++            self.tree_cache.cache_unfinished_req(req)
++
++
+     def process_batch_result_dllm(
+         self: Scheduler,
+         batch: ScheduleBatch,
+@@ -406,6 +446,11 @@ class SchedulerOutputProcessorMixin:
+             next_token_ids = result.next_token_ids[idx].tolist()
+             self.num_generated_tokens += len(next_token_ids)
+ 
++            # to accelerate decoding by check in blockwise-manner
++            if _is_npu:
++                self._append_block_and_finalize_req(req, next_token_ids)
++                continue
++
+             for _token_idx, next_token_id in enumerate(next_token_ids):
+                 req.output_ids.append(next_token_id)
+                 req.check_finished()
+diff --git a/python/sglang/srt/model_executor/forward_batch_info.py b/python/sglang/srt/model_executor/forward_batch_info.py
+index bcd1fda10..5941e97e9 100644
+--- a/python/sglang/srt/model_executor/forward_batch_info.py
++++ b/python/sglang/srt/model_executor/forward_batch_info.py
+@@ -466,7 +466,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
+         if batch.dllm_config is not None:
+             block_size = batch.dllm_config.block_size
+             # Use int64 for AMD rotary embedding kernel compatibility
+-            positions_dtype = torch.int64 if is_hip() else torch.int32
++            positions_dtype = torch.int64 if is_hip() or _is_npu else torch.int32
+             ret.positions = torch.tensor(
+                 [
+                     i
+diff --git a/python/sglang/srt/models/llada2.py b/python/sglang/srt/models/llada2.py
+index d49172c96..779960d41 100644
+--- a/python/sglang/srt/models/llada2.py
++++ b/python/sglang/srt/models/llada2.py
+@@ -76,12 +76,15 @@ from sglang.srt.models.utils import (
+     enable_fused_set_kv_buffer,
+ )
+ from sglang.srt.server_args import get_global_server_args
+-from sglang.srt.utils import add_prefix, is_cuda, is_non_idle_and_non_empty, make_layers
++from sglang.srt.utils import add_prefix, is_cuda, is_npu, is_non_idle_and_non_empty, make_layers
+ 
+ LoraConfig = None
+ logger = logging.getLogger(__name__)
+ _is_cuda = is_cuda()
++_is_npu = is_npu()
+ 
++if _is_npu:
++    from sglang.srt.layers.rotary_embedding import split_qkv_rmsnorm_rope_pos_cache_half_npu
+ 
+ class LLaDA2MoeMLP(nn.Module):
+     def __init__(
+@@ -195,6 +198,11 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
+                 "Only silu is supported for now."
+             )
+ 
++        # fused_topk_npu() by defualt conduct norm before scale with routed_scaling_factor
++        # norm_topk_prob=True will renorm the routed_scaling_factor thus need to keep norm_topk_prob=False
++        if _is_npu:
++            self.norm_topk_prob = False
++
+         # Gate always runs at half / full precision for now.
+         router_dtype = getattr(config, "router_dtype", None)
+         if router_dtype is None:
+@@ -204,6 +212,10 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
+         else:
+             self.router_dtype = torch.bfloat16
+ 
++        # to accelerate MoEGate on NPU, and LLaDA2.0-mini precision on GSM8k increase from 0.930->0.935
++        if _is_npu:
++            self.router_dtype = torch.bfloat16
++
+         # TODO global_server_args.ep_num_redundant_experts is used for eplb, not supported now
+         assert get_global_server_args().ep_num_redundant_experts == 0
+         # check group topk
+@@ -247,7 +259,7 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
+             # num_fused_shared_experts=self.num_fused_shared_experts,
+             topk_group=self.topk_group,
+             correction_bias=self.correction_bias,
+-            # routed_scaling_factor=self.routed_scaling_factor,
++            routed_scaling_factor=self.routed_scaling_factor,
+         )
+ 
+         self.experts = get_moe_impl_class(quant_config)(
+@@ -257,7 +269,7 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
+             hidden_size=config.hidden_size,
+             intermediate_size=config.moe_intermediate_size,
+             quant_config=quant_config,
+-            # routed_scaling_factor=self.routed_scaling_factor,
++            routed_scaling_factor=self.routed_scaling_factor,
+             prefix=add_prefix("experts", prefix),
+         )
+         # shared expert
+@@ -363,12 +375,7 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
+             final_hidden_states = self._forward_router_experts(hidden_states)
+ 
+         if self.num_shared_experts > 0:
+-            x = shared_output
+-            x.add_(final_hidden_states, alpha=self.routed_scaling_factor)
+-            final_hidden_states = x
+-            # final_hidden_states = final_hidden_states + shared_output
+-        else:
+-            final_hidden_states.mul_(self.routed_scaling_factor)
++            final_hidden_states = final_hidden_states + shared_output
+ 
+         if self.tp_size > 1 and not use_reduce_scatter:
+             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+@@ -401,13 +408,7 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
+         )
+ 
+         if shared_output is not None:
+-            x = shared_output
+-            x.add_(final_hidden_states, alpha=self.routed_scaling_factor)
+-            final_hidden_states = x
+-            # final_hidden_states = final_hidden_states + shared_output
+-        else:
+-            final_hidden_states.mul_(self.routed_scaling_factor)
+-
++            final_hidden_states += shared_output
+         return final_hidden_states
+ 
+ 
+@@ -513,30 +514,47 @@ class LLaDA2MoeAttention(nn.Module):
+         if hidden_states.shape[0] == 0:
+             return hidden_states
+         qkv, _ = self.query_key_value(hidden_states)
+-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+-        if self.use_qk_norm:
+-            q, k = apply_qk_norm(
+-                q=q,
+-                k=k,
+-                q_norm=self.query_layernorm,
+-                k_norm=self.key_layernorm,
+-                head_dim=self.head_dim,
+-                alt_stream=self.alt_stream,
++        if _is_npu:
++            q, k, v = split_qkv_rmsnorm_rope_pos_cache_half_npu(
++                qkv,
++                positions,
++                self.rotary_emb.cos_sin_cache,
++                self.q_size,
++                self.kv_size,
++                self.head_dim,
++                eps=self.query_layernorm.variance_epsilon,
++                q_weight=self.query_layernorm.weight,
++                k_weight=self.key_layernorm.weight,
++                q_bias=getattr(self.query_layernorm, "bias", None),
++                k_bias=getattr(self.key_layernorm, "bias", None),
++                rope_dim=self.rotary_dim,
+             )
+-        q, k = self.rotary_emb(
+-            positions,
+-            q,
+-            k,
+-            fused_set_kv_buffer_arg=(
+-                create_fused_set_kv_buffer_arg(
+-                    value=v,
+-                    layer=self.attn,
+-                    forward_batch=forward_batch,
++        else:
++            q, k, v= qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
++            if self.use_qk_norm:
++                q, k = apply_qk_norm(
++                    q=q,
++                    k=k,
++                    q_norm=self.query_layernorm,
++                    k_norm=self.key_layernorm,
++                    head_dim=self.head_dim,
++                    alt_stream=self.alt_stream,
+                 )
+-                if enable_fused_set_kv_buffer(forward_batch)
+-                else None
+-            ),
+-        )
++            q, k = self.rotary_emb(
++                positions,
++                q,
++                k,
++                fused_set_kv_buffer_arg=(
++                    create_fused_set_kv_buffer_arg(
++                        value=v,
++                        layer=self.attn,
++                        forward_batch=forward_batch,
++                    )
++                    if enable_fused_set_kv_buffer(forward_batch)
++                    else None
++                ),
++            )
++
+         context_layer = self.attn(
+             q,
+             k,
+diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
+index 0a9615244..7b4422c12 100644
+--- a/python/sglang/srt/server_args.py
++++ b/python/sglang/srt/server_args.py
+@@ -2724,13 +2724,13 @@ class ServerArgs:
+                     "Attention backend is set to triton for diffusion LLM inference on AMD GPUs"
+                 )
+                 self.attention_backend = "triton"
++        elif is_npu():
++            if self.attention_backend != "ascend":
++                logger.warning(
++                    "Attention backend is set to ascend with npu because of enabling cuda graph in diffusion LLM inference"
++                )
++                self.attention_backend = "ascend"
+         elif not self.disable_cuda_graph:
+-            if self.device == "npu":
+-                if self.attention_backend != "ascend":
+-                    logger.warning(
+-                        "Attention backend is set to ascend with npu because of enabling cuda graph in diffusion LLM inference"
+-                    )
+-                    self.attention_backend = "ascend"
+             elif self.attention_backend != "flashinfer":
+                 logger.warning(
+                     "Attention backend is set to flashinfer because of enabling cuda graph in diffusion LLM inference"
+-- 
+2.33.0
+

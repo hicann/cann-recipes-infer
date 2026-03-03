@@ -1,0 +1,28 @@
+From 22d6975792378f117d6d77a430c464f4332af85e Mon Sep 17 00:00:00 2001
+From: Yuan Yuan <soc.yuan@gmail.com>
+Date: Sat, 28 Feb 2026 18:16:41 +0800
+Subject: [PATCH 16/16] revert the moe gate accuracy to the model prededfined
+ in llada2.0 on NPU
+
+---
+ python/sglang/srt/models/llada2.py | 4 ----
+ 1 file changed, 4 deletions(-)
+
+diff --git a/python/sglang/srt/models/llada2.py b/python/sglang/srt/models/llada2.py
+index f87ae779a..a2636837d 100644
+--- a/python/sglang/srt/models/llada2.py
++++ b/python/sglang/srt/models/llada2.py
+@@ -221,10 +221,6 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
+         else:
+             self.router_dtype = torch.bfloat16
+ 
+-        # to accelerate MoEGate on NPU, and LLaDA2.0-mini precision on GSM8k increase from 0.930->0.935
+-        if _is_npu:
+-            self.router_dtype = torch.bfloat16
+-
+         # TODO global_server_args.ep_num_redundant_experts is used for eplb, not supported now
+         assert get_global_server_args().ep_num_redundant_experts == 0
+         # check group topk
+-- 
+2.33.0
+

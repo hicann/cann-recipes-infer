@@ -1,0 +1,35 @@
+From fbca17fea2535fb357edc2041e578c39d1df0cb0 Mon Sep 17 00:00:00 2001
+From: Yuan Yuan <soc.yuan@gmail.com>
+Date: Sat, 14 Feb 2026 14:38:22 +0700
+Subject: [PATCH 14/16] update the ascend dllm accuracy test config
+
+---
+ test/registered/dllm/low_confidence.yaml        | 2 ++
+ test/registered/dllm/test_llada2_mini_ascend.py | 2 ++
+ 2 files changed, 4 insertions(+)
+ create mode 100644 test/registered/dllm/low_confidence.yaml
+
+diff --git a/test/registered/dllm/low_confidence.yaml b/test/registered/dllm/low_confidence.yaml
+new file mode 100644
+index 000000000..741a6b314
+--- /dev/null
++++ b/test/registered/dllm/low_confidence.yaml
+@@ -0,0 +1,2 @@
++block_size: 32
++threshold: 0.85
+diff --git a/test/registered/dllm/test_llada2_mini_ascend.py b/test/registered/dllm/test_llada2_mini_ascend.py
+index ac6cea22f..21defecd5 100644
+--- a/test/registered/dllm/test_llada2_mini_ascend.py
++++ b/test/registered/dllm/test_llada2_mini_ascend.py
+@@ -34,6 +34,8 @@ class TestLLaDA2Mini(CustomTestCase):
+             "ascend",
+             "--dllm-algorithm",
+             "LowConfidence",  # TODO: Add dLLM configurations
++            "--dllm-algorithm-config",
++            "low_confidence.yaml",
+         ]
+ 
+         cls.process = popen_launch_server(
+-- 
+2.33.0
+

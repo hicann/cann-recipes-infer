@@ -1,0 +1,25 @@
+From 36a5844402901297119a91a78a65e3917b4d07b5 Mon Sep 17 00:00:00 2001
+From: Yuan Yuan <soc.yuan@gmail.com>
+Date: Mon, 9 Feb 2026 14:20:50 +0700
+Subject: [PATCH 05/16] [NPU] fix bug in python/sglang/srt/server_args.py
+
+---
+ python/sglang/srt/server_args.py | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
+index 7b4422c12..7bc746863 100644
+--- a/python/sglang/srt/server_args.py
++++ b/python/sglang/srt/server_args.py
+@@ -2731,7 +2731,7 @@ class ServerArgs:
+                 )
+                 self.attention_backend = "ascend"
+         elif not self.disable_cuda_graph:
+-            elif self.attention_backend != "flashinfer":
++            if self.attention_backend != "flashinfer":
+                 logger.warning(
+                     "Attention backend is set to flashinfer because of enabling cuda graph in diffusion LLM inference"
+                 )
+-- 
+2.33.0
+

@@ -1,0 +1,592 @@
+From fab662c8bc05fbf9413686b1be0b3f1ae1815f42 Mon Sep 17 00:00:00 2001
+From: Yuan Yuan <soc.yuan@gmail.com>
+Date: Mon, 9 Feb 2026 16:39:02 +0700
+Subject: [PATCH 08/16] [NPU] dllm update: format code with pre-commit
+
+---
+ .../srt/dllm/algorithm/low_confidence.py      |  77 ++++++-----
+ .../npu/attention/ascend_backend.py           |  12 +-
+ python/sglang/srt/layers/rotary_embedding.py  | 124 +++++++++++++-----
+ python/sglang/srt/managers/scheduler.py       |   3 +-
+ .../scheduler_output_processor_mixin.py       |  15 +--
+ python/sglang/srt/models/llada2.py            |  17 ++-
+ .../dllm/test_llada2_mini_ascend.py           |   2 +-
+ 7 files changed, 162 insertions(+), 88 deletions(-)
+
+diff --git a/python/sglang/srt/dllm/algorithm/low_confidence.py b/python/sglang/srt/dllm/algorithm/low_confidence.py
+index ed7fb459c..1c15ead07 100644
+--- a/python/sglang/srt/dllm/algorithm/low_confidence.py
++++ b/python/sglang/srt/dllm/algorithm/low_confidence.py
+@@ -1,7 +1,7 @@
+-from typing import List, Tuple, Union, Optional
++import math
++from typing import List, Optional, Tuple, Union
+ 
+ import numpy as np
+-import math
+ import torch
+ import torch.nn.functional as F
+ 
+@@ -14,13 +14,16 @@ from sglang.srt.utils import is_npu
+ 
+ _is_npu = is_npu()
+ 
++
+ def parallel_decoding_update_input_ids_vectorized(
+-    input_ids_1d: torch.Tensor,          # [B*blk]
+-    full_logits_2d: torch.Tensor,         # [B*blk, V]
++    input_ids_1d: torch.Tensor,  # [B*blk]
++    full_logits_2d: torch.Tensor,  # [B*blk, V]
+     mask_id: int,
+     block_size: int,
+     threshold: float,
+-    finished: Optional[torch.Tensor] = None,  # [B] bool, True means do NOT update this row
++    finished: Optional[
++        torch.Tensor
++    ] = None,  # [B] bool, True means do NOT update this row
+     force_at_least_one: bool = True,
+ ) -> None:
+     """
+@@ -36,12 +39,18 @@ def parallel_decoding_update_input_ids_vectorized(
+       - Rows with no mask positions are left unchanged (equivalent to `continue`)
+       - If `finished` is provided, finished rows are always left unchanged
+     """
+-    assert input_ids_1d.dim() == 1, f"input_ids_1d must be 1D, got {tuple(input_ids_1d.shape)}"
+-    assert full_logits_2d.dim() == 2, f"full_logits_2d must be 2D, got {tuple(full_logits_2d.shape)}"
+-    assert input_ids_1d.shape[0] == full_logits_2d.shape[0], \
+-        f"len mismatch: {input_ids_1d.shape[0]} vs {full_logits_2d.shape[0]}"
+-    assert input_ids_1d.shape[0] % block_size == 0, \
+-        f"len(input_ids_1d) must be divisible by block_size, got {input_ids_1d.shape[0]}, block_size={block_size}"
++    assert (
++        input_ids_1d.dim() == 1
++    ), f"input_ids_1d must be 1D, got {tuple(input_ids_1d.shape)}"
++    assert (
++        full_logits_2d.dim() == 2
++    ), f"full_logits_2d must be 2D, got {tuple(full_logits_2d.shape)}"
++    assert (
++        input_ids_1d.shape[0] == full_logits_2d.shape[0]
++    ), f"len mismatch: {input_ids_1d.shape[0]} vs {full_logits_2d.shape[0]}"
++    assert (
++        input_ids_1d.shape[0] % block_size == 0
++    ), f"len(input_ids_1d) must be divisible by block_size, got {input_ids_1d.shape[0]}, block_size={block_size}"
+     assert 0.0 < threshold <= 1.0, f"threshold should be in (0,1], got {threshold}"
+ 
+     B = input_ids_1d.shape[0] // block_size
+@@ -50,41 +59,43 @@ def parallel_decoding_update_input_ids_vectorized(
+     dev = input_ids_1d.device
+ 
+     # Views (no copy)
+-    input_ids = input_ids_1d.view(B, blk)                 # [B, blk]
+-    logits = full_logits_2d.view(B, blk, V)               # [B, blk, V]
++    input_ids = input_ids_1d.view(B, blk)  # [B, blk]
++    logits = full_logits_2d.view(B, blk, V)  # [B, blk, V]
+ 
+     # Candidate mask
+-    mask = input_ids.eq(mask_id)                          # [B, blk]
++    mask = input_ids.eq(mask_id)  # [B, blk]
+     if finished is not None:
+-        assert finished.shape == (B,), f"finished must be shape [B]={B}, got {tuple(finished.shape)}"
+-        alive = (~finished).view(B, 1)                    # [B,1]
++        assert finished.shape == (
++            B,
++        ), f"finished must be shape [B]={B}, got {tuple(finished.shape)}"
++        alive = (~finished).view(B, 1)  # [B,1]
+         eff_mask = mask & alive
+     else:
+         eff_mask = mask
+ 
+     # Argmax token id per position and its log-prob.
+     # logp = log softmax(logits)[argmax] = max_logit - logsumexp(logits)
+-    max_logit, x = logits.max(dim=-1)                     # [B, blk], [B, blk]
+-    lse = torch.logsumexp(logits, dim=-1)                 # [B, blk]
+-    logp = max_logit - lse                                # [B, blk]
++    max_logit, x = logits.max(dim=-1)  # [B, blk], [B, blk]
++    lse = torch.logsumexp(logits, dim=-1)  # [B, blk]
++    logp = max_logit - lse  # [B, blk]
+ 
+     neg_inf = torch.full_like(logp, float("-inf"))
+-    confidence = torch.where(eff_mask, logp, neg_inf)     # [B, blk]
++    confidence = torch.where(eff_mask, logp, neg_inf)  # [B, blk]
+ 
+     log_thr = math.log(threshold)
+-    transfer = confidence > log_thr                       # [B, blk] bool
++    transfer = confidence > log_thr  # [B, blk] bool
+ 
+     # Apply threshold updates first
+-    new_ids = torch.where(transfer, x, input_ids)         # [B, blk]
++    new_ids = torch.where(transfer, x, input_ids)  # [B, blk]
+ 
+     # Force-at-least-one (graph-friendly): unconditional sparse per-row write, gated to no-op when not needed
+     if force_at_least_one:
+-        row_has_any = eff_mask.any(dim=1)                 # [B]
+-        hit_any = transfer.any(dim=1)                     # [B]
+-        need_force = row_has_any & (~hit_any)             # [B]
++        row_has_any = eff_mask.any(dim=1)  # [B]
++        hit_any = transfer.any(dim=1)  # [B]
++        need_force = row_has_any & (~hit_any)  # [B]
+ 
+         # Best idx per row (even if all -inf -> 0); gated by need_force
+-        best_idx = confidence.argmax(dim=1)               # [B] long
++        best_idx = confidence.argmax(dim=1)  # [B] long
+ 
+         # idx2: where to write per row:
+         #   - need_force: best_idx
+@@ -92,13 +103,13 @@ def parallel_decoding_update_input_ids_vectorized(
+         zero_idx = torch.zeros_like(best_idx)
+         idx2 = torch.where(need_force, best_idx, zero_idx)  # [B]
+ 
+-        rows = torch.arange(B, device=dev)                # [B]
++        rows = torch.arange(B, device=dev)  # [B]
+ 
+         # val2: what to write per row:
+         #   - need_force: x[row, best_idx]
+         #   - else: new_ids[row, 0] (no-op)
+-        force_val = x[rows, best_idx]                     # [B]
+-        noop_val = new_ids[rows, zero_idx]                # [B] == new_ids[:,0]
++        force_val = x[rows, best_idx]  # [B]
++        noop_val = new_ids[rows, zero_idx]  # [B] == new_ids[:,0]
+         val2 = torch.where(need_force, force_val, noop_val)  # [B]
+ 
+         # Single-point update per row (typically much cheaper than [B,blk] one-hot scatter_)
+@@ -154,7 +165,9 @@ class LowConfidence(DllmAlgorithm):
+                 break
+ 
+             if _is_npu:
+-                out = model_runner.forward(forward_batch, skip_attn_backend_init, pp_proxy_tensors=None)
++                out = model_runner.forward(
++                    forward_batch, skip_attn_backend_init, pp_proxy_tensors=None
++                )
+                 skip_attn_backend_init = True
+             else:
+                 out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
+@@ -206,7 +219,9 @@ class LowConfidence(DllmAlgorithm):
+                 block_input_ids[transfer_index] = x[transfer_index]
+ 
+         if _is_npu:
+-            out = model_runner.forward(forward_batch, skip_attn_backend_init, pp_proxy_tensors=None)
++            out = model_runner.forward(
++                forward_batch, skip_attn_backend_init, pp_proxy_tensors=None
++            )
+         else:
+             out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
+         logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
+diff --git a/python/sglang/srt/hardware_backend/npu/attention/ascend_backend.py b/python/sglang/srt/hardware_backend/npu/attention/ascend_backend.py
+index 131f676f8..822548b0c 100644
+--- a/python/sglang/srt/hardware_backend/npu/attention/ascend_backend.py
++++ b/python/sglang/srt/hardware_backend/npu/attention/ascend_backend.py
+@@ -11,10 +11,10 @@ from sgl_kernel_npu.attention.sinks_attention import (
+ )
+ 
+ from sglang.srt.configs.model_config import AttentionArch
++from sglang.srt.dllm.config import DllmConfig
+ from sglang.srt.hardware_backend.npu.attention.ascend_torch_native_backend import (
+     AscendTorchNativeAttnBackend,
+ )
+-from sglang.srt.dllm.config import DllmConfig
+ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
+     is_fia_nz,
+     is_mla_preprocess_enabled,
+@@ -424,15 +424,15 @@ class AscendAttnBackend(AttentionBackend):
+         max_seq_pages = (max_len + self.page_size - 1) // self.page_size
+ 
+         metadata.block_tables[:bs, :max_seq_pages].copy_(
+-           self.req_to_token[req_pool_indices[:bs], :max_len][:, :: self.page_size]
+-           // self.page_size
++            self.req_to_token[req_pool_indices[:bs], :max_len][:, :: self.page_size]
++            // self.page_size
+         )
+ 
+         metadata.block_tables[:bs, max_seq_pages:].fill_(0)
+         metadata.block_tables[bs:, :].fill_(0)
+ 
+         if forward_mode.is_target_verify():
+-           seq_lens = seq_lens + self.speculative_num_draft_tokens
++            seq_lens = seq_lens + self.speculative_num_draft_tokens
+         metadata.seq_lens[:bs].copy_(seq_lens[:bs])
+ 
+         self.forward_metadata = metadata
+@@ -1887,7 +1887,3 @@ class AscendAttnMultiStepDraftBackend:
+             )
+ 
+         self.common_template(forward_batch, call_fn)
+-
+-
+-
+-
+diff --git a/python/sglang/srt/layers/rotary_embedding.py b/python/sglang/srt/layers/rotary_embedding.py
+index dd7aba8ab..d3193c318 100644
+--- a/python/sglang/srt/layers/rotary_embedding.py
++++ b/python/sglang/srt/layers/rotary_embedding.py
+@@ -3210,8 +3210,8 @@ def fp32_to_bf16_rne(x):
+ @triton.jit
+ def split_qkv_rmsnorm_rope_half_pos_cache_kernel(
+     input_ptr,
+-    pos_ptr,                  # [B]
+-    cos_sin_cache_ptr,        # [max_seq, ROPE_DIM] layout: [cos_half, sin_half]
++    pos_ptr,  # [B]
++    cos_sin_cache_ptr,  # [max_seq, ROPE_DIM] layout: [cos_half, sin_half]
+     q_ptr,
+     k_ptr,
+     v_ptr,
+@@ -3220,25 +3220,20 @@ def split_qkv_rmsnorm_rope_half_pos_cache_kernel(
+     k_weight_ptr,
+     k_bias_ptr,
+     batch_size,
+-
+     q_hidden_size: tl.constexpr,
+     kv_hidden_size: tl.constexpr,
+     total_hidden_size: tl.constexpr,
+     eps: tl.constexpr,
+-
+     Q_BLOCK_SIZE: tl.constexpr,
+     KV_BLOCK_SIZE: tl.constexpr,
+-    Q_BLOCK_N: tl.constexpr,          # Q_BLOCK_SIZE // HEAD_DIM
+-    K_BLOCK_N: tl.constexpr,          # KV_BLOCK_SIZE // HEAD_DIM
+-
++    Q_BLOCK_N: tl.constexpr,  # Q_BLOCK_SIZE // HEAD_DIM
++    K_BLOCK_N: tl.constexpr,  # KV_BLOCK_SIZE // HEAD_DIM
+     BIAS: tl.constexpr,
+     NORMS: tl.constexpr,
+     HEAD_DIM: tl.constexpr,
+-
+     ROPE_DIM: tl.constexpr,
+     HALF_ROPE_DIM: tl.constexpr,
+     COS_SIN_STRIDE0: tl.constexpr,
+-
+     CAST_NORM_TO_BF16: tl.constexpr,  # ONLY this cast uses fp32_to_bf16_rne
+ ):
+     row_pid = tl.program_id(0)
+@@ -3284,23 +3279,40 @@ def split_qkv_rmsnorm_rope_half_pos_cache_kernel(
+         # y_base: fp32 or bf16
+         if CAST_NORM_TO_BF16:
+             # keep strict RNE here ONLY
+-            y_base = fp32_to_bf16_rne(y)   # bf16
++            y_base = fp32_to_bf16_rne(y)  # bf16
+         else:
+-            y_base = y                     # fp32
++            y_base = y  # fp32
+ 
+         # ---- load cos/sin half (fp32) ----
+         p = tl.load(pos_ptr + row_idx).to(tl.int32)
+         base = p * COS_SIN_STRIDE0
+         offs = tl.arange(0, HALF_ROPE_DIM)
+-        cos_f = tl.load(cos_sin_cache_ptr + base + offs).to(tl.float32).reshape(1, HALF_ROPE_DIM)
+-        sin_f = tl.load(cos_sin_cache_ptr + base + HALF_ROPE_DIM + offs).to(tl.float32).reshape(1, HALF_ROPE_DIM)
++        cos_f = (
++            tl.load(cos_sin_cache_ptr + base + offs)
++            .to(tl.float32)
++            .reshape(1, HALF_ROPE_DIM)
++        )
++        sin_f = (
++            tl.load(cos_sin_cache_ptr + base + HALF_ROPE_DIM + offs)
++            .to(tl.float32)
++            .reshape(1, HALF_ROPE_DIM)
++        )
+ 
+         # ---- RoPE half on first ROPE_DIM (fp32 math; casts use .to(bf16)) ----
+-        y_rot = tl.extract_slice(y_base, offsets=(0, 0), sizes=(Q_BLOCK_N, ROPE_DIM), strides=(1, 1))
++        y_rot = tl.extract_slice(
++            y_base, offsets=(0, 0), sizes=(Q_BLOCK_N, ROPE_DIM), strides=(1, 1)
++        )
+         y_rot_f = y_rot.to(tl.float32)
+ 
+-        x1 = tl.extract_slice(y_rot_f, offsets=(0, 0), sizes=(Q_BLOCK_N, HALF_ROPE_DIM), strides=(1, 1))
+-        x2 = tl.extract_slice(y_rot_f, offsets=(0, HALF_ROPE_DIM), sizes=(Q_BLOCK_N, HALF_ROPE_DIM), strides=(1, 1))
++        x1 = tl.extract_slice(
++            y_rot_f, offsets=(0, 0), sizes=(Q_BLOCK_N, HALF_ROPE_DIM), strides=(1, 1)
++        )
++        x2 = tl.extract_slice(
++            y_rot_f,
++            offsets=(0, HALF_ROPE_DIM),
++            sizes=(Q_BLOCK_N, HALF_ROPE_DIM),
++            strides=(1, 1),
++        )
+ 
+         o1 = x1 * cos_f - x2 * sin_f
+         o2 = x2 * cos_f + x1 * sin_f
+@@ -3308,17 +3320,29 @@ def split_qkv_rmsnorm_rope_half_pos_cache_kernel(
+         ro2 = o2.to(tl.bfloat16)
+ 
+         roped = tl.zeros((Q_BLOCK_N, ROPE_DIM), dtype=tl.bfloat16)
+-        roped = tl.insert_slice(roped, ro1, offsets=(0, 0), sizes=(Q_BLOCK_N, HALF_ROPE_DIM), strides=(1, 1))
+-        roped = tl.insert_slice(roped, ro2, offsets=(0, HALF_ROPE_DIM), sizes=(Q_BLOCK_N, HALF_ROPE_DIM), strides=(1, 1))
++        roped = tl.insert_slice(
++            roped, ro1, offsets=(0, 0), sizes=(Q_BLOCK_N, HALF_ROPE_DIM), strides=(1, 1)
++        )
++        roped = tl.insert_slice(
++            roped,
++            ro2,
++            offsets=(0, HALF_ROPE_DIM),
++            sizes=(Q_BLOCK_N, HALF_ROPE_DIM),
++            strides=(1, 1),
++        )
+ 
+         # output base bf16 (tail passthrough)
+         if CAST_NORM_TO_BF16:
+-            y_out = y_base                 # already bf16
++            y_out = y_base  # already bf16
+         else:
+-            y_out = y_base.to(tl.bfloat16) # fast cast
++            y_out = y_base.to(tl.bfloat16)  # fast cast
+ 
+-        y_out = tl.insert_slice(y_out, roped, offsets=(0, 0), sizes=(Q_BLOCK_N, ROPE_DIM), strides=(1, 1))
+-        tl.store(q_ptr + outq_off + col, y_out.reshape(Q_BLOCK_SIZE).to(Q_TY), mask=mask)
++        y_out = tl.insert_slice(
++            y_out, roped, offsets=(0, 0), sizes=(Q_BLOCK_N, ROPE_DIM), strides=(1, 1)
++        )
++        tl.store(
++            q_ptr + outq_off + col, y_out.reshape(Q_BLOCK_SIZE).to(Q_TY), mask=mask
++        )
+ 
+         in_off += in_off_step
+         outq_off += outq_off_step
+@@ -3354,7 +3378,7 @@ def split_qkv_rmsnorm_rope_half_pos_cache_kernel(
+             y = x
+ 
+         if CAST_NORM_TO_BF16:
+-            y_base = fp32_to_bf16_rne(y)   # strict here only
++            y_base = fp32_to_bf16_rne(y)  # strict here only
+         else:
+             y_base = y
+ 
+@@ -3362,15 +3386,32 @@ def split_qkv_rmsnorm_rope_half_pos_cache_kernel(
+         p = tl.load(pos_ptr + row_idx).to(tl.int32)
+         base = p * COS_SIN_STRIDE0
+         offs = tl.arange(0, HALF_ROPE_DIM)
+-        cos_f = tl.load(cos_sin_cache_ptr + base + offs).to(tl.float32).reshape(1, HALF_ROPE_DIM)
+-        sin_f = tl.load(cos_sin_cache_ptr + base + HALF_ROPE_DIM + offs).to(tl.float32).reshape(1, HALF_ROPE_DIM)
++        cos_f = (
++            tl.load(cos_sin_cache_ptr + base + offs)
++            .to(tl.float32)
++            .reshape(1, HALF_ROPE_DIM)
++        )
++        sin_f = (
++            tl.load(cos_sin_cache_ptr + base + HALF_ROPE_DIM + offs)
++            .to(tl.float32)
++            .reshape(1, HALF_ROPE_DIM)
++        )
+ 
+         # rope
+-        y_rot = tl.extract_slice(y_base, offsets=(0, 0), sizes=(K_BLOCK_N, ROPE_DIM), strides=(1, 1))
++        y_rot = tl.extract_slice(
++            y_base, offsets=(0, 0), sizes=(K_BLOCK_N, ROPE_DIM), strides=(1, 1)
++        )
+         y_rot_f = y_rot.to(tl.float32)
+ 
+-        x1 = tl.extract_slice(y_rot_f, offsets=(0, 0), sizes=(K_BLOCK_N, HALF_ROPE_DIM), strides=(1, 1))
+-        x2 = tl.extract_slice(y_rot_f, offsets=(0, HALF_ROPE_DIM), sizes=(K_BLOCK_N, HALF_ROPE_DIM), strides=(1, 1))
++        x1 = tl.extract_slice(
++            y_rot_f, offsets=(0, 0), sizes=(K_BLOCK_N, HALF_ROPE_DIM), strides=(1, 1)
++        )
++        x2 = tl.extract_slice(
++            y_rot_f,
++            offsets=(0, HALF_ROPE_DIM),
++            sizes=(K_BLOCK_N, HALF_ROPE_DIM),
++            strides=(1, 1),
++        )
+ 
+         o1 = x1 * cos_f - x2 * sin_f
+         o2 = x2 * cos_f + x1 * sin_f
+@@ -3378,16 +3419,28 @@ def split_qkv_rmsnorm_rope_half_pos_cache_kernel(
+         ro2 = o2.to(tl.bfloat16)
+ 
+         roped = tl.zeros((K_BLOCK_N, ROPE_DIM), dtype=tl.bfloat16)
+-        roped = tl.insert_slice(roped, ro1, offsets=(0, 0), sizes=(K_BLOCK_N, HALF_ROPE_DIM), strides=(1, 1))
+-        roped = tl.insert_slice(roped, ro2, offsets=(0, HALF_ROPE_DIM), sizes=(K_BLOCK_N, HALF_ROPE_DIM), strides=(1, 1))
++        roped = tl.insert_slice(
++            roped, ro1, offsets=(0, 0), sizes=(K_BLOCK_N, HALF_ROPE_DIM), strides=(1, 1)
++        )
++        roped = tl.insert_slice(
++            roped,
++            ro2,
++            offsets=(0, HALF_ROPE_DIM),
++            sizes=(K_BLOCK_N, HALF_ROPE_DIM),
++            strides=(1, 1),
++        )
+ 
+         if CAST_NORM_TO_BF16:
+             y_out = y_base
+         else:
+             y_out = y_base.to(tl.bfloat16)
+ 
+-        y_out = tl.insert_slice(y_out, roped, offsets=(0, 0), sizes=(K_BLOCK_N, ROPE_DIM), strides=(1, 1))
+-        tl.store(k_ptr + outk_off + col, y_out.reshape(KV_BLOCK_SIZE).to(K_TY), mask=mask)
++        y_out = tl.insert_slice(
++            y_out, roped, offsets=(0, 0), sizes=(K_BLOCK_N, ROPE_DIM), strides=(1, 1)
++        )
++        tl.store(
++            k_ptr + outk_off + col, y_out.reshape(KV_BLOCK_SIZE).to(K_TY), mask=mask
++        )
+ 
+         in_off += in_off_step
+         outk_off += outk_off_step
+@@ -3409,9 +3462,9 @@ def split_qkv_rmsnorm_rope_half_pos_cache_kernel(
+ 
+ 
+ def split_qkv_rmsnorm_rope_pos_cache_half_npu(
+-    input: torch.Tensor,            # [B, q_hidden + 2*kv_hidden]
+-    positions: torch.Tensor,        # [B]
+-    cos_sin_cache: torch.Tensor,    # [max_seq, rope_dim] layout [cos_half, sin_half]
++    input: torch.Tensor,  # [B, q_hidden + 2*kv_hidden]
++    positions: torch.Tensor,  # [B]
++    cos_sin_cache: torch.Tensor,  # [max_seq, rope_dim] layout [cos_half, sin_half]
+     q_hidden_size: int,
+     kv_hidden_size: int,
+     head_dim: int,
+@@ -3424,6 +3477,7 @@ def split_qkv_rmsnorm_rope_pos_cache_half_npu(
+     cast_norm_to_bf16: bool = True,
+ ):
+     from sgl_kernel_npu.utils.triton_utils import get_device_properties
++
+     _, num_vectorcore = get_device_properties()
+     assert input.dim() == 2
+     B, total_hidden = input.shape
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index 40fd9d8e4..04e45f80f 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -203,6 +203,7 @@ from sglang.srt.utils import (
+     set_random_seed,
+     suppress_other_loggers,
+ )
++from sglang.srt.utils.common import is_npu
+ from sglang.srt.utils.hf_transformers_utils import (
+     get_processor,
+     get_tokenizer,
+@@ -210,7 +211,6 @@ from sglang.srt.utils.hf_transformers_utils import (
+ )
+ from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+ from sglang.utils import TypeBasedDispatcher, get_exception_traceback
+-from sglang.srt.utils.common import is_npu
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -221,6 +221,7 @@ TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
+ 
+ _is_npu = is_npu()
+ 
++
+ @dataclass
+ class EmbeddingBatchResult:
+     embeddings: torch.Tensor
+diff --git a/python/sglang/srt/managers/scheduler_output_processor_mixin.py b/python/sglang/srt/managers/scheduler_output_processor_mixin.py
+index f98d39b47..d41d3608a 100644
+--- a/python/sglang/srt/managers/scheduler_output_processor_mixin.py
++++ b/python/sglang/srt/managers/scheduler_output_processor_mixin.py
+@@ -36,7 +36,7 @@ if TYPE_CHECKING:
+         Scheduler,
+     )
+ 
+-_is_npu=is_npu()
++_is_npu = is_npu()
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -404,21 +404,21 @@ class SchedulerOutputProcessorMixin:
+         """
+         if not next_token_ids:
+             return
+-    
++
+         # If already finished, do nothing (matches check_finished early return behavior)
+         if req.finished():
+             return
+-    
++
+         # Append all at once
+         req.output_ids.extend(next_token_ids)
+-    
++
+         # Single finished check: treat the whole block as newly accepted
+         req.check_finished(new_accepted_len=len(next_token_ids))
+-    
++
+         # Truncate to stop position if finished_len is provided
+         if req.finished_len is not None and len(req.output_ids) > req.finished_len:
+-            del req.output_ids[req.finished_len:]
+-    
++            del req.output_ids[req.finished_len :]
++
+         # Now mirror the original post-check behavior:
+         if req.finished():
+             release_kv_cache(req, self.tree_cache)
+@@ -426,7 +426,6 @@ class SchedulerOutputProcessorMixin:
+         else:
+             self.tree_cache.cache_unfinished_req(req)
+ 
+-
+     def process_batch_result_dllm(
+         self: Scheduler,
+         batch: ScheduleBatch,
+diff --git a/python/sglang/srt/models/llada2.py b/python/sglang/srt/models/llada2.py
+index 779960d41..c3428f5a0 100644
+--- a/python/sglang/srt/models/llada2.py
++++ b/python/sglang/srt/models/llada2.py
+@@ -76,7 +76,13 @@ from sglang.srt.models.utils import (
+     enable_fused_set_kv_buffer,
+ )
+ from sglang.srt.server_args import get_global_server_args
+-from sglang.srt.utils import add_prefix, is_cuda, is_npu, is_non_idle_and_non_empty, make_layers
++from sglang.srt.utils import (
++    add_prefix,
++    is_cuda,
++    is_non_idle_and_non_empty,
++    is_npu,
++    make_layers,
++)
+ 
+ LoraConfig = None
+ logger = logging.getLogger(__name__)
+@@ -84,7 +90,10 @@ _is_cuda = is_cuda()
+ _is_npu = is_npu()
+ 
+ if _is_npu:
+-    from sglang.srt.layers.rotary_embedding import split_qkv_rmsnorm_rope_pos_cache_half_npu
++    from sglang.srt.layers.rotary_embedding import (
++        split_qkv_rmsnorm_rope_pos_cache_half_npu,
++    )
++
+ 
+ class LLaDA2MoeMLP(nn.Module):
+     def __init__(
+@@ -198,7 +207,7 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
+                 "Only silu is supported for now."
+             )
+ 
+-        # fused_topk_npu() by defualt conduct norm before scale with routed_scaling_factor
++        # fused_topk_npu() conducting norm before scale with routed_scaling_factor by default
+         # norm_topk_prob=True will renorm the routed_scaling_factor thus need to keep norm_topk_prob=False
+         if _is_npu:
+             self.norm_topk_prob = False
+@@ -530,7 +539,7 @@ class LLaDA2MoeAttention(nn.Module):
+                 rope_dim=self.rotary_dim,
+             )
+         else:
+-            q, k, v= qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
++            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+             if self.use_qk_norm:
+                 q, k = apply_qk_norm(
+                     q=q,
+diff --git a/test/registered/dllm/test_llada2_mini_ascend.py b/test/registered/dllm/test_llada2_mini_ascend.py
+index 05998113e..88a770010 100644
+--- a/test/registered/dllm/test_llada2_mini_ascend.py
++++ b/test/registered/dllm/test_llada2_mini_ascend.py
+@@ -2,7 +2,6 @@ import unittest
+ from types import SimpleNamespace
+ 
+ from sglang.srt.utils import kill_process_tree
+-from sglang.test.ci.ci_register import register_npu_ci
+ from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
+ from sglang.test.send_one import BenchArgs, send_one_prompt
+ from sglang.test.test_utils import (
+@@ -14,6 +13,7 @@ from sglang.test.test_utils import (
+     write_github_step_summary,
+ )
+ 
++
+ class TestLLaDA2Mini(CustomTestCase):
+     @classmethod
+     def setUpClass(cls):
+-- 
+2.33.0
+

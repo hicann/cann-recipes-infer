@@ -1,0 +1,24 @@
+From cacf9f46269aac613f3f287a45fd512ed0a39373 Mon Sep 17 00:00:00 2001
+From: Yuan Yuan <soc.yuan@gmail.com>
+Date: Tue, 24 Feb 2026 17:55:23 +0700
+Subject: [PATCH 15/16] update the comments in test_llada2_mini_ascend.py
+
+---
+ test/registered/dllm/test_llada2_mini_ascend.py | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/test/registered/dllm/test_llada2_mini_ascend.py b/test/registered/dllm/test_llada2_mini_ascend.py
+index 21defecd5..4c7442d49 100644
+--- a/test/registered/dllm/test_llada2_mini_ascend.py
++++ b/test/registered/dllm/test_llada2_mini_ascend.py
+@@ -81,6 +81,7 @@ class TestLLaDA2Mini(CustomTestCase):
+                 f"### test_bs_1_speed (llada2-mini) with tp1\n"
+                 f"{speed=:.2f} token/s\n"
+             )
++            # if test speed lower than 130 tps, have to check the environ
+             self.assertGreater(speed, 130)
+ 
+ 
+-- 
+2.33.0
+

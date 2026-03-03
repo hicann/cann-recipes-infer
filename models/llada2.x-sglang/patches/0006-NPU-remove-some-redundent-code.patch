@@ -1,0 +1,55 @@
+From 87072ac84cdce15274c78f50e1f76ddfc6aaa02a Mon Sep 17 00:00:00 2001
+From: Yuan Yuan <soc.yuan@gmail.com>
+Date: Mon, 9 Feb 2026 14:42:27 +0700
+Subject: [PATCH 06/16] [NPU] remove some redundent code
+
+---
+ python/sglang/srt/dllm/algorithm/low_confidence.py           | 2 +-
+ .../hardware_backend/npu/graph_runner/npu_graph_runner.py    | 1 -
+ python/sglang/srt/layers/rotary_embedding.py                 | 5 -----
+ 3 files changed, 1 insertion(+), 7 deletions(-)
+
+diff --git a/python/sglang/srt/dllm/algorithm/low_confidence.py b/python/sglang/srt/dllm/algorithm/low_confidence.py
+index e0a1778f5..ed7fb459c 100644
+--- a/python/sglang/srt/dllm/algorithm/low_confidence.py
++++ b/python/sglang/srt/dllm/algorithm/low_confidence.py
+@@ -167,7 +167,7 @@ class LowConfidence(DllmAlgorithm):
+                     mask_id=self.mask_id,
+                     block_size=self.block_size,
+                     threshold=self.threshold,
+-                    finished=None,                 # 如果你有 finished mask，就传进来
++                    finished=None,
+                     force_at_least_one=True,
+                 )
+                 continue
+diff --git a/python/sglang/srt/hardware_backend/npu/graph_runner/npu_graph_runner.py b/python/sglang/srt/hardware_backend/npu/graph_runner/npu_graph_runner.py
+index 658b3e1e6..dc40a0fb8 100644
+--- a/python/sglang/srt/hardware_backend/npu/graph_runner/npu_graph_runner.py
++++ b/python/sglang/srt/hardware_backend/npu/graph_runner/npu_graph_runner.py
+@@ -87,7 +87,6 @@ class NPUGraphRunner(CudaGraphRunner):
+             self.attr_name: Dict[str, str] = {
+                 AttentionArch.MLA: "actual_seq_lengths_kv",
+                 AttentionArch.MHA: "actual_seq_lengths_kv",
+-                # AttentionArch.MHA: "context_lens",
+             }
+         else:
+             self.attr_name: Dict[str, str] = {
+diff --git a/python/sglang/srt/layers/rotary_embedding.py b/python/sglang/srt/layers/rotary_embedding.py
+index 37d0522f6..dd7aba8ab 100644
+--- a/python/sglang/srt/layers/rotary_embedding.py
++++ b/python/sglang/srt/layers/rotary_embedding.py
+@@ -301,11 +301,6 @@ class RotaryEmbedding(MultiPlatformOp):
+         ), "fused_set_kv_buffer_arg is not supported for npu implementation"
+         if query.dtype == torch.bfloat16 and self.cos_sin_cache.dtype == torch.float:
+             return self.forward_native(positions, query, key, offsets)
+-
+-        # cast the position dtype to int64 for npu_mrope call
+-        if positions.dtype != torch.int64:
+-            positions = positions.to(torch.int64)
+-
+         if self.is_neox_style:
+             rotary_mode = "half"
+         else:
+-- 
+2.33.0
+

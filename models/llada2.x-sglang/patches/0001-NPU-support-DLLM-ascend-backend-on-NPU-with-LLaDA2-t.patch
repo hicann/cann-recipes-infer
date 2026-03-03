@@ -1,0 +1,239 @@
+From 367e4198d6d8f46577edd92e699300968bb62623 Mon Sep 17 00:00:00 2001
+From: Yuan Yuan <soc.yuan@gmail.com>
+Date: Mon, 5 Jan 2026 19:27:40 +0700
+Subject: [PATCH 01/16] [NPU] support DLLM ascend backend on NPU, with LLaDA2
+ testing
+
+---
+ git                                           |  0
+ .../npu/attention/ascend_backend.py           | 12 ++-
+ python/sglang/srt/layers/rotary_embedding.py  |  5 ++
+ python/sglang/srt/managers/scheduler.py       |  9 ++
+ python/sglang/srt/models/llada2.py            | 11 ++-
+ .../dllm/test_llada2_mini_ascend.py           | 83 +++++++++++++++++++
+ 6 files changed, 117 insertions(+), 3 deletions(-)
+ create mode 100644 git
+ create mode 100644 test/registered/dllm/test_llada2_mini_ascend.py
+
+diff --git a/git b/git
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/python/sglang/srt/hardware_backend/npu/attention/ascend_backend.py b/python/sglang/srt/hardware_backend/npu/attention/ascend_backend.py
+index 33345593f..92430da14 100644
+--- a/python/sglang/srt/hardware_backend/npu/attention/ascend_backend.py
++++ b/python/sglang/srt/hardware_backend/npu/attention/ascend_backend.py
+@@ -11,9 +11,13 @@ from sgl_kernel_npu.attention.sinks_attention import (
+ )
+ 
+ from sglang.srt.configs.model_config import AttentionArch
++<<<<<<< HEAD
+ from sglang.srt.hardware_backend.npu.attention.ascend_torch_native_backend import (
+     AscendTorchNativeAttnBackend,
+ )
++=======
++from sglang.srt.dllm.config import DllmConfig
++>>>>>>> f0f60a812 ([NPU] support DLLM ascend backend on NPU, with LLaDA2 testing)
+ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
+     is_fia_nz,
+     is_mla_preprocess_enabled,
+@@ -247,6 +251,12 @@ class AscendAttnBackend(AttentionBackend):
+         if self.use_mla:
+             self.ringmla_mask = self.ascend_attn_mask_builder.ringmla_mask
+ 
++        # dllm model config
++        self.dllm_config = DllmConfig.from_server_args(model_runner.server_args)
++        self.is_dllm_model = False
++        if self.dllm_config is not None:
++            self.is_dllm_model = True
++
+     def get_verify_buffers_to_fill_after_draft(self):
+         """
+         Return buffers for verify attention kernels that needs to be filled after draft.
+@@ -818,13 +828,13 @@ class AscendAttnBackend(AttentionBackend):
+                     or layer.attn_type == AttentionType.ENCODER_ONLY
+                 ):
+                     causal = False
+-
+                 # there are some accuracy issues in cross attention scene to use torch_npu._npu_flash_attention_qlens
+                 # forward_batch.encoder_lens is not None in cross attention scend, we add native attn to solve accuracy issues
+                 if (
+                     layer.qk_head_dim <= 128
+                     and causal
+                     and forward_batch.encoder_lens is None
++                    and not self.is_dllm_model
+                 ):
+                     if not self.use_alibi:
+                         query = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
+diff --git a/python/sglang/srt/layers/rotary_embedding.py b/python/sglang/srt/layers/rotary_embedding.py
+index da3d3ecb0..752974499 100644
+--- a/python/sglang/srt/layers/rotary_embedding.py
++++ b/python/sglang/srt/layers/rotary_embedding.py
+@@ -301,6 +301,11 @@ class RotaryEmbedding(MultiPlatformOp):
+         ), "fused_set_kv_buffer_arg is not supported for npu implementation"
+         if query.dtype == torch.bfloat16 and self.cos_sin_cache.dtype == torch.float:
+             return self.forward_native(positions, query, key, offsets)
++
++        # cast the position dtype to int64 for npu_mrope call
++        if positions.dtype != torch.int64:
++            positions = positions.to(torch.int64)
++
+         if self.is_neox_style:
+             rotary_mode = "half"
+         else:
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index c7c704c1b..5b1a90e94 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -403,6 +403,15 @@ class Scheduler(
+             if self.server_args.dllm_algorithm is not None
+             else None
+         )
++        if self.dllm_config:
++            # make sure the page size is not larger than block_size and chunked_prefill_size
++            if self.dllm_config.block_size < self.page_size:
++                logger.warning(
++                    "WARNING: "
++                    f"The page size {self.page_size} should not be larger than dllm block size {self.dllm_config.block_size}."
++                    f"Page size now falls back to {self.dllm_config.block_size}"
++                )
++                self.page_size = self.dllm_config.block_size
+ 
+     def init_ipc_channels(self, port_args: PortArgs):
+         context = zmq.Context(2)
+diff --git a/python/sglang/srt/models/llada2.py b/python/sglang/srt/models/llada2.py
+index 7094be5c5..768d3530d 100644
+--- a/python/sglang/srt/models/llada2.py
++++ b/python/sglang/srt/models/llada2.py
+@@ -247,7 +247,7 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
+             # num_fused_shared_experts=self.num_fused_shared_experts,
+             topk_group=self.topk_group,
+             correction_bias=self.correction_bias,
+-            routed_scaling_factor=self.routed_scaling_factor,
++            # routed_scaling_factor=self.routed_scaling_factor,
+         )
+ 
+         self.experts = get_moe_impl_class(quant_config)(
+@@ -257,7 +257,7 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
+             hidden_size=config.hidden_size,
+             intermediate_size=config.moe_intermediate_size,
+             quant_config=quant_config,
+-            routed_scaling_factor=self.routed_scaling_factor,
++            # routed_scaling_factor=self.routed_scaling_factor,
+             prefix=add_prefix("experts", prefix),
+         )
+         # shared expert
+@@ -362,6 +362,9 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
+             shared_output = self._forward_shared_experts(hidden_states)
+             final_hidden_states = self._forward_router_experts(hidden_states)
+ 
++        # manually scales the hidden states as not all moe runner support fuse scaling factor
++        final_hidden_states.mul_(self.routed_scaling_factor)
++
+         if self.num_shared_experts > 0:
+             final_hidden_states = final_hidden_states + shared_output
+ 
+@@ -395,8 +398,12 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
+             topk_output=topk_output,
+         )
+ 
++        # manually scales the hidden states as not all moe runner support fuse scaling factor
++        final_hidden_states.mul_(self.routed_scaling_factor)
++
+         if shared_output is not None:
+             final_hidden_states += shared_output
++
+         return final_hidden_states
+ 
+ 
+diff --git a/test/registered/dllm/test_llada2_mini_ascend.py b/test/registered/dllm/test_llada2_mini_ascend.py
+new file mode 100644
+index 000000000..741c51401
+--- /dev/null
++++ b/test/registered/dllm/test_llada2_mini_ascend.py
+@@ -0,0 +1,83 @@
++import unittest
++from types import SimpleNamespace
++
++from sglang.srt.utils import kill_process_tree
++from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
++from sglang.test.send_one import BenchArgs, send_one_prompt
++from sglang.test.test_utils import (
++    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
++    DEFAULT_URL_FOR_TEST,
++    CustomTestCase,
++    is_in_amd_ci,
++    is_in_ci,
++    popen_launch_server,
++    write_github_step_summary,
++)
++
++
++class TestLLaDA2Mini(CustomTestCase):
++    @classmethod
++    def setUpClass(cls):
++        cls.model = "inclusionAI/LLaDA2.0-mini"
++        cls.base_url = DEFAULT_URL_FOR_TEST
++
++        other_args = [
++            "--trust-remote-code",
++            "--disable-radix-cache",
++            "--disable-cuda-graph",
++            "--mem-fraction-static",
++            "0.9",
++            "--max-running-requests",
++            "1",
++            "--attention-backend",
++            "ascend",
++            "--dllm-algorithm",
++            "LowConfidence",  # TODO: Add dLLM configurations
++        ]
++
++        cls.process = popen_launch_server(
++            cls.model,
++            cls.base_url,
++            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
++            other_args=other_args,
++        )
++
++    @classmethod
++    def tearDownClass(cls):
++        kill_process_tree(cls.process.pid)
++
++    def test_gsm8k(self):
++        args = SimpleNamespace(
++            num_shots=5,
++            data_path=None,
++            num_questions=200,
++            max_new_tokens=512,
++            parallel=128,
++            host="http://127.0.0.1",
++            port=int(self.base_url.split(":")[-1]),
++        )
++        metrics = run_eval_few_shot_gsm8k(args)
++        print(f"{metrics=}")
++
++        self.assertGreater(metrics["accuracy"], 0.88)
++        self.assertGreater(metrics["output_throughput"], 10)
++
++    def test_bs_1_speed(self):
++        args = BenchArgs(port=int(self.base_url.split(":")[-1]), max_new_tokens=2048)
++        acc_length, speed = send_one_prompt(args)
++
++        print(f"{speed=:.2f}")
++
++        if is_in_ci():
++            write_github_step_summary(
++                f"### test_bs_1_speed (llada2-mini) with tp1\n"
++                f"{speed=:.2f} token/s\n"
++            )
++            if is_in_amd_ci():
++                self.assertGreater(speed, 10)
++            else:
++                self.assertGreater(speed, 250)
++
++
++if __name__ == "__main__":
++    unittest.main()
+-- 
+2.33.0
+

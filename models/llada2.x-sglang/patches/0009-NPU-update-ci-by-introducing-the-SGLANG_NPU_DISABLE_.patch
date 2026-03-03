@@ -1,0 +1,44 @@
+From f068e591e3614bc6d761632a48376881734ebb1e Mon Sep 17 00:00:00 2001
+From: Yuan Yuan <soc.yuan@gmail.com>
+Date: Mon, 9 Feb 2026 17:00:49 +0700
+Subject: [PATCH 09/16] [NPU] update ci by introducing the
+ SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT env parameter, to avoid oom with tp1
+
+---
+ test/registered/dllm/test_llada2_mini_ascend.py | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/test/registered/dllm/test_llada2_mini_ascend.py b/test/registered/dllm/test_llada2_mini_ascend.py
+index 88a770010..29134b098 100644
+--- a/test/registered/dllm/test_llada2_mini_ascend.py
++++ b/test/registered/dllm/test_llada2_mini_ascend.py
+@@ -1,3 +1,4 @@
++import os
+ import unittest
+ from types import SimpleNamespace
+ 
+@@ -17,6 +18,9 @@ from sglang.test.test_utils import (
+ class TestLLaDA2Mini(CustomTestCase):
+     @classmethod
+     def setUpClass(cls):
++        cls._old_disable_acl = os.environ.get("SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT")
++        os.environ["SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT"] = "1"
++
+         cls.model = "inclusionAI/LLaDA2.0-mini"
+         cls.base_url = DEFAULT_URL_FOR_TEST
+ 
+@@ -44,6 +48,11 @@ class TestLLaDA2Mini(CustomTestCase):
+     def tearDownClass(cls):
+         kill_process_tree(cls.process.pid)
+ 
++        if cls._old_disable_acl is None:
++            os.environ.pop("SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT", None)
++        else:
++            os.environ["SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT"] = cls._old_disable_acl
++
+     def test_gsm8k(self):
+         args = SimpleNamespace(
+             num_shots=5,
+-- 
+2.33.0
+

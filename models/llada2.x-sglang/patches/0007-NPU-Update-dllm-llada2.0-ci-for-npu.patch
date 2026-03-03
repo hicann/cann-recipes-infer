@@ -1,0 +1,62 @@
+From f4c88b374b287837c8835619c93d4a464e1fcfac Mon Sep 17 00:00:00 2001
+From: Yuan Yuan <soc.yuan@gmail.com>
+Date: Mon, 9 Feb 2026 16:09:01 +0700
+Subject: [PATCH 07/16] [NPU] Update dllm-llada2.0 ci for npu
+
+---
+ test/registered/dllm/test_llada2_mini_ascend.py | 8 ++------
+ test/srt/run_suite.py                           | 1 +
+ 2 files changed, 3 insertions(+), 6 deletions(-)
+
+diff --git a/test/registered/dllm/test_llada2_mini_ascend.py b/test/registered/dllm/test_llada2_mini_ascend.py
+index de0646925..05998113e 100644
+--- a/test/registered/dllm/test_llada2_mini_ascend.py
++++ b/test/registered/dllm/test_llada2_mini_ascend.py
+@@ -2,19 +2,18 @@ import unittest
+ from types import SimpleNamespace
+ 
+ from sglang.srt.utils import kill_process_tree
++from sglang.test.ci.ci_register import register_npu_ci
+ from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
+ from sglang.test.send_one import BenchArgs, send_one_prompt
+ from sglang.test.test_utils import (
+     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+     DEFAULT_URL_FOR_TEST,
+     CustomTestCase,
+-    is_in_amd_ci,
+     is_in_ci,
+     popen_launch_server,
+     write_github_step_summary,
+ )
+ 
+-
+ class TestLLaDA2Mini(CustomTestCase):
+     @classmethod
+     def setUpClass(cls):
+@@ -72,10 +71,7 @@ class TestLLaDA2Mini(CustomTestCase):
+                 f"### test_bs_1_speed (llada2-mini) with tp1\n"
+                 f"{speed=:.2f} token/s\n"
+             )
+-            if is_in_amd_ci():
+-                self.assertGreater(speed, 10)
+-            else:
+-                self.assertGreater(speed, 130)
++            self.assertGreater(speed, 130)
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/test/srt/run_suite.py b/test/srt/run_suite.py
+index 6dde83ab7..d512a7aea 100644
+--- a/test/srt/run_suite.py
++++ b/test/srt/run_suite.py
+@@ -91,6 +91,7 @@ suite_ascend = {
+         TestFile("ascend/test_ascend_compile_graph_tp1_bf16.py", 400),
+         TestFile("ascend/test_ascend_w8a8_quantization.py", 400),
+         TestFile("test_embed_interpolate_unittest.py", 400),
++        TestFile("../registered/dllm/test_llada2_mini_ascend.py", 3600),
+     ],
+     "per-commit-2-npu-a2": [
+         TestFile("ascend/test_ascend_graph_tp2_bf16.py", 400),
+-- 
+2.33.0
+

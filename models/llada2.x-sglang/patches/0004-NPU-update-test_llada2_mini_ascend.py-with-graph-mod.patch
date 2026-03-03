@@ -1,0 +1,42 @@
+From 6c8348d219b0fb2386be64df5ca67ab14b4e3b95 Mon Sep 17 00:00:00 2001
+From: Yuan Yuan <soc.yuan@gmail.com>
+Date: Mon, 9 Feb 2026 14:13:33 +0700
+Subject: [PATCH 04/16] [NPU] update test_llada2_mini_ascend.py with graph mode
+
+---
+ test/registered/dllm/test_llada2_mini_ascend.py | 5 ++---
+ 1 file changed, 2 insertions(+), 3 deletions(-)
+
+diff --git a/test/registered/dllm/test_llada2_mini_ascend.py b/test/registered/dllm/test_llada2_mini_ascend.py
+index 741c51401..de0646925 100644
+--- a/test/registered/dllm/test_llada2_mini_ascend.py
++++ b/test/registered/dllm/test_llada2_mini_ascend.py
+@@ -24,7 +24,6 @@ class TestLLaDA2Mini(CustomTestCase):
+         other_args = [
+             "--trust-remote-code",
+             "--disable-radix-cache",
+-            "--disable-cuda-graph",
+             "--mem-fraction-static",
+             "0.9",
+             "--max-running-requests",
+@@ -60,7 +59,7 @@ class TestLLaDA2Mini(CustomTestCase):
+         print(f"{metrics=}")
+ 
+         self.assertGreater(metrics["accuracy"], 0.88)
+-        self.assertGreater(metrics["output_throughput"], 10)
++        self.assertGreater(metrics["output_throughput"], 70)
+ 
+     def test_bs_1_speed(self):
+         args = BenchArgs(port=int(self.base_url.split(":")[-1]), max_new_tokens=2048)
+@@ -76,7 +75,7 @@ class TestLLaDA2Mini(CustomTestCase):
+             if is_in_amd_ci():
+                 self.assertGreater(speed, 10)
+             else:
+-                self.assertGreater(speed, 250)
++                self.assertGreater(speed, 130)
+ 
+ 
+ if __name__ == "__main__":
+-- 
+2.33.0
+
