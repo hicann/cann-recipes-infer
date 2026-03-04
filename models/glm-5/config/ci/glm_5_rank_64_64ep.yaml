@@ -1,6 +1,6 @@
 model_name: "GLM-5"
 model_path: "/data/models/GLM-5"
-exe_mode: "ge_graph"          # ["ge_graph", "eager", "acl_graph"], mode of decode
+exe_mode: "acl_graph"          # ["ge_graph", "eager", "acl_graph"], mode of decode
 world_size: 64               # world_size = 2 * chip_num in A3
 
 model_config:

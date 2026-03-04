@@ -952,15 +952,9 @@ class GlmMoeDsaAttention(nn.Module):
             slot_mapping=slot_mapping,
             offload_cache=offload_cache
         )
-        # query_states is tuple(q_nope,q_pe) q_nope shape: [B,S,N,D]
-        bsz, q_len, _, _ = query_states[0].shape
-        actual_seq_qlen = torch.arange(q_len, q_len * (bsz + 1), q_len,
-                                       dtype=torch.int32, device=query_states[0].device)
-        if is_prefill:
-            actual_seq_lengths_kv = torch.tensor([q_len for _ in range(bsz)], dtype=torch.int32).npu()
         attn_output = self.attn_func(
             query_states=query_states,
-            actual_seq_qlen=actual_seq_qlen,
+            actual_seq_qlen=actual_seq_lengths_q,
             actual_seq_lengths_kv=actual_seq_lengths_kv,
             past_key_value=past_key_value,
             topk_indices=topk_indices,
@@ -2306,7 +2300,7 @@ class GlmMoeDsaForCausalLM(GlmMoeDsaPreTrainedModel):
         is_prefill=True
     ):
         if is_prefill:
-            actual_seq_lengths_kv = torch.cumsum(kv_len, dim=0)
+            actual_seq_lengths_kv = kv_len
         else:
             if seq_len > 1:
                 last_kv = torch.max(kv_len, axis=1)[0]
@@ -2346,12 +2340,8 @@ class GlmMoeDsaForCausalLM(GlmMoeDsaPreTrainedModel):
             actual_seq_lengths_kv = self.get_actual_seq_lengths(kv_len, seq_len, is_prefill)
             position_ids = kv_len.view(-1, seq_len) - 1
 
-        actual_seq_lengths_q = None
-        if is_prefill:
-            actual_seq_lengths_q = torch.tensor(actual_seq_lengths_kv, dtype=torch.int32).npu()
-        else:
-            actual_seq_lengths_q = torch.tensor([seq_len + i * seq_len for i in range(batch_size)],
-                                                dtype=torch.int32).npu()
+        actual_seq_lengths_q = torch.tensor([seq_len + i * seq_len for i in range(batch_size)],
+                                            dtype=torch.int32).npu()
 
         slot_mapping = self.get_slot_mapping(kv_len_withpad if is_prefill else position_ids.to(kv_len.dtype),
                                              is_prefill, input_ids.device)

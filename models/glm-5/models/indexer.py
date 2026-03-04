@@ -281,11 +281,7 @@ class GlmMoeDsaIndexer(nn.Module):
                 torch_npu.npu_scatter_nd_update_(past_key_states.view(-1, self.head_dim),
                                                 slot_mapping.view(-1, 1),
                                                 k.view(-1, k.shape[-1]))
-        if is_prefill:
-            # input format is [B, S, N, D] with seq pad to input_max_len, attention calc use the seq_len after pad.
-            # note: tnd layerout, actual_seq_lengths_q use cumsum indices
-            seq_qlen_with_pad = torch.tensor([seqlen for _ in range(bsz)], dtype=kv_len.dtype, device=kv_len.device)
-            actual_seq_lengths_kv = seq_qlen_with_pad
+
         indexer_func = self.li_fusion
         indexer_input.update({"actual_seq_lengths_query": actual_seq_lengths_q,
                             "actual_seq_lengths_kv": actual_seq_lengths_kv,
