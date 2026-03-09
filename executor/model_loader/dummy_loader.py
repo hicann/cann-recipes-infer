@@ -32,9 +32,12 @@ class DummyModelLoader(BaseModelLoader):
     def __init__(self):
         super().__init__()
 
-    def load_model(self, config, model_cls, runner_settings, **kargs) -> nn.Module:
+    def load_model(self, config, model_cls, runner_settings, **kwargs) -> nn.Module:
         with set_default_torch_dtype(torch.bfloat16):
-            model = model_cls(config, runner_settings)
+            if "comm_manager" in kwargs:
+                model = model_cls(config, runner_settings, comm_manager=kwargs["comm_manager"])
+            else:
+                model = model_cls(config, runner_settings)
             # NOTE(woosuk): For accurate performance evaluation, we assign
             # random values to the weights.
             initialize_dummy_weights(model)

@@ -120,6 +120,10 @@ function check_env_vars()
     SCRIPT_PATH=$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
     PARENT_PARENT_DIR=$(cd "$SCRIPT_PATH/../.." &>/dev/null && pwd)
     INFER_PATH=${PARENT_PARENT_DIR}/models/${MODEL_DIR}/infer.py
+    if [ ! -f "${INFER_PATH}" ]; then
+        INFER_PATH="${PARENT_PARENT_DIR}/executor/infer.py"
+    fi
+
     echo "==================================>"
 
 }

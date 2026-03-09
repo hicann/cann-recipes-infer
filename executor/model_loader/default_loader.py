@@ -162,9 +162,9 @@ class DefaultModelLoader(BaseModelLoader):
         for source in secondary_weights:
             yield from self._get_weights_iterator(source)
 
-    def load_model(self, config, model_cls, runner_settings, model_path) -> nn.Module:
+    def load_model(self, config, model_cls, runner_settings, model_path, **kwargs) -> nn.Module:
         with set_default_torch_dtype(torch.bfloat16):
-            model = model_cls(config, runner_settings)
+            model = model_cls(config, runner_settings, **kwargs)
 
             weights_to_load = {name for name, _ in model.named_parameters()}
             loaded_weights = model.load_weights(

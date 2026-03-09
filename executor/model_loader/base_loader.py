@@ -28,6 +28,12 @@ class BaseModelLoader(ABC):
         pass
 
     @abstractmethod
-    def load_model(self, *, config) -> nn.Module:
-        """Load a model with the given configurations."""
+    def load_model(self, *, config, **kwargs) -> nn.Module:
+        """Load a model with the given configurations.
+
+        Args:
+            config: Model configuration
+            **kwargs: Additional arguments passed to model constructor
+                      (e.g., infer_config, comm_manager)
+        """
         raise NotImplementedError

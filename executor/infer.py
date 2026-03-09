@@ -1,0 +1,77 @@
+# coding=utf-8
+# Copyright (c) 2025 Huawei Technologies Co., Ltd.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import os
+import argparse
+import yaml
+from executor.core import InferenceConfig, OfflineInference
+from executor.utils.data_utils import generate_default_prompt, load_longbench_dataset, build_dataset_input
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="llm run parameters")
+    parser.add_argument('--yaml_file_path', type=str, required=True, help="inference configurations")
+    return parser.parse_args()
+
+def generate_prompt(dataset, dataset_path):
+    if dataset == "default":
+        preset_prompts = generate_default_prompt(dataset_path)
+    elif dataset == "LongBench":
+        dataset_path = os.path.abspath(os.path.join(dataset_path, f"{dataset}"))
+        if os.path.isdir(dataset_path): # use local LongBench dataset first
+            dataset = dataset_path
+        else:
+            dataset = "THUDM/LongBench"
+        preset_prompts = load_longbench_dataset(dataset)
+
+    else:
+        raise ValueError(f"Unsupported dataset: {dataset}")
+    return preset_prompts
+
+def preprocess_prompts_for_scheduler(prompts, tokenizer, scheduler_config):
+    bsz = scheduler_config.batch_size
+    prompts = prompts * (bsz // len(prompts) + 1)
+    prompts = prompts[:bsz]
+    return build_dataset_input(tokenizer, prompts, scheduler_config.input_max_len,
+                               scheduler_config.max_new_tokens, False)
+
+def main():
+    local_rank = int(os.getenv("LOCAL_RANK", "0"))
+    rank_offset = int(os.getenv("RANK_OFFSET", "0"))
+    global_rank = local_rank + rank_offset
+
+    args = parse_args()
+    with open(args.yaml_file_path, 'r') as f:
+        yaml_dict = yaml.safe_load(f)
+    config = InferenceConfig.from_dict(yaml_dict, global_rank=global_rank, local_rank=local_rank)
+    if config.model_config.output_path == "":
+        config.model_config.output_path = os.path.dirname(args.yaml_file_path)
+
+    dataset_path = os.path.join(os.path.dirname(__file__), f"../dataset")
+    if config.data_config.dataset_path != "":
+        dataset_path = config.data_config.dataset_path
+    prompts = generate_prompt(config.data_config.dataset, dataset_path)
+
+    llm = OfflineInference(config)
+
+    if config.data_config.dataset != "default":
+        prompts = preprocess_prompts_for_scheduler(prompts, llm.engine.tokenizer, config.scheduler_config)
+    results = llm.generate(prompts)
+    for res in results:
+        print(f"outputs: {res.output_text}")
+
+
+if __name__ == "__main__":
+    main()
