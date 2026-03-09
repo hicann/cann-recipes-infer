@@ -51,7 +51,7 @@ class Infer(nn.Module):
 
         self.exe_mode = runner_settings.get("exe_mode", "ge_graph")
         self.enable_skip_guard = runner_settings.get("model_config").get("enable_skip_guard", False)
-    
+
     def inference(self, model_runner, model_inputs, cycle_idx=None, is_prefill=False, warm_up=False, prefix=''):
         if not warm_up:
             self.logits_wp, self.prev_hidden_states_wp, self.inference_time_wp = None, None, None
@@ -87,18 +87,18 @@ class Infer(nn.Module):
                             torch.ops.custom.npu_mla_prolog_v3_functional.default:
                                 InplaceableNpuOp(
                                     inplace_op=torch.ops.custom.npu_mla_prolog_v3.default,
-                                    mutated_arg=[9, 10], 
+                                    mutated_arg=[9, 10],
                                     extra_check=check_multi_stream_for_multi_reinplace,
                                 ),
                         })
                     except ImportError:
-                        logging.warning(f"custom op reinplace needs to update torch_npu version 7.3.0")
-                # warm-up phase, compilation is required; subsequent runs will skip the guard check.        
+                        logging.warning(f"custom op reinplace needs to update torch_npu version to 7.3.0")
+                # warm-up phase, compilation is required; subsequent runs will skip the guard check.
                 if self.exe_mode == "acl_graph" and self.enable_skip_guard and not warm_up:
-                    with torch.compiler.set_stance(skip_guard_eval_unsafe=True):  
+                    with torch.compiler.set_stance(skip_guard_eval_unsafe=True):
                         logits, prev_hidden_states = model_runner.model.decode(**model_inputs)
                 else:
-                    logits, prev_hidden_states = model_runner.model.decode(**model_inputs)    
+                    logits, prev_hidden_states = model_runner.model.decode(**model_inputs)
 
         torch.npu.synchronize()
         inference_time = time.time() - start_time
@@ -229,7 +229,7 @@ class Infer(nn.Module):
                                     main_next_tokens, main_hidden):
         batch_size, _ = main_next_tokens.shape
         input_dict_main['is_prefill'] = False
-        cur_kv_len_prefill = model_inputs['kv_len']
+        cur_kv_len_prefill = model_inputs['kv_len'] + 1
         indices = torch.arange(self.spec_len, device="npu")
         kv_len = (cur_kv_len_prefill).unsqueeze(1) + indices # kv_len increase by one after prefill
 
@@ -290,20 +290,15 @@ class Infer(nn.Module):
             mtp_prev_hid = torch.cat([last_step_hidden[j], cur_accepted_hidden], dim=1)[:, -self.spec_len:, :]
             mtp_prev_hid_tmp.append(mtp_prev_hid)
             input_dict_main['prev_hidden_states'].append(mtp_prev_hid)
-        input_dict_mtp['prev_hidden_states'] = torch.cat(mtp_prev_hid_tmp, dim=0)
+        input_dict_mtp['prev_hidden_states'] = torch.cat(mtp_prev_hid_tmp, dim=0).reshape(batch_size, self.spec_len, -1)
 
         return input_dict_main, input_dict_mtp
 
-    def mtp_post_process(self, input_dict_mtp, cycle_idx, warm_up):
+    def mtp_post_process(self, input_dict_mtp, cycle_idx, warm_up, last_prefill=False):
         # mtp model
         infer_time_spec_mtp = []
-        past_key_values_bak = input_dict_mtp.get("past_key_values")
-        past_key_values_indexer_bak = input_dict_mtp.get("past_key_values_indexer")
-        if self.enable_offload:
-            selected_key_values_bak = input_dict_mtp.get("offload_cache").selected_key_values
-            selection_kv_block_table_bak = input_dict_mtp.get("offload_cache").selection_kv_block_table
-            selection_kv_block_status_bak = input_dict_mtp.get("offload_cache").selection_kv_block_status
-        for next_index in range(self.next_n):
+        loop_mtp = self.next_n if not last_prefill else self.next_n - 1
+        for next_index in range(loop_mtp):
             model_inputs = self.model_input_prepare(self.mtp_model.model, input_dict_mtp)
             outputs, prev_hidden_states, infer_time_spec = self.inference(self.mtp_model, model_inputs,
                                                                           is_prefill=input_dict_mtp['is_prefill'],
@@ -311,31 +306,13 @@ class Infer(nn.Module):
                                                                           warm_up=warm_up,
                                                                           prefix='[MTP]')
             infer_time_spec_mtp.append(infer_time_spec)
-            if next_index < self.next_n - 1:
-                # mtp model output process
-                past_key_values_cur = (past_key_values_bak[next_index],)
-                past_key_values_indexer_cur = (past_key_values_indexer_bak[next_index],)
+            # mtp model output process
+            input_dict_mtp = self.mtp_model_output_process(model_inputs, input_dict_mtp,
+                                                            outputs, prev_hidden_states)
+            # When mini_batch is enabled and the mini_batch has not yet ended, the mtp model performs only prefill.
+            if self.mini_batch and cycle_idx is not None:
+                break
 
-                input_dict_mtp = self.mtp_model_output_process_continue(model_inputs, input_dict_mtp,
-                                                                    outputs, prev_hidden_states,
-                                                                    past_key_values_cur, past_key_values_indexer_cur)
-                if self.enable_offload:
-                    input_dict_mtp["offload_cache"].selected_key_values = (selected_key_values_bak[next_index],)
-                    input_dict_mtp["offload_cache"].selection_kv_block_table = \
-                            (selection_kv_block_table_bak[next_index],)
-                    input_dict_mtp["offload_cache"].selection_kv_block_status = \
-                            (selection_kv_block_status_bak[next_index],)
-            else:
-                # mtp model output process
-                input_dict_mtp = self.mtp_model_output_process(model_inputs, input_dict_mtp,
-                                                                outputs, prev_hidden_states)
-
-        input_dict_mtp["past_key_values"] = past_key_values_bak
-        input_dict_mtp["past_key_values_indexer"] = past_key_values_indexer_bak
-        if self.enable_offload:
-            input_dict_mtp["offload_cache"].selected_key_values = selected_key_values_bak
-            input_dict_mtp["offload_cache"].selection_kv_block_table = selection_kv_block_table_bak
-            input_dict_mtp["offload_cache"].selection_kv_block_status = selection_kv_block_status_bak
         return input_dict_mtp, infer_time_spec_mtp
 
     def mtp_model_output_process(self, model_inputs, input_dict, outputs, prev_hidden_states):
@@ -343,7 +320,9 @@ class Infer(nn.Module):
             # kv_len increase by one after prefill
             kv_len_prefill = model_inputs['kv_len']
             indices = torch.arange(self.spec_len, device="npu")
-            kv_len = kv_len_prefill.unsqueeze(1) + indices
+            kv_len_prefill = kv_len_prefill.unsqueeze(1) + indices
+            kv_len = kv_len_prefill + 1
+            kv_len_prefill -= self.next_n
         else:
             kv_len = input_dict['kv_len'] + 1
 
@@ -364,18 +343,21 @@ class Infer(nn.Module):
         input_dict['past_key_scales_indexer'] = past_key_scales_indexer
         input_dict['kv_len'] = kv_len
         input_dict['input_lens'] = input_dict['input_lens'] + 1
-        input_dict['prev_hidden_states'] = prev_hidden_states[:, -self.spec_len:, :]
+        bsz = prev_hidden_states.shape[0]
+        input_dict['prev_hidden_states'] = prev_hidden_states[:, -self.spec_len:, :].reshape(bsz, self.spec_len, -1)
 
         # for next_n > 1, need to pad inputs for the first decode step
         if (next_tokens.shape[1] < self.spec_len) and (self.next_n > 1):
             pad_len = self.spec_len - next_tokens.shape[1]
             next_tokens = torch.cat([input_dict['input_ids'][:, -pad_len:], next_tokens], dim=-1)
             input_dict['kv_len'] -= pad_len
-        input_dict['input_ids'] = next_tokens
+            input_dict['input_ids'] = next_tokens
+        else:
+            input_dict['input_ids'] = torch.cat([input_dict['input_ids'], spec_token], dim=-1)[:, 1:]
 
         # cache kv_len for the first mtp module
         if input_dict['is_prefill']:
-            input_dict['kv_len_cached'] = kv_len
+            input_dict['kv_len_cached'] = kv_len_prefill
             input_dict['is_prefill'] = False
 
         return input_dict
@@ -415,7 +397,8 @@ class Infer(nn.Module):
             if not self.enable_offload:
                 past_key_values = model.init_cache(
                     device,
-                    num_hidden_layers=self.next_n if model.is_mtp else model.config.num_hidden_layers
+                    num_hidden_layers=model.config.num_nextn_predict_layers if model.is_mtp \
+                        else model.config.num_hidden_layers
                 )
                 input_dict.update({'past_key_values': past_key_values})
             else:
@@ -779,6 +762,13 @@ class Infer(nn.Module):
 
         decode_cnt = 0
         decode_infer_time_rec = []
+        # When mini_batch is enabled, after the prefill of the main model and the mtp model is completed,
+        # it is necessary to perform the remaining next_n-1 steps of decode inference for the mtp model.
+        if self.mini_batch and self.next_n > 1:
+            logging.info(f"Mini_batch prefill done, MTP decode begins...")
+            input_dict_mtp, _ = self.mtp_post_process(input_dict_mtp, None, warm_up, last_prefill=True)
+            mtp_spec_tokens = input_dict_mtp['spec_tokens'][:, -(self.next_n - 1):]
+            input_dict_main['input_ids'] = torch.cat([input_dict_main['input_ids'], mtp_spec_tokens], dim=1)
 
         # run decode profile
         decode_profiler = self.main_model.define_profiler(enable_profiler=enable_profiler,

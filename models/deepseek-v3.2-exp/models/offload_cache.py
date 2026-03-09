@@ -22,7 +22,7 @@ class OffloadCache(nn.Module):
         self.config = model.config
         self.is_mtp = model.is_mtp
 
-        self.num_hidden_layers = self.next_n if self.is_mtp else self.config.num_hidden_layers
+        self.num_hidden_layers = self.config.num_nextn_predict_layers if self.is_mtp else self.config.num_hidden_layers
         self.batch_size_per_rank = self.runner_settings.get("data_config").get("batch_size_per_rank", 1)
         self.index_topk = self.config.index_topk
         self.block_size = self.runner_settings.get("model_config").get("pa_block_size", 128)

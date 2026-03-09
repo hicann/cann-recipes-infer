@@ -249,6 +249,9 @@ class Indexer(nn.Module):
         enable_multi_streams = self.enable_multi_streams and not is_prefill
 
         if enable_multi_streams and self.enable_aclgraph:
+            tng.ops.npu_record_tagged_stream(qr, "22")
+            tng.ops.npu_record_tagged_stream(cos, "22")
+            tng.ops.npu_record_tagged_stream(sin, "22")
             tng.ops.npu_tagged_event_record(indexer_npu_events[0])
         with npu_stream_switch(enable_multi_streams, "22"):
             # prolog for kv use multi streams
@@ -259,7 +262,7 @@ class Indexer(nn.Module):
                     tng.scope.npu_wait_tensor(qr, query_states[0])
             # q process in new stream
             q_b = self.wq_b(qr, c8_input_dict.get("pertoken_scale", None)) # [b,s,1536] @ [1536,64*128] = [b,s,64*128]
-            
+
             if enable_multi_streams and self.enable_aclgraph:
                 tng.ops.npu_tagged_event_record(indexer_npu_events[1])
 
@@ -273,6 +276,10 @@ class Indexer(nn.Module):
             q = torch.cat([q_pe, q_nope], dim=-1)
             if enable_multi_streams and self.enable_aclgraph:
                 tng.ops.npu_tagged_event_record(indexer_npu_events[2])
+
+        if enable_multi_streams and self.enable_aclgraph:
+            tng.ops.npu_record_tagged_stream(x, "33")
+
         with npu_stream_switch(enable_multi_streams, "33"):
             if enable_multi_streams:
                 if self.enable_aclgraph:
@@ -355,11 +362,6 @@ class Indexer(nn.Module):
                 torch_npu.npu_scatter_nd_update_(past_key_states.view(-1, self.head_dim),
                                                 slot_mapping.view(-1, 1),
                                                 k.view(-1, k.shape[-1]))
-        if is_prefill:
-            # input format is [B, S, N, D] with seq pad to input_max_len, attention calc use the seq_len after pad.
-            # note: tnd layerout, actual_seq_lengths_q use cumsum indices
-            seq_qlen_with_pad = torch.tensor([seqlen for _ in range(bsz)], dtype=kv_len.dtype, device=kv_len.device)
-            actual_seq_lengths_kv = seq_qlen_with_pad
         indexer_func = self.li_fusion
         indexer_input.update({"actual_seq_lengths_query": actual_seq_lengths_q,
                             "actual_seq_lengths_kv": actual_seq_lengths_kv,
