@@ -1,8 +1,7 @@
-/* *
- * This program is free software, you can redistribute it and/or modify it.
+/**
  * Copyright (c) 2025 Huawei Technologies Co., Ltd.
- * This file is a part of the CANN Open Software.
- * Licensed under CANN Open Software License Agreement Version 2.0 (the "License").
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
  * Please refer to the License for details. You may not use this file except in compliance with the License.
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
  * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
@@ -13,7 +12,7 @@
  * \file quant_lightning_indexer_prolog_impl.cpp
  * \brief
  */
- 
+
 #include <iostream>
 #include <cmath>
 #include <cstdint>
@@ -23,10 +22,10 @@
 #include "tilefwk/op_registry.h"
 #include "tilefwk/tilefwk_op.h"
 #include "quant_lightning_indexer_prolog.h"
- 
+
 namespace npu::tile_fwk {
 constexpr uint64_t Lightning_Indexer_Prolog_ConfigKey = uint64_t(100000000UL);
- 
+
 struct LightningIndexerPrologParams {
     int t = -1;
     int blockNum = -1;
@@ -43,11 +42,11 @@ struct LightningIndexerPrologParams {
     // perf
     bool enableNz{true};
 };
- 
+
 void SetPerfConfig() {
     config::SetHostOption(ONLY_CODEGEN, true);
 }
- 
+
 void SetTileConfigParams(LightningIndexerPrologParams &params) {
     QuantIndexerConfigs configs;
     configs.qLinear = {32, 32, 512, 512, 128, 128};
@@ -56,7 +55,7 @@ void SetTileConfigParams(LightningIndexerPrologParams &params) {
     configs.wLinear = {16, 16, 1024, 1024, 32, 32};
     params.quantIndexerPrologConfigs = configs;
 }
- 
+
 template <bool nz = false>
 void DynamicLightningIndexerPrologImpl(LightningIndexerPrologParams &params) {
     DataType dType = DT_BF16;
@@ -73,7 +72,7 @@ void DynamicLightningIndexerPrologImpl(LightningIndexerPrologParams &params) {
     constexpr int64_t nzFirstDim = 16;
     constexpr int64_t b16C0Dim = 16;
     constexpr int64_t b8C0Dim = 32;
- 
+
     TileOpFormat weightFormat = nz ? TileOpFormat::TILEOP_NZ : TileOpFormat::TILEOP_ND;
     Tensor x(dType, {t, h}, "x");
     Tensor qNorm(DT_INT8, {t, qLoraRank}, "qNorm");
@@ -91,10 +90,10 @@ void DynamicLightningIndexerPrologImpl(LightningIndexerPrologParams &params) {
     Tensor kCache(DT_INT8, {blockNum, blockSize, nKV, headDim}, "kCache");
     Tensor kCacheScale(DT_FP16, {blockNum, blockSize, nKV, 1}, "kCacheScale");
     Tensor kCacheIndex(DT_INT64, {t}, "kCacheIndex");
- 
+
     QuantIndexerPrologInput input{x, qNorm, qNormScale, wQb, wQbScale, wk, wProj, lnGammaK, lnBetaK, cosIdxRope,
         sinIdxRope, hadamardQ, hadamardK, kCache, kCacheScale, kCacheIndex};
- 
+
     // outputs
     auto symT = GetInputShape(x, 0);
     auto symBlockNum = GetInputShape(kCache, 0);
@@ -104,26 +103,26 @@ void DynamicLightningIndexerPrologImpl(LightningIndexerPrologParams &params) {
     Tensor kScaleOut(DT_FP16, {symBlockNum, blockSize, nKV, 1}, "kScale");
     Tensor weightsOut(DT_FP16, {symT, headNum}, "weights");
     QuantIndexerPrologOutput output{qInt8Out, qScaleOut, kInt8Out, kScaleOut, weightsOut};
- 
+
     QuantIndexerPrologAttr attrs;
     attrs.eps = 1e-6f;
     attrs.layeroutKey = "PA_BSND";
     attrs.layeroutQuery = "TND";
- 
+
     QuantLightningIndexerProlog(input, output, attrs, params.quantIndexerPrologConfigs);
 }
- 
+
 void DynamicLightningIndexerPrologPto(uint64_t configKey) {
     (void)configKey;
- 
+
     SetPerfConfig();
- 
+
     LightningIndexerPrologParams params;
     SetTileConfigParams(params);
-    
+
     DynamicLightningIndexerPrologImpl<true>(params); // enable nz
 }
- 
+
 REGISTER_OP(LightningIndexerPrologPto)
     .ImplFunc({
         {Lightning_Indexer_Prolog_ConfigKey, DynamicLightningIndexerPrologPto}

@@ -1,10 +1,10 @@
 /**
- * This program is free software, you can redistribute it and/or modify it.
  * Copyright (c) 2025 Huawei Technologies Co., Ltd.
- * This file is a part of the CANN Open Software.
- * Licensed under CANN Open Software License Agreement Version 2.0 (the "License").
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
  * Please refer to the License for details. You may not use this file except in compliance with the License.
- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
  * See LICENSE in the root of the software repository for the full text of the License.
  */
 
@@ -73,7 +73,7 @@ template <typename T, SFA_LAYOUT SRC_LAYOUT>
 __aicore__ inline void DataCopyPA(LocalTensor<T> &dstTensor,  //l1
                                   GlobalTensor<T> &srcTensor, //gm
                                   GlobalTensor<int32_t> &blockTableGm,
-                                  const PAShape &shape,       // blockSize, headNum, headDim                           
+                                  const PAShape &shape,       // blockSize, headNum, headDim
                                   const Position &startPos)   // bacthIdx nIdx curSeqIdx
 {
     uint32_t copyFinishRowCnt = 0;
@@ -106,7 +106,7 @@ __aicore__ inline void DataCopyPA(LocalTensor<T> &dstTensor,  //l1
         LocalTensor<T> tmpDstTensor = dstTensor[copyFinishRowCnt * blockElementCnt];
         GlobalTensor<T> tmpSrcTensor = srcTensor[offset];
 
-        DataCopyGmNDToL1<T>(tmpDstTensor, tmpSrcTensor, copyRowCnt, shape.copyRowNumAlign, dValue, srcDValue);                     
+        DataCopyGmNDToL1<T>(tmpDstTensor, tmpSrcTensor, copyRowCnt, shape.copyRowNumAlign, dValue, srcDValue);
         copyFinishRowCnt += copyRowCnt;
         curS2Idx += copyRowCnt;
     }
@@ -540,7 +540,7 @@ __aicore__ inline void SFAMatmulService<SFAT>::CalcTopKBlockInfo(
             if (sparseIndices == -1) {
                 break;
             }
-            
+
             uint64_t blockBegin = sparseIndices * constInfo.sparseBlockSize;
             if (blockBegin >= info.threshold) {
                 continue;
@@ -583,7 +583,7 @@ __aicore__ inline void SFAMatmulService<SFAT>::ComputeMm1(const RunInfo &info, c
     LocalTensor<KV_T> kTensor;
     // ka表示左矩阵4buf选择哪一块buf, kb表示右矩阵3buf选择哪一块buf
     uint32_t ka = 0, kb = 0;
-    
+
     uint32_t curTopKIdx = info.curTopKIdx;
     uint64_t curOffsetInSparseBlock = info.curOffsetInSparseBlock; //sparse Block块内偏移
     uint32_t copyRowCnt = 0;
@@ -613,7 +613,7 @@ __aicore__ inline void SFAMatmulService<SFAT>::ComputeMm1(const RunInfo &info, c
             // 从k当中取当前的块
             bL1Tensor = l1KVTensor[kb * L1_BLOCK_OFFSET];
                 // mm1拷贝主流程
- 
+
                 uint32_t curSeqIdx = info.s2BatchOffset + nL1 * N_SPLIT_SIZE;
                 uint32_t copyFinishRowCnt = 0;
                 curTopKIdx = curTopKIdxTmp;

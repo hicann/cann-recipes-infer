@@ -1,12 +1,11 @@
-/* *
- * This program is free software, you can redistribute it and/or modify it.
- * Copyright (c) 2025 Huawei Technologies Co., Ltd.
- * This file is a part of the CANN Open Software.
- * Licensed under CANN Open Software License Agreement Version 2.0 (the "License").
- * Please refer to the License for details. You may not use this file except in compliance with the License.
- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED, INCLUDING
-BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.  * See LICENSE in the root of
-the software repository for the full text of the License.
+/**
+ * Copyright (c) 2025 Huawei Technologies Co., Ltd.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
  */
 
 #include <iostream>
@@ -21,7 +20,7 @@ the software repository for the full text of the License.
 
 namespace npu::tile_fwk {
 constexpr uint64_t Lightning_Indexer_PTO_ConfigKey = uint64_t(100000000UL);
- 
+
 struct LightningIndexerPtoParams {
     int b = -1;
     int s1 = -1;
@@ -35,7 +34,7 @@ struct LightningIndexerPtoParams {
     DataType dType = DT_BF16;
     int selectedCount = 2048;
 };
- 
+
 void DynamicLightningIndexerPto(uint64_t configKey) {
     (void)configKey;
     config::SetHostOption(ONLY_CODEGEN, true);
@@ -60,7 +59,7 @@ void DynamicLightningIndexerPto(uint64_t configKey) {
     std::vector<int64_t> weightsShape = {params.b, params.s1, params.n1, 1};
     std::vector<int64_t> actualSeqLengthsKeyShape = {params.b};
     std::vector<int64_t> blockTableShape = {params.b, params.maxBlockNum};
- 
+
     Tensor query(params.dType, queryShape, "query");
     Tensor key(params.dType, keyShape, "key");
     Tensor weights(params.dType, weightsShape, "weights");
@@ -68,7 +67,7 @@ void DynamicLightningIndexerPto(uint64_t configKey) {
     Tensor blockTable(DT_INT32, blockTableShape, "blocktable");
     Tensor selectedIndices(DT_INT32,
         {GetInputShape(query, 0), GetInputShape(query, 1), params.n2, params.selectedCount}, "selectedIndices");
- 
+
     FUNCTION("LightningIndexer", {query, key, weights, actualSeqLengthsKey, blockTable}, {selectedIndices}) {
         LightningIndexerTopk(
             query, key, weights, actualSeqLengthsKey, blockTable, selectedIndices, params.selectedCount, indexerConfig);

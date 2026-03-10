@@ -1,10 +1,10 @@
 /**
- * This program is free software, you can redistribute it and/or modify it.
  * Copyright (c) 2025 Huawei Technologies Co., Ltd.
- * This file is a part of the CANN Open Software.
- * Licensed under CANN Open Software License Agreement Version 2.0 (the "License").
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
  * Please refer to the License for details. You may not use this file except in compliance with the License.
- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
  * See LICENSE in the root of the software repository for the full text of the License.
  */
 
@@ -29,7 +29,7 @@ std::tuple<at::Tensor, at::Tensor> construct_swiglu_clip_quant_output_tensor(con
         TORCH_CHECK(x.size(i) > 0, "All values within query's shape should be greater "
             "than 0, but shape[", i, "] is ", x.size(i));
     }
-    
+
     // Divide the last dimension by 2
     if (!y_size.empty()) {
         y_size.back() = y_size.back() / SWIGLU_FACTOR;
@@ -59,7 +59,7 @@ std::tuple<at::Tensor, at::Tensor> npu_swiglu_clip_quant_npu(
     }
     char *quant_mode_ptr = const_cast<char *>(quant_mode_str.c_str());
 
-    EXEC_NPU_CMD_V1(aclnnSwigluClipQuant, x, group_index, group_alpha, 
+    EXEC_NPU_CMD_V1(aclnnSwigluClipQuant, x, group_index, group_alpha,
                     activate_left, quant_mode_ptr, clamp_mode, y, scale);
 
     return std::tuple<at::Tensor, at::Tensor>(y, scale);

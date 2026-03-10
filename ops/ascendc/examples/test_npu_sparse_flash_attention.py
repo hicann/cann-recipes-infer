@@ -1,10 +1,11 @@
-# This program is free software, you can redistribute it and/or modify it.
 # Copyright (c) 2025 Huawei Technologies Co., Ltd.
-# This file is a part of the CANN Open Software.
-# Licensed under CANN Open Software License Agreement Version 2.0 (the "License").
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
 # Please refer to the License for details. You may not use this file except in compliance with the License.
-# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
+
 import random
 import torch
 import torch_npu
@@ -25,7 +26,7 @@ def gather_kv(k_tensor, v_tensor, sparse_indices, sparse_block_size, sparse_coun
              cur_actual_seq_lengths_kv):
     s2_sparse = list()
     for sparse_id in sparse_indices:
-        if sparse_id == -1: 
+        if sparse_id == -1:
             break
         begin_idx = sparse_id * sparse_block_size
         end_idx = begin_idx + sparse_block_size \
@@ -311,7 +312,7 @@ class TestCustomSFA(TestCase):
         from torchair.configs.compiler_config import CompilerConfig
         config = CompilerConfig()
         npu_backend = torchair.get_npu_backend(compiler_config=config)
-        
+
         class Network(nn.Module):
             def __init__(self):
                 super(Network, self).__init__()
@@ -320,9 +321,9 @@ class TestCustomSFA(TestCase):
                 actual_seq_lengths_query, actual_seq_lengths_kv,
                 query_rope, key_rope, layout_query, layout_kv,
                 sparse_mode, block_table):
-                
+
                 out1 = torch_npu.npu_sparse_flash_attention(query, key, value,
-                    sparse_indices, scale_value, sparse_block_size, 
+                    sparse_indices, scale_value, sparse_block_size,
                     actual_seq_lengths_query=actual_seq_lengths_query, actual_seq_lengths_kv=actual_seq_lengths_kv,
                     query_rope=query_rope, key_rope=key_rope,
                     layout_query=layout_query, layout_kv=layout_kv, sparse_mode=sparse_mode, block_table=block_table)
@@ -464,7 +465,7 @@ class TestCustomSFA(TestCase):
         from torchair.configs.compiler_config import CompilerConfig
         config = CompilerConfig()
         npu_backend = torchair.get_npu_backend(compiler_config=config)
-        
+
         class Network(nn.Module):
             def __init__(self):
                 super(Network, self).__init__()
@@ -473,9 +474,9 @@ class TestCustomSFA(TestCase):
                 actual_seq_lengths_query, actual_seq_lengths_kv,
                 query_rope, key_rope, layout_query, layout_kv,
                 sparse_mode, block_table):
-                
+
                 out1 = torch_npu.npu_sparse_flash_attention(query, key, value,
-                    sparse_indices, scale_value, sparse_block_size, 
+                    sparse_indices, scale_value, sparse_block_size,
                     actual_seq_lengths_query=actual_seq_lengths_query, actual_seq_lengths_kv=actual_seq_lengths_kv,
                     query_rope=query_rope, key_rope=key_rope,
                     layout_query=layout_query, layout_kv=layout_kv, sparse_mode=sparse_mode, block_table=block_table)

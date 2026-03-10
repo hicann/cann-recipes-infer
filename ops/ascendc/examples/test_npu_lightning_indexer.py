@@ -1,9 +1,9 @@
-# This program is free software, you can redistribute it and/or modify it.
 # Copyright (c) 2025 Huawei Technologies Co., Ltd.
-# This file is a part of the CANN Open Software.
-# Licensed under CANN Open Software License Agreement Version 2.0 (the "License").
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
 # Please refer to the License for details. You may not use this file except in compliance with the License.
-# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 
 import torch
@@ -119,8 +119,8 @@ class TestCustomLightningIndexer(TestCase):
         # start run custom ops
         print(f'======================== PTA eager BEGIN ========================')
         npu_out = torch_npu.npu_lightning_indexer(
-            query, key, weights, actual_seq_lengths_query=actual_seq_lengths_query, 
-                actual_seq_lengths_key=actual_seq_lengths_key, block_table=block_table, layout_query=layout_query, 
+            query, key, weights, actual_seq_lengths_query=actual_seq_lengths_query,
+                actual_seq_lengths_key=actual_seq_lengths_key, block_table=block_table, layout_query=layout_query,
                 layout_key=layout_key, sparse_count=sparse_count, sparse_mode=sparse_mode)
 
         # compare result
@@ -171,19 +171,19 @@ class TestCustomLightningIndexer(TestCase):
             def __init__(self):
                 super(Network, self).__init__()
 
-            def forward(self, query, key, weights, actual_seq_lengths_query=None, 
-                    actual_seq_lengths_key=None, block_table=None, layout_query='BSND', 
+            def forward(self, query, key, weights, actual_seq_lengths_query=None,
+                    actual_seq_lengths_key=None, block_table=None, layout_query='BSND',
                     layout_key='BSND', sparse_count=2048, sparse_mode=3):
 
                 out1 = torch_npu.npu_lightning_indexer(query, key, weights,
-                                                       actual_seq_lengths_query=actual_seq_lengths_query,  
+                                                       actual_seq_lengths_query=actual_seq_lengths_query,
                                                        actual_seq_lengths_key=actual_seq_lengths_key,
-                                                       block_table=block_table, layout_query=layout_query, 
-                                                       layout_key=layout_key, sparse_count=sparse_count, 
+                                                       block_table=block_table, layout_query=layout_query,
+                                                       layout_key=layout_key, sparse_count=sparse_count,
                                                        sparse_mode=sparse_mode)
 
                 return out1
-        
+
         print(f'======================== PTA graph BEGIN ========================')
         npu_mode = Network().to("npu:%s" % DEVICE_ID)
         from torchair.configs.compiler_config import CompilerConfig
@@ -191,8 +191,8 @@ class TestCustomLightningIndexer(TestCase):
         npu_backend = torchair.get_npu_backend(compiler_config=config)
 
         npu_mode = torch.compile(npu_mode, fullgraph=True, backend=npu_backend, dynamic=False)
-        npu_out = npu_mode(query, key, weights, actual_seq_lengths_query=actual_seq_lengths_query, 
-            actual_seq_lengths_key=actual_seq_lengths_key, block_table=block_table, layout_query=layout_query, 
+        npu_out = npu_mode(query, key, weights, actual_seq_lengths_query=actual_seq_lengths_query,
+            actual_seq_lengths_key=actual_seq_lengths_key, block_table=block_table, layout_query=layout_query,
             layout_key=layout_key, sparse_count=sparse_count, sparse_mode=sparse_mode)
 
         # compare result
@@ -241,8 +241,8 @@ class TestCustomLightningIndexer(TestCase):
         # start run custom ops
         print(f'======================== PTA eager BEGIN ========================')
         npu_out = torch.ops.custom.npu_lightning_indexer(
-            query, key, weights, actual_seq_lengths_query=actual_seq_lengths_query, 
-                actual_seq_lengths_key=actual_seq_lengths_key, block_table=block_table, layout_query=layout_query, 
+            query, key, weights, actual_seq_lengths_query=actual_seq_lengths_query,
+                actual_seq_lengths_key=actual_seq_lengths_key, block_table=block_table, layout_query=layout_query,
                 layout_key=layout_key, sparse_count=sparse_count, sparse_mode=sparse_mode)
 
         # compare result
@@ -293,19 +293,19 @@ class TestCustomLightningIndexer(TestCase):
             def __init__(self):
                 super(Network, self).__init__()
 
-            def forward(self, query, key, weights, actual_seq_lengths_query=None, 
-                    actual_seq_lengths_key=None, block_table=None, layout_query='BSND', 
+            def forward(self, query, key, weights, actual_seq_lengths_query=None,
+                    actual_seq_lengths_key=None, block_table=None, layout_query='BSND',
                     layout_key='BSND', sparse_count=2048, sparse_mode=3):
 
                 out1 = torch.ops.custom.npu_lightning_indexer(query, key, weights,
-                                                              actual_seq_lengths_query=actual_seq_lengths_query,  
+                                                              actual_seq_lengths_query=actual_seq_lengths_query,
                                                               actual_seq_lengths_key=actual_seq_lengths_key,
-                                                              block_table=block_table, layout_query=layout_query, 
-                                                              layout_key=layout_key, sparse_count=sparse_count, 
+                                                              block_table=block_table, layout_query=layout_query,
+                                                              layout_key=layout_key, sparse_count=sparse_count,
                                                               sparse_mode=sparse_mode)
 
                 return out1
-        
+
         print(f'======================== PTA graph BEGIN ========================')
         npu_mode = Network().to("npu:%s" % DEVICE_ID)
         from torchair.configs.compiler_config import CompilerConfig
@@ -313,8 +313,8 @@ class TestCustomLightningIndexer(TestCase):
         npu_backend = torchair.get_npu_backend(compiler_config=config)
 
         npu_mode = torch.compile(npu_mode, fullgraph=True, backend=npu_backend, dynamic=False)
-        npu_out = npu_mode(query, key, weights, actual_seq_lengths_query=actual_seq_lengths_query, 
-            actual_seq_lengths_key=actual_seq_lengths_key, block_table=block_table, layout_query=layout_query, 
+        npu_out = npu_mode(query, key, weights, actual_seq_lengths_query=actual_seq_lengths_query,
+            actual_seq_lengths_key=actual_seq_lengths_key, block_table=block_table, layout_query=layout_query,
             layout_key=layout_key, sparse_count=sparse_count, sparse_mode=sparse_mode)
 
         # compare result

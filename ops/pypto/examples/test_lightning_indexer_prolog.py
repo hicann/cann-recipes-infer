@@ -1,9 +1,9 @@
-# This program is free software, you can redistribute it and/or modify it.
 # Copyright (c) 2025 Huawei Technologies Co., Ltd.
-# This file is a part of the CANN Open Software.
-# Licensed under CANN Open Software License Agreement Version 2.0 (the "License").
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
 # Please refer to the License for details. You may not use this file except in compliance with the License.
-# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 
 import torch
@@ -64,14 +64,14 @@ class Model(torch.nn.Module):
         res1 = torch.add(idx_k_cache, 0)
         res2 = torch.add(idx_k_scale_cache, 0)
         return res, res1, res2
- 
+
 
 def rotate_half(x):
     """Rotates half the hidden dims of the input."""
     x1, x2 = x.chunk(2, dim=-1)
     return torch.cat((-x2, x1), dim=-1)
- 
- 
+
+
 def single_rope(x, cos_in, sin_in):
     logging.info("Entering into single_rope")
     # x: (b, s, n, d), cos_in: (b, s, d), sin_in: (b, s, d)
@@ -87,8 +87,8 @@ def single_rope(x, cos_in, sin_in):
     x_re1 = x_trans.reshape(b, s, n, d)
     res = x_re1 * cos_re + rotate_half(x_re1) * sin_re  # (b, s, n, d)
     return res.to(x_dtype)
- 
- 
+
+
 def layer_norm(x: torch.Tensor, gamma: torch.Tensor, beta: torch.Tensor, eps=1e-6) -> torch.Tensor:
     x_dtype = x.dtype
     if x_dtype != torch.float32:
@@ -97,8 +97,8 @@ def layer_norm(x: torch.Tensor, gamma: torch.Tensor, beta: torch.Tensor, eps=1e-
     var = ((x - mean) ** 2).mean(dim=-1, keepdim=True)
     x = (x - mean) / torch.sqrt(var + eps)
     return (x * gamma.to(torch.float32) + beta.to(torch.float32)).to(x_dtype)
- 
- 
+
+
 def quant_int8(x: torch.Tensor):
     # pertoken
     x_dtype = x.dtype  # bf16, (b, s, n, d)
@@ -126,9 +126,9 @@ def gen_block_table(act_seq, block_size, s1, need_indices=False):
     block_table_shape = [b, math.ceil(max_kv / block_size)]
     block_idx_list = torch.arange(0, block_num, 1)
     block_idx_list = block_idx_list[torch.randperm(block_idx_list.size(0))].to(torch.int32)
- 
+
     block_table = -torch.ones(block_table_shape, dtype=torch.int32)
- 
+
     block_idx = 0
     block_table_bidx = 0
     for cur_block in block_num_each:
@@ -136,7 +136,7 @@ def gen_block_table(act_seq, block_size, s1, need_indices=False):
             block_table[block_table_bidx, j] = block_idx_list[block_idx]
             block_idx += 1
         block_table_bidx += 1
- 
+
     if need_indices:
         cache_index = -torch.ones((b, s1), dtype=torch.int64)
         for i in range(b):
@@ -145,19 +145,19 @@ def gen_block_table(act_seq, block_size, s1, need_indices=False):
                 pos = cur_act - s1 + j
                 block_idx_in_seq = pos // block_size
                 global_block_id = block_table[i, block_idx_in_seq]
- 
+
                 offset_in_block = pos % block_size
                 global_index = global_block_id * block_size + offset_in_block
                 cache_index[i, j] = global_index
     else:
         cache_index = None
- 
+
     if need_indices:
         return block_num, block_table, cache_index
     else:
         return block_num, block_table
- 
- 
+
+
 def gen_cache_tensor(k_cache_bsnd, block_table, block_num, block_size):
     dtype = k_cache_bsnd.dtype
     b, s2, n_kv, d = k_cache_bsnd.shape
@@ -165,7 +165,7 @@ def gen_cache_tensor(k_cache_bsnd, block_table, block_num, block_size):
     s2_new = ((s2 + block_size - 1) // block_size) * block_size  # ceil to block_size
     k_cache_raw = torch.zeros((b, s2_new, n_kv, d), dtype=dtype)
     k_cache_raw[:, :s2, :, :] = k_cache_bsnd
- 
+
     for b_idx in range(b):
         for block_idx, cache_block_idx in enumerate(block_table[b_idx]):
             block_offset = block_idx * block_size
@@ -175,24 +175,24 @@ def gen_cache_tensor(k_cache_bsnd, block_table, block_num, block_size):
                 k_cache[cache_block_idx, :, :, :] = k_cache_raw[
                     b_idx, block_offset : (block_offset + block_size), :, :
                 ]
- 
+
     return k_cache
- 
- 
+
+
 def scatter_update_pa_bsnd(cache, k_bsnd, cache_index, axis):
     block_number, block_size, n_kv, d = cache.shape
     res = cache.reshape(block_number * block_size * n_kv, d)
     b, s1 = cache_index.shape
- 
+
     if axis == -2:
         for b_i in range(b):
             for s1_i in range(s1):
                 index_value = cache_index[b_i][s1_i]
                 res[index_value, :] = k_bsnd[b_i, s1_i, :, :]
- 
+
     return res.reshape(block_number, block_size, n_kv, d)
- 
- 
+
+
 # IndexerProlog quant
 def indexer_prolog(inputs: dict, dims: dict):
     # input
@@ -216,7 +216,7 @@ def indexer_prolog(inputs: dict, dims: dict):
     idx_k_scale_cache = inputs["idx_k_scale_cache"]  # input14, fp16
     cache_index = inputs["idx_k_cache_index"]  # (b, s), int64
     x_dtype = x.dtype
- 
+
     # calculate
     q = torch.matmul(q_norm.to(torch.int32), w_idx_qb.to(torch.int32))  # (b, s, n * d)
     q_fp32 = q.to(torch.float32)
@@ -230,7 +230,7 @@ def indexer_prolog(inputs: dict, dims: dict):
     q = torch.matmul(q, hadamard_q)  # (b, s, n, d)
     q_int8, q_scale = quant_int8(q)  # (b, s, n, d) int8, (b, s, n, 1) fp32
     q_scale = q_scale.to(torch.float16)
- 
+
     k = torch.matmul(x.to(torch.float32), w_idx_k.to(torch.float32))  # (b, s, d)
     k = layer_norm(k, layer_norm_gamma, layer_norm_beta).to(x_dtype)
     k_rope, k_nope = torch.split(k, [rope_head_dim, d - rope_head_dim], dim=-1)
@@ -245,7 +245,7 @@ def indexer_prolog(inputs: dict, dims: dict):
     k_scale_cache = idx_k_scale_cache.clone()  # (block_num, block_size, n_kv, 1)
     scatter_update_pa_bsnd(k_cache, k_int8.reshape(b, s, 1, d), cache_index, -2)
     scatter_update_pa_bsnd(k_scale_cache, k_scale.reshape(b, s, 1, 1), cache_index, -2)
- 
+
     weights = torch.matmul(x, w_idx_proj).to(torch.float32)  # (b, s, n)
     weights = weights * (n ** -0.5) * (d ** -0.5)
     weights = weights.to(torch.float16)
@@ -271,8 +271,8 @@ def gen_dims(params):
     dims["block_num"] = dims["b"] * dims["s2"] // dims["block_size"]
     dims["n_kv"] = 1
     return dims
- 
- 
+
+
 def gen_indexer_prolog_inputs(dims, dtype=torch.bfloat16, qunat_dtype=torch.int8, eps=1e-6):
     b, t, n, d = dims["b"], dims["t"], dims["idx_n_heads"], dims["idx_head_dim"]
     s = t // b
@@ -283,7 +283,7 @@ def gen_indexer_prolog_inputs(dims, dtype=torch.bfloat16, qunat_dtype=torch.int8
     n_kv = dims["n_kv"]
     s2 = dims["s2"]
     rope_head_dim = dims["rope_head_dim"]
- 
+
     x = torch.empty((b, s, h), dtype=dtype).uniform_(-1, 1)
     q_norm = torch.randint(low=-128, high=128, size=(b, s, q_lora_rank), dtype=qunat_dtype)
     q_norm_scale = torch.empty((b, s, 1), dtype=torch.float32).uniform_(-1, 1)
@@ -295,20 +295,20 @@ def gen_indexer_prolog_inputs(dims, dtype=torch.bfloat16, qunat_dtype=torch.int8
 
     w_idx_k = torch.empty((h, d), dtype=dtype).uniform_(-1, 1)
     w_idx_k_nz = torch_npu.npu_format_cast(w_idx_k.npu(), 29)
-    
+
     w_idx_proj = torch.empty((h, n), dtype=dtype).uniform_(-1, 1)
     w_idx_proj_nz = torch_npu.npu_format_cast(w_idx_proj.npu(), 29)
 
     ln_gamma = torch.ones((d,), dtype=dtype)
     ln_beta = torch.zeros((d,), dtype=dtype)
- 
+
     random_angles = (torch.rand(b, s, rope_head_dim, dtype=torch.float32) * 2 * torch.pi)
     cos = torch.cos(random_angles).to(dtype)
     sin = torch.sin(random_angles).to(dtype)
- 
+
     hadamard_q = torch.empty((d, d), dtype=dtype).uniform_(-1, 1)  # (128, 128)
     hadamard_k = torch.empty((d, d), dtype=dtype).uniform_(-1, 1)
- 
+
     act_seq = torch.tensor([s2] * b)  # (b,)
     k_cache_bsnd = torch.randint(low=-128, high=128, size=(b, s2, n_kv, d), dtype=qunat_dtype)
     k_scale_cache_bsnd = torch.empty((b, s2, n_kv, 1), dtype=torch.float16).uniform_(-1, 1)
@@ -317,7 +317,7 @@ def gen_indexer_prolog_inputs(dims, dtype=torch.bfloat16, qunat_dtype=torch.int8
     # (block_num, block_size, n_kv, d), (block_num, block_size, n_kv, 1)
     k_cache = gen_cache_tensor(k_cache_bsnd, block_table, block_num, block_size)
     k_scale_cache = gen_cache_tensor(k_scale_cache_bsnd, block_table, block_num, block_size)
- 
+
     return {
         "token_x": x,  # input0, bf16
         "q_norm": q_norm,  # input1, int8
@@ -395,11 +395,11 @@ def build_npu_graph():
     params["b"] = b
     params["s1"] = s1
     params["s2"] = s2
- 
+
     dims = gen_dims(params)
     dim_tensor = torch.tensor(list(dims.values()), dtype=torch.int32)
     print("params:", dim_tensor, flush=True)
- 
+
     input_data_map = gen_indexer_prolog_inputs(dims, torch.bfloat16)
     outputs = indexer_prolog(input_data_map, dims)
 

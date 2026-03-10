@@ -1,10 +1,10 @@
 # coding=utf-8
-# This program is free software, you can redistribute it and/or modify it.
 # Copyright (c) 2025 Huawei Technologies Co., Ltd.
-# This file is a part of the CANN Open Software.
-# Licensed under CANN Open Software License Agreement Version 2.0 (the "License").
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
 # Please refer to the License for details. You may not use this file except in compliance with the License.
-# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 
 import os
@@ -242,7 +242,7 @@ class InferMTP(nn.Module):
         return input_dict_main, input_dict_mtp
 
     # post process for mtp model output when continue inference(next_index < next_n - 1)
-    def mtp_model_output_process_continue(self, input_dict, outputs, prev_hidden_states, 
+    def mtp_model_output_process_continue(self, input_dict, outputs, prev_hidden_states,
                                       past_key_values_cur):
 
         next_tokens = torch.argmax(outputs, dim=-1)
@@ -259,7 +259,7 @@ class InferMTP(nn.Module):
         if not self.mtp_model.enable_prefill_multi_cycle and input_dict['is_prefill']:
             prev_hidden_states = prev_hidden_states.view(batch_size, -1, prev_hidden_states.shape[-1]) # (B, S, H)
 
-        input_dict['prev_hidden_states'] = torch.cat([input_dict['prev_hidden_states'], 
+        input_dict['prev_hidden_states'] = torch.cat([input_dict['prev_hidden_states'],
                     prev_hidden_states[:, -1:, :]], dim=1)[:, -prev_hidden_states.shape[1]:, :].contiguous()
         input_dict['input_ids'] = torch.cat([input_dict['input_ids'], spec_token], dim=-1)[:, 1:]
 

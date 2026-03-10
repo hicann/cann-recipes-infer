@@ -1,9 +1,9 @@
-# This program is free software, you can redistribute it and/or modify it.
 # Copyright (c) 2025 Huawei Technologies Co., Ltd.
-# This file is a part of the CANN Open Software.
-# Licensed under CANN Open Software License Agreement Version 2.0 (the "License").
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
 # Please refer to the License for details. You may not use this file except in compliance with the License.
-# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 
 cmake_minimum_required(VERSION 3.14)
@@ -82,7 +82,7 @@ if (ENABLE_BUILD_BINARY)
                         COMMAND ${CMAKE_COMMAND} -E make_directory ${BINARY_OUTPUT_PATH}/config/${COMPUTE_UNIT}/
                         COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/cmake/utils/gen_binary_info_config.py
                                 -p ${BINARY_OUTPUT_PATH}/${COMPUTE_UNIT}/
-                                -o ${BINARY_OUTPUT_PATH}/config/${COMPUTE_UNIT}/ -s ${COMPUTE_UNIT}                        
+                                -o ${BINARY_OUTPUT_PATH}/config/${COMPUTE_UNIT}/ -s ${COMPUTE_UNIT}
                 )
 
                 # lightning_indexer_prolog_pto
@@ -100,9 +100,9 @@ if (ENABLE_BUILD_BINARY)
                         COMMAND ${CMAKE_COMMAND} -E make_directory ${BINARY_OUTPUT_PATH}/config/${COMPUTE_UNIT}/
                         COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/cmake/utils/gen_binary_info_config.py
                                 -p ${BINARY_OUTPUT_PATH}/${COMPUTE_UNIT}/
-                                -o ${BINARY_OUTPUT_PATH}/config/${COMPUTE_UNIT}/ -s ${COMPUTE_UNIT}                        
+                                -o ${BINARY_OUTPUT_PATH}/config/${COMPUTE_UNIT}/ -s ${COMPUTE_UNIT}
                 )
-                
+
                 # lightning_indexer_pto
                 add_custom_command(
                         TARGET tile_fwk_impl POST_BUILD
@@ -118,7 +118,7 @@ if (ENABLE_BUILD_BINARY)
                         COMMAND ${CMAKE_COMMAND} -E make_directory ${BINARY_OUTPUT_PATH}/config/${COMPUTE_UNIT}/
                         COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/cmake/utils/gen_binary_info_config.py
                                 -p ${BINARY_OUTPUT_PATH}/${COMPUTE_UNIT}/
-                                -o ${BINARY_OUTPUT_PATH}/config/${COMPUTE_UNIT}/ -s ${COMPUTE_UNIT}                        
+                                -o ${BINARY_OUTPUT_PATH}/config/${COMPUTE_UNIT}/ -s ${COMPUTE_UNIT}
                 )
         endforeach()
 endif()

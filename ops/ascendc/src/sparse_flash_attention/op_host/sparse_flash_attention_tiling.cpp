@@ -1,10 +1,10 @@
 /**
- * This program is free software, you can redistribute it and/or modify it.
  * Copyright (c) 2025 Huawei Technologies Co., Ltd.
- * This file is a part of the CANN Open Software.
- * Licensed under CANN Open Software License Agreement Version 2.0 (the "License").
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
  * Please refer to the License for details. You may not use this file except in compliance with the License.
- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
  * See LICENSE in the root of the software repository for the full text of the License.
  */
 
@@ -265,7 +265,7 @@ void SFAMlaTiling::InitParams()
     } else {
         perfMode_ = SFAPerfMode::C_TEMPLATE_MODE;
     }
-   
+
     coreNum_ = aicNum_;
 
     headDimAlign_ = Align(sfaInfo_->qkHeadDim, BYTE_BLOCK); // 元素个数按照基本块大小对齐
@@ -275,7 +275,7 @@ void SFAMlaTiling::InitParams()
 void SFAMlaTiling::CalcUbBmm()
 {
     uint32_t cubeMSize = sfaInfo_->gSize * sfaInfo_->s1Size;
-    uint32_t maxMSize = mBaseSize_; 
+    uint32_t maxMSize = mBaseSize_;
     if (cubeMSize > maxMSize) {
         cubeMSize = maxMSize;
     }
@@ -317,7 +317,7 @@ void SFAMlaTiling::SplitBalanced()
     CalcInnerSize(sfaInfo_->s2Size);
 
     InnerSplitParams innerSplitParams;
-    innerSplitParams.s1GBaseSize = sfaInfo_->gSize; 
+    innerSplitParams.s1GBaseSize = sfaInfo_->gSize;
     innerSplitParams.s2BaseSize = sInnerSize_;
     tilingData_.innerSplitParams.set_mBaseSize(innerSplitParams.s1GBaseSize);
     tilingData_.innerSplitParams.set_s2BaseSize(innerSplitParams.s2BaseSize);
@@ -712,7 +712,7 @@ ge::graphStatus SFATilingCheck::CheckSinglePara() const
 {
     if (ge::GRAPH_SUCCESS != CheckSingleParaQuery() ||
         ge::GRAPH_SUCCESS != CheckSingleParaKey() ||
-        ge::GRAPH_SUCCESS != CheckSingleParaSparseIndices() || 
+        ge::GRAPH_SUCCESS != CheckSingleParaSparseIndices() ||
         ge::GRAPH_SUCCESS != CheckSingleParaNumHeads() ||
         ge::GRAPH_SUCCESS != CheckSingleParaKvHeadNums() ||
         ge::GRAPH_SUCCESS != CheckSingleParaSparseMode() ||
@@ -880,13 +880,13 @@ ge::graphStatus SFATilingCheck::CheckBlockTable() const
             return ge::GRAPH_FAILED);
         return ge::GRAPH_SUCCESS;
     }
-    
+
     uint32_t blockTableBatch = opParamInfo_.blockTable.tensor->GetStorageShape().GetDim(0);
     OPS_ERR_IF(blockTableBatch != bSize_,
         OPS_LOG_E(opName_, "%s's first dimension(%u) should be equal to batch size(%u)",
             BLOCK_TABLE_NAME.c_str(), blockTableBatch, bSize_),
         return ge::GRAPH_FAILED);
-    
+
     return ge::GRAPH_SUCCESS;
 }
 
@@ -1170,7 +1170,7 @@ ge::graphStatus SFATilingCheck::CheckFeatureMlaNoQuantShape() const
     OPS_ERR_IF(bSize_ <= 0,
         OPS_LOG_E(opName_, "batch_size should be greater than 0, but got %u", bSize_),
         return ge::GRAPH_FAILED);
-        
+
     OPS_ERR_IF(qTSize_ <= 0 && (qLayout_ == SFALayout::TND),
         OPS_LOG_E(opName_, "T_size of query should be greater than 0, but got %u", qTSize_),
         return ge::GRAPH_FAILED);
@@ -1238,11 +1238,11 @@ ge::graphStatus SFATilingCheck::CheckFeatureMlaNoquantPa() const
     OPS_ERR_IF(blockSize_ <= 0 || blockSize_ > static_cast<int32_t>(MAX_BLOCK_SIZE),
         OPS_LOG_E(opName_, "when page attention is enabled, block_size(%d) should be in range (0, %u].",
         blockSize_, MAX_BLOCK_SIZE), return ge::GRAPH_FAILED);
-    
+
     OPS_ERR_IF(blockSize_ % 16 > 0,
         OPS_LOG_E(opName_, "when page attention is enabled, block_size(%d) should be 16-aligned.",
         blockSize_), return ge::GRAPH_FAILED);
-    
+
     OPS_ERR_IF(blockSize_ % sparseBlockSize_ > 0,
         OPS_LOG_E(opName_, "when page attention is enabled, block_size(%d) must be divided by sparse_block_size(%d), but now the remainder is %d.",
         blockSize_, sparseBlockSize_, blockSize_ % sparseBlockSize_), return ge::GRAPH_FAILED);
@@ -1322,7 +1322,7 @@ ge::graphStatus SFATilingCheck::Process()
 }
 
 bool SFAInfoParser::HasAxis(const SFAAxis &axis, const SFALayout &layout, const gert::Shape &shape) const
-{   
+{
     const auto& layoutIt = SFA_LAYOUT_AXIS_MAP.find(layout);
     if (layoutIt == SFA_LAYOUT_AXIS_MAP.end()) {
         return false;

@@ -1,12 +1,11 @@
-/* *
- * This program is free software, you can redistribute it and/or modify it.
- * Copyright (c) 2025 Huawei Technologies Co., Ltd.
- * This file is a part of the CANN Open Software.
- * Licensed under CANN Open Software License Agreement Version 2.0 (the "License").
- * Please refer to the License for details. You may not use this file except in compliance with the License.
- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED, INCLUDING
-BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.  * See LICENSE in the root of
-the software repository for the full text of the License.
+/**
+ * Copyright (c) 2025 Huawei Technologies Co., Ltd.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
  */
 
 #include "deepseek_indexer_attention.h"
@@ -49,7 +48,7 @@ void DeepseekIndexerAttentionPto(const Tensor &x, const Tensor &wDq, const Tenso
     int dn = params.kv_lora_rank;
     int dr = params.rope_dim;
     int idx_head_dim = params.idx_head_dim;
-    Tensor kvCacheOut(dType, {GetInputShape(kvCache, 0) , blockSize , n2, dn}, "kvCacheOuTmp"); 
+    Tensor kvCacheOut(dType, {GetInputShape(kvCache, 0) , blockSize , n2, dn}, "kvCacheOuTmp");
     Tensor krCacheOut(dType, {GetInputShape(krCache, 0) , blockSize , n2, dr}, "krCacheOuTmp");
     Tensor indexKCacheOut(dType, {GetInputShape(indexKCache, 0), blockSize, n2, idx_head_dim}, "indexKCacheOut");
     Tensor kNope2D(dType, {GetInputShape(kvCache, 0) * blockSize * n2, dn}, "kNope2D");

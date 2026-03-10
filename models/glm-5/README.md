@@ -133,7 +133,7 @@ source ${cann_path}/bin/setenv.bash
 |-------| ----------------- | ---------- | ----- | --------- | ----------------------- |
 |W8A8 |    256           | 65536       | 64   | 22.54      |177.46                     |
 
-> 注：性能数据基于 MTP3 与 perfect eplb 配置采集，平均 1 个 draft token 中 accept token 为 0.8 个。
+> 注：性能数据基于 MTP3 与 perfect eplb 配置采集，平均 3 个 draft token 中 accept token 为 1.44 个。
 
 ## 附录
 ### FAQ

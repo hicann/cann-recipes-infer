@@ -1,7 +1,6 @@
-* This program is free software, you can redistribute it and/or modify.
 * Copyright (c) 2025 Huawei Technologies Co., Ltd.
-* This file is a part of the CANN Open Software.
-* Licensed under CANN Open Software License Agreement Version 2.0 (the "License").
+* This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+* CANN Open Software License Agreement Version 2.0 (the "License").
 * Please refer to the License for details. You may not use this file except in compliance with the License.
 * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 * See LICENSE in the root of the software repository for the full text of the License.
@@ -365,7 +364,7 @@ POSSIBILITY OF SUCH DAMAGE.
 
 
 Software: transformers	4.53.3
-Copyright notice: 	
+Copyright notice:
 Copyright 2022 Microsoft Research and The HuggingFace Inc. team. All rights reserved
 Copyright 2021 Iz Beltagy, Matthew E. Peters, Arman Cohan and The HuggingFace Inc. team. All rights reserved
 Copyright 2023 The OpenAI Team
@@ -1031,7 +1030,7 @@ Copyright (c) 2014-2017 The Regents
 
 License:BSD 3-Clause License
 
-Copyright (c) Soumith Chintala 2016, 
+Copyright (c) Soumith Chintala 2016,
 All rights reserved.
 
 Redistribution and use in source and binary forms, with or without
@@ -2377,7 +2376,7 @@ Copyright 2025 Sana-Sprint
 Copyright 2025 Jake Babbidge, TencentARC and The HuggingFace Team. All rights reserved
 
 License: Apache License V2.0
-Please see above 
+Please see above
 
 Software: pandas 2.0.3
 Copyright notice:
@@ -2454,7 +2453,7 @@ Please see above
 
 
 Software: numpy 1.26.4
-Copyright notice: 
+Copyright notice:
 Copyright 2017 Niklas Claesson
 Copyright (c) 2014 Ryan Juckett
 Copyright 2014-2021 The Meson development team
@@ -2650,7 +2649,7 @@ standalone and requires a support library to be linked with it.  This
 support library is itself covered by the above license.
 
 Software: decorator 5.2.1
-Copyright notice: 
+Copyright notice:
 Copyright (c) 2005-2025, Michele Simionato All rights reserved
 License: BSD 3-Clause License
 Copyright (c) 2005-2025, Michele Simionato
@@ -2913,7 +2912,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 
 Software: attrs 25.3.0
-Copyright notice: 
+Copyright notice:
 Copyright (c) 2015 Hynek Schlawack
 License: MIT License
 The MIT License (MIT)
@@ -2940,7 +2939,7 @@ SOFTWARE.
 
 
 Software: compressed-tensors 0.6.0
-Copyright notice: 
+Copyright notice:
 Copyright (c) 2021 - present / Neuralmagic, Inc. All Rights Reserved
 
 License: Apache License V2.0
@@ -2964,7 +2963,7 @@ License: Apache License V2.0
 Please see above
 
 Software: accelerate v1.0.1
-Copyright notice: 
+Copyright notice:
 (c) 2017 Minio, Inc.
 (c) 2019 Minio, Inc.
 (c) 2021 Minio, Inc.
@@ -2978,18 +2977,18 @@ Please see above
 
 
 Software: tiktoken 0.9.0
-Copyright notice: 
+Copyright notice:
 Copyright (c) 2022 OpenAI, Shantanu Jain
 License: MIT License
 Please see above
 
 Software: hypothesis 6.140.2
-Copyright notice: 
+Copyright notice:
 Copyright (c) 2013, David R. MacIver
 License: Mozilla Public License (MPL) V2.0
 
 Software: einops 0.8.1
-Copyright notice: 
+Copyright notice:
 Copyright (c) 2018 Alex Rogozhnikov
 License: MIT License
 Please see above

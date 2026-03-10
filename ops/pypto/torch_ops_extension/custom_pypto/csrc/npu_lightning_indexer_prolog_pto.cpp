@@ -1,12 +1,11 @@
-/* *
- * This program is free software, you can redistribute it and/or modify it.
- * Copyright (c) 2025 Huawei Technologies Co., Ltd.
- * This file is a part of the CANN Open Software.
- * Licensed under CANN Open Software License Agreement Version 2.0 (the "License").
- * Please refer to the License for details. You may not use this file except in compliance with the License.
- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED, INCLUDING
-BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.  * See LICENSE in the root of
-the software repository for the full text of the License.
+/**
+ * Copyright (c) 2025 Huawei Technologies Co., Ltd.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
  */
 
 #include <iostream>
@@ -65,7 +64,7 @@ std::tuple<at::Tensor,at::Tensor,at::Tensor> npu_lightning_indexer_prolog_pto_me
     return construct_npu_lightning_indexer_prolog_pto_output_tensor(token_x, q_norm, q_norm_scale, wq_b, wq_b_scale, wk, weights_proj,
         ln_gamma_k, ln_beta_k, cos_idx_rope, sin_idx_rope, hadamard_q, hadamard_k, idx_k_cache, idx_k_scale_cache,
         idx_k_cache_index, layernorm_epsilon_k, layout_query, layout_key);
- 
+
 }
 }
 TORCH_LIBRARY_IMPL(custom_pypto, Meta, m) {

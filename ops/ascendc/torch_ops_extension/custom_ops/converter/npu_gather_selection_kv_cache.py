@@ -1,9 +1,9 @@
-# This program is free software, you can redistribute it and/or modify it.
 # Copyright (c) 2025 Huawei Technologies Co., Ltd.
-# This file is a part of the CANN Open Software.
-# Licensed under CANN Open Software License Agreement Version 2.0 (the "License").
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
 # Please refer to the License for details. You may not use this file except in compliance with the License.
-# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 
 from typing import (
@@ -81,24 +81,24 @@ m = Library("custom", "FRAGMENT")
 
 @impl(m, "npu_gather_selection_kv_cache", "Functionalize")
 def custom_npu_gather_selection_kv_cache_func(
-    selection_k_rope: Tensor, 
-    selection_kv_cache: Tensor, 
-    selection_kv_block_table: Tensor, 
+    selection_k_rope: Tensor,
+    selection_kv_cache: Tensor,
+    selection_kv_block_table: Tensor,
     selection_kv_block_status: Tensor,
-    selection_topk_indices: Tensor, 
-    full_k_rope: Tensor, 
-    full_kv_cache: Tensor, 
-    full_kv_block_table: Tensor, 
+    selection_topk_indices: Tensor,
+    full_k_rope: Tensor,
+    full_kv_cache: Tensor,
+    full_kv_block_table: Tensor,
     full_kv_actual_seq: Tensor,
-    full_q_actual_seq: Tensor, 
-    *, 
+    full_q_actual_seq: Tensor,
+    *,
     selection_topk_block_size: int = 64):
 
     (
-        selection_kv_actual_seq_out, 
-        selection_k_rope_inplace, 
-        selection_kv_cache_inplace, 
-        selection_kv_block_table_inplace, 
+        selection_kv_actual_seq_out,
+        selection_k_rope_inplace,
+        selection_kv_cache_inplace,
+        selection_kv_block_table_inplace,
         selection_kv_block_status_inplace
     ) = torch.ops.custom.npu_gather_selection_kv_cache_functional(
         selection_k_rope,
@@ -127,17 +127,17 @@ def custom_npu_gather_selection_kv_cache_func(
 # 注意：meta_outputs形参名为固定写法，若写错会影响ge节点的输出dtype与shape推导
 @register_fx_node_ge_converter(torch.ops.custom.npu_gather_selection_kv_cache.default)
 def convert_npu_gather_selection_kv_cache(
-    selection_k_rope: Tensor, 
-    selection_kv_cache: Tensor, 
-    selection_kv_block_table: Tensor, 
+    selection_k_rope: Tensor,
+    selection_kv_cache: Tensor,
+    selection_kv_block_table: Tensor,
     selection_kv_block_status: Tensor,
-    selection_topk_indices: Tensor, 
-    full_k_rope: Tensor, 
-    full_kv_cache: Tensor, 
-    full_kv_block_table: Tensor, 
+    selection_topk_indices: Tensor,
+    full_k_rope: Tensor,
+    full_kv_cache: Tensor,
+    full_kv_block_table: Tensor,
     full_kv_actual_seq: Tensor,
-    full_q_actual_seq: Tensor, 
-    *, 
+    full_q_actual_seq: Tensor,
+    *,
     selection_topk_block_size: int = 64,
     meta_outputs: Any = None):
 
@@ -159,10 +159,10 @@ def convert_npu_gather_selection_kv_cache(
                 "full_kv_block_table": full_kv_block_table,
                 "full_kv_actual_seq": full_kv_actual_seq,
                 "full_q_actual_seq": full_q_actual_seq
-                }, 
+                },
         attrs={
                 "selection_topk_block_size": attr.Int(selection_topk_block_size)
-                }, 
+                },
         outputs=[
                 "selection_k_rope",
                 "selection_kv_cache",
@@ -176,17 +176,17 @@ def convert_npu_gather_selection_kv_cache(
 #注意：meta_outputs形参名为固定写法，若写错会影响ge节点的输出dtype与shape推导
 @register_fx_node_ge_converter(torch.ops.custom.npu_gather_selection_kv_cache_functional.default)
 def convert_npu_gather_selection_kv_cache_functional(
-    selection_k_rope: Tensor, 
-    selection_kv_cache: Tensor, 
-    selection_kv_block_table: Tensor, 
+    selection_k_rope: Tensor,
+    selection_kv_cache: Tensor,
+    selection_kv_block_table: Tensor,
     selection_kv_block_status: Tensor,
-    selection_topk_indices: Tensor, 
-    full_k_rope: Tensor, 
-    full_kv_cache: Tensor, 
-    full_kv_block_table: Tensor, 
+    selection_topk_indices: Tensor,
+    full_k_rope: Tensor,
+    full_kv_cache: Tensor,
+    full_kv_block_table: Tensor,
     full_kv_actual_seq: Tensor,
-    full_q_actual_seq: Tensor, 
-    *, 
+    full_q_actual_seq: Tensor,
+    *,
     selection_topk_block_size: int = 64,
     meta_outputs: Any = None):
 

@@ -1,10 +1,10 @@
 /**
- * This program is free software, you can redistribute it and/or modify it.
  * Copyright (c) 2025 Huawei Technologies Co., Ltd.
- * This file is a part of the CANN Open Software.
- * Licensed under CANN Open Software License Agreement Version 2.0 (the "License").
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
  * Please refer to the License for details. You may not use this file except in compliance with the License.
- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
  * See LICENSE in the root of the software repository for the full text of the License.
  */
 
@@ -32,13 +32,13 @@ at::Tensor construct_lightning_indexer_output_tensor(const at::Tensor& query, co
             "than 0, but shape[", i, "] is ", query.size(i));
     }
     TORCH_CHECK(sparse_count > 0, "sparse count should be greater than 0, but now is ", sparse_count);
-    
+
     if (query_layout_str == "BSND") {
         output_size = {query.size(DIM_0), query.size(DIM_1), key.size(DIM_2), sparse_count};
     } else {
         int n_dim_index = 0;
         n_dim_index = (key_layout_str == "TND") ? DIM_1 : DIM_2;
-        output_size = {query.size(DIM_0), key.size(n_dim_index), sparse_count};       
+        output_size = {query.size(DIM_0), key.size(n_dim_index), sparse_count};
     }
     at::Tensor output = at::empty(output_size, query.options().dtype(at::kInt));
 
@@ -85,7 +85,7 @@ at::Tensor npu_lightning_indexer_meta(
     TORCH_CHECK(key.numel() > 0, "Key is empty.");
     TORCH_CHECK(weights.numel() > 0, "Weights is empty.");
     std::string query_layout_str = std::string(layout_query);
-    std::string key_layout_str = std::string(layout_key);   
+    std::string key_layout_str = std::string(layout_key);
     // construct the output tensor
     at::Tensor lightning_indexer_output = construct_lightning_indexer_output_tensor(
             query, key, actual_seq_lengths_query, sparse_count, query_layout_str, key_layout_str);

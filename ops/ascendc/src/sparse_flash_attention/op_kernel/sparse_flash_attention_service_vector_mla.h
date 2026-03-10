@@ -1,10 +1,10 @@
 /**
- * This program is free software, you can redistribute it and/or modify it.
  * Copyright (c) 2025 Huawei Technologies Co., Ltd.
- * This file is a part of the CANN Open Software.
- * Licensed under CANN Open Software License Agreement Version 2.0 (the "License").
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
  * Please refer to the License for details. You may not use this file except in compliance with the License.
- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
  * See LICENSE in the root of the software repository for the full text of the License.
  */
 
@@ -382,7 +382,7 @@ __aicore__ inline void SFAVectorService<SFAT>::ElewiseCompute(const RunInfo &inf
             // 场景一 s2Mid > s2ValidSizeFirstPart + oneBlk
             // 可以推导出s2StartCeilAlign < s2Mid   第一阶段取到s2StartCeilAlign
             // s2StartCeilAlign <= s2MidFloorAlign 第二阶段取到s2MidFloorAlign
-            // 场景二 s2Mid <= s2ValidSizeFirstPart + oneBlk 
+            // 场景二 s2Mid <= s2ValidSizeFirstPart + oneBlk
             // 可以推导出 s2StartCeilAlign >= s2Mid 第一阶段取到mid
             // s2StartCeilAlign > s2MidFloorAlign 第二阶段取到s2StartCeilAlign
             SetInfInBlk(mmResUb, dealRowCount, columnCount, s2ValidSizeFirstPart,
@@ -664,7 +664,7 @@ __aicore__ inline void SFAVectorService<SFAT>::ProcessAmlaNupdate(const RunInfo 
         // (m,1)单次brcb扩充成(m,8), 重复16次, 扩充为(m,128)
         for (uint32_t i = 0; i < dGroupSize / elementPerBlock; i++) {
             Brcb(tmpQue[i * elementPerBlock],
-                 nUpdateTensor[loop * mSplitSize], 
+                 nUpdateTensor[loop * mSplitSize],
                  static_cast<uint8_t>((processMSize + elementPerBlock - 1) / elementPerBlock),
                  {static_cast<uint16_t>(dGroupSize / elementPerBlock), // 单次迭代内，目的操作数不同datablock间地址步长,单位为datablock
                   static_cast<uint16_t>(dGroupSize)});                 // 相邻迭代间，目的操作数相同datablock地址步长
@@ -843,7 +843,7 @@ __aicore__ inline void SFAVectorService<SFAT>::CopyInKv(int64_t &mte2Size, int64
                             (keyRopeOffset2 - keyRopeOffset1)) - constInfo.sparseBlockSize) *
                              constInfo.headDimRope * sizeof(KV_T);
     }
-    
+
     if (unlikely(keySrcStride >= INT32_MAX || keySrcStride < 0 ||
         (!PAGE_ATTENTION && (keyRopeSrcStride >= INT32_MAX || keyRopeSrcStride < 0)) ||
         realS2Idx1 + constInfo.sparseBlockSize >= s2IdLimit ||
@@ -1163,7 +1163,7 @@ SFAVectorService<SFAT>::Bmm2DataCopyOutTrans(const RunInfo &info, LocalTensor<OU
     dataCopyParams.blockLen = actualColumnCount * sizeof(OUT_T);
     dataCopyParams.srcStride = (columnCount - actualColumnCount) / (BYTE_BLOCK / sizeof(OUT_T));
     dataCopyParams.dstStride = 0;
-    DataCopyPad(attentionOutGm[info.attenOutOffset + wsMStart * actualColumnCount], attenOutUb, dataCopyParams);    
+    DataCopyPad(attentionOutGm[info.attenOutOffset + wsMStart * actualColumnCount], attenOutUb, dataCopyParams);
     return;
 }
 
@@ -1221,7 +1221,7 @@ SFAVectorService<SFAT>::DealBmm2ResBaseBlock(const RunInfo &info, const MSplitIn
 
     SetFlag<AscendC::HardEvent::MTE2_V>(SYNC_INPUT_BUF1_FLAG);
     WaitFlag<AscendC::HardEvent::MTE2_V>(SYNC_INPUT_BUF1_FLAG);
-    
+
     // 将绝对值大于1e10的数置为0
     LocalTensor<T> bmm2ResUb = tmpBuff1.Get<T>();
     bmm2ResUb.SetSize(vec2ComputeSize);

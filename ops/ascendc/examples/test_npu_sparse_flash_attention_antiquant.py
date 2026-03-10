@@ -1,6 +1,6 @@
-# Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
-# This file is a part of the CANN Open Software.
-# Licensed under CANN Open Software License Agreement Version 2.0 (the "License").
+# Copyright (c) 2025 Huawei Technologies Co., Ltd.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
 # Please refer to the License for details. You may not use this file except in compliance with the License.
 # THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
@@ -37,7 +37,7 @@ def gather_kv(k_tensor, v_tensor, sparse_indices, sparse_block_size, sparse_coun
               batch, n2_idx, s1_idx, cur_actual_seq_lengths_kv):
     s2_sparse = list()
     for sparse_id in sparse_indices:
-        if sparse_id == -1: 
+        if sparse_id == -1:
             break
         begin_idx = sparse_id * sparse_block_size
         end_idx = begin_idx + sparse_block_size \
@@ -76,7 +76,7 @@ def cpu_sparse_flash_attention_antiquant(
     key_quant_scale = np.repeat(key_quant_scale, repeats=tile_size, axis=-1)
     key = (key * key_quant_scale).to(query_type)
     value = key
-    
+
     batch_size = actual_seq_lengths_query.shape[0]
     num_heads = query.shape[2]
     num_kv_heads = key.shape[2]
@@ -172,7 +172,7 @@ class TestCustomSFA(TestCase):
         print(f'======================== PTA eager BEGIN ========================')
         # start run custom ops
         npu_out = torch_npu.npu_sparse_flash_attention_antiquant(
-            query, key, value, sparse_indices, 
+            query, key, value, sparse_indices,
             scale_value=scale_value, sparse_block_size=sparse_block_size,
             actual_seq_lengths_query=act_seq_q, actual_seq_lengths_kv=act_seq_kv,
             layout_query='BSND', layout_kv='PA_BSND', sparse_mode=3, block_table=block_table,
@@ -234,7 +234,7 @@ class TestCustomSFA(TestCase):
             layout_query='BSND', layout_kv='PA_BSND', sparse_mode=3, block_table=block_table,
             attention_mode=2, quant_scale_repo_mode=1, tile_size=tile_size, key_quant_mode=2,
             value_quant_mode=2, rope_head_dim=64)
-        
+
         query = query.to("npu:%s" % DEVICE_ID)
         key = key.to("npu:%s" % DEVICE_ID)
         value = value.to("npu:%s" % DEVICE_ID)
@@ -250,7 +250,7 @@ class TestCustomSFA(TestCase):
         from torchair.configs.compiler_config import CompilerConfig
         config = CompilerConfig()
         npu_backend = torchair.get_npu_backend(compiler_config=config)
-      
+
         class Network(nn.Module):
             def __init__(self):
                 super(Network, self).__init__()
@@ -260,9 +260,9 @@ class TestCustomSFA(TestCase):
                 layout_query, layout_kv, sparse_mode, block_table,
                 attention_mode, quant_scale_repo_mode, tile_size, key_quant_mode,
                 value_quant_mode, rope_head_dim):
-              
+
                 out1 = torch_npu.npu_sparse_flash_attention_antiquant(query, key, value,
-                    sparse_indices, scale_value, sparse_block_size, 
+                    sparse_indices, scale_value, sparse_block_size,
                     actual_seq_lengths_query=actual_seq_lengths_query, actual_seq_lengths_kv=actual_seq_lengths_kv,
                     layout_query=layout_query, layout_kv=layout_kv, sparse_mode=sparse_mode, block_table=block_table,
                     attention_mode=attention_mode, quant_scale_repo_mode=quant_scale_repo_mode, tile_size=tile_size,
