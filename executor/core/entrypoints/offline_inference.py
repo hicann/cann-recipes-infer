@@ -101,6 +101,9 @@ class OfflineInference:
         # Reset scheduler for new batch
         self.scheduler.reset()
 
+        # Use batch_size_per_dp_rank for distributed inference
+        batch_size = self.scheduler.config.batch_size_per_dp_rank
+
         # Add all requests to scheduler
         request_ids = []
         prompt_map = {}
@@ -109,12 +112,13 @@ class OfflineInference:
             request_ids.append(request_id)
             # simplified process, to be optimized
             prompt_map[request_id] = prompt
-            if len(request_ids) >= self.scheduler.config.batch_size:
+            if len(request_ids) >= batch_size:
                 break
 
-        if len(request_ids) < self.scheduler.config.batch_size:
+        original_request_count = len(request_ids)
+        if len(request_ids) < batch_size:
             # Pad requests to batch_size if needed
-            while len(request_ids) < self.scheduler.config.batch_size:
+            while len(request_ids) < batch_size:
                 request_id = self.scheduler.add_request(prompts[-1])
                 request_ids.append(request_id)
 
@@ -125,9 +129,9 @@ class OfflineInference:
                 logging.warning("Scheduler has work but no batch was scheduled. Breaking loop to avoid infinite wait.")
                 break
 
-        # Collect results
+        # Collect results (only for original requests, not padded ones)
         results = []
-        for request_id in request_ids:
+        for request_id in request_ids[:original_request_count]:
             request = self.scheduler.get_finished_request(request_id)
             if request is None:
                 results.append(GenerationOutput(

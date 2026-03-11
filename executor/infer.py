@@ -62,7 +62,31 @@ def main():
     dataset_path = os.path.join(os.path.dirname(__file__), f"../dataset")
     if config.data_config.dataset_path != "":
         dataset_path = config.data_config.dataset_path
-    prompts = generate_prompt(config.data_config.dataset, dataset_path)
+
+    attn_tp_size = config.parallel_config.attn_tp_size
+    attn_dp_size = config.parallel_config.attn_dp_size
+    batch_size = config.scheduler_config.batch_size
+
+    if attn_dp_size > 1:
+        if batch_size % attn_dp_size != 0:
+            raise ValueError(f"batch_size ({batch_size}) must be divisible by attn_dp_size ({attn_dp_size})")
+        batch_size_per_rank = batch_size // attn_dp_size
+        # For BSH/BSND format, some modules within TP group split along batch dimension,
+        # so each TP rank must process the same number of samples.
+        # Note: TND format splits by token count, this validation does not apply.
+        if batch_size_per_rank % attn_tp_size != 0:
+            raise ValueError(
+                f"batch_size_per_rank ({batch_size_per_rank}) "
+                f"must be divisible by attn_tp_size ({attn_tp_size})"
+            )
+        global_dp_rank = global_rank // attn_tp_size
+        all_prompts = generate_prompt(config.data_config.dataset, dataset_path)
+        all_prompts = all_prompts * (batch_size // len(all_prompts) + 1)
+        prompts = all_prompts[
+            global_dp_rank * batch_size_per_rank:(global_dp_rank + 1) * batch_size_per_rank
+        ]
+    else:
+        prompts = generate_prompt(config.data_config.dataset, dataset_path)
 
     llm = OfflineInference(config)
 

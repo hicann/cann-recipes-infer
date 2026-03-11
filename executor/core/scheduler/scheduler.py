@@ -142,7 +142,7 @@ class Scheduler:
         selected: List[Request] = []
 
         # Iterate through queue and select requests
-        while self.waiting_queue and len(selected) < self.config.batch_size:
+        while self.waiting_queue and len(selected) < self.config.batch_size_per_dp_rank:
             request = self.waiting_queue.popleft()
 
             # Tokenize if not already done
@@ -162,10 +162,7 @@ class Scheduler:
             return None
 
         # Create batch
-        batch = Batch(
-            requests=selected,
-            is_prefill=True,
-        )
+        batch = Batch(requests=selected, is_prefill=True)
 
         # Build padded tensors
         self._build_prefill_tensors(batch)
@@ -185,16 +182,13 @@ class Scheduler:
 
         # Get all running requests (up to batch size)
         running_list = list(self.running_requests.values())
-        selected = running_list[:self.config.batch_size]
+        selected = running_list[:self.config.batch_size_per_dp_rank]
 
         if not selected:
             return None
 
         # Create batch
-        batch = Batch(
-            requests=selected,
-            is_prefill=False,
-        )
+        batch = Batch(requests=selected, is_prefill=False)
 
         # Build input tensors from last tokens
         self._build_decode_tensors(batch)
@@ -202,19 +196,11 @@ class Scheduler:
         return batch
 
     def _build_prefill_tensors(self, batch: Batch) -> None:
-        """Build padded input tensors for prefill batch.
-
-        Args:
-            batch: Batch to build tensors for (modified in-place).
-        """
+        """Build padded input tensors for prefill batch."""
         batch.input_ids = torch.stack([req.input_ids for req in batch.requests])
 
     def _build_decode_tensors(self, batch: Batch) -> None:
-        """Build input tensors for decode batch.
-
-        Args:
-            batch: Batch to build tensors for (modified in-place).
-        """
+        """Build input tensors for decode batch."""
         batch.input_ids = torch.tensor([req.get_last_token_id() for req in batch.requests],
                                        dtype=torch.long).unsqueeze(1)
 

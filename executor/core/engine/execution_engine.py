@@ -28,7 +28,7 @@ from executor.utils.forward_metadata import set_forward_metadata, get_forward_me
 from executor.core.model_worker import ModelWorker
 from executor.utils.profiler_context import create_profiler
 
-
+torch.npu.config.allow_internal_format = True
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
 
 
@@ -110,14 +110,15 @@ class ExecutionEngine:
         attention_mask = ~torch.tril(torch.ones((2048, 2048), dtype=torch.bool, device=self.device))
 
         if is_prefill:
-            # Prefill: compute position_ids from input_ids
             mask = input_ids != self.tokenizer.pad_token_id
             position_ids = mask.long().cumsum(-1) - 1
             position_ids.masked_fill_(mask == 0, 1)
             kv_len = torch.zeros((batch_size), dtype=torch.long, device=input_ids.device)
             actual_seq_lengths_kv = torch.tensor(
                 [seq_len] * batch_size, dtype=torch.long, device=self.device
-            ).cumsum(0)
+            )
+            if self.infer_config.model_config.packed_sequence:
+                actual_seq_lengths_kv = actual_seq_lengths_kv.cumsum(0)
         else:
             # Decode: use kv_len from previous step
             kv_len = get_forward_metadata().kv_len + 1

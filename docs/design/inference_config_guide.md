@@ -26,6 +26,8 @@
 - `micro_batch_mode`: 微批次模式（默认 0）。
 - `perfect_eplb`: 是否为 MoE 模型开启完美的专家负载均衡（默认 False）。
 - `enable_profiler`: 是否启用性能分析器（默认 False）。
+- `packed_sequence`: 输入序列是否打包（batch+seq 轴合并），默认 True。
+- `enable_weight_nz`: 是否启用权重 NZ 格式（默认 True）。
 
 ### 2.3 ParallelConfig (并行配置)
 定义分布式推理时的并行维度和 Rank 信息。

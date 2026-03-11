@@ -15,7 +15,10 @@
 
 from models.gpt_oss.models.modeling_gpt_oss import GptOssForCausalLM
 from models.gpt_oss.models.configuration_gpt_oss import GptOssConfig
+from models.qwen3_moe.models.modeling_qwen3_moe import Qwen3MoeForCausalLM
+from models.qwen3_moe.models.configuration_qwen3_moe import Qwen3MoeConfig
 
 model_dict = {
     "gpt-oss": (GptOssForCausalLM, GptOssConfig),
+    "qwen3-moe": (Qwen3MoeForCausalLM, Qwen3MoeConfig),
 }

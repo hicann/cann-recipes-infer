@@ -67,6 +67,8 @@ class ModelConfig:
         perfect_eplb: Whether to enable perfect expert load balancing for MoE models (default: False)
 
         enable_profiler: Enable profiler (default: False)
+        packed_sequence: Whether input sequences are packed (batch+seq merged) (default: True)
+        enable_weight_nz: Whether to enable NZ format for weights (default: True)
     """
     model_name: str = "model"
     model_path: str = ""
@@ -83,6 +85,9 @@ class ModelConfig:
 
     enable_profiler: bool = False
 
+    packed_sequence: bool = True
+    enable_weight_nz: bool = True
+
     @classmethod
     def from_dict(cls, model_config_dict: dict) -> "ModelConfig":
         """Create ModelConfig from YAML-parsed dictionary."""
@@ -98,6 +103,8 @@ class ModelConfig:
             micro_batch_mode=model_config_dict.get("micro_batch_mode", 0),
             perfect_eplb=model_config_dict.get("perfect_eplb", False),
             enable_profiler=model_config_dict.get("enable_profiler", False),
+            packed_sequence=model_config_dict.get("packed_sequence", True),
+            enable_weight_nz=model_config_dict.get("enable_weight_nz", True),
         )
 
 

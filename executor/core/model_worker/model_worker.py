@@ -134,10 +134,9 @@ class ModelWorker:
         batch_size = self.infer_config.scheduler_config.batch_size_per_dp_rank
         cache_seq_len = self.infer_config.scheduler_config.input_max_len + \
             self.infer_config.scheduler_config.max_new_tokens
-        attn_tp_size = self.infer_config.parallel_config.attn_tp_size
-        attn_dp_size = self.infer_config.parallel_config.attn_dp_size
-        if attn_dp_size > 1 and attn_tp_size > 1:
-            batch_size = batch_size * attn_tp_size
+        # For TP+DP mode, KV cache needs to store all_gathered data
+        # batch_size_per_dp_rank is already the per-rank batch size after DP split
+        # No need to multiply by attn_tp_size since input will be split in model forward
 
         # Bind kv_cache to model modules
         for module in self.model.modules():
