@@ -1,7 +1,7 @@
 # coding=utf-8
 # Adapted from
 # https://github.com/vllm-project/vllm/blob/v0.9.0/vllm/model_executor/layers/linear.py
-# Copyright (c) 2025 Huawei Technologies Co., Ltd.
+# Copyright (c) 2025-2026 Huawei Technologies Co., Ltd.
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,6 +18,7 @@
 
 import os
 from abc import ABC, abstractmethod
+import math
 from typing import Optional, Union, List, Sequence, Tuple
 
 import torch
@@ -118,7 +119,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
               bias: Optional[torch.Tensor] = None,
               **kargs) -> torch.Tensor:
         origin_shape = x.size()
-        x = x.view(-1, origin_shape[-1])
+        x = x.reshape(-1, origin_shape[-1])
         out = torch.matmul(x, layer.weight.data)
         if bias is not None:
             out = out + bias
@@ -128,9 +129,9 @@ class UnquantizedLinearMethod(LinearMethodBase):
     def process_weights_after_loading(self, layer, is_transpose=True, is_nz=True, **kwargs):
         weight = layer.weight
         if is_transpose:
-            weight.data = weight.data.transpose(-2, -1).contiguous()
-        if is_nz:
-            weight.data = torch_npu.npu_format_cast(weight.data, 29)  # 29: format nz
+            weight.data = weight.data.transpose(-2, -1)
+        if is_nz and layer.weight.dtype != torch.float32:
+            weight.data = torch_npu.npu_format_cast(weight.data.contiguous(), 29)  # 29: format nz
         layer.weight = Parameter(weight, requires_grad=False)
 
 
@@ -302,7 +303,11 @@ class ColumnParallelLinear(LinearBase):
         # Matrix multiply.
         if self.quant_method is None:
             raise RuntimeError("quant method cannnot be none")
-        output = self.quant_method.apply(self, input_, bias, dynamic_scale=dynamic_scale, out_dtype=out_dtype)
+        output = self.quant_method.apply(self,
+                                         x=input_,
+                                         bias=bias,
+                                         dynamic_scale=dynamic_scale,
+                                         out_dtype=out_dtype)
         output_bias = self.bias if self.skip_bias_add else None
         if not self.return_bias:
             return output
@@ -468,7 +473,11 @@ class ReplicatedLinear(LinearBase):
         bias = self.bias if not self.skip_bias_add else None
         if self.quant_method is None:
             raise RuntimeError("quant method cannnot be none")
-        output = self.quant_method.apply(self, input_, bias, dynamic_scale=dynamic_scale, out_dtype=out_dtype)
+        output = self.quant_method.apply(self,
+                                         x=input_,
+                                         bias=bias,
+                                         dynamic_scale=dynamic_scale,
+                                         out_dtype=out_dtype)
         output_bias = self.bias if self.skip_bias_add else None
         if not self.return_bias:
             return output
@@ -522,6 +531,7 @@ class MergedColumnParallelLinear(LinearBase):
         if not all(output_size % tp_size == 0 for output_size in output_sizes):
             raise RuntimeError("All output_sizes must be divisible by tp_size")
         self.tp_rank = tp_rank
+        self.quant_config = quant_config
         output_size = sum(output_sizes)
         super().__init__(input_size,
                          output_size,
@@ -529,7 +539,8 @@ class MergedColumnParallelLinear(LinearBase):
                          params_dtype,
                          quant_config,
                          prefix,
-                         return_bias=return_bias)
+                         return_bias=return_bias,
+                         )
         if self.quant_method is None:
             raise RuntimeError("self.quant_method must not be None")
         # Divide the weight matrix along the last dimension.
@@ -569,7 +580,11 @@ class MergedColumnParallelLinear(LinearBase):
         # Matrix multiply.
         if self.quant_method is None:
             raise RuntimeError("self.quant_method must not be None")
-        output = self.quant_method.apply(self, input_, bias, dynamic_scale=dynamic_scale, out_dtype=out_dtype)
+        output = self.quant_method.apply(self,
+                                         x=input_,
+                                         bias=bias,
+                                         dynamic_scale=dynamic_scale,
+                                         out_dtype=out_dtype)
         output_bias = self.bias if self.skip_bias_add else None
         if not self.return_bias:
             return output
@@ -582,6 +597,7 @@ class MergedColumnParallelLinear(LinearBase):
 
         param_data = param.data
         output_dim = getattr(param, "output_dim", None)
+        is_per_block_scale = getattr(param, "is_per_block_scale", False)
         # Special case for per-tensor scale to load scalar into fused array.
         needs_scalar_to_array = getattr(param, "needs_scalar_to_array", False)
 
@@ -614,8 +630,13 @@ class MergedColumnParallelLinear(LinearBase):
         if loaded_shard_id >= len(self.output_sizes):
             raise RuntimeError("loaded_shard_id must be less than the length of self.output_sizes")
         if output_dim is not None:
-            shard_offset = sum(self.output_sizes[:loaded_shard_id]) // self.tp_size
-            shard_size = self.output_sizes[loaded_shard_id] // self.tp_size
+            if is_per_block_scale:
+                block_size = self.quant_config.weight_block_size[0]
+                shard_offset = math.ceil(sum(self.output_sizes[:loaded_shard_id]) / block_size) // self.tp_size
+                shard_size = math.ceil(self.output_sizes[loaded_shard_id] / block_size) // self.tp_size
+            else:
+                shard_offset = sum(self.output_sizes[:loaded_shard_id]) // self.tp_size
+                shard_size = self.output_sizes[loaded_shard_id] // self.tp_size
             # Special case for quantization.
             # If quantized, we need to adjust the offset and size to account
             # for the packing.
@@ -697,8 +718,13 @@ class RowParallelLinear(LinearBase):
                  quant_config: Optional = None,
                  prefix: str = "",
                  return_bias: bool = False):
-        super().__init__(input_size, output_size, skip_bias_add, params_dtype,
-                         quant_config, prefix)
+        super().__init__(input_size,
+                         output_size,
+                         skip_bias_add,
+                         params_dtype,
+                         quant_config,
+                         prefix,
+                         )
 
         if self.quant_method is None:
             raise RuntimeError("self.quant_method must not be None")
@@ -768,8 +794,10 @@ class RowParallelLinear(LinearBase):
         # bias will not get added more than once in TP>1 case)
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
         output = self.quant_method.apply(self,
-                                         input_parallel,
-                                         bias=bias_, dynamic_scale=dynamic_scale, out_dtype=out_dtype)
+                                         x=input_parallel,
+                                         bias=bias_,
+                                         dynamic_scale=dynamic_scale,
+                                         out_dtype=out_dtype)
 
         output_bias = self.bias if self.skip_bias_add else None
         if not self.return_bias:
@@ -947,8 +975,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         *,
-        return_bias: bool = True,
-    ):
+        return_bias: bool = True):
         self.hidden_size = hidden_size
         self.head_size = head_size
         self.total_num_heads = total_num_heads

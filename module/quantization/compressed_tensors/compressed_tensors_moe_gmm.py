@@ -1,7 +1,7 @@
 # coding=utf-8
 # Adapted from
 # https://github.com/vllm-project/vllm/blob/v0.9.0/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe.py
-# Copyright (c) 2025 Huawei Technologies Co., Ltd.
+# Copyright (c) 2025-2026 Huawei Technologies Co., Ltd.
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,6 +22,7 @@ from torch.nn import Parameter
 from module.utils import set_weight_attrs
 from module.fuse_moe_gmm import FusedMoeWeightScaleSupported
 from module.quantization import QuantizeMethodBase
+from module.quantization.mxfp4 import W4A8MxFp4MoEGMMMethod
 
 
 class CompressedTensorsMoEGMMMethod(QuantizeMethodBase):
@@ -39,10 +40,12 @@ class CompressedTensorsMoEGMMMethod(QuantizeMethodBase):
         if quant_config.is_wNa16_group_channel(weight_quant, input_quant):
             if weight_quant.num_bits == 4:
                 return CompressedTensorW4A16Int4MoEGMMMethod(quant_config)
-        elif quant_config.is_dynamic_token_w8a8(weight_quant, input_quant):
+        elif quant_config.is_dynamic_token_w8a8_int8(weight_quant, input_quant):
             return CompressedTensorW8A8Int8MoEGMMMethod()
-        elif quant_config.is_dynamic_token_w4a8(weight_quant, input_quant):
+        elif quant_config.is_dynamic_token_w4a8_int8(weight_quant, input_quant):
             return CompressedTensorW4A8Int8MoEGMMMethod()
+        elif quant_config.is_dynamic_token_w4a8_mxfp8(weight_quant, input_quant):
+            return W4A8MxFp4MoEGMMMethod()
         else:
             raise RuntimeError(
                 f"Unsupported FusedMoe scheme: {weight_quant}, {input_quant}")
@@ -155,11 +158,11 @@ class CompressedTensorW8A8Int8MoEGMMMethod(QuantizeMethodBase):
         w13_weight = layer.w13_weight
         w2_weight = layer.w2_weight
         if is_transpose:
-            w13_weight.data = w13_weight.data.transpose(1, 2).contiguous()
-            w2_weight.data = w2_weight.data.transpose(1, 2).contiguous()
+            w13_weight.data = w13_weight.data.transpose(1, 2)
+            w2_weight.data = w2_weight.data.transpose(1, 2)
         if is_nz:
-            w13_weight.data = torch_npu.npu_format_cast(w13_weight.data, 29)  # 29: format nz
-            w2_weight.data = torch_npu.npu_format_cast(w2_weight.data, 29)  # 29: format nz
+            w13_weight.data = torch_npu.npu_format_cast(w13_weight.data.contiguous(), 29)  # 29: format nz
+            w2_weight.data = torch_npu.npu_format_cast(w2_weight.data.contiguous(), 29)  # 29: format nz
         layer.w13_weight_scale.data = layer.w13_weight_scale.data.to(torch.float)
         layer.smooth_scale_1.data = layer.smooth_scale_1.data.to(torch.float)
         layer.smooth_scale_2.data = layer.smooth_scale_2.data.to(torch.float)
@@ -175,11 +178,11 @@ class CompressedTensorW4A16Int4MoEGMMMethod(QuantizeMethodBase):
         STORAGE_BITS_NPU = 32
         WEIGHT_BITS = 4
         self.pack_factor = STORAGE_BITS_NPU // WEIGHT_BITS
-        
+
         target = "MoEGMM" if "MoEGMM" in quant_config.target_scheme_map else "Linear"
         self.weight_quant = quant_config.target_scheme_map[target].get("weights")
         self.group_size = self.weight_quant.group_size if self.weight_quant.group_size is not None else 1
-        
+
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -225,7 +228,7 @@ class CompressedTensorW4A16Int4MoEGMMMethod(QuantizeMethodBase):
                                       requires_grad=False)
         layer.register_parameter("w2_weight_scale", w2_scale)
         set_weight_attrs(w2_scale, extra_weight_attrs)
-        
+
         w13_offset = torch.nn.Parameter(torch.zeros(num_experts,
                                                   2 * intermediate_size_per_partition,
                                                   hidden_size // self.group_size,
@@ -241,7 +244,7 @@ class CompressedTensorW4A16Int4MoEGMMMethod(QuantizeMethodBase):
                                       requires_grad=False)
         layer.register_parameter("w2_offset", w2_offset)
         set_weight_attrs(w2_offset, extra_weight_attrs)
-        
+
         smooth_scale_1 = Parameter(torch.ones((num_experts, hidden_size), dtype=params_dtype), requires_grad=False)
         smooth_scale_2 = Parameter(torch.ones((num_experts, intermediate_size_per_partition),
                                               dtype=params_dtype),
@@ -257,7 +260,7 @@ class CompressedTensorW4A16Int4MoEGMMMethod(QuantizeMethodBase):
         pertoken_scale: torch.Tensor = None,
         final_output_dtype: torch.dtype = torch.bfloat16
     ):
-        
+
         mm1_mm3 = torch_npu.npu_grouped_matmul(
             [x], [layer.w13_weight],
             antiquant_scale=[layer.w13_weight_scale],
@@ -288,7 +291,7 @@ class CompressedTensorW4A16Int4MoEGMMMethod(QuantizeMethodBase):
     ) -> None:
         w13_weight = layer.w13_weight
         w2_weight = layer.w2_weight
-        
+
         # GMM kernel only support Ndim packed, repack is necessary when Kdim packed
         unpacked_w13_weight = self.unpack_from_int32(layer.w13_weight.data.flatten(0, 1), 4).view(
             layer.w13_weight.data.shape[0], layer.w13_weight.data.shape[1], -1).transpose(1, 2).contiguous().int()
@@ -296,17 +299,17 @@ class CompressedTensorW4A16Int4MoEGMMMethod(QuantizeMethodBase):
             layer.w2_weight.data.shape[0], layer.w2_weight.data.shape[1], -1).transpose(1, 2).contiguous().int()
         w13_weight = self.pack_to_int32(unpacked_w13_weight)
         w2_weight = self.pack_to_int32(unpacked_w2_weight)
-        
+
         layer.w13_weight_scale.data = layer.w13_weight_scale.data.transpose(1, 2).contiguous()
         layer.w13_offset.data = layer.w13_offset.data.transpose(1, 2).contiguous()
         layer.w2_weight_scale.data = layer.w2_weight_scale.data.transpose(1, 2).contiguous()
         layer.w2_offset.data = layer.w2_offset.data.transpose(1, 2).contiguous()
-        
+
         layer.smooth_scale_1.data = layer.smooth_scale_1.data.to(torch.float)
         layer.smooth_scale_2.data = layer.smooth_scale_2.data.to(torch.float)
         layer.w13_weight = Parameter(w13_weight, requires_grad=False)
         layer.w2_weight = Parameter(w2_weight, requires_grad=False)
-        
+
     def unpack_from_int32(
         self,
         value: torch.Tensor,
@@ -370,12 +373,12 @@ class CompressedTensorW4A16Int4MoEGMMMethod(QuantizeMethodBase):
         unpacked = (unpacked - offset).to(torch.int8)
 
         return unpacked
-    
+
     def pack_to_int32(self, weight: torch.Tensor):
         if weight.dim() != 3:
             raise ValueError(f"weight dim must be 3, cur ={weight.dim()} is not supported !")
         if weight.dtype == torch.int32:
-            # pack 8 int4 to int32, we use a int32 to represent a int4 
+            # pack 8 int4 to int32, we use a int32 to represent a int4
             if weight.shape[-1] % 8 != 0:
                 raise ValueError("the last dim of weight needs to be divided by 8")
             new_weight = torch_npu.npu_convert_weight_to_int4pack(weight.flatten(0, 1))
@@ -397,7 +400,7 @@ class CompressedTensorW4A8Int8MoEGMMMethod(QuantizeMethodBase):
         STORAGE_BITS_NPU = 8
         WEIGHT_BITS = 4
         self.pack_factor = STORAGE_BITS_NPU // WEIGHT_BITS
-        
+
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -424,7 +427,7 @@ class CompressedTensorW4A8Int8MoEGMMMethod(QuantizeMethodBase):
                                         requires_grad=False)
         layer.register_parameter("w2_weight", w2_weight)
         set_weight_attrs(w2_weight, extra_weight_attrs)
-        
+
         w13_bias = torch.nn.Parameter(torch.empty(num_experts,
                                                   2 * intermediate_size_per_partition,
                                                   dtype=torch.float),
@@ -448,7 +451,7 @@ class CompressedTensorW4A8Int8MoEGMMMethod(QuantizeMethodBase):
                                        requires_grad=False)
         layer.register_parameter("w13_weight_scale", w13_scale)
         set_weight_attrs(w13_scale, extra_weight_attrs)
-        
+
         w2_scale = torch.nn.Parameter(torch.ones(num_experts,
                                                  hidden_size,
                                                  dtype=torch.int64),
@@ -461,7 +464,7 @@ class CompressedTensorW4A8Int8MoEGMMMethod(QuantizeMethodBase):
                                    requires_grad=False)
         layer.register_parameter("smooth_scale_1", smooth_scale_1)
         layer.register_parameter("smooth_scale_2", smooth_scale_2)
-        
+
         # alpha is a factor for clip kernel
         w2_alpha = torch.nn.Parameter(torch.ones(num_experts, dtype=torch.float), requires_grad=False)
         layer.register_parameter("w2_alpha", w2_alpha)
@@ -525,11 +528,11 @@ class CompressedTensorW4A8Int8MoEGMMMethod(QuantizeMethodBase):
         w13_weight = layer.w13_weight
         w2_weight = layer.w2_weight
         if is_transpose:
-            w13_weight.data = w13_weight.data.transpose(1, 2).contiguous()
-            w2_weight.data = w2_weight.data.transpose(1, 2).contiguous()
+            w13_weight.data = w13_weight.data.transpose(1, 2)
+            w2_weight.data = w2_weight.data.transpose(1, 2)
         if is_nz:
-            w13_weight.data = torch_npu.npu_format_cast(w13_weight.data, 29)  # 29: format nz
-            w2_weight.data = torch_npu.npu_format_cast(w2_weight.data, 29)  # 29: format nz
+            w13_weight.data = torch_npu.npu_format_cast(w13_weight.data.contiguous(), 29)  # 29: format nz
+            w2_weight.data = torch_npu.npu_format_cast(w2_weight.data.contiguous(), 29)  # 29: format nz
         w13_weight.data = w13_weight.data.view(torch.int32).contiguous()
         w2_weight.data = w2_weight.data.view(torch.int32).contiguous()
         layer.smooth_scale_1.data = layer.smooth_scale_1.data.to(torch.float)

@@ -107,8 +107,8 @@ class DeepseekV3DenseMLP(nn.Module):
             dist.all_gather_into_tensor(x_output, x, group=self.hccl_comm_dict.get("dense_tp_group", None))
             x = x_output
 
-        if self.mm_quant_mode == "w8a8":
-            down_proj = self.forward_w8a8(x)
+        if self.mm_quant_mode == "w8a8int8":
+            down_proj = self.forward_w8a8int8(x)
         else:
             down_proj = self.forward_normal(x)
 
@@ -126,7 +126,7 @@ class DeepseekV3DenseMLP(nn.Module):
         intermediate_hidden_states = torch_npu.npu_swiglu(merged_x)
         return self.down_proj(intermediate_hidden_states)
 
-    def forward_w8a8(self, x):
+    def forward_w8a8int8(self, x):
         merged_x, pertoken_scale = self.gate_up_proj(x, out_dtype=torch.int32)
         intermediate_hidden_states, pertoken_scale = torch_npu.npu_dequant_swiglu_quant(
             merged_x, weight_scale=self.gate_up_proj.weight_scale,
@@ -169,8 +169,8 @@ class DeepseekV3SharedExpert(nn.Module):
             prefix=f"{prefix}.down_proj")
 
     def forward(self, x):
-        if self.mm_quant_mode == "w8a8":
-            down_proj = self.forward_w8a8(x)
+        if self.mm_quant_mode == "w8a8int8":
+            down_proj = self.forward_w8a8int8(x)
         else:
             down_proj = self.forward_normal(x)
         return down_proj
@@ -180,7 +180,7 @@ class DeepseekV3SharedExpert(nn.Module):
         intermediate_hidden_states = torch_npu.npu_swiglu(merged_x)
         return self.down_proj(intermediate_hidden_states)
 
-    def forward_w8a8(self, x):
+    def forward_w8a8int8(self, x):
         merged_x, pertoken_scale = self.gate_up_proj(x, out_dtype=torch.int32)
         intermediate_hidden_states, pertoken_scale = torch_npu.npu_dequant_swiglu_quant(
             merged_x, weight_scale=self.gate_up_proj.weight_scale,
@@ -275,7 +275,7 @@ class DeepseekV3MoE(nn.Module):
         bsz, seq_len, h = hidden_states.shape
         # compute gating score
         hidden_states = hidden_states.view(-1, h)
-        logits = F.linear(hidden_states, self.gate.weight)
+        logits = self.gate(hidden_states)
 
         # use fused kernel, currently only support 256 or 384 experts
         if self.topk_method == "noaux_tc" and self.n_routed_experts in [256, 384]:
@@ -1783,7 +1783,7 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
 
         kv_len = torch.ceil(kv_len / (self.cp_size * 2)).to(torch.int64)
         kv_len_prev = kv_len * (self.global_rank + 1)
-        # convert kv_len to list to optimize npu async time in prefill FA 
+        # convert kv_len to list to optimize npu async time in prefill FA
         cp_input_dict.update({"kv_len_prev": kv_len_prev.tolist()})
         kv_len_next = kv_len * (self.cp_size * 2 - self.global_rank)
         cp_input_dict.update({"kv_len_next": kv_len_next.tolist(), "actual_seq_q": kv_len.cumsum(dim=-1).tolist()})

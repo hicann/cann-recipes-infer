@@ -97,8 +97,8 @@ class DeepseekV3DenseMLP(nn.Module):
             quant_config=config.quant_config,
             prefix=f"{prefix}.down_proj")
 
-        if self.mm_quant_mode == "w8a8":
-            self.down_proj_forward = self.forward_w8a8
+        if self.mm_quant_mode == "w8a8int8":
+            self.down_proj_forward = self.forward_w8a8int8
         else:
             self.down_proj_forward = self.forward_normal
 
@@ -127,7 +127,7 @@ class DeepseekV3DenseMLP(nn.Module):
         intermediate_hidden_states = torch_npu.npu_swiglu(merged_x)
         return self.down_proj(intermediate_hidden_states)
 
-    def forward_w8a8(self, x):
+    def forward_w8a8int8(self, x):
         merged_x, pertoken_scale = self.gate_up_proj(x, out_dtype=torch.int32)
         intermediate_hidden_states, pertoken_scale = torch_npu.npu_dequant_swiglu_quant(
             merged_x, weight_scale=self.gate_up_proj.weight_scale,
@@ -168,8 +168,8 @@ class DeepseekV3SharedExpert(nn.Module):
             tp_rank=dist.get_rank(self.hccl_comm_dict["moe_tp_group"]) if self.moe_tp_size > 1 else 0,
             quant_config=config.quant_config,
             prefix=f"{prefix}.down_proj")
-        if self.mm_quant_mode == "w8a8":
-            self.down_proj_forward = self.forward_w8a8
+        if self.mm_quant_mode == "w8a8int8":
+            self.down_proj_forward = self.forward_w8a8int8
         else:
             self.down_proj_forward = self.forward_normal
 
@@ -183,7 +183,7 @@ class DeepseekV3SharedExpert(nn.Module):
         intermediate_hidden_states = torch_npu.npu_swiglu(merged_x)
         return self.down_proj(intermediate_hidden_states)
 
-    def forward_w8a8(self, x):
+    def forward_w8a8int8(self, x):
         merged_x, pertoken_scale = self.gate_up_proj(x, out_dtype=torch.int32)
         intermediate_hidden_states, pertoken_scale = torch_npu.npu_dequant_swiglu_quant(
             merged_x, weight_scale=self.gate_up_proj.weight_scale,

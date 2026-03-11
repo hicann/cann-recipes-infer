@@ -98,8 +98,8 @@ class GlmMoeDsaMLP(nn.Module):
             dist.all_gather_into_tensor(x_output, x, group=self.hccl_comm_dict.get("dense_tp_group", None))
             x = x_output
 
-        if self.mm_quant_mode == "w8a8":
-            down_proj = self.forward_w8a8(x)
+        if self.mm_quant_mode == "w8a8int8":
+            down_proj = self.forward_w8a8int8(x)
         else:
             down_proj = self.forward_normal(x)
 
@@ -117,7 +117,7 @@ class GlmMoeDsaMLP(nn.Module):
         intermediate_hidden_states = torch_npu.npu_swiglu(merged_x)
         return self.down_proj(intermediate_hidden_states)
 
-    def forward_w8a8(self, x):
+    def forward_w8a8int8(self, x):
         merged_x, pertoken_scale = self.gate_up_proj(x, out_dtype=torch.int32)
         intermediate_hidden_states, pertoken_scale = torch_npu.npu_dequant_swiglu_quant(
             merged_x, weight_scale=self.gate_up_proj.weight_scale,
@@ -158,8 +158,8 @@ class GlmMoeDsaSharedExpert(nn.Module):
             tp_rank=dist.get_rank(self.hccl_comm_dict["moe_tp_group"]) if self.moe_tp_size > 1 else 0,
             quant_config=config.quant_config,
             prefix=f"{prefix}.down_proj")
-        if self.mm_quant_mode == "w8a8":
-            self.down_proj_forward = self.forward_w8a8
+        if self.mm_quant_mode == "w8a8int8":
+            self.down_proj_forward = self.forward_w8a8int8
         else:
             self.down_proj_forward = self.forward_normal
 
@@ -172,7 +172,7 @@ class GlmMoeDsaSharedExpert(nn.Module):
         intermediate_hidden_states = torch_npu.npu_swiglu(merged_x)
         return self.down_proj(intermediate_hidden_states)
 
-    def forward_w8a8(self, x):
+    def forward_w8a8int8(self, x):
         merged_x, pertoken_scale = self.gate_up_proj(x, out_dtype=torch.int32)
         intermediate_hidden_states, pertoken_scale = torch_npu.npu_dequant_swiglu_quant(
             merged_x, weight_scale=self.gate_up_proj.weight_scale,
@@ -221,7 +221,7 @@ class GlmMoeDsaMoE(nn.Module):
             hidden_size=self.hidden_dim,
             intermediate_size=self.intermediate_size,
             # when W4A8 is enabled, gmm kernel needs an auxiliary matrix, it will be passed in as a bias
-            bias=True if self.gmm_quant_mode == "W4A8" else False,
+            bias=True if self.gmm_quant_mode == "w4a8int4" else False,
             quant_config=config.quant_config,
             tp_size=self.moe_tp_size,
             tp_rank=dist.get_rank(self.hccl_comm_dict["moe_tp_group"]) if self.moe_tp_size > 1 else 0,
@@ -269,7 +269,7 @@ class GlmMoeDsaMoE(nn.Module):
         bsz, seq_len, h = hidden_states.shape
         # compute gating score
         hidden_states = hidden_states.view(-1, h)
-        logits = F.linear(hidden_states, self.gate.weight)
+        logits = self.gate(hidden_states)
 
         # use fused kernel, currently only support 256 or 384 experts
         if self.topk_method == "noaux_tc" and self.n_routed_experts in [256, 384]:

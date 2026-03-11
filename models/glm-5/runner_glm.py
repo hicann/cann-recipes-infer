@@ -118,11 +118,9 @@ class GlmRunner(ModelRunner):
                     scales_dtype['smooth_scale_dtype'] = torch.float
                     break
 
-            is_nz = False if ("mlp.gate" in module_name and "proj" not in module_name) else True
-            is_transpose = False if ("mlp.gate" in module_name and "proj" not in module_name) else True
             if isinstance(quant_method, QuantizeMethodBase):
-                quant_method.process_weights_after_loading(module, is_nz=is_nz, is_transpose=is_transpose,\
-                                                           scales_dtype=scales_dtype)
+                quant_method.process_weights_after_loading(
+                    module, is_nz=self.enable_weight_nz, scales_dtype=scales_dtype)
             # Dynamic quant for input_avtivation of first grouped matmul requies complete smooth scale.
             # When applying expert parallel, each device only reserves smooth scales of mapping experts.
             # Need to do all gather to obtain complete smooth scale.

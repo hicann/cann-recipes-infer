@@ -59,6 +59,7 @@ class Qwen3MoeRunner(ModelRunner):
         self.attn_dp_size = runner_settings.get("parallel_config").get("attn_dp_size", 1)
         self.enable_cache_compile = runner_settings.get("model_config").get("enable_cache_compile", False)
         self.past_key_values = None
+        self.enable_weight_nz = runner_settings.get("model_config").get("enable_weight_nz", True)
 
     @staticmethod
     def repeat_batch(tensor, repeat_num):
@@ -85,9 +86,8 @@ class Qwen3MoeRunner(ModelRunner):
         for module_name, module in self.model.named_modules():
             quant_method = getattr(module, "quant_method", None)
 
-            is_nz = False if ("mlp.gate" in module_name and "proj" not in module_name) else True
             if isinstance(quant_method, QuantizeMethodBase):
-                quant_method.process_weights_after_loading(module, is_nz=is_nz)
+                quant_method.process_weights_after_loading(module, is_nz=self.enable_weight_nz)
 
     @override
     def graph_compile(self):

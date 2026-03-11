@@ -197,11 +197,11 @@ class LongcatFlashMLP(nn.Module):
             tp_rank=dist.get_rank(self.hccl_comm_dict["dense_tp_group"]) if self.dense_tp_size > 1 else 0,
             quant_config=config.quant_config,
             prefix=f"{prefix}.down_proj")
-        dtype_bit = 1 if self.mm_quant_mode == "w8a8" else 2
+        dtype_bit = 1 if self.mm_quant_mode == "w8a8int8" else 2  # int8: 1bit, bf16: 2bit
         self.up_gate_prefetch_size = self.hidden_size * self.intermediate_size * 2 * dtype_bit // self.dense_tp_size
         self.down_prefetch_size = self.hidden_size * self.intermediate_size * dtype_bit // self.dense_tp_size
-        if self.mm_quant_mode == "w8a8":
-            self.mlp_forward = self.forward_w8a8
+        if self.mm_quant_mode == "w8a8int8":
+            self.mlp_forward = self.forward_w8a8int8
         else:
             self.mlp_forward = self.forward_normal
 
@@ -235,7 +235,7 @@ class LongcatFlashMLP(nn.Module):
         intermediate_hidden_states = torch_npu.npu_swiglu(merged_x)
         return self.down_proj(intermediate_hidden_states), merged_x
 
-    def forward_w8a8(self, x, enable_prefetch):
+    def forward_w8a8int8(self, x, enable_prefetch):
         npu_prefetch(enable_prefetch, self.down_proj.weight.data, x, self.down_prefetch_size, 0)
         merged_x, pertoken_scale = self.gate_up_proj(x, out_dtype=torch.int32)
         intermediate_hidden_states, pertoken_scale = torch_npu.npu_dequant_swiglu_quant(
@@ -281,7 +281,7 @@ class LongcatFlashTopkRouter(nn.Module):
 
     def forward(self, hidden_states):
         hidden_states = hidden_states.view(-1, self.config.hidden_size)
-        router_logits = F.linear(hidden_states.type(torch.float32), self.classifier.weight, None)
+        router_logits = self.classifier(hidden_states.type(torch.float32))
         topk_weights, topk_indices, _ = torch_npu.npu_moe_gating_top_k(
                 router_logits,
                 k=self.top_k,

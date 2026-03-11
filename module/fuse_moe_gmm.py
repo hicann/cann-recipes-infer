@@ -1,7 +1,7 @@
 # coding=utf-8
 # Adapted from
 # https://github.com/vllm-project/vllm/blob/v0.9.0/vllm/model_executor/layers/fused_moe/layer.py
-# Copyright (c) 2025 Huawei Technologies Co., Ltd.
+# Copyright (c) 2025-2026 Huawei Technologies Co., Ltd.
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -81,11 +81,11 @@ class UnquantizedFusedMoEGMMMethod(QuantizeMethodBase):
         w13_weight = layer.w13_weight
         w2_weight = layer.w2_weight
         if is_transpose:
-            w13_weight.data = w13_weight.data.transpose(1, 2).contiguous()
-            w2_weight.data = w2_weight.data.transpose(1, 2).contiguous()
+            w13_weight.data = w13_weight.data.transpose(1, 2)
+            w2_weight.data = w2_weight.data.transpose(1, 2)
         if is_nz:
-            w13_weight.data = torch_npu.npu_format_cast(w13_weight.data, 29)  # 29: format nz
-            w2_weight.data = torch_npu.npu_format_cast(w2_weight.data, 29)  # 29: format nz
+            w13_weight.data = torch_npu.npu_format_cast(w13_weight.data.contiguous(), 29)  # 29: format nz
+            w2_weight.data = torch_npu.npu_format_cast(w2_weight.data.contiguous(), 29)  # 29: format nz
         layer.w13_weight = Parameter(w13_weight, requires_grad=False)
         layer.w2_weight = Parameter(w2_weight, requires_grad=False)
 
@@ -229,7 +229,8 @@ class FusedMoEGMM(torch.nn.Module):
                     loaded_weight=loaded_weight,
                     expert_data=expert_data,
                     tp_rank=self.tp_rank)
-            elif quant_method == FusedMoeWeightScaleSupported.GROUP.value:
+            elif quant_method == FusedMoeWeightScaleSupported.GROUP.value or \
+                quant_method == FusedMoeWeightScaleSupported.BLOCK.value:
                 self._load_model_weight_or_group_weight_scale(
                     shard_id=shard_id,
                     shard_dim=shard_dim,
@@ -245,7 +246,7 @@ class FusedMoEGMM(torch.nn.Module):
                 raise ValueError(
                     f"quant method must be one of {WEIGHT_SCALE_SUPPORTED}")
             return
-        
+
         if "bias" in weight_name or "alpha" in weight_name:
             self._load_per_channel_weight_scale(
                 shard_id=shard_id,

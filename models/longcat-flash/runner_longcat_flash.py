@@ -70,6 +70,7 @@ class LongcatFlashRunner(ModelRunner):
         self.next_n = runner_settings.get("model_config").get("next_n", 0)
         self.spec_len = self.next_n + 1 # speculative len is one more than num of mtp modules
         self.is_attn_rank = check_is_attn_rank(runner_settings)
+        self.enable_weight_nz = runner_settings.get("model_config").get("enable_weight_nz", True)
 
     @override
     def init_model(self, is_mtp=False):
@@ -206,11 +207,9 @@ class LongcatFlashRunner(ModelRunner):
                         scales_dtype['smooth_scale_dtype'] = torch.float
                         break
 
-                is_nz = False if ("classifier" in module_name) else True
-                is_transpose = False if ("classifier" in module_name) else True
                 if isinstance(quant_method, QuantizeMethodBase):
-                    quant_method.process_weights_after_loading(module, is_nz=is_nz, is_transpose=is_transpose, \
-                                                               scales_dtype=scales_dtype)
+                    quant_method.process_weights_after_loading(
+                        module, is_nz=self.enable_weight_nz, scales_dtype=scales_dtype)
                 # Dynamic quant for input_avtivation of first grouped matmul requies complete smooth scale.
                 # When applying expert parallel, each device only reserves smooth scales of mapping experts.
                 # Need to do all gather to obtain complete smooth scale.

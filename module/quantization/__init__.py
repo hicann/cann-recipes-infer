@@ -1,7 +1,7 @@
 # coding=utf-8
 # Adapted from
 # https://github.com/vllm-project/vllm/blob/v0.9.0/vllm/model_executor/layers/quantization/base_config.py
-# Copyright (c) 2025 Huawei Technologies Co., Ltd.
+# Copyright (c) 2025-2026 Huawei Technologies Co., Ltd.
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -25,6 +25,8 @@ from torch import nn
 
 QuantizationMethods = Literal[
     "compressed-tensors",
+    "fp8",
+    "mxfp8"
 ]
 QUANTIZATION_METHODS: list[str] = list(get_args(QuantizationMethods))
 
@@ -73,6 +75,10 @@ class QuantizationConfig(ABC):
         super().__init__()
         # mapping is updated by models as they initialize
         self.packed_modules_mapping: dict[str, list[str]] = dict()
+        # quant_mode default w16a16, will be initalized in function from_config()
+        self.mm_quant_mode = "w16a16"
+        self.gmm_quant_mode = "w16a16"
+        self.kv_cache_quant_mode = "unquant"
 
     @abstractmethod
     def get_name(self) -> QuantizationMethods:
@@ -147,9 +153,13 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
 
     # lazy import to avoid triggering `torch.compile` too early
     from module.quantization.compressed_tensors.compressed_tensors import CompressedTensorsConfig
+    from module.quantization.fp8 import Fp8Config
+    from module.quantization.mxfp8 import MxFp8Config
 
     method_to_config: dict[str, type[QuantizationConfig]] = {
         "compressed-tensors": CompressedTensorsConfig,
+        "fp8": Fp8Config,
+        "mxfp8": MxFp8Config,
     }
     # Update the `method_to_config` with customized quantization methods.
 

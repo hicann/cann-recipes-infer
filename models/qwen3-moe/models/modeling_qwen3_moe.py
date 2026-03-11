@@ -44,6 +44,7 @@ from transformers.utils import (
     logging,
 )
 from module.linear import (
+    ReplicatedLinear,
     ColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
@@ -392,75 +393,6 @@ def npu_apply_rotary_pos_emb(q, k, cos, sin, position_ids, layer_idx):
     return q_embed, k_embed
 
 
-class MoEGate(nn.Module):
-    def __init__(self, config, runner_settings):
-        super().__init__()
-        self.config = config
-        self.top_k = config.num_experts_per_tok
-        self.num_experts = config.num_experts
-        self.batch_size = runner_settings.get("data_config").get("batch_size", 1)
-        # topk selection algorithm
-        self.norm_topk_prob = config.norm_topk_prob
-        self.gating_dim = config.hidden_size
-        self.weight = nn.Parameter(
-            torch.empty((self.num_experts, self.gating_dim))
-        )
-        self.reset_parameters()
-
-    def reset_parameters(self) -> None:
-        pass
-
-    def one_hot(self, tensor):
-        index = torch.arange(0, self.n_group, dtype=tensor.dtype, device=tensor.device)
-        return (
-            tensor.view([*tensor.shape, 1]) == index.view([1] * tensor.ndim + [self.n_group])
-        ).to(torch.float32)
-
-    def forward_group_limited_greedy(self, logits):
-        bs_seq, h = logits.shape
-        scores = logits.softmax(dim=-1, dtype=torch.float32)
-        group_scores = (
-            scores.view(bs_seq, self.n_group, -1).max(dim=-1).values
-        ) # [n, n_group]
-
-        group_idx = torch.topk(
-            group_scores, k=self.topk_group, dim=-1
-        )[1]
-        group_mask = self.one_hot(group_idx)
-        group_mask = torch.sum(group_mask, dim=-1)
-        score_mask = (
-            group_mask.unsqueeze(-1).expand(
-                bs_seq, self.n_group, self.num_experts // self.n_group
-            ).reshape(bs_seq, -1)
-        )
-        tmp_scores = scores.masked_fill(~score_mask.bool(), 0.0)
-        topk_weight, topk_idx = torch.topk(
-            tmp_scores, k=self.top_k, dim=-1
-        )
-        row_idx = None
-        return topk_idx, topk_weight, row_idx
-
-    def forward_greedy(self, logits):
-        topk_weight, topk_idx, row_idx = torch_npu.npu_moe_gating_top_k_softmax(logits, None, k=self.top_k)
-        return topk_idx, topk_weight, row_idx
-
-    def forward(self, hidden_states):
-        bsz, seq_len, _ = hidden_states.shape
-        hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
-
-        logits = F.linear(
-            hidden_states, self.weight, None
-        )
-        topk_idx, topk_weight, row_idx = self.forward_greedy(logits)
-
-        if self.top_k > 1 and self.norm_topk_prob:
-            denominator = topk_weight.sum(dim=-1, keepdim=True) + 1e-20
-            topk_weight = topk_weight / denominator
-
-        aux_loss = None
-        return topk_idx, topk_weight, aux_loss, row_idx
-
-
 class AddAuxiliaryLoss(torch.autograd.Function):
     """
     The trick function of adding auxiliary (aux) loss,
@@ -516,11 +448,37 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             ep_rank=dist.get_rank(self.hccl_comm_dict["moe_ep_group"]) if self.moe_ep_size > 1 else 0,
             prefix=f"{prefix}.experts",
         )
-        self.gate = MoEGate(config, runner_settings)
+        self.init_gate(prefix)
         self.row_idx_decode_len = self.batch_size_decode * self.top_k
         self.row_idx_decode = torch.arange(
             0, self.row_idx_decode_len,
             dtype=torch.int32).view(self.top_k, -1).permute(1, 0).contiguous().npu()
+
+    def init_gate(self, prefix):
+        self.top_k = self.config.num_experts_per_tok
+        # topk selection algorithm
+        self.norm_topk_prob = self.config.norm_topk_prob
+        self.gating_dim = self.config.hidden_size
+        self.gate = ReplicatedLinear(self.gating_dim,
+                                     self.num_experts,
+                                     bias=False,
+                                     quant_config=None,
+                                     params_dtype=torch.float32,
+                                     prefix=f"{prefix}.gate")
+
+    def _forward_gate(self, hidden_states):
+        bsz, seq_len, _ = hidden_states.shape
+        hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+
+        logits = self.gate(hidden_states)
+        topk_weight, topk_idx, row_idx = torch_npu.npu_moe_gating_top_k_softmax(logits, None, k=self.top_k)
+
+        if self.top_k > 1 and self.norm_topk_prob:
+            denominator = topk_weight.sum(dim=-1, keepdim=True) + 1e-20
+            topk_weight = topk_weight / denominator
+
+        aux_loss = None
+        return topk_idx, topk_weight, aux_loss, row_idx
 
     def set_mc2_kwargs(self):
         global_rank = dist.get_rank()
@@ -558,7 +516,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             }
 
     def forward(self, hidden_states, is_prefill=False, cur_topk_list=None):
-        topk_idx, topk_weight, _, row_idx = self.gate(hidden_states)
+        topk_idx, topk_weight, _, row_idx = self._forward_gate(hidden_states)
         if self.perfect_eplb:
             topk_idx = cur_topk_list
         topk_idx = topk_idx.to(torch.int32)

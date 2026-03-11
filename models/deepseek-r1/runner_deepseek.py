@@ -113,9 +113,9 @@ class DeepSeekRunner(ModelRunner):
                     scales_dtype['smooth_scale_dtype'] = torch.float
                     break
 
-            is_nz = False if ("mlp.gate" in module_name and "proj" not in module_name) else True
             if isinstance(quant_method, QuantizeMethodBase):
-                quant_method.process_weights_after_loading(module, is_nz=is_nz, scales_dtype=scales_dtype)
+                quant_method.process_weights_after_loading(
+                    module, is_nz=self.enable_weight_nz, scales_dtype=scales_dtype)
             # Dynamic quant for input_avtivation of first grouped matmul requies complete smooth scale.
             # When applying expert parallel, each device only reserves smooth scales of mapping experts.
             # Need to do all gather to obtain complete smooth scale.
@@ -339,7 +339,7 @@ class DeepSeekRunner(ModelRunner):
     @override
     def check_model_cfg(self):
         if self.hf_config.quant_config is not None:
-            enable_kv_cache_c8 = True if self.hf_config.quant_config.kv_cache_scheme is not None else False
+            enable_kv_cache_c8 = True if self.hf_config.quant_config.kv_cache_quant_mode == "int8" else False
             enable_mla_prolog = self.runner_settings.get("model_config").get("enable_mla_prolog", False)
             if enable_kv_cache_c8 and not enable_mla_prolog:
                 raise ValueError("if kv_cache_quant_mode is C8, then enable_mla_prolog must be set to True.")

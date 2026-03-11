@@ -1,7 +1,7 @@
 # coding=utf-8
 # Adapted from
 # https://github.com/vllm-project/vllm/blob/v0.9.0/vllm/model_executor/layers/quantization/compressed_tensors/schemes/compressed_tensors_w8a8_int8.py
-# Copyright (c) 2025 Huawei Technologies Co., Ltd.
+# Copyright (c) 2025-2026 Huawei Technologies Co., Ltd.
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -41,9 +41,12 @@ class CompressedTensorsW8A8Int8LinearMethod(CompressedTensorsScheme):
         self.input_symmetric = input_symmetric
 
 
-    def create_weights(self, layer: torch.nn.Module, output_partition_sizes: List[int],
-                    input_size_per_partition: int, params_dtype: torch.dtype, weight_loader: Callable,
-                    **kwargs):
+    def create_weights(self, layer: torch.nn.Module,
+                       output_partition_sizes: List[int],
+                       input_size_per_partition: int,
+                       params_dtype: torch.dtype,
+                       weight_loader: Callable,
+                       **kwargs):
         self.logical_widths = output_partition_sizes
 
         weight = Parameter(torch.empty(sum(output_partition_sizes),
@@ -103,9 +106,9 @@ class CompressedTensorsW8A8Int8LinearMethod(CompressedTensorsScheme):
         weight_scale = layer.weight_scale
         smooth_scales = layer.smooth_scales
         if is_transpose:
-            weight.data = weight.data.transpose(-2, -1).contiguous()
+            weight.data = weight.data.transpose(-2, -1)
         if is_nz:
-            weight.data = torch_npu.npu_format_cast(weight.data, 29)  # 29: format nz
+            weight.data = torch_npu.npu_format_cast(weight.data.contiguous(), 29)  # 29: format nz
         if 'scale_dtype' in scales_dtype:
             weight_scale.data = weight_scale.data.to(scales_dtype.get('scale_dtype'))
         if 'smooth_scale_dtype' in scales_dtype:
