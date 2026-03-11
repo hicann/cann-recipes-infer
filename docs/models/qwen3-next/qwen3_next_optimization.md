@@ -62,7 +62,14 @@ MTP机制允许在一次主模型推理过程中同时推理多个Token，在相
 
 
 ## 融合Kernel
-- 使能npu_recurrent_gated_delta_rule融合算子，替换decode阶段的GDN模块计算，其中包含计算注意力分数和计算并更新`ssm_state`操作。
+- 使能recurrent_gated_delta_rule融合算子，替换decode阶段的GDN模块等计算，其中包含Sigmoid、L2Norm以及计算注意力分数和计算并更新`ssm_state`操作。
+融合算子计算流程如下：
+<p align="center">
+  <img src="./figures/rgdr.png" width="70%" alt="decode_parallel">
+</p>
+
+- 使能mambav2_rmsnormgated融合算子，将 RMSNorm + Silu + Mul 融合计算。
+
 
 ## 量化策略
 
@@ -77,7 +84,7 @@ MTP机制允许在一次主模型推理过程中同时推理多个Token，在相
 - MoE: 路由专家使用W8A8量化；
 - LM_Head: 暂不量化。
 
-**注: 
+**注:
 W8A8: W8指权重使用静态Per-Channel Int8量化，A8指数据使用动态Per-Token Int8量化；
 KVCache C8: 表示KVCache 使用动态Per-Tensor Int8量化；**
 

@@ -1,0 +1,284 @@
+From a4bab4278f1cbdb54cea947e4f7f5d65890cad79 Mon Sep 17 00:00:00 2001
+From: qushiyi <xxx@xxx>
+Date: Fri, 27 Feb 2026 17:03:31 +0800
+Subject: [PATCH 1/2] feat-support-GDN-and-rmsnormgated-fusion-ops
+
+---
+ .../srt/layers/attention/ascend_backend.py    | 141 ++++++++++--------
+ .../layers/attention/fla/fused_gdn_gating.py  |   2 +-
+ python/sglang/srt/models/qwen3_next.py        |  16 +-
+ 3 files changed, 96 insertions(+), 63 deletions(-)
+
+diff --git a/python/sglang/srt/layers/attention/ascend_backend.py b/python/sglang/srt/layers/attention/ascend_backend.py
+index eb398cb66..6cdcb6e63 100644
+--- a/python/sglang/srt/layers/attention/ascend_backend.py
++++ b/python/sglang/srt/layers/attention/ascend_backend.py
+@@ -46,6 +46,9 @@ from sgl_kernel_npu.fla.fused_sigmoid_gating_recurrent import (
+ )
+ from sgl_kernel_npu.mamba.causal_conv1d import causal_conv1d_fn_npu
+
++if get_bool_env_var("USE_CUSTOM_NORM_KERNEL", "False"):
++    import npu_ops_transformer_ext
++
+ logger = logging.getLogger(__name__)
+
+
+@@ -1564,21 +1567,21 @@ class AscendGDNAttnBackend(MambaAttnBackendBase):
+
+     def fused_recurrent_gated_delta_rule_update_npu(
+         self,
+-        query: torch.Tensor,
+-        key: torch.Tensor,
+-        value: torch.Tensor,
++        mix_qkv: torch.Tensor,
++        num_heads,
++        num_value_heads,
++        head_k_dim,
++        head_v_dim,
+         recurrent_state: torch.Tensor,
+         beta: torch.Tensor,
+         g: torch.Tensor,
+         cache_indices: torch.Tensor,
+         intermediate_state: Optional[torch.Tensor] = None,
+     ):
+-        _, num_heads, head_k_dim = query.shape  # T, N, D
+-        _, num_value_heads, head_v_dim = value.shape
+-        beta = beta.view(-1, num_value_heads).to(torch.bfloat16)
+-        g = g.view(-1, num_value_heads).to(torch.float32)
+-        batch_size = cache_indices.shape[0]
+-        seq_len = query.shape[0] // batch_size
++        beta = beta.to(torch.bfloat16)
++        g = g.to(torch.float32)
++        batch_size = mix_qkv.shape[0]
++        seq_len = mix_qkv.shape[1]
+         scale = 1 / (head_k_dim**0.5)
+
+         if intermediate_state is not None:
+@@ -1590,15 +1593,16 @@ class AscendGDNAttnBackend(MambaAttnBackendBase):
+         else:
+             ssm_state = recurrent_state
+
+-        attn_core_out = torch_npu.npu_recurrent_gated_delta_rule(
+-            query,
+-            key,
+-            value,
++        ssm_state_indices_view = self.ssm_state_indices.view(batch_size, seq_len)
++        attn_core_out = torch.ops.npu_ops_transformer_ext.recurrent_gated_delta_rule(
++            mix_qkv,
+             ssm_state,
+             beta=beta,
+             scale=scale,
+             actual_seq_lengths=self.actual_seq_lengths,
+-            ssm_state_indices=self.ssm_state_indices,
++            ssm_state_indices=ssm_state_indices_view,
++            nk=num_heads,
++            nv=num_value_heads,
+             num_accepted_tokens=self.num_accepted_tokens,
+             g=g,
+         )
+@@ -1651,40 +1655,49 @@ class AscendGDNAttnBackend(MambaAttnBackendBase):
+             )
+         )
+         mixed_qkv = mixed_qkv.squeeze(-1)
+-        query, key, value = torch.split(
+-            mixed_qkv,
+-            [
+-                key_dim // attn_tp_size,
+-                key_dim // attn_tp_size,
+-                value_dim // attn_tp_size,
+-            ],
+-            dim=-1,
+-        )
+-        # Reshape from [l, h*d] to [1, l, h, d]
+-        seq_len = query.shape[0]
+-        num_heads = query.shape[1] // head_k_dim
+-        num_value_heads = value.shape[1] // head_v_dim
++
++        key_split_dim = key_dim // attn_tp_size
++        value_split_dim = value_dim // attn_tp_size
++
++
+         g, beta = fused_gdn_gating_v3(A_log, a, b, dt_bias)
+
++        batch_size = cache_indices.shape[0]
++
+         if self.enable_ascendc_fusion_gdn:
+-            query = query.view(-1, num_heads, head_k_dim)
+-            key = key.view(-1, num_heads, head_k_dim)
+-            value = value.view(-1, num_value_heads, head_v_dim)
+-            query = l2norm_fwd(
+-                query.contiguous(), eps=1e-6, output_dtype=torch.bfloat16
+-            )
+-            key = l2norm_fwd(key.contiguous(), eps=1e-6, output_dtype=torch.bfloat16)
++            beta = beta.unsqueeze(0)
++            num_heads = key_split_dim // head_k_dim
++            num_value_heads = value_split_dim // head_v_dim
++
++            mixed_qkv_last_dim = mixed_qkv.shape[-1]
++
++            mixed_qkv = mixed_qkv.view(batch_size, -1, mixed_qkv_last_dim)
++            beta = beta.view(batch_size, -1, num_value_heads)
++            g = g.view(batch_size, -1, num_value_heads)
+
+             core_attn_out = self.fused_recurrent_gated_delta_rule_update_npu(
+-                query,
+-                key,
+-                value,
++                mixed_qkv,
++                num_heads,
++                num_value_heads,
++                head_k_dim,
++                head_v_dim,
+                 recurrent_state=ssm_states,
+                 beta=beta,
+                 g=g,
+                 cache_indices=cache_indices,
+             )
++            core_attn_out = core_attn_out.view(-1, num_value_heads, head_v_dim)
+         else:
++            beta = beta.sigmoid().unsqueeze(0)
++            query, key, value = torch.split(
++                mixed_qkv,
++                [key_split_dim, key_split_dim, value_split_dim],
++                dim=-1,
++            )
++            seq_len = query.shape[0]
++            num_heads = query.shape[1] // head_k_dim
++            num_value_heads = value.shape[1] // head_v_dim
++
+             query = query.view(1, seq_len, num_heads, head_k_dim)
+             key = key.view(1, seq_len, num_heads, head_k_dim)
+             value = value.view(1, seq_len, value.shape[1] // head_v_dim, head_v_dim)
+@@ -1803,41 +1816,32 @@ class AscendGDNAttnBackend(MambaAttnBackendBase):
+         key_split_dim = key_dim // attn_tp_size
+         value_split_dim = value_dim // attn_tp_size
+
+-        query, key, value = torch.split(
+-            mixed_qkv,
+-            [key_split_dim, key_split_dim, value_split_dim],
+-            dim=-1,
+-        )
+-
+-        actual_seq_len = query.shape[0]
+-        num_heads = query.shape[1] // head_k_dim
+-        num_value_heads = value.shape[1] // head_v_dim
+-
+-        query = query.view(1, actual_seq_len, num_heads, head_k_dim)
+-        key = key.view(1, actual_seq_len, num_heads, head_k_dim)
+-        value = value.view(1, actual_seq_len, num_value_heads, head_v_dim)
+-
+         g, beta = fused_gdn_gating_v3(A_log, a, b, dt_bias)
+
+         if is_target_verify:
+-            query = query.view(-1, num_heads, head_k_dim)
+-            key = key.view(-1, num_heads, head_k_dim)
+-            value = value.view(-1, num_value_heads, head_v_dim)
+-            query = l2norm_fwd(
+-                query.contiguous(), eps=1e-6, output_dtype=torch.bfloat16
+-            )
+-            key = l2norm_fwd(key.contiguous(), eps=1e-6, output_dtype=torch.bfloat16)
++            beta = beta.unsqueeze(0)
++            num_heads = key_split_dim // head_k_dim
++            num_value_heads = value_split_dim // head_v_dim
++
++            s = seq_len // batch_size
++            mixed_qkv = mixed_qkv.view(batch_size, s, -1)
++            beta = beta.view(batch_size, s, num_value_heads)
++            g = g.view(batch_size, s, num_value_heads)
+
+             core_attn_out = self.fused_recurrent_gated_delta_rule_update_npu(
+-                query,
+-                key,
+-                value,
++                mixed_qkv,
++                num_heads,
++                num_value_heads,
++                head_k_dim,
++                head_v_dim,
+                 recurrent_state=ssm_states,
+                 beta=beta,
+                 g=g,
+                 cache_indices=cache_indices,
+                 intermediate_state=intermediate_state_cache,
+             )
++            core_attn_out = core_attn_out.view(-1, num_value_heads, head_v_dim)
++
+             if (not self.graph_mode) and core_attn_out.shape[0] < num_token_padding:
+                 core_attn_out = torch.cat(
+                     [
+@@ -1850,6 +1854,21 @@ class AscendGDNAttnBackend(MambaAttnBackendBase):
+                     dim=0,
+                 )
+         else:
++            beta = beta.sigmoid().unsqueeze(0)
++            query, key, value = torch.split(
++                mixed_qkv,
++                [key_split_dim, key_split_dim, value_split_dim],
++                dim=-1,
++            )
++
++            actual_seq_len = query.shape[0]
++            num_heads = query.shape[1] // head_k_dim
++            num_value_heads = value.shape[1] // head_v_dim
++
++            query = query.view(1, actual_seq_len, num_heads, head_k_dim)
++            key = key.view(1, actual_seq_len, num_heads, head_k_dim)
++            value = value.view(1, actual_seq_len, num_value_heads, head_v_dim)
++
+             recurrent_state = ssm_states[cache_indices]
+             core_attn_out, last_recurrent_state, _ = chunk_gated_delta_rule_npu( # version of sgl-kernel-npu before 25.12.22 only returns the first 2 values
+                 q=query,
+diff --git a/python/sglang/srt/layers/attention/fla/fused_gdn_gating.py b/python/sglang/srt/layers/attention/fla/fused_gdn_gating.py
+index d37e5682e..449654c3b 100644
+--- a/python/sglang/srt/layers/attention/fla/fused_gdn_gating.py
++++ b/python/sglang/srt/layers/attention/fla/fused_gdn_gating.py
+@@ -141,4 +141,4 @@ def fused_gdn_gating_v3(
+         num_warps=1,
+     )
+     g = g.unsqueeze(0)
+-    return g, b.sigmoid().unsqueeze(0)
++    return g, b
+diff --git a/python/sglang/srt/models/qwen3_next.py b/python/sglang/srt/models/qwen3_next.py
+index aa2cb4598..1fd165bda 100644
+--- a/python/sglang/srt/models/qwen3_next.py
++++ b/python/sglang/srt/models/qwen3_next.py
+@@ -71,6 +71,8 @@ import triton.language as tl
+ from sglang.srt.compilation.piecewise_context_manager import get_forward_context
+ from sglang.srt.utils import direct_register_custom_op
+
++if get_bool_env_var("USE_CUSTOM_NORM_KERNEL", "False"):
++    import npu_ops_transformer_ext
+
+ @triton.jit
+ def fused_qkvzba_split_reshape_cat_kernel(
+@@ -311,6 +313,7 @@ class Qwen3GatedDeltaNet(nn.Module):
+             device=torch.get_device_module().current_device(),
+             dtype=config.torch_dtype,
+         )
++        self.use_custom_norm_kernel = get_bool_env_var("USE_CUSTOM_NORM_KERNEL", "False")
+
+         self.out_proj = RowParallelLinear(
+             self.value_dim,
+@@ -481,7 +484,18 @@ class Qwen3GatedDeltaNet(nn.Module):
+             core_attn_out_pad[: core_attn_out.shape[0], :] = core_attn_out
+             core_attn_out = core_attn_out_pad
+
+-        core_attn_out = self.norm(core_attn_out, z)
++        if self.use_custom_norm_kernel:
++            if forward_batch.forward_mode.is_extend():
++                core_attn_out = self.norm(core_attn_out, z)
++            else:
++                core_attn_out = core_attn_out.reshape(-1, self.hidden_size).unsqueeze(0)
++                z = z.reshape(core_attn_out.shape)
++                w = self.norm.weight
++                G = self.num_v_heads // self.attn_tp_size
++                E = self.layer_norm_epsilon
++                core_attn_out = torch.ops.npu_ops_transformer_ext.mambav2_rmsnormgated(core_attn_out, z, w, G, E)
++        else:
++            core_attn_out = self.norm(core_attn_out, z)
+         core_attn_out = core_attn_out.reshape(z_shape_og)
+         core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
+
+--
+2.50.1.windows.1
+

@@ -1,0 +1,142 @@
+From 3ad2b48656631b06675b04455389c5659ae1fc88 Mon Sep 17 00:00:00 2001
+From: qushiyi <xxx@xxx>
+Date: Fri, 27 Feb 2026 17:27:59 +0800
+Subject: [PATCH 2/2] fix-mtp-graph-mode-and-env_var-getter
+
+---
+ .../srt/layers/attention/ascend_backend.py    | 50 +++++++++++++------
+ .../srt/layers/vocab_parallel_embedding.py    |  1 -
+ .../scheduler_runtime_checker_mixin.py        |  2 +-
+ .../sglang/srt/speculative/eagle_info_v2.py   |  7 ++-
+ 4 files changed, 39 insertions(+), 21 deletions(-)
+
+diff --git a/python/sglang/srt/layers/attention/ascend_backend.py b/python/sglang/srt/layers/attention/ascend_backend.py
+index 6cdcb6e63..3dfe50721 100644
+--- a/python/sglang/srt/layers/attention/ascend_backend.py
++++ b/python/sglang/srt/layers/attention/ascend_backend.py
+@@ -915,22 +915,40 @@ class AscendAttnBackend(AttentionBackend):
+                 )
+             return attn_output
+         else:
+-            q = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+-            num_token_padding = q.shape[0]
+-            if (
+-                not self.graph_mode
+-            ) and forward_batch.num_token_non_padded_cpu != num_token_padding:
+-                q = q[: forward_batch.num_token_non_padded_cpu]
++            if layer.tp_q_head_num == layer.tp_k_head_num and self.graph_mode:
++                raise ValueError("When the MTP scenario enables the graph mode, it needs to meet the GQA requirement," +
++                "which means tp_q_head_num > tp_k_head_num")
+
+             k, v = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+             k_cache = k.view(
+                 -1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim
+             )
+             v_cache = v.view(-1, self.page_size, layer.tp_v_head_num * layer.v_head_dim)
+-            q = q.view(
+-                forward_batch.batch_size, -1, layer.tp_q_head_num, layer.qk_head_dim
+-            )
+-            attn_output, _ = torch_npu.npu_fused_infer_attention_score(
++            q = q.reshape(
++                -1, layer.tp_q_head_num, layer.qk_head_dim
++            ).contiguous()
++            num_token_padding = q.shape[0]
++            if (
++                not self.graph_mode
++            ) and forward_batch.num_token_non_padded_cpu != num_token_padding:
++                q = q[: forward_batch.num_token_non_padded_cpu]
++            if self.forward_metadata.seq_lens_cpu_int is None:
++                actual_seq_lengths_kv = self.forward_metadata.seq_lens_cpu_list
++            else:
++                actual_seq_lengths_kv = (
++                    self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
++                )
++            if forward_batch.forward_mode.is_draft_extend():
++                actual_seq_lengths = (
++                    np.array(forward_batch.extend_seq_lens_cpu).cumsum().tolist()
++                )
++            else:
++                actual_seq_lengths = np.arange(
++                    self.speculative_num_draft_tokens,
++                    self.speculative_num_draft_tokens + q.shape[0],
++                    self.speculative_num_draft_tokens,
++                )
++            attn_output, _ = torch.ops.npu.npu_fused_infer_attention_score(
+                 q,
+                 k_cache,
+                 v_cache,
+@@ -938,21 +956,23 @@ class AscendAttnBackend(AttentionBackend):
+                 block_size=self.page_size,
+                 num_heads=layer.tp_q_head_num,
+                 num_key_value_heads=layer.tp_k_head_num,
+-                sparse_mode=3,
++                input_layout="TND",
+                 atten_mask=self.mtp_mask,
+-                input_layout="BSND",
+                 scale=layer.scaling,
+-                actual_seq_lengths_kv=self.forward_metadata.actual_seq_lengths_kv,
++                actual_seq_lengths=actual_seq_lengths,
++                actual_seq_lengths_kv=actual_seq_lengths_kv,
++                sparse_mode=3,
+             )
+             attn_output = attn_output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+             if (
+                 not self.graph_mode
+-            ) and forward_batch.num_token_non_padded_cpu != num_token_padding:
++                and forward_batch.num_token_non_padded_cpu != num_token_padding
++            ):
+                 attn_output = torch.cat(
+                     [
+                         attn_output,
+                         attn_output.new_zeros(
+-                            num_token_padding - attn_output.shape[0],
++                            num_token_padding - forward_batch.num_token_non_padded_cpu,
+                             *attn_output.shape[1:],
+                         ),
+                     ],
+diff --git a/python/sglang/srt/layers/vocab_parallel_embedding.py b/python/sglang/srt/layers/vocab_parallel_embedding.py
+index f171a15f2..ab394c8c7 100644
+--- a/python/sglang/srt/layers/vocab_parallel_embedding.py
++++ b/python/sglang/srt/layers/vocab_parallel_embedding.py
+@@ -123,7 +123,6 @@ class VocabParallelEmbeddingShardIndices:
+         assert self.num_added_elements <= self.num_added_elements_padded
+
+
+-@torch.compile(dynamic=True, backend=get_compiler_backend())
+ def get_masked_input_and_mask(
+     input_: torch.Tensor,
+     org_vocab_start_index: int,
+diff --git a/python/sglang/srt/managers/scheduler_runtime_checker_mixin.py b/python/sglang/srt/managers/scheduler_runtime_checker_mixin.py
+index 70ffc90bf..dcbec4211 100644
+--- a/python/sglang/srt/managers/scheduler_runtime_checker_mixin.py
++++ b/python/sglang/srt/managers/scheduler_runtime_checker_mixin.py
+@@ -213,7 +213,7 @@ class SchedulerRuntimeCheckerMixin:
+             msg = "token_to_kv_pool_allocator memory leak detected! " f"{token_msg}"
+             raise_error_or_warn(
+                 self,
+-                envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE,
++                envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE.get(),
+                 "count_memory_leak_warnings",
+                 msg,
+             )
+diff --git a/python/sglang/srt/speculative/eagle_info_v2.py b/python/sglang/srt/speculative/eagle_info_v2.py
+index 952ce740c..c907465e7 100644
+--- a/python/sglang/srt/speculative/eagle_info_v2.py
++++ b/python/sglang/srt/speculative/eagle_info_v2.py
+@@ -245,10 +245,9 @@ class EagleVerifyInputV2Mixin:
+         if can_run_cuda_graph:
+             target_worker.model_runner.graph_runner.replay_prepare(verify_forward_batch)
+         else:
+-            if not batch.forward_mode.is_idle():
+-                target_worker.model_runner.attn_backend.init_forward_metadata(
+-                    verify_forward_batch
+-                )
++            target_worker.model_runner.attn_backend.init_forward_metadata(
++                verify_forward_batch
++            )
+
+         return verify_forward_batch, can_run_cuda_graph
+
+--
+2.50.1.windows.1
+

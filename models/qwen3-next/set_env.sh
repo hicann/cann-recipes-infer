@@ -52,6 +52,8 @@ export SGLANG_DEEPEP_BF16_DISPATCH=1  # deepep, bf16权重
 
 export ENABLE_ASCENDC_FUSION_GDN="true"  # 使能GDN融合算子
 
+export USE_CUSTOM_NORM_KERNEL="true"
+
 export ENABLE_NPU_DEEPEP_MOE_MULTI_STREAM=1 # 使能MoE多流
 
 export ASCEND_USE_FIA=1
