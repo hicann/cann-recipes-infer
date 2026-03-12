@@ -710,7 +710,7 @@ class Infer(nn.Module):
 
         prefill_profiler = self.main_model.define_profiler(
                             enable_profiler=enable_profiler,
-                            profile_save_path=os.path.join(self.main_model.res_path, "prefill", "prof"),
+                            profile_save_path=os.path.join(self.main_model.res_path, 'prof', 'prefill'),
                             active=1, skip_first=5, repeat=1)
         with prefill_profiler as prof:
             for _ in range(prefill_prof_cycles):
@@ -772,7 +772,7 @@ class Infer(nn.Module):
 
         # run decode profile
         decode_profiler = self.main_model.define_profiler(enable_profiler=enable_profiler,
-                                    profile_save_path=os.path.join(self.main_model.res_path,'decode', 'prof'))
+                                    profile_save_path=os.path.join(self.main_model.res_path, 'prof', 'decode'))
         with decode_profiler as prof:
             while True:
                 jump_flag = self.get_jump_flag(decode_cnt, warm_up)

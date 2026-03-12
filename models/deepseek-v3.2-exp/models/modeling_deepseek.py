@@ -1863,10 +1863,11 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
         tng_config.experimental_config.tiling_schedule_optimize = True
         tng_config.experimental_config.topology_sorting_strategy = "StableRDFS"
         case_name = "compile_cache/" + os.getenv("CASE_NAME")
-        cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), case_name)
         cache_model = self.main_decode
         if self.is_mtp:
             cache_model = self.main_decode_mtp
+            case_name += "_spec"
+        cache_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), case_name)
         if self.enable_aclgraph:
             tng_config.mode = "reduce-overhead"
             if self.enable_static_kernel:
