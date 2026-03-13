@@ -1,0 +1,8 @@
+**/log/**
+**/extra-info/**
+**/kernel_meta/**
+**/torch_compile_debug/**
+**/__pycache__/**
+**.tar.gz
+**/res/**
+**/experiment_results_*.log

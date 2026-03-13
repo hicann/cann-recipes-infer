@@ -201,6 +201,8 @@ class MxFp8LinearMethod(LinearMethodBase):
             weight_scale.data = weight_scale.data.contiguous()
         layer.weight = Parameter(weight, requires_grad=False)
         layer.weight_scale = Parameter(weight_scale, requires_grad=False)
+        if getattr(layer, "bias", None) is not None:
+            layer.bias = Parameter(layer.bias.to(torch.float32).contiguous(), requires_grad=False)
 
 
 class MxFp8MoEGMMMethod(QuantizeMethodBase):

@@ -1,0 +1,26 @@
+model_name: "pangu_7B"
+model_path: "/dev/shm/ckpts/openPangu-Embedded-7B"
+exe_mode: "eager"        # ["ge_graph", "eager", "acl_graph"]
+world_size: 1
+
+model_config:
+  mm_quant_mode: A16W16       # ["A16W16", "A8W8"]
+  gmm_quant_mode: A16W16      # ["A16W16", "A8W8"]
+  enable_weight_nz: False
+  enable_profiler: False  # [False, True]
+  with_ckpt: True # [False, True]
+  enable_cache_compile: False
+  enable_online_split_weight: True # [False, True]
+  tokenizer_mode: "default"  # ["default", "chat"]
+
+data_config:
+  dataset: "default"  # ["default", "LongBench"]
+  input_max_len: 2048
+  max_new_tokens: 256
+  batch_size: 1  # global batch_size, should be divisible by ep_size
+
+parallel_config:
+  attn_tp_size: 1 # attn_dp_size = world_size // attn_tp_size
+  moe_tp_size: 1 # moe_ep_size = world_size // moe_tp_size
+  embed_tp_size: 1
+  lmhead_tp_size: 1
