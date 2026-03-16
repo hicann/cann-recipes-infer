@@ -1,6 +1,6 @@
-# Adapted from  
+# Adapted from
 # https://github.com/Tencent-Hunyuan/HunyuanImage-3.0,
-# Copyright (c) Huawei Technologies Co., Ltd. 2025.
+# Copyright (c) Huawei Technologies Co., Ltd. 2025-2026.
 # Copyright (C) 2025 THL A29 Limited, a Tencent company. All rights reserved.
 #
 # This code is based on Tencent-Hunyuan's HunyuanImage-3.0 library and the
@@ -24,18 +24,26 @@
 
 import math
 import os
+import time
 import warnings
-from typing import List, Union, Optional, Tuple
+from dataclasses import dataclass
+from typing import List, Union, Optional, Tuple, Dict, Any
 
 import torch
+import torch.nn.functional as F
 import torch.distributed as dist
 
 from einops import rearrange
 from torch import nn
 import torch_npu
 from transformers.cache_utils import Cache
-from transformers.modeling_outputs import BaseModelOutputWithPast
-
+from transformers.modeling_outputs import (
+    BaseModelOutputWithPast,
+    CausalLMOutputWithPast,
+)
+from transformers.utils import ModelOutput
+from transformers.generation.utils import ALL_CACHE_NAMES
+from loguru import logger
 try:
     import flashinfer
 except Exception as e:
@@ -50,7 +58,8 @@ from hunyuan_image_3.hunyuan import (
     build_batch_2d_rope,
     default,
     real_batched_index_select,
-    to_device
+    to_device,
+    get_system_prompt,
 )
 from hunyuan_image_3.hunyuan import (
     Hunyuan_ATTENTION_CLASSES,
@@ -72,6 +81,26 @@ from executor.utils import init_comm_group, get_default_group
 from module.fuse_moe_gmm import FusedMoEGMM
 
 local_rank = int(os.environ['LOCAL_RANK'])
+
+# Type aliases
+BatchRaggedImages = Union[torch.Tensor, List[Union[torch.Tensor, List[torch.Tensor]]]]
+BatchRaggedTensor = Union[torch.Tensor, List[torch.Tensor]]
+
+
+@dataclass
+class CausalMMOutputWithPast(CausalLMOutputWithPast):
+    diffusion_prediction: Optional[torch.Tensor] = None
+
+
+class TicToc:
+    def __init__(self) -> None:
+        self.moment = time.time()
+
+    def tic(self):
+        self.moment = time.time()
+
+    def toc(self):
+        return time.time() - self.moment
 
 
 # =======================================================
@@ -133,33 +162,12 @@ def rms_norm_forward(self, hidden_states, *args):
         )
 
 
-def top_k_gate_forward(self, hidden_states, topk_impl='default'):
-    bsz, seq_len, hidden_size = hidden_states.shape
-    hidden_states = hidden_states.reshape(-1, hidden_size)
-    with torch.npu.amp.autocast(enabled=False):
-        if self.wg.weight.dtype == torch.float32:
-            hidden_states = hidden_states.float()
-        logits = self.wg(hidden_states)
-    if topk_impl == 'default':
-        gate_output = topkgating(logits, self.moe_topk, group_limited_greedy=self.group_limited_greedy,
-                                    n_group=self.n_group, topk_group=self.topk_group,
-                                    norm_topk_prob=self.norm_topk_prob,
-                                    routed_scaling_factor=self.routed_scaling_factor,
-                                    capacity_factor=self.config.capacity_factor,
-                                    drop_tokens=self.drop_tokens)
-    elif topk_impl == 'easy':
-        gate_output = self.easy_topk(logits, self.moe_topk)
-    else:
-        raise ValueError(f"Unsupported topk_impl: {topk_impl}")
-
-    return gate_output
-
-
 def moe_init(self, config: HunyuanImage3Config, layer_idx: Optional[int] = None, **kwargs):
     super(HunyuanMoE, self).__init__()
     self.config = config
     self.layer_idx = layer_idx
     self.moe_topk = config.moe_topk[0]
+    self.hidden_dim = config.hidden_size
     self.num_experts = config.num_experts if isinstance(config.num_experts, int) else config.num_experts[layer_idx]
     if config.use_mixed_mlp_moe:
         self.shared_mlp = HunyuanMLP(config, layer_idx=layer_idx, is_shared_mlp=True)
@@ -168,7 +176,8 @@ def moe_init(self, config: HunyuanImage3Config, layer_idx: Optional[int] = None,
     self.hccl_comm_dict = kwargs.get("hccl_comm_dict")
     self.moe_tp_size = self.hccl_comm_dict.get("moe_tp_size")
     self.moe_tp_group = self.hccl_comm_dict["moe_tp_group"]
-    self.moe_ep_size = 1
+    self.moe_ep_size = self.hccl_comm_dict.get("moe_ep_size")
+    self.moe_ep_group = self.hccl_comm_dict["moe_ep_group"]
     self.experts_per_rank = config.num_experts // self.moe_ep_size
     if self._moe_impl == "npu_grouped_matmul":
         self.experts = FusedMoEGMM(
@@ -180,7 +189,7 @@ def moe_init(self, config: HunyuanImage3Config, layer_idx: Optional[int] = None,
             tp_size=self.moe_tp_size,
             tp_rank=dist.get_rank(self.moe_tp_group) if self.moe_tp_size > 1 else 0,
             ep_size=self.moe_ep_size,
-            ep_rank=dist.get_rank(self.moe_tp_group) if self.moe_ep_size > 1 else 0,
+            ep_rank=dist.get_rank(self.moe_ep_group) if self.moe_ep_size > 1 else 0,
             prefix="HunyuanMoE.experts",
         )
         self.reset_weight = True
@@ -193,6 +202,73 @@ def moe_init(self, config: HunyuanImage3Config, layer_idx: Optional[int] = None,
     self.moe_weight = None
     self.moe_weight_2 = None
     self._weights_initialized = False
+    self.share_mlp_stream = kwargs.get(
+        "share_mlp_stream",
+        torch.npu.Stream(device=torch.device(f"npu:{torch.npu.current_device()}"))
+    )
+
+
+def moe_dispatch_double_routing(self, tokens_per_expert, expanded_x):
+    tokens_per_expert_group = tokens_per_expert.new_empty(tokens_per_expert.shape[0])
+    # First all_to_all: (total_experts,)->(total_ranks*n_routed_experts_per_rank)
+    dist.all_to_all_single(tokens_per_expert_group, tokens_per_expert, group=self.moe_ep_group)
+    # Combine tensors, do reduceSum and D2H togather
+    combine_tokens = torch.stack([tokens_per_expert_group, tokens_per_expert], dim=0)
+    combine_tokens = combine_tokens.view(2, self.moe_ep_size, -1).sum(2)
+    all_tokens = combine_tokens[0].sum()
+    combine_tokens_cpu = combine_tokens.cpu().tolist()
+    input_splits = combine_tokens_cpu[1]
+    output_splits = combine_tokens_cpu[0]
+    gathered_tokens = expanded_x.new_empty(all_tokens.item(), expanded_x.shape[1])
+    # Second all_to_all: Distribute tokens to ranks to which they are assigned
+    dist.all_to_all_single(gathered_tokens, expanded_x, output_splits, input_splits, group=self.moe_ep_group)
+    return tokens_per_expert_group, gathered_tokens, input_splits, output_splits
+
+
+def moe_infer_double_routing(self, hidden_states, topk_ids, topk_weight):
+    hidden_states = rearrange(hidden_states, 'b s h -> (b s) h')
+
+    # InitRouting: Determine the experts to which the tokens of current rank are to be distributed
+    expanded_x, expanded_row_idx, tokens_per_expert, _ = torch_npu.npu_moe_init_routing_v2(
+        hidden_states,
+        expert_idx=topk_ids,
+        active_num=topk_ids.shape[0] * topk_ids.shape[1],
+        scale=None,  # non-quant
+        expert_num=self.num_experts,
+        expert_tokens_num_type=1,  # 0: cumsum mode(not supported now); 1: count mode
+        expert_tokens_num_flag=True, active_expert_range=[0, self.num_experts],
+        quant_mode=-1  # -1: non-quant; 1: dynamic quant; 0: static quant(not supported now)
+    )
+    tokens_per_expert_group, gathered_tokens, input_splits, output_splits =\
+        self.moe_dispatch_double_routing(tokens_per_expert, expanded_x)
+
+    # LocalRerouting: Rearrange tokens within each rank according to the expert order
+    hidden_states_ordered_by_experts, _, gathered_ids_unsort, tokens_per_local_expert = \
+        torch_npu.npu_moe_re_routing(gathered_tokens, tokens_per_expert_group.view(self.moe_ep_size, -1))
+
+    # Compute experts
+    gmm_args = {
+        "x": hidden_states_ordered_by_experts,
+        "expert_tokens": tokens_per_local_expert,
+        "group_list_type": 1,
+    }
+    hidden_states_ordered_by_experts = self.experts(**gmm_args)
+
+    # Local finalize-rerouting: Rearrange computation results to the order after the second all_to_all within each rank
+    new_x = torch.index_select(hidden_states_ordered_by_experts, 0, gathered_ids_unsort.float().argsort().int())
+    gathered_tokens = new_x.new_empty(*expanded_x.shape)
+
+    # Third all_to_all: Distribute the computation results to original ranks
+    dist.all_to_all_single(gathered_tokens, new_x, input_splits, output_splits, group=self.moe_ep_group)
+
+    # Global finalize-routing: Combine and accumulate the expert calculation results within the TP domain
+    hidden_states = torch_npu.npu_moe_finalize_routing(
+        gathered_tokens, skip1=None, skip2=None, bias=None,
+        scales=topk_weight.to(gathered_tokens.dtype),
+        expanded_src_to_dst_row=expanded_row_idx,
+        export_for_source_row=None, drop_pad_mode=2
+    )
+    return hidden_states
 
 
 def moe_forward(self, hidden_states):
@@ -200,80 +276,104 @@ def moe_forward(self, hidden_states):
     bsz, seq_len, hidden_size = hidden_states.shape
     shared_mlp_input = hidden_states
     reshaped_input = hidden_states.reshape(-1, hidden_size) # [bsz*seq_len, hidden_size]
+    hidden_states_mlp = 0
+    gate_input = hidden_states
+    shared_mlp_input = hidden_states
 
     if self._moe_impl == "npu_grouped_matmul":
         if self.reset_weight:
             self.reset_weight = False
             self.experts.quant_method.process_weights_after_loading(layer=self.experts)
-        topk_weight, expert_index = self.gate(hidden_states, topk_impl='easy')
-        routing_args = {
-            "expert_idx": expert_index.to(torch.int32),
-            "active_num": bsz * seq_len * self.moe_topk,
-            "expert_num": self.num_experts,
-            "expert_tokens_num_type": 1,  # 0: cumsum mode(not supported now); 1: count mode
-            "expert_tokens_num_flag": True,
-            "active_expert_range": [0, self.num_experts],
-            "quant_mode": -1
-        }
 
-        expanded_x, expanded_row_idx, tokens_per_expert, pertoken_scale = torch_npu.npu_moe_init_routing_v2(
-            reshaped_input, **routing_args
-        )
+        topk_weight, expert_index = self.gate(gate_input, topk_impl='easy')
+        expert_index = expert_index.to(torch.int32)
+        if self.moe_ep_size > 1:
+            if self.config.use_mixed_mlp_moe:
+                input_ready_event = torch.npu.Event()
+                input_ready_event.record(torch.npu.current_stream())
 
-        moe_args = {"group_list_type": 1}
+                with torch.npu.stream(self.share_mlp_stream):
+                    input_ready_event.wait()
+                    hidden_states_mlp = self.shared_mlp(shared_mlp_input)
+            combined_output = self.moe_infer_double_routing(gate_input, expert_index, topk_weight)
+            combined_output = combined_output.reshape(bsz, seq_len, hidden_size)
+        else:
+            shared_mlp_input = hidden_states
+            routing_args = {
+                "expert_idx": expert_index,
+                "active_num": bsz * seq_len * self.moe_topk,
+                "expert_num": self.num_experts,
+                "expert_tokens_num_type": 1,  # 0: cumsum mode(not supported now); 1: count mode
+                "expert_tokens_num_flag": True,
+                "active_expert_range": [0, self.num_experts],
+                "quant_mode": -1
+            }
 
-        hidden_states_ordered_by_experts = self.experts(expanded_x, tokens_per_expert, **moe_args)
+            expanded_x, expanded_row_idx, tokens_per_expert, pertoken_scale = torch_npu.npu_moe_init_routing_v2(
+                reshaped_input, **routing_args
+            )
 
-        hidden_states = torch_npu.npu_moe_finalize_routing(
-            hidden_states_ordered_by_experts,
-            skip1=None, skip2=None,
-            bias=None,
-            scales=topk_weight.to(hidden_states_ordered_by_experts.dtype),
-            expanded_src_to_dst_row=expanded_row_idx,
-            export_for_source_row=None, drop_pad_mode=2
-        )
-        if self.moe_tp_size > 1:
-            dist_moe = dist.all_reduce(hidden_states, group=self.moe_tp_group, async_op=True)
-    elif self._moe_impl == "flashinfer":
-        # Get expert weights
-        if not self._weights_initialized:
-            self._initialize_weights_on_device(hidden_states.device)
-        topk_weight, topk_index = self.gate(hidden_states, topk_impl='easy')
+            moe_args = {"group_list_type": 1}
 
-        combined_output = torch.zeros_like(reshaped_input)
-        _ = flashinfer.fused_moe.cutlass_fused_moe(     # noqa
-            reshaped_input.contiguous(),
-            topk_index.to(torch.int).contiguous(),
-            topk_weight.to(torch.float).contiguous(),
-            self.moe_weight,
-            self.moe_weight_2,
-            torch.bfloat16,
-            output=combined_output,
-            quant_scales=None,
-        )
-        combined_output = combined_output.reshape(bsz, seq_len, hidden_size)
+            hidden_states_ordered_by_experts = self.experts(expanded_x, tokens_per_expert, **moe_args)
+
+            hidden_states = torch_npu.npu_moe_finalize_routing(
+                hidden_states_ordered_by_experts,
+                skip1=None, skip2=None,
+                bias=None,
+                scales=topk_weight.to(hidden_states_ordered_by_experts.dtype),
+                expanded_src_to_dst_row=expanded_row_idx,
+                export_for_source_row=None, drop_pad_mode=2
+            )
+            if self.config.use_mixed_mlp_moe:
+                input_ready_event = torch.npu.Event()
+                input_ready_event.record(torch.npu.current_stream())
+
+                with torch.npu.stream(self.share_mlp_stream):
+                    input_ready_event.wait()
+                    hidden_states_mlp = self.shared_mlp(shared_mlp_input)
+
+            if self.moe_tp_size > 1:
+                dist.all_reduce(hidden_states, group=self.moe_tp_group)
+            combined_output = hidden_states.view(bsz, seq_len, hidden_size)
     else:
-        # Original implementation - fallback for compatibility
-        l_moe, combine_weights, dispatch_mask, exp_counts = self.gate(hidden_states, topk_impl='default')
-        dispatched_input = torch.einsum("sec,sm->ecm", dispatch_mask.type_as(hidden_states), reshaped_input)
-        chunks = dispatched_input.chunk(self.num_experts, dim=0)
-        expert_outputs = []
-        for chunk, expert in zip(chunks, self.experts):
-            expert_outputs.append(expert(chunk))
+        if self.config.use_mixed_mlp_moe:
+            hidden_states_mlp = self.shared_mlp(hidden_states)
+        if self._moe_impl == "flashinfer":
+            # Get expert weights
+            if not self._weights_initialized:
+                self._initialize_weights_on_device(hidden_states.device)
+            topk_weight, topk_index = self.gate(hidden_states, topk_impl='easy')
 
-        expert_output = torch.cat(expert_outputs, dim=0)
-        combined_output = torch.einsum("sec,ecm->sm", combine_weights.type_as(hidden_states), expert_output)
-        combined_output = combined_output.reshape(bsz, seq_len, hidden_size)
+            combined_output = torch.zeros_like(reshaped_input)
+            _ = flashinfer.fused_moe.cutlass_fused_moe(     # noqa
+                reshaped_input.contiguous(),
+                topk_index.to(torch.int).contiguous(),
+                topk_weight.to(torch.float).contiguous(),
+                self.moe_weight,
+                self.moe_weight_2,
+                torch.bfloat16,
+                output=combined_output,
+                quant_scales=None,
+            )
+        else:
+            # Original implementation - fallback for compatibility
+            l_moe, combine_weights, dispatch_mask, exp_counts = self.gate(hidden_states, topk_impl='default')
+            dispatched_input = torch.einsum("sec,sm->ecm", dispatch_mask.type_as(hidden_states), reshaped_input)
+            chunks = dispatched_input.chunk(self.num_experts, dim=0)
+            expert_outputs = []
+            for chunk, expert in zip(chunks, self.experts):
+                expert_outputs.append(expert(chunk))
 
-    if self.config.use_mixed_mlp_moe:
-        hidden_states_mlp = self.shared_mlp(shared_mlp_input)
-
-    if self._moe_impl == "npu_grouped_matmul":
-        if self.moe_tp_size > 1:
-            dist_moe.wait()
+            expert_output = torch.cat(expert_outputs, dim=0)
+            combined_output = torch.einsum("sec,ecm->sm", combine_weights.type_as(hidden_states), expert_output)
         combined_output = hidden_states.view(bsz, seq_len, hidden_size)
 
     if self.config.use_mixed_mlp_moe:
+        if self._moe_impl == "npu_grouped_matmul":
+            mlp_done_event = torch.npu.Event()
+            mlp_done_event.record(self.share_mlp_stream)
+            mlp_done_event.wait(torch.npu.current_stream())
         output = hidden_states_mlp + combined_output    # noqa
     else:
         output = combined_output
@@ -289,7 +389,6 @@ def spda_attention_init(self, config: HunyuanImage3Config, layer_idx: int, **kwa
     self.attention_dropout = config.attention_dropout
     self.hidden_size = config.hidden_size
     self.num_heads = config.num_attention_heads
-    # self.head_dim = self.hidden_size // self.num_heads
     self.head_dim = config.attention_head_dim
     self.num_key_value_heads = config.num_key_value_heads if config.num_key_value_heads else self.num_heads
     self.num_key_value_groups = self.num_heads // self.num_key_value_heads
@@ -305,6 +404,9 @@ def spda_attention_init(self, config: HunyuanImage3Config, layer_idx: int, **kwa
     self.hccl_comm_dict = kwargs.get("hccl_comm_dict")
     self.attn_tp_size = self.hccl_comm_dict.get("attn_tp_size")
     self.attn_tp_group = self.hccl_comm_dict.get("attn_tp_group")
+    self.moe_ep_size = self.hccl_comm_dict.get("moe_ep_size")
+    self.moe_ep_group = self.hccl_comm_dict.get("moe_ep_group")
+    self.ep_rank = self.hccl_comm_dict.get("ep_rank")
     if self.num_key_value_heads < self.attn_tp_size:
         self.num_q_heads_per_group = self.num_heads // self.attn_tp_size
         self.num_local_kv_heads = 1
@@ -329,24 +431,23 @@ def spda_attention_init(self, config: HunyuanImage3Config, layer_idx: int, **kwa
         self._init_rope()
 
 
-def npu_fas(q, k, v, attn_mask_npu, causal=False):
-    b, n, s, d = q.shape
+def flash_attn_func_npu(q, k, v, attn_mask_npu, scale, causal=False):
+    n_q = q.shape[1]
     n_kv = k.shape[1]
-    scale = 1.0 / math.sqrt(d)
     if not causal:
         attn_out = torch_npu.npu_fused_infer_attention_score(
             q, k, v,
-            num_heads=n,
+            num_heads=n_q,
             input_layout="BNSD",
             scale=scale,
             num_key_value_heads=n_kv
         )[0]
     else:
         attn_out = torch_npu.npu_fused_infer_attention_score(
-            q, k, v, 
+            q, k, v,
             atten_mask=attn_mask_npu,
             sparse_mode=2,
-            num_heads=n,
+            num_heads=n_q,
             input_layout="BNSD",
             scale=scale,
             num_key_value_heads=n_kv
@@ -357,7 +458,12 @@ def npu_fas(q, k, v, attn_mask_npu, causal=False):
 class HunyuanImage3NpuFIA(HunyuanImage3SDPAAttention):
     def __init__(self, config: HunyuanImage3Config, layer_idx: int, **kwargs):
         super().__init__(config, layer_idx, **kwargs)
-    
+        # Used in flash_attn_func_npu when seq_len of qeury_states is 1. Since seq_len of qeury_states may change with
+        # timestep, the initialization of this variable is performed before being called.
+        # https://www.hiascend.com/document/detail/zh/Pytorch/730/apiref/torchnpuCustomsapi/docs/context/
+        # torch_npu-npu_fused_infer_attention_score.md
+        self.attn_mask_npu_qs_is_1 = None
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -368,6 +474,8 @@ class HunyuanImage3NpuFIA(HunyuanImage3SDPAAttention):
         use_cache: Optional[bool] = False,
         custom_pos_emb: Optional[Tuple[torch.FloatTensor]] = None,
         attn_mask_npu: Optional[torch.Tensor] = None,
+        fa_scale: Optional[float] = None,
+        timestep_index: Optional[int] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Cache]]:
         if output_attentions:
@@ -378,21 +486,37 @@ class HunyuanImage3NpuFIA(HunyuanImage3SDPAAttention):
                 past_key_value=past_key_value,
                 output_attentions=output_attentions,
             )
-        bsz, q_len, _ = hidden_states.size()
-        qkv_states = self.qkv_proj(hidden_states)
+        bsz = hidden_states.shape[0]
+        origin_s_len = kwargs.get('origin_s_len', 0)
+        if origin_s_len == 0:
+            raise ValueError(f"Invalid seq_len ({origin_s_len}), which must be positive")
+        s_per_rank = math.ceil(origin_s_len / self.moe_ep_size)
+        pad_len = s_per_rank * self.moe_ep_size - origin_s_len
+        if self.moe_ep_size > 1:
+            if self.ep_rank == self.moe_ep_size - 1 and pad_len > 0:
+                hidden_states = F.pad(hidden_states, (0, 0, 0, pad_len), mode='constant', value=0.0)
+
+            hidden_states = rearrange(hidden_states, 'b s h -> (s b) h')
+
+            qkv_states, _ = torch_npu.npu_all_gather_base_mm(hidden_states, self.qkv_proj.weight.transpose(0, 1),
+                self.attn_tp_group._get_backend(torch.device("npu")).get_hccl_comm_name(local_rank), self.moe_ep_size)
+            qkv_states = rearrange(qkv_states, '(s b) h -> b s h', b=bsz)[:, :origin_s_len, :]
+        else:
+            qkv_states = self.qkv_proj(hidden_states)
+
         qkv_states = qkv_states.reshape(bsz,
-                                        q_len,
+                                        origin_s_len,
                                         self.num_local_kv_heads,
                                         self.num_q_heads_per_group + 2,
                                         self.head_dim)
         query_states, key_states, value_states = torch.split(qkv_states, [self.num_q_heads_per_group, 1, 1], dim=3)
 
         query_states = query_states.reshape(bsz,
-                                            q_len,
+                                            origin_s_len,
                                             self.num_heads // self.attn_tp_size,
                                             self.head_dim).transpose(1, 2)
-        key_states = key_states.reshape(bsz, q_len, self.num_local_kv_heads, self.head_dim).transpose(1, 2)
-        value_states = value_states.reshape(bsz, q_len, self.num_local_kv_heads, self.head_dim).transpose(1, 2)
+        key_states = key_states.reshape(bsz, origin_s_len, self.num_local_kv_heads, self.head_dim).transpose(1, 2)
+        value_states = value_states.reshape(bsz, origin_s_len, self.num_local_kv_heads, self.head_dim).transpose(1, 2)
 
         if self.use_rotary_pos_emb:
             cos, sin = custom_pos_emb
@@ -410,20 +534,14 @@ class HunyuanImage3NpuFIA(HunyuanImage3SDPAAttention):
         k_fa = key_states.contiguous()
         v_fa = value_states.contiguous()
 
-        b, n, s, d = q_fa.shape
-
         mode = kwargs.get("mode", "gen_text")
 
         if mode == "gen_text":
             if attention_mask is None:
-                attn_output = npu_fas(q_fa, k_fa, v_fa, attn_mask_npu, causal=False)
+                attn_output = flash_attn_func_npu(q_fa, k_fa, v_fa, attn_mask_npu, fa_scale, causal=False)
             else:
-                attn_output = npu_fas(q_fa, k_fa, v_fa, attn_mask_npu, causal=True)
+                attn_output = flash_attn_func_npu(q_fa, k_fa, v_fa, attn_mask_npu, fa_scale, causal=True)
         else:
-            gen_timestep_scatter_index: Optional[torch.Tensor] = kwargs.get("gen_timestep_scatter_index", None)
-            assert gen_timestep_scatter_index is not None, \
-                "When gen_image, `gen_timestep_scatter_index` must be provided."
-            timestep_index = gen_timestep_scatter_index[0, 0].item()
             first_step = kwargs.get("first_step", None)
             if first_step is None:
                 raise ValueError("When gen_image, `first_step` must be provided.")
@@ -432,26 +550,44 @@ class HunyuanImage3NpuFIA(HunyuanImage3SDPAAttention):
                 text_query_states = q_fa[:, :, :casual_len, :]
                 text_key_states = k_fa[:, :, :casual_len, :]
                 text_value_states = v_fa[:, :, :casual_len, :]
-                text_attn_output = npu_fas(
-                    text_query_states, text_key_states, text_value_states, attn_mask_npu, causal=True)
+                text_attn_output = flash_attn_func_npu(
+                    text_query_states, text_key_states, text_value_states, attn_mask_npu, fa_scale, causal=True)
                 image_query_states = q_fa[:, :, casual_len:, :]
-                image_attn_output = npu_fas(image_query_states, k_fa, v_fa, attn_mask_npu, causal=False)
+                image_attn_output = flash_attn_func_npu(image_query_states, k_fa, v_fa, attn_mask_npu,
+                                                        fa_scale, causal=False)
                 attn_output = torch.cat((text_attn_output, image_attn_output), dim=2)
             else:
                 casual_len = timestep_index + 1
                 timestep_query_states = q_fa[:, :, 0:1, :]
                 timestep_key_states = k_fa[:, :, :casual_len, :]
                 timestep_value_states = v_fa[:, :, :casual_len, :]
-                timestep_attn_output = npu_fas(
-                    timestep_query_states, timestep_key_states, timestep_value_states, attn_mask_npu, causal=True)
+                if self.attn_mask_npu_qs_is_1 is None or self.attn_mask_npu_qs_is_1.shape != (bsz, casual_len):
+                    self.attn_mask_npu_qs_is_1 = torch.ones([bsz, casual_len],
+                                                      dtype=torch.bool,
+                                                      device=torch.device(f"npu:{local_rank}"))
+                timestep_attn_output = flash_attn_func_npu(timestep_query_states, timestep_key_states,
+                                                           timestep_value_states, self.attn_mask_npu_qs_is_1,
+                                                           fa_scale, causal=True)
                 image_query_states = q_fa[:, :, 1:, :]
-                image_attn_output = npu_fas(image_query_states, k_fa, v_fa, attn_mask_npu, causal=False)
+                image_attn_output = flash_attn_func_npu(image_query_states, k_fa, v_fa, attn_mask_npu,
+                                                        fa_scale, causal=False)
                 attn_output = torch.cat((timestep_attn_output, image_attn_output), dim=2)
-        
-        attn_output = rearrange(attn_output, 'b n s d -> b s (n d)')
-        attn_output = self.o_proj(attn_output)
-        if self.attn_tp_size > 1:
-            dist.all_reduce(attn_output, op=torch.distributed.ReduceOp.SUM, group=self.attn_tp_group)
+
+        if self.moe_ep_size > 1:
+            if pad_len > 0:
+                attn_output = F.pad(attn_output, (0, 0, 0, pad_len), mode="constant", value=0.0)
+            attn_output = rearrange(attn_output, 'b n s d -> (s b) (n d)')
+            attn_output = torch_npu.npu_mm_reduce_scatter_base(attn_output, self.o_proj.weight.transpose(0, 1),
+                self.moe_ep_group._get_backend(torch.device("npu")).get_hccl_comm_name(local_rank),
+                self.moe_ep_size, reduce_op='sum')
+            attn_output = rearrange(attn_output, '(s b) h -> b s h', b=bsz)
+            ep_rank = self.hccl_comm_dict.get("ep_rank")
+            if ep_rank == self.moe_ep_size - 1 and pad_len > 0:
+                attn_output = attn_output[:, :-pad_len, :]
+        else:
+            attn_output = rearrange(attn_output, 'b n s d -> b s (n d)')
+            attn_output = self.o_proj(attn_output)
+            dist.all_reduce(attn_output, op=dist.ReduceOp.SUM, group=self.attn_tp_group)
 
         return attn_output, None, past_key_value
 
@@ -533,6 +669,8 @@ def decoder_layer_forward(
         **kwargs,
     )
     # Fully Connected
+    if hidden_states.shape != residual.shape:
+        hidden_states = hidden_states[:, :residual.shape[1], :].contiguous()
     hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
     hidden_states = self.mlp(hidden_states)
 
@@ -553,7 +691,10 @@ def model_init(self, config: HunyuanImage3Config, **kwargs):
     self.vocab_size = config.vocab_size
     self.add_classification_head = config.add_classification_head
     self.hccl_comm_dict = kwargs.get("hccl_comm_dict", None)
+    self.moe_ep_size = self.hccl_comm_dict.get("moe_ep_size", 1)
+    self.ep_rank = self.hccl_comm_dict.get("ep_rank")
     self.wte = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+    kwargs["share_mlp_stream"] = torch.npu.Stream(device=torch.device(f"npu:{local_rank}"))
     self.layers = nn.ModuleList(
         [HunyuanImage3DecoderLayer(config, layer_idx, **kwargs) for layer_idx in range(config.num_hidden_layers)]
     )
@@ -565,8 +706,24 @@ def model_init(self, config: HunyuanImage3Config, **kwargs):
 
     self.shared_tensor = None
     self.attn_mask_npu = torch.triu(
-        torch.ones([2048, 2048], dtype=torch.bool), diagonal=1).to(torch.device(f"npu:{local_rank}")
+        torch.ones([2048, 2048], dtype=torch.bool, device=torch.device(f"npu:{local_rank}")), diagonal=1
     )
+    self.fa_scale = 1.0 / math.sqrt(config.hidden_size / config.num_attention_heads)
+
+
+def mlp_forward(self, x):
+    if self.hidden_act == "silu":
+        gate_and_up_proj = self.gate_and_up_proj(x)
+        act_res = torch_npu.npu_swiglu(gate_and_up_proj)
+        down_proj = self.down_proj(act_res)
+        return down_proj
+    elif self.hidden_act == "gelu":
+        intermediate = self.gate_and_up_proj(x)
+        intermediate = self.act_fn(intermediate)
+        output = self.down_proj(intermediate)
+        return output
+    else:
+        assert False, "other hidden_act are not supported"
 
 
 def model_forward(
@@ -583,7 +740,7 @@ def model_forward(
     custom_pos_emb: Optional[Tuple[torch.FloatTensor]] = None,
     mode: str = "gen_text",
     first_step: Optional[bool] = None,
-    gen_timestep_scatter_index: Optional[torch.Tensor] = None,
+    timestep_index: Optional[int] = None,
 ) -> Union[Tuple, BaseModelOutputWithPast]:
 
     output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -598,7 +755,12 @@ def model_forward(
         inputs_embeds = self.wte(input_ids)
 
     # embed positions
-    hidden_states = inputs_embeds
+    origin_s_len = inputs_embeds.shape[1]
+    if self.moe_ep_size > 1:
+        s_per_rank = math.ceil(inputs_embeds.shape[1] / self.moe_ep_size)
+        hidden_states = inputs_embeds[:, self.ep_rank * s_per_rank:(self.ep_rank+1) * s_per_rank, :].contiguous()
+    else:
+        hidden_states = inputs_embeds
 
     # decoder layers
     all_hidden_states = () if output_hidden_states else None
@@ -620,9 +782,11 @@ def model_forward(
             use_cache=use_cache,
             custom_pos_emb=custom_pos_emb,
             attn_mask_npu=self.attn_mask_npu,
+            fa_scale=self.fa_scale,
             mode=mode,
             first_step=first_step,
-            gen_timestep_scatter_index=gen_timestep_scatter_index,
+            origin_s_len=origin_s_len,
+            timestep_index=timestep_index,
         )
 
         residual = layer_outputs[0]
@@ -659,20 +823,20 @@ def model_forward(
 model_forward.__doc__ = Hunyuan_INPUTS_DOCSTRING + (model_forward.__doc__ or '')
 
 
-def get_parallel_settings(self):
+def get_parallel_settings(self, apply_moe_tp) -> None:
     world_size = dist.get_world_size()
     self.cfg_parallel_size = 2 if os.environ.get("CFG_PARALLEL") == "1" else 1
     self.attn_tp_size = world_size // self.cfg_parallel_size
     self.attn_dp_size = 1
-    self.moe_ep_size = 1
-    self.moe_tp_size = world_size // self.cfg_parallel_size
+    self.moe_tp_size = world_size // self.cfg_parallel_size if apply_moe_tp else 1
+    self.moe_ep_size = 1 if apply_moe_tp else world_size // self.cfg_parallel_size
     self.moe_dp_size = 1
 
 
-def init_parallel_comm_group(self):
+def init_parallel_comm_group(self) -> None:
     world_size = dist.get_world_size()
     global_rank = dist.get_rank()
-    attn_tp_group = init_comm_group(
+    self.attn_tp_group = init_comm_group(
         global_rank=global_rank,
         group_num=world_size // self.attn_tp_size,
         world_size=world_size,
@@ -681,26 +845,24 @@ def init_parallel_comm_group(self):
     )
 
     if self.moe_tp_size == self.attn_tp_size:
-        moe_tp_group = attn_tp_group
+        self.moe_tp_group = self.attn_tp_group
     else:
-        moe_tp_group = init_comm_group(
+        self.moe_tp_group = init_comm_group(
             global_rank=global_rank,
             group_num=world_size // self.moe_tp_size,
             world_size=world_size,
-            group_stride=1,
+            group_stride=world_size // self.moe_ep_size,
             group_name="moe_tp_group"
         )
-    
-    moe_ep_group, moe_ep_group_name = init_comm_group(
+
+    self.moe_ep_group = init_comm_group(
             global_rank=global_rank,
             group_num=world_size // self.moe_ep_size,
             world_size=world_size,
             group_stride=1,
-            group_name="moe_ep_group",
-            return_name=True
     )
 
-    cfg_parallel_group = init_comm_group(
+    self.cfg_parallel_group = init_comm_group(
             global_rank=global_rank,
             group_num=world_size // self.cfg_parallel_size,
             world_size=world_size,
@@ -708,19 +870,24 @@ def init_parallel_comm_group(self):
             group_name="cfg_parallel_group"
     )
 
-    hccl_comm_dict = {
+    self.tp_rank = dist.get_rank(self.attn_tp_group) if self.attn_tp_size > 1 else 0
+    self.ep_rank = dist.get_rank(self.moe_ep_group) if self.moe_ep_size > 1 else 0
+    self.cfgp_rank = dist.get_rank(self.cfg_parallel_group) if self.cfg_parallel_size > 1 else 0
+
+    self.hccl_comm_dict = {
         "default_pg": get_default_group(),
-        "attn_tp_group": attn_tp_group,
-        "moe_tp_group": moe_tp_group,
-        "moe_ep_group": moe_ep_group,
-        "moe_ep_group_name": moe_ep_group_name,
         "attn_tp_size": self.attn_tp_size,
+        "attn_tp_group": self.attn_tp_group,
         "moe_tp_size": self.moe_tp_size,
-        "moe_ep_size": 1,
-        "cfg_parallel_group": cfg_parallel_group,
+        "moe_tp_group": self.moe_tp_group,
+        "moe_ep_size": self.moe_ep_size,
+        "moe_ep_group": self.moe_ep_group,
         "cfg_parallel_size": self.cfg_parallel_size,
+        "cfg_parallel_group": self.cfg_parallel_group,
+        "tp_rank": self.tp_rank,
+        "ep_rank": self.ep_rank,
+        "cfgp_rank": self.cfgp_rank,
     }
-    return hccl_comm_dict
 
 
 def causalmm_init(self, config: HunyuanImage3Config):
@@ -763,14 +930,14 @@ def causalmm_init(self, config: HunyuanImage3Config):
     else:
         raise ValueError(f"Unknown img_proj_type {config.img_proj_type}")
 
-    self.get_parallel_settings()
+    self.get_parallel_settings(config.moe_tp)
     kwargs = {}
     default_pg = get_default_group()
     if default_pg is not None:
         if dist.get_world_size() > 1:
-            self.hccl_comm_dict = self.init_parallel_comm_group()
+            self.init_parallel_comm_group()
             kwargs.update({"hccl_comm_dict": self.hccl_comm_dict})
-    
+
     # transformer backbone
     self.model = HunyuanImage3Model(config, **kwargs)
 
@@ -884,11 +1051,10 @@ def causalmm_prepare_model_inputs(
     )
     output, sections = out['output'], out['sections']
 
-    if self.hccl_comm_dict["cfg_parallel_size"] > 1:
+    if self.cfg_parallel_size > 1:
         # Some data still has batchsize 2 in CFG parallel and needs to be selected according to CFG parallel RANK
-        idx_select = torch.distributed.get_rank(self.hccl_comm_dict.get("cfg_parallel_group"))
-        cfg_split_model_inputs(output, idx_select)
-        sections = sections[idx_select:idx_select + 1]
+        cfg_split_model_inputs(output, self.cfgp_rank)
+        sections = sections[self.cfgp_rank:self.cfgp_rank + 1]
 
     # 4. Encode conditional images
     if batch_cond_image_info is not None and len(batch_cond_image_info[0]) > 0:
@@ -983,18 +1149,393 @@ def causalmm_prepare_model_inputs(
         max_new_tokens=max_new_tokens,
     )
 
-    if self.hccl_comm_dict["cfg_parallel_size"] > 1:
+    if self.cfg_parallel_size > 1:
         # There ard some other data needs to be selected for CFG parallel
-        idx_select = torch.distributed.get_rank(self.hccl_comm_dict.get("cfg_parallel_group"))
-        model_input_kwargs["position_ids"] = model_input_kwargs["position_ids"][idx_select:idx_select + 1]
-        model_input_kwargs["eos_token_id"] = model_input_kwargs["eos_token_id"][idx_select:idx_select + 1]
+        model_input_kwargs["position_ids"] = model_input_kwargs["position_ids"][self.cfgp_rank:self.cfgp_rank + 1]
+        model_input_kwargs["eos_token_id"] = model_input_kwargs["eos_token_id"][self.cfgp_rank:self.cfgp_rank + 1]
 
     return model_input_kwargs
 
 
+def static_cache_update(
+    self,
+    key_states: torch.Tensor,
+    value_states: torch.Tensor,
+    layer_idx: int,
+    cache_kwargs: Optional[Dict[str, Any]] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Updates the cache with the new `key_states` and `value_states` for the layer `layer_idx`.
+    It is VERY important to index using a tensor, otherwise you introduce a copy to the device.
+
+    Parameters:
+        key_states (`torch.Tensor`):
+            The new key states to cache.
+        value_states (`torch.Tensor`):
+            The new value states to cache.
+        layer_idx (`int`):
+            The index of the layer to cache the states for.
+        cache_kwargs (`Dict[str, Any]`, `optional`):
+            Additional arguments for the cache subclass. The `StaticCache` needs the `cache_position` input
+            to know how where to write in the cache.
+
+    Return:
+        A tuple containing the updated key and value states.
+    """
+    cache_position = cache_kwargs.get("cache_position")
+    if hasattr(self, "key_cache") and hasattr(self, "value_cache"):
+        if self.key_cache[layer_idx].device != key_states.device:
+            self.key_cache[layer_idx] = self.key_cache[layer_idx].to(key_states.device)
+            self.value_cache[layer_idx] = self.value_cache[layer_idx].to(value_states.device)
+        k_out = self.key_cache[layer_idx]
+        v_out = self.value_cache[layer_idx]
+        key_states = key_states.to(k_out.dtype)
+        value_states = value_states.to(v_out.dtype)
+    else:
+        if self.layers[layer_idx].keys is None:
+            self.layers[layer_idx].lazy_initialization(key_states, value_states)
+        k_out = self.layers[layer_idx].keys
+        v_out = self.layers[layer_idx].values
+
+    if cache_position is None:
+        k_out.copy_(key_states)
+        v_out.copy_(value_states)
+    else:
+        # Note: here we use `tensor.index_copy_(dim, index, tensor)` that is equivalent to
+        # `tensor[:, :, index] = tensor`, but the first one is compile-friendly and it does explicitly an in-place
+        # operation, that avoids copies and uses less memory.
+        if cache_position.dim() == 1:
+            k_out.index_copy_(2, cache_position, key_states)
+            v_out.index_copy_(2, cache_position, value_states)
+
+            if self.dynamic:
+                end = cache_position[-1].item() + 1
+                k_out = k_out[:, :, :end]
+                v_out = v_out[:, :, :end]
+        else:
+            assert cache_position.dim() == 2, f"multiple batch dims not yet {cache_position.shape=}"
+            batch_size, idx_size = cache_position.shape
+            assert batch_size == k_out.size(0)
+            assert batch_size == v_out.size(0)
+            assert batch_size == key_states.size(0)
+            assert batch_size == value_states.size(0)
+            for i in range(batch_size):
+                unbatched_dim = 1
+                k_out[i].index_copy_(unbatched_dim, cache_position[i], key_states[i])
+                v_out[i].index_copy_(unbatched_dim, cache_position[i], value_states[i])
+
+            if self.dynamic:
+                assert len(cache_position) == 1
+                end = cache_position[0, -1].item() + 1
+                k_out = k_out[:, :, :end]
+                v_out = v_out[:, :, :end]
+
+    return k_out, v_out
+
+
+def causalmm_forward(
+        self,
+        input_ids: torch.LongTensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[List[torch.FloatTensor]] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        custom_pos_emb: Optional[Tuple[torch.FloatTensor]] = None,
+        mode: str = "gen_text",
+        first_step: Optional[bool] = None,
+        # for gen image
+        images: Optional[BatchRaggedImages] = None,
+        image_mask: Optional[torch.Tensor] = None,
+        timestep: Optional[BatchRaggedTensor] = None,
+        gen_timestep_scatter_index: Optional[torch.Tensor] = None,
+        # for cond image
+        cond_vae_images: Optional[BatchRaggedImages] = None,
+        cond_timestep: Optional[BatchRaggedTensor] = None,
+        cond_vae_image_mask: Optional[torch.Tensor] = None,
+        cond_vit_images: Optional[BatchRaggedImages] = None,
+        cond_vit_image_mask: Optional[torch.Tensor] = None,
+        vit_kwargs: Optional[Dict[str, Any]] = None,
+        cond_timestep_scatter_index: Optional[torch.Tensor] = None,
+        timestep_index: Optional[int] = None,
+    ) -> Union[Tuple, CausalMMOutputWithPast]:
+    return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+    # Sanity Check of Inputs
+    self._check_inputs(mode == "gen_image", "in `gen_image` mode", [
+        ("images", images), ("timestep", timestep), ("gen_timestep_scatter_index", gen_timestep_scatter_index),
+    ])
+    self._check_inputs(mode == "gen_image" and first_step, "in `gen_image` mode at the first step", [
+        ("image_mask", image_mask),
+    ])
+    self._check_inputs(cond_vae_images is not None, "`cond_vae_images` is provided", [
+        ("cond_timestep", cond_timestep), ("cond_vae_image_mask", cond_vae_image_mask),
+        ("cond_timestep_scatter_index", cond_timestep_scatter_index),
+    ])
+    self._check_inputs(cond_vit_images is not None, "`cond_vit_images` is provided", [
+        ("cond_vit_image_mask", cond_vit_image_mask), ("vit_kwargs", vit_kwargs),
+    ])
+
+    custom_pos_emb = self.get_pos_emb(custom_pos_emb, position_ids)
+
+    inputs_embeds = self.model.wte(input_ids)
+    bsz, seq_len, n_embd = inputs_embeds.shape
+
+    # Instantiate placeholder tokens: <timestep>, <img> for the gen image
+    if mode == "gen_text":
+        # For gen_text, make sure gen_timestep_scatter_index is None
+        gen_timestep_scatter_index = None
+        token_h, token_w = None, None
+    else:
+        if first_step:
+            inputs_embeds, token_h, token_w = self.instantiate_vae_image_tokens(
+                inputs_embeds, images, timestep, image_mask)
+            inputs_embeds = self.instantiate_timestep_tokens(
+                inputs_embeds, timestep, gen_timestep_scatter_index)
+        else:
+            t_emb = self.time_embed(timestep)
+            image_emb, token_h, token_w = self.patch_embed(images, t_emb)
+            timestep_emb = self.timestep_emb(timestep).reshape(bsz, -1, n_embd)
+            inputs_embeds = torch.cat([timestep_emb, image_emb], dim=1)
+
+    # Instantiate placeholder tokens: <timestep>, <img> for cond images
+    # Should only run once with kv-cache enabled.
+    if cond_vae_images is not None:
+        inputs_embeds, _, _ = self.instantiate_vae_image_tokens(
+            inputs_embeds, cond_vae_images, cond_timestep, cond_vae_image_mask)
+        inputs_embeds = self.instantiate_timestep_tokens(
+            inputs_embeds, cond_timestep, cond_timestep_scatter_index)
+    if cond_vit_images is not None:
+        inputs_embeds = self.instantiate_vit_image_tokens(
+            inputs_embeds, cond_vit_images, cond_vit_image_mask, vit_kwargs)
+
+    # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
+    outputs = self.model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        past_key_values=past_key_values,
+        inputs_embeds=inputs_embeds,
+        use_cache=use_cache,
+        output_attentions=output_attentions,
+        output_hidden_states=output_hidden_states,
+        return_dict=return_dict,
+        custom_pos_emb=custom_pos_emb,
+        mode=mode,
+        first_step=first_step,
+        timestep_index=timestep_index,
+    )
+    hidden_states = outputs[0]
+    if self.moe_ep_size > 1:
+        s_per_rank = math.ceil(seq_len / self.moe_ep_size)
+        pad_len = s_per_rank * self.moe_ep_size - seq_len
+        if self.ep_rank == self.moe_ep_size - 1 and pad_len > 0:
+            hidden_states = F.pad(hidden_states, (0, 0, 0, pad_len), mode="constant", value=0.0).contiguous()
+
+        hidden_states_gathered = [torch.empty_like(hidden_states) for _ in range(self.moe_ep_size)]
+        dist.all_gather(hidden_states_gathered, hidden_states, group=self.moe_ep_group)
+        hidden_states = torch.cat(hidden_states_gathered, dim=1)[:, :seq_len, :]
+
+    if mode == "gen_text":
+        hidden_states = self.model.ln_f(hidden_states)
+        logits = self.lm_head(hidden_states)
+        logits = logits.float()
+        diffusion_prediction = None
+    else:
+        logits = None
+        hidden_states = hidden_states.to(input_ids.device)
+        diffusion_prediction = self.ragged_final_layer(
+            hidden_states, image_mask, timestep, token_h, token_w, first_step)
+
+    if not return_dict:
+        output = (logits,) + outputs[1:] + (diffusion_prediction,)
+        return output
+
+    output = CausalMMOutputWithPast(
+        logits=logits,
+        past_key_values=outputs.past_key_values,
+        hidden_states=outputs.hidden_states,
+        attentions=outputs.attentions,
+        diffusion_prediction=diffusion_prediction,
+    )
+
+    return output
+
+
+def causalmm_generate_image(
+            self,
+            prompt,
+            seed=None,
+            image_size="auto",
+            use_system_prompt=None,
+            system_prompt=None,
+            bot_task=None,
+            stream=False,
+            **kwargs,
+    ):
+    torch.npu.synchronize()
+    tictoc_generate_image = TicToc()
+    max_new_tokens = kwargs.pop("max_new_tokens", 8192)
+    verbose = kwargs.pop("verbose", 0)
+
+    if stream:
+        from transformers import TextStreamer
+        streamer = TextStreamer(self._tkwrapper.tokenizer, skip_prompt=True, skip_special_tokens=False)
+        kwargs["streamer"] = streamer
+
+    use_system_prompt = default(use_system_prompt, self.generation_config.use_system_prompt)
+    bot_task = default(bot_task, self.generation_config.bot_task)
+    system_prompt = get_system_prompt(use_system_prompt, bot_task, system_prompt)
+
+    if bot_task in ["think", "recaption"]:
+        # Cot
+        model_inputs = self.prepare_model_inputs(
+            prompt=prompt, bot_task=bot_task, system_prompt=system_prompt, max_new_tokens=max_new_tokens)
+        logger.info(f"<{bot_task}>")
+        outputs = self._generate(**model_inputs, **kwargs, verbose=verbose)
+        cot_text = self.get_cot_text(outputs[0])
+        # Switch system_prompt to `en_recaption` if drop_think is enabled.
+        if self.generation_config.drop_think and system_prompt:
+            system_prompt = t2i_system_prompts["en_recaption"][0]
+    else:
+        cot_text = kwargs.pop("cot_text", None)
+
+    # Image ratio
+    if image_size == "auto":
+        model_inputs = self.prepare_model_inputs(
+            prompt=prompt, cot_text=cot_text, bot_task="img_ratio", system_prompt=system_prompt, seed=seed)
+        outputs = self._generate(**model_inputs, **kwargs, verbose=verbose)
+        ratio_index = outputs[0, -1].item() - self._tkwrapper.ratio_token_offset
+        # In some cases, the generated ratio_index is out of range. A valid ratio_index should be in [0, 32].
+        # If ratio_index is out of range, we set it to 16 (i.e., 1:1).
+        if ratio_index < 0 or ratio_index >= len(self.image_processor.reso_group):
+            ratio_index = 16
+        reso = self.image_processor.reso_group[ratio_index]
+        image_size = reso.height, reso.width
+
+    # Generate image
+    model_inputs = self.prepare_model_inputs(
+        prompt=prompt, cot_text=cot_text, system_prompt=system_prompt, mode="gen_image", seed=seed,
+        image_size=image_size,
+    )
+
+    outputs = self._generate(**model_inputs, **kwargs, verbose=verbose)
+
+    torch.npu.synchronize()
+    logger.success(f"[rank:{local_rank}] generate_image cost {tictoc_generate_image.toc():.4f} s")
+
+    return outputs[0]
+
+
+def causalmm_prepare_inputs_for_generation(
+    self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None,
+        tokenizer_output=None, batch_gen_image_info=None, generator=None, **kwargs
+):
+    # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
+    if inputs_embeds is not None and past_key_values is None:
+        model_inputs = {"inputs_embeds": inputs_embeds}
+    else:
+        if input_ids.shape[1] != kwargs["position_ids"].shape[1]:    # in decode steps
+            input_ids = torch.gather(input_ids, dim=1, index=kwargs["position_ids"])
+        model_inputs = {"input_ids": input_ids}
+
+    model_inputs.update(
+        {
+            "attention_mask": attention_mask,
+            "position_ids": kwargs["position_ids"],
+            "past_key_values": past_key_values,
+            "use_cache": kwargs.get("use_cache"),
+            "custom_pos_emb": kwargs["custom_pos_emb"],
+            "mode": kwargs["mode"],
+            "images": kwargs.get("images"),
+            "image_mask": kwargs.get("image_mask"),
+            "timestep": kwargs.get("timestep"),
+            "gen_timestep_scatter_index": kwargs.get("gen_timestep_scatter_index"),
+            "cond_vae_images": kwargs.get("cond_vae_images"),
+            "cond_timestep": kwargs.get("cond_timestep"),
+            "cond_vae_image_mask": kwargs.get("cond_vae_image_mask"),
+            "cond_vit_images": kwargs.get("cond_vit_images"),
+            "cond_vit_image_mask": kwargs.get("cond_vit_image_mask"),
+            "vit_kwargs": kwargs.get("vit_kwargs"),
+            "cond_timestep_scatter_index": kwargs.get("cond_timestep_scatter_index"),
+            "timestep_index": kwargs.get("timestep_index"),
+        }
+    )
+    return model_inputs
+
+
+def causalmm_update_model_kwargs_for_generation(
+    self,
+    outputs: ModelOutput,
+    model_kwargs: Dict[str, Any],
+    is_encoder_decoder: bool = False,
+    num_new_tokens: int = 1,
+) -> Dict[str, Any]:
+    mode = model_kwargs["mode"]
+
+    updated_model_kwargs = {
+        "mode": mode,
+        "custom_pos_emb": model_kwargs["custom_pos_emb"],
+        "timestep_index": model_kwargs["timestep_index"],
+    }
+
+    # update past_key_values keeping its naming used in model code
+    for possible_cache_name in ALL_CACHE_NAMES:
+        if possible_cache_name in outputs:
+            # TODO (joao): remove output/input mismatch when these old models (xlnet, reformer) are deprecated
+            if possible_cache_name in ("past_buckets_states", "mems"):
+                cache_name = "past_key_values"
+            else:
+                cache_name = possible_cache_name
+            updated_model_kwargs[cache_name] = getattr(outputs, possible_cache_name)
+            break
+
+    if "tokenizer_output" in model_kwargs:
+        if mode == "gen_text":
+            # When enable batching, we use right padding, which requires a real_pos to index the valid
+            # end position of the sequence. If tokenizer_output in model_kwargs, it means we are in the
+            # prefill step of generation.
+            real_pos = to_device(model_kwargs["tokenizer_output"].real_pos, self.device)
+            updated_model_kwargs["position_ids"] = real_pos
+        else:
+            # position ids
+            image_mask = model_kwargs["image_mask"]
+            bsz, seq_len = image_mask.shape
+            index = torch.arange(seq_len, device=image_mask.device).unsqueeze(0).repeat(bsz, 1)
+            position_ids = index.masked_select(image_mask.bool()).reshape(bsz, -1)
+            timestep_position_ids = \
+                index[torch.arange(bsz), model_kwargs["gen_timestep_scatter_index"][:, -1]].unsqueeze(-1)
+            updated_model_kwargs["position_ids"] = torch.cat([timestep_position_ids, position_ids], dim=1)
+
+            # attention mask
+            mask_list = []
+            for attention_mask_i, position_ids_i in zip(
+                    model_kwargs["attention_mask"], updated_model_kwargs["position_ids"]):
+                mask_list.append(torch.index_select(attention_mask_i, dim=1, index=position_ids_i.reshape(-1)))
+            attention_mask = torch.stack(mask_list, dim=0)
+            updated_model_kwargs["attention_mask"] = attention_mask
+            updated_model_kwargs["gen_timestep_scatter_index"] = model_kwargs["gen_timestep_scatter_index"]
+
+    else:
+        if mode == "gen_text":
+            # Now we are in the decode steps.
+            updated_model_kwargs["position_ids"] = model_kwargs["position_ids"] + 1
+        else:
+            updated_model_kwargs["position_ids"] = model_kwargs["position_ids"]
+            updated_model_kwargs["attention_mask"] = model_kwargs["attention_mask"]
+            updated_model_kwargs["gen_timestep_scatter_index"] = model_kwargs["gen_timestep_scatter_index"]
+
+    return updated_model_kwargs
+
+
 Hunyuan_ATTENTION_CLASSES["npu"] = HunyuanImage3NpuFIA
 HunyuanRMSNorm.forward = rms_norm_forward
+HunyuanMLP.forward = mlp_forward
+HunyuanStaticCache.update = static_cache_update
 HunyuanMoE.__init__ = moe_init
+HunyuanMoE.moe_dispatch_double_routing = moe_dispatch_double_routing
+HunyuanMoE.moe_infer_double_routing = moe_infer_double_routing
 HunyuanMoE.forward = moe_forward
 HunyuanImage3SDPAAttention.__init__ = spda_attention_init
 HunyuanImage3DecoderLayer.__init__ = decoder_layer_init
@@ -1004,5 +1545,9 @@ HunyuanImage3Model.forward = model_forward
 HunyuanImage3ForCausalMM.get_parallel_settings = get_parallel_settings
 HunyuanImage3ForCausalMM.init_parallel_comm_group = init_parallel_comm_group
 HunyuanImage3ForCausalMM.__init__ = causalmm_init
+HunyuanImage3ForCausalMM.forward = causalmm_forward
 HunyuanImage3ForCausalMM.get_pos_emb = causalmm_get_pos_emb
+HunyuanImage3ForCausalMM.prepare_inputs_for_generation = causalmm_prepare_inputs_for_generation
+HunyuanImage3ForCausalMM._update_model_kwargs_for_generation = causalmm_update_model_kwargs_for_generation
 HunyuanImage3ForCausalMM.prepare_model_inputs = causalmm_prepare_model_inputs
+HunyuanImage3ForCausalMM.generate_image = causalmm_generate_image

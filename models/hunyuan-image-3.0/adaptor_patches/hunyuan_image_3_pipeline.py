@@ -1,6 +1,6 @@
-# Adapted from  
+# Adapted from
 # https://github.com/Tencent-Hunyuan/HunyuanImage-3.0,
-# Copyright (c) Huawei Technologies Co., Ltd. 2025.
+# Copyright (c) Huawei Technologies Co., Ltd. 2025-2026.
 # Copyright (C) 2025 THL A29 Limited, a Tencent company. All rights reserved.
 #
 # This code is based on Tencent-Hunyuan's HunyuanImage-3.0 library and the
@@ -40,14 +40,15 @@
 import os
 import math
 from typing import Any, Callable, Dict, List
-from typing import Optional, Tuple, Union
+from typing import Optional, Union
 
 import torch
 import torch_npu
 from diffusers.callbacks import MultiPipelineCallbacks, PipelineCallback
 from diffusers.image_processor import VaeImageProcessor
 from diffusers.schedulers.scheduling_utils import SchedulerMixin
-from diffusers.utils import logging
+from loguru import logger
+
 from hunyuan_image_3.hunyuan_image_3_pipeline import retrieve_timesteps
 from hunyuan_image_3.hunyuan_image_3_pipeline import (
     ClassifierFreeGuidance,
@@ -56,8 +57,8 @@ from hunyuan_image_3.hunyuan_image_3_pipeline import (
 )
 from module.vae_patch_parallel import set_vae_patch_parallel, VAE_patch_parallel
 
+
 local_rank = int(os.environ['LOCAL_RANK'])
-logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 
 def init_vae_parallel(self):
@@ -100,7 +101,7 @@ def init_vae_parallel(self):
         self.use_vae_parallel = False
 
 
-def text2_image_pipeline_init(
+def text2image_pipeline_init(
     self,
     model,
     scheduler: SchedulerMixin,
@@ -144,7 +145,7 @@ def text2_image_pipeline_init(
 
 
 @torch.no_grad()
-def text2_image_pipeline_call(
+def text2image_pipeline_call(
     self,
     batch_size: int,
     image_size: List[int],
@@ -230,7 +231,7 @@ def text2_image_pipeline_call(
     self._guidance_rescale = guidance_rescale
 
     cfg_factor = 1 + self.do_classifier_free_guidance
-    if self.model.hccl_comm_dict["cfg_parallel_size"] > 1:
+    if self.model.cfg_parallel_size > 1:
         # If enable CFG parallel, cond and uncond inputs are deployed separately on two ranks, so the
         # batch size no longer needs to be multiplied by 2, cfg_factor should be 1
         cfg_factor = 1
@@ -265,6 +266,9 @@ def text2_image_pipeline_call(
         input_ids, self.model.generation_config, model_kwargs=model_kwargs,
     )
     model_kwargs["attention_mask"] = attention_mask.to(latents.device)
+    gen_timestep_scatter_index: Optional[torch.Tensor] = model_kwargs.get("gen_timestep_scatter_index", None)
+    timestep_index = gen_timestep_scatter_index[0, 0].item()
+    model_kwargs["timestep_index"] = timestep_index
 
     # Sampling loop
     num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
@@ -323,11 +327,9 @@ def text2_image_pipeline_call(
 
             # perform guidance
             if self.do_classifier_free_guidance:
-                if self.model.hccl_comm_dict["cfg_parallel_size"] > 1:
-                    cfg_parallel_group = self.model.hccl_comm_dict.get("cfg_parallel_group")
-                    cfg_rank = torch.distributed.get_rank(cfg_parallel_group)
+                if self.model.cfg_parallel_size > 1:
                     cfg_preds_list = [torch.empty_like(pred) for _ in range(2)]
-                    torch.distributed.all_gather(cfg_preds_list, pred, group=cfg_parallel_group)
+                    torch.distributed.all_gather(cfg_preds_list, pred, group=self.model.cfg_parallel_group)
                     pred_cond, pred_uncond = cfg_preds_list
                 else:
                     pred_cond, pred_uncond = pred.chunk(2)
@@ -398,5 +400,5 @@ def text2_image_pipeline_call(
 
 
 HunyuanImage3Text2ImagePipeline.init_vae_parallel = init_vae_parallel
-HunyuanImage3Text2ImagePipeline.__init__ = text2_image_pipeline_init
-HunyuanImage3Text2ImagePipeline.__call__ = text2_image_pipeline_call
+HunyuanImage3Text2ImagePipeline.__init__ = text2image_pipeline_init
+HunyuanImage3Text2ImagePipeline.__call__ = text2image_pipeline_call

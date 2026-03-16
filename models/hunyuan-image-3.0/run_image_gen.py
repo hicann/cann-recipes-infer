@@ -1,4 +1,4 @@
-# Adapted from  
+# Adapted from
 # https://github.com/Tencent-Hunyuan/HunyuanImage-3.0,
 # Copyright (c) Huawei Technologies Co., Ltd. 2025.
 # Copyright (C) 2025 THL A29 Limited, a Tencent company. All rights reserved.
@@ -29,8 +29,8 @@ import torch
 import torch_npu
 from torch_npu.contrib import transfer_to_npu
 from loguru import logger
-from hunyuan_image_3.hunyuan import HunyuanImage3ForCausalMM
 import torch.distributed as dist
+from hunyuan_image_3.hunyuan import HunyuanImage3ForCausalMM
 import model_adaptor
 
 
@@ -63,10 +63,14 @@ def parse_args():
     parser.add_argument("--save", type=str, default="image.png", help="Path to save the generated image")
     parser.add_argument("--verbose", type=int, default=0, help="Verbose level")
     parser.add_argument("--rewrite", type=int, default=0, help="Whether to rewrite the prompt with DeepSeek")
-    parser.add_argument("--sys-deepseek-prompt", type=str, choices=["universal", "text_rendering"], 
+    parser.add_argument("--sys-deepseek-prompt", type=str, choices=["universal", "text_rendering"],
                         default="universal", help="System prompt for rewriting the prompt")
 
     parser.add_argument("--reproduce", action="store_true", help="Whether to reproduce the results")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--moe-tp", action="store_true", help="Use TP for MoE mudule")
+    group.add_argument("--moe-ep", action="store_true", help="Use EP for MoE mudule")
+
     return parser.parse_args()
 
 
@@ -115,6 +119,7 @@ def main(args):
     kwargs = dict(
         torch_dtype="auto",
         moe_impl=args.moe_impl,
+        moe_tp=True if not args.moe_ep else False
     )
 
     setup_distributed()
@@ -146,7 +151,7 @@ def main(args):
             stream=True,
             idx_round=k
         )
-    
+
     if local_rank == 0:
         Path(args.save).parent.mkdir(parents=True, exist_ok=True)
         image.save(args.save)

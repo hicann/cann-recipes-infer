@@ -6,13 +6,12 @@ pillow==11.3.0
 diffusers>=0.32.0
 safetensors==0.4.5
 tokenizers>=0.21.0
-transformers[accelerate,tiktoken]>=4.56.0
+transformers[accelerate,tiktoken]>=4.56.0,<=5.2.0
 huggingface_hub[cli]
 datasets
 loguru
+decorator
+scipy
 
 # Interactive demo
 gradio>=4.21.0
-
-
-

@@ -1,6 +1,6 @@
-# Adapted from  
+# Adapted from
 # https://github.com/Tencent-Hunyuan/HunyuanImage-3.0,
-# Copyright (c) Huawei Technologies Co., Ltd. 2025.
+# Copyright (c) Huawei Technologies Co., Ltd. 2025-2026.
 # Copyright (C) 2025 THL A29 Limited, a Tencent company. All rights reserved.
 #
 # This code is based on Tencent-Hunyuan's HunyuanImage-3.0 library and the
@@ -117,6 +117,7 @@ def init(
     self.capacity_factor = capacity_factor
     self.moe_drop_tokens = moe_drop_tokens
     self.moe_random_routing_dropped_token = moe_random_routing_dropped_token
+    self.moe_tp = kwargs.get('moe_tp', False)
 
     if attention_head_dim is not None:
         self.attention_head_dim = attention_head_dim
