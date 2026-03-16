@@ -1617,7 +1617,6 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
         self.lmhead_tp_size = self.runner_settings.get("parallel_config").get("lmhead_tp_size", self.embed_tp_size)
         self.moe_dp_size = self.runner_settings.get("parallel_config").get("moe_dp_size", 1)
         self.embed_dp_size = self.runner_settings.get("parallel_config").get("embed_dp_size", 1)
-        self.attn_dp_size = self.runner_settings.get("parallel_config").get("attn_dp_size", 1)
         self.dense_tp_size = self.runner_settings.get("parallel_config").get("dense_tp_size", 1)
 
     def get_cached_graph(self):

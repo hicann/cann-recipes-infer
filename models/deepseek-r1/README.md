@@ -132,7 +132,7 @@ source ${cann_path}/bin/setenv.bash
 基于Atlas A3，本实践使用`config/decode_r1_rank_128_128ep_a8w8c8_mtp_benchmark.yaml`作为运行配置文件，对DeepSeek-R1 W8A8C8 量化版本进行了性能Benchmark测试。
 |Quant Mode| Global Batch Size | Seq Length | Chips | TPOT (ms) | Throughput (tokens/p/s) |
 |-------| ----------------- | ---------- | ----- | --------- | ----------------------- |
-|W8A8C8 |    6144           | 4096       | 128   | 44.9      |2138                     |
+|W8A8C8 |    6144           | 4096       | 64    | 44.9      |2138                     |
 
 > 注：性能数据基于 MTP1 与 perfect eplb 配置采集，平均 1 个 draft token 中 accept token 为 0.7 个。
 

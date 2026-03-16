@@ -2306,7 +2306,6 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
         self.lmhead_tp_size = self.runner_settings.get("parallel_config").get("lmhead_tp_size", self.embed_tp_size)
         self.moe_dp_size = self.runner_settings.get("parallel_config").get("moe_dp_size", 1)
         self.embed_dp_size = self.runner_settings.get("parallel_config").get("embed_dp_size", 1)
-        self.attn_dp_size = self.runner_settings.get("parallel_config").get("attn_dp_size", 1)
         self.dense_tp_size = self.runner_settings.get("parallel_config").get("dense_tp_size", 1)
         self.is_sp = self.attn_tp_size > 1 and self.moe_ep_size > 1
         self.micro_batch_mode = MicroBatchMode(self.runner_settings.get("model_config").get("micro_batch_mode", 0))
