@@ -9,13 +9,22 @@
 
 BASE_DIR=$(pwd)
 
-# 移除历史编译结果
+# remove historical compilation results
 rm -rf build
 
-# 编译wheel包
-python3 setup.py build bdist_wheel
+# use ninja to build system and parallel compilation
+export USE_NINJA=1
 
-# 安装wheel包
+# set parallel jobs for compilation
+if [ -z "$MAX_JOBS" ]; then
+    export MAX_JOBS=`nproc`
+    echo "Using $MAX_JOBS parallel jobs for compilation"
+fi
+
+# compile wheel package using incremental compilation
+python3 setup.py build_ext && python3 setup.py bdist_wheel
+
+# install wheel package
 cd ${BASE_DIR}/dist
 pip3 install *.whl -I
 cd -
