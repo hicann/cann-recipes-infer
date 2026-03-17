@@ -239,7 +239,6 @@ python3 -m sglang_router.launch_router --decode http://${d0}:30001 --prefill htt
 ```sh
 curl --location 'http://127.0.0.1:30002/generate' -H 'Content-Type: application/json' --data '{"text": ["1 + 1 = ?"], "sampling_params": { "temperature": 0, "max_new_tokens": 15}}'
 ```
-* sglang框架图模式存在精度问题，请在单算子模式下验证精度。
 * 若服务拉起配置了`--skip-server-warmup`，请在验证精度前发送dp_size个请求，保证每个dp_rank都预热到。
 * 长序列可以通过以下`send_long_text.py`构造发送，请将脚本内的`TXT_PATH`配置为要发送的文本。
 

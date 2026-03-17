@@ -1,0 +1,34 @@
+From 4a654e69d147056c8cb6c0a3c3384c7d46dbdab3 Mon Sep 17 00:00:00 2001
+From: qushiyi <xxx@xxx>
+Date: Mon, 16 Mar 2026 20:31:29 +0800
+Subject: [PATCH] fix-sglang-graph-mode-precision
+
+---
+ .../sglang/srt/layers/attention/hybrid_linear_attn_backend.py | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py b/python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py
+index af90ae152..f9ee72806 100644
+--- a/python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py
++++ b/python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py
+@@ -251,7 +251,7 @@ class MambaAttnBackendBase(AttentionBackend):
+         # Make sure forward metadata is correctly handled for padding reqs
+         req_pool_indices[bs - num_padding :] = 0
+         mamba_indices = self.req_to_token_pool.get_mamba_indices(req_pool_indices)
+-        mamba_indices[bs - num_padding :] = -1
++        mamba_indices[bs - num_padding :] = 0
+         self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
+         if forward_mode.is_decode_or_idle():
+             if num_padding == 0:
+@@ -304,6 +304,8 @@ class MambaAttnBackendBase(AttentionBackend):
+             )
+
+     def get_cuda_graph_seq_len_fill_value(self):
++        if is_npu():
++            return 0
+         return 1  # Mamba attn does not use seq lens to index kv cache
+
+
+--
+2.50.1.windows.1
+
