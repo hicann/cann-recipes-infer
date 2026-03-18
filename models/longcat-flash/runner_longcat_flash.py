@@ -71,6 +71,9 @@ class LongcatFlashRunner(ModelRunner):
         self.spec_len = self.next_n + 1 # speculative len is one more than num of mtp modules
         self.is_attn_rank = check_is_attn_rank(runner_settings)
         self.enable_weight_nz = runner_settings.get("model_config").get("enable_weight_nz", True)
+        self.moe_chunk_max_len = self.runner_settings.get("model_config").get("moe_chunk_max_len", 65536)
+        self.input_max_len = self.runner_settings.get("data_config").get("input_max_len", 2048)
+        self.enable_prefill_profiler = self.enable_profiler and (self.input_max_len <= self.moe_chunk_max_len)
 
     @override
     def init_model(self, is_mtp=False):

@@ -26,7 +26,7 @@ from executor.core.config import InferenceConfig, CommManager
 from executor.utils import get_default_group
 from executor.utils.forward_metadata import set_forward_metadata, get_forward_metadata
 from executor.core.model_worker import ModelWorker
-from executor.utils.profiler_context import create_profiler
+from executor.utils.profiler_context import ProfilerManager
 
 torch.npu.config.allow_internal_format = True
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
@@ -59,8 +59,8 @@ class ExecutionEngine:
 
         # Profiling configuration
         self.enable_profiler = self.infer_config.model_config.enable_profiler
-        self.output_path = self.infer_config.model_config.output_path
-        self.profiler = create_profiler(self.enable_profiler, os.path.join(self.output_path, "prof"))
+        self.output_path = os.getenv("RES_PATH", "./")
+        self.profiler = ProfilerManager(self.enable_profiler, self.output_path)
 
     def _init_device(self):
         """Initialize NPU device and communication."""
@@ -193,25 +193,25 @@ class ExecutionEngine:
                 - "next_tokens": Dict mapping request_id to generated token
                 - "logits": [batch_size, seq_len, vocab_size] model outputs
         """
-        # Create profiler context
-        with self.profiler as prof:
-            # Prepare model inputs
-            inputs_ids = batch.input_ids.to(self.device)
-            model_inputs = self._build_model_inputs(inputs_ids, is_prefill=batch.is_prefill)
+        # Set profiler status based on prefill or decode
+        self.profiler.set_status(batch.is_prefill)
+        # Prepare model inputs
+        inputs_ids = batch.input_ids.to(self.device)
+        model_inputs = self._build_model_inputs(inputs_ids, is_prefill=batch.is_prefill)
 
-            # Run inference
-            logits, _ = self.main_worker.inference(model_inputs, is_prefill=batch.is_prefill)
-            # Step the profiler
+        # Run inference
+        logits, _ = self.main_worker.inference(model_inputs, is_prefill=batch.is_prefill)
+        # Step the profiler
 
-            # Update KV cache length after prefill
-            if batch.is_prefill:
-                kv_lens = torch.max(model_inputs["position_ids"], dim=1)[0]
-                set_forward_metadata(kv_len=kv_lens)
+        # Update KV cache length after prefill
+        if batch.is_prefill:
+            kv_lens = torch.max(model_inputs["position_ids"], dim=1)[0]
+            set_forward_metadata(kv_len=kv_lens)
 
-            # Sample next tokens for each request
-            next_tokens = self._sample_tokens_for_batch(batch, logits)
+        # Sample next tokens for each request
+        next_tokens = self._sample_tokens_for_batch(batch, logits)
 
-            prof.step()
+        self.profiler.step()
 
         return {
             "next_tokens": next_tokens,

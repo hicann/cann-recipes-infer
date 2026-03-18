@@ -53,6 +53,9 @@ class DeepSeekRunner(ModelRunner):
         self.enable_o_proj_alltoall = runner_settings.get("parallel_config").get("enable_o_proj_alltoall", False)
         if self.enable_prefill_multi_cycle and not runner_settings.get("model_config").get("enable_pa", False):
             raise ValueError("not support prefill_multi_cycle when disable paged attention!")
+        self.moe_chunk_max_len = self.runner_settings.get("model_config").get("moe_chunk_max_len", 65536)
+        self.input_max_len = self.runner_settings.get("data_config").get("input_max_len", 2048)
+        self.enable_prefill_profiler = self.enable_profiler and (self.input_max_len <= self.moe_chunk_max_len)
         self.prefill_cycles = 0
         self.query_id_list = []
         self.past_key_values = None
@@ -247,6 +250,8 @@ class DeepSeekRunner(ModelRunner):
                     kv_len_pad_cumsum[(i + 1) * mini_batch] - kv_len_pad_cumsum[i * mini_batch])
 
             logit, prev_hidden_state = self.model.prefill(**model_inputs_prefill)
+            if i < (self.prefill_cycles - 1):
+                self.profiler.step()
             logits.append(logit)
             prev_hidden_states.append(prev_hidden_state)
 

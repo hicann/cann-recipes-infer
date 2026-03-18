@@ -34,6 +34,10 @@ class FakeContextManager:
     def step():
         return
 
+    @staticmethod
+    def stop():
+        return
+
 
 def create_profiler(enable_profiler=False, profile_save_path="prof", active=3, repeat=1, skip_first=3):
     if enable_profiler:
@@ -64,3 +68,41 @@ def create_profiler(enable_profiler=False, profile_save_path="prof", active=3, r
         profiler = FakeContextManager()
 
     return profiler
+
+
+class ProfilerManager:
+    """
+    Profiler manager for profiling using torch_npu.profiler.
+    This class provides a manager for profiling NPU operations during inference. 
+    """
+    def __init__(self, enable_profiler, profile_save_path):
+        self.enable_profiler = enable_profiler
+        self.profile_save_path = profile_save_path
+        self.status = None
+        self.current_profiler = FakeContextManager()
+
+    def set_status(self, is_prefill):
+        if not self.enable_profiler:
+            return
+        if self.status is None and is_prefill:
+            self.status = "prefill"
+            self.current_profiler = create_profiler(
+                enable_profiler=self.enable_profiler,
+                profile_save_path=os.path.join(self.profile_save_path, "prof", "prefill"), 
+                active=1, repeat=1, skip_first=0)
+            self.current_profiler.start()
+        elif self.status == "prefill" and not is_prefill:
+            self.status = "decode"
+            self.current_profiler.stop()
+            self.current_profiler = create_profiler(
+                enable_profiler=self.enable_profiler, 
+                profile_save_path=os.path.join(self.profile_save_path, "prof", "decode"))
+            self.current_profiler.start()
+        return
+
+    def step(self):
+        self.current_profiler.step()
+    
+    def __del__(self):
+        if self.enable_profiler:
+            self.current_profiler.stop()

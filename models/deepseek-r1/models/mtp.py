@@ -35,6 +35,54 @@ class InferMTP(nn.Module):
         self.mtp_model = mtp_model
 
 
+    def model_inference_mtp(self, input_dict_main, input_dict_mtp, warm_up):
+        """
+        Model inference for MTP.
+        """
+        step_time = 0
+        # main model
+        model_inputs = self.main_model.model_input_prepare(input_dict_main)
+        outputs = self.main_model.model_inference(model_inputs,
+                                                    is_prefill=input_dict_main['is_prefill'], warm_up=warm_up,
+                                                    prefix='[MainModel]')
+        # The outputs is a tuple containing logits, inference_time and prev_hidden_states.
+        logits, infer_time_main, prev_hidden_states = outputs
+        step_time += infer_time_main
+        main_next_tokens = torch.argmax(logits, dim=-1)
+        accepted_num = self.verify_spec_tokens(input_dict_main, input_dict_mtp, main_next_tokens)
+        if input_dict_main['is_prefill']:
+            self.update_model_inputs_prefill(model_inputs, input_dict_main, input_dict_mtp,
+                                                main_next_tokens, prev_hidden_states)
+        else:
+            self.update_model_inputs_decode(input_dict_main, input_dict_mtp,
+                                            main_next_tokens, prev_hidden_states, accepted_num)
+
+        # mtp model
+        for next_index in range(self.next_n):
+            model_inputs = self.mtp_model.model_input_prepare(input_dict_mtp)
+            outputs = self.mtp_model.model_inference(model_inputs,
+                                                        is_prefill=input_dict_mtp['is_prefill'], warm_up=warm_up,
+                                                        prefix='[MTP]')
+            # The outputs is a tuple containing logits, inference_time and prev_hidden_states.
+            logits, infer_time_spec, prev_hidden_states = outputs
+
+            # mtp model output process
+            if next_index < self.next_n - 1:
+                past_key_values_cur = (model_inputs['past_key_values'][next_index],)
+                input_dict_mtp = self.mtp_model_output_process_continue(input_dict_mtp,
+                                                                        logits, prev_hidden_states,
+                                                                        past_key_values_cur)
+            else:
+                input_dict_mtp = self.mtp_model_output_process(model_inputs, input_dict_mtp,
+                                                                logits, prev_hidden_states)
+            step_time += infer_time_spec
+
+        # update inputs for main model to verify in the next round
+        mtp_spec_tokens = input_dict_mtp['spec_tokens']
+        input_dict_main['input_ids'] = torch.cat([input_dict_main['input_ids'], mtp_spec_tokens], dim=1)
+        return step_time, input_dict_main, input_dict_mtp, accepted_num
+
+
     def model_generate_mtp(self, prompts, warm_up=False):
         # init input_dict and count
         input_dict_main, input_dict_mtp, inputs, input_lens = self.get_inputs(prompts)
@@ -43,64 +91,41 @@ class InferMTP(nn.Module):
         infer_time_rec = []
         generate_tokens = torch.zeros([batch_size], device="npu")
         total_accepted_num = torch.zeros([batch_size], device="npu")
-
-        profiler = self.main_model.define_profiler(
-            enable_profiler=self.main_model.enable_profiler and not warm_up,
-            profile_save_path=f"{self.main_model.res_path}/prof",
-        )
-        with profiler as prof:
+        # profile prefill
+        enable_profiler = self.main_model.enable_prefill_profiler and not warm_up
+        self.main_model.profiler = self.main_model.define_profiler(
+            enable_profiler=enable_profiler,
+            profile_save_path=os.path.join(self.main_model.res_path, "prof", "prefill"),
+            active=1, skip_first=0, repeat=1)
+        with self.main_model.profiler:
+            input_dict_main_clone = input_dict_main.copy()
+            input_dict_mtp_clone = input_dict_mtp.copy()
+            step_time, main_dict_rec, mtp_dict_rec, accepted_num = self.model_inference_mtp(
+                input_dict_main_clone, input_dict_mtp_clone, warm_up)
+            self.main_model.profiler.step()
+            cnt += 1
+            infer_time_rec.append(step_time)
+        generate_tokens = generate_tokens + 1 + accepted_num
+        total_accepted_num = total_accepted_num + accepted_num
+        input_dict_main = main_dict_rec
+        input_dict_mtp = mtp_dict_rec
+        # profile decode
+        enable_profiler = self.main_model.enable_decode_profiler and not warm_up
+        self.main_model.profiler = self.main_model.define_profiler(
+            enable_profiler=enable_profiler,
+            profile_save_path=os.path.join(self.main_model.res_path, "prof", "decode"))
+        with self.main_model.profiler:
             while True:
                 jump_flag = self.main_model.get_jump_flag(cnt, warm_up)
                 if jump_flag:
                     break
-                step_time = 0
-                # main model
-                model_inputs = self.main_model.model_input_prepare(input_dict_main)
-                outputs = self.main_model.model_inference(model_inputs,
-                                                          is_prefill=input_dict_main['is_prefill'], warm_up=warm_up,
-                                                          prefix='[MainModel]')
-                # The outputs is a tuple containing logits, inference_time and prev_hidden_states.
-                logits, infer_time_main, prev_hidden_states = outputs
-                step_time += infer_time_main
-                main_next_tokens = torch.argmax(logits, dim=-1)
-                accepted_num = self.verify_spec_tokens(input_dict_main, input_dict_mtp, main_next_tokens)
-                if input_dict_main['is_prefill']:
-                    self.update_model_inputs_prefill(model_inputs, input_dict_main, input_dict_mtp,
-                                                     main_next_tokens, prev_hidden_states)
-                else:
-                    self.update_model_inputs_decode(input_dict_main, input_dict_mtp,
-                                                    main_next_tokens, prev_hidden_states, accepted_num)
-
-                generate_tokens = generate_tokens + 1 + accepted_num
-                total_accepted_num = total_accepted_num + accepted_num
-
-                # mtp model
-                for next_index in range(self.next_n):
-
-                    model_inputs = self.mtp_model.model_input_prepare(input_dict_mtp)
-                    outputs = self.mtp_model.model_inference(model_inputs,
-                                                             is_prefill=input_dict_mtp['is_prefill'], warm_up=warm_up,
-                                                             prefix='[MTP]')
-                    # The outputs is a tuple containing logits, inference_time and prev_hidden_states.
-                    logits, infer_time_spec, prev_hidden_states = outputs
-
-                    # mtp model output process
-                    if next_index < self.next_n - 1:
-                        past_key_values_cur = (model_inputs['past_key_values'][next_index],)
-                        input_dict_mtp = self.mtp_model_output_process_continue(input_dict_mtp,
-                                                                                logits, prev_hidden_states,
-                                                                                past_key_values_cur)
-                    else:
-                        input_dict_mtp = self.mtp_model_output_process(model_inputs, input_dict_mtp,
-                                                                       logits, prev_hidden_states)
-                    step_time += infer_time_spec
-
-                # update inputs for main model to verify in the next round
-                mtp_spec_tokens = input_dict_mtp['spec_tokens']
-                input_dict_main['input_ids'] = torch.cat([input_dict_main['input_ids'], mtp_spec_tokens], dim=1)
-                prof.step()
+                step_time, input_dict_main, input_dict_mtp, accepted_num = self.model_inference_mtp(
+                    input_dict_main, input_dict_mtp, warm_up)
+                self.main_model.profiler.step()
                 cnt += 1
                 infer_time_rec.append(step_time)
+                generate_tokens = generate_tokens + 1 + accepted_num
+                total_accepted_num = total_accepted_num + accepted_num
 
         if not warm_up:
             avg_infer_time = obtain_mtp_stats(

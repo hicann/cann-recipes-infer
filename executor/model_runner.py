@@ -75,9 +75,12 @@ class ModelRunner:
             self.model_path = os.path.join(model_path, f"rank_{self.global_rank}")
         self.res_path = os.getenv("RES_PATH", "./")
         self.enable_profiler = runner_settings.get("model_config").get("enable_profiler", False)
+        self.enable_prefill_profiler = self.enable_profiler
+        self.enable_decode_profiler = self.enable_profiler
         self.use_pretrained_model = True
         self.execute_mode = runner_settings.get("exe_mode", "ge_graph")
         self.tokenizer_mode = runner_settings.get("model_config").get("tokenizer_mode", "default")
+        self.profiler = FakeContextManager()
         self.hf_config = None
         self.quantization = None
         self.init_device()
@@ -319,15 +322,31 @@ class ModelRunner:
 
     def model_generate(self, input_dict, input_lens, warm_up=False):
         logging.info("Prompt lens is : %d", input_lens)
-        profiler = self.define_profiler(
-            enable_profiler=self.enable_profiler and not warm_up,
-            profile_save_path=f"{self.res_path}/prof",
-        )
-
         generate_tokens = 0
         cnt = 0
         infer_time_rec = []
-        with profiler as prof:
+        enable_profiler = self.enable_prefill_profiler and not warm_up
+        self.profiler = self.define_profiler(
+            enable_profiler=enable_profiler,
+            profile_save_path=os.path.join(self.res_path, "prof", "prefill"),
+            active=1, skip_first=0, repeat=1)
+
+        with self.profiler:
+            model_inputs = self.model_input_prepare(input_dict)
+            outputs = self.model_inference(model_inputs, is_prefill=input_dict['is_prefill'], warm_up=warm_up)
+            # The outputs is a tuple containing logits, inference_time and other necessary return values.
+            logits = outputs[0]
+            inference_time = outputs[1]
+            self.model_output_process(model_inputs, logits, input_dict)
+            self.profiler.step()
+            generate_tokens += 1
+            cnt += 1
+            infer_time_rec.append(inference_time)
+        enable_profiler = self.enable_decode_profiler and not warm_up
+        self.profiler = self.define_profiler(
+            enable_profiler=enable_profiler,
+            profile_save_path=os.path.join(self.res_path, "prof", "decode"))
+        with self.profiler:
             while True:
                 jump_flag = self.get_jump_flag(cnt, warm_up)
                 if jump_flag:
@@ -339,7 +358,7 @@ class ModelRunner:
                 logits = outputs[0]
                 inference_time = outputs[1]
                 self.model_output_process(model_inputs, logits, input_dict)
-                prof.step()
+                self.profiler.step()
                 generate_tokens += 1
                 cnt += 1
                 infer_time_rec.append(inference_time)
