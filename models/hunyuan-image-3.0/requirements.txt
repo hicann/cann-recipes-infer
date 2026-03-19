@@ -12,6 +12,7 @@ datasets
 loguru
 decorator
 scipy
+torchvision==0.22.1
 
 # Interactive demo
 gradio>=4.21.0

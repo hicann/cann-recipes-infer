@@ -727,7 +727,7 @@ class HunyuanWeightSplitterMixedSharded:
                     shutil.copy2(src, dst)
 
     @staticmethod
-    def _save_single_shard(self, shard: Dict[str, torch.Tensor], shard_path: Path) -> tuple:
+    def _save_single_shard(shard: Dict[str, torch.Tensor], shard_path: Path) -> tuple:
         """
         Thread task function for saving a single shard file
         Return: (shard_path, success or not, error information)
@@ -820,8 +820,7 @@ class HunyuanWeightSplitterMixedSharded:
 
         self.load_and_split()
 
-        if self.ep > 1:
-            self.recognize_moe_weights()
+        self.recognize_moe_weights()
 
         self.save_sharded_weights()
 

@@ -137,7 +137,7 @@ def main(args):
     model.load_tokenizer(args.model_id)
     model = model.to(torch.device(f"npu:{local_rank}"))
 
-    for k in range(2):
+    for k in range(4):
         image = model.generate_image(
             prompt=args.prompt,
             attn_implementation=args.attn_impl,

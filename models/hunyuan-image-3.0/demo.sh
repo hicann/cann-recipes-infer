@@ -14,8 +14,8 @@
 # limitations under the License.
 
 #!/bin/bash
-export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3
-export CFG_PARALLEL=0
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+export CFG_PARALLEL=1
 export USE_VAE_PARALLEL=1
 export CPU_AFFINITY_CONF=2
 
@@ -28,5 +28,5 @@ log_path="./logs/$(date +%Y%m%d)"
 mkdir -p ${log_path}
 log_file_name="$(date +%Y%m%d_%H%M%S).log"
 
-torchrun --master_port=10086 --nproc_per_node 4 run_image_gen.py --reproduce --model-id ./ckpts/weight_tp4_ep4 --verbose 0 --image-size 1024x1024 --moe-impl npu_grouped_matmul --moe-ep \
+torchrun --master_port=10086 --nproc_per_node 16 run_image_gen.py --reproduce --model-id ./ckpts/weight_ep8 --verbose 0 --image-size 1024x1024 --moe-impl npu_grouped_matmul --moe-ep \
     --prompt "A cinematic medium shot captures a single Asian woman seated on a chair within a dimly lit room, creating an intimate and theatrical atmosphere. The composition is focused on the subject, rendered with rich colors and intricate textures that evoke a nostalgic and moody feeling.\n\nThe primary subject is a young Asian woman with a thoughtful and expressive countenance, her gaze directed slightly away from the camera. She is seated in a relaxed yet elegant posture on an ornate, vintage armchair. The chair is upholstered in a deep red velvet, its fabric showing detailed, intricate textures and slight signs of wear. She wears a simple, elegant dress in a dark teal hue, the material catching the light in a way that reveals its fine-woven texture. Her skin has a soft, matte quality, and the light delicately models the contours of her face and arms.\n\nThe surrounding room is characterized by its vintage decor, which contributes to the historic and evocative mood. In the immediate background, partially blurred due to a shallow depth of field consistent with a f/2.8 aperture, the wall is covered with wallpaper featuring a subtle, damask pattern. The overall color palette is a carefully balanced interplay of deep teal and rich red hues, creating a visually compelling and cohesive environment. The entire scene is detailed, from the fibers of the upholstery to the subtle patterns on the wall.\n\nThe lighting is highly dramatic and artistic, defined by high contrast and pronounced shadow play. A single key light source, positioned off-camera, projects gobo lighting patterns onto the scene, casting intricate shapes of light and shadow across the woman and the back wall. These dramatic shadows create a strong scense of depth and a theatrical quality. While some shadows are deep and defined, others remain soft, gently wrapping around the subject and preventing the loss of detail in darker areas. The soft focus on the background enhances the intimate feeling, drawing all attention to the expressive subject. The overall image presents a cinematic, photorealistic photography style." 2>&1 | tee "${log_path}/${log_file_name}"

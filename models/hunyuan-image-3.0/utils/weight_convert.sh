@@ -14,10 +14,16 @@
 # limitations under the License.
 
 #!/bin/bash
+
+SCRIPT_PATH=$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
+SET_ENV_ABS_PATH="${SCRIPT_PATH}/../../../executor/scripts/set_env.sh"
+SET_ENV_ABS_PATH=$(realpath "${SET_ENV_ABS_PATH}")
+source ${SET_ENV_ABS_PATH}
+
 python convert_model.py \
     --model-path ../ckpts/HunyuanImage-3.0 \
-    --output-path ../ckpts/weight_tp8 \
+    --output-path ../ckpts/weight_ep8 \
     --tp-attn 8 \
-    --tp-moe 8 \
-    --ep 1 \
+    --tp-moe 1 \
+    --ep 8 \
     --max-shard-size 5.0
