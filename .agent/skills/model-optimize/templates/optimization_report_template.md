@@ -15,7 +15,7 @@
 | 硬件平台 | {Atlas A2 / A3} |
 | 卡数 (world_size) | {world_size} |
 | 量化模式 | {BF16 / W8A8 / W8A8C8 / W4A16} |
-| 执行模式 | {eager / ge_graph} |
+| 执行模式 | {eager / ge_graph / acl_graph} |
 
 ### 1.1 模型结构概要
 
@@ -188,7 +188,7 @@ Embedding
 
 | 项目 | 内容 |
 |------|------|
-| 图模式类型 | {GE 图模式} |
+| 图模式类型 | {npugraph_ex / GE 图模式} |
 | 适配范围 | Decode 阶段（Prefill 保持 eager） |
 | 修改文件列表 | {file1.py, file2.py, ...} |
 

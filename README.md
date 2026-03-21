@@ -1,6 +1,7 @@
 # cann-recipes-infer
 
 ## 🚀Latest News
+- [2026/03] 模型优化 Agent Skills已开源，支持 Agent 在昇腾Atlas A2/A3系列上完成端到端推理优化部署。
 - [2026/03] HunyuanImage-3.0模型在昇腾Atlas A2/A3系列上已支持EP推理部署方案。
 - [2026/02] GLM-5模型在昇腾Atlas A3系列上已支持推理部署。
 - [2026/01] Qwen3-next模型支持SGLang框架下序列并行、MTP、GDN融合算子、W8A8C8量化。

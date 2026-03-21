@@ -104,7 +104,7 @@ user-invocable: true
 
 - 硬件平台：Atlas A2 / A3 / A5
 - 量化模式：BF16 / W8A8 / W8A8C8 / W4A16
-- 执行模式：当前 exe_mode（eager / ge_graph）
+- 执行模式：当前 exe_mode（eager / ge_graph / acl_graph）
 - **当前范围为单卡模型适配，多卡并行策略不在本技能范围内**
 
 > 后续可扩展并行策略优化阶段（TP / EP / DP 配置优化），作为单卡优化完成后的进阶流程。

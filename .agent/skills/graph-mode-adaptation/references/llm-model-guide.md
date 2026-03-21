@@ -224,6 +224,35 @@ max_pos_id = MAX_SEQ_LEN  # 作为常量传入
 
 ## 推荐配置
 
+### npugraph_ex 后端（推荐用于 LLM Decode）
+
+```python
+import torch
+import torch_npu
+
+model = YourModel().npu()
+opt_model = torch.compile(
+    model,
+    backend="npugraph_ex",
+    fullgraph=True,
+    dynamic=False,  # LLM decode 固定 shape
+    options={
+        # FX图优化
+        "inplace_pass": True,
+        "input_inplace_pass": True,
+        "pattern_fusion_pass": True,
+        # 内存优化
+        "reuse_graph_pool_in_same_fx": True,
+        "clone_input": True,
+        "clone_output": False,
+        # 性能优化
+        "remove_noop_ops": True,
+    }
+)
+```
+
+### GE 图模式
+
 ```python
 import torch
 import torch_npu
@@ -285,4 +314,5 @@ class MyRunner:
 
 ## 相关文档
 
+- **npugraph_ex 详细指南**：`npugraph_ex-guide.md`
 - **GE 图模式详细指南**：`ge-graph-guide.md`

@@ -1,12 +1,12 @@
 ---
 name: graph-mode-adaptation
-description: 图模式适配技能。当用户需要将模型适配到NPU平台使用torch.compile图模式加速时使用此技能。触发场景包括：GE图模式、图模式适配、torch.compile在NPU上的使用、图中断(Graph Break)问题、图编译相关问题、启用图模式加速推理、模型下沉到NPU等。如果是LLM大语言模型的图模式适配，优先阅读LLM模型改造指南。
+description: 图模式适配技能。当用户需要将模型适配到NPU平台使用torch.compile图模式加速时使用此技能。触发场景包括：用户询问npugraph_ex、GE图模式、图模式适配、torch.compile在NPU上的使用、图中断(Graph Break)问题、aclgraph或图编译相关问题、启用图模式加速推理、模型下沉到NPU等。如果是LLM大语言模型的图模式适配，优先阅读LLM模型改造指南。
 user-invocable: true
 ---
 
 # 图模式适配优化技能
 
-提供 GE 图模式（Ascend IR）的适配指南，覆盖方案设计、图中断修复、FA 参数配置和验证测试。
+提供 npugraph_ex 和 GE 两种图模式的适配指南，覆盖方案设计、图中断修复、FA 参数配置和验证测试。
 
 ---
 
@@ -17,6 +17,7 @@ user-invocable: true
 - **保持模型完整性**：不为适配图模式而简化模型逻辑
 - **NPU 不支持的后端**：`aot_eager`、`inductor`、`cudagraphs` 等不可用
 - **固定 tensor 图外预创建**：atten_mask、KV cache 等推理全程不变的 tensor 在图外预创建，用 `torch._dynamo.mark_static()` 标记
+- **LLM Decode 重编译注意**：`kv_len`/`actual_seq_lengths_kv` 每步变化，npugraph_ex 可能触发重编译，遇到 `hit recompile_limit` 参考重编译解决方案排查
 - **精度问题调试**：遇到精度问题可调用 `kvcache-fa-precision-debug` skill 进行排查
 
 ---
@@ -52,17 +53,40 @@ user-invocable: true
 
 ---
 
-## GE 图模式概述
+## 图模式选择
 
-当前采用 GE 图模式（Ascend IR），通过 `torchair.get_npu_backend()` 启用。
+在开始适配前先确定使用哪种模式。如果用户未指定，默认采用 npugraph_ex。
 
-| 特性 | 说明 |
-|------|------|
-| **启用方式** | `torchair.get_npu_backend()` |
-| **实现原理** | FX 图转换为 Ascend IR，GE 引擎编译执行 |
-| **支持场景** | 通用场景 |
+| 场景 | 推荐模式 | 详细文档 |
+|------|---------|---------|
+| **LLM 大语言模型** | npugraph_ex（优先阅读 LLM 指南） | `references/llm-model-guide.md` |
+| **通用模型** | npugraph_ex | `references/npugraph_ex-guide.md` |
+| **需要 GE 图模式** | GE（Ascend IR） | `references/ge-graph-guide.md` |
 
-### 快速示例
+| 特性 | npugraph_ex 后端 (aclgraph) | GE 图模式 (Ascend IR) |
+|------|----------------------------|----------------------|
+| **启用方式** | `backend="npugraph_ex"` | `torchair.get_npu_backend()` |
+| **实现原理** | 捕获模式 (Capture & Replay) | FX 图转换为 Ascend IR，GE 引擎编译执行 |
+| **成熟度** | 试验特性，暂不支持商用 | 更成熟稳定 |
+| **PyTorch版本** | 需要 2.6.0+ | 无特殊要求 |
+| **支持场景** | 在线推理 | 通用场景 |
+| **类似技术** | torch.cuda.CUDAGraph | 传统图编译 |
+
+### npugraph_ex 快速示例
+
+```python
+import torch
+import torch_npu
+
+model = YourModel().to("npu")
+opt_model = torch.compile(model, backend="npugraph_ex", fullgraph=True, dynamic=False)
+# 注：LLM Decode 场景 actual_seq_lengths 每步变化时需 dynamic=True
+output = opt_model(input_tensor)
+```
+
+**关键约束**：PyTorch 2.6.0+、仅支持在线推理、不支持随机数算子和动态控制流、forward 中不可使用 `.item()`
+
+### GE 图模式快速示例
 
 ```python
 import torch
@@ -79,7 +103,7 @@ opt_model = torch.compile(model, backend=npu_backend)
 output = opt_model(input_tensor)
 ```
 
-> 详细文档：`references/ge-graph-guide.md`
+> 详细文档：npugraph_ex 见 `references/npugraph_ex-guide.md`，GE 见 `references/ge-graph-guide.md`
 
 ---
 
@@ -112,7 +136,7 @@ class YourModel:
         return self._forward(input_ids, ...)
 
 # 仅对 decode 方法应用图模式, model.prefill保持 eager
-model.decode = torch.compile(model.decode, backend=npu_backend, ...)
+model.decode = torch.compile(model.decode, backend="npugraph_ex", ...)
 ```
 
 ### 核心改造原则
@@ -144,16 +168,17 @@ model.decode = torch.compile(model.decode, backend=npu_backend, ...)
     │       ↓ 正常
     │
     └─→ 图模式问题
-            ├── 重编译问题 → 阅读 LLM 指南 + GE 指南
+            ├── 重编译问题 → 阅读 LLM 指南 + npugraph_ex 指南
             ├── Graph Break 问题 → 阅读 TorchAir 在线文档中的典型案例
-            └── 其他问题 → 阅读 `references/ge-graph-guide.md`
+            └── 其他问题 → 阅读对应模式文档（npugraph_ex-guide.md 或 ge-graph-guide.md）
 ```
 
 **调试知识来源（按优先级）**：
 1. 本 SKILL.md 中的方法、原则和检查清单
-2. `references/llm-model-guide.md` - LLM 模型改造指南
-3. `references/ge-graph-guide.md` - GE 图模式指南
-4. [TorchAir 官方文档](https://gitcode.com/Ascend/torchair/tree/master/docs/zh)
+2. `references/npugraph_ex-guide.md` - npugraph_ex 详细指南
+3. `references/llm-model-guide.md` - LLM 模型改造指南
+4. `references/ge-graph-guide.md` - GE 图模式指南
+5. [TorchAir 官方文档](https://gitcode.com/Ascend/torchair/tree/master/docs/zh)
 
 **注意**：避免盲目复制其他模型的图模式配置，应基于当前模型结构独立分析。
 
@@ -175,10 +200,12 @@ model.decode = torch.compile(model.decode, backend=npu_backend, ...)
 
 FA 算子的 `actual_seq_lengths` / `actual_seq_qlen` / `actual_seq_kvlen` 参数在不同图模式下有不同的要求：
 
-| 方案 | FA 接口来源 | actual_seq_lengths 类型 | dynamic 设置 | 执行模式约束 | 说明 |
-|------|------------|------------------------|-------------|-------------|------|
-| **推荐** | torchair FA 接口 | **Tensor** | `dynamic=False` | **仅支持 GE 图模式** | 最佳方案，静态图 |
-| **不推荐** | torch_npu FA 接口 | list[int] | `dynamic=True` + `mark_static` | 无限制 | 需额外配置，易出错 |
+| 图模式 | FA 接口来源 | actual_seq_lengths 类型 | dynamic 设置 | 执行模式约束 | 说明 |
+|--------|------------|------------------------|-------------|-------------|------|
+| **GE 模式（推荐）** | torchair FA 接口 | **Tensor** | `dynamic=False` | **仅支持 GE 图模式** | 最佳方案，静态图 |
+| **GE 模式（不推荐）** | torch_npu FA 接口 | list[int] | `dynamic=True` + `mark_static` | 无限制 | 需额外配置，易出错 |
+| **npugraph_ex 模式** | torch_npu FA 接口 | list[int] | `dynamic=True` | 无限制 | 动态捕获模式 |
+| **npugraph_ex 模式** | torch_npu FA 接口 | Tensor（如有） | `dynamic=False` | 无限制 | 需确认接口是否支持 |
 
 ### GE 模式配置指南
 
@@ -209,8 +236,8 @@ opt_model = torch.compile(model, backend=npu_backend, dynamic=False)
 - 图编译更稳定
 
 **约束**：
-- TorchAir FA 接口**仅支持 GE 图模式**，不支持 Eager 模式调用
-- 必须在 GE 图模式（`torchair.get_npu_backend()`）下使用
+- TorchAir FA 接口**仅支持 GE 图模式**，不支持 Eager 模式和 npugraph_ex 模式调用
+- 必须在 GE 图模式（`torchair.get_npu_backend()`）下使用，不可在 Eager 或 npugraph_ex 模式下调用
 
 #### 方案二：torch_npu FA 接口（不推荐）
 
@@ -245,6 +272,48 @@ opt_model = torch.compile(model, backend=npu_backend, dynamic=True)
 - 需要手动调用 `mark_static` 标记所有静态输入
 - 配置繁琐，易遗漏导致问题
 
+### npugraph_ex 模式配置指南
+
+#### 方案一：list[int] 类型 + dynamic=True
+
+```python
+import torch
+import torch_npu
+
+# 使用 torch_npu 的 FA 接口
+# actual_seq_lengths 为 list[int] 类型
+attn_output = torch.ops.npu.npu_fused_infer_attention_score(
+    query, key, value,
+    actual_seq_lengths=[seq_len],  # list[int] 类型
+    actual_seq_lengths_kv=[kv_len],
+    # ... 其他参数
+)
+
+# 必须配置 dynamic=True
+opt_model = torch.compile(model, backend="npugraph_ex", dynamic=True)
+```
+
+#### 方案二：Tensor 类型 + dynamic=False（如有接口支持）
+
+```python
+import torch
+import torch_npu
+
+# 查询是否有 Tensor 类型的 actual_seq_lengths 接口
+# 通过 subagent 调用 /torch-npu-fusion-optimizer 查询
+
+# 如果有支持的接口：
+attn_output = torch.ops.npu.npu_fused_infer_attention_score(
+    query, key, value,
+    actual_seq_lengths=actual_seq_lengths_tensor,  # Tensor 类型
+    actual_seq_lengths_kv=actual_seq_kvlen_tensor,
+    # ... 其他参数
+)
+
+# 可配置 dynamic=False
+opt_model = torch.compile(model, backend="npugraph_ex", dynamic=False)
+```
+
 ### FA 接口查询
 
 如需查询具体的 FA 接口参数和版本支持，使用 subagent 调用 `/torch-npu-fusion-optimizer` 技能：
@@ -256,28 +325,30 @@ opt_model = torch.compile(model, backend=npu_backend, dynamic=True)
    - "查询 npu_fused_infer_attention_score 的 actual_seq_lengths 参数是否支持 Tensor 类型"
    - "查询 npu_fused_infer_attention_score_v2 在图模式下的推荐配置"
    - "查询 torchair 提供的 FA 接口及其参数要求"
-3. 提供当前使用的图模式
+3. 提供当前使用的图模式（GE / npugraph_ex）
 ```
 
 ### 常见错误与修复
 
 | 错误现象 | 根因 | 修复方案 |
 |---------|------|---------|
-| 编译报错：actual_seq_lengths 类型错误 | torch_npu FA 接口传 Tensor 给 GE 模式 | 改用 torchair FA 接口，或改用 list[int] + dynamic=True |
+| 编译报错：actual_seq_lengths 类型错误 | GE 模式下 torch_npu FA 接口传 Tensor | 改用 torchair FA 接口，或改用 list[int] + dynamic=True |
 | 运行时频繁重编译 | dynamic=False 但 actual_seq_lengths 为 list[int] | 改用 Tensor 类型 + torchair 接口，或设置 dynamic=True |
 | 性能不达预期 | dynamic=True 导致无法充分优化 | 尽量使用 torchair FA 接口 + dynamic=False |
-| Eager 模式调用 TorchAir FA 报错 | TorchAir FA 接口仅支持 GE 图模式 | 改用 torch_npu FA 接口 |
+| npugraph_ex 模式报错 | actual_seq_lengths 为 Tensor 但接口不支持 | 确认接口支持情况，或改用 list[int] + dynamic=True |
+| Eager 或 npugraph_ex 模式调用 TorchAir FA 报错 | TorchAir FA 接口仅支持 GE 图模式 | 改用 torch_npu FA 接口，或切换到 GE 图模式 |
 
 ### Debug 检查清单
 
 在图模式 + FA 场景下，按以下清单逐一排查：
 
-- [ ] 1. 确认 FA 接口来源：torch_npu 还是 torchair
-- [ ] 2. 若使用 torchair FA 接口，确认当前为 GE 图模式（不支持 Eager 模式）
-- [ ] 3. 检查 actual_seq_lengths 类型：torchair 接口→Tensor；torch_npu 接口→list[int]+dynamic=True
-- [ ] 4. 检查 dynamic 配置是否与 actual_seq_lengths 类型匹配
-- [ ] 5. 若使用 torch_npu FA + list[int]，检查是否已 mark_static 标记所有静态输入
-- [ ] 6. 如有疑问，调用 `torch-npu-fusion-optimizer` skill 查询接口详情
+- [ ] 1. 确认使用的图模式：GE 还是 npugraph_ex
+- [ ] 2. 确认 FA 接口来源：torch_npu 还是 torchair
+- [ ] 3. 若使用 torchair FA 接口，确认当前为 GE 图模式（不支持 Eager 和 npugraph_ex）
+- [ ] 4. 检查 actual_seq_lengths 类型：GE+torchair→Tensor；GE+torch_npu→list[int]+dynamic=True；npugraph_ex→list[int]+dynamic=True
+- [ ] 5. 检查 dynamic 配置是否与 actual_seq_lengths 类型匹配
+- [ ] 6. 若使用 GE + torch_npu FA + list[int]，检查是否已 mark_static 标记所有静态输入
+- [ ] 7. 如有疑问，调用 `torch-npu-fusion-optimizer` skill 查询接口详情
 
 ---
 

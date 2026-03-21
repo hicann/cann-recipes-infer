@@ -12,6 +12,20 @@
 
 ---
 
+## 与 npugraph_ex 对比
+
+| 特性 | npugraph_ex 后端 | GE 图模式 |
+|------|------------------|-----------|
+| **启用方式** | `backend="npugraph_ex"` | `torchair.get_npu_backend()` |
+| **实现原理** | 捕获模式 (Capture & Replay) | FX图转换为Ascend IR，GE引擎编译执行 |
+| **默认模式** | 需显式指定 | 系统默认模式 `mode="max-autotune"` |
+| **成熟度** | 试验特性，暂不支持商用 | 更成熟稳定 |
+| **PyTorch版本** | 需要 2.6.0+ | 无特殊要求 |
+| **支持场景** | 在线推理 | 通用场景 |
+| **配置方式** | `options={}` 参数 | `CompilerConfig` 对象 |
+
+---
+
 ## 快速上手
 
 ```python
@@ -37,7 +51,7 @@ opt_model = torch.compile(model, backend=npu_backend)
 output = opt_model(input_tensor)
 ```
 
-> 完整示例见 `context/GE图模式快速上手.md`
+> 完整示例见 [GE 图模式快速上手](https://gitcode.com/Ascend/torchair/tree/master/docs/zh/ascend_ir/quick_start.md)
 
 ---
 
@@ -74,112 +88,53 @@ config.ge_config.xxx = ...
 
 | API | 用途 | 文档路径 |
 |-----|------|---------|
-| `CompilerConfig类` | 配置图模式功能 | `context/CompilerConfig类.md` |
-| `get_npu_backend()` | 获取 NPU 后端 | `context/get_npu_backend.md` |
-| `get_compiler()` | 获取编译器 | `context/get_compiler.md` |
-| `dynamo_export()` | 导出模型 | `context/dynamo_export.md` |
-| `register_fx_node_ge_converter()` | 注册转换器 | `context/register_fx_node_ge_converter.md` |
-| `register_replacement()` | 自定义算子融合 | `context/register_replacement-0.md` |
+| `CompilerConfig类` | 配置图模式功能 | [compiler_config.md](https://gitcode.com/Ascend/torchair/tree/master/docs/zh/ascend_ir/api/torchair/compiler_config.md) |
+| `get_npu_backend()` | 获取 NPU 后端 | [get_npu_backend.md](https://gitcode.com/Ascend/torchair/tree/master/docs/zh/ascend_ir/api/torchair/get_npu_backend.md) |
+| `get_compiler()` | 获取编译器 | [get_compiler.md](https://gitcode.com/Ascend/torchair/tree/master/docs/zh/ascend_ir/api/torchair/get_compiler.md) |
+| `dynamo_export()` | 导出模型 | [dynamo_export.md](https://gitcode.com/Ascend/torchair/tree/master/docs/zh/ascend_ir/api/torchair/dynamo_export.md) |
+| `register_fx_node_ge_converter()` | 注册转换器 | [register_fx_node_ge_converter.md](https://gitcode.com/Ascend/torchair/tree/master/docs/zh/ascend_ir/api/torchair/register_fx_node_ge_converter.md) |
+| `register_replacement()` | 自定义算子融合 | [register_replacement.md](https://gitcode.com/Ascend/torchair/tree/master/docs/zh/ascend_ir/api/torchair/register_replacement-0.md) |
 
 ---
 
 ## 功能文档索引
 
-> 路径相对于 `resources/PyTorch图模式使用指南（TorchAir）/`
+> 在线文档：[gitcode.com/Ascend/torchair/docs/zh/ascend_ir](https://gitcode.com/Ascend/torchair/tree/master/docs/zh/ascend_ir)
 
 ### 概述
 
-| 功能 | 文档路径 |
+| 功能 | 在线链接 |
 |-----|---------|
-| GE图模式概述 | `context/GE图模式.md` |
-| GE图模式功能 | `context/GE图模式功能.md` |
-| GE动-静态图概念 | `context/GE动-静态图概念.md` |
-| GE动-静态图展示 | `context/GE动-静态图展示.md` |
+| GE 图模式总览 | [ascend_ir.md](https://gitcode.com/Ascend/torchair/tree/master/docs/zh/ascend_ir/ascend_ir.md) |
+| GE 图模式快速上手 | [quick_start.md](https://gitcode.com/Ascend/torchair/tree/master/docs/zh/ascend_ir/quick_start.md) |
 
 ### 基础功能
 
-| 功能 | 文档路径 |
+| 功能 | 在线链接 |
 |-----|---------|
-| TorchAir Python层日志 | `context/TorchAir-Python层日志打印.md` |
-| TorchAir C++层日志 | `context/TorchAir-C++层日志打印.md` |
-| 集合通信入图 | `context/集合通信入图.md` |
-| 图结构dump功能 | `context/图结构dump功能.md` |
-| 算子data dump（Eager模式） | `context/算子data-dump功能（Eager模式）.md` |
-| 图编译Debug信息（Ascend IR） | `context/图编译Debug信息保存功能（Ascend-IR）.md` |
-| run-eagerly功能 | `context/run-eagerly功能.md` |
-| 冗余算子消除（Ascend IR） | `context/冗余算子消除功能（Ascend-IR）.md` |
-| FX图算子融合Pass（Ascend IR） | `context/FX图算子融合Pass配置功能（Ascend-IR）.md` |
-| 自定义FX图Pass（Ascend IR） | `context/自定义FX图Pass功能（Ascend-IR）.md` |
+| 基础功能总览 | [basic/](https://gitcode.com/Ascend/torchair/tree/master/docs/zh/ascend_ir/features/basic) |
 
 ### 高级功能
 
-| 功能 | 文档路径 |
+| 功能 | 在线链接 |
 |-----|---------|
-| Dynamo导图功能 | `context/Dynamo导图功能.md` |
-| 模型编译缓存（Ascend IR） | `context/模型编译缓存功能（Ascend-IR）.md` |
-| 图内Tensor打印 | `context/图内Tensor打印功能.md` |
-| 多流表达功能（Ascend IR） | `context/多流表达功能（Ascend-IR）.md` |
-| 动态shape图分档执行 | `context/动态shape图分档执行功能.md` |
-| 图编译统计信息导出 | `context/图编译统计信息导出功能.md` |
-| 单流执行功能 | `context/单流执行功能.md` |
-| 图编译多级优化选项 | `context/图编译多级优化选项.md` |
-| 算子融合规则配置（fusion_switch_file） | `context/算子融合规则配置功能（fusion_switch_file）.md` |
-| 算子融合规则配置（optimization_switch） | `context/算子融合规则配置功能（optimization_switch）.md` |
-| 固定权重类输入地址（Ascend IR） | `context/固定权重类输入地址功能（Ascend-IR）.md` |
-| 计算与通信并行 | `context/计算与通信并行功能.md` |
-| Tiling调度优化 | `context/Tiling调度优化功能.md` |
-| View类算子优化 | `context/View类算子优化功能.md` |
-| 动静子图拆分场景性能优化 | `context/动静子图拆分场景性能优化.md` |
-| 图内标定SuperKernel范围 | `context/图内标定SuperKernel范围.md` |
-| AI Core/Vector Core限核（Ascend IR） | `context/AI-Core和Vector-Core限核功能（Ascend-IR）.md` |
-| 图内算子不超时配置 | `context/图内算子不超时配置功能.md` |
+| 进阶功能总览 | [advanced/](https://gitcode.com/Ascend/torchair/tree/master/docs/zh/ascend_ir/features/advanced) |
 
-### torchair.ge API
+### API 参考
 
-| API | 文档路径 |
+| API | 在线链接 |
 |-----|---------|
-| torchair.ge 模块 | `context/torchair-ge.md` |
-| GE图模式API列表 | `context/GE图模式API列表.md` |
-| GE图模式API参考 | `context/GE图模式API参考.md` |
-| DataType类 | `context/DataType类.md` |
-| Format类 | `context/Format类.md` |
-| Tensor类 | `context/Tensor类.md` |
-| TensorSpec类 | `context/TensorSpec类.md` |
-| Const | `context/Const.md` |
-| Cast | `context/Cast.md` |
-| custom_op | `context/custom_op.md` |
-
-### torchair.inference API
-
-| API | 文档路径 |
-|-----|---------|
-| cache_compile | `context/cache_compile-1.md` |
-| readable_cache | `context/readable_cache-2.md` |
-| set_dim_gears | `context/set_dim_gears.md` |
-
-### torchair.ops API
-
-| API | 文档路径 |
-|-----|---------|
-| npu_print | `context/npu_print.md` |
-| npu_fused_infer_attention_score | `context/npu_fused_infer_attention_score.md` |
-| npu_fused_infer_attention_score_v2 | `context/npu_fused_infer_attention_score_v2.md` |
-| record | `context/record.md` |
-| wait | `context/wait.md` |
-
-### torchair.scope API
-
-| API | 文档路径 |
-|-----|---------|
-| npu_stream_switch | `context/npu_stream_switch.md` |
-| npu_wait_tensor | `context/npu_wait_tensor.md` |
-| super_kernel | `context/super_kernel.md` |
-| limit_core_num | `context/limit_core_num-3.md` |
-| op_never_timeout | `context/op_never_timeout.md` |
-| data_dump | `context/data_dump.md` |
+| API 总览 | [api/](https://gitcode.com/Ascend/torchair/tree/master/docs/zh/ascend_ir/api) |
+| API 列表 | [api_list.md](https://gitcode.com/Ascend/torchair/tree/master/docs/zh/ascend_ir/api/api_list.md) |
+| torchair 核心 | [torchair/](https://gitcode.com/Ascend/torchair/tree/master/docs/zh/ascend_ir/api/torchair) |
+| torchair.ge | [ge/](https://gitcode.com/Ascend/torchair/tree/master/docs/zh/ascend_ir/api/ge) |
+| torchair.inference | [inference/](https://gitcode.com/Ascend/torchair/tree/master/docs/zh/ascend_ir/api/inference) |
+| torchair.ops | [ops/](https://gitcode.com/Ascend/torchair/tree/master/docs/zh/ascend_ir/api/ops) |
+| torchair.scope | [scope/](https://gitcode.com/Ascend/torchair/tree/master/docs/zh/ascend_ir/api/scope) |
 
 ---
 
 ## 相关文档
 
 - **LLM 模型改造指南**：`llm-model-guide.md`（LLM 适配优先阅读）
+- **npugraph_ex 指南**：`npugraph_ex-guide.md`
