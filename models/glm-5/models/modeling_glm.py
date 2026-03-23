@@ -1163,7 +1163,7 @@ class GlmMoeDsaAttention(nn.Module):
                                       k_pe.view(bsnd_bsz, -1, self.qk_rope_head_dim),
                                       axis=1)
 
-        if self.li_cache_quant_mode == "int8":
+        if weight_quant_mode == 1:
             c8_input_dict.update({'pertoken_scale': dequant_q_norm})
 
         return q_nope, q_pe, qr, nope_cache, rope_cache
@@ -1223,7 +1223,7 @@ class GlmMoeDsaAttention(nn.Module):
         q_nope, q_pe, dequant_scale_q_nope, qr, dequant_q_norm = torch_npu.npu_mla_prolog_v3(
             **mla_prolog_input_args
         )
-        if self.li_cache_quant_mode == "int8":
+        if weight_quant_mode == 1:
             c8_input_dict.update({'pertoken_scale': dequant_q_norm})
         return q_nope, q_pe, qr, nope_cache, rope_cache
 

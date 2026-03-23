@@ -445,9 +445,9 @@ class Indexer(nn.Module):
                 "query_quant_mode": 0,
                 "weights": weights.type(torch.float16),
             })
-            return torch.ops.custom.npu_lightning_indexer_quant(**li_input_kwargs)
+            return torch_npu.npu_quant_lightning_indexer(**li_input_kwargs)
         elif not use_pto:
-            return torch.ops.custom.npu_lightning_indexer(**li_input_kwargs)
+            return torch_npu.npu_lightning_indexer(**li_input_kwargs)[0]
         else:
             topk_indices = torch.ops.custom_pypto.npu_lightning_indexer_pto(**li_input_kwargs)
             return topk_indices.view(-1, 1, self.index_topk)

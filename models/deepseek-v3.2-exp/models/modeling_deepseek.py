@@ -834,7 +834,7 @@ class DeepseekIndexerAttention(nn.Module):
             self.ckv_a_alpha = torch.nn.Parameter(torch.ones(1, dtype=torch.float), requires_grad=False)
             # empty tensor input for kr_cache
             # Its shape can be specified arbitrarily, but one of its dimensions must be 0
-            self.fake_kr_cache = torch.empty((1, 2, 1, 0), dtype=torch.int8, device="npu")
+            self.fake_kr_cache = torch.empty((1, 2, 1, 0), dtype=torch.bfloat16, device="npu")
 
         self.enable_offload = self.runner_settings.get("model_config").get("enable_offload", False)
         self.index_topk = self.config.index_topk
@@ -1130,7 +1130,7 @@ class DeepseekIndexerAttention(nn.Module):
                 "k_nope_clip_alpha": self.ckv_a_alpha
             })
 
-        q_nope, q_pe, dequant_scale_q_nope, qr, dequant_q_norm = torch.ops.custom.npu_mla_prolog_v3(
+        q_nope, q_pe, dequant_scale_q_nope, qr, dequant_q_norm = torch_npu.npu_mla_prolog_v3(
             **mla_prolog_input_args
         )
 
@@ -1178,7 +1178,7 @@ class DeepseekIndexerAttention(nn.Module):
                                       k_pe.view(bsnd_bsz, -1, self.qk_rope_head_dim),
                                       axis=1)
 
-        if self.kv_cache_quant_mode == "int8":
+        if weight_quant_mode == 1:
             c8_input_dict.update({'pertoken_scale': dequant_q_norm})
 
         return q_nope, q_pe, qr, nope_cache, rope_cache
@@ -1235,10 +1235,10 @@ class DeepseekIndexerAttention(nn.Module):
                 "k_nope_clip_alpha": self.ckv_a_alpha
             })
 
-        q_nope, q_pe, dequant_scale_q_nope, qr, dequant_q_norm = torch.ops.custom.npu_mla_prolog_v3(
+        q_nope, q_pe, dequant_scale_q_nope, qr, dequant_q_norm = torch_npu.npu_mla_prolog_v3(
             **mla_prolog_input_args
         )
-        if self.kv_cache_quant_mode == "int8":
+        if weight_quant_mode == 1:
             c8_input_dict.update({'pertoken_scale': dequant_q_norm})
         return q_nope, q_pe, qr, nope_cache, rope_cache
 
@@ -1359,6 +1359,7 @@ class DeepseekIndexerAttention(nn.Module):
                 "layout_query": 'TND',
                 "layout_kv": 'PA_BSND',
                 "sparse_mode": 3,
+                "attention_mode": 2
             }
 
             slc_fa_input_kwargs.update({
@@ -1382,6 +1383,7 @@ class DeepseekIndexerAttention(nn.Module):
                 "layout_query": 'TND',  # default is BSND
                 "layout_kv": 'PA_BSND',
                 "sparse_mode": 3,
+                "attention_mode": 2
             }
 
         if self.kv_cache_quant_mode == "int8":
@@ -1390,7 +1392,6 @@ class DeepseekIndexerAttention(nn.Module):
                 "query": q,
                 "key_quant_mode": 2,
                 "value_quant_mode": 2,
-                "attention_mode": 2,
                 "quant_scale_repo_mode": 1,
                 "tile_size": 128,
                 "rope_head_dim": 64,
@@ -1398,14 +1399,14 @@ class DeepseekIndexerAttention(nn.Module):
                 "value_dequant_scale": None
             })
 
-            slc_fa_fusion = torch.ops.custom.npu_sparse_flash_attention_antiquant(**slc_fa_input_kwargs)
+            slc_fa_fusion = torch_npu.npu_kv_quant_sparse_flash_attention(**slc_fa_input_kwargs)
 
         else:
             slc_fa_input_kwargs.update({
                 "query_rope": q_pe,
                 "key_rope": k_pe,
             })
-            slc_fa_fusion = torch.ops.custom.npu_sparse_flash_attention(**slc_fa_input_kwargs)
+            slc_fa_fusion, _, _ = torch_npu.npu_sparse_flash_attention(**slc_fa_input_kwargs)
 
         slc_fa_fusion = slc_fa_fusion.transpose(0, 1)
         return slc_fa_fusion
