@@ -62,7 +62,42 @@ with limit_core_num(True, "16", "32"):
 
 
 ### 权重预取
-该优化提供网络weight预取功能，在算子计算的同时，利用空闲的带宽，提前将一些访存bound算子的权重搬运到L2 Cache中，提升算子性能。npu_prefetch技术的详细介绍，请参考[官方文档](https://www.hiascend.com/document/detail/zh/Pytorch/720/apiref/torchnpuCustomsapi/context/torch_npu-npu_prefetch.md)。npu_prefetch优化功能可通过`enable_prefetch`开关使能。下图为LongCat-Flash模型的预取位置。我们针对访存bound的算子如QuantBatchMatmul (QBMM)、MLA_Prolog、matmul等算子提前预取了对应的权重。其中MLA_Prolog算子包含了多个matmul，搬运bound较大，因此我们提前预取了前置的QBMM的权重，为MLA_Prolog提供了更大的预取空间，获取较大的性能收益。具体的预取大小及预取位置，可在`models/modeling_longcat_flash.py`中搜索`npu_prefetch`接口查看。
+该优化提供网络weight预取功能，在算子计算的同时，利用空闲的带宽，提前将一些访存bound算子的权重从HBM搬运到L2 Cache中，提升算子性能。npu_prefetch技术的详细介绍，请参考[官方文档](https://www.hiascend.com/document/detail/zh/Pytorch/730/apiref/torchnpuCustomsapi/docs/context/torch_npu-npu_prefetch.md)。npu_prefetch优化功能可通过`enable_prefetch`开关使能。
+
+以下图为例，`Matmul`的权重有20 MB，前序的算子`RmsNorm`对内存带宽的需求较小，执行时间为10us，此时可以通过预取技术，将`Matmul`的权重提前写入到L2 Cache中，理想情况下，最大可预取的大小为 `HBM_brandwidth / time_available`，实际可预取大小因网络与前序算子对带宽的占用程度而异。假设此时可预取的大小为10 MB，与`RmsNorm`并行执行，则在`Matmul`算子执行时，只需要再额外读10 MB权重，访存的耗时开销减少明显。
+<div align="center">
+    <img src="./figures/prefetch_demo.jpg" width="300" />
+</div>
+
+判断预取的大小和位置是否合理，可以通过profiling分析，如果与预取并行的算子性能有明显劣化，则需要进一步调整预取的位置（可以将预取的位置提前开始，或与劣化算子错开），如没有可调整的位置，则需要减少预取的大小使得并行算子尽量不劣化。如果想要获取最大化的预取收益，可以通过实验对比调整。如果前序算子是访存密集型，如Matmul等，则不适合并行，避免带宽抢占导致劣化。
+
+预取分析和调试的通用流程如下：
+
+<div align="center">
+
+```mermaid
+%%{ init: { 'theme': 'neutral', 'fontFamily': 'Microsoft YaHei', 'fontSize':12 } }%%
+flowchart LR
+    classDef start fill:#e6f7ff,stroke:#1890ff,stroke-width:1.5px
+    classDef proc fill:#f6ffed,stroke:#52c41a
+    classDef proc2 fill:#fff0f0,stroke:#ff7875
+    classDef judge fill:#fff7e6,stroke:#faad14
+    classDef procend fill:#f0f2f5,stroke:#8c8c8c
+
+    S[分析profiling]:::start --> B{前序算子是否<br/>访存密集？}:::judge
+    B -->|是| C[无预取空间]:::proc2
+    B -->|否| D[预取理论大小]:::proc
+    D --> E{性能是否<br/>有劣化？}:::judge
+    E -->|否| F[完成预取]:::procend
+    E -->|是| G[调小预取的大小<br/>或调整预取位置]:::proc
+    G --> E
+```
+
+</div>
+
+> 注：各模型的预取情况可能有所不同，可按需调整上述流程。
+
+下图为LongCat-Flash模型的预取位置。我们针对访存bound的算子如QuantBatchMatmul (QBMM)、MLAProlog、Matmul等算子提前预取了对应的权重。其中MLAProlog算子包含了多个矩阵乘计算，搬运bound较大，因此我们提前预取了前置的QBMM的权重，为MLAProlog提供了更大的预取空间，获取较大的性能收益。具体的预取大小及预取位置，可在`models/modeling_longcat_flash.py`中搜索`npu_prefetch`接口查看。
 
 <div align="center">
     <img src="./figures/prefetch.png" width="800" />
@@ -133,11 +168,11 @@ Prefill阶段路由专家采用**Double-Routing**的计算策略完成计算,具
 #### 优化出发点
 在非分离场景中，Attention 模块和 MoE 模块部署在同一个卡上，由于 ScMoE 结构的固有特性，为了获取最佳的性能，在 [多流并行与控核](###多流并行与控核) 小节中对 Stage2 设计了多流并行策略，通过分配不同的核数将 Attention 计算流和 MoE 计算流进行了并行流水，达到最佳性能。
 
-然而，对 Stage2 通过控核后，由于两条计算流在计算时只能使用部分 Cube 和 Vector 核，算子执行时会受到算力的约束。在 Atlas A3 环境上实测对比发现，在不控核情况下，MLA_Prolog/FA/MM/TBMM/QBMM算子耗时相比控核时均有所下降，耗时对比如下表格。
+然而，对 Stage2 通过控核后，由于两条计算流在计算时只能使用部分 Cube 和 Vector 核，算子执行时会受到算力的约束。在 Atlas A3 环境上实测对比发现，在不控核情况下，MLAProlog/FA/MM/TBMM/QBMM算子耗时相比控核时均有所下降，耗时对比如下表格。
 <table style="width:99%; border-collapse:collapse; margin:20px 0;">
     <tr>
         <th style="border:1px solid #ddd; padding:10px; text-align:center;"> Cube_Vector核数</th>
-        <th style="border:1px solid #ddd; padding:10px; text-align:center;">MLA_Prolog（us）</th>
+        <th style="border:1px solid #ddd; padding:10px; text-align:center;">MLAProlog（us）</th>
         <th style="border:1px solid #ddd; padding:10px; text-align:center;">FA（us）</th>
         <th style="border:1px solid #ddd; padding:10px; text-align:center;">MM（us）</th>
         <th style="border:1px solid #ddd; padding:10px; text-align:center;">TBMM（us）</th>
@@ -189,14 +224,14 @@ Attention 和 MoE 独立部署后的示意图如下：
 同理，FFN 节点作为服务端，任务执行时图上第一个是 Recv 算子，它一直等待直到 Attention 节点通过 Send 算子发数据过来。当前 FFN 节点接收到数据后，会进行 Router/Dispatch/MoE-GMM/Combine 等操作，最后再通过 Send 算子将数据发回 Attention 节点。
 
 #### FFN 权重预取
-非分离场景中，对 QuantBatchMatmul (QBMM)、MLA_Prolog、matmul 进行权重预取后，一方面由于 Stage2 里 Stream0 上算子的计算耗时与Stream1 上 Router/Dispatch/MoE-GMM/Combine 算子耗时相当，另一方面也没有较好的时间窗口对 MoE-GMM 进行权重预取，故对 MoE-GMM 算子没有采取权重预取。
+非分离场景中，对 QuantBatchMatmul (QBMM)、MLAProlog、Matmul 进行权重预取后，一方面由于 Stage2 里 Stream0 上算子的计算耗时与Stream1 上 Router/Dispatch/MoE GMM/Combine 算子耗时相当，另一方面也没有较好的时间窗口对 MoE GMM 进行权重预取，故对 MoE GMM 算子没有采取权重预取。
 
-但使能 AFD 之后，Attention 侧再不控核后，MLA_Prolog/FA/MM/TBMM/QBMM 算子耗时降低，可能出现 FFN 侧计算瓶颈，导致 Attention 侧的 Recv 算子长时间没能收到 FFN 侧发来的数据，在计算流上出现 EVENT_WAIT 间隙的拖尾现象，如下图所示。
+但使能 AFD 之后，Attention 侧再不控核后，MLAProlog/FA/MM/TBMM/QBMM 算子耗时降低，可能出现 FFN 侧计算瓶颈，导致 Attention 侧的 Recv 算子长时间没能收到 FFN 侧发来的数据，在计算流上出现 EVENT_WAIT 间隙的拖尾现象，如下图所示。
 <p align="center">
   <img src="./figures/attn_event_wait.png" width="100%" alt="attn_event_wait">
 </p>
 
-针对 FFN 侧计算瓶颈问题，可对 GMM/MatMul 访存 Bound 类算子在通信间隙时提前预取对应的权重，从而降低 FFN 侧的整体耗时，示意图如下。
+针对 FFN 侧计算瓶颈问题，可对 GMM/Matmul 访存 Bound 类算子在通信间隙时提前预取对应的权重，从而降低 FFN 侧的整体耗时，示意图如下。
 <p align="center">
   <img src="./figures/afd_ffn_cmo.png" width="100%" alt="afd_ffn_cmo">
 </p>
