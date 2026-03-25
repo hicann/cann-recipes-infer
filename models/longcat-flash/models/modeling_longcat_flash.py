@@ -1024,7 +1024,6 @@ class LongcatFlashAttention(nn.Module):
         attn_partial = attn_partial.view(self.num_heads_per_rank, -1, self.kv_lora_rank)
         attn_partial = (
             torch.matmul(attn_partial, self.kv_b_proj_w_v)
-            .reshape(self.num_heads_per_rank, bsz, q_len, -1)
         )
         if self.kvp_size > 1:
             def _all_to_all_along_headdim(partial: torch.Tensor, group: dist.ProcessGroup):
@@ -1035,6 +1034,7 @@ class LongcatFlashAttention(nn.Module):
                 return scattered
 
             # AllToAll of attn_partial(NBSD) along N-axis.
+            attn_partial = attn_partial.view(self.num_heads_per_rank, bsz, q_len, -1)
             attn_scatter = _all_to_all_along_headdim(attn_partial, self.kvp_group)
 
             # Transpose(BNSD->NBSD) and AllToAll of lse_partial along N-axis.
@@ -1044,10 +1044,12 @@ class LongcatFlashAttention(nn.Module):
             lse_partial = lse_partial.transpose(0, 1).contiguous()                    
             lse_scatter = _all_to_all_along_headdim(lse_partial, self.kvp_group)            
             attn_output = (attn_scatter * lse_scatter.softmax(dim=0)).sum(dim=0).to(torch.bfloat16)
+
+            attn_output = attn_output.view(self.num_heads_per_rank // self.kvp_size, bsz * q_len, -1)
         else:
             attn_output = attn_partial
-        # (N, B, S, D) -> (B, S, N, D) -> (B, S, N * D)
-        attn_output = attn_output.permute(1, 2, 0, 3).reshape(bsz, q_len, -1)
+        # (N, B*S, D) -> (B*S, N, D) -> (B, S, N * D)
+        attn_output = attn_output.transpose(1, 0).reshape(bsz, q_len, -1)
         attn_output, o_proj = self.o_proj_forward(attn_output)
         return attn_output, o_proj
 
