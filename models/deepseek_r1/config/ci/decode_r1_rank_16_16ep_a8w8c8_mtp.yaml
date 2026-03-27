@@ -1,0 +1,37 @@
+model_name: "deepseek_r1"  # keep it for backward compatibility.
+world_size: 16  # keep it for backward compatibility.
+
+model_config:
+  model_name: "deepseek_r1"
+  model_path: "/data/models/origin/DeepSeek-R1-W8A8C8"
+  with_ckpt: True                   # [False, True]
+  exe_mode: "ge_graph"              # ["eager", "npugraph_ex", "ge_graph"]
+  enable_profiler: False            # [False, True]
+  force_eplb: False                 # [False, True]
+  enable_cache_compile: False       # [False, True]
+  next_n: 1
+  custom_params:
+    enable_pa: True                   # [False, True]
+    pa_block_size: 128
+    enable_weight_nz: True            # [False, True]
+    enable_mla_prolog: True           # [False, True]
+    enable_multi_streams: True        # [False, True]
+    enable_superkernel: False         # [False, True]
+    moe_chunk_max_len: 1024
+
+data_config:
+  dataset: "default"  # ["default", "LongBench", "InfiniteBench"]
+
+parallel_config:
+  world_size: 16
+  attn_tp_size: 1
+  dense_tp_size: 1
+  moe_tp_size: 1
+  embed_tp_size: 16
+  lmhead_tp_size: 16
+
+scheduler_config:
+  input_max_len: 32
+  max_new_tokens: 100
+  batch_size: 64
+  prefill_mini_batch: 1

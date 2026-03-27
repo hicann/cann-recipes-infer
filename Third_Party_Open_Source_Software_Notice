@@ -3108,7 +3108,7 @@ Please see above
 Software: DeepSeek-V3
 Official Repository: https://huggingface.co/deepseek-ai/DeepSeek-V3/tree/main/modeling_deepseek.py
 Usage: "
-models/deepseek-r1/models/modules.py,
+models/deepseek_r1/models/modules.py,
 models/kimi-k2-thinking/models/modules.py,
 models/deepseek-v3.2-exp/models/modules.py
 "

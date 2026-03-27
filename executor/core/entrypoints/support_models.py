@@ -17,8 +17,11 @@ from models.gpt_oss.models.modeling_gpt_oss import GptOssForCausalLM
 from models.gpt_oss.models.configuration_gpt_oss import GptOssConfig
 from models.qwen3_moe.models.modeling_qwen3_moe import Qwen3MoeForCausalLM
 from models.qwen3_moe.models.configuration_qwen3_moe import Qwen3MoeConfig
+from models.deepseek_r1.models.modeling_deepseek import DeepseekV3ForCausalLM, DeepseekV3ModelMTP
+from models.deepseek_r1.models.configuration_deepseek import DeepseekV3Config
 
 model_dict = {
     "gpt-oss": (GptOssForCausalLM, GptOssConfig),
     "qwen3-moe": (Qwen3MoeForCausalLM, Qwen3MoeConfig),
+    "deepseek_r1": (DeepseekV3ForCausalLM, DeepseekV3ModelMTP, DeepseekV3Config)
 }

@@ -18,7 +18,7 @@ from executor.core.config import InferenceConfig, SchedulerConfig
 from executor.core.engine import ExecutionEngine
 from executor.core.entrypoints import OfflineInference
 from executor.core.scheduler import Scheduler
-from executor.core.types_ import GenerationOutput, Request, StepOutput, Batch
+from executor.core.types_ import GenerationOutput, Request, StepOutput, Batch, MTPInfo
 
 __all__ = [
     "InferenceConfig",
@@ -30,4 +30,5 @@ __all__ = [
     "Request",
     "StepOutput",
     "Batch",
+    "MTPInfo"
 ]

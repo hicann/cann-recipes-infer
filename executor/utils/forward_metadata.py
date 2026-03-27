@@ -25,6 +25,7 @@ class ForwardMetaData:
     attention_mask: Optional[torch.Tensor] = None
     kv_len: Optional[torch.Tensor] = None
     actual_seq_lengths_kv: Optional[torch.Tensor] = None
+    actual_seq_lengths_q: Optional[torch.Tensor] = None
 
 
 _forward_metadata = ForwardMetaData()

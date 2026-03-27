@@ -155,7 +155,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         self.moe_intermediate_size = config.moe_intermediate_size
         self.intermediate_size_per_rank = self.moe_intermediate_size // self.moe_tp_size
         self.experts_per_rank = config.num_experts // self.moe_ep_size
-        self.perfect_eplb = infer_config.model_config.perfect_eplb
+        self.force_eplb = infer_config.model_config.force_eplb
         self.ep_size = self.infer_config.parallel_config.moe_ep_size
         self.tp_size = self.infer_config.parallel_config.moe_tp_size
         self.experts = FusedMoEGMM(
@@ -237,10 +237,10 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                 "comm_quant_mode": 0
             }
 
-    def forward(self, hidden_states, cur_topk_list=None):
+    def forward(self, hidden_states, cur_topk_list=None, **kwargs):
         is_prefill = get_forward_metadata().is_prefill
         topk_idx, topk_weight, _, row_idx = self._forward_gate(hidden_states)
-        if self.perfect_eplb:
+        if self.force_eplb:
             topk_idx = cur_topk_list
         topk_idx = topk_idx.to(torch.int32)
         if self.moe_tp_size > 1:
@@ -718,8 +718,10 @@ class Qwen3MoeForCausalLM(nn.Module):
         self.comm_manager = comm_manager
         self.world_size = infer_config.parallel_config.world_size
         self.num_hidden_layers = config.num_hidden_layers
-        self.perfect_eplb = infer_config.model_config.perfect_eplb
+        self.force_eplb = infer_config.model_config.force_eplb
         self.config = config
+        self.num_experts_per_tok = config.num_experts_per_tok
+        self.num_experts = config.num_experts
         self.input_max_len = infer_config.scheduler_config.input_max_len
         self.lmhead_tp_size = infer_config.parallel_config.lmhead_tp_size
         self.moe_ep_size = infer_config.parallel_config.moe_ep_size
@@ -729,7 +731,6 @@ class Qwen3MoeForCausalLM(nn.Module):
 
         self.model = Qwen3MoeModel(config, infer_config, comm_manager, prefix)
         self.vocab_size_per_rank = config.vocab_size // self.lmhead_tp_size
-        self.experts_per_rank = config.num_experts // self.moe_ep_size
         self.lm_head = ColumnParallelLinear(
             input_size=config.hidden_size,
             output_size=config.vocab_size,
@@ -757,8 +758,8 @@ class Qwen3MoeForCausalLM(nn.Module):
         # TP+DP: all_gather after LM Head to reduce communication volume
         if self.attn_tp_size > 1 and self.attn_dp_size > 1:
             bsz, q_len, v = logits.size()
-            new_logits = torch.empty([bsz * self.attn_tp_size, q_len, v], 
-                                     dtype=logits.dtype, device="npu")
+            new_logits = torch.empty([bsz * self.attn_tp_size, q_len, v],
+                                    dtype=logits.dtype, device="npu")
             dist.all_gather_into_tensor(new_logits, logits, 
                                         group=self.comm_manager.get_group("attn_tp_group"))
             logits = new_logits
@@ -769,46 +770,6 @@ class Qwen3MoeForCausalLM(nn.Module):
             logits = torch.concat(new_logits, dim=-1)
         logits = logits.float()
         return logits
-
-    def gen_cur_topk_idx(
-        self,
-        is_prefill,
-        batch_size,
-        seq_len
-    ):
-        if not self.perfect_eplb:
-            return None
-        global_rank = dist.get_rank()
-        if is_prefill:
-            tokens_per_rank_prefill = (batch_size * seq_len + self.attn_tp_size - 1) // self.attn_tp_size \
-            if self.moe_ep_size != 1 else batch_size * seq_len * self.attn_dp_size
-            step_prefill = tokens_per_rank_prefill * self.config.num_experts_per_tok
-            cur_topk_list_prefill = [
-                (i + global_rank) % self.config.num_experts for i in range(step_prefill)]
-            cur_topk_list = torch.Tensor(cur_topk_list_prefill).int().view(tokens_per_rank_prefill, -1).npu()
-        else:
-            if self.moe_tp_size > 1:
-                expanded_tokens = batch_size * self.config.num_experts_per_tok * seq_len
-                cur_topk_list_decode = []
-                for offset in range(self.moe_ep_size):
-                    expert_start = offset * self.experts_per_rank
-                    expert_end = expert_start + expanded_tokens
-                    cur_topk_list_decode = cur_topk_list_decode + [i for i in range(expert_start, expert_end)]
-                cur_topk_list = torch.Tensor(cur_topk_list_decode).int().view(batch_size * seq_len, -1).npu()
-            else:
-                expanded_tokens = batch_size * self.config.num_experts_per_tok * seq_len  # Total tokens
-                step_gap = self.config.num_experts // self.moe_ep_size # Number of experts per rank
-                expanded_offset = expanded_tokens * global_rank + global_rank # Token count offset
-
-                cur_topk_list_decode = []
-                # Allocate experts using round-robin algorithm
-                for idx in range(expanded_tokens):
-                    col = (expanded_offset + idx) % self.moe_ep_size  # Column index
-                    row = (expanded_offset + idx) // self.moe_ep_size % step_gap  # Row index
-                    expert_idx = row + col * step_gap  # Final expert index
-                    cur_topk_list_decode.append(expert_idx)
-                cur_topk_list = torch.Tensor(cur_topk_list_decode).int().view(batch_size * seq_len, -1).npu()
-        return cur_topk_list
 
     # Adapted from vllm.model_executor.models.qwen3moe.Qwen3MoeModel.load_weights
     def load_weights(self, weights: Iterable[tuple[str,

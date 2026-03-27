@@ -72,8 +72,14 @@ class OfflineInference:
         model_name = self.infer_config.model_config.model_name
 
         if model_name in model_dict:
-            model_class, config_class = model_dict[model_name]
-            self.engine.load_model(config_class, model_class)
+            model_config_cls = model_dict[model_name]
+            if len(model_config_cls) == 2:
+                model_class, config_class = model_config_cls
+                model_mtp_class = None
+            else:
+                model_class, model_mtp_class, config_class = model_config_cls
+                model_mtp_class = None if self.engine.next_n == 0 else model_mtp_class
+            self.engine.load_model(config_class, model_class, model_mtp_class)
             self.engine.warm_up()
         else:
             raise ValueError(f"Unsupported model: {model_name}")
@@ -81,7 +87,7 @@ class OfflineInference:
     def generate(
         self,
         prompts: List[str],
-    ) -> List[GenerationOutput]:
+    ) -> tuple[List[GenerationOutput], List[Optional[dict]]]:
         """Generate text for a batch of prompts.
 
         This method processes prompts using batching:
@@ -93,7 +99,10 @@ class OfflineInference:
             prompts: List of input text prompts.
 
         Returns:
-            List of GenerationOutput objects, one per prompt.
+            A tuple containing:
+            - List of GenerationOutput objects, one per prompt.
+            - List of MTP statistics dicts for each request (None if MTP not enabled).
+              Each dict contains 'spec_num_accepted_tokens' and 'spec_num_forward_ct'.
         """
         if not prompts:
             return []
@@ -131,6 +140,7 @@ class OfflineInference:
 
         # Collect results (only for original requests, not padded ones)
         results = []
+        mtp_stats = [0, 0]  # Store raw MTP statistics
         for request_id in request_ids[:original_request_count]:
             request = self.scheduler.get_finished_request(request_id)
             if request is None:
@@ -139,10 +149,15 @@ class OfflineInference:
                     output_text="",
                     finish_reason="error",
                 ))
+                mtp_stats.append(None)
                 continue
 
             # Decode output
             output_text = self.engine.tokenizer.decode(torch.tensor(request.output_id_list), skip_special_tokens=True)
+            # Caculate mtp accept rate
+            if request.mtp_info:
+                mtp_stats[0] += request.spec_num_accepted_tokens
+                mtp_stats[1] += request.spec_num_forward_ct
 
             results.append(GenerationOutput(
                 prompt=prompt_map[request_id],
@@ -150,4 +165,4 @@ class OfflineInference:
                 finish_reason=request.finish_reason,
             ))
 
-        return results
+        return results, mtp_stats

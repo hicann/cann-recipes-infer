@@ -65,4 +65,4 @@ with superkernel_scope(switch, scope, options):
 > 注：性能数据基于 MTP1 与 perfect eplb 配置采集，平均 1 个 draft token 中 accept token 为 0.7 个。
 ---
 ## 附录
-[环境部署以及样例执行](../../../models/deepseek-r1/README.md)
+[环境部署以及样例执行](../../../models/deepseek_r1/README.md)

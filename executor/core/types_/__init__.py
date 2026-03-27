@@ -15,6 +15,6 @@
 
 """Types module"""
 
-from executor.core.types_.types import GenerationOutput, Request, StepOutput, Batch
+from executor.core.types_.types import GenerationOutput, Request, StepOutput, Batch, MTPInfo
 
-__all__ = ["GenerationOutput", "Request", "StepOutput", "Batch"]
+__all__ = ["GenerationOutput", "Request", "StepOutput", "Batch", "MTPInfo"]

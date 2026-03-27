@@ -13,8 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Model Worker module for managing model inference operations."""
+"""
+Model Worker module for managing model inference operations. 
+MTP Worker provides components for speculative decoding with multi-token prediction (MTP).
+"""
 
 from .model_worker import ModelWorker
+from .mtp_worker import MTPWorker
 
-__all__ = ["ModelWorker"]
+__all__ = ["ModelWorker", "MTPWorker"]

@@ -9,9 +9,9 @@
 
 # User Guide:
 # 1. To execute this script, please enter executor/scripts (cd executor/scripts).
-# 2. Execute test_all_case.sh to run CI tests for all models, currently support deepseek-r1, qwen3-moe.
-#    a. test one specific model: please provide the model folder name, eg. bash test_all_case.sh --models "deepseek-r1"
-#    b. test multiple models: seperate model folder names with blank space, eg. bash test_all_case.sh --models "deepseek-r1 qwen3-moe"
+# 2. Execute test_all_case.sh to run CI tests for all models, currently support deepseek_r1, qwen3-moe.
+#    a. test one specific model: please provide the model folder name, eg. bash test_all_case.sh --models "deepseek_r1"
+#    b. test multiple models: seperate model folder names with blank space, eg. bash test_all_case.sh --models "deepseek_r1 qwen3-moe"
 #    c. test all models: no need to provide specific names of models, eg. bash test_all_case.sh
 
 #!/bin/bash

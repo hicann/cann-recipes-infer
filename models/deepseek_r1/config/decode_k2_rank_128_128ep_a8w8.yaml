@@ -1,0 +1,35 @@
+model_name: "kimi_k2"  # keep it for backward compatibility.
+world_size: 128  # keep it for backward compatibility.
+
+model_config:
+  model_name: "kimi_k2"
+  model_path: "/data/models/origin/kimi-k2-int8-pertoken/"
+  with_ckpt: True                   # [False, True]
+  exe_mode: "ge_graph"              # ["eager", "npugraph_ex", "ge_graph"]
+  enable_profiler: False            # [False, True]
+  force_eplb: False                 # [False, True]
+  enable_cache_compile: True        # [False, True]
+  custom_params:
+    enable_pa: True                   # [False, True]
+    pa_block_size: 128
+    enable_weight_nz: True            # [False, True]
+    enable_mla_prolog: True           # [False, True]
+    enable_multi_streams: True        # [False, True]
+    enable_superkernel: False         # [False, True]
+    moe_chunk_max_len: 1024
+
+data_config:
+  dataset: "LongBench"  # ["default", "LongBench", "InfiniteBench"]
+
+parallel_config:
+  world_size: 128
+  attn_tp_size: 1
+  dense_tp_size: 1
+  moe_tp_size: 1
+  embed_tp_size: 1
+  lmhead_tp_size: 1
+
+scheduler_config:
+  input_max_len: 4060
+  max_new_tokens: 36
+  batch_size: 128

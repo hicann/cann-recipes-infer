@@ -459,12 +459,25 @@ class GptOssForCausalLM(nn.Module):
             forward_metadata=forward_metadata,
             **kwargs,
         )
+        bs, q_len, hidden_size = hidden_states.shape
+        if forward_metadata.is_prefill:
+            bs = position_ids.shape[0]
+            gather_index, _ = torch.max(position_ids, dim=-1)
+            seq_index = ((gather_index + 1).to(torch.int32).cumsum(-1) - 1).npu()
+            hidden_states = \
+                (torch.index_select(hidden_states.view(1, -1, hidden_size), 1, seq_index.view(-1))).view(bs, 1, -1)
+            q_len = 1 # prefill takes th last token
+        else: # combine bs and q_len axes for lm_head
+            hidden_states = hidden_states.view(bs * q_len, 1, hidden_size)
+
         logits = self.lm_head(hidden_states)
+
         if self.lm_head_tp_size > 1:
             new_logits = [logits.clone().detach() for _ in range(self.lm_head_tp_size)]
             dist.all_gather(new_logits, logits)
             logits = torch.concat(new_logits, dim=-1)
-        return logits
+
+        return logits.reshape(bs, q_len, -1).float()
 
     # Adapted from vllm.model_executor.models.gpt_oss.GptOssModel._load_weights_other
     # (https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/gpt_oss.py)

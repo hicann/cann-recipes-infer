@@ -19,7 +19,8 @@ from typing import List, Dict, Optional, Set, Tuple
 from collections import deque
 import torch
 from executor.core.config import SchedulerConfig
-from ..types_.types import Request, Batch, StepOutput
+from executor.utils.forward_metadata import set_forward_metadata, get_forward_metadata
+from ..types_.types import Request, Batch, StepOutput, MTPInfo
 
 
 class Scheduler:
@@ -79,9 +80,10 @@ class Scheduler:
         processes results.
 
         The scheduling strategy:
-        1. Try to schedule prefill requests first (up to budget)
-        2. If no prefill, schedule decode requests
-        3. Execute batch and update states
+        1. Process all pending prefill requests in batch cycles
+        2. Otherwise, try to schedule prefill requests first (up to budget)
+        3. If no prefill, schedule decode requests
+        4. Execute batch and update states
 
         Args:
             engine: ExecutionEngine instance for model inference.
@@ -90,7 +92,7 @@ class Scheduler:
             StepOutput containing batch results,
             or None if no work to do.
         """
-        # Assemble batch
+        # Assemble batch (normal mode)
         batch = self._schedule_batch()
         if batch is None or batch.is_empty():
             return None
@@ -99,7 +101,7 @@ class Scheduler:
         output = engine.forward_batch(batch)
 
         # Process outputs and update request states
-        finished = self._process_batch_output(batch, output)
+        finished = self._process_batch_output(batch)
 
         return StepOutput(
             next_tokens=output.get("next_tokens", {}),
@@ -140,9 +142,10 @@ class Scheduler:
             return None
 
         selected: List[Request] = []
-
+        prefill_mini_batch = self.config.prefill_mini_batch
+        cycle_idx = len(self.running_requests) // prefill_mini_batch
         # Iterate through queue and select requests
-        while self.waiting_queue and len(selected) < self.config.batch_size_per_dp_rank:
+        while self.waiting_queue and len(selected) < prefill_mini_batch:
             request = self.waiting_queue.popleft()
 
             # Tokenize if not already done
@@ -162,10 +165,7 @@ class Scheduler:
             return None
 
         # Create batch
-        batch = Batch(requests=selected, is_prefill=True)
-
-        # Build padded tensors
-        self._build_prefill_tensors(batch)
+        batch = Batch(requests=selected, is_prefill=True, cycle_idx=cycle_idx)
 
         return batch
 
@@ -190,52 +190,31 @@ class Scheduler:
         # Create batch
         batch = Batch(requests=selected, is_prefill=False)
 
-        # Build input tensors from last tokens
-        self._build_decode_tensors(batch)
-
         return batch
-
-    def _build_prefill_tensors(self, batch: Batch) -> None:
-        """Build padded input tensors for prefill batch."""
-        batch.input_ids = torch.stack([req.input_ids for req in batch.requests])
-
-    def _build_decode_tensors(self, batch: Batch) -> None:
-        """Build input tensors for decode batch."""
-        batch.input_ids = torch.tensor([req.get_last_token_id() for req in batch.requests],
-                                       dtype=torch.long).unsqueeze(1)
 
     def _process_batch_output(
         self,
         batch: Batch,
-        output: Dict[str, torch.Tensor]
     ) -> List[int]:
         """Process batch execution output and update request states.
 
         Args:
             batch: The batch that was executed.
-            output: Engine output containing next tokens.
+            output: Engine output used for scheduling state transitions.
 
         Returns:
             List of request IDs that finished in this step.
         """
-        next_tokens = output.get("next_tokens", {})
         finished = []
 
         for request in batch.requests:
-            # Get generated token for this request
-            token = next_tokens.get(request.request_id)
-            if token is None:
-                continue
-
             if batch.is_prefill:
                 # Prefill completion
                 request.is_prefill_done = True
-                request.output_id_list.append(token)
                 self.running_requests[request.request_id] = request
             else:
-                # Decode step
-                request.output_id_list.append(token)
-
+                # Decode step - increment step counter
+                request.decode_step_count += 1
                 # Check if finished
                 if self._should_finish(request):
                     request.is_finished = True
@@ -255,17 +234,10 @@ class Scheduler:
         Returns:
             True if generation should stop.
         """
-        # Check length limit
-        if len(request.output_id_list) >= self.config.max_new_tokens:
+        # Check step limit - iterate max_new_tokens steps
+        if request.decode_step_count >= self.config.max_new_tokens:
             request.finish_reason = "length"
             return True
-
-        # Check for EOS token
-        if request.output_id_list:
-            last_token = request.output_id_list[-1]
-            if hasattr(self.tokenizer, 'eos_token_id') and last_token == self.tokenizer.eos_token_id:
-                request.finish_reason = "eos"
-                return True
 
         return False
 

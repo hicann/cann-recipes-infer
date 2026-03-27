@@ -15,9 +15,11 @@
 
 import os
 import argparse
+import logging
 import yaml
 from executor.core import InferenceConfig, OfflineInference
-from executor.utils.data_utils import generate_default_prompt, load_longbench_dataset, build_dataset_input
+from executor.utils.data_utils import generate_default_prompt, load_longbench_dataset, build_dataset_input, \
+    load_infinitebench_dataset
 
 
 def parse_args():
@@ -35,9 +37,13 @@ def generate_prompt(dataset, dataset_path):
         else:
             dataset = "THUDM/LongBench"
         preset_prompts = load_longbench_dataset(dataset)
-
+    elif dataset == "InfiniteBench":
+        dataset_path = os.path.abspath(os.path.join(dataset_path, f"{dataset}"))
+        if os.path.isdir(dataset_path): # use local InfiniteBench dataset first
+            dataset = dataset_path
+        preset_prompts = load_infinitebench_dataset(dataset)
     else:
-        raise ValueError(f"Unsupported dataset: {dataset}")
+        raise Exception(f"your dataset {dataset} is not supported, dataset supported: LongBench, InfiniteBench")
     return preset_prompts
 
 def preprocess_prompts_for_scheduler(prompts, tokenizer, scheduler_config):
@@ -46,6 +52,29 @@ def preprocess_prompts_for_scheduler(prompts, tokenizer, scheduler_config):
     prompts = prompts[:bsz]
     return build_dataset_input(tokenizer, prompts, scheduler_config.input_max_len,
                                scheduler_config.max_new_tokens, False)
+
+
+def log_results(results, mtp_stats, next_n):
+    """Log inference results and calculate MTP acceptance rate if MTP is enabled.
+
+    Args:
+        results: List of GenerationOutput objects containing output_text.
+        mtp_stats: List of MTP metrics (None if MTP not enabled).
+                   Contain 'spec_num_accepted_tokens' and 'spec_num_forward_ct'.
+        next_n: MTP speculation depth (0 if MTP not enabled).
+    """
+    # Log output text for each request
+    for i, res in enumerate(results):
+        logging.info("Request %s: outputs: %s\n", i, res.output_text)
+
+    # Calculate and log total MTP acceptance rate if MTP is enabled
+    if mtp_stats[0] > 0 and mtp_stats[1] > 0:
+        total_accept_rate = mtp_stats[0] / mtp_stats[1]
+        logging.info("The inference runs with MTP enabled (next_n=%s)", next_n)
+        logging.info("Total accepted tokens: %s", mtp_stats[0])
+        logging.info("Total forward passes: %s", mtp_stats[1])
+        logging.info("Total speculation accept rate: %.4f", total_accept_rate)
+
 
 def main():
     local_rank = int(os.getenv("LOCAL_RANK", "0"))
@@ -58,6 +87,8 @@ def main():
     config = InferenceConfig.from_dict(yaml_dict, global_rank=global_rank, local_rank=local_rank)
     if config.model_config.output_path == "":
         config.model_config.output_path = os.path.dirname(args.yaml_file_path)
+    logging.info("Inference Configuration")
+    logging.info(config)
 
     dataset_path = os.path.join(os.path.dirname(__file__), f"../dataset")
     if config.data_config.dataset_path != "":
@@ -92,9 +123,8 @@ def main():
 
     if config.data_config.dataset != "default":
         prompts = preprocess_prompts_for_scheduler(prompts, llm.engine.tokenizer, config.scheduler_config)
-    results = llm.generate(prompts)
-    for res in results:
-        print(f"outputs: {res.output_text}")
+    results, mtp_stats = llm.generate(prompts)
+    log_results(results, mtp_stats, llm.engine.next_n)
 
 
 if __name__ == "__main__":

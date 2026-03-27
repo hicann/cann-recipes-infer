@@ -19,7 +19,7 @@ source ${FUNCTION_ABS_PATH}
 
 export MODEL_DIR=$(basename "$SCRIPT_PATH")
 export YAML_PARENT_PATH="${SCRIPT_PATH}/config"
-export YAML_FILE_NAME=ci/decode_r1_rank_16_16ep_a8w8.yaml # modify to your yaml file name
+export YAML_FILE_NAME=decode_r1_rank_16_16ep_a8w8.yaml # modify to your yaml file name
 export YAML=${YAML_PARENT_PATH}/${YAML_FILE_NAME}
 
 launch

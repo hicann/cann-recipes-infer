@@ -21,13 +21,14 @@
 - `dtype`: 计算使用的数据类型（默认 "bfloat16"）。
 - `with_ckpt`: 是否加载权重检查点（默认 True）。
 - `next_n`: 投机采样步骤数，即 MTP 模块数量（默认 0）。
-- `exe_mode`: 执行模式，可选 eager, ge_graph, acl_graph（默认 "eager"）。
+- `exe_mode`: 执行模式，可选 eager, ge_graph, npugraph_ex（默认 "eager"）。
+- `enable_static_kernel`: 指定npugraph_ex是否开启静态kernel（默认 False）。
 - `enable_cache_compile`: 是否启用缓存编译（默认 False）。
-- `micro_batch_mode`: 微批次模式（默认 0）。
-- `perfect_eplb`: 是否为 MoE 模型开启完美的专家负载均衡（默认 False）。
+- `force_eplb`: 是否为 MoE 模型开启强制的专家负载均衡（默认 False）。
 - `enable_profiler`: 是否启用性能分析器（默认 False）。
 - `packed_sequence`: 输入序列是否打包（batch+seq 轴合并），默认 True。
 - `enable_weight_nz`: 是否启用权重 NZ 格式（默认 True）。
+- `custom_params`：存放模型特有特性的字典（默认{}）。
 
 ### 2.3 ParallelConfig (并行配置)
 定义分布式推理时的并行维度和 Rank 信息。

@@ -22,7 +22,7 @@ This module contains all configuration classes for the inference framework:
 - SchedulerConfig: Request scheduler configuration
 - InferenceConfig: Unified configuration container
 """
-
+import os
 import math
 from dataclasses import dataclass, field
 from typing import Any
@@ -60,11 +60,10 @@ class ModelConfig:
         with_ckpt: Whether to load checkpoint (default: True)
         next_n: Number of the speculative steps (default: 0)
 
-        exe_mode: Execution mode (eager, ge_graph, acl_graph) (default: "eager")
+        exe_mode: Execution mode (eager, ge_graph, npugraph_ex) (default: "eager")
         enable_cache_compile: Enable cache compilation (default: False)
-
-        micro_batch_mode: Micro batch mode (default: 0)
-        perfect_eplb: Whether to enable perfect expert load balancing for MoE models (default: False)
+        enable_static_kernel: Enable static kernel acceleration for npugraph_ex inference (default: False)
+        force_eplb: Whether to enable force expert load balancing for MoE models (default: False)
 
         enable_profiler: Enable profiler (default: False)
         packed_sequence: Whether input sequences are packed (batch+seq merged) (default: True)
@@ -79,19 +78,20 @@ class ModelConfig:
 
     exe_mode: str = "eager"
     enable_cache_compile: bool = False
-
-    micro_batch_mode: int = 0
-    perfect_eplb: bool = False
+    enable_static_kernel: bool = False
+    force_eplb: bool = False
 
     enable_profiler: bool = False
 
     packed_sequence: bool = True
     enable_weight_nz: bool = True
 
+    custom_params: dict = field(default_factory=dict)
+
     @classmethod
     def from_dict(cls, model_config_dict: dict) -> "ModelConfig":
         """Create ModelConfig from YAML-parsed dictionary."""
-        return cls(
+        model_config = cls(
             model_name=model_config_dict.get("model_name", "model"),
             model_path=model_config_dict.get("model_path", ""),
             output_path=model_config_dict.get("output_path", ""),
@@ -100,12 +100,30 @@ class ModelConfig:
             next_n=model_config_dict.get("next_n", 0),
             exe_mode=model_config_dict.get("exe_mode", "eager"),
             enable_cache_compile=model_config_dict.get("enable_cache_compile", False),
-            micro_batch_mode=model_config_dict.get("micro_batch_mode", 0),
-            perfect_eplb=model_config_dict.get("perfect_eplb", False),
+            enable_static_kernel=model_config_dict.get("enable_static_kernel", False),
+            force_eplb=model_config_dict.get("force_eplb", False),
             enable_profiler=model_config_dict.get("enable_profiler", False),
             packed_sequence=model_config_dict.get("packed_sequence", True),
             enable_weight_nz=model_config_dict.get("enable_weight_nz", True),
+            custom_params=model_config_dict.get("custom_params", {}),
         )
+        model_config._validate()
+        return model_config
+
+    def _validate(self):
+        """Validate model configuration consistency."""
+        if self.exe_mode not in ["eager", "ge_graph", "npugraph_ex"]:
+            raise ValueError(
+                f"exe_mode={self.exe_mode} is not supported, expected one of ['eager', 'ge_graph', 'npugraph_ex']"
+            )
+        if self.enable_static_kernel and self.exe_mode != "npugraph_ex":
+            raise ValueError("enable_static_kernel only supports exe_mode='npugraph_ex'")
+
+        if self.exe_mode == "npugraph_ex" and os.getenv("TASK_QUEUE_ENABLE", "2") != "1":
+            os.environ["TASK_QUEUE_ENABLE"] = "1"  # npugraph_ex only supports TASK_QUEUE_ENABLE 0 or 1
+        else:
+            os.environ["TASK_QUEUE_ENABLE"] = "2"  # 2: default value, opt host perf in eager
+
 
 
 @dataclass
@@ -216,8 +234,10 @@ class SchedulerConfig:
         input_max_len: Maximum input sequence length (default: 1024)
         max_new_tokens: Maximum number of tokens to generate per request (default: 32)
         batch_size_per_dp_rank: Batch size per rank for distributed inference (default: 1)
+        prefill_mini_batch: Batch size for prefill phase pre rank (default: 1)
     """
     batch_size: int = 1
+    prefill_mini_batch: int = 0
     input_max_len: int = 1024
     max_new_tokens: int = 32
     batch_size_per_dp_rank: int = 1  # This will be calculated based on batch_size and parallel config
@@ -229,6 +249,7 @@ class SchedulerConfig:
             batch_size=scheduler_config_dict.get("batch_size", 1),
             input_max_len=scheduler_config_dict.get("input_max_len", 1024),
             max_new_tokens=scheduler_config_dict.get("max_new_tokens", 32),
+            prefill_mini_batch=scheduler_config_dict.get("prefill_mini_batch", 0),
         )
 
 
@@ -261,6 +282,13 @@ class InferenceConfig:
     
         infer_config.scheduler_config.batch_size_per_dp_rank = \
             infer_config.scheduler_config.batch_size // infer_config.parallel_config.attn_dp_size
+
+        if infer_config.scheduler_config.prefill_mini_batch > 0:
+            infer_config.scheduler_config.prefill_mini_batch = \
+            min(infer_config.scheduler_config.batch_size_per_dp_rank, infer_config.scheduler_config.prefill_mini_batch)
+        else:
+            infer_config.scheduler_config.prefill_mini_batch = infer_config.scheduler_config.batch_size_per_dp_rank
+
         return infer_config
 
     def validate(self, hf_config=None):
