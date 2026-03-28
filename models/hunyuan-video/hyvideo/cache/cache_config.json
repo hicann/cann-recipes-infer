@@ -10,7 +10,7 @@
         },
         "TeaCache":{
                 "cache_name" : "TeaCache",
-                "rel_l1_thresh": 0.1,
+                "rel_l1_thresh": 0.15,
                 "coefficients": [733.226126,-401.131952,67.5869174,-3.149879,0.0961237896],
                 "warmup": 2,
                 "latent": "latent",

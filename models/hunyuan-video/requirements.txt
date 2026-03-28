@@ -4,7 +4,7 @@ transformers==4.46.3
 tokenizers==0.20.3
 accelerate==1.1.1
 pandas==2.0.3
-numpy==1.24.4
+numpy==1.26.4
 einops==0.7.0
 tqdm==4.66.2
 loguru==0.7.2

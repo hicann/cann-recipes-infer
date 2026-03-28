@@ -13,6 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .core import UnifiedSPAttention, SPConfig
+from .core import (
+    UnifiedSPAttention,
+    SPConfig,
+    _gather_size_by_comm
+)
 
-__all__ = ['UnifiedSPAttention', 'SPConfig']
+__all__ = [
+    'UnifiedSPAttention',
+    'SPConfig',
+    '_gather_size_by_comm'
+]

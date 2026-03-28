@@ -383,7 +383,19 @@ def add_inference_args(parser: argparse.ArgumentParser):
     group.add_argument(
         "--use-fp8",
         action="store_true",
-        help="Enable use fp8 for inference acceleration."
+        help="Enable a16w8 to save memory."
+    )
+
+    group.add_argument(
+        "--fa-perblock-fp8",
+        action="store_true",
+        help="Enable per_block fp8 quantization in flash attention to accelerate inference."
+    )
+
+    group.add_argument(
+        "--mm-mxfp8",
+        action="store_true",
+        help="Enable mxfp8 quantization in matmul to accelerate inference."
     )
 
     group.add_argument(
@@ -431,7 +443,12 @@ def add_parallel_args(parser: argparse.ArgumentParser):
         default=1,
         help="Ulysses degree.",
     )
-
+    group.add_argument(
+        "--ulysses-anything",
+        action="store_true",
+        help="Enable Ulysses Anything Attention (UAA) for arbitrary sequence length.",
+    )
+ 
     return parser
 
 

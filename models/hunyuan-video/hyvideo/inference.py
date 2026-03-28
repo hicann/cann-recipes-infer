@@ -41,11 +41,13 @@ from hyvideo.modules import load_model
 from hyvideo.text_encoder import TextEncoder
 from hyvideo.utils.data_utils import align_to
 from hyvideo.modules.posemb_layers import get_nd_rotary_pos_embed
-from hyvideo.modules.fp8_optimization import convert_fp8_linear
+from hyvideo.modules.fp8_a16w8 import convert_fp8_linear
+from hyvideo.modules.mxfp8_a8w8 import dynamic_convert_mxfp8_linear
 from hyvideo.diffusion.schedulers import FlowMatchDiscreteScheduler
 from hyvideo.diffusion.pipelines import HunyuanVideoPipeline
 from hyvideo.vae.vae_parallel import decode
 from module.unified_sp.core import UnifiedSPAttention
+from module.unified_sp.uaa import split_func, all_gather_anything
 
 try:
     import xfuser
@@ -74,6 +76,8 @@ def parallelize_transformer(pipe):
         ulysses_group=get_sp_group().ulysses_group,
         ring_group=get_sp_group().ring_group,
         use_ring_overlap=True,
+        ulysses_anything=transformer.args.ulysses_anything,
+        fa_perblock_fp8=pipe.args.fa_perblock_fp8
     )
 
     @functools.wraps(transformer.__class__.forward)
@@ -90,30 +94,22 @@ def parallelize_transformer(pipe):
         return_dict: bool = True,
     ):
         sp_size = get_sequence_parallel_world_size()
-        if x.shape[-2] // 2 % sp_size == 0:
-            # try to split x by height
-            split_dim = -2
-        elif x.shape[-1] // 2 % sp_size == 0:
-            # try to split x by width
-            split_dim = -1
-        else:
-            raise ValueError(
-                "Cannot split video sequence into ulysses_degree x ring_degree"
-                f"({sp_size}) parts evenly"
-            )
+        split_dim = -1
 
         # patch sizes for the temporal, height, and width dimensions are 1, 2, and 2.
         temporal_size, h, w = x.shape[2], x.shape[3] // 2, x.shape[4] // 2
 
-        x = torch.chunk(x, sp_size, dim=split_dim)[get_sequence_parallel_rank()]
+        x = split_func(x, sp_size, dim=split_dim)[get_sequence_parallel_rank()]
 
         dim_thw = freqs_cos.shape[-1]
         freqs_cos = freqs_cos.reshape(temporal_size, h, w, dim_thw)
-        freqs_cos = torch.chunk(freqs_cos, sp_size, dim=split_dim - 1)[get_sequence_parallel_rank()]
+        freqs_cos = freqs_cos.tensor_split(sp_size, dim=split_dim - 1)[get_sequence_parallel_rank()]
+        
         freqs_cos = freqs_cos.reshape(1, -1, 1, dim_thw)
         dim_thw = freqs_sin.shape[-1]
         freqs_sin = freqs_sin.reshape(temporal_size, h, w, dim_thw)
-        freqs_sin = torch.chunk(freqs_sin, sp_size, dim=split_dim - 1)[get_sequence_parallel_rank()]
+        freqs_sin = freqs_sin.tensor_split(sp_size, dim=split_dim - 1)[get_sequence_parallel_rank()]
+
         freqs_sin = freqs_sin.reshape(1, -1, 1, dim_thw)
         
         for block in transformer.double_blocks + transformer.single_blocks:
@@ -133,7 +129,18 @@ def parallelize_transformer(pipe):
 
         return_dict = not isinstance(output, tuple)
         sample = output["x"]
-        sample = get_sp_group().all_gather(sample, dim=split_dim)
+        if self.args.ulysses_anything:
+            sample = all_gather_anything(
+                sample, 
+                dim=split_dim, 
+                world_size=sp_attn.ulysses_world_size, 
+                group=sp_attn.ulysses_pg
+            )
+        else:
+            sample = get_sp_group().all_gather(
+                sample, 
+                dim=split_dim
+            )
         output["x"] = sample
         return output
 
@@ -192,7 +199,8 @@ class Inference(object):
             device (int): The device for inference. Default is 0.
         """
         # ========================================================================
-        logger.info(f"Got text-to-video model root path: {pretrained_model_path}")
+        if os.environ.get('LOCAL_RANK', 0) == "0":
+            logger.info(f"Got text-to-video model root path: {pretrained_model_path}")
         
         # ==================== Initialize Distributed Environment ================
         if args.ulysses_degree > 1 or args.ring_degree > 1:
@@ -223,7 +231,11 @@ class Inference(object):
             if device is None:
                 device = "npu" if torch.cuda.is_available() else "cpu"
 
-        parallel_args = {"ulysses_degree": args.ulysses_degree, "ring_degree": args.ring_degree}
+        parallel_args = {
+            "ulysses_degree": args.ulysses_degree, 
+            "ring_degree": args.ring_degree, 
+            "ulysses_anything": args.ulysses_anything
+        }
 
         # ======================== Get the args path =============================
 
@@ -231,6 +243,18 @@ class Inference(object):
         torch.set_grad_enabled(False)
 
         # =========================== Build main model ===========================
+
+        use_quant = args.use_fp8 or args.mm_mxfp8 or args.fa_perblock_fp8
+        device_name = torch.npu.get_device_name()
+        not_950 = any(device_prefix in device_name for device_prefix in ["Ascend910B", "Ascend910_93"])
+        
+        if use_quant and not_950:
+            raise RuntimeError(
+                f"Only Atlas A5 supports FP8 and MXFP8. "
+                f"Current device: {device_name}, which does not support these features."
+            )
+
+
         logger.info("Building model...")
         factor_kwargs = {"device": device, "dtype": PRECISION_TO_TYPE[args.precision]}
         in_channels = args.latent_channels
@@ -248,6 +272,11 @@ class Inference(object):
         torch.npu.set_device(device)
         model = model.to(device)
         model = Inference.load_state_dict(args, model, pretrained_model_path)
+
+        if args.mm_mxfp8:
+            # Enable dynamic quantization converts the weights to mxfp8. 
+            dynamic_convert_mxfp8_linear(model, original_dtype=PRECISION_TO_TYPE[args.precision])
+
         model.eval()
 
         # ============================= Build extra models ========================
@@ -384,7 +413,9 @@ class Inference(object):
 
         if not model_path.exists():
             raise ValueError(f"model_path not exists: {model_path}")
-        logger.info(f"Loading torch model {model_path}...")
+            
+        if os.environ.get('LOCAL_RANK', 0) == "0":
+            logger.info(f"Loading torch model {model_path}...")
         state_dict = torch.load(model_path, map_location=lambda storage, loc: storage)
 
         if bare_model == "unknown" and ("ema" in state_dict or "module" in state_dict):
@@ -624,9 +655,10 @@ class HunyuanVideoSampler(Inference):
                 f"`video_length-1` must be a multiple of 4, got {video_length}"
             )
 
-        logger.info(
-            f"Input (height, width, video_length) = ({height}, {width}, {video_length})"
-        )
+        if os.environ.get('LOCAL_RANK', 0) == "0":
+            logger.info(
+                f"Input (height, width, video_length) = ({height}, {width}, {video_length})"
+            )
 
         target_height = align_to(height, 16)
         target_width = align_to(width, 16)
@@ -690,7 +722,9 @@ class HunyuanVideoSampler(Inference):
                       n_tokens: {n_tokens}
                     flow_shift: {flow_shift}
        embedded_guidance_scale: {embedded_guidance_scale}"""
-        logger.debug(debug_str)
+       
+        if os.environ.get('LOCAL_RANK', 0) == "0":
+            logger.debug(debug_str)
 
         # ========================================================================
         # Pipeline inference

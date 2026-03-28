@@ -116,7 +116,6 @@ class BaseCache():
             raise ValueError("Invalid step difference")
         updated_taylor_factors = {}
         updated_taylor_factors[0] = feature
-        
         if self.offload:
             self._offload_derivative_approximation(cache_dic, current, distance, updated_taylor_factors)
 
@@ -131,7 +130,7 @@ class BaseCache():
                         raise KeyError("Missing taylor factor") from e
                 else:
                     break
-            utf = updated_taylor_factors 
+            utf = updated_taylor_factors
             cache_dic['cache'][-1][current['stream']][current['layer']][current['module']] = utf
 
     def _offload_derivative_approximation(self, cache_dic: Dict, current: Dict, distance, utf):
@@ -150,7 +149,7 @@ class BaseCache():
         with torch.npu.stream(copy_stream):
             if isinstance(utf, dict):
                 utf = {k: (v.to('cpu', non_blocking=True) if torch.is_tensor(v) else v) for k, v in utf.items()}
-            else: 
+            else:
                 utf = utf.to('cpu', non_blocking=True)
 
         torch.npu.current_stream().wait_stream(copy_stream)
@@ -333,7 +332,6 @@ class FBCache(BaseCache):
         idx = 1 if is_cond else 0
         residual = (current_latent - self.ori_latent).detach()
         self.previous_residual[idx] = residual
-        self.prev_block[idx] = current_block.detach()
 
     def should_cache(self, current_block: torch.Tensor, is_cond: bool = True) -> bool:
         self.step_counter()
@@ -439,11 +437,12 @@ class TeaCache(BaseCache):
 
         if can_reuse:
             self.skip_cnt += 1
-            self.should_skip = True 
+            self.should_skip = True
+            
         else:
             self.accumulated_rel_l1[idx] = 0.0
             self.should_skip = False
-        self.prev_judge_input[idx] = judge_input.detach()
+            self.prev_judge_input[idx] = judge_input.detach()
         self.cnt += 1
         return can_reuse
 

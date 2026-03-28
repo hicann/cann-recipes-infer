@@ -61,12 +61,14 @@ class MMDoubleStreamBlock(nn.Module):
         qk_norm: bool = True,
         qk_norm_type: str = "rms",
         qkv_bias: bool = False,
+        fa_type: str = "flash",
         dtype: Optional[torch.dtype] = None,
         device: Optional[torch.device] = None,
     ):
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
 
+        self.fa_type = fa_type
         self.deterministic = False
         self.heads_num = heads_num
         head_dim = hidden_size // heads_num
@@ -232,7 +234,7 @@ class MMDoubleStreamBlock(nn.Module):
                 q,
                 k,
                 v,
-                mode='flash',
+                mode=self.fa_type,
                 cu_seqlens_q=cu_seqlens_q,
                 cu_seqlens_kv=cu_seqlens_kv,
                 max_seqlen_q=max_seqlen_q,
@@ -297,12 +299,14 @@ class MMSingleStreamBlock(nn.Module):
         qk_norm: bool = True,
         qk_norm_type: str = "rms",
         qk_scale: float = None,
+        fa_type: str = "flash",
         dtype: Optional[torch.dtype] = None,
         device: Optional[torch.device] = None,
     ):
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
-
+        
+        self.fa_type = fa_type
         self.deterministic = False
         self.hidden_size = hidden_size
         self.heads_num = heads_num
@@ -397,7 +401,7 @@ class MMSingleStreamBlock(nn.Module):
                 q,
                 k,
                 v,
-                mode='flash',
+                mode=self.fa_type,
                 cu_seqlens_q=cu_seqlens_q,
                 cu_seqlens_kv=cu_seqlens_kv,
                 max_seqlen_q=max_seqlen_q,
@@ -500,6 +504,7 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
 
+        self.fa_type = "perblock_fp8" if args.fa_perblock_fp8 else "flash"
         self.patch_size = patch_size
         self.in_channels = in_channels
         self.out_channels = in_channels if out_channels is None else out_channels
@@ -579,6 +584,7 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
                     qk_norm=qk_norm,
                     qk_norm_type=qk_norm_type,
                     qkv_bias=qkv_bias,
+                    fa_type=self.fa_type,
                     **factory_kwargs,
                 )
                 for _ in range(mm_double_blocks_depth)
@@ -595,6 +601,7 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
                     mlp_act_type=mlp_act_type,
                     qk_norm=qk_norm,
                     qk_norm_type=qk_norm_type,
+                    fa_type=self.fa_type,
                     **factory_kwargs,
                 )
                 for _ in range(mm_single_blocks_depth)

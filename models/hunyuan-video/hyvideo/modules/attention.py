@@ -1,7 +1,7 @@
 # coding=utf-8
 # Adapted from  
 # https://github.com/Tencent-Hunyuan/HunyuanVideo,
-# Copyright (c) Huawei Technologies Co., Ltd. 2025-2026.
+# Copyright (c) Huawei Technologies Co., Ltd. 2026.
 # Copyright (C) 2024 THL A29 Limited, a Tencent company. All rights reserved.
 #
 # This code is based on Tencent-Hunyuan's HunyuanVideo library and the HunyuanVideo
@@ -27,6 +27,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch_npu
+
+from module.fa_quant import npu_fp8_attn
 
 MEMORY_LAYOUT = {
     "TND": (
@@ -110,6 +112,8 @@ def attention(
         pre_attn_layout, post_attn_layout = MEMORY_LAYOUT["BNSD"]
     elif mode == "flash":
         pre_attn_layout, post_attn_layout = MEMORY_LAYOUT["BNSD"]
+    elif mode == 'perblock_fp8':
+        pre_attn_layout, post_attn_layout = MEMORY_LAYOUT["BSND"]
     elif mode == "vanilla":
         pre_attn_layout, post_attn_layout = MEMORY_LAYOUT["BSND"]
     
@@ -170,6 +174,28 @@ def attention(
                 scale=scale,
             )[0]
             x = torch.cat([attn1, attn2], dim=2)
+    elif mode == "perblock_fp8":
+        scale = 1.0 / math.sqrt(d)
+        attn1 = npu_fp8_attn(
+            q[:, :cu_seqlens_q[1], ...],
+            k[:, :cu_seqlens_kv[1], ...],
+            v[:, :cu_seqlens_kv[1], ...],
+            dst_type=torch.float8_e4m3fn,
+            softmax_scale=scale
+        )
+
+        attn2 = torch_npu.npu_fused_infer_attention_score(
+            q[:, cu_seqlens_q[1]:, ...],
+            k[:, cu_seqlens_kv[1]:, ...],
+            v[:, cu_seqlens_kv[1]:, ...],
+            num_heads=n,
+            input_layout="BSND",
+            scale=scale,
+        )[0]
+
+        x = torch.cat([attn1, attn2], dim=1)
+
+
     elif mode == "vanilla":
         scale_factor = 1 / math.sqrt(q.size(-1))
 

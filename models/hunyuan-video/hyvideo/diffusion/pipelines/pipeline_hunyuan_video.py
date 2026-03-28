@@ -997,7 +997,7 @@ class HunyuanVideoPipeline(DiffusionPipeline):
                     torch_npu.profiler.ProfilerActivity.CPU,
                     torch_npu.profiler.ProfilerActivity.NPU
                     ],
-                schedule=torch_npu.profiler.schedule(wait=0, warmup=4, active=8, repeat=1, skip_first=0),
+                schedule=torch_npu.profiler.schedule(wait=0, warmup=4, active=1, repeat=1, skip_first=0),
                 on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(os.path.join("./prof/DiT_prof/", 
                                                                                 self.args.prof_prefix)),
                 record_shapes=False,
