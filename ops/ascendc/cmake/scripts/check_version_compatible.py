@@ -44,10 +44,12 @@ class VersionChecker:
         # 基本合法性检查, 版本号获取
         cann_version_info_file = Path(args.cann_path[0], args.cann_package_name[0], 'version.info').absolute()
         if not cann_version_info_file.exists():
-            raise ValueError(f"CANN version info file({cann_version_info_file}) not exist.")
+            logging.warning(f"CANN version info file({cann_version_info_file}) not exist.")
+            return None
         ret, cann_version = cls._get_version_str(file=cann_version_info_file)
         if not ret:
-            raise ValueError(f"Can't get version from CANN version info file({cann_version_info_file}).")
+            logging.warning(f"Can't get version from CANN version info file({cann_version_info_file}).")
+            return None
         rst = args.func(cann_version, args)
         return rst
 
@@ -55,17 +57,20 @@ class VersionChecker:
     def _check_compatible(cls, cann_version: str, args) -> str:
         code_version_info_file = Path(args.code_version_info_file[0]).absolute()
         if not code_version_info_file.exists():
-            raise ValueError(f"Code version info file({code_version_info_file}) not exist.")
+            logging.warning(f"Code version info file({code_version_info_file}) not exist.")
+            return None
         ret, code_version = cls._get_version_str(file=code_version_info_file)
         if not ret:
-            raise ValueError(f"Can't get version from Code version info file({code_version_info_file}).")
+            logging.warning(f"Can't get version from Code version info file({code_version_info_file}).")
+            return None
         # 兼容性检查
         cann_sub_version = cann_version.rsplit('.', 1)[0]
         code_sub_version = code_version.rsplit('.', 1)[0]
         if cann_sub_version != code_sub_version:
-            raise ValueError(f"The version number of the current code is {code_sub_version}, "
-                             f"and the version number of the cann package used is {cann_sub_version}. "
-                             f"Please install version {code_sub_version} of the cann package.")
+            logging.warning(f"The version number of the current code is {code_sub_version}, "
+                            f"and the version number of the cann package used is {cann_sub_version}. "
+                            f"Please install version {code_sub_version} of the cann package.")
+            return None
         return cann_sub_version
 
     @classmethod
