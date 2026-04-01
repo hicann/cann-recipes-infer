@@ -44,17 +44,11 @@ function(op_add_subdirectory OP_LIST OP_DIR_LIST)
     set(_OP_DIR_LIST)
 
     file(GLOB OP_HOST_CMAKE_FILES
-        "${CMAKE_CURRENT_SOURCE_DIR}/src/lightning_indexer/CMakeLists.txt"
-        "${CMAKE_CURRENT_SOURCE_DIR}/src/lightning_indexer_quant/CMakeLists.txt"
-        "${CMAKE_CURRENT_SOURCE_DIR}/src/gather_selection_kv_cache/CMakeLists.txt"
-        "${CMAKE_CURRENT_SOURCE_DIR}/src/sparse_flash_attention/CMakeLists.txt"
-        "${CMAKE_CURRENT_SOURCE_DIR}/src/sparse_flash_attention_antiquant/CMakeLists.txt"
-        "${CMAKE_CURRENT_SOURCE_DIR}/src/swiglu_clip_quant/CMakeLists.txt"
-        "${CMAKE_CURRENT_SOURCE_DIR}/src/mla_prolog_v3/CMakeLists.txt"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/*/CMakeLists.txt"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/**/ophost/CMakeLists.txt"
-        "${CMAKE_CURRENT_SOURCE_DIR}/src/**/**/**/ophost/CMakeLists.txt"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/**/**/**/CMakeLists.txt"
     )
+    list(REMOVE_ITEM OP_HOST_CMAKE_FILES "${CMAKE_CURRENT_SOURCE_DIR}/src/utils/CMakeLists.txt")
 
     foreach(OP_CMAKE_FILE ${OP_HOST_CMAKE_FILES})
         if ("${OP_CMAKE_FILE}" MATCHES "ophost")

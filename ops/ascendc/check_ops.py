@@ -26,12 +26,7 @@ logging.basicConfig(
 # 1. 检查单个算子是否存在
 # -------------------------------------------------
 LIGHTNING_OPS = {
-    "npu_lightning_indexer",
-    "npu_lightning_indexer_quant",
     "npu_gather_selection_kv_cache",
-    "npu_mla_prolog_v3",
-    "npu_sparse_flash_attention",
-    "npu_sparse_flash_attention_antiquant",
     "npu_swiglu_clip_quant",
 }
 

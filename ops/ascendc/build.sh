@@ -51,7 +51,7 @@ function help_info() {
     echo "-h|--help            Displays help message."
     echo
     echo "-n|--op-name         Specifies the compiled operator. If there are multiple values, separate them with semicolons and use quotation marks. The default is all."
-    echo "                     For example: -n \"lightning_indexer\" or -n \"lightning_indexer;sparse_flash_attention\""
+    echo "                     For example: -n \"swiglu_clip_quant\""
     echo
     echo "-c|--compute-unit    Specifies the chip type. If there are multiple values, separate them with semicolons and use quotation marks. The default is ascend910_93."
     echo "                     For example: -c \"ascend910_93\" or -c \"ascend910b\""

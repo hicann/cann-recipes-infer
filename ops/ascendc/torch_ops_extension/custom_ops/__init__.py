@@ -14,7 +14,7 @@ __all__ = list(module for _, module, _ in pkgutil.iter_modules([os.path.dirname(
 
 # 导入so 和 python
 from . import custom_ops_lib
-from .converter import npu_lightning_indexer, npu_sparse_flash_attention, npu_lightning_indexer_quant, npu_swiglu_clip_quant, npu_mla_prolog_v3, npu_sparse_flash_attention_antiquant, npu_gather_selection_kv_cache
+from .converter import npu_swiglu_clip_quant, npu_gather_selection_kv_cache
 
 """
 import custom ops as torch_npu ops to support the following usage:

@@ -1,6 +1,6 @@
 ## 概述
 
-此项目是基于昇腾Atlas A3的融合算子库，当前项目中包括[SparseFlashAttention](./docs/custom-npu_sparse_flash_attention.md)、[SparseFlashAttentionAntiquant](./docs/custom-npu_sparse_flash_attention_antiquant.md)、[LightningIndexer](./docs/custom-npu_lightning_indexer.md)、[LightningIndexerQuant](./docs/custom-npu_lightning_indexer_quant.md)、[SwigluClipQuant](./docs/custom-npu_swiglu_clip_quant.md)、[MLAPrologV3](./docs/custom-npu_mla_prolog_v3.md)和[GatherSelectionKvCache](./docs/custom-npu_gather_selection_kv_cache.md)七个算子。
+此项目是基于昇腾Atlas A3的融合算子库，当前项目中包括[SwigluClipQuant](./docs/custom-npu_swiglu_clip_quant.md)和[GatherSelectionKvCache](./docs/custom-npu_gather_selection_kv_cache.md)。
 
 ## 目录结构说明
 
@@ -11,22 +11,7 @@
   ├── docs                                      # 算子使用说明和资料
   ├── examples                                  # 算子的使用示例代码
   ├── src                                       # 算子的源代码
-  |   ├── sparse_flash_attention                # 推理SparseFlashAttention（简称sfa）算子示例代码
-  |   |   ├── op_host                           # 算子信息库、Tiling、InferShape相关实现目录
-  |   |   ├── op_kernel                         # 算子Kernel目录
-  |   ├── sparse_flash_attention_antiquant      # 推理SparseFlashAttentionAntiquant算子示例代码
-  |   |   ├── op_host                           # 算子信息库、Tiling、InferShape相关实现目录
-  |   |   ├── op_kernel                         # 算子Kernel目录
-  |   ├── lightning_indexer                     # 推理LightningIndexer（简称li）算子示例代码
-  |   |   ├── op_host                           # 算子信息库、Tiling、InferShape相关实现目录
-  |   |   ├── op_kernel                         # 算子Kernel目录
-  |   ├── lightning_indexer_quant               # 推理LightningIndexerQuant（简称liq）算子示例代码
-  |   |   ├── op_host                           # 算子信息库、Tiling、InferShape相关实现目录
-  |   |   ├── op_kernel                         # 算子Kernel目录
   |   ├── swiglu_clip_quant                     # 推理SwigluClipQuant算子示例代码
-  |   |   ├── op_host                           # 算子信息库、Tiling、InferShape相关实现目录
-  |   |   ├── op_kernel                         # 算子Kernel目录
-  |   ├── mla_prolog_v3                         # 推理MLAPrologV3算子示例代码
   |   |   ├── op_host                           # 算子信息库、Tiling、InferShape相关实现目录
   |   |   ├── op_kernel                         # 算子Kernel目录
   |   ├── gather_selection_kv_cache             # 推理gather_selection_kv_cache算子示例代码
@@ -151,12 +136,7 @@
 examples用例运行命令如下：
   ```shell
   cd /home/code/cann-recipes-infer/ops/ascendc/examples
-  python3 test_npu_lightning_indexer.py
-  python3 test_npu_lightning_indexer_quant.py
-  python3 test_npu_sparse_flash_attention.py   
-  python3 test_npu_sparse_flash_attention_antiquant.py   
   python3 test_npu_swiglu_clip_quant.py
-  python3 test_npu_mla_prolog_v3.py
   ```
 
 ## 附录
