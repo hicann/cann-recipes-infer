@@ -44,4 +44,4 @@ export HCCL_OP_EXPANSION_MODE=AIV
 ```
 
 ## 附录
-[环境部署以及样例执行](../../../models/gpt-oss/README.md)
+[环境部署以及样例执行](../../../models/gpt_oss/README.md)

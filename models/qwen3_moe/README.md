@@ -30,7 +30,7 @@ Qwen3-MoE模型是2025年开源的大语言模型，包括Qwen3-235B-A22B与Qwen
 
     # 安装依赖的python库，仅支持python 3.11
     cd cann-recipes-infer
-    pip3 install -r ./models/qwen3-moe/requirements.txt
+    pip3 install -r ./models/qwen3_moe/requirements.txt
     ```
 
 4. 配置样例运行所需环境信息。
@@ -53,9 +53,9 @@ Qwen3-MoE模型是2025年开源的大语言模型，包括Qwen3-235B-A22B与Qwen
 
    - 修改YAML文件中`model_path`参数。关于YAML文件中的更多配置说明可参见[YAML参数描述](./config/README.md)。
 
-     在`models/qwen3-moe/config`目录下已提供了较优性能的YAML样例供您参考，您可以根据模型类型选择对应的YAML文件，本文以`models/qwen3-moe/config/qwen3_235b_16tp.yaml`文件为例，修改其中的`model_path`参数，将其设置为[权重准备](#权重准备)阶段准备好的权重文件存储路径，例如`/data/models/qwen3_origin_weight/`。
+     在`models/qwen3_moe/config`目录下已提供了较优性能的YAML样例供您参考，您可以根据模型类型选择对应的YAML文件，本文以`models/qwen3_moe/config/qwen3_235b_16tp.yaml`文件为例，修改其中的`model_path`参数，将其设置为[权重准备](#权重准备)阶段准备好的权重文件存储路径，例如`/data/models/qwen3_origin_weight/`。
 
-   - 修改`models/qwen3-moe/infer.sh`脚本中`YAML_FILE_NAME`参数。
+   - 修改`models/qwen3_moe/infer.sh`脚本中`YAML_FILE_NAME`参数。
 
      将`YAML_FILE_NAME`设置为`config`文件夹下YAML文件的名字，例如`qwen3_235b_16tp.yaml`。
 
@@ -80,7 +80,7 @@ Qwen3-MoE模型是2025年开源的大语言模型，包括Qwen3-235B-A22B与Qwen
 2. 执行推理脚本。
 
    ```shell
-   cd models/qwen3-moe
+   cd models/qwen3_moe
    bash infer.sh
    ```
    > 说明：如果是多机环境，需要在每个节点上执行。

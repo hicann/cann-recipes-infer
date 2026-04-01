@@ -33,7 +33,7 @@
     git clone https://gitcode.com/cann/cann-recipes-infer.git
 
     # 安装依赖的python库
-    cd cann-recipes-infer/models/gpt-oss
+    cd cann-recipes-infer/models/gpt_oss
     pip3 install -r requirements.txt
     ```
 
@@ -60,9 +60,9 @@
 
    - 修改YAML文件中的`model_path`参数。
 
-     在`models/gpt-oss/config`目录下已提供了较优性能的YAML样例供您参考，您可以根据权重的不同选择对应的YAML文件，本文以`gpt_oss_20b.yaml`文件为例，修改其中的`model_path`参数，将其设置为[权重准备](#权重准备)阶段准备好的权重文件存储路径，例如`/data/models/gpt-oss-20b-bf16`。
+     在`models/gpt_oss/config`目录下已提供了较优性能的YAML样例供您参考，您可以根据权重的不同选择对应的YAML文件，本文以`gpt_oss_20b.yaml`文件为例，修改其中的`model_path`参数，将其设置为[权重准备](#权重准备)阶段准备好的权重文件存储路径，例如`/data/models/gpt-oss-20b-bf16`。
 
-   - 修改`models/gpt-oss/infer.sh`脚本中`YAML`参数。
+   - 修改`models/gpt_oss/infer.sh`脚本中`YAML`参数。
 
      将`YAML`设置为`config`文件夹下YAML文件名称，例如`gpt_oss_20b.yaml`。
 
@@ -86,7 +86,7 @@
 3. 执行推理脚本。
 
     ```shell
-    cd models/gpt-oss
+    cd models/gpt_oss
     bash infer.sh
     ```
 

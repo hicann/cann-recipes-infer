@@ -70,4 +70,4 @@ if self.enable_cache_compile:
 export HCCL_OP_EXPANSION_MODE=AIV
 ```
 ## 附录
-[环境部署以及样例执行](../../../models/qwen3-moe/README.md)
+[环境部署以及样例执行](../../../models/qwen3_moe/README.md)
