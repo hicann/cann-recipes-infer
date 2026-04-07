@@ -27,7 +27,7 @@ conda activate sana
   ```
 
 ### 依赖安装
-本仓库依赖SANA-Video的开源代码代码。
+本仓库依赖 SANA-Video 的开源代码。
 首先在项目目录拉取SANA-Video源代码：
 ```
 git clone https://github.com/NVlabs/Sana.git
@@ -58,12 +58,18 @@ git clone https://gitcode.com/cann/cann-recipes-infer.git
 cp -rn Sana/* cann-recipes-infer/models/sana-video/
 ```
 
+说明：`models/sana-video` 现在只保留 NPU patch 层、入口脚本与文档，绝大部分 `diffusion/` 源码来自上游 Sana。推理入口会在导入上游模块前自动执行 `patches.apply_all()`：`patches/__init__.py` 中包含NPU适配 patch，包括 `patch_triton_rms_norm_import()` 和 `patch_wan_rotary_npu()`；`patches/npu_patches.py` 中包含优化相关 patch，并通过 `apply_npu_optimization_patches()` 统一应用。
+
 安装依赖：
 
 ```
 cd cann-recipes-infer/models/sana-video
 pip install -e .
+pip uninstall -y opencv-python
+pip install opencv-python-headless==4.8.0.76
 ```
+
+说明：依赖中的`mmengine` 会引入 `opencv-python`，本样例需要 `opencv-python-headless==4.8.0.76`，因此需切换为 headless 版本。
 
 编译安装mmcv库(注意1.x分支才有Registry模块)：
 ```
@@ -111,6 +117,6 @@ bash inference_video_scripts/inference_sana_video.sh \
 
 本样例在Atlas A2的推理性能如下表所示：
 
-| 规格| 单步时延(s) | 端到端时延(s) |
+| 规格| 单步时延(s) | Diffusion sampling总时长(s) |
 |--|--| --|
-| 480p81f | 2.79 | 154.2 |
+| 480p81f | 2.75 | 132 |

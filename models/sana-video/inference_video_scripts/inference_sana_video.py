@@ -35,11 +35,13 @@ import torch.nn as nn
 import torch_npu
 from torch_npu.contrib import transfer_to_npu
 from accelerate import Accelerator
+from patches import apply_all
 from termcolor import colored
 from tqdm import tqdm
 
 warnings.filterwarnings("ignore")  # ignore warning
 os.environ["DISABLE_XFORMERS"] = "1"
+apply_all()
 
 from diffusion import DPMS, FlowEuler, LongLiveFlowEuler, LTXFlowEuler
 from diffusion.data.datasets.utils import *
@@ -531,10 +533,10 @@ if __name__ == "__main__":
         del state_dict["state_dict"]["pos_embed"]
 
     missing, unexpected = model.load_state_dict(state_dict["state_dict"], strict=False)
-    # 调换时序conv2d的hw轴
+    # Keep in sync with patch_temporal_conv_swap().
     for block in model.blocks:
         block.mlp.t_conv_swap.weight = nn.Parameter(block.mlp.t_conv.weight.permute(0, 1, 3, 2))
-        
+
     logger.warning(f"Missing keys: {missing}")
     logger.warning(f"Unexpected keys: {unexpected}")
     model.eval().to(weight_dtype)

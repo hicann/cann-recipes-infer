@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = ["setuptools>=61.0,<82"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -13,6 +13,7 @@ classifiers = [
     "License :: OSI Approved :: Apache Software License",
 ]
 dependencies = [
+    "setuptools>=61.0,<82",
     "torch==2.6.0+cpu",
     "torch-npu==2.6.0",
     "numpy<2",
@@ -33,7 +34,6 @@ dependencies = [
     "image-reward",
     "ipdb",
     "omegaconf",
-    "opencv-python-headless",
     "optimum",
     "patch_conv",
     "peft==0.17.0",
