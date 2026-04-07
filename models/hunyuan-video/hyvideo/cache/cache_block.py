@@ -81,14 +81,30 @@ def _double_block_full_compute(
     k = torch.cat((img_k, txt_k), dim=1)
     v = torch.cat((img_v, txt_v), dim=1)
 
-    attn = attention(q, k, v, 
-                    mode='flash', 
-                    cu_seqlens_q=block_args['cu_seqlens_q'], 
-                    cu_seqlens_kv=block_args['cu_seqlens_kv'], 
-                    max_seqlen_q=block_args['max_seqlen_q'], 
-                    max_seqlen_kv=block_args['max_seqlen_kv'], 
-                    batch_size=img.shape[0]
-                )
+    # attention computation start
+    if not self.hybrid_seq_parallel_attn:
+        attn = attention(
+            q,
+            k,
+            v,
+            mode='flash',
+            cu_seqlens_q=block_args['cu_seqlens_q'], 
+            cu_seqlens_kv=block_args['cu_seqlens_kv'], 
+            max_seqlen_q=block_args['max_seqlen_q'], 
+            max_seqlen_kv=block_args['max_seqlen_kv'], 
+            batch_size=img_k.shape[0],
+        )
+    else:
+        attn = parallel_attention(
+            self.hybrid_seq_parallel_attn,
+            q,
+            k,
+            v,
+            img_q_len=img_q.shape[1],
+            img_kv_len=img_k.shape[1],
+            cu_seqlens_q=block_args['cu_seqlens_q'], 
+            cu_seqlens_kv=block_args['cu_seqlens_kv'], 
+        )
     
     img_attn, txt_attn = attn[:, :img.shape[1]], attn[:, img.shape[1]:]
     # Image Attn Update
@@ -246,15 +262,31 @@ def _single_block_full_compute(
         img_q, img_k = apply_rotary_emb(img_q, img_k, freqs_cis, head_first=False)
         q = torch.cat((img_q, txt_q), dim=1)
         k = torch.cat((img_k, txt_k), dim=1)
-    
-    attn = attention(q, k, v, 
-                mode='flash', 
-                cu_seqlens_q=block_args['cu_seqlens_q'], 
-                cu_seqlens_kv=block_args['cu_seqlens_kv'], 
-                max_seqlen_q=block_args['max_seqlen_q'], 
-                max_seqlen_kv=block_args['max_seqlen_kv'], 
-                batch_size=x.shape[0]
-            )
+
+    # attention computation start
+    if not self.hybrid_seq_parallel_attn:
+        attn = attention(
+            q,
+            k,
+            v,
+            mode='flash',
+            cu_seqlens_q=block_args['cu_seqlens_q'], 
+            cu_seqlens_kv=block_args['cu_seqlens_kv'], 
+            max_seqlen_q=block_args['max_seqlen_q'], 
+            max_seqlen_kv=block_args['max_seqlen_kv'], 
+            batch_size=k.shape[0],
+        )
+    else:
+        attn = parallel_attention(
+            self.hybrid_seq_parallel_attn,
+            q,
+            k,
+            v,
+            img_q_len=img_q.shape[1],
+            img_kv_len=img_k.shape[1],
+            cu_seqlens_q=block_args['cu_seqlens_q'], 
+            cu_seqlens_kv=block_args['cu_seqlens_kv'], 
+        )
     
     output = self.linear2(torch.cat((attn, self.mlp_act(mlp)), dim=2))
     cache_manager.cache_method.derivative_approximation(cache_dic, current, output)

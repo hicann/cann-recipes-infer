@@ -501,3 +501,20 @@ else:
     }
 }
 ```
+
+#### cache for sp
+
+本方案支持cache+多卡推理，针对FBCache和TeaCache，需要通过all_reduce收集每张卡的`l1_loss`，每张卡采用相同的cache复用/计算判断。
+
+```python
+def _sync_scalar_for_sp(self, value: float) -> float:
+    """
+    Synchronize a scalar value across all SP ranks.
+    Returns the averaged value across all ranks.
+    """
+    if self.sp_group is None or self.sp_world_size <= 1:
+        return value
+    tensor = torch.tensor([value], dtype=torch.float32, device='npu')
+    dist.all_reduce(tensor, op=dist.ReduceOp.SUM, group=self.sp_group)
+    return (tensor.item() / self.sp_world_size)
+```

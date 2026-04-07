@@ -100,7 +100,7 @@ source scripts/set_env.sh
 bash scripts/test.sh
 ```
 
-**Dit-Cache**：本样例集成了多种Dit-Cache方案，包括[FBCache](https://github.com/chengzeyi/ParaAttention)、[TeaCache](https://cvpr.thecvf.com/virtual/2025/poster/33872)，[TaylorSeer](https://github.com/Shenyi-Z/TaylorSeer)加速方案，**当前仅支持单机单卡**。
+**Dit-Cache**：本样例集成了多种Dit-Cache方案，包括[FBCache](https://github.com/chengzeyi/ParaAttention)、[TeaCache](https://cvpr.thecvf.com/virtual/2025/poster/33872)，[TaylorSeer](https://github.com/Shenyi-Z/TaylorSeer)加速方案，**支持多卡推理**。
 
 通过读取配置文件`hyvideo/cache/cache_config.json`初始化Dit-Cache，用户可自定义配置文件，通过传入参数`--cache-config`来自定义配置文件地址。
 

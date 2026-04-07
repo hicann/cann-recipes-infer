@@ -48,6 +48,7 @@ from hyvideo.diffusion.pipelines import HunyuanVideoPipeline
 from hyvideo.vae.vae_parallel import decode
 from module.unified_sp.core import UnifiedSPAttention
 from module.unified_sp.uaa import split_func, all_gather_anything
+from module.dit_cache.cache_method import cache_manager 
 
 try:
     import xfuser
@@ -78,6 +79,17 @@ def parallelize_transformer(pipe):
         use_ring_overlap=True,
         ulysses_anything=transformer.args.ulysses_anything,
         fa_perblock_fp8=pipe.args.fa_perblock_fp8
+    )
+
+    # Set SP group for cache_manager to enable multi-card cache synchronization 
+    # For pure SP (ring_degree=1), use ulysses_group; otherwise use the combined SP group 
+    sp_world_size = get_sequence_parallel_world_size() 
+    sp_rank = get_sequence_parallel_rank() 
+    # Use ulysses_group for synchronization (covers pure Ulysses and hybrid cases) 
+    cache_manager.set_sp_group( 
+        sp_group=get_sp_group().ulysses_group, 
+        sp_world_size=sp_world_size, 
+        sp_rank=sp_rank 
     )
 
     @functools.wraps(transformer.__class__.forward)

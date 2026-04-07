@@ -54,6 +54,19 @@ class CacheManager():
         self.config = None
         self.cache_params = {}
         self.enable_separate_cfg = False
+        self.sp_group = None  # Sequence parallel process group
+        self.sp_world_size = 1
+        self.sp_rank = 0
+
+    def set_sp_group(self, sp_group=None, sp_world_size=1, sp_rank=0):
+        """Set sequence parallel process group for multi-card cache synchronization."""
+        self.sp_group = sp_group
+        self.sp_world_size = sp_world_size
+        self.sp_rank = sp_rank
+        if self.cache_method is not None:
+            self.cache_method.sp_group = sp_group
+            self.cache_method.sp_world_size = sp_world_size
+            self.cache_method.sp_rank = sp_rank
 
     def from_config(self, config_path, cache_params=None):
         self.config = load_cache_config(config_path)
@@ -68,6 +81,11 @@ class CacheManager():
             self.cache_method = TaylorSeer(self.config, self.cache_params)
         else:
             self.cache_method = NoCache()
+        # Propagate SP settings to cache method
+        if self.sp_group is not None:
+            self.cache_method.sp_group = self.sp_group
+            self.cache_method.sp_world_size = self.sp_world_size
+            self.cache_method.sp_rank = self.sp_rank
         logger.info(f"Apply dit cache method: {self.cache_method.cache_name}!")
         logger.info(f"Enable separate_cfg: {self.enable_separate_cfg}!")
 
@@ -85,9 +103,26 @@ class BaseCache():
         self.streams_init()
         self.copy_events = []
         self.cal_events = []
+        # SP settings for multi-card
+        self.sp_group = None
+        self.sp_world_size = 1
+        self.sp_rank = 0
 
     def step_counter(self):
         self.num_steps += 1
+
+    def _sync_scalar_for_sp(self, value: float) -> float:
+        """
+        Synchronize a scalar value across all SP ranks.
+        Returns the averaged value across all ranks.
+        """
+        
+        value = value.item() if torch.is_tensor(value) else value
+        if self.sp_group is None or self.sp_world_size <= 1:
+            return value
+        tensor = torch.tensor([value], dtype=torch.float32, device='npu')
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM, group=self.sp_group)
+        return (tensor.item() / self.sp_world_size)
 
     def print_statistics(self):
         raise NotImplementedError("Need print_statistics")
@@ -343,6 +378,8 @@ class FBCache(BaseCache):
         mean_diff = torch.mean(torch.abs(current_block - prev_block))
         mean_current = torch.mean(torch.abs(current_block))
         diff_ratio = mean_diff / (mean_current + 1e-8)
+        # Sync diff_ratio across all SP ranks for consistent decision
+        diff_ratio = self._sync_scalar_for_sp(diff_ratio)
         can_reuse = diff_ratio < self.rel_l1_thresh_fbcache
         if can_reuse:
             self.skip_cnt += 1
@@ -425,12 +462,14 @@ class TeaCache(BaseCache):
             self.accumulated_rel_l1[idx] = 0.0
             self.cnt += 1
             return False
-        
+
         prev_input = self.prev_judge_input[idx]
         accumulated_rel_l1 = self.accumulated_rel_l1[idx]
         abs_diff = torch.abs(judge_input - prev_input)
         rel_l1 = abs_diff.mean() / (prev_input.abs().mean() + 1e-8)
-        scaled_rel_l1 = abs(self.rescale_func(rel_l1.cpu().item()))
+        # Sync rel_l1 across all SP ranks for consistent decision
+        rel_l1 = self._sync_scalar_for_sp(rel_l1)
+        scaled_rel_l1 = abs(self.rescale_func(rel_l1))
         self.accumulated_rel_l1[idx] += scaled_rel_l1
         accumulated_rel_l1 = self.accumulated_rel_l1[idx]
         can_reuse = accumulated_rel_l1 < self.rel_l1_thresh
@@ -438,7 +477,6 @@ class TeaCache(BaseCache):
         if can_reuse:
             self.skip_cnt += 1
             self.should_skip = True
-            
         else:
             self.accumulated_rel_l1[idx] = 0.0
             self.should_skip = False

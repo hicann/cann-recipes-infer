@@ -82,10 +82,7 @@ def main():
 
     cache_manager.from_config(args.cache_config, cache_params=cache_params)
 
-    if WORLD_SIZE > 1 and cache_manager.cache_method.cache_name != "NoCache":
-        raise Exception("Cannot enable both Multi-NPU and DIT-Cache!")
-
-    elif cache_manager.cache_method.cache_name == "TaylorSeer":
+    if cache_manager.cache_method.cache_name == "TaylorSeer":
         for block in hunyuan_video_sampler.pipeline.transformer.double_blocks:
             block.forward = double_block_forward.__get__(block, type(block))
 
