@@ -6,6 +6,7 @@ model_config:
   model_path: "/data/models/origin/DeepSeek-R1-W8A8"
   with_ckpt: True                   # [False, True]
   exe_mode: "npugraph_ex"                 # ["eager", "npugraph_ex", "ge_graph"]
+  enable_static_kernel: False             # [False, True] Only takes effect in npugraph_ex mode.
   enable_profiler: False            # [False, True]
   force_eplb: False                 # [False, True]
   enable_cache_compile: False       # [False, True]

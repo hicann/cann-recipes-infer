@@ -261,7 +261,7 @@ class ExecutionEngine:
                 )
 
         # Run inference
-        output, _ = self.main_worker.inference(model_inputs, is_prefill=batch.is_prefill)
+        output, infer_time = self.main_worker.inference(model_inputs, is_prefill=batch.is_prefill)
 
         # Handle different output formats: tuple (logits, prev_hidden_states) or tensor (logits)
         if isinstance(output, tuple):
@@ -280,11 +280,12 @@ class ExecutionEngine:
 
         if self.mtp_worker:
             accepted_num = self.verify_spec_tokens(batch, next_tokens)
-            self.mtp_worker.inference(batch, next_tokens, accepted_num, model_inputs, prev_hidden_states)
+            infer_time_mtp = self.mtp_worker.inference(batch, next_tokens, accepted_num,
+                                                       model_inputs, prev_hidden_states)
+            infer_time += infer_time_mtp
 
         self.profiler.step()
-
-        next_tokens_by_request = batch.update_requests_from_batch(next_tokens)
+        next_tokens_by_request = batch.update_requests_from_batch(next_tokens, infer_time)
         return {
             "next_tokens": next_tokens_by_request,
             "logits": logits,

@@ -81,7 +81,7 @@ source ${cann_path}/bin/setenv.bash
 
 1. 配置推理执行需要加载的权重文件以及YAML文件。
 
-   - 修改YAML文件中`model_path`参数。关于YAML文件中的更多配置说明可参见[YAML参数描述](./config/README.md)。
+   - 修改YAML文件中`model_path`参数。关于YAML文件中的更多配置说明可参见[YAML参数描述](../../docs/common/inference_config_guide.md)。
 
      在`models/deepseek_r1/config`目录下已提供了较优性能的YAML样例供您参考，您可以根据模型类型、集群规模以及量化类型选择对应的YAML文件，本文以`models/deepseek_r1/config/decode_r1_rank_16_16ep_a8w8.yaml`文件为例，修改其中的`model_path`参数，将其设置为[权重转换](#权重转换)阶段准备好的权重文件存储路径，例如`/data/models/origin/DeepSeek-R1-W8A8`。
 
@@ -150,10 +150,10 @@ source ${cann_path}/bin/setenv.bash
 
 为了缓解这两处峰值带来的OOM问题，可分别采用以下方法：
 
-  - 通过YAML文件中的`enable_pa`开关使能Flash Attention融合算子，算子内会切块计算Attention，避免了q_s * kv_s的峰值内存产生。
+  - 使能Paged Attention进行内存管理并调用Flash Attention融合算子，算子内会切块计算Attention，避免了q_s * kv_s的峰值内存产生。
 
   - Prefill内存通常与batch_size大小成正比，当decode需要推理的global batch size过大时，prefill可能会由于OOM而无法在一轮推理中处理完所有的batch，因此我们可进行多次小batch串行推理，从而降低峰值内存。
 
-    可通过YAML中的`enable_prefill_multi_cycle`开关使能，当前仅支持mini_batch的大小为1，即逐batch进行推理。
+    可通过配置YAML中的`prefill_mini_batch`，表示prefill阶段的batch大小，从而进行小batch串行推理。
 
   - 为了缓解MoE负载不均带来的峰值内存，我们可进行Chunk MoE推理，即在MoE切Chunk串行推理，降低极端场景下的峰值内存，可通过YAML中的`moe_chunk_max_len`开关设置chunk的大小。当前该开关只针对prefill生效，开启后，由于MoE部分将串行计算各chunk，会对prefill的性能产生相应的影响。

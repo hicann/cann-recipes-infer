@@ -96,6 +96,8 @@ class Request:
     # Metrics
     spec_num_forward_ct: int = 0
     spec_num_accepted_tokens: int = 0
+    # Measure the combined inference time of the main model and the MTP model
+    infer_time: List[float] = field(default_factory=list)
     # Step counter for decode phase
     decode_step_count: int = 0
 
@@ -216,6 +218,7 @@ class Batch:
     def update_requests_from_batch(
         self,
         next_tokens: Optional[torch.Tensor],
+        infer_time: Optional[List]
     ) -> Dict[int, List[int]]:
         """Split batch outputs by index and update each request in-place."""
         next_tokens_by_request: Dict[int, List[int]] = {}
@@ -248,6 +251,9 @@ class Batch:
 
             if kv_lens is not None:
                 request.kv_len = kv_lens[i]
+
+            if infer_time is not None:
+                request.infer_time.append(infer_time)
 
         return next_tokens_by_request
 

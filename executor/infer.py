@@ -17,9 +17,11 @@ import os
 import argparse
 import logging
 import yaml
+import torch
 from executor.core import InferenceConfig, OfflineInference
 from executor.utils.data_utils import generate_default_prompt, load_longbench_dataset, build_dataset_input, \
     load_infinitebench_dataset
+from executor.utils.common_utils import process_infer_time, obtain_mtp_stats
 
 
 def parse_args():
@@ -54,26 +56,45 @@ def preprocess_prompts_for_scheduler(prompts, tokenizer, scheduler_config):
                                scheduler_config.max_new_tokens, False)
 
 
-def log_results(results, mtp_stats, next_n):
+def log_results(results, mtp_stats, infer_time, next_n, model_name):
     """Log inference results and calculate MTP acceptance rate if MTP is enabled.
 
     Args:
         results: List of GenerationOutput objects containing output_text.
-        mtp_stats: List of MTP metrics (None if MTP not enabled).
+        mtp_stats: Dict of MTP metrics (None if MTP not enabled).
                    Contain 'spec_num_accepted_tokens' and 'spec_num_forward_ct'.
+        infer_time: Per-step inference time list. The first item is prefill time.
         next_n: MTP speculation depth (0 if MTP not enabled).
+        model_name: Name of the model used for logging.
     """
     # Log output text for each request
     for i, res in enumerate(results):
         logging.info("Request %s: outputs: %s\n", i, res.output_text)
 
-    # Calculate and log total MTP acceptance rate if MTP is enabled
-    if mtp_stats[0] > 0 and mtp_stats[1] > 0:
-        total_accept_rate = mtp_stats[0] / mtp_stats[1]
-        logging.info("The inference runs with MTP enabled (next_n=%s)", next_n)
-        logging.info("Total accepted tokens: %s", mtp_stats[0])
-        logging.info("Total forward passes: %s", mtp_stats[1])
-        logging.info("Total speculation accept rate: %.4f", total_accept_rate)
+    decode_infer_time = infer_time[1:] if infer_time and len(infer_time) > 1 else []
+    if decode_infer_time:
+        # Calculate and log total MTP acceptance rate if MTP is enabled
+        if next_n > 0:
+            cnt = mtp_stats["spec_num_forward_ct"] - 1
+            spec_num_accepted_tokens = [x - cnt for x in mtp_stats["spec_num_accepted_tokens"]]
+            accept_token_num = torch.tensor(spec_num_accepted_tokens, dtype=torch.float)
+            obtain_mtp_stats(
+                next_n,
+                model_name,
+                accept_token_num,
+                cnt,
+                decode_infer_time,
+            )
+            avg_accepted_num = torch.mean(accept_token_num).item()
+            total_accept_rate = avg_accepted_num / cnt + 1
+            logging.info("Total speculation accept rate: %.4f", total_accept_rate)
+        else:
+            avg_infer_time = sum(decode_infer_time) / len(decode_infer_time)
+            logging.info(
+                "%s decode average inference time cost is %.2f ms",
+                model_name,
+                avg_infer_time * 1000,
+            )
 
 
 def main():
@@ -123,8 +144,8 @@ def main():
 
     if config.data_config.dataset != "default":
         prompts = preprocess_prompts_for_scheduler(prompts, llm.engine.tokenizer, config.scheduler_config)
-    results, mtp_stats = llm.generate(prompts)
-    log_results(results, mtp_stats, llm.engine.next_n)
+    results, mtp_stats, infer_time = llm.generate(prompts)
+    log_results(results, mtp_stats, infer_time, llm.engine.next_n, llm.engine.main_worker.model_name)
 
 
 if __name__ == "__main__":

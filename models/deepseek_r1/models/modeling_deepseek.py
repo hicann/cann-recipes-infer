@@ -197,10 +197,11 @@ class DeepseekV3MoE(nn.Module):
     A mixed expert module containing shared experts.
     """
 
-    def __init__(self, config, infer_config: InferenceConfig, comm_manager: CommManager, prefix, **kwargs):
+    def __init__(self, config, infer_config: InferenceConfig, comm_manager: CommManager, layer_idx: int,
+                 prefix, **kwargs):
         super().__init__()
         self.config = config
-        self.layer_idx = kwargs.get("layer_idx")
+        self.layer_idx = layer_idx
         self.infer_config = infer_config
         self.comm_manager = comm_manager
         self.gmm_quant_mode = (
@@ -212,7 +213,7 @@ class DeepseekV3MoE(nn.Module):
         self.moe_tp_size = self.infer_config.parallel_config.moe_tp_size
         self.moe_ep_size = self.infer_config.parallel_config.moe_ep_size
         self.exe_mode = self.infer_config.model_config.exe_mode
-        self.enable_multi_streams = False
+        self.enable_multi_streams = self.infer_config.model_config.custom_params.get("enable_multi_streams", False)
         self.enable_npugraph_ex = self.exe_mode == "npugraph_ex"
         self.enable_gegraph = self.exe_mode == "ge_graph"
         self.force_eplb = self.infer_config.model_config.force_eplb
@@ -426,6 +427,7 @@ class DeepseekV3MoE(nn.Module):
 
         if self.n_shared_experts > 0:
             if use_npugraph_ex_event:
+                tng.ops.npu_record_tagged_stream(hidden_states, "11")
                 tng.ops.npu_tagged_event_record(events[self.layer_idx])
             if self.enable_geraph_and_multistream:
                 hidden_states_share = None
@@ -1356,7 +1358,7 @@ class DeepseekV3DecoderLayer(nn.Module):
 
         self.mlp = (
             DeepseekV3MoE(config, infer_config=self.infer_config, comm_manager=self.comm_manager, 
-                          prefix=f"{prefix}.mlp", **kwargs)
+                          layer_idx=layer_idx, prefix=f"{prefix}.mlp", **kwargs)
             if self.is_moe
             else DeepseekV3DenseMLP(config, infer_config=self.infer_config, comm_manager=self.comm_manager, 
                                     prefix=f"{prefix}.mlp", **kwargs)
@@ -1367,8 +1369,8 @@ class DeepseekV3DecoderLayer(nn.Module):
         self.post_attention_layernorm = DeepseekV3RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        self.enable_superkernel = False
-        self.enable_multi_streams = False
+        self.enable_superkernel = self.infer_config.model_config.custom_params.get("enable_superkernel", False)
+        self.enable_multi_streams = self.infer_config.model_config.custom_params.get("enable_multi_streams", False)
 
     def forward(
         self,
@@ -1507,8 +1509,8 @@ class DeepseekV3Model(nn.Module):
         self.vocab_size_per_rank = self.vocab_size // self.embed_tp_size
         self.kv_len_offset = kwargs.get("kv_len_offset", None)
         self.global_rank = kwargs.get("global_rank")
-        self.enable_superkernel = False
-        self.enable_multi_streams = False
+        self.enable_superkernel = self.infer_config.model_config.custom_params.get("enable_superkernel", False)
+        self.enable_multi_streams = self.infer_config.model_config.custom_params.get("enable_multi_streams", False)
         self.is_sp = kwargs.get("is_sp", False)
 
         self.input_max_len = self.infer_config.scheduler_config.input_max_len

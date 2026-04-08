@@ -140,7 +140,11 @@ class OfflineInference:
 
         # Collect results (only for original requests, not padded ones)
         results = []
-        mtp_stats = [0, 0]  # Store raw MTP statistics
+        # Store raw MTP statistics
+        mtp_stats = {
+            "spec_num_accepted_tokens": [],
+            "spec_num_forward_ct": 0
+        }
         for request_id in request_ids[:original_request_count]:
             request = self.scheduler.get_finished_request(request_id)
             if request is None:
@@ -149,20 +153,18 @@ class OfflineInference:
                     output_text="",
                     finish_reason="error",
                 ))
-                mtp_stats.append(None)
                 continue
 
             # Decode output
             output_text = self.engine.tokenizer.decode(torch.tensor(request.output_id_list), skip_special_tokens=True)
             # Caculate mtp accept rate
             if request.mtp_info:
-                mtp_stats[0] += request.spec_num_accepted_tokens
-                mtp_stats[1] += request.spec_num_forward_ct
+                mtp_stats["spec_num_accepted_tokens"].append(request.spec_num_accepted_tokens)
 
             results.append(GenerationOutput(
                 prompt=prompt_map[request_id],
                 output_text=output_text,
                 finish_reason=request.finish_reason,
             ))
-
-        return results, mtp_stats
+        mtp_stats["spec_num_forward_ct"] = request.spec_num_forward_ct
+        return results, mtp_stats, request.infer_time

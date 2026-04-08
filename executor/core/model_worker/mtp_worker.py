@@ -248,6 +248,7 @@ class MTPWorker:
         """Execute multi-step speculative inference to generate draft tokens."""
         # Determine number of MTP steps: single for mini-batch prefill, else next_n steps
         loop_mtp = 1 if batch.is_prefill else self.next_n
+        infer_time_mtp = 0
         if not batch.mtp_infos:
             batch.mtp_infos = MTPInfo()
         batch.mtp_infos.set_mtp_info(
@@ -271,6 +272,7 @@ class MTPWorker:
                 is_prefill=batch.mtp_infos.is_prefill,
                 is_mtp=True
             )
+            infer_time_mtp += infer_time
             logits, prev_hidden_states = output
 
             # Process output after inference
@@ -279,3 +281,4 @@ class MTPWorker:
                 logits,
                 mtp_infos=batch.mtp_infos,
             )
+        return infer_time_mtp
