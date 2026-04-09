@@ -23,6 +23,7 @@ import os
 import sys
 import time
 import logging
+import builtins
 import gin
 import torch
 import torch.distributed as dist
@@ -52,6 +53,12 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 lib_fbgemm_npu_api_so_path = os.getenv('LIB_FBGEMM_NPU_API_SO_PATH')
 torch.ops.load_library(lib_fbgemm_npu_api_so_path)
+
+
+SUPPORTED_FUSED_OPS = (
+    "concat_nd_jagged",
+    "in_linear_silu",
+)
 
 
 def recursive_traverse_dict(input_dict, key_prefix):
@@ -579,13 +586,14 @@ def run_ranking_gr_evaluate(
                 experimental_config=experimental_config
             ) as prof:
                 for batch, user_ids, seq_startpos in prefetched:
-                    logits = model.forward(batch, user_ids, seq_startpos)
+                    logits = model.forward(batch, user_ids, seq_startpos, host_append_kv=False)
                     torch_npu.npu.synchronize()
                     prof.step()
             
-            remaining_steps = max_steps - profile_step
-            local_step_count = profile_step
-            for _ in range(remaining_steps):
+            model.clear_kv_cache()
+            dataloader_iter = iter(dataloader)
+            local_step_count = 0
+            for _ in range(max_steps):
                 batch, user_ids, seq_startpos = prepare_one_batch(dataloader_iter)
                 local_step_count += 1
                 logits = model.forward(batch, user_ids, seq_startpos)
@@ -614,9 +622,26 @@ if __name__ == "__main__":
     parser.add_argument("--disable_context", action="store_true")
     parser.add_argument("--enable_profiler", action="store_true")
     parser.add_argument("--embed_tp_size", type=int, default=1)
+    
+    parser.add_argument(
+        "--enable_fused_ops",
+        type=str,
+        choices=("all",) + SUPPORTED_FUSED_OPS,
+        default=None,
+        help="Enable fused ops: all | " + " | ".join(SUPPORTED_FUSED_OPS),
+    )
 
     args = parser.parse_args()
     gin.parse_config_file(args.gin_config_file)
+    
+    if args.enable_fused_ops == "all":
+        builtins.ENABLED_FUSED_OPS = set(SUPPORTED_FUSED_OPS)
+    elif args.enable_fused_ops is None:
+        builtins.ENABLED_FUSED_OPS = set()
+    else:
+        builtins.ENABLED_FUSED_OPS = {args.enable_fused_ops}
+    
+    logger.info("Enabled fused ops: %s", sorted(builtins.ENABLED_FUSED_OPS))
 
     if args.mode == RunningMode.EVAL:
         if args.disable_auc:

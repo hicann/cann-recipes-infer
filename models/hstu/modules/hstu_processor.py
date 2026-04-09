@@ -18,6 +18,7 @@
 # limitations under the License.
 import itertools
 import os
+import builtins
 from typing import Dict, List, Optional, Tuple, Union
 import torch
 import torch_npu
@@ -31,7 +32,10 @@ from dataset.utils import RankingBatch
 
 lib_fbgemm_npu_api_so_path = os.getenv('LIB_FBGEMM_NPU_API_SO_PATH')
 torch.ops.load_library(lib_fbgemm_npu_api_so_path)
-SUPPORT_TRAINING = True
+
+
+def fused_enabled(name: str) -> bool:
+    return name in getattr(builtins, "ENABLED_FUSED_OPS", set())
 
 
 def length_to_complete_offsets(length_tensor: torch.Tensor):
@@ -107,6 +111,38 @@ def jagged_2d_tensor_concat(
         prefix = prefix + lengths
 
     return merged_values, merged_lengths
+
+
+def jagged_2d_tensor_concat_mxrec(
+    values_list: List[torch.Tensor],
+    offsets_list: List[torch.Tensor],
+):
+    if not values_list or not offsets_list:
+        raise ValueError("Values_list and offsets_list cannot be empty")
+    if len(values_list) != len(offsets_list):
+        raise ValueError("values_list and offsets_list must have same length")
+    
+    value_tensors = [switch_to_contiguous_if_needed(tensor) for tensor in values_list]
+    
+    device = value_tensors[0].device
+    offsets_dtype = offsets_list[0].dtype
+    offset_tensors = [
+        offset_tensor if (offset_tensor.device == device and offset_tensor.dtype == offsets_dtype)
+        else offset_tensor.to(device=device, dtype=offsets_dtype)
+        for offset_tensor in offsets_list
+    ]
+
+    concat_values = torch.ops.mxrec.concat_nd_jagged(
+        1024,
+        value_tensors,
+        offset_tensors,
+    )
+    
+    merged_offsets = offset_tensors[0]
+    for offset_tensor in offset_tensors[1:]:
+        merged_offsets = merged_offsets + offset_tensor
+    concat_lengths = merged_offsets[1:] - merged_offsets[:-1]
+    return concat_values, concat_lengths
 
 
 def torch_split_2d_jagged(
@@ -339,10 +375,16 @@ def hstu_preprocess_embeddings(
         contextual_jts_values = [jt.values().to(dtype) for jt in contextual_jts]
         contextual_jts_offsets = [jt.offsets() for jt in contextual_jts]
 
-        (contextual_sequence_embeddings, contextual_seqlen) = jagged_2d_tensor_concat(
-            contextual_jts_values,
-            contextual_jts_offsets,
-        )
+        if fused_enabled("concat_nd_jagged") and hasattr(torch.ops.mxrec, "concat_nd_jagged"):
+            (contextual_sequence_embeddings, contextual_seqlen) = jagged_2d_tensor_concat_mxrec(
+                contextual_jts_values,
+                contextual_jts_offsets,
+            )
+        else:
+            (contextual_sequence_embeddings, contextual_seqlen) = jagged_2d_tensor_concat(
+                contextual_jts_values,
+                contextual_jts_offsets,
+            )
         if contextual_mlp is not None:
             contextual_sequence_embeddings = contextual_mlp(
                 contextual_sequence_embeddings
@@ -353,13 +395,22 @@ def hstu_preprocess_embeddings(
         contextual_max_seqlen = max(
             len(batch.contextual_feature_names), sum(contextual_max_seqlens)
         )
-        (
-            sequence_embeddings,
-            sequence_embeddings_lengths,
-        ) = jagged_2d_tensor_concat(
-            [contextual_sequence_embeddings, sequence_embeddings],
-            [contextual_seqlen_offsets, sequence_embeddings_lengths_offsets],
-        )
+        if fused_enabled("concat_nd_jagged") and hasattr(torch.ops.mxrec, "concat_nd_jagged"):
+            (
+                sequence_embeddings,
+                sequence_embeddings_lengths,
+            ) = jagged_2d_tensor_concat_mxrec(
+                [contextual_sequence_embeddings, sequence_embeddings],
+                [contextual_seqlen_offsets, sequence_embeddings_lengths_offsets],
+            )
+        else:
+            (
+                sequence_embeddings,
+                sequence_embeddings_lengths,
+            ) = jagged_2d_tensor_concat(
+                [contextual_sequence_embeddings, sequence_embeddings],
+                [contextual_seqlen_offsets, sequence_embeddings_lengths_offsets],
+            )
 
         sequence_embeddings_lengths_offsets = (
             torch.ops.fbgemm.asynchronous_complete_cumsum(sequence_embeddings_lengths)
@@ -369,24 +420,24 @@ def hstu_preprocess_embeddings(
     return JaggedData(
         values=sequence_embeddings,
         seqlen=sequence_embeddings_lengths.to(
-            torch.int64
+            torch.int32
         ),  # contextual + history + candidate
-        seqlen_offsets=sequence_embeddings_lengths_offsets.to(torch.int64),
+        seqlen_offsets=sequence_embeddings_lengths_offsets.to(torch.int32),
         max_seqlen=sequence_max_seqlen,
         max_num_candidates=max_num_candidates,
-        num_candidates=num_candidates.to(torch.int64)
+        num_candidates=num_candidates.to(torch.int32)
         if num_candidates is not None
         else None,
         num_candidates_offsets=length_to_complete_offsets(num_candidates).to(
-            torch.int64
+            torch.int32
         )
         if num_candidates is not None
         else None,
         contextual_max_seqlen=contextual_max_seqlen,
-        contextual_seqlen=contextual_seqlen.to(torch.int64)
+        contextual_seqlen=contextual_seqlen.to(torch.int32)
         if contextual_seqlen is not None
         else None,
-        contextual_seqlen_offsets=contextual_seqlen_offsets.to(torch.int64)
+        contextual_seqlen_offsets=contextual_seqlen_offsets.to(torch.int32)
         if contextual_seqlen_offsets is not None
         else None,
         has_interleaved_action=batch.action_feature_name is not None,

@@ -17,10 +17,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import math
+from dataclasses import dataclass
 from enum import Enum
-from typing import Tuple
+from typing import Tuple, Optional
+
 import torch
 import torch_npu
+
 from configs import InferenceHSTUConfig, KVCacheConfig, KVCacheMetadata
 from modules.kv_cache_manager_impl import KVCacheManagerImpl
 
@@ -31,51 +34,52 @@ class DataType(Enum):
     FLOAT = "fp32"
 
 
+@dataclass
+class OffloadContext:
+    page_ids_dev: torch.Tensor
+    num_pages: int
+    offload_user_ids: torch.Tensor
+    offload_start_pos: torch.Tensor
+    offload_page_indptr: torch.Tensor
+
+
 @torch.no_grad()
 def get_batch_indices_positions(
     append_indptr: torch.Tensor,
     seq_lens: torch.Tensor,
     nnz: int
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    if append_indptr.dim() != 1:
-        raise ValueError(f"append_indptr must be 1D, got shape {append_indptr.shape}")
-    if seq_lens.dim() != 1:
-        raise ValueError(f"seq_lens must be 1D, got shape {seq_lens.shape}")
-    
-    if append_indptr.dtype != torch.int32:
-        append_indptr = append_indptr.to(torch.int32)
-    if seq_lens.dtype != torch.int32:
-        seq_lens = seq_lens.to(torch.int32)
-    
     device = append_indptr.device
-    batch_size = append_indptr.numel() - 1
-    if batch_size != seq_lens.numel():
-        raise ValueError(
-            f"seq_lens.shape[0] ({seq_lens.numel()}) != append_indptr.shape[0] - 1 ({batch_size})"
-        )
-    
-    total_nnz = int(append_indptr[-1].item())
-    if nnz != total_nnz:
-        raise ValueError(
-            f"nnz ({nnz}) != append_indptr[-1] ({total_nnz}), data inconsistent"
-        )
-    
-    batch_indices = torch.empty(nnz, dtype=torch.int32, device=device)
-    positions = torch.empty(nnz, dtype=torch.int32, device=device)
+    if nnz == 0:
+        empty = torch.empty((0,), device=device, dtype=torch.int32)
+        return empty, empty
 
-    for b in range(batch_size):
-        start = int(append_indptr[b].item())
-        end = int(append_indptr[b + 1].item())
-        if end <= start:
-            continue
+    if append_indptr.dtype != torch.int64:
+        append_indptr64 = append_indptr.to(torch.int64)
+    else:
+        append_indptr64 = append_indptr
+    if seq_lens.dtype != torch.int64:
+        seq_lens64 = seq_lens.to(torch.int64)
+    else:
+        seq_lens64 = seq_lens
 
-        seq_len_b = int(seq_lens[b].item())
-        offset = seq_len_b - end
+    t = torch.arange(nnz, device=device, dtype=torch.int64)
 
-        idx_range = torch.arange(start, end, dtype=torch.int32, device=device)
-        batch_indices[start:end] = b
-        positions[start:end] = idx_range + offset
-    return batch_indices, positions
+    # batch idx for each token in flattened append space
+    bidx = torch.searchsorted(append_indptr64[1:], t, right=True)
+
+    # pos within the appended segment
+    start_in_flat = append_indptr64[bidx]
+    pos_in_append = t - start_in_flat
+
+    # new_history_lengths per batch
+    new_lens = append_indptr64[1:] - append_indptr64[:-1]
+    # old end = seq_lens, so old_len_end - new_lens = first position to write
+    base_pos = (seq_lens64 - new_lens)[bidx]
+
+    positions = base_pos + pos_in_append
+
+    return bidx.to(torch.int32), positions.to(torch.int32)
 
 
 class HSTUGpuKVCacheManager:
@@ -187,6 +191,12 @@ class HSTUGpuKVCacheManager:
             for i in range(self.num_layers)
         ]
 
+        self._attn_done_events = [torch_npu.npu.Event() for _ in range(self.num_layers)]
+        self._offload_done_events = [torch_npu.npu.Event() for _ in range(self.num_layers)]
+        
+        self._active_offload_ctx = None
+        self._layer_offload_enqueued = [False] * self.num_layers
+    
     def allocate(
         self,
         user_ids: torch.Tensor,
@@ -238,6 +248,58 @@ class HSTUGpuKVCacheManager:
         )
         return (cached_start_pos, cached_lengths)
 
+    @torch.no_grad()
+    def get_batch_state_and_metadata(
+        self, user_ids: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, "KVCacheMetadata"]:
+        user_ids_list = [int(x) for x in user_ids.tolist()]
+        batch_size = len(user_ids_list)
+
+        cached_start_pos_cpu = torch.empty((batch_size, ), dtype=torch.int32, device="cpu")
+        cached_lengths_cpu = torch.empty((batch_size, ), dtype=torch.int32, device="cpu")
+        total_history_lengths_cpu = torch.empty((batch_size, ), dtype=torch.int32, device="cpu")
+        kv_num_pages_cpu = torch.empty((batch_size, ), dtype=torch.int32, device="cpu")
+
+        all_page_ids = []
+
+        for i, uid in enumerate(user_ids_list):
+            sp = int(self.impl.get_cached_start_position(uid))
+            ln = int(self.impl.get_num_tokens_cached(uid))
+            cached_start_pos_cpu[i] = sp
+            cached_lengths_cpu[i] = ln
+
+            total_history_lengths_cpu[i] = sp + ln
+
+            block_ids = self.impl.get_cache_block_ids(uid)[0]
+            n_pages = int(len(block_ids))
+            kv_num_pages_cpu[i] = n_pages
+            if n_pages > 0:
+                all_page_ids.extend(block_ids)
+        
+        if len(all_page_ids) > 0:
+            kv_page_indices_cpu = torch.tensor(all_page_ids, dtype=torch.int32, device="cpu")
+        else:
+            kv_page_indices_cpu = torch.empty((0, ), dtype=torch.int32, device="cpu")
+        
+        kv_page_indptr_cpu = torch.zeros((batch_size + 1, ), dtype=torch.int32, device="cpu")
+        torch.cumsum(kv_num_pages_cpu, 0, out=kv_page_indptr_cpu[1:])
+
+        kv_last_page_len_cpu = torch.remainder(total_history_lengths_cpu, self.page_size)
+        kv_last_page_len_cpu[kv_last_page_len_cpu == 0] = self.page_size
+
+        total_history_offsets_cpu = torch.zeros((batch_size + 1, ), dtype=torch.int32, device="cpu")
+        torch.cumsum(total_history_lengths_cpu, 0, out=total_history_offsets_cpu[1:])
+
+        kv_cache_metadata = KVCacheMetadata(
+            kv_indices=kv_page_indices_cpu.npu(),
+            kv_indptr=kv_page_indptr_cpu.npu(),
+            kv_last_page_len=kv_last_page_len_cpu.npu(),
+            total_history_lengths=total_history_lengths_cpu.npu(),
+            total_history_offsets=total_history_offsets_cpu.npu(),
+        )
+
+        return cached_start_pos_cpu, cached_lengths_cpu, kv_cache_metadata
+
     def offload(
         self,
         user_ids: torch.Tensor,
@@ -252,6 +314,8 @@ class HSTUGpuKVCacheManager:
         return offload_results
 
     def offload_wait(self):
+        if not self.has_active_offload():
+            return
         self._offload_end_event.wait()
 
     def offload_async(
@@ -330,6 +394,7 @@ class HSTUGpuKVCacheManager:
             if page_ids.dtype != torch.long:
                 page_ids = page_ids.to(torch.long)
             primary_pool = self.impl.get_primary_pool()
+            
             for layer_idx in range(self.num_layers):
                 layer_pool = primary_pool[layer_idx]
                 bs = layer_pool.shape[1]
@@ -481,3 +546,166 @@ class HSTUGpuKVCacheManager:
             2, reserved.shape[1], self.page_size,
             self.num_heads_per_layer[layer_idx], self.head_dim
         )
+
+    def build_offload_plan(
+        self,
+        user_ids: torch.Tensor,
+        host_start_pos: torch.Tensor,
+        host_lengths: torch.Tensor,
+        kvcache_metadata,
+    ):
+        batch_size = len(user_ids)
+        pages_per_chunk = self.offload_chunksize // self.page_size
+        
+        offload_user_ids = []
+        offload_start_pos = []
+        offload_page_indptr = [0]
+        page_ids_to_offload = []
+        
+        for idx in range(batch_size):
+            uid = int(user_ids[idx].item())
+            cur_offloaded_start_pos, cur_offloaded_length = host_start_pos[idx], host_lengths[idx]
+            cached_start_pos, cached_length = self.get_user_kvdata_info(uid)
+            
+            new_offload_start_pos = cur_offloaded_start_pos + cur_offloaded_length
+            new_offload_length = max(0, (cached_start_pos + cached_length) - new_offload_start_pos)
+            new_offload_chunks = new_offload_length // self.offload_chunksize
+            
+            if new_offload_chunks == 0:
+                continue
+            
+            new_offload_start_page_idx = (
+                kvcache_metadata.kv_indptr[idx] + new_offload_start_pos // self.page_size
+            )
+            new_offload_end_page_idx = (
+                new_offload_start_page_idx + new_offload_chunks * pages_per_chunk
+            )
+            
+            offload_page_ids = kvcache_metadata.kv_indices[
+                new_offload_start_page_idx:new_offload_end_page_idx
+            ]
+            num_pages = int(offload_page_ids.numel())
+            if num_pages > 0:
+                offload_user_ids.append(uid)
+                offload_start_pos.append(int(new_offload_start_pos))
+                page_ids_to_offload.append(offload_page_ids)
+                offload_page_indptr.append(offload_page_indptr[-1] + num_pages)
+                
+        if len(offload_user_ids) == 0:
+            return None
+        
+        offload_user_ids = torch.tensor(offload_user_ids, dtype=torch.long)
+        offload_start_pos = torch.tensor(offload_start_pos, dtype=torch.int32)
+        offload_page_indptr = torch.tensor(offload_page_indptr, dtype=torch.int32)
+        
+        page_ids_offload = (
+            page_ids_to_offload[0] if len(page_ids_to_offload) == 1
+            else torch.cat(page_ids_to_offload, dim=0)
+        )
+        return page_ids_offload, offload_user_ids, offload_start_pos, offload_page_indptr
+    
+    
+    def start_offload_plan(
+        self,
+        user_ids: torch.Tensor,
+        host_start_pos: torch.Tensor,
+        host_lengths: torch.Tensor,
+        kvcache_metadata,
+    ) -> Optional[OffloadContext]:
+        if getattr(kvcache_metadata, "is_graph_capture", False):
+            self.reset_offload_round()
+            return None
+        
+        plan = self.build_offload_plan(user_ids, host_start_pos, host_lengths, kvcache_metadata)
+        if plan is None:
+            self.reset_offload_round()
+            return None
+        
+        page_ids_offload, offload_user_ids, offload_start_pos, offload_page_indptr = plan
+        
+        primary_pool = self.impl.get_primary_pool()
+        device = primary_pool[0].device
+            
+        page_ids_dev = page_ids_offload
+        if page_ids_dev.device != device:
+            page_ids_dev = page_ids_dev.to(device, non_blocking=True)
+        if page_ids_dev.dtype != torch.long:
+            page_ids_dev = page_ids_dev.to(torch.long)
+        
+        self._offload_start_event.record(torch_npu.npu.current_stream())
+        
+        ctx = OffloadContext(
+            page_ids_dev=page_ids_dev,
+            num_pages=int(page_ids_dev.numel()),
+            offload_user_ids=offload_user_ids,
+            offload_start_pos=offload_start_pos,
+            offload_page_indptr=offload_page_indptr,
+        )
+        self._active_offload_ctx = ctx
+        self._layer_offload_enqueued = [False] * self.num_layers
+        return ctx
+    
+    def has_active_offload(self) -> bool:
+        return self._active_offload_ctx is not None and self._active_offload_ctx.num_pages > 0
+    
+    def record_attn_done(self, layer_idx: int):
+        self._attn_done_events[layer_idx].record(torch_npu.npu.current_stream())
+        
+    def offload_layer_async(self, layer_idx: int):
+        ctx = self._active_offload_ctx
+        if ctx is None or ctx.num_pages <= 0:
+            return
+        if self._layer_offload_enqueued[layer_idx]:
+            return
+        self._layer_offload_enqueued[layer_idx] = True
+        
+        page_ids = ctx.page_ids_dev
+        num_pages = ctx.num_pages
+        primary_pool = self.impl.get_primary_pool()
+        
+        with torch_npu.npu.stream(self._offload_stream):
+            self._offload_start_event.wait(self._offload_stream)
+            self._attn_done_events[layer_idx].wait(self._offload_stream)
+            
+            layer_pool = primary_pool[layer_idx]            
+            bs = layer_pool.shape[1]
+            num_heads = self.num_heads_per_layer[layer_idx]
+
+            base = layer_pool.view(2 * bs, -1)
+            k_idx = page_ids
+            v_idx = page_ids + bs
+            all_idx = torch.cat((k_idx, v_idx), dim=0)
+
+            selected = base.index_select(0, all_idx)
+            selected = selected.view(
+                2,
+                num_pages,
+                self.page_size,
+                num_heads,
+                self.head_dim,
+            )
+
+            selected = selected.permute(1, 0, 2, 3, 4)
+            self._offload_kvdata_host_buffers[layer_idx][:num_pages, ...].copy_(
+                selected, non_blocking=True
+            )
+            
+            self._offload_done_events[layer_idx].record(self._offload_stream)
+            if layer_idx == self.num_layers - 1:
+                self._offload_end_event.record(self._offload_stream)
+    
+    def get_offload_results(self):
+        ctx = self._active_offload_ctx
+        if ctx is None or ctx.num_pages <= 0:
+            return None
+        
+        return(
+            self._offload_kvdata_host_buffers,
+            ctx.offload_user_ids,
+            ctx.offload_start_pos,
+            ctx.offload_page_indptr,
+        )
+    
+    def reset_offload_round(self):
+        self._active_offload_ctx = None
+        self._layer_offload_enqueued = [False] * self.num_layers

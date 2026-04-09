@@ -86,12 +86,15 @@ class InferenceEmbedding(torch.nn.Module):
                         hidden_size=config.dim,
                         tp_size=self.embed_tp_size,
                         tp_rank=self.tp_rank,
-                        params_dtype=torch.float32 
+                        params_dtype=torch.float32,
+                        # device=torch.device(f"npu:{torch.npu.current_device()}"),
                     )
                 else:
                     self._embedding_layers[config.table_name] = torch.nn.Embedding(
                         num_embeddings=config.vocab_size,
                         embedding_dim=config.dim,
+                        dtype=torch.float32,
+                        device=torch.device(f"npu:{torch.npu.current_device()}"),
                     )
 
             for feature_name in config.feature_names:

@@ -17,6 +17,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import warnings
+import builtins
 from typing import List, Optional, Tuple, Union
 import torch
 import torch_npu
@@ -35,6 +36,10 @@ from modules.inference_embedding import InferenceEmbedding
 from modules.jagged_data import JaggedData
 from modules.mlp import MLP
 from dataset.utils import Batch
+
+
+def fused_enabled(name: str) -> bool:
+    return name in getattr(builtins, "ENABLED_FUSED_OPS", set())
 
 
 def _dense_to_jagged(values: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, int, int]:
@@ -361,15 +366,16 @@ class InferenceRankingGR(torch.nn.Module):
             torch.sum(batch.features.lengths().view(-1, batch_size), 0).view(-1)
             - batch.num_candidates
         )
-        (
-            cached_start_pos,
-            cached_lengths,
-        ) = self._gpu_kv_cache_manager.get_batch_kvdata_info(user_ids)
 
         self._gpu_kv_cache_manager.allocate(
             user_ids, user_start_pos, new_history_lengths
         )
-        kv_cache_metadata = self._gpu_kv_cache_manager.get_cache_metadata(user_ids)
+
+        (
+            cached_start_pos,
+            cached_lengths,
+            kv_cache_metadata
+        ) = self._gpu_kv_cache_manager.get_batch_state_and_metadata(user_ids)
         append_metadata = self._gpu_kv_cache_manager.get_append_metadata(
             new_history_lengths, kv_cache_metadata.total_history_lengths
         )
@@ -398,12 +404,20 @@ class InferenceRankingGR(torch.nn.Module):
             user_ids, cached_start_pos, cached_lengths
         )
         if onload_length > 0:
-            kv_page_ids = torch_concat_2d_jagged(
-                values_a=onload_kv_page_ids.view(-1, 1),
-                values_b=kv_cache_metadata.kv_indices.view(-1, 1),
-                offsets_a=onload_kv_page_indptr.to(torch.int64),
-                offsets_b=kv_cache_metadata.kv_indptr.to(torch.int64),
-            )
+            if fused_enabled("concat_nd_jagged") and hasattr(torch.ops.mxrec, "concat_2d_jagged"):
+                kv_page_ids = torch.ops.mxrec.concat_2d_jagged(
+                    values_a=onload_kv_page_ids.view(-1, 1),
+                    values_b=kv_cache_metadata.kv_indices.view(-1, 1),
+                    offsets_a=onload_kv_page_indptr.to(torch.int64),
+                    offsets_b=kv_cache_metadata.kv_indptr.to(torch.int64),
+                )
+            else:
+                kv_page_ids = torch_concat_2d_jagged(
+                    values_a=onload_kv_page_ids.view(-1, 1),
+                    values_b=kv_cache_metadata.kv_indices.view(-1, 1),
+                    offsets_a=onload_kv_page_indptr.to(torch.int64),
+                    offsets_b=kv_cache_metadata.kv_indptr.to(torch.int64),
+                )
             kv_cache_metadata.kv_indices = kv_page_ids.view(-1)
             kv_cache_metadata.kv_indptr = (
                 onload_kv_page_indptr + kv_cache_metadata.kv_indptr
@@ -466,9 +480,26 @@ class InferenceRankingGR(torch.nn.Module):
         batch: Batch,
         user_ids: torch.Tensor,
         user_start_pos: torch.Tensor,
+        host_append_kv: bool = True,
     ):
         with torch.inference_mode():
             kvcache_metadata = self.prepare_kv_cache(batch, user_ids, user_start_pos)
+            
+            meta = self._kvcache_metadata if self.use_cudagraph else kvcache_metadata
+            host_kvdata_start_pos, host_kvdata_lengths = zip(
+                *[
+                    self._host_kv_storage_manager.get_user_kvdata_info(int(user_ids[idx]))
+                    for idx in range(len(user_ids))
+                ]
+            )
+            host_kvdata_start_pos = torch.tensor(host_kvdata_start_pos, dtype=torch.int64)
+            host_kvdata_lengths = torch.tensor(host_kvdata_lengths, dtype=torch.int64)
+            
+            self._gpu_kv_cache_manager.start_offload_plan(
+                user_ids, host_kvdata_start_pos, host_kvdata_lengths, meta
+            )
+            meta.gpu_kv_cache_manager = self._gpu_kv_cache_manager
+
             embeddings = self._embedding_collection(batch.features)
             embeddings, batch = self.strip_contextual_features(
                 embeddings, batch, user_start_pos
@@ -487,7 +518,6 @@ class InferenceRankingGR(torch.nn.Module):
                 self._kvcache_metadata.total_history_offsets += (
                     self._jagged_metadata.num_candidates_offsets
                 )
-                # self.offload_kv_cache_wait(self._offload_states)
 
                 hstu_output = self._hstu_block.predict(
                     batch.batch_size,
@@ -501,7 +531,7 @@ class InferenceRankingGR(torch.nn.Module):
                 kvcache_metadata.total_history_offsets += (
                     jagged_data.num_candidates_offsets
                 )
-                # self.offload_kv_cache_wait(self._offload_states)
+
                 hstu_output = self._hstu_block.predict(
                     batch.batch_size,
                     num_tokens,
@@ -517,10 +547,9 @@ class InferenceRankingGR(torch.nn.Module):
 
             jagged_data = self._hstu_block._postprocessor(jagged_data)
             jagged_item_logit = self._mlp(jagged_data.values)
-            self._offload_states = self.offload_kv_cache_async(
-                user_ids, kvcache_metadata
-            )
-            self.offload_kv_cache_wait(self._offload_states)
+            offload_results = self._gpu_kv_cache_manager.get_offload_results()
+            if host_append_kv:
+                self.offload_kv_cache_wait(offload_results)
             self.finalize_kv_cache(user_ids)
 
         return jagged_item_logit

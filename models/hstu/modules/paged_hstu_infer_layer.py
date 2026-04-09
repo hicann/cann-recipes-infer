@@ -17,16 +17,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
+import builtins
 import torch
 import torch_npu
 import torch.nn.functional as F
 from configs import InferenceHSTUConfig, KVCacheConfig
 from modules.jagged_data import JaggedData
-from einops import rearrange
 
 lib_fbgemm_npu_api_so_path = os.getenv('LIB_FBGEMM_NPU_API_SO_PATH')
 torch.ops.load_library(lib_fbgemm_npu_api_so_path)
 
+
+def fused_enabled(name: str) -> bool:
+    return name in getattr(builtins, "ENABLED_FUSED_OPS", set())
+
+
+def build_pos_tables(max_pos: int, page_size: int, device, dtype=torch.long):
+    pos = torch.arange(max_pos, dtype=torch.long, device="cpu")
+    pos2page = (pos // page_size).to(dtype=dtype).to(device, non_blocking=False)
+    pos2entry = (pos % page_size).to(dtype=dtype).to(device, non_blocking=False)
+    return pos2page, pos2entry
+    
 
 @torch.no_grad()
 def append_kvcache(
@@ -41,6 +52,8 @@ def append_kvcache(
     kv_indices: torch.Tensor,
     kv_indptr: torch.Tensor,
     kv_layout: int,
+    pos2page: torch.Tensor,
+    pos2entry: torch.Tensor,
 ) -> None:
     if kv_layout != 0:
         raise NotImplementedError("Only support kv_layout == 0 now")
@@ -76,9 +89,9 @@ def append_kvcache(
     row_idx = torch.arange(nnz_true, device=device, dtype=torch.long)
     token_idx = row_idx + seqlen_offsets.index_select(0, batch)
     
-    # Compute page + entry index inside page for each token position
-    page_iter = pos // page_size
-    entry_idx = pos - page_iter * page_size
+    # get page + entry index inside page for each token position
+    page_iter = pos2page.index_select(0, pos)
+    entry_idx = pos2entry.index_select(0, pos)
     
     # Map (batch, page_iter) -> page_id via CSR-like indptr/indices
     base_ptr = kv_indptr.index_select(0, batch)
@@ -135,6 +148,7 @@ class PagedHSTUInferLayer(torch.nn.Module):
             self._attention_dim_per_head * self._num_heads,
         ]
         self._max_seqlen = kv_cache_config.max_seq_len
+        self.page_size = kv_cache_config.page_size
 
         dtype = (
             torch.bfloat16
@@ -143,7 +157,14 @@ class PagedHSTUInferLayer(torch.nn.Module):
             if config.fp16
             else torch.float32
         )
-        device = torch_npu.npu.current_device()
+        device = torch.device(f"npu:{torch.npu.current_device()}")
+        
+        self.pos2page, self.pos2entry = build_pos_tables(
+            self._max_seqlen,
+            self.page_size,
+            device=device,
+            dtype=torch.long
+            )
 
         # linear_uvqk
         self._linear_uvqk = torch.nn.Linear(
@@ -157,7 +178,14 @@ class PagedHSTUInferLayer(torch.nn.Module):
         for param in self._linear_uvqk.parameters():
             param.requires_grad = False
             param.copy_(torch.empty_like(param).uniform_(-0.5, 0.5))
-        self._linear_uvqk_weight = self._linear_uvqk.weight.T.contiguous()
+        
+        with torch.no_grad():
+            self._linear_uvqk.bias = torch.nn.Parameter(
+                torch.empty_like(self._linear_uvqk.bias, dtype=torch.float32),
+                requires_grad=False
+            )
+            self._linear_uvqk.bias.uniform_(-0.5, 0.5)
+        self._linear_uvqk_weight = self._linear_uvqk.weight.contiguous()
 
         # input norm
         if config.learnable_input_layernorm:
@@ -237,12 +265,17 @@ class PagedHSTUInferLayer(torch.nn.Module):
             eps=self._eps,
         )
 
-        mixed_uvqk = F.silu(self._linear_uvqk(normed_input))
-        (user, value, query, key) = torch.split(
-            mixed_uvqk,
-            self._split_arg_list,
-            dim=-1,
-        )
+        if fused_enabled("in_linear_silu") and hasattr(torch.ops.mxrec, "distance_in_linear_silu_forward"):
+            (user, value, query, key, _) = torch.ops.mxrec.distance_in_linear_silu_forward(
+                normed_input, self._linear_uvqk_weight, self._linear_uvqk.bias, self._split_arg_list
+            )
+        else:
+            mixed_uvqk = F.silu(self._linear_uvqk(normed_input))
+            (user, value, query, key) = torch.split(
+                mixed_uvqk,
+                self._split_arg_list,
+                dim=-1,
+            )
 
         value = value.view(-1, self._num_heads, self._linear_dim_per_head)
         query = query.view(-1, self._num_heads, self._attention_dim_per_head)
@@ -262,6 +295,8 @@ class PagedHSTUInferLayer(torch.nn.Module):
             kv_cache_metadata.kv_indices,
             kv_cache_metadata.kv_indptr,
             0,  # NHD layout
+            self.pos2page,
+            self.pos2entry,
         )
 
         kv_cache_metadata.onload_history_kv_events[self.layer_idx].wait(
@@ -319,12 +354,18 @@ class PagedHSTUInferLayer(torch.nn.Module):
             bias=self._input_layernorm_bias,
             eps=self._eps,
         )
-        self.uvqk_buffer_[:num_tokens, ...] = F.silu(self._linear_uvqk(normed_input))
-        (user, value, query, key) = torch.split(
-            self.uvqk_buffer_[:num_tokens, ...],
-            self._split_arg_list,
-            dim=-1,
-        )
+
+        if fused_enabled("in_linear_silu") and hasattr(torch.ops.mxrec, "distance_in_linear_silu_forward"):
+            (_, value, _, key, _) = torch.ops.mxrec.distance_in_linear_silu_forward(
+                normed_input, self._linear_uvqk_weight, self._linear_uvqk.bias, self._split_arg_list
+            )
+        else:
+            self.uvqk_buffer_[:num_tokens, ...] = F.silu(self._linear_uvqk(normed_input))
+            (_, value, _, key) = torch.split(
+                self.uvqk_buffer_[:num_tokens, ...],
+                self._split_arg_list,
+                dim=-1,
+            )
 
         value = value.view(-1, self._num_heads, self._linear_dim_per_head)
         key = key.view(-1, self._num_heads, self._attention_dim_per_head)
@@ -343,6 +384,8 @@ class PagedHSTUInferLayer(torch.nn.Module):
             kv_cache_metadata.kv_indices,
             kv_cache_metadata.kv_indptr,
             0,  # NHD layout
+            self.pos2page,
+            self.pos2entry,
         )
 
         return self.uvqk_buffer_[:num_tokens, ...]
