@@ -22,7 +22,7 @@ pip install einops addict easydict triton-ascend PyMuPDF img2pdf \
 
 if [ ! -d "$SOURCE_DIR" ]; then
     echo "[INFO] Cloning DeepSeek-OCR-2..."
-    git clone --depth=1 https://github.com/deepseek-ai/DeepSeek-OCR-2
+    git clone --depth=1 https://github.com/deepseek-ai/DeepSeek-OCR-2.git
     SOURCE_DIR="DeepSeek-OCR-2/DeepSeek-OCR2-master/DeepSeek-OCR2-vllm"
 fi
 

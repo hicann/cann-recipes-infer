@@ -53,7 +53,7 @@ docker run -it -d --net=host --shm-size=512g \
 ```bash
 pip install modelscope -i https://mirrors.huaweicloud.com/repository/pypi/simple
 # 下载模型
-modelscope download --model deepseek-ai/DeepSeek-OCR-2 --local-dir /data/models/DeepSeek-OCR-2
+modelscope download --model deepseek-ai/DeepSeek-OCR-2 --local_dir /data/models/DeepSeek-OCR-2
 ```
 参数说明：
 - --model: 模型名称
@@ -161,13 +161,13 @@ vllm-deepseek-ocr-2/
 | 指定 NPU 设备 | `export ASCEND_RT_VISIBLE_DEVICES=0` |
 
 ## KernelCAT内测申请
-KernelCAT限时免费内测中，欢迎体验：https://kernelcat.autokernel.cn
+KernelCAT限时免费内测中，欢迎体验：https://kerminal.cn
 
 ## 项目参考
 
 - [DeepSeek AI](https://github.com/deepseek-ai/DeepSeek-OCR-2) - DeepSeek-OCR-2 模型
 - [vLLM](https://github.com/vllm-project/vllm) - 高效 LLM 推理框架
-- [vLLM-Ascend](https://gitee.com/ascend/vllm-ascend) - vLLM 昇腾适配
+- [vLLM-Ascend](https://github.com/vllm-project/vllm-ascend) - vLLM 昇腾适配
 - [Meta SAM](https://github.com/facebookresearch/segment-anything) - 视觉编码器
 
 ## 许可证
