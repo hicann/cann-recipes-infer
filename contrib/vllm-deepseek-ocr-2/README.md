@@ -161,7 +161,7 @@ vllm-deepseek-ocr-2/
 | 指定 NPU 设备 | `export ASCEND_RT_VISIBLE_DEVICES=0` |
 
 ## KernelCAT内测申请
-KernelCAT限时免费内测中，欢迎体验：https://kerminal.cn
+KernelCAT限时免费内测中，欢迎体验：https://kernelcat.cn
 
 ## 项目参考
 
