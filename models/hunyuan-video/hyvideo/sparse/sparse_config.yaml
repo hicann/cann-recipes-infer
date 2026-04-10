@@ -1,0 +1,16 @@
+comment: choose from TopK/SVG
+block_size_Q: 128
+block_size_K: 512
+model: HunyuanVideo
+TopK:
+   predictor_name: TopK
+   sparse_time_step: "10-49"
+   sparsity_files_path: ./sparsity/320x480x65/v3
+   CAC_threshold: 0.66
+SVG:
+   predictor_name: SVG
+   sparse_time_step: "14-49"
+   sparsity: 0.8
+   sample_mse_max_row: 5000
+   context_length: 256
+

@@ -25,19 +25,21 @@ import time
 from pathlib import Path
 from datetime import datetime
 
+from loguru import logger
 import torch
 import torch_npu
 from torch_npu.contrib import transfer_to_npu
 import torch.distributed as dist
-from loguru import logger
+
 
 import hyvideo.monkey_patch
+from hyvideo.sparse import sparse_double_block_forward, sparse_single_block_forward
 from hyvideo.utils.file_utils import save_videos_grid, load_json
 from hyvideo.config import parse_args
 from hyvideo.inference import HunyuanVideoSampler
 from hyvideo.cache import first_block_forward, double_block_forward, single_block_forward
 from module.dit_cache.cache_method import cache_manager
-
+from module.blockwise_sparse.sparse_method import sparse_predictor_manager
 
 torch_npu.npu.set_compile_mode(jit_compile=False)
 torch.npu.config.allow_internal_format = False
@@ -48,6 +50,8 @@ WORLD_SIZE = int(os.getenv("WORLD_SIZE", 1))
 
 def main():
     args = parse_args()
+    device = f"npu:{args.device}"
+    torch.npu.set_device(device)
     logger.add(os.path.join(args.save_path, "logs/hy_{time:YYYY-MM-DD}.log"),
            rotation="00:00",
            retention="7 days",
@@ -65,11 +69,13 @@ def main():
         os.makedirs(save_path, exist_ok=True)
 
     # Load models
-    hunyuan_video_sampler = HunyuanVideoSampler.from_pretrained(models_root_path, args=args)
+    hunyuan_video_sampler = HunyuanVideoSampler.from_pretrained(models_root_path, args=args, device=device)
+
     
     # Get the updated args
     args = hunyuan_video_sampler.args
 
+    world_size = int(os.getenv("WORLD_SIZE", 1))
     # cache init
     double_layer_num = len(hunyuan_video_sampler.pipeline.transformer.double_blocks)
     single_layer_num = len(hunyuan_video_sampler.pipeline.transformer.single_blocks)
@@ -92,7 +98,20 @@ def main():
     elif cache_manager.cache_method.cache_name in ["FBCache", "TeaCache"]:
         cache_block = hunyuan_video_sampler.pipeline.transformer.double_blocks[0]
         cache_block.forward = first_block_forward.__get__(cache_block, type(cache_block))
-
+    
+    sparse_params = {
+        "num_steps": args.infer_steps,
+        "double_stream_layers": double_layer_num,
+        "single_stream_layers": single_layer_num,
+        "device": f"npu:{args.device}"
+    }
+    if args.sparse_method != "no_sparse":
+        sparse_predictor_manager.from_config(f"./hyvideo/sparse/sparse_config.yaml", args.sparse_method, sparse_params)
+        for block in hunyuan_video_sampler.pipeline.transformer.double_blocks:
+            block.forward = sparse_double_block_forward.__get__(block, type(block))
+        for block in hunyuan_video_sampler.pipeline.transformer.single_blocks:
+            block.forward = sparse_single_block_forward.__get__(block, type(block))
+            
     # Start sampling
     if args.prompt_path:
         full_prompts_info = load_json(args.prompt_path)

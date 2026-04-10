@@ -35,11 +35,28 @@ def parse_args(namespace=None):
     parser = add_inference_args(parser)
     parser = add_parallel_args(parser)
     parser = add_cache_args(parser)
+    parser = add_sparse_args(parser)
 
     args = parser.parse_args(namespace=namespace)
     args = sanity_check_args(args)
 
     return args
+
+
+def add_sparse_args(parser: argparse.ArgumentParser):
+    group = parser.add_argument_group(title="HunyuanVideo sparse args")
+    group.add_argument(
+        "--sparse-attention-config",
+        type=str,
+        default="hyvideo/sparse/sparse_config.yaml",
+        help="Path to sparse config."
+    )
+    group.add_argument(
+        "--sparse-method",
+        type=str,
+        choices=["no_sparse", "TopK", "SVG"]
+    )
+    return parser
 
 
 def add_network_args(parser: argparse.ArgumentParser):
@@ -320,6 +337,12 @@ def add_inference_args(parser: argparse.ArgumentParser):
         help="Suffix for the names of saved samples.",
     )
     group.add_argument(
+        "--device",
+        type=str,
+        default="0",
+        help="npu device index",
+    )
+    group.add_argument(
         "--num-videos",
         type=int,
         default=1,
@@ -422,7 +445,6 @@ def add_inference_args(parser: argparse.ArgumentParser):
         action="store_true",
         help="Enable profiling dit for npu.",
     )
-
 
     return parser
 

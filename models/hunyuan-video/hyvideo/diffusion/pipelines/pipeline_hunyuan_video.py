@@ -53,6 +53,8 @@ from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 from diffusers.utils import BaseOutput
 
 from module.dit_cache.cache_method import cache_manager
+from module.blockwise_sparse import sparse_predictor_manager
+
 from ...constants import PRECISION_TO_TYPE
 from ...vae.autoencoder_kl_causal_3d import AutoencoderKLCausal3D
 from ...text_encoder import TextEncoder
@@ -955,7 +957,17 @@ class HunyuanVideoPipeline(DiffusionPipeline):
             generator,
             latents,
         )
-
+        sink_frame_len = int(int(height) // self.vae_scale_factor / 2 * int(width) // self.vae_scale_factor / 2)
+        img_token_len = int(sink_frame_len * video_length)
+        sparse_predictor_manager\
+            .sparse_attn_mode\
+            .update_sparse_params(
+                {
+                    "sink_frame_len": sink_frame_len,
+                    "img_token_len": img_token_len,
+                    "frame_num": video_length,
+                }
+            )
         # 6. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
         extra_step_kwargs = self.prepare_extra_func_kwargs(
             self.scheduler.step,
