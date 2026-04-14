@@ -27,13 +27,19 @@
 cann-recipes-infer/
 ├── docs/
 │   └── agent/                  # Agent 相关文档
+├── AGENTS.md                   # 全局配置（Skill 路由、行为约束）
 └── .agent/
-    ├── skills/                 # Skills 目录
-    │   ├── README.md
-    │   ├── skill-name-1/
-    │   ├── skill-name-2/
-    │   └── skill-name-n/
-    └── tests/                  # Skill 测试
+    ├── README.md               # 体系总览
+    ├── agents/                 # SubAgent 角色定义
+    │   ├── model-infer-analyzer.md
+    │   ├── model-infer-implementer.md
+    │   └── model-infer-reviewer.md
+    ├── hooks/                  # Hook 脚本
+    ├── settings.json           # Agent 配置
+    └── skills/                 # Skills 目录
+        ├── model-infer-optimize/
+        ├── model-infer-migrator/
+        ├── ...
 ```
 
 ### 2.2 Skill 调度架构
@@ -43,38 +49,45 @@ Skill 体系采用 **Agent Team** 模式——由一个编排 Agent 协调多个
 - **主 Agent**：加载总入口 Skill，负责全局编排、阶段推进和进度管理
 - **SubAgent**：由主 Agent 按需启动，加载特定阶段的 Skill 执行具体任务，完成后将结果返回主 Agent
 
-以当前版本的 5 个 Skill 为例，调度流程如下：
+调度流程如下：
 
 ```
 用户任务
   │
   ▼
-主 Agent（加载 model-optimize）
+主 Agent（加载 model-infer-optimize）
   │
-  ├── 0. 模型分析 + 性能基线（主 Agent 执行）
+  ├── 阶段 0：模型分析与基线建立
+  │   ├── analyzer ──→ 架构分析、环境确认
+  │   └── implementer ──→ model-infer-migrator（框架适配、基线采集）
   │
-  ├── 阶段 1：启动 SubAgent ──→ 加载 kvcache-optimization
-  │                                │
-  │                                ├── 执行 KVCache + FA 优化
-  │                                ├── 精度验证 ──失败──→ 启动 SubAgent 加载 kvcache-fa-precision-debug
-  │                                └── 结果返回主 Agent
+  ├── 阶段 1：并行化改造（多卡部署时）
+  │   ├── analyzer ──→ model-infer-parallel-analysis（策略推荐）
+  │   └── implementer ──→ model-infer-parallel-impl（代码改造）
+  │   └── reviewer ──→ 验证并行正确性
   │
-  ├── 主 Agent 确认阶段 1 通过
+  ├── 阶段 2：KVCache + FA
+  │   ├── analyzer ──→ model-infer-kvcache（方案分析）
+  │   ├── implementer ──→ model-infer-kvcache（实施改造）
+  │   └── reviewer ──→ 精度/性能验证
+  │       └── FAIL → implementer ──→ model-infer-precision-debug（精度排查）
   │
-  ├── 阶段 2：启动 SubAgent ──→ 加载 torch-npu-fusion-optimizer
-  │                                │
-  │                                ├── 执行融合算子分析与替换
-  │                                └── 结果返回主 Agent
+  ├── 阶段 3：融合算子
+  │   ├── analyzer ──→ model-infer-fusion（模式匹配）
+  │   ├── implementer ──→ model-infer-fusion（算子替换）
+  │   └── reviewer ──→ 精度/性能验证
   │
-  ├── 主 Agent 确认阶段 2 通过
+  ├── 阶段 4：图模式适配
+  │   ├── analyzer ──→ model-infer-graph-mode（方案设计）
+  │   ├── implementer ──→ model-infer-graph-mode（适配实施）
+  │   └── reviewer ──→ 精度/性能验证
   │
-  └── 阶段 3：启动 SubAgent ──→ 加载 graph-mode-adaptation
-                                   │
-                                   ├── 执行图模式适配
-                                   └── 结果返回主 Agent ──→ 输出优化报告
+  └── 阶段 5：优化总结 ──→ 输出优化报告
 ```
 
-这种调度方式的设计考虑：
+全流程中，model-infer-runtime-debug 可在任意阶段按需触发（aicore timeout、OOM、推理卡住等）。
+
+设计考虑：
 
 - **隔离上下文**：每个 SubAgent 只加载对应阶段的 Skill 和 references，避免上下文窗口被无关信息占满
 - **阶段间状态传递**：通过 `progress.md` 共享文件传递阶段间的设计决策和验证结果，支持断点接力
@@ -82,19 +95,114 @@ Skill 体系采用 **Agent Team** 模式——由一个编排 Agent 协调多个
 
 ### 2.3 Skill 分类
 
-| 类型 | Skill | 说明 |
+| 类别 | Skill | 说明 |
 |------|-------|------|
-| 编排类 | model-optimize | 总入口，管理阶段流程和进度 |
-| 阶段执行类 | kvcache-optimization、torch-npu-fusion-optimizer、graph-mode-adaptation | 各阶段的具体优化实施 |
-| 辅助类 | kvcache-fa-precision-debug | 按需触发的精度调试 |
+| 编排 | model-infer-optimize | 总入口，阶段 0-5 编排 |
+| 主流程 | model-infer-migrator | 框架适配与基线建立 |
+| 主流程 | model-infer-parallel-analysis | 并行策略分析 |
+| 主流程 | model-infer-parallel-impl | 并行切分实施 |
+| 主流程 | model-infer-kvcache | KVCache + FA 替换 |
+| 主流程 | model-infer-fusion | 融合算子替换 |
+| 主流程 | model-infer-graph-mode | 图模式适配 |
+| 调试 | model-infer-precision-debug | 推理精度诊断（当前主要覆盖 KVCache/FA） |
+| 调试 | model-infer-runtime-debug | NPU 运行时错误诊断 |
+| 独立进阶优化 | model-infer-multi-stream | 多流并行 |
+| 独立进阶优化 | model-infer-prefetch | 权重预取 |
+| 独立进阶优化 | model-infer-superkernel | SuperKernel 适配 |
 
-## 3. Skill 标准化设计
+## 3. Agent 角色设计
 
-### 3.1 遵循标准
+### 3.1 角色分工
+
+通过分析/实施/验证的职责隔离，降低单个 Agent 同时承担多角色导致的越界与漏检问题：
+
+| 角色 | 职责 | 权限 | 挂载 Skills |
+|------|------|------|-----------|
+| 主 Agent | 阶段编排、用户确认、进度管理 | 不直接修改模型代码 | model-infer-optimize |
+| analyzer | 架构分析、方案设计 | 只读代码，只写 progress.md | parallel-analysis、kvcache、fusion、graph-mode |
+| implementer | 代码改造、调试修复 | 读写全部文件 | migrator、parallel-impl、kvcache、fusion、graph-mode、precision-debug、runtime-debug |
+| reviewer | 精度验证、性能对比 | 禁止修改模型代码 | precision-debug、runtime-debug |
+
+三个角色共享核心原则：禁止编造解释，遇到异常数据必须先用工具调查。
+
+### 3.2 协作信息流
+
+```mermaid
+sequenceDiagram
+    participant U as 用户
+    participant M as 主 Agent
+    participant A as Analyzer
+    participant I as Implementer
+    participant R as Reviewer
+
+    M->>A: 派发分析任务，指定 skill
+    A-->>M: 方案写入 progress.md
+    M->>U: 呈现方案，请求确认
+    U-->>M: 确认方案
+    M->>I: 派发实施任务，指定 skill
+    I-->>M: 实施记录 + 自验证结果
+    M->>M: 检查自验证完整性
+    M->>R: 派发验证任务
+    R-->>M: 验证报告
+
+    opt 验证未通过时进入修复循环
+        M->>I: 派发修复，指定调试 skill
+        I-->>M: 修复记录 + 自验证
+        M->>R: 重新验证
+        R-->>M: 验证报告
+    end
+
+    M->>U: 阶段总结，确认后 commit 进入下一阶段
+```
+
+每阶段遵循统一流程：
+
+1. 主 Agent 派发 analyzer 进行方案分析，结果写入 progress.md
+2. 主 Agent 将方案呈现给用户确认
+3. 确认后派发 implementer 实施改造，implementer 必须完成自验证
+4. 主 Agent 检查自验证完整性，缺失则打回重派
+5. 派发 reviewer 进行精度和性能验证
+6. 验证未通过时，进入修复循环：派发 implementer 修复 → reviewer 重新验证
+7. 全部通过后输出阶段总结，用户确认后进入下一阶段
+
+### 3.3 派发规范
+
+主 Agent 的 dispatch prompt 保持简洁：指定工作目录、任务、必须使用的 skill，不附加完整方案或实施步骤。SubAgent 通过读取 progress.md 获取上下文，由 skill 流程指导具体执行，避免 prompt 覆盖 skill 内的流程定义。
+
+## 4. 状态管理设计
+
+### 4.1 共享状态文件
+
+SubAgent 之间通过 `progress.md` 共享阶段结论和任务状态，实现跨 Agent、跨阶段、跨会话的上下文接力：
+
+```
+{model_dir}/
+├── progress.md              ← 活跃文件，所有 SubAgent 启动时读取
+│   ├── 常驻区：阶段 0 模型分析结果，不清除
+│   │   └── 进度概览表，主 Agent 每阶段更新一行
+│   ├── 分隔标记
+│   └── 工作区：当前阶段记录，阶段推进时归档清空
+│
+├── progress_history.md      ← 历史归档，按需索引
+│
+└── baseline/
+    └── baseline_metadata.json ← 性能基线，reviewer 验证基准
+```
+
+### 4.2 读写规则
+
+- **常驻区**由阶段 0 写入，后续只有主 Agent 更新概览表
+- **工作区**由各 SubAgent 追加，写入前先读取现有内容
+- **阶段推进**：主 Agent 更新概览表 → 调用归档脚本 → 清空工作区
+- **历史归档**禁止全文读取，通过关键字索引查找
+
+## 5. Skill 标准化设计
+
+### 5.1 遵循标准
 
 本项目遵循 [Agent Skills 规范](https://agentskills.io/home)，确保 Skill 可被支持该规范的工具（如 OpenCode 等）识别和加载。
 
-### 3.2 Skill 目录结构
+### 5.2 Skill 目录结构
 
 每个 Skill 采用自包含结构，所有相关资源集中在 Skill 文件夹内：
 
@@ -117,7 +225,7 @@ skill-name/
 | `templates/` | 否 | 报告模板、代码模板等 |
 | `scripts/` | 否 | 辅助工具脚本（调试、验证等） |
 
-### 3.3 SKILL.md 规范
+### 5.3 SKILL.md 规范
 
 frontmatter 必需字段：
 
@@ -129,47 +237,42 @@ user-invocable: true      # 是否可由用户直接调用
 ---
 ```
 
-### 3.4 命名规范
+### 5.4 命名规范
 
 - `SKILL.md` 文件名严格区分大小写
-- Skill 文件夹使用 kebab-case（如 `kvcache-optimization`）
+- Skill 文件夹使用 kebab-case（如 `model-infer-kvcache`）
 - Skill 文件夹内不放 `README.md`，文档内容在 `SKILL.md` 或 `references/` 中
 
-## 4. 知识组织设计
+## 6. 知识组织设计
 
-### 4.1 三层知识结构
+### 6.1 分层上下文
 
-```
-SKILL.md（工作流程层）
-  │  定义"做什么、怎么做、什么顺序"
-  │
-  ▼
-references/（领域知识层）
-  │  仓库模型实现经验的结构化提炼
-  │
-  ▼
-在线文档（接口参考层）
-     torch_npu 算子 API、图模式文档
-```
+知识按渐进式披露分三层组织，Agent 用到哪层才加载哪层，避免一次性占满上下文窗口：
 
-SKILL.md 控制流程，references 提供领域知识，在线文档提供接口细节。Agent 按需逐层深入，避免一次性加载全部文档。
+| 层级 | 内容 | 加载时机 | 体量控制 |
+|------|------|---------|---------|
+| AGENTS.md | 项目概述、Skill 路由、行为约束 | 每次对话自动加载 | ~100 行 |
+| SKILL.md | 阶段流程、规则、完成标志 | 被匹配或指定时加载 | < 500 行 |
+| references/ | 配置索引、代码示例、API 文档 | Skill 流程中指定读取时 | 不限 |
 
-### 4.2 在线文档引用
+SKILL.md 控制流程，references 提供领域知识，在线文档提供接口细节。
 
-算子接口和图模式文档通过在线链接引用上游仓库，不包含离线副本：
+### 6.2 在线文档引用
+
+大型外部文档通过在线链接引用，不包含离线副本：
 
 | 文档来源 | 在线地址 |
 |---------|---------|
 | torch_npu 算子 API | [op-plugin/docs/context/](https://gitcode.com/Ascend/op-plugin/tree/7.3.0/docs/context/) |
 | TorchAir 图模式文档 | [torchair/docs/zh/](https://gitcode.com/Ascend/torchair/tree/master/docs/zh) |
 
-### 4.3 references 设计说明
+### 6.3 references 设计说明
 
 references 是对仓库内模型实现经验的结构化提炼，而非算子文档的离线副本。每个参考文档从仓库已有模型中提取标准链路和最佳实践，让 Agent 在分析新模型时能快速找到最接近的参考实现。
 
-## 5. 验证设计
+## 7. 验证设计
 
-### 5.1 Skill 有效性验证
+### 7.1 Skill 有效性验证
 
 采用"有 Skill / 无 Skill"对比测试方法：
 
@@ -177,7 +280,7 @@ references 是对仓库内模型实现经验的结构化提炼，而非算子文
 - 唯一变量：是否加载 Skill
 - 对比维度：最终性能、中间阶段质量、优化路径完整性
 
-### 5.2 每阶段验证机制
+### 7.2 每阶段验证机制
 
 每个阶段完成后必须通过两项验证：
 
@@ -186,44 +289,55 @@ references 是对仓库内模型实现经验的结构化提炼，而非算子文
 
 未通过精度验证时，触发精度调试 Skill 进行排查。
 
-## 6. 技能全景与演进规划
+## 8. Harness 与约束机制
 
-### 6.1 技能全景
+### 8.1 设计思路
 
-当前 Skill 覆盖推理优化的核心三阶段。完整的 NPU 模型适配与优化流程还包括前置阶段和后续进阶特性，规划如下：
+Harness 的核心目标是通过约束限制 Agent 的错误行为空间，而非替代 Agent 完成任务。写在 Skill 和 Agent 定义中的规则是"软约束"，Agent 可能不遵守；Hook 脚本提供的是"硬约束"，在工具调用前后自动执行，不依赖 Agent 自觉。
 
-```
-模型适配全流程：
+### 8.2 约束分类
 
-[前置阶段]                    [当前覆盖]                         [进阶特性]
+| 类型 | 机制 | 示例 |
+|------|------|------|
+| 角色权限 | Agent 定义中的 skills/tools 限制 | analyzer 禁止写代码、reviewer 禁止修改文件 |
+| 流程规则 | Skill 中的阶段前置条件和验证门禁 | 每阶段必须精度验证通过后才能进入下一阶段 |
+| Hook 约束 | 工具调用前后的脚本拦截 | 写文件前检查角色权限、commit 前检查是否已验证 |
 
-模型基线迁移适配               阶段 1：KVCache + FA               性能采集与分析
-  │                            │                                │
-并行化改造                     阶段 2：融合算子优化                多流并行
-  │(TP/EP/DP)                  │                                │
-  │                            阶段 3：图模式适配                 SuperKernel
-  ▼                            │                                │
-  ──────────────────────────── ▼ ──────────────────────────────  │
-         待添加                    已开源                        Prefetch
-                                                                │
-                                                              KV Offload
-                                                                │
-                                                              新增融合算子设计与开发
-                                                                │
-                                                                ▼
-                                                              待添加
-```
+### 8.3 Hook 机制
 
-### 6.2 演进原则
+Hook 脚本位于 `.agent/hooks/`，在工具调用时自动触发：
+
+- **pre_tool**：工具调用前执行，可拦截违规操作（如 analyzer 尝试写代码）
+- **post_tool**：工具调用后执行（如记录操作日志）
+
+当前 Hook：
+
+| Hook | 触发时机 | 作用 |
+|------|---------|------|
+| 角色越界保护 | Edit/Write 前 | analyzer/reviewer 修改模型代码时阻断 |
+| 改代码前必读 progress | Edit/Write 前 | 未读 progress.md 就改代码时阻断 |
+| 自验证完整性检查 | implementer 结束时 | progress.md 缺少自验证项则打回 |
+| 外循环重试上限 | implementer/reviewer 结束时 | 同一阶段超 5 轮循环则阻断 |
+| 长时间任务提醒 | Edit/Write/Bash 前 | 超 60 分钟周期提醒，检查是否偏离 skill 流程 |
+
+## 9. 演进规划
+
+### 9.1 演进方向
+
+- **流程完善与规模扩展**：多卡及更多模型的适配验证；多流、SuperKernel 等高阶特性加入主流程
+- **性能分析能力集成**：接入自动 Profiling 分析能力，支持更精准的切分策略评估与性能瓶颈拆解
+- **知识库自迭代**：建立反馈知识库，将执行断点及调测经验积累总结，Skill 自动迭代更新
+- **新方案设计能力拓展**：新增融合算子设计与开发能力、量化方案及实现；软硬件协同优化迭代
+
+### 9.2 演进原则
 
 - 每个新 Skill 独立开发、独立验证，不影响已有 Skill
-- 前置阶段 Skill 完成后，纳入 model-optimize 的编排流程
-- 进阶特性 Skill 作为主要优化流程之后的可选扩展
+- 独立进阶优化 Skill 验证成熟后，纳入 model-infer-optimize 的编排流程
 - 持续通过真实模型测试积累经验，迭代 Skill 编排与 references 中的参考链路
 
-## 7. 协作与贡献
+## 10. 协作与贡献
 
-### 7.1 贡献流程
+### 10.1 贡献流程
 
 1. 在上游仓库提交 RFC（Issue）描述技能方案
 2. Fork 仓库，创建特性分支
@@ -231,7 +345,7 @@ references 是对仓库内模型实现经验的结构化提炼，而非算子文
 4. 提交 PR 并关联 RFC Issue
 5. 代码审核与合并
 
-### 7.2 审核标准
+### 10.2 审核标准
 
 - SKILL.md frontmatter 格式正确
 - 命名规范符合 kebab-case
