@@ -14,3 +14,4 @@ safetensors==0.4.3
 gradio==5.0.0
 xfuser==0.4.5
 yunchang==0.6.4
+python==3.11

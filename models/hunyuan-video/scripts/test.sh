@@ -23,8 +23,8 @@
 export ASCEND_RT_VISIBLE_DEVICES=0
 source scripts/set_env.sh
 python sample_video.py \
-    --video-size 320 480 \
-    --video-length 65 \
+    --video-size 720 1280 \
+    --video-length 129 \
     --infer-steps 50 \
     --prompt "A cat walks on the grass, realistic style." \
 	--embedded-cfg-scale 6.0 \

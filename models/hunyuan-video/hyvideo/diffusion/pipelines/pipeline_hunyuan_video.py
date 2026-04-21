@@ -909,7 +909,7 @@ class HunyuanVideoPipeline(DiffusionPipeline):
 
         torch.npu.synchronize()
         encoder_end_time = time.time()
-        logger.success(f'Text Encoder end, totally cost {encoder_end_time - encoder_start_time}')
+        logger.success(f'Text Encoder end, totally cost {encoder_end_time - encoder_start_time:.2f} s')
 
         # For classifier free guidance, we need to do two forward passes.
         # Here we concatenate the unconditional and text embeddings into a single batch
@@ -1117,7 +1117,7 @@ class HunyuanVideoPipeline(DiffusionPipeline):
 
         torch.npu.synchronize()
         dit_end_time = time.time()
-        logger.success(f"DiT end, totally cost {dit_end_time - dit_start_time}")
+        logger.success(f"DiT end, totally cost {dit_end_time - dit_start_time:.2f} s")
 
         if hasattr(cache_manager.cache_method, "cache_dic"):
             del cache_manager.cache_method.cache_dic
@@ -1167,7 +1167,7 @@ class HunyuanVideoPipeline(DiffusionPipeline):
                 image = image.squeeze(2)
             torch.npu.synchronize()
             vae_end_time = time.time()
-            logger.success(f"VAE end, totally cost {vae_end_time - vae_start_time}")
+            logger.success(f"VAE end, totally cost {vae_end_time - vae_start_time:.2f} s")
 
         else:
             image = latents
@@ -1178,7 +1178,7 @@ class HunyuanVideoPipeline(DiffusionPipeline):
 
         torch.npu.synchronize()
         hunyuan_end_time = time.time()
-        logger.success(f"HunyuanVideo end, totally cost {hunyuan_end_time - hunyuan_start_time}")
+        logger.success(f"HunyuanVideo end, totally cost {hunyuan_end_time - hunyuan_start_time:.2f} s")
 
         # Offload all models
         self.maybe_free_model_hooks()

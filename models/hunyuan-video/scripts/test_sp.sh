@@ -21,9 +21,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+
 source scripts/set_env.sh
 torchrun --master_port=29600 --nproc_per_node=8 sample_video.py \
-    --video-size 780 1280 \
+    --video-size 720 1280 \
     --video-length 129 \
     --infer-steps 50 \
 	--prompt "A cat walks on the grass, realistic style." \
@@ -31,7 +33,6 @@ torchrun --master_port=29600 --nproc_per_node=8 sample_video.py \
 	--embedded-cfg-scale 6.0 \
 	--flow-shift 7.0 \
 	--flow-reverse \
-	--use-cpu-offload \
 	--ulysses-degree=8 \
 	--ring-degree=1 \
 	--use-vae-parallel \
