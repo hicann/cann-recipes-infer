@@ -151,61 +151,152 @@ python sample_video.py \
 
 ### 快速启动
 
-本样例在scripts文件夹中准备了单卡和多卡的推理脚本。
+本样例通过 `bash infer.sh` 拉起，推理参数集中在 `config/*.yaml` 维护。
 
-首先参考[依赖按照](#12-依赖安装)准备环境和代码。
+#### 1. 配置 CANN 环境变量
 
-执行测试脚本前，请参考[Ascend社区](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/83RC1alpha001/softwareinst/instg/instg_quick.html?Mode=PmIns&OS=Debian&Software=cannToolKit)中的CANN安装软件教程，配置环境变量：
-
-```shell
-source /usr/local/Ascend/ascend-toolkit/set_env.sh 
-```
-
-启用torch_npu环境, 添加PYTHONPATH：
+执行推理前先完成 CANN 环境变量配置（参考 [Ascend 社区](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/83RC1alpha001/softwareinst/instg/instg_quick.html?Mode=PmIns&OS=Debian&Software=cannToolKit)）：
 
 ```shell
-source scripts/set_env.sh
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
 ```
 
-#### 单卡推理: 
+> 注意：`PYTHONPATH` 不会也不应全局设置项目根路径，`mm_function.sh` 会在 `torchrun` 子进程中按需注入，避免影响 CANN TBE 编译器的内置 Python 解释器。
 
-原生hunyuanVideo模型在单块Atlas 800I A2上，支持生成视频规格`720*1280*129`。执行以下脚本启用单卡推理，环境变量的详细信息请参考[CANN社区](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/850/maintenref/envvar/envref_07_0001.html)。
+#### 2. 选择推理配置
+
+`config/` 目录下已预置以下 YAML，分别对应不同的推理场景：
+
+| YAML 文件 | 卡数 | Dit-Cache | 适用场景 |
+|-----------|------|-----------|----------|
+| `single.yaml` | 1 | NoCache | 单卡基线，无加速 |
+| `single_fbcache.yaml` | 1 | FBCache | 单卡 + FBCache 加速 |
+| `single_teacache.yaml` | 1 | TeaCache | 单卡 + TeaCache 累积 L1 阈值 + warmup |
+| `single_taylorseer.yaml` | 1 | TaylorSeer | 单卡 + TaylorSeer，Taylor 展开 + CPU offload |
+| `single_fp8.yaml` | 1 | NoCache | 单卡 + FP8 量化权重（950PR） |
+| `sp8.yaml` | 8 | NoCache | 8 卡 Ulysses 序列并行 + VAE 并行，原生规格 `720*1280*129` |
+| `sp8_fbcache.yaml` | 8 | FBCache | 8 卡 SP + FBCache 加速 |
+| `sp8_teacache.yaml` | 8 | TeaCache | 8 卡 SP + TeaCache 加速 |
+| `sp8_taylorseer.yaml` | 8 | TaylorSeer | 8 卡 SP + TaylorSeer，Taylor 展开 + CPU offload |
+
+#### 3. 修改模型权重路径与提示词
+
+打开所选 YAML，按需修改 `model_args` 中的 `prompt`、`video-size`、`video-length`、`seed` 等字段；多卡 YAML 通过 `ulysses-degree / ring-degree` 控制序列并行，通过 `use-vae-parallel` 启用 VAE 并行；FP8 YAML 通过 `dit-weight` 指定量化权重路径。
+
+YAML 中 `model_args` 会按以下规则透传给 `sample_video.py`：
+
+| YAML 类型 | 命令行效果 | 示例 |
+|-----------|-----------|------|
+| 字符串/数字 | `--key value` | `infer-steps: 50` → `--infer-steps 50` |
+| 布尔 `true` | `--key`（flag） | `flow-reverse: true` → `--flow-reverse` |
+| 布尔 `false` | 忽略 | `use-cpu-offload: false` → 不添加 |
+| 列表 | `--key v1 v2 …` | `video-size: [720, 1280]` → `--video-size 720 1280` |
+
+#### 4. 切换要使用的 YAML
+
+`infer.sh` 中仅需指定一行 `YAML_FILE_NAME`：
+
+```bash
+# 默认：8 卡多卡推理
+export YAML_FILE_NAME=sp8.yaml
+
+# 单卡 + TeaCache
+# export YAML_FILE_NAME=single_teacache.yaml
+```
+
+#### 5. 拉起推理
 
 ```shell
-bash scripts/test.sh
+bash infer.sh
 ```
 
-**Dit-Cache**：本样例集成了多种Dit-Cache方案，包括[FBCache](https://github.com/chengzeyi/ParaAttention)、[TeaCache](https://cvpr.thecvf.com/virtual/2025/poster/33872)，[TaylorSeer](https://github.com/Shenyi-Z/TaylorSeer)加速方案，**支持多卡推理**。
+拉起过程会自动：
+- 解析 YAML 中的 `world_size`、`master_port`、`entry_script`、`env_vars`、`dit_cache`、`model_args`；
+- 设置通用 NPU 优化环境变量（`PYTORCH_NPU_ALLOC_CONF`、`TASK_QUEUE_ENABLE`、`CPU_AFFINITY_CONF`、`TOKENIZERS_PARALLELISM`）以及 HCCL 通信配置；
+- 在 `res/<YYYYMMDD>/<model_name>/` 下自动创建日志目录，并将推理输出 `tee` 到 `log_<timestamp>.log`；
+- 调用 `torchrun --nproc_per_node=<world_size>` 启动 `sample_video.py`，并将 YAML 中的 `dit_cache` 段通过 `--cache-config <yaml>` 透传给 Python 侧的 `CacheManager`。
 
-通过读取配置文件`hyvideo/cache/cache_config.json`初始化Dit-Cache，用户可自定义配置文件，通过传入参数`--cache-config`来自定义配置文件地址。
+### Dit-Cache 说明
 
-用户可修改配置文件中的以下几项config文件里的字段，其他配置信息详见[HunyuanVideo优化文档](../../docs/models/hunyuan-video/hunyuan_video_optimization.md)：
+本样例集成了多种 Dit-Cache 方案（[FBCache](https://github.com/chengzeyi/ParaAttention)、[TeaCache](https://cvpr.thecvf.com/virtual/2025/poster/33872)、[TaylorSeer](https://github.com/Shenyi-Z/TaylorSeer)），通过 YAML 的 `dit_cache` 段配置：
 
-`cache_forward`: 选择Dit-Cache方案，设为`FBCache`启用FBCache，设为`TeaCache`启用TeaCache，设为`TaylorSeer`启用TaylorSeer，其他情况不启用Dit-Cache。默认不启用Dit-Cache。
-
-`rel_l1_thresh`: 控制加速比，当Dit-Cache为FBCache时，`rel_l1_thresh=0.1`时DiT模型加速比为2.0；当Dit-Cache为TeaCache时，`rel_l1_thresh=0.1`时DiT模型加速比为1.6，`rel_l1_thresh=0.15`时DiT模型加速比为2.1。请注意，更大的阈值可以获得更高的加速比，但也会带来更高的精度损失。
-
-`offload`: 开关offload功能，减少TaylorSeer对**npu内存**的占用，以支持生成序列长度更长的视频。大样例建议使能该特性规避TaylorSeer额外缓存导致的oom问题，默认`offload=True`，开启offload。**`720*1280*129`规格下，开启TaylorSeer offload功能需要保证有400GB以上的CPU内存。**
-
-**注意**：开启DiT-Cache后，会轻微加剧内存占用。如果内存占用过高（e.g. 剩余可用内存不足100MB），开启虚拟内存可能会产生严重的性能下降。此时请删除环境变量`export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True`，并且开启`--cpu-offload`。
-
-**量化**：传入参数`--fa-perblock-fp8` 启用FP8 FA量化，当前量化策略为per-block，q的block粒度为128，kv的block粒度为256；传入参数`--mm-mxfp8`启用MXFP8 A8W8量化，当前策略为per-channel直转。量化功能**支持多卡推理**，**仅支持950PR**。
-
-**性能分析**：本样例支持Ascend PyTorch Profiler接口采集并分析模型性能，在脚本中传入参数`--prof-dit`，启用性能分析，分析文件默认保存在`.prof`路径。具体使用方法请参考CANN社区文档[性能分析](https://www.hiascend.com/document/detail/zh/canncommercial/80RC3/devaids/devtools/profiling/atlasprofiling_16_0006.html)。**支持多卡推理**。
-
-#### 多卡推理: 
-
-本样例适配了Ulysses/Ring Attention两种序列并行方法，用于多卡并行推理，减少显存占用，提高推理速率，通过传入参数`--ulysses-degree=<SP number>`或者`--ring-degree=<SP number>`启用序列并行。原生hunyuanVideo模型在8块Atlas 800I A2上，支持生成视频规格`720*1280*649`。多卡推理要求满足以下约束：
-1. 混合并行策略约束 `nproc_per_node == ulysses-degree * ring-degree`；
-2. 视频规格约束条件`H % 16 % <SP number> == 0 or W % 16 % <SP number> == 0`，其中`H, W, T` 分别是视频帧的高、宽、数量；
-3. 序列并行度的约束条件`<head num> % <SP number> == 0`，其中`<head num> = 24`。
-
-执行以下脚本启用多卡序列并行，环境变量的详细信息请参考[CANN社区](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/850/maintenref/envvar/envref_07_0001.html)。
-
-```shell
-bash scripts/test_sp.sh
+```yaml
+dit_cache:
+  method: "TeaCache"                # NoCache / FBCache / TeaCache / TaylorSeer
+  enable_separate_cfg: true
+  params:                           # 方法特有参数（覆盖内置默认值）
+    rel_l1_thresh: 0.15
+    coefficients: [733.226126, -401.131952, 67.5869174, -3.149879, 0.0961237896]
+    warmup: 2
 ```
 
-**VAE并行**: 在多卡推理时，本样例支持VAE并行，传入参数`--use-vae-parallel`开启VAE并行功能。
+常用调参：
 
-**UAA, Ulysses Anythin Attention**: 传入参数`--ulysses-anything`启用UAA。开启后解除对视频规格`H, W`的约束，支持任意尺寸的`H, W`；解除序列并行度的约束条件`<head num> % <SP number> == 0`，支持`<head num> 大于 <SP number>`，其中`<head num> = 24`。**UAA仅支持纯Ulysses，不支持Ulysses+RingAttention混合序列并行策略**。
+- **FBCache `rel_l1_thresh`**：L1 差异阈值。`rel_l1_thresh=0.1` 时 DiT 加速比约 2.0；阈值越大越快，精度损失越大。
+- **TeaCache `rel_l1_thresh / coefficients / warmup`**：累积 L1 阈值、多项式重缩放系数、前 N 步强制完整计算。`rel_l1_thresh=0.1` 约 1.6 倍加速，`rel_l1_thresh=0.15` 约 2.1 倍加速。
+- **TaylorSeer `n_derivatives / skip_interval_steps / warmup / cutoff_steps / offload`**：Taylor 展开阶数、跳算间隔、前后强制完整计算步数、是否 offload 到 CPU。**`720*1280*129` 规格开启 offload 需保证 400GB 以上主机内存。**
+
+> **内存提示**：开启 Dit-Cache 后内存占用会略增。若剩余可用内存过低（如不足 100MB），可在 YAML 的 `env_vars` 中移除/改写 `PYTORCH_NPU_ALLOC_CONF`，并在 `model_args` 中启用 `use-cpu-offload: true`。
+
+### 量化
+
+通过单卡 FP8 YAML（`single_fp8.yaml`）直接启用；也可向任意 YAML 的 `model_args` 添加：
+
+- `fa-perblock-fp8: true`：启用 FP8 FA 量化（per-block，Q block=128，KV block=256）；
+- `mm-mxfp8: true`：启用 MXFP8 A8W8 量化（per-channel 直转）。
+
+量化**支持多卡推理**，**仅支持 950PR**。
+
+### 性能分析
+
+在 YAML 的 `model_args` 中添加 `prof-dit: true` 即可启用 Ascend PyTorch Profiler，默认分析文件保存到 `.prof/`。用法参考 CANN 社区文档[性能分析](https://www.hiascend.com/document/detail/zh/canncommercial/80RC3/devaids/devtools/profiling/atlasprofiling_16_0006.html)。**支持多卡推理**。
+
+### 多卡推理约束与并行配置组合
+
+本样例适配了 Ulysses / Ring Attention 两种序列并行方法，原生 HunyuanVideo 在 8 卡 Atlas 800I A2 上支持 `720*1280*129` 及以上规格。多卡推理需满足以下约束：
+
+1. 混合并行策略约束：`world_size == ulysses-degree * ring-degree`（由 YAML 中 `world_size` 与 `ulysses-degree / ring-degree` 共同决定，`mm_function.sh` 会将 `world_size` 映射为 `torchrun --nproc_per_node`）；
+2. 视频规格约束：`H % 16 % <SP number> == 0 or W % 16 % <SP number> == 0`；
+3. 序列并行度约束：`<head num> % <SP number> == 0`，其中 `<head num> = 24`。
+
+要使用不同的并行配置组合时，复制 `sp8.yaml` 并修改 `world_size / ulysses-degree / ring-degree / video-size / video-length` 即可：
+
+|     video-size        | video-length | ulysses-degree x ring-degree | world_size |
+|-----------------------|--------------|------------------------------|------------|
+| 1280 720 or 720 1280  | 129          | 8x1, 4x2, 2x4, 1x8           | 8          |
+| 1280 720 or 720 1280  | 129          | 1x5                          | 5          |
+| 1280 720 or 720 1280  | 129          | 4x1, 2x2, 1x4                | 4          |
+| 1280 720 or 720 1280  | 129          | 3x1, 1x3                     | 3          |
+| 1280 720 or 720 1280  | 129          | 2x1, 1x2                     | 2          |
+| 1104 832 or 832 1104  | 129          | 4x1, 2x2, 1x4                | 4          |
+| 1104 832 or 832 1104  | 129          | 3x1, 1x3                     | 3          |
+| 1104 832 or 832 1104  | 129          | 2x1, 1x2                     | 2          |
+| 960 960               | 129          | 6x1, 3x2, 2x3, 1x6           | 6          |
+| 960 960               | 129          | 4x1, 2x2, 1x4                | 4          |
+| 960 960               | 129          | 3x1, 1x3                     | 3          |
+| 960 960               | 129          | 1x2, 2x1                     | 2          |
+| 960 544 or 544 960    | 129          | 6x1, 3x2, 2x3, 1x6           | 6          |
+| 960 544 or 544 960    | 129          | 4x1, 2x2, 1x4                | 4          |
+| 960 544 or 544 960    | 129          | 3x1, 1x3                     | 3          |
+| 960 544 or 544 960    | 129          | 1x2, 2x1                     | 2          |
+| 832 624 or 624 832    | 129          | 4x1, 2x2, 1x4                | 4          |
+| 832 624 or 624 832    | 129          | 3x1, 1x3                     | 3          |
+| 832 624 or 624 832    | 129          | 2x1, 1x2                     | 2          |
+| 720 720               | 129          | 1x5                          | 5          |
+| 720 720               | 129          | 3x1, 1x3                     | 3          |
+
+**VAE 并行**：在多卡 YAML 中置 `use-vae-parallel: true` 即可启用。
+
+**UAA（Ulysses Anything Attention）**：在 YAML 中置 `ulysses-anything: true` 可启用。开启后解除对视频规格 `H, W` 的整除约束，解除 `<head num> % <SP number> == 0` 的约束，支持 `<head num>` 大于 `<SP number>`（`<head num> = 24`）。**UAA 仅支持纯 Ulysses，不支持 Ulysses + Ring Attention 混合序列并行策略。**
+
+## 附录：公共环境变量说明
+
+以下环境变量由 `executor/scripts/mm_function.sh` 在启动时统一设置（作为默认值，可通过 YAML 的 `env_vars` 覆盖）：
+
+- `PYTORCH_NPU_ALLOC_CONF='expandable_segments:True'`：PyTorch 针对昇腾 NPU 的内存分配配置，启用"可扩展内存段"减少 OOM 风险；
+- `TASK_QUEUE_ENABLE=2`：开启 task_queue 算子下发队列 Level 2 优化；
+- `CPU_AFFINITY_CONF=1`：开启粗粒度绑核；
+- `TOKENIZERS_PARALLELISM=false`：禁用 tokenizers 并行化；
+- 自动设置 HCCL 通信相关的 `HCCL_IF_IP / HCCL_IF_BASE_PORT / HCCL_CONNECT_TIMEOUT / HCCL_EXEC_TIMEOUT`。
+
+指定参与推理的设备：`export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7` 后再执行 `bash infer.sh`。

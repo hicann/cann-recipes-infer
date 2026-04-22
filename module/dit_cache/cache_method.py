@@ -28,15 +28,64 @@ import torch.nn as nn
 import torch.distributed as dist
 
 
-DEFAULT_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache_config.json")
+DEFAULT_CACHE_CONFIG = {
+    "FBCache": {
+        "cache_name": "FBCache",
+        "rel_l1_thresh": 0.05,
+        "latent": "latent",
+        "judge_input": "cache_latent"
+    },
+    "TeaCache": {
+        "cache_name": "TeaCache",
+        "rel_l1_thresh": 0.15,
+        "coefficients": [733.226126, -401.131952, 67.5869174, -3.149879, 0.0961237896],
+        "warmup": 2,
+        "latent": "latent",
+        "judge_input": "modulated_inp"
+    },
+    "TaylorSeer": {
+        "cache_name": "TaylorSeer",
+        "n_derivatives": 3,
+        "skip_interval_steps": 4,
+        "warmup": 3,
+        "cutoff_steps": 1,
+        "offload": True
+    },
+    "NoCache": {
+        "cache_name": "NoCache"
+    }
+}
 
 
-def load_cache_config(config_path=DEFAULT_CONFIG_PATH):
-    try:
-        with open(config_path, "r", encoding="utf-8") as f:
-            config = json.loads(f.read(), parse_float=lambda x: float(x))
-    except Exception as e:
-        raise ValueError(f"File {config_path} not found!") from e
+def load_cache_config(config_path):
+    """Load cache config from JSON or YAML file.
+
+    JSON: legacy format, used as-is.
+    YAML: reads the dit_cache section and merges with defaults.
+    """
+    if not os.path.exists(config_path):
+        raise ValueError(f"Config file not found: {config_path}")
+
+    with open(config_path, "r", encoding="utf-8") as f:
+        raw = f.read()
+
+    if config_path.endswith((".yaml", ".yml")):
+        import yaml
+        full_cfg = yaml.safe_load(raw)
+        dit = full_cfg.get("dit_cache", {})
+        method = dit.get("method", "NoCache")
+        user_params = dit.get("params", {})
+        config = {
+            "cache_forward": method,
+            "enable_separate_cfg": dit.get("enable_separate_cfg", True),
+        }
+        for key, defaults in DEFAULT_CACHE_CONFIG.items():
+            config[key] = dict(defaults)
+        if method in config and user_params:
+            config[method].update(user_params)
+    else:
+        config = json.loads(raw, parse_float=lambda x: float(x))
+
     _validate_config_keys(config)
     return config
 

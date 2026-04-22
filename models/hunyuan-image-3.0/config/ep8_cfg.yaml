@@ -1,0 +1,21 @@
+model_args:
+  model-id: "./ckpts/weight_ep8"     # must modify: path to converted EP/TP weight directory (see README "权重准备与转换")
+  prompt: "A cinematic medium shot captures a single Asian woman seated on a chair within a dimly lit room, creating an intimate and theatrical atmosphere."
+  image-size: "1024x1024"            # WxH
+  seed: 42
+  diff-infer-steps: 50               # denoising steps
+  reproduce: true                    # deterministic mode
+  attn-impl: "npu"                   # use NPU attention implementation
+  moe-impl: "npu_grouped_matmul"     # use NPU MoE implementation
+  moe-ep: true                       # MoE EP sharding; mutually exclusive with moe-tp
+  verbose: 0
+
+model_name: "hunyuan-image-3.0"
+world_size: 16                       # = tp_attn(=8) * 2 when CFG_PARALLEL=1; drops to 8 without CFG
+master_port: 10086
+entry_script: "run_image_gen.py"
+
+env_vars:
+  CFG_PARALLEL: "1"                  # 1 enables CFG parallel; doubles required world_size
+  USE_VAE_PARALLEL: "1"
+  CPU_AFFINITY_CONF: "2"             # auto core binding

@@ -85,33 +85,83 @@ cd ..
 
 ## 快速启动
 
-本样例准备了单卡环境下的训练和推理脚本。执行脚本前，参考[Ascend社区](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/850/softwareinst/instg/instg_0008.html?Mode=PmIns&InstallType=local&OS=Debian)中的CANN安装软件教程配置环境变量：
+本样例通过 `bash infer.sh` 拉起，推理参数集中在 `config/*.yaml` 维护，启动器使用 `accelerate`。
+
+### 1. 配置 CANN 环境变量
+
+执行推理前先完成 CANN 环境变量配置（参考 [Ascend 社区](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/850/softwareinst/instg/instg_0008.html?Mode=PmIns&InstallType=local&OS=Debian)）：
+
 ```
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 ```
-执行推理脚本：
+
+> 注意：`PYTHONPATH` 不会也不应全局设置项目根路径，`mm_function.sh` 会在 `accelerate` 子进程中按需注入，避免影响 CANN TBE 编译器的内置 Python 解释器。
+
+### 2. 选择推理配置
+
+`config/` 目录下已预置以下 YAML：
+
+| YAML 文件 | 卡数 | 启动器 | 适用场景 |
+|-----------|------|--------|----------|
+| `2b_480p_single.yaml` | 1 | accelerate（`mixed_precision: bf16`） | SANA-Video 2B 480p 单卡文生视频 |
+
+YAML 中的关键字段：
+
+```yaml
+launcher: "accelerate"
+launcher_args:
+  mixed_precision: "bf16"          # 透传 accelerate launch --mixed_precision=bf16
+env_vars:
+  DISABLE_XFORMERS: "1"            # 屏蔽 xformers，走 NPU 融合算子
+model_args:
+  config: "configs/sana_video_config/Sana_2000M_480px_AdamW_fsdp.yaml"
+  model_path: "hf://Efficient-Large-Model/SANA-Video_2B_480p/checkpoints/SANA_Video_2B_480p.pth"
+  txt_file: "asset/samples/video_prompts_samples.txt"
+  cfg_scale: 6
+  motion_score: 30
+  flow_shift: 8
+  work_dir: "output/sana_t2v_video_results"
+  model.fp32_attention: "False"    # 用字符串 "False"，argparse 侧按字面量接收
 ```
-bash inference_video_scripts/inference_sana_video.sh \
-      --np 1 \
-      --config configs/sana_video_config/Sana_2000M_480px_AdamW_fsdp.yaml \
-      --model_path hf://Efficient-Large-Model/SANA-Video_2B_480p/checkpoints/SANA_Video_2B_480p.pth \
-      --txt_file=asset/samples/video_prompts_samples.txt \
-      --cfg_scale 6 \
-      --motion_score 30 \
-      --flow_shift 8 \
-      --work_dir output/sana_t2v_video_results \
-      --model.fp32_attention False
+
+### 3. 修改推理输入
+
+根据需要修改 YAML 中 `model_args` 下的字段：
+
+| YAML 字段 | 含义 |
+|-----------|------|
+| `config` | 推理使用的配置文件（上游 Sana 的 YAML） |
+| `model_path` | 推理使用的权重文件路径，默认从 HuggingFace 自动下载 |
+| `txt_file` | 推理使用的文本提示词文件 |
+| `cfg_scale` | 提示词对齐强度 |
+| `motion_score` | 运动强度分数 |
+| `flow_shift` | 流偏移参数，用于调整扩散模型去噪时间步 |
+| `work_dir` | 生成视频输出路径 |
+| `model.fp32_attention` | attn 是否使用 fp32 精度，推理时置 `"False"` 以提升性能 |
+
+透传规则（适用于所有字段）：
+
+| YAML 类型 | 命令行效果 |
+|-----------|-----------|
+| 字符串/数字 | `--key value` |
+| 布尔 `true` | `--key`（flag） |
+| 布尔 `false` | 忽略 |
+| 列表 | `--key v1 v2 …` |
+| 加引号字符串 `"False"` | `--key False`（用于 pyrallis/Hydra 类解析器） |
+
+### 4. 拉起推理
+
 ```
-参数说明：
-- `np`: 推理使用卡数
-- `config`: 推理使用的配置文件
-- `model_path`: 推理使用的权重文件路径
-- `txt_file`: 推理使用的文本提示词文件
-- `cfg_scale`: 提示词对齐强度
-- `motion_score`: 运动强度分数
-- `flow_shift`: 流偏移参数，用于调整扩散模型去噪时间步
-- `work_dir`: 生成视频输出路径
-- `model.fp32_attention`: 控制attn是否使用fp32精度，推理时可设为False提升性能
+bash infer.sh
+```
+
+拉起过程会自动：
+- 解析 YAML 中的 `world_size`、`master_port`、`entry_script`、`env_vars`、`launcher_args`、`model_args`；
+- 设置通用 NPU 优化环境变量（`PYTORCH_NPU_ALLOC_CONF`、`TASK_QUEUE_ENABLE`、`CPU_AFFINITY_CONF`、`TOKENIZERS_PARALLELISM`）及 HCCL 通信配置；
+- 在 `res/<YYYYMMDD>/<model_name>/` 下自动创建日志目录，并将推理输出 `tee` 到 `log_<timestamp>.log`；
+- 调用 `accelerate launch --num_processes=<world_size> --num_machines=1 --main_process_port=<master_port> --mixed_precision=bf16 inference_video_scripts/inference_sana_video.py <model_args>`。
+
+如需切换到多卡 DP，可将 YAML 中的 `world_size` 调整为目标卡数，`mm_function.sh` 会自动转换为 `accelerate --num_processes`。
 
 ## 性能数据
 

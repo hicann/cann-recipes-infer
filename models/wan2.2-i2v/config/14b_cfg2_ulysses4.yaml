@@ -1,0 +1,29 @@
+model_args:
+  ckpt_dir: "/path/to/Wan2.2-I2V-14B"  # must modify: path to downloaded weight directory
+  image: "examples/i2v_input.JPG"    # input reference image
+  prompt: "Summer beach vacation style, a white cat wearing sunglasses sits on a surfboard. The fluffy-furred feline gazes directly at the camera with a relaxed expression. Blurred beach scenery forms the background featuring crystal-clear waters, distant green hills, and a blue sky dotted with white clouds. The cat assumes a naturally relaxed posture, as if savoring the sea breeze and warm sunlight. A close-up shot highlights the feline's intricate details and the refreshing atmosphere of the seaside."
+  task: "i2v-A14B"
+  size: "1280*720"                   # HxW; supported 1280*720, 832*480
+  frame_num: 81                      # frame count; 4n+1 form
+  sample_steps: 40                   # denoising steps
+  base_seed: 100
+  cfg_size: 2                        # CFG parallel degree; tunable, must satisfy cfg_size * ulysses_size * ring_size = world_size
+  ulysses_size: 4                    # Ulysses SP degree; tunable
+  ring_size: 1                       # Ring Attention SP degree; tunable
+  dit_fsdp: true                     # DiT FSDP sharding to reduce memory
+  t5_fsdp: true                      # T5 FSDP sharding
+  vae_parallel: true
+
+model_name: "wan2.2-i2v"
+world_size: 8                        # must equal cfg_size * ulysses_size * ring_size
+master_port: 29600
+entry_script: "generate.py"
+
+env_vars:
+  PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
+  TASK_QUEUE_ENABLE: "2"
+  CPU_AFFINITY_CONF: "1"
+
+dit_cache:
+  method: "NoCache"                  # multi-card and Dit-Cache are mutually exclusive
+  enable_separate_cfg: true

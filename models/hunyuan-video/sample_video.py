@@ -52,7 +52,8 @@ def main():
     args = parse_args()
     device = f"npu:{args.device}"
     torch.npu.set_device(device)
-    logger.add(os.path.join(args.save_path, "logs/hy_{time:YYYY-MM-DD}.log"),
+    log_dir = os.environ.get("LOG_DIR", os.path.join(args.save_path, "logs"))
+    logger.add(os.path.join(log_dir, "hy_{time:YYYY-MM-DD}.log"),
            rotation="00:00",
            retention="7 days",
            compression="zip",

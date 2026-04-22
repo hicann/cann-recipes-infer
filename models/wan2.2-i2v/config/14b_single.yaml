@@ -1,0 +1,27 @@
+model_args:
+  ckpt_dir: "/path/to/Wan2.2-I2V-14B"  # must modify: path to downloaded weight directory
+  image: "examples/i2v_input.JPG"    # input reference image
+  prompt: "Summer beach vacation style, a white cat wearing sunglasses sits on a surfboard."
+  task: "i2v-A14B"
+  size: "832*480"                    # HxW; supported 1280*720, 832*480
+  frame_num: 61                      # frame count; 4n+1 form
+  sample_steps: 40                   # denoising steps
+  base_seed: 100
+  convert_model_dtype: true          # cast to inference dtype; saves memory on single card
+  cfg_size: 1
+  ulysses_size: 1
+  ring_size: 1
+
+model_name: "wan2.2-i2v"
+world_size: 1
+master_port: 29600
+entry_script: "generate.py"
+
+env_vars:
+  PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
+  TASK_QUEUE_ENABLE: "2"
+  CPU_AFFINITY_CONF: "1"
+
+dit_cache:
+  method: "NoCache"                  # NoCache / FBCache / TeaCache
+  enable_separate_cfg: true

@@ -1,0 +1,21 @@
+model_args:
+  config: "configs/sana_video_config/Sana_2000M_480px_AdamW_fsdp.yaml"  # must modify if using custom upstream config
+  model_path: "hf://Efficient-Large-Model/SANA-Video_2B_480p/checkpoints/SANA_Video_2B_480p.pth"  # must modify: weight path, or hf:// URI for auto-download
+  txt_file: "asset/samples/video_prompts_samples.txt"                    # text prompts file (one prompt per line)
+  work_dir: "output/sana_t2v_video_results"                              # output directory
+  cfg_scale: 6                       # CFG guidance strength
+  motion_score: 30                   # motion strength hint
+  flow_shift: 8                      # flow solver shift
+  model.fp32_attention: "False"      # quoted str literal; bypasses pyrallis bool parsing
+
+model_name: "sana-video"
+world_size: 1                        # also supports multi-card DP; set to target card count
+master_port: 29600
+entry_script: "inference_video_scripts/inference_sana_video.py"
+launcher: "accelerate"
+
+launcher_args:
+  mixed_precision: "bf16"            # no / fp16 / bf16 / fp8
+
+env_vars:
+  DISABLE_XFORMERS: "1"              # route attention to NPU fused kernel
