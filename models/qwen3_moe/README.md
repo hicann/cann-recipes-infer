@@ -60,20 +60,18 @@ Qwen3-MoE模型是2025年开源的大语言模型，包括Qwen3-235B-A22B与Qwen
 
 2. 准备输入prompt。
 
+   - 使用长序列prompt（默认）。
+
+     本样例默认使用LongBench数据集作为长序列prompt，YAML配置文件中`dataset`参数已设置为`"LongBench"`。若您的机器无法联网，需要从[huggingface](http://huggingface.co/datasets/zai-org/LongBench/tree/main)手动下载数据集至`dataset/LongBench`目录下，`LongBench`文件夹需手工创建，目录中包含`LongBench.py`和`data`目录，并需要在`LongBench.py`中修改数据集加载路径；若您的机器可正常联网，样例执行过程中会自动在线读取LongBench数据集，您无需手工下载。
+     > 说明：在使用LongBench数据集或其他自定义数据集时，默认执行文本摘要任务，可在`cann-recipes-infer/executor/utils/data_utils.py`的`build_dataset_input`函数里修改默认的system prompt。
+
    - 使用内置prompt。
 
-     本样例已在`dataset/default_prompt.json`中内置了输入prompt，若您直接使用内置prompt，本步骤可直接跳过。
+     若您需要使用内置prompt，需要执行以下操作：
 
-     当然，您也可以在`dataset/default_prompt.json`文件中自定义prompt输入。
+     1. 修改YAML文件中的`dataset`参数，将其修改为`dataset: "default"`。
 
-   - 使用长序列prompt。
-
-     本样例默认使用内置prompt，若您需要使用长序列prompt，需要执行以下操作：
-
-     1. 修改YAML文件中的`dataset`参数，将其修改为`dataset: "LongBench"`，使用LongBench数据集作为长序列prompt。
-
-     2. 若您的机器无法联网，需要您从[huggingface](http://huggingface.co/datasets/zai-org/LongBench/tree/main)手动下载数据集至`dataset/LongBench`目录下，`LongBench`文件夹需手工创建，目录中包含`LongBench.py`和`data`目录，并需要在`LongBench.py`中修改数据集加载路径；若您的机器可正常联网，样例执行过程中会自动在线读取LongBench数据集，您无需手工下载。
-      > 说明：在使用LongBench数据集或其他自定义数据集时，默认执行文本摘要任务，可在`cann-recipes-infer/executor/utils/data_utils.py`的`build_dataset_input`函数里修改默认的system prompt。
+     2. 本样例已在`dataset/default_prompt.json`中内置了输入prompt，您可以直接使用或在该文件中自定义prompt输入。
 
 
 3. 执行推理脚本。
