@@ -249,7 +249,9 @@ dit_cache:
 
 ### 性能分析
 
-在 YAML 的 `model_args` 中添加 `prof-dit: true` 即可启用 Ascend PyTorch Profiler，默认分析文件保存到 `.prof/`。用法参考 CANN 社区文档[性能分析](https://www.hiascend.com/document/detail/zh/canncommercial/80RC3/devaids/devtools/profiling/atlasprofiling_16_0006.html)。**支持多卡推理**。
+**块稀疏 Attention**：传入参数`--sparse-method` 启用块稀疏 Attention，可选的稀疏策略为`TopK`和`SVG`，在`models/hunyuan-video/hyvideo/sparse/sparse_config.yaml`文件中可以调整参数配置。该优化方法基于[blitz_sparse_attention算子](https://gitcode.com/cann/ops-transformer/blob/master/experimental/attention/blitz_sparse_attention/README.md)实现，运行前需要依据参考文档编译算子。当选择稀疏策略为TopK时，需要运行`offline-profiling`程序，可参考[优化文档](https://gitcode.com/cann/cann-recipes-infer/blob/master/docs/models/hunyuan-video/hunyuan_video_optimization.md)中，`TopK`章节实现过程。
+
+**性能分析**：本样例支持Ascend PyTorch Profiler接口采集并分析模型性能，在脚本中传入参数`--prof-dit`，启用性能分析，分析文件默认保存在`.prof`路径。具体使用方法请参考CANN社区文档[性能分析](https://www.hiascend.com/document/detail/zh/canncommercial/80RC3/devaids/devtools/profiling/atlasprofiling_16_0006.html)。**支持多卡推理**。
 
 ### 多卡推理约束与并行配置组合
 

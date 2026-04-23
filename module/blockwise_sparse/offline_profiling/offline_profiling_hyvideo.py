@@ -3,7 +3,7 @@ import argparse
 
 import torch
 import torch_npu
-import torch.nn.funcitonal as F
+import torch.nn.functional as F
 
 from offline_profiling import get_cumulative_coverage_of_different_sparsity, \
                         get_sparsity_of_target_cumulative_coverage, save_expected_sparsity
@@ -92,4 +92,4 @@ for scene in scene_list:
                                         sparsity_list, device=device)
     sparsity_of_target_coverage = get_sparsity_of_target_cumulative_coverage(all_layer_cumulative_coverage,
                                     global_layer_num, head_num, sparsity_list, target_coverage, device=device)
-    save_expected_sparsity(dir_path, sparsity_of_target_coverage, target_coverage=target_coverage)
+    save_expected_sparsity(target_dir_path, sparsity_of_target_coverage, target_coverage=target_coverage)

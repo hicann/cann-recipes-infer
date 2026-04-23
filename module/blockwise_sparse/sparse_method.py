@@ -11,7 +11,12 @@ import torch
 import torch.nn as nn
 import torch.distributed as dist
 import torch.nn.functional as F
-import torch_bsa
+
+try:
+    import torch_bsa
+except ImportError:
+    torch_bsa = None
+
 import torch_npu
 import yaml
 from loguru import logger
@@ -313,7 +318,7 @@ class TopKPredictor(BaseSparsePredictor):
         max_k = int(k_nums.max().item())
         _, indices = torch.topk(attn, max_k, dim=-1)
         
-        k_nums_expanded = k_nums.view(1, H, 1, 1)
+        k_nums_expanded = k_nums.view(1, h, 1, 1)
         arange_k = torch.arange(max_k, device=q.device).view(1, 1, 1, max_k)
         mask = arange_k < k_nums_expanded
         new_sabi_tensor[:, :, :, :max_k] = torch.where(mask, indices, -1)
@@ -686,7 +691,7 @@ class HunyuanVideoTopKAdapter(TopKPredictor):
         must_keep_k = must_keep_indices_k.shape[0]
         added_q_row_num = must_keep_indices_q.shape[0]
         sink_txt_suffix = must_keep_indices_k.view(1, 1, 1, must_keep_k) \
-                            .expand(b, h, num_blocks_q, K) \
+                            .expand(b, h, num_blocks_q, must_keep_k) \
                             .to(mid_sabi_tensor[0].device)
         full_k_indices = torch.arange(total_num_blocks_k, device=mid_sabi_tensor.device, dtype=self.index_type) \
                             .view(1, 1, 1, total_num_blocks_k) \

@@ -536,8 +536,13 @@ def _sync_scalar_for_sp(self, value: float) -> float:
 ```bash
 git clone https://gitcode.com/cann/ops-transformer.git
 cd ops-transformer
-bash build.sh --make_clean --experimental -j96 --pkg --soc=ascend910b --ops=blitz_sparse_attention
+
+yum install patch # 安装相关依赖
+pip install -r requirements.txt
+
+bash build.sh --make_clean --experimental -j96 --pkg --soc=ascend910_93 --ops=blitz_sparse_attention #（--soc，A2：ascend910b，A3：ascend910_93）
 ./build/cann-ops-transformer-custom_linux-"$(uname -i)".run
+cd experimental/attention/blitz_sparse_attention/torch_interface && bash build.sh custom
 ```
 
 #### TopK
@@ -551,7 +556,8 @@ $$
 offline-profiling代码存放在`/module/blockwise_sparse/offline_profiling/`，参考以下命令执行。offline-profiling会执行个别样例的推理，对于dit过程中的每个step、layer和head，根据预先设定的CAC阈值，遍历不同的稀疏度，找出满足该CAC的最大稀疏度，并进行记录。在后续的推理中，每次做块稀疏attention时，会根据先前设定好的稀疏度进行计算。offline-profiling的运行命令如下：
 
 ```bash
-python offline_profiling_hyvideo.py  --qk_dir_path /path/to/qk_dir --target_dir_path /path/to/target_dir --global_layer_num 60 --head_num 24 --target_coverage 0.66 --step_start 15 --step_end 50
+cd /module/blockwise_sparse/offline_profiling/
+python offline_profiling_hyvideo.py  --qk_dir_path /path/to/qk_dir --target_dir_path /path/to/target_dir --global_layer_num 60 --head_num 24 --target_coverage 0.66 --step_start 0 --step_end 50
 ```
 需要保存各step和layer的q和k的张量，放置在`/path/to/qk_dir`，结果将被保存在`/path/to/target_dir`。`global_layer_num`和`head_num`表示总层数数和头的个数，`target_coverage`表示目标CAC，`step_start`和`step_end`分别表示开始进行稀疏的step id和结束稀疏的step id。
 
@@ -582,3 +588,9 @@ SVG:
    sample_mse_max_row: 5000 # 采样长度
    context_length: 256 # context长度
 ```
+不同块稀疏 Attention算法的性能数据如下：
+| Method   | Sparsity | DiT Time (s) | E2E Time (s) | DiT Speedup | E2E Speedup |
+|----------|----------|-------------:|-------------:|------------:|------------:|
+| Baseline | –        | 3459.52      | 3577.19      | 1.00×       | 1.00×       |
+| TopK     | 76%      | **1839.48**  | **1963.52**  | **1.88×**   | **1.82×**   |
+| SVG      | 80%      | 2036.18      | 2167.55      | 1.70×       | 1.65×       |

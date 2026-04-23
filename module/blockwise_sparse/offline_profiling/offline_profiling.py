@@ -7,7 +7,6 @@ import torch.nn.functional as F
 from loguru import logger
 
 import numpy as np
-import seaborn as sns
 
 
 def get_dense_attention_score(q, k):
@@ -86,7 +85,7 @@ def get_sparsity_of_target_cumulative_coverage(all_layer_sparsity_cumulative_cov
         for global_idx in range(0, global_layer_num):
             per_layer_sparsity_cumulative_coverage = all_layer_sparsity_cumulative_coverage[global_idx][sparsity][0]
             
-            for per_head_cov, idx in enumerate(per_layer_sparsity_cumulative_coverage):
+            for idx, per_head_cov in enumerate(per_layer_sparsity_cumulative_coverage):
                 if per_head_cov > target_coverage:
                     target_sparsity_of_target_coverage[global_idx][idx] = 1 - sparsity
     target_sparsity_of_target_coverage[torch.where(target_sparsity_of_target_coverage == -1)] = 0
@@ -94,8 +93,7 @@ def get_sparsity_of_target_cumulative_coverage(all_layer_sparsity_cumulative_cov
 
 
 def save_expected_sparsity(dir_path, target_sparsity_expected_coverage, target_coverage=0.95):
-    sparsity_dir_path = f"{dir_path}/sparsity_of_target_coverage_{target_coverage}"
-    os.makedirs(sparsity_dir_path, exist_ok=True)
-    sparsity_file_path_of_expected_coverage = os.path.join(sparsity_dir_path, 
+    os.makedirs(dir_path, exist_ok=True)
+    sparsity_file_path_of_expected_coverage = os.path.join(dir_path, 
                                                 f"sparsity_of_RE_{target_coverage}_only_img.pt")
     torch.save(target_sparsity_expected_coverage, sparsity_file_path_of_expected_coverage)
