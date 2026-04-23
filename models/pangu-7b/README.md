@@ -24,7 +24,7 @@
    请从[软件包下载地址](https://gitcode.com/Ascend/pytorch/tree/v7.2.RC1.alpha002-pytorch2.6.0)下载`v7.2.RC1.alpha002-pytorch2.6.0`源码，参考[源码编译安装](https://www.hiascend.com/document/detail/zh/Pytorch/710/configandinstg/instg/insg_0005.html)。
 
 3. 下载项目源码并安装依赖的python库。
-   ```python
+   ```bash
    # 下载项目源码，以master分支为例
    git clone https://gitcode.com/cann/cann-recipes-infer.git
 
@@ -59,10 +59,11 @@ snapshot_download(
 )
 ```
 
-量化权重转换脚本的使用，以下以mxfp8为例子（目前仅支持mxfp8的A8W8量化，hif8和mxfp4 尚未开放)：
+量化权重转换脚本的使用，以下以mxfp8为例子（目前仅支持mxfp8的A8W8量化，hif8和mxfp4 尚未开放）：
 ```bash
 python /cann-recipes-infer/models/pangu-7b/utils/convert_model.py --input_bf16_hf_path /dev/shm/ckpts/openPangu-Embedded-7B/ --output_hf_path /dev/shm/ckpts/openPangu-Embedded-7B-MXFP8/ --w8a8 --w_quant mxfp8
 ```
+> - 注意：mxfp8量化仅支持Atlas A5硬件。
 
 
 ## 推理执行
@@ -94,8 +95,7 @@ python /cann-recipes-infer/models/pangu-7b/utils/convert_model.py --input_bf16_h
      2. 若您的机器无法联网，需要您从[huggingface](http://huggingface.co/datasets/zai-org/LongBench/tree/main)手动下载数据集至`dataset/LongBench`目录下，`LongBench`文件夹需手工创建，目录中包含`LongBench.py`和`data`目录，并需要在`LongBench.py`中修改数据集加载路径；若您的机器可正常联网，样例执行过程中会自动在线读取LongBench数据集，您无需手工下载。
       > 说明：在使用LongBench数据集或其他自定义数据集时，默认执行文本摘要任务，可在`cann-recipes-infer/executor/utils/data_utils.py`的`build_dataset_input`函数里修改默认的system prompt。
 
-
-2. 执行推理脚本。
+3. 执行推理脚本。
 
    ```shell
    cd models/pangu-7b

@@ -10,3 +10,5 @@ psutil==7.0.0
 compressed-tensors==0.6.0
 accelerate==1.0.1
 einops==0.8.0
+setuptools<70
+sentencepiece>=0.1.99
