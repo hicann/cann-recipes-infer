@@ -121,6 +121,17 @@ def limit_core_num(switch_flag: bool, aic_num: str, aiv_num: str):
     else:
         return FakeContextManager()
 
+def record_event(switch_flag: bool, events: tuple[torch.npu.Event], idx: int):
+    if switch_flag:
+        tng.ops.npu_tagged_event_record(events[idx])
+
+def wait_event(switch_flag: bool, events: tuple[torch.npu.Event], idx: int):
+    if switch_flag:
+        tng.ops.npu_tagged_event_wait(events[idx])
+
+def record_stream(switch_flag: bool, out: torch.Tensor, stream_id: str):
+    if switch_flag:
+        tng.ops.npu_record_tagged_stream(out, stream_id)
 
 def npu_prefetch(switch_flag, weight, depend, size, offset=0):
     if switch_flag:
@@ -185,6 +196,15 @@ def remove_padding_left(tensor, pad_id):
 
     return output_tensorlist
 
+
+def remove_eos_right(output_tensorlist: list[torch.Tensor], eos_id: int) -> list[list[int]]:
+    res = []
+
+    for toks in output_tensorlist:
+        if eos_id in toks:
+            toks = toks[:toks.index(eos_id)]
+        res.append(toks.cpu().tolist().append(eos_id))
+    return res
 
 def detokenize_outputs(generate_ids_list, tokenizer, input_lens):
     res_list = []
@@ -253,3 +273,52 @@ def obtain_mtp_stats(next_n, model_name, total_accepted_num, cnt, infer_time_rec
         f" is {(equivalent_infer_time)*1000:.2f} ms")
 
     return avg_infer_time
+
+
+# Adapted from
+# https://gitee.com/ascend/ModelZoo-PyTorch/blob/master/MindIE/LLM/DeepSeek/DeepSeek-V2/NPU_inference/fp8_cast_bf16.py
+def weight_dequant(weight: torch.Tensor, scale: torch.Tensor, block_size: int = 128) -> torch.Tensor:
+    """
+    Dequantizes the given weight tensor using the provided scale tensor, efficiently handling cases where
+    `weight` is not a multiple of `block_size` by broadcasting `scale`.
+
+    Args:
+        weight (torch.Tensor): The quantized weight tensor of shape(M, N).
+        scale (torch.Tensor): The scale tensor of shape (M // block_size, N // block_size).
+        block_size (int, optional): The block size to use for dequantization. Defaults to 128.
+
+    Returns:
+        torch.Tensor: The dequantized weight tensor of the same shape as `weight`, converted to the default dtype.
+
+    Raises:
+        AssertionError: If `scale` dimensions do not align with `weight` shape after scaling.
+    """
+
+    # Get the original dimensions of weight
+    M, N = weight.shape
+
+    # Compute the effective block dimensions for scale
+    scale_m, scale_n = scale.shape
+    assert scale_m == (
+        M + block_size - 1) // block_size, "Mismatch in scale rows and weight rows."
+    assert scale_n == (
+        N + block_size - 1) // block_size, "Mismatch in scale columns and weight columns."
+
+    # Convert weight to float32 for calculations
+    weight = weight.to(torch.float32)
+    scale = scale.to(torch.float32)
+
+    # Expand scale to match the weight tensor's shape
+    scale_expanded = scale.repeat_interleave(
+        block_size, dim=0).repeat_interleave(block_size, dim=1)
+
+    # Trim scale_expanded to match weight's shape if necessary
+    scale_expanded = scale_expanded[:M, :N]
+
+    # Perform element-wise multiplication
+    dequantized_weight = weight * scale_expanded
+
+    # Convert the output to the default dtype
+    dequantized_weight = dequantized_weight.to(torch.get_default_dtype())
+
+    return dequantized_weight

@@ -31,10 +31,17 @@ function get_rank()
 {
     filename=$(basename "$YAML")
     world_size=$(python3 -c "import yaml; print(yaml.safe_load(open('$YAML'))['world_size'])")
+    platform_version=$(python3 -c "import yaml; print(yaml.safe_load(open('$YAML'))['model_config'].get('platform_version'))")
+    if [ "$platform_version" = "950" ]; then
+        chip_num=8
+    else
+        chip_num=16
+    fi
+    offset=$(expr $chip_num - 1)
     if [ -n "$world_size" ]; then
         export WORLD_SIZE=$world_size
         echo "world_size is: $WORLD_SIZE"
-        SERVER_NUM=$(( (WORLD_SIZE+15) / 16 ))
+        SERVER_NUM=$(((WORLD_SIZE + $offset) / $chip_num ))
         echo "server_num is: $SERVER_NUM"
 
         if [ "$SERVER_NUM" -eq 1 ]; then
@@ -76,8 +83,7 @@ function check_env_vars()
         export MASTER_PORT=6138                            # Port of the master server
     fi
     echo "VC_TASK_INDEX >>>" $VC_TASK_INDEX
-
-    export MA_NUM_GPUS=16                       # Number of devices on each server. Should be the same for each server
+    export MA_NUM_GPUS=$chip_num  # Number of devices on each server. Should be the same for each server
     if [ "$WORLD_SIZE" -lt "$MA_NUM_GPUS" ]; then
         MA_NUM_GPUS=$WORLD_SIZE
     fi
@@ -137,7 +143,9 @@ function set_hccl()
         print(yaml.safe_load(open('$YAML')).get('model_config').get('micro_batch_mode', 0))")
 
     # 910c needs enable HCCL aiv
-    export HCCL_OP_EXPANSION_MODE=AIV
+    if [ "$platform_version" != "950" ]; then
+         export HCCL_OP_EXPANSION_MODE=AIV
+    fi
 
     if [[ ${micro_batch_mode} -eq 1 ]]; then
         # if enable micro_batch, disable AIV

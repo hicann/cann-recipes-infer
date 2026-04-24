@@ -1,9 +1,9 @@
+# This program is free software, you can redistribute it and/or modify it.
 # Copyright (c) 2025 Huawei Technologies Co., Ltd.
-# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
-# CANN Open Software License Agreement Version 2.0 (the "License").
+# This file is a part of the CANN Open Software.
+# Licensed under CANN Open Software License Agreement Version 2.0 (the "License").
 # Please refer to the License for details. You may not use this file except in compliance with the License.
-# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
-# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 
 import os
@@ -307,7 +307,7 @@ def do_golden_gen(batch_size, seq_length, head_num, select_topk, select_k_rope, 
                         f_block_offset = full_kv_block_tables[_bs][block_table_id]
                         f_block_tokens_offset = f_tokens_offset - \
                             (block_table_id * f_block_tokens)
-
+                        
                         end_index = s_block_tokens_offset + cu_block_size
                         select_k_rope[s_block_offset_batch][s_block_tokens_offset: end_index] = \
                             full_k_ropes[f_block_offset][f_block_tokens_offset:
@@ -536,7 +536,7 @@ class TestCustomGatherSelectionKvCache(TestCase):
         selection_max_seq_len = selection_topk * selection_topk_block_size
         all_topk_num = np.arange(0, (max_seq_len + selection_topk_block_size -
                                 1) // selection_topk_block_size, dtype=np.int32)
-
+        
         # 每个batch 最大blocknum
         s_max_block_num = (selection_max_seq_len + s_block_size - 1) // s_block_size
         f_max_block_num = (max_seq_len + f_block_size - 1) // f_block_size
@@ -563,7 +563,7 @@ class TestCustomGatherSelectionKvCache(TestCase):
             low=max_seq_len, high=max_seq_len, size=[batchsize]).astype(np.int32)
         full_q_actual_seq = np.random.uniform(
             low=0, high=0, size=[batchsize]).astype(np.int32) + seq_len
-
+        
         # 1. 产生reuse可复用的输入
         out_for_in = do_golden_all_host(batchsize, seq_len, headnum, selection_topk, selection_k_rope,
                                         selection_kv_cache, selection_kv_block_table, selection_kv_block_status,
@@ -573,7 +573,7 @@ class TestCustomGatherSelectionKvCache(TestCase):
         selection_kv_cache = out_for_in[1]
         selection_kv_block_table = out_for_in[2]
         selection_kv_block_status = out_for_in[3]
-
+        
         # 2.2 控制topk复用率
         for b in range(batchsize):
             curvv = selection_topk_indices[b].copy()
@@ -642,7 +642,7 @@ class TestCustomGatherSelectionKvCache(TestCase):
                         full_kv_cache_npu, full_kv_block_table_npu, full_kv_actual_seq_npu,
                         full_q_actual_seq_npu, selection_topk_block_size, api_impl_mode="eager")
         print(f'======================== PTA eager FINISH ========================')
-
+        
         if lay_out == 'TND':
             selection_topk_indices = selection_topk_indices.reshape(
                 batchsize * seq_len, headnum, selection_topk)
@@ -682,7 +682,7 @@ class TestCustomGatherSelectionKvCache(TestCase):
             assert(kv_blk_t_equal)
             assert(kv_blk_s_equal)
             assert(kv_blk_seq_equ)
-
+            
     def test_gather_selection_kv_cache_graph(self):
         k_rope = 64
         kvcahce = 512
@@ -701,7 +701,7 @@ class TestCustomGatherSelectionKvCache(TestCase):
         selection_max_seq_len = selection_topk * selection_topk_block_size
         all_topk_num = np.arange(0, (max_seq_len + selection_topk_block_size -
                                 1) // selection_topk_block_size, dtype=np.int32)
-
+        
         # 每个batch 最大blocknum
         s_max_block_num = (selection_max_seq_len + s_block_size - 1) // s_block_size
         f_max_block_num = (max_seq_len + f_block_size - 1) // f_block_size
@@ -728,7 +728,7 @@ class TestCustomGatherSelectionKvCache(TestCase):
             low=max_seq_len, high=max_seq_len, size=[batchsize]).astype(np.int32)
         full_q_actual_seq = np.random.uniform(
             low=0, high=0, size=[batchsize]).astype(np.int32) + seq_len
-
+        
         # 1. 产生reuse可复用的输入
         out_for_in = do_golden_all_host(batchsize, seq_len, headnum, selection_topk, selection_k_rope,
                                         selection_kv_cache, selection_kv_block_table,
@@ -739,7 +739,7 @@ class TestCustomGatherSelectionKvCache(TestCase):
         selection_kv_cache = out_for_in[1]
         selection_kv_block_table = out_for_in[2]
         selection_kv_block_status = out_for_in[3]
-
+        
         # 2.2 控制topk复用率
         for b in range(batchsize):
             curvv = selection_topk_indices[b].copy()
@@ -867,7 +867,7 @@ class TestCustomGatherSelectionKvCache(TestCase):
         selection_max_seq_len = selection_topk * selection_topk_block_size
         all_topk_num = np.arange(0, (max_seq_len + selection_topk_block_size -
                                 1) // selection_topk_block_size, dtype=np.int32)
-
+        
         # 每个batch 最大blocknum
         s_max_block_num = (selection_max_seq_len + s_block_size - 1) // s_block_size
         f_max_block_num = (max_seq_len + f_block_size - 1) // f_block_size
@@ -894,7 +894,7 @@ class TestCustomGatherSelectionKvCache(TestCase):
             low=max_seq_len, high=max_seq_len, size=[batchsize]).astype(np.int32)
         full_q_actual_seq = np.random.uniform(
             low=0, high=0, size=[batchsize]).astype(np.int32) + seq_len
-
+        
         # 1. 产生reuse可复用的输入
         out_for_in = do_golden_all_host(batchsize, seq_len, headnum, selection_topk, selection_k_rope,
                                         selection_kv_cache, selection_kv_block_table,
@@ -905,7 +905,7 @@ class TestCustomGatherSelectionKvCache(TestCase):
         selection_kv_cache = out_for_in[1]
         selection_kv_block_table = out_for_in[2]
         selection_kv_block_status = out_for_in[3]
-
+        
         # 2.2 控制topk复用率
         for b in range(batchsize):
             curvv = selection_topk_indices[b].copy()
@@ -1015,7 +1015,7 @@ class TestCustomGatherSelectionKvCache(TestCase):
             assert(kv_blk_t_equal)
             assert(kv_blk_s_equal)
             assert(kv_blk_seq_equ)
-
+            
     def test_gather_selection_kv_cache_tnd_graph(self):
         k_rope = 64
         kvcahce = 512
@@ -1034,7 +1034,7 @@ class TestCustomGatherSelectionKvCache(TestCase):
         selection_max_seq_len = selection_topk * selection_topk_block_size
         all_topk_num = np.arange(0, (max_seq_len + selection_topk_block_size -
                                 1) // selection_topk_block_size, dtype=np.int32)
-
+        
         # 每个batch 最大blocknum
         s_max_block_num = (selection_max_seq_len + s_block_size - 1) // s_block_size
         f_max_block_num = (max_seq_len + f_block_size - 1) // f_block_size
@@ -1061,7 +1061,7 @@ class TestCustomGatherSelectionKvCache(TestCase):
             low=max_seq_len, high=max_seq_len, size=[batchsize]).astype(np.int32)
         full_q_actual_seq = np.random.uniform(
             low=0, high=0, size=[batchsize]).astype(np.int32) + seq_len
-
+        
         # 1. 产生reuse可复用的输入
         out_for_in = do_golden_all_host(batchsize, seq_len, headnum, selection_topk, selection_k_rope,
                                         selection_kv_cache, selection_kv_block_table,
@@ -1072,7 +1072,7 @@ class TestCustomGatherSelectionKvCache(TestCase):
         selection_kv_cache = out_for_in[1]
         selection_kv_block_table = out_for_in[2]
         selection_kv_block_status = out_for_in[3]
-
+        
         # 2.2 控制topk复用率
         for b in range(batchsize):
             curvv = selection_topk_indices[b].copy()

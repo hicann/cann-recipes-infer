@@ -24,6 +24,19 @@ from torch.nn import Module
 from compressed_tensors import CompressionFormat
 
 
+MOE_PRIORITY = ["MoEGMMUpGate", "MoEGMM", "Linear"]
+
+def get_moe_target(target_scheme_map):
+    for target in MOE_PRIORITY:
+        if target in target_scheme_map:
+            return target
+    raise ValueError(f"targets must contain one of {MOE_PRIORITY} in quantization config")
+
+def is_quantization_scheme_of_moe_projs_same(target, target_scheme_map):
+    if target != "MoEGMMUpGate":
+        return True
+    return False
+
 def should_ignore_layer(
     layer_name: Optional[str],
     ignore: Iterable[str] = tuple(),

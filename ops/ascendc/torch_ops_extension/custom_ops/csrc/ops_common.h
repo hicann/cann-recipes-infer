@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2025 Huawei Technologies Co., Ltd.
+ * Copyright (c) 2025-2026 Huawei Technologies Co., Ltd.
  * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
  * CANN Open Software License Agreement Version 2.0 (the "License").
  * Please refer to the License for details. You may not use this file except in compliance with the License.
@@ -14,6 +14,8 @@
 #include <fstream>
 #include <sys/stat.h>
 #include <dlfcn.h>
+#include <future>
+#include <utility>
 #include <vector>
 #include <functional>
 #include <type_traits>
@@ -23,6 +25,7 @@
 #include <acl/acl_rt.h>
 #include <c10/util/Exception.h>
 #include <torch/extension.h>
+#include <torch/library.h>
 
 #include "torch_npu/csrc/aten/CustomFunctions.h"
 #include "torch_npu/csrc/aten/NPUNativeFunctions.h"
@@ -39,7 +42,7 @@
 #include "torch_npu/csrc/framework/interface/EnvVariables.h"
 #include "torch_npu/csrc/flopcount/FlopCount.h"
 #include "torch_npu/csrc/flopcount/FlopCounter.h"
-#include "torch_npu/csrc/custom_dtype/Init.h"
+// #include "torch_npu/csrc/custom_dtype/Init.h"
 
 
 typedef struct aclOpExecutor aclOpExecutor;
@@ -144,27 +147,55 @@ extern thread_local char g_hashBuf[kHashBufSize];
 extern thread_local int g_hashOffset;
 
 // dtype convert map
-#define AT_ALL_SCALAR_TYPE_AND_ACL_DATATYPE_PAIR(_) \
-  _(at::ScalarType::Byte, ACL_UINT8)                \
-  _(at::ScalarType::Char, ACL_INT8)                 \
-  _(at::ScalarType::Short, ACL_INT16)               \
-  _(at::ScalarType::Int, ACL_INT32)                 \
-  _(at::ScalarType::Long, ACL_INT64)                \
-  _(at::ScalarType::Half, ACL_FLOAT16)              \
-  _(at::ScalarType::Float, ACL_FLOAT)               \
-  _(at::ScalarType::Double, ACL_DOUBLE)             \
-  _(at::ScalarType::ComplexHalf, ACL_DT_UNDEFINED)  \
-  _(at::ScalarType::ComplexFloat, ACL_COMPLEX64)    \
-  _(at::ScalarType::ComplexDouble, ACL_COMPLEX128)  \
-  _(at::ScalarType::Bool, ACL_BOOL)                 \
-  _(at::ScalarType::QInt8, ACL_DT_UNDEFINED)        \
-  _(at::ScalarType::QUInt8, ACL_DT_UNDEFINED)       \
-  _(at::ScalarType::QInt32, ACL_DT_UNDEFINED)       \
-  _(at::ScalarType::BFloat16, ACL_BF16)             \
-  _(at::ScalarType::QUInt4x2, ACL_DT_UNDEFINED)     \
-  _(at::ScalarType::QUInt2x4, ACL_DT_UNDEFINED)     \
-  _(at::ScalarType::Undefined, ACL_DT_UNDEFINED)    \
-  _(at::ScalarType::NumOptions, ACL_DT_UNDEFINED)
+#define AT_ALL_SCALAR_TYPE_AND_ACL_DATATYPE_PAIR(_)                                                                    \
+    _(at::ScalarType::Byte, ACL_UINT8)                                                                                 \
+    _(at::ScalarType::Char, ACL_INT8)                                                                                  \
+    _(at::ScalarType::Short, ACL_INT16)                                                                                \
+    _(at::ScalarType::Int, ACL_INT32)                                                                                  \
+    _(at::ScalarType::Long, ACL_INT64)                                                                                 \
+    _(at::ScalarType::Half, ACL_FLOAT16)                                                                               \
+    _(at::ScalarType::Float, ACL_FLOAT)                                                                                \
+    _(at::ScalarType::Double, ACL_DOUBLE)                                                                              \
+    _(at::ScalarType::ComplexHalf, ACL_COMPLEX32)                                                                      \
+    _(at::ScalarType::ComplexFloat, ACL_COMPLEX64)                                                                     \
+    _(at::ScalarType::ComplexDouble, ACL_COMPLEX128)                                                                   \
+    _(at::ScalarType::Bool, ACL_BOOL)                                                                                  \
+    _(at::ScalarType::QInt8, ACL_DT_UNDEFINED)                                                                         \
+    _(at::ScalarType::QUInt8, ACL_DT_UNDEFINED)                                                                        \
+    _(at::ScalarType::QInt32, ACL_DT_UNDEFINED)                                                                        \
+    _(at::ScalarType::BFloat16, ACL_BF16)                                                                              \
+    _(at::ScalarType::QUInt4x2, ACL_DT_UNDEFINED)                                                                      \
+    _(at::ScalarType::QUInt2x4, ACL_DT_UNDEFINED)                                                                      \
+    _(at::ScalarType::Bits1x8, ACL_DT_UNDEFINED)                                                                       \
+    _(at::ScalarType::Bits2x4, ACL_DT_UNDEFINED)                                                                       \
+    _(at::ScalarType::Bits4x2, ACL_DT_UNDEFINED)                                                                       \
+    _(at::ScalarType::Bits8, ACL_DT_UNDEFINED)                                                                         \
+    _(at::ScalarType::Bits16, ACL_DT_UNDEFINED)                                                                        \
+    _(at::ScalarType::Float8_e5m2, ACL_FLOAT8_E5M2)                                                                    \
+    _(at::ScalarType::Float8_e4m3fn, ACL_FLOAT8_E4M3FN)                                                                \
+    _(at::ScalarType::Float8_e5m2fnuz, ACL_DT_UNDEFINED)                                                               \
+    _(at::ScalarType::Float8_e4m3fnuz, ACL_DT_UNDEFINED)                                                               \
+    _(at::ScalarType::UInt16, ACL_UINT16)                                                                              \
+    _(at::ScalarType::UInt32, ACL_UINT32)                                                                              \
+    _(at::ScalarType::UInt64, ACL_UINT64)                                                                              \
+    _(at::ScalarType::UInt1, ACL_DT_UNDEFINED)                                                                         \
+    _(at::ScalarType::UInt2, ACL_DT_UNDEFINED)                                                                         \
+    _(at::ScalarType::UInt3, ACL_DT_UNDEFINED)                                                                         \
+    _(at::ScalarType::UInt4, ACL_DT_UNDEFINED)                                                                         \
+    _(at::ScalarType::UInt5, ACL_DT_UNDEFINED)                                                                         \
+    _(at::ScalarType::UInt6, ACL_DT_UNDEFINED)                                                                         \
+    _(at::ScalarType::UInt7, ACL_DT_UNDEFINED)                                                                         \
+    _(at::ScalarType::Int1, ACL_DT_UNDEFINED)                                                                          \
+    _(at::ScalarType::Int2, ACL_DT_UNDEFINED)                                                                          \
+    _(at::ScalarType::Int3, ACL_DT_UNDEFINED)                                                                          \
+    _(at::ScalarType::Int4, ACL_DT_UNDEFINED)                                                                          \
+    _(at::ScalarType::Int5, ACL_DT_UNDEFINED)                                                                          \
+    _(at::ScalarType::Int6, ACL_DT_UNDEFINED)                                                                          \
+    _(at::ScalarType::Int7, ACL_DT_UNDEFINED)                                                                          \
+    _(at::ScalarType::Float8_e8m0fnu, ACL_FLOAT8_E8M0)                                                                \
+    _(at::ScalarType::Float4_e2m1fn_x2, ACL_FLOAT4_E2M1)                                                              \
+    _(at::ScalarType::Undefined, ACL_DT_UNDEFINED)                                                                     \
+    _(at::ScalarType::NumOptions, ACL_DT_UNDEFINED)
 
 constexpr aclDataType kATenScalarTypeToAclDataTypeTable
     [static_cast<int64_t>(at::ScalarType::NumOptions) + 1] = {
@@ -278,6 +309,7 @@ inline std::vector<std::string> get_default_custom_lib_path()
 extern const std::vector<std::string> g_custom_lib_path;
 extern const std::vector<std::string> g_default_custom_lib_path;
 void *GetOpApiFuncAddrFromFeatureLib(const char *api_name);
+const c10::optional<at::Tensor> get_valid_tensor(const c10::optional<at::Tensor> &tensor_opt, at::Device device);
 
 
 inline const char *GetOpApiLibName(void)
@@ -927,6 +959,8 @@ inline void UnInitCacheThreadLocal()
     }
 }
 
+using AclUseStreamResFunc = void(*)(void*);
+AclUseStreamResFunc GetUseStreamResFuncCoreNum();
 
 #define EXEC_NPU_CMD_V1(aclnn_api, ...)                                                                                \
     do {                                                                                                               \
@@ -941,6 +975,9 @@ inline void UnInitCacheThreadLocal()
                     #aclnn_api "GetWorkspaceSize", " not in ", GetOpApiLibName(), ", or ", GetOpApiLibName(),          \
                     "not found.");                                                                                     \
         auto acl_stream = c10_npu::getCurrentNPUStream().stream(false);                                                \
+        if (c10_npu::check_enqueue_need_use(acl_stream)) {                                                             \
+            GetUseStreamResFuncCoreNum()(acl_stream);                                                                  \
+        }                                                                                                              \
         uint64_t workspace_size = 0;                                                                                   \
         uint64_t *workspace_size_addr = &workspace_size;                                                               \
         aclOpExecutor *executor = nullptr;                                                                             \
@@ -971,6 +1008,9 @@ inline void UnInitCacheThreadLocal()
             workspace_addr = const_cast<void *>(workspace_tensor.storage().data());                                    \
         }                                                                                                              \
         auto acl_call = [converted_params, workspace_addr, workspace_size, acl_stream, executor]()->int {              \
+            if (c10_npu::check_dequeue_need_use(acl_stream)) {                                                         \
+                GetUseStreamResFuncCoreNum()(acl_stream);                                                              \
+            }                                                                                                          \
             OpApiFunc opApiFunc = reinterpret_cast<OpApiFunc>(opApiFuncAddr);                                          \
             auto api_ret = opApiFunc(workspace_addr, workspace_size, executor, acl_stream);                            \
             TORCH_CHECK(api_ret==0, "call " #aclnn_api " failed");                                                     \
@@ -1056,4 +1096,14 @@ inline void UnInitCacheThreadLocal()
     }                                                                         \
   } while (false)
 
+  #define DO_COMPATIBILITY(aclnn_api, originCallExpression)                                                            \
+    do {                                                                                                               \
+        static const auto getWorkspaceSizeFuncAddr = GetOpApiFuncAddr(#aclnn_api "GetWorkspaceSize");                  \
+        static const auto opApiFuncAddr = GetOpApiFuncAddr(#aclnn_api);                                                \
+        if (getWorkspaceSizeFuncAddr == nullptr || opApiFuncAddr == nullptr) {                                         \
+            ASCEND_LOGW("%s or %sGetWorkspaceSize not in %s, or %s not found. Will call %s", #aclnn_api, #aclnn_api,   \
+                        GetOpApiLibName(), GetOpApiLibName(), #originCallExpression);                                  \
+            return originCallExpression;                                                                               \
+        }                                                                                                              \
+    } while (0)
 #endif  // TORCHNPU_TORCH_NPU_CSRC_ATEN_OPS_OP_API_PTA_COMMON_H_

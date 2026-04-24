@@ -26,7 +26,8 @@ from module.quantization.compressed_tensors.compressed_tensors_w8a8_int8 import 
 from module.linear import LinearBase, LinearMethodBase, UnquantizedLinearMethod
 from module.fuse_moe_gmm import FusedMoEGMM
 from module.quantization.mxfp8 import MxFp8LinearMethod
-from .utils import (find_matched_target, is_activation_quantization_format, should_ignore_layer)
+from module.quantization.fp8 import Fp8LinearMethod
+from .utils import (find_matched_target, is_activation_quantization_format, should_ignore_layer, get_moe_target)
 
 QUANTIZATION_SCHEME_MAP_TYPE = dict[str, Optional[dict[str, QuantizationArgs]]]
 MX_BLOCK_K = 32
@@ -98,12 +99,11 @@ class CompressedTensorsConfig(QuantizationConfig):
         quant_config_instance.mm_quant_mode = quant_config_instance._get_quant_mode(
             target_scheme_map=target_scheme_map,
             target="Linear")
-        if "MoEGMM" in target_scheme_map:
-            quant_config_instance.gmm_quant_mode = quant_config_instance._get_quant_mode(
-                target_scheme_map=target_scheme_map,
-                target="MoEGMM")
-        else:
-            quant_config_instance.gmm_quant_mode = quant_config_instance.mm_quant_mode
+        moe_target = get_moe_target(target_scheme_map)
+        quant_config_instance.gmm_quant_mode = quant_config_instance._get_quant_mode(
+            target_scheme_map=target_scheme_map,
+            target=moe_target)
+
         kv_cache_scheme = config.get("kv_cache_scheme")
         if kv_cache_scheme is not None:
             quant_config_instance.kv_cache_quant_mode = \
@@ -223,14 +223,16 @@ class CompressedTensorsConfig(QuantizationConfig):
                     == QuantizationStrategy.TOKEN.value)
         is_dynamic = not weight_quant.dynamic and input_quant.dynamic
 
-        # Both symmetric and asymmetric input quantization are supported.
-        # Only symmetric weight quantization is supported.
+        # Both symmetric and asymmetric input quantization supported.
+        # Only symmetric weight quantization supported.
         return is_w4a8_int8 and is_token and weight_quant.symmetric and is_dynamic
 
     def is_dynamic_token_w8a8_mxfp8(self,
                                weight_quant: BaseModel,
                                input_quant: BaseModel,) -> bool:
-        is_w8a8_fp8 = (weight_quant.num_bits == 8) and (input_quant.num_bits == 8) and weight_quant.type == "float"
+        is_mxfloat = (self.weight_block_size is not None and self.weight_block_size[0] == 1 and
+                      self.weight_block_size[1] == MX_BLOCK_K and weight_quant.type == "float")
+        is_w8a8_mxfp8 = (weight_quant.num_bits == 8) and (input_quant.num_bits == 8) and is_mxfloat
         weight_strategy = (
             weight_quant.strategy == QuantizationStrategy.TENSOR.value
             or weight_quant.strategy == QuantizationStrategy.CHANNEL.value
@@ -239,14 +241,32 @@ class CompressedTensorsConfig(QuantizationConfig):
                     == QuantizationStrategy.TOKEN.value)
         is_dynamic = not weight_quant.dynamic and input_quant.dynamic
 
-        # Both symmetric and asymmetric input quantization are supported.
-        # Only symmetric weight quantization is supported.
+        # Both symmetric and asymmetric input quantization supported.
+        # Only symmetric weight quantization supported.
+        return is_w8a8_mxfp8 and is_token and weight_quant.symmetric and is_dynamic
+
+    def is_dynamic_token_w8a8_fp8(self,
+                               weight_quant: BaseModel,
+                               input_quant: BaseModel,) -> bool:
+        is_not_mxfloat = (self.weight_block_size is not None and (self.weight_block_size[0] != 1 or
+                      self.weight_block_size[1] != MX_BLOCK_K) and weight_quant.type == "float")
+        is_w8a8_fp8 = (weight_quant.num_bits == 8) and (input_quant.num_bits == 8) and is_not_mxfloat
+        weight_strategy = (
+            weight_quant.strategy == QuantizationStrategy.TENSOR.value
+            or weight_quant.strategy == QuantizationStrategy.CHANNEL.value
+            or weight_quant.strategy == QuantizationStrategy.GROUP.value)
+        is_token = (weight_strategy and input_quant.strategy
+                    == QuantizationStrategy.TOKEN.value)
+        is_dynamic = not weight_quant.dynamic and input_quant.dynamic
+
+        # Both symmetric and asymmetric input quantization supported.
+        # Only symmetric weight quantization supported.
         return is_w8a8_fp8 and is_token and weight_quant.symmetric and is_dynamic
 
     def is_dynamic_token_w4a8_mxfp8(self,
                                weight_quant: BaseModel,
                                input_quant: BaseModel,) -> bool:
-        is_w4a8_fp8 = (weight_quant.num_bits == 4) and (input_quant.num_bits == 8) and weight_quant.type == "float"
+        is_w4a8_mxfp8 = (weight_quant.num_bits == 4) and (input_quant.num_bits == 8) and weight_quant.type == "float"
         weight_strategy = (
             weight_quant.strategy == QuantizationStrategy.TENSOR.value
             or weight_quant.strategy == QuantizationStrategy.CHANNEL.value
@@ -255,9 +275,25 @@ class CompressedTensorsConfig(QuantizationConfig):
                     == QuantizationStrategy.TOKEN.value)
         is_dynamic = not weight_quant.dynamic and input_quant.dynamic
 
-        # Both symmetric and asymmetric input quantization are supported.
-        # Only symmetric weight quantization is supported.
-        return is_w4a8_fp8 and is_token and weight_quant.symmetric and is_dynamic
+        # Both symmetric and asymmetric input quantization supported.
+        # Only symmetric weight quantization supported.
+        return is_w4a8_mxfp8 and is_token and weight_quant.symmetric and is_dynamic
+
+    def is_dynamic_token_w4a4_mxfp4(self,
+                               weight_quant: BaseModel,
+                               input_quant: BaseModel,) -> bool:
+        is_w4a4_mxfp4 = (weight_quant.num_bits == 4) and (input_quant.num_bits == 4) and weight_quant.type == "float"
+        weight_strategy = (
+            weight_quant.strategy == QuantizationStrategy.TENSOR.value
+            or weight_quant.strategy == QuantizationStrategy.CHANNEL.value
+            or weight_quant.strategy == QuantizationStrategy.GROUP.value)
+        is_token = (weight_strategy and input_quant.strategy
+                    == QuantizationStrategy.TOKEN.value)
+        is_dynamic = not weight_quant.dynamic and input_quant.dynamic
+
+        # Both symmetric and asymmetric input quantization supported.
+        # Only symmetric weight quantization supported.
+        return is_w4a4_mxfp4 and is_token and weight_quant.symmetric and is_dynamic
 
     def _get_scheme_from_parts(
             self,
@@ -273,6 +309,8 @@ class CompressedTensorsConfig(QuantizationConfig):
                     input_symmetric=input_quant.symmetric)
             elif self.is_dynamic_token_w8a8_mxfp8(weight_quant, input_quant):
                 return MxFp8LinearMethod()
+            elif self.is_dynamic_token_w8a8_fp8(weight_quant, input_quant):
+                return Fp8LinearMethod(self)
 
         raise NotImplementedError(
             "No compressed-tensors compatible scheme was found.")

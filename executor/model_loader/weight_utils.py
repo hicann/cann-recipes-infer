@@ -113,10 +113,10 @@ def default_weight_loader(param: torch.Tensor,
                     f"into parameter ({param.size()})")
 
             param.data.copy_(loaded_weight)
-    except Exception:
+    except Exception as e:
         # NOTE: This exception is added for the purpose of setting breakpoint to
         # debug weight loading issues.
-        logger.error(f"default weight load failed")
+        logger.error(f"default weight load failed {e}")
 
 
 def initialize_dummy_weights(

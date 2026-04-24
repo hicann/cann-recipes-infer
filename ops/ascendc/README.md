@@ -1,6 +1,6 @@
 ## 概述
 
-此项目是基于昇腾Atlas A3的融合算子库，当前项目中包括[SwigluClipQuant](./docs/custom-npu_swiglu_clip_quant.md)和[GatherSelectionKvCache](./docs/custom-npu_gather_selection_kv_cache.md)。
+此项目是基于昇腾`Atlas A3`和`950PR/DT`的融合算子库，当前项目中包括[SwigluClipQuant](./docs/custom-npu_swiglu_clip_quant.md)和[GatherSelectionKvCache](./docs/custom-npu_gather_selection_kv_cache.md)等算子。
 
 ## 目录结构说明
 
@@ -17,6 +17,46 @@
   |   ├── gather_selection_kv_cache             # 推理gather_selection_kv_cache算子示例代码
   |   |   ├── op_host                           # 算子信息库、Tiling、InferShape相关实现目录
   |   |   ├── op_kernel                         # 算子Kernel目录
+  |   ├── hc_post                               # 推理hc_post算子示例代码
+  |   |   ├── op_host                           # 算子信息库、Tiling、InferShape相关实现目录
+  |   |   ├── op_kernel                         # 算子Kernel目录
+  |   ├── hc_pre                                # 推理hc_pre算子示例代码
+  |   |   ├── op_host                           # 算子信息库、Tiling、InferShape相关实现目录
+  |   |   ├── op_kernel                         # 算子Kernel目录
+  |   ├── hc_pre_inv_rms                        # 推理hc_pre_inv_rms算子示例代码
+  |   |   ├── op_host                           # 算子信息库、Tiling、InferShape相关实现目录
+  |   |   ├── op_kernel                         # 算子Kernel目录
+  |   ├── hc_pre_sinkhorn                       # 推理hc_pre_sinkhorn算子示例代码
+  |   |   ├── op_host                           # 算子信息库、Tiling、InferShape相关实现目录
+  |   |   ├── op_kernel                         # 算子Kernel目录
+  |   ├── indexer_compress_epilog               # 推理indexer_compress_epilog算子示例代码
+  |   |   ├── op_host                           # 算子信息库、Tiling、InferShape相关实现目录
+  |   |   ├── op_kernel                         # 算子Kernel目录
+  |   ├── inplace_partial_rotary_mul            # 推理inplace_partial_rotary_mul算子示例代码
+  |   |   ├── op_host                           # 算子信息库、Tiling、InferShape相关实现目录
+  |   |   ├── op_kernel                         # 算子Kernel目录
+  |   ├── kv_compress_epilog                    # 推理kv_compress_epilog算子示例代码
+  |   |   ├── op_host                           # 算子信息库、Tiling、InferShape相关实现目录
+  |   |   ├── op_kernel                         # 算子Kernel目录
+  |   ├── moe_gating_top_k_hash                 # 推理moe_gating_top_k_hash算子示例代码
+  |   |   ├── op_host                           # 算子信息库、Tiling、InferShape相关实现目录
+  |   |   ├── op_kernel                         # 算子Kernel目录
+  |   ├── moe_init_routing_group_quant          # 推理moe_init_routing_group_quant算子示例代码
+  |   |   ├── op_host                           # 算子信息库、Tiling、InferShape相关实现目录
+  |   |   ├── op_kernel                         # 算子Kernel目录
+  |   ├── rms_norm_dynamic_quant                # 推理rms_norm_dynamic_quant算子示例代码
+  |   |   ├── op_host                           # 算子信息库、Tiling、InferShape相关实现目录
+  |   |   ├── op_kernel                         # 算子Kernel目录
+  |   ├── dequant_swiglu_clamp_quant            # 推理dequant_swiglu_clamp_quant算子示例代码
+  |   |   ├── op_host                           # 算子信息库、Tiling、InferShape相关实现目录
+  |   |   ├── op_kernel                         # 算子Kernel目录
+  |   ├── scatter_nd_update_asc                 # 推理scatter_nd_update_asc算子示例代码
+  |   |   ├── op_host                           # 算子信息库、Tiling、InferShape相关实现目录
+  |   |   ├── op_kernel                         # 算子Kernel目录
+  |   ├── swiglu_group_quant                    # 推理swiglu_group_quant算子示例代码
+  |   |   ├── op_host                           # 算子信息库、Tiling、InferShape相关实现目录
+  |   |   ├── op_kernel                         # 算子Kernel目录
+  |   ├── utils                                 # 公共工具库
   |
   ├── torch_ops_extension                       # torch_ops_extension目录
       ├── custom_ops
@@ -27,7 +67,7 @@
   |
   ├── build.sh                                  # 项目工程编译脚本
   ├── CMakeList.txt                             # 项目工程编译配置文件
-  ├── README.md                              
+  ├── README.md
   ├── version.info                              # 项目版本信息
   ```
 昇腾社区Ascend C自定义算子开发资料：[Ascend C自定义算子开发](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/800alpha002/devguide/opdevg/ascendcopdevg/atlas_ascendc_10_0001.html)
@@ -45,7 +85,7 @@
 
 ### 获取 docker 镜像
 
-  从[ARM镜像地址](https://cann-ai.obs.cn-north-4.myhuaweicloud.com/cann-quantization/DeepSeek-V3.2-Exp/cann8.5_pt2.6.0_dsv3.2_aarch_image_v0.5.tar)中下载 docker 镜像，然后上传到A3服务器上，并通过命令导入镜像 `docker load -i cann8.5_pt2.6.0_dsv3.2_aarch_image_v0.5.tar`。
+  从[ARM镜像地址](https://cann-ai.obs.cn-north-4.myhuaweicloud.com/cann-quantization/DeepSeek/cann9.0_pt2.8.0_ds_aarch_image_v1.0.tar)中下载 docker 镜像，然后上传到A3服务器上，并通过命令导入镜像 `docker load -i cann9.0_pt2.8.0_ds_aarch_image_v1.0.tar`。
 
 ### 拉起 docker 容器
 
@@ -74,7 +114,7 @@
       --net=host \
       --shm-size=128g \
       --privileged \
-      cann8.5_pt2.6.0_dsv3.2_aarch_image:v0.5 /bin/bash
+      cann9.0_pt2.8.0_ds_aarch_image:v1.0 /bin/bash
   ```
   通过如下命令进入容器：
   ```
@@ -91,11 +131,18 @@
 
 ### 自定义融合算子编译
 
-执行如下命令编译所有自定义算子：
+Atlas A3 执行如下命令编译所有自定义算子：
 
   ```bash
   cd /home/code/cann-recipes-infer/ops/ascendc
   bash build.sh
+  ```
+
+`950PR/DT` 执行如下命令编译所有自定义算子：
+
+  ```bash
+  cd /home/code/cann-recipes-infer/ops/ascendc
+  bash build.sh -c ascend910_95
   ```
 
 **说明：**
@@ -117,7 +164,7 @@
   cd /home/code/cann-recipes-infer/ops/ascendc/output
   chmod +x CANN-custom_ops-<cann_version>-linux.<arch>.run
   ./CANN-custom_ops-<cann_version>-linux.<arch>.run --quiet --install-path=/usr/local/Ascend/ascend-toolkit/latest/opp
-  source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash  
+  source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
   ```
 
 执行上述命令后，自定义融合算子对应的run包会安装到对应的CANN软件包目录:`/usr/local/Ascend/ascend-toolkit/latest/opp/vendors/`

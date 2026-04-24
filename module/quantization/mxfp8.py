@@ -25,7 +25,7 @@ import torch.nn.functional as F
 from torch.nn import Parameter
 from module.quantization import QuantizationMethods, QuantizeMethodBase, QuantizationConfig
 from module.linear import LinearBase, LinearMethodBase, UnquantizedLinearMethod
-from module.quantization.utils.quant_utils import is_layer_skipped
+from module.quantization.utils.quant_utils import is_layer_skipped, reshape_mx_scale
 from module.fuse_moe_gmm import FusedMoEGMM, FusedMoeWeightScaleSupported
 from module.utils import set_weight_attrs
 
@@ -35,13 +35,6 @@ BEFORE_INIT = 0
 AFTER_INIT = 1
 BLOCK_K = 32
 
-
-def reshape_mx_scale(scale_tensor):
-    """
-    Reshape the last dimension of 2D/3D tensor into (original_size // 2, 2) for GMM/MM operators.
-    """
-    # Keep all dims except the last, then split the last into (n // 2, 2)
-    return scale_tensor.view(*scale_tensor.shape[:-1], scale_tensor.size(-1) // 2, 2)
 
 
 class MxFp8Config(QuantizationConfig):
@@ -266,10 +259,12 @@ class MxFp8MoEGMMMethod(QuantizeMethodBase):
         expert_tokens: torch.Tensor,
         group_list_type: int,
         pertoken_scale: torch.Tensor = None,
-        final_output_dtype: torch.dtype = torch.bfloat16
+        final_output_dtype: torch.dtype = torch.bfloat16,
+        **kwargs,
     ):
         if pertoken_scale is None:
             x, pertoken_scale = torch_npu.npu_dynamic_mx_quant(x, dst_type=torch.float8_e4m3fn)
+
 
         mm1_mm3 = torch_npu.npu_grouped_matmul(
             [x], [layer.w13_weight],
@@ -283,8 +278,16 @@ class MxFp8MoEGMMMethod(QuantizeMethodBase):
             tuning_config=[0]
         )[0]
 
-        mm1_mm3 = torch_npu.npu_swiglu(mm1_mm3)
-        intermediate_h, pertoken_scale = torch_npu.npu_dynamic_mx_quant(mm1_mm3, dst_type=torch.float8_e4m3fn)
+        swiglu_limit = kwargs.get("swiglu_limit", 0.0)
+        enable_custom_ops = kwargs.get("enable_custom_ops", False)
+        if enable_custom_ops:
+            intermediate_h, pertoken_scale , _ = torch.ops.custom.npu_swiglu_group_quant(mm1_mm3,
+                                                                                        dst_type=torch.float8_e4m3fn,
+                                                                                        quant_mode=2,
+                                                                                        clamp_value=swiglu_limit)
+        else:
+            mm1_mm3 = torch_npu.npu_swiglu(mm1_mm3)
+            intermediate_h, pertoken_scale = torch_npu.npu_dynamic_mx_quant(mm1_mm3, dst_type=torch.float8_e4m3fn)
 
         out_hidden = torch_npu.npu_grouped_matmul(
             [intermediate_h], [layer.w2_weight], bias=None,

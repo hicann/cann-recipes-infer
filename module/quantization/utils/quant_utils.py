@@ -42,3 +42,11 @@ def is_layer_skipped(
 
     assert is_skipped is not None
     return is_skipped
+
+
+def reshape_mx_scale(scale_tensor):
+    """
+    Reshape the last dimension of 2D/3D tensor into (original_size // 2, 2) for GMM/MM operators.
+    """
+    # Keep all dims except last, then split last into (n // 2, 2)
+    return scale_tensor.view(*scale_tensor.shape[:-1], scale_tensor.size(-1) // 2, 2)

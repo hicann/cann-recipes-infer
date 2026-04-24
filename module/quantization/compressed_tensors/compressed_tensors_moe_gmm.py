@@ -22,7 +22,8 @@ from torch.nn import Parameter
 from module.utils import set_weight_attrs
 from module.fuse_moe_gmm import FusedMoeWeightScaleSupported
 from module.quantization import QuantizeMethodBase
-from module.quantization.mxfp4 import W4A8MxFp4MoEGMMMethod
+from module.quantization.mxfp4 import W4A8MxFp4MoEGMMMethod, UpGateW4A4DownW4A8MxFp4MoEGMMMethod
+from .utils import get_moe_target, is_quantization_scheme_of_moe_projs_same
 
 
 class CompressedTensorsMoEGMMMethod(QuantizeMethodBase):
@@ -32,23 +33,50 @@ class CompressedTensorsMoEGMMMethod(QuantizeMethodBase):
         quant_config: "CompressedTensorsConfig",
         layer: torch.nn.Module,
     ) -> "CompressedTensorsMoEMethod":
-        target = "MoEGMM" if "MoEGMM" in quant_config.target_scheme_map else "Linear"
-        weight_quant = quant_config.target_scheme_map[target].get("weights")
-        input_quant = quant_config.target_scheme_map[target].get(
+        # get targets for moe in quantization
+        target = get_moe_target(quant_config.target_scheme_map)
+
+        # when target is "MoEGMMUpGate", need to check quantization scheme of moe projections is same or not
+        if is_quantization_scheme_of_moe_projs_same(target, quant_config.target_scheme_map):
+            # if same
+            weight_quant = quant_config.target_scheme_map[target].get("weights")
+            input_quant = quant_config.target_scheme_map[target].get(
+                "input_activations")
+
+            if quant_config.is_wNa16_group_channel(weight_quant, input_quant):
+                if weight_quant.num_bits == 4:
+                    return CompressedTensorW4A16Int4MoEGMMMethod(quant_config)
+            elif quant_config.is_dynamic_token_w8a8_int8(weight_quant, input_quant):
+                return CompressedTensorW8A8Int8MoEGMMMethod()
+            elif quant_config.is_dynamic_token_w4a8_int8(weight_quant, input_quant):
+                return CompressedTensorW4A8Int8MoEGMMMethod()
+            elif quant_config.is_dynamic_token_w4a8_mxfp8(weight_quant, input_quant):
+                return W4A8MxFp4MoEGMMMethod()
+            else:
+                raise RuntimeError(
+                    f"Unsupported FusedMoe scheme: {weight_quant}, {input_quant}")
+        # if different
+        weight_quant_up_gate = quant_config.target_scheme_map[target].get("weights")
+        input_quant_up_gate = quant_config.target_scheme_map[target].get(
             "input_activations")
 
-        if quant_config.is_wNa16_group_channel(weight_quant, input_quant):
-            if weight_quant.num_bits == 4:
-                return CompressedTensorW4A16Int4MoEGMMMethod(quant_config)
-        elif quant_config.is_dynamic_token_w8a8_int8(weight_quant, input_quant):
-            return CompressedTensorW8A8Int8MoEGMMMethod()
-        elif quant_config.is_dynamic_token_w4a8_int8(weight_quant, input_quant):
-            return CompressedTensorW4A8Int8MoEGMMMethod()
-        elif quant_config.is_dynamic_token_w4a8_mxfp8(weight_quant, input_quant):
-            return W4A8MxFp4MoEGMMMethod()
+        if "MoEGMMDown" in quant_config.target_scheme_map:
+            weight_quant_down = quant_config.target_scheme_map["MoEGMMDown"].get("weights")
+            input_quant_down = quant_config.target_scheme_map["MoEGMMDown"].get(
+                "input_activations")
         else:
             raise RuntimeError(
-                f"Unsupported FusedMoe scheme: {weight_quant}, {input_quant}")
+                f"target 'MoEGMMDown' must contained in quantization config "
+                "if target 'MoEGMMUpGate' in quantization config")
+
+        if (quant_config.is_dynamic_token_w4a4_mxfp4(weight_quant_up_gate, input_quant_up_gate) and
+            quant_config.is_dynamic_token_w4a8_mxfp8(weight_quant_down, input_quant_down)):
+            return UpGateW4A4DownW4A8MxFp4MoEGMMMethod()
+        else:
+            raise RuntimeError(
+                f"Unsupported FusedMoeUpgate scheme: {weight_quant_up_gate}, {input_quant_up_gate} "
+                f"together with FusedMoeDown scheme: {weight_quant_down}, {input_quant_down}")
+
 
 
 class CompressedTensorW8A8Int8MoEGMMMethod(QuantizeMethodBase):
@@ -110,7 +138,8 @@ class CompressedTensorW8A8Int8MoEGMMMethod(QuantizeMethodBase):
         expert_tokens: torch.Tensor,
         group_list_type: int,
         pertoken_scale: torch.Tensor = None,
-        final_output_dtype: torch.dtype = torch.bfloat16
+        final_output_dtype: torch.dtype = torch.bfloat16,
+        **kwargs,
     ):
         hidden_size = x.size(-1)
 
@@ -129,13 +158,25 @@ class CompressedTensorW8A8Int8MoEGMMMethod(QuantizeMethodBase):
             tuning_config=[0]
         )[0]
 
-        intermediate_h, pertoken_scale = torch_npu.npu_dequant_swiglu_quant(
+        swiglu_limit = kwargs.get("swiglu_limit", None)
+        enable_custom_ops = kwargs.get("enable_custom_ops", False)
+        dequant_swiglu_quant_ops = torch_npu.npu_dequant_swiglu_clamp_quant if enable_custom_ops else torch_npu.npu_dequant_swiglu_quant
+        swiglu_limit_args = {}
+        if swiglu_limit:
+            swiglu_limit_args.update({
+                "swiglu_mode": 1,
+                "clamp_limit": swiglu_limit,
+                "glu_alpha": 1,
+                "glu_bias": 0
+            })
+        intermediate_h, pertoken_scale = dequant_swiglu_quant_ops(
             mm1_mm3, weight_scale=layer.w13_weight_scale,
             quant_scale=layer.smooth_scale_2,
             group_index=expert_tokens,
             activate_left=True,
             quant_mode=1,
-            activation_scale=pertoken_scale
+            activation_scale=pertoken_scale,
+            **swiglu_limit_args,
             )
 
         out_hidden = torch_npu.npu_grouped_matmul(
@@ -258,7 +299,8 @@ class CompressedTensorW4A16Int4MoEGMMMethod(QuantizeMethodBase):
         expert_tokens: torch.Tensor,
         group_list_type: int,
         pertoken_scale: torch.Tensor = None,
-        final_output_dtype: torch.dtype = torch.bfloat16
+        final_output_dtype: torch.dtype = torch.bfloat16,
+        **kwargs,
     ):
 
         mm1_mm3 = torch_npu.npu_grouped_matmul(
@@ -477,7 +519,8 @@ class CompressedTensorW4A8Int8MoEGMMMethod(QuantizeMethodBase):
         expert_tokens: torch.Tensor,
         group_list_type: int,
         pertoken_scale: torch.Tensor = None,
-        final_output_dtype: torch.dtype = torch.bfloat16
+        final_output_dtype: torch.dtype = torch.bfloat16,
+        **kwargs,
     ):
         hidden_size = x.size(-1)
 

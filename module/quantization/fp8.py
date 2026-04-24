@@ -120,10 +120,9 @@ class Fp8Config(QuantizationConfig):
 class Fp8LinearMethod(LinearMethodBase):
     _kernel_backends_being_used: set[str] = set()
 
-    def __init__(self, quant_config: Fp8Config):
-        self.quant_config = quant_config
+    def __init__(self, quant_config):
         self.out_dtype = torch.get_default_dtype()
-        self.weight_block_size = self.quant_config.weight_block_size
+        self.weight_block_size = quant_config.weight_block_size
         self.block_quant = self.weight_block_size is not None
 
     def create_weights(self,
@@ -135,7 +134,7 @@ class Fp8LinearMethod(LinearMethodBase):
                        params_dtype: torch.dtype,
                        weight_loader: Callable,
                        **kwargs):
-        weight_dtype = torch.float8_e4m3fn if self.quant_config.is_checkpoint_fp8_serialized else params_dtype
+        weight_dtype = torch.float8_e4m3fn
 
         weight = Parameter(torch.empty(sum(output_partition_sizes),
                                        input_size_per_partition,
@@ -191,6 +190,8 @@ class Fp8LinearMethod(LinearMethodBase):
             return x, x_scale
         else:
             return x
+
+    apply_weights = apply
 
     def process_weights_after_loading(self, layer, is_transpose=True, is_nz=True, scales_dtype=None):
         weight = layer.weight
@@ -284,7 +285,8 @@ class Fp8MoEGMMMethod(QuantizeMethodBase):
         expert_tokens: torch.Tensor,
         group_list_type: int,
         pertoken_scale: torch.Tensor = None,
-        final_output_dtype: torch.dtype = torch.bfloat16
+        final_output_dtype: torch.dtype = torch.bfloat16,
+        **kwargs,
     ):
         if pertoken_scale is None:
             # only k-axis quantized; gmm supports gsM = 1, gsN = gsK = 128
@@ -305,14 +307,21 @@ class Fp8MoEGMMMethod(QuantizeMethodBase):
             tuning_config=[0]
         )[0]
 
-        mm1_mm3 = torch_npu.npu_swiglu(mm1_mm3)
-        intermediate_h, pertoken_scale = torch_npu.npu_dynamic_block_quant(
-            mm1_mm3,
-            dst_type=torch.float8_e4m3fn,
-            row_block_size=1,
-            col_block_size=self.weight_block_size[1],
-        )
-
+        swiglu_limit = kwargs.get("swiglu_limit", 0.0)
+        enable_custom_ops = kwargs.get("enable_custom_ops", False)
+        if enable_custom_ops:
+            intermediate_h, pertoken_scale , _ = torch.ops.custom.npu_swiglu_group_quant(mm1_mm3,
+                                                                                        dst_type=torch.float8_e4m3fn,
+                                                                                        quant_mode=1,
+                                                                                        clamp_value=swiglu_limit)
+        else:
+            mm1_mm3 = torch_npu.npu_swiglu(mm1_mm3)
+            intermediate_h, pertoken_scale = torch_npu.npu_dynamic_block_quant(
+                mm1_mm3,
+                dst_type=torch.float8_e4m3fn,
+                row_block_size=1,
+                col_block_size=self.weight_block_size[1],
+            )
         out_hidden = torch_npu.npu_grouped_matmul(
             [intermediate_h], [layer.w2_weight], bias=None,
             scale=[layer.w2_scale], per_token_scale=[pertoken_scale],

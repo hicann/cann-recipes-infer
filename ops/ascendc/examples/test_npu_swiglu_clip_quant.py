@@ -1,9 +1,9 @@
+# This program is free software, you can redistribute it and/or modify it.
 # Copyright (c) 2025 Huawei Technologies Co., Ltd.
-# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
-# CANN Open Software License Agreement Version 2.0 (the "License").
+# This file is a part of the CANN Open Software.
+# Licensed under CANN Open Software License Agreement Version 2.0 (the "License").
 # Please refer to the License for details. You may not use this file except in compliance with the License.
-# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
-# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 
 import torch
@@ -39,13 +39,13 @@ def data_compare(npu_out, cpu_out, diff_thd=0.01, pct_thd=0.05, max_diff_hd=0.1)
     result = "Failed"
     if real_data.size != data_compe.size:
         return result, 0.0, max_error
-
+    
     split_count = int(end - start + 1) if end != start else 1
     diff_abs = np.abs(np.subtract(real_data.astype(np.float32), data_compe.astype(np.float32)))
     diff_index = np.where(diff_abs > 0)
     rdiff = cal_relative_diff_np(real_data[diff_index].astype(np.float32),
                                  data_compe[diff_index].astype(np.float32), diff_thd)
-
+    
     err_diff = rdiff[rdiff > diff_thd]
     diff_idx_list = diff_index[0]
     err_idx = diff_idx_list[np.where(rdiff > diff_thd)]
@@ -77,7 +77,7 @@ def _swiglu_clip_quant(x, group_indexs, group_alpha, activate_left=True):
             x_left, x_right = torch.chunk(x_part, 2, dim=-1)
         else:
             x_right, x_left = torch.chunk(x_part, 2, dim=-1)
-
+        
         # swiglu
         y = torch.nn.functional.silu(x_left) * x_right
         # clamp
@@ -114,7 +114,7 @@ class TestCustomSwigluClipQuant(TestCase):
         clamp_mode = 1
         activate_left = True
         total_nums = group_index.sum().item()
-        cpu_y, cpu_scale = _swiglu_clip_quant(x, group_indexs=group_index, group_alpha=group_alpha,
+        cpu_y, cpu_scale = _swiglu_clip_quant(x, group_indexs=group_index, group_alpha=group_alpha, 
                                     activate_left=activate_left)
 
         torch_npu.npu.set_device(int(DEVICE_ID))
@@ -146,7 +146,7 @@ class TestCustomSwigluClipQuant(TestCase):
         clamp_mode = 1
         activate_left = True
         total_nums = group_index.sum().item()
-        cpu_y, cpu_scale = _swiglu_clip_quant(x, group_index, group_alpha,
+        cpu_y, cpu_scale = _swiglu_clip_quant(x, group_index, group_alpha, 
                                               activate_left=activate_left)
 
         torch_npu.npu.set_device(int(DEVICE_ID))
@@ -160,12 +160,12 @@ class TestCustomSwigluClipQuant(TestCase):
                 super(Network, self).__init__()
 
             def forward(self, x, group_index, group_alpha, quant_mode=1, clamp_mode=1, activate_left=True):
-                y, scale = torch_npu.npu_swiglu_clip_quant(x, group_index, group_alpha,
-                                                           quant_mode=quant_mode, clamp_mode=clamp_mode,
+                y, scale = torch_npu.npu_swiglu_clip_quant(x, group_index, group_alpha, 
+                                                           quant_mode=quant_mode, clamp_mode=clamp_mode, 
                                                            activate_left=activate_left)
 
                 return y, scale
-
+        
         print(f'======================== PTA graph BEGIN ========================')
         npu_mode = Network().to("npu:%s" % DEVICE_ID)
         from torchair.configs.compiler_config import CompilerConfig
@@ -173,7 +173,7 @@ class TestCustomSwigluClipQuant(TestCase):
         npu_backend = torchair.get_npu_backend(compiler_config=config)
 
         npu_mode = torch.compile(npu_mode, fullgraph=True, backend=npu_backend, dynamic=False)
-        npu_y, npu_scale = npu_mode(x, group_index, group_alpha, quant_mode=quant_mode, clamp_mode=clamp_mode,
+        npu_y, npu_scale = npu_mode(x, group_index, group_alpha, quant_mode=quant_mode, clamp_mode=clamp_mode, 
                                     activate_left=activate_left)
         print(f'======================== PTA graph FINISH ========================')
         # compare result

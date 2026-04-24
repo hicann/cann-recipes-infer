@@ -54,7 +54,7 @@ custom.npu_gather_selection_kv_cache(Tensor(a!) selection_k_rope, Tensor(b!) sel
 ## 约束说明<a name="zh-cn_topic_0000001832267082_section12345537164214"></a>
 
 -   该接口支持推理场景下使用。
--   该接口支持图模式。
+-   该接口支持aclgraph入图。
 -   该接口与PyTorch配合使用时，需要保证CANN相关包与PyTorch相关包的版本匹配。
 -   BLOCK_SIZE需要保证能被selection_topk_block_size整除。
 -   TOPK ≤ 2048。

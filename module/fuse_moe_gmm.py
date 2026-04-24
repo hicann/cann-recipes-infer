@@ -63,7 +63,7 @@ class UnquantizedFusedMoEGMMMethod(QuantizeMethodBase):
             x: torch.Tensor,
             expert_tokens: torch.Tensor,
             group_list_type: int,
-            **kargs,
+            **kwargs,
     ) -> torch.Tensor:
         mm1_mm3 = torch_npu.npu_grouped_matmul([x], [layer.w13_weight],
             group_list=expert_tokens, group_type=0, group_list_type=group_list_type, split_item=3)[0]
@@ -140,6 +140,7 @@ class FusedMoEGMM(torch.nn.Module):
                 group_list_type: int = 0,
                 pertoken_scale: torch.Tensor = None,
                 final_output_dtype: torch.dtype = torch.bfloat16,
+                **kwargs,
                 ):
         if self.quant_method is None:
             raise RuntimeError("self.quant_method must not be None")
@@ -152,6 +153,7 @@ class FusedMoEGMM(torch.nn.Module):
             group_list_type=group_list_type,
             pertoken_scale=pertoken_scale,
             final_output_dtype=final_output_dtype,
+            **kwargs,
         )
 
         return final_hidden_states

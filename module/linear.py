@@ -157,7 +157,7 @@ class LinearBase(torch.nn.Module):
         quant_config: Optional = None,
         prefix: str = "",
         *,
-        return_bias: bool = False,
+        return_bias: Optional[bool] = False,
     ):
         super().__init__()
 
@@ -221,7 +221,7 @@ class ColumnParallelLinear(LinearBase):
         output_sizes: Optional[list[int]] = None,
         prefix: str = "",
         *,
-        return_bias: bool = False,
+        return_bias: Optional[bool] = False,
     ):
         # Divide the weight matrix along the last dimension.
         self.tp_size = tp_size
@@ -242,7 +242,8 @@ class ColumnParallelLinear(LinearBase):
                          params_dtype,
                          quant_config,
                          prefix,
-                         return_bias=return_bias)
+                         return_bias=return_bias,
+                         )
 
         if output_sizes is None:
             output_sizes = [output_size]
@@ -435,7 +436,8 @@ class ReplicatedLinear(LinearBase):
                          params_dtype,
                          quant_config,
                          prefix=prefix,
-                         return_bias=return_bias)
+                         return_bias=return_bias,
+                         )
 
         # All the linear layer supports quant method.
         if self.quant_method is None:
@@ -525,7 +527,8 @@ class MergedColumnParallelLinear(LinearBase):
                  params_dtype: Optional[torch.dtype] = None,
                  quant_config: Optional = None,
                  prefix: str = "",
-                 return_bias: bool = False):
+                 return_bias: bool = False,
+                 ):
         self.output_sizes = output_sizes
         self.tp_size = tp_size
         if not all(output_size % tp_size == 0 for output_size in output_sizes):
@@ -1011,7 +1014,8 @@ class QKVParallelLinear(ColumnParallelLinear):
                          params_dtype=params_dtype,
                          quant_config=quant_config,
                          prefix=prefix,
-                         return_bias=return_bias)
+                         return_bias=return_bias,
+                         )
 
     def weight_loader(self,
                       param: Parameter,

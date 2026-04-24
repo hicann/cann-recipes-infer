@@ -51,3 +51,15 @@
         LOG_FUNC;                                                                                                      \
         EXPR;                                                                                                          \
     }
+#define unlikely(x) __builtin_expect((x), 0)
+
+#define OP_CHECK_NULL_WITH_CONTEXT(context, ptr)                                                           \
+    do {                                                                                                   \
+        if (unlikely((ptr) == nullptr)) {                                                                  \
+            const char* name = (unlikely(((context) == nullptr) || (context)->GetNodeName() == nullptr)) ? \
+                                   "nil" :                                                                 \
+                                   (context)->GetNodeName();                                               \
+            OPS_LOG_E(name, "%s is nullptr!", #ptr);                                                         \
+            return ge::GRAPH_FAILED;                                                                       \
+        }                                                                                                  \
+    } while (0)

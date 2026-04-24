@@ -15,7 +15,7 @@ import copy
 import numpy as np
 import torch
 import torch_npu
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, AutoProcessor
 
 from executor.utils import get_default_group, process_infer_time, remove_padding_left, detokenize_outputs
 from executor.model_loader.default_loader import DefaultModelLoader
@@ -80,6 +80,7 @@ class ModelRunner:
         self.use_pretrained_model = True
         self.execute_mode = runner_settings.get("exe_mode", "ge_graph")
         self.tokenizer_mode = runner_settings.get("model_config").get("tokenizer_mode", "default")
+        self.platform_version = runner_settings.get("model_config").get("platform_version", "A3")
         self.profiler = FakeContextManager()
         self.hf_config = None
         self.quantization = None
@@ -127,14 +128,17 @@ class ModelRunner:
         if torch.npu.is_available() and self.world_size > 1:
             default_pg = get_default_group()
             if default_pg is None:
+                options = torch_npu._C._distributed_c10d.ProcessGroupHCCL.Options()
+                if self.platform_version == "950": # use ccu_ms for 950
+                    options.hccl_config = {"hccl_op_expansion_mode" : 5}
                 torch.distributed.init_process_group(
-                    backend="hccl", world_size=self.world_size, rank=self.global_rank)
+                    backend="hccl", world_size=self.world_size, rank=self.global_rank, pg_options=options)
 
-    def init_model(self, model, config=None):
+    def init_model(self, model, config=None, **kwargs):
         if self.enable_online_split_weight:
-            self._init_model_with_online_splited_weight(model, config)
+            self._init_model_with_online_splited_weight(model, config, **kwargs)
         else:
-            self._init_model_with_offline_splited_weight(model, config)
+            self._init_model_with_offline_splited_weight(model, config, **kwargs)
         self._process_weight_after_loading()
         self.compile_model()
         self.init_tokenizer()
@@ -151,7 +155,7 @@ class ModelRunner:
             self.cast_format()
 
 
-    def _init_model_with_online_splited_weight(self, model, config):
+    def _init_model_with_online_splited_weight(self, model, config, **kwargs):
         if config is None:
             raise Exception("config cannot be None")
         if self.use_pretrained_model:
@@ -170,29 +174,31 @@ class ModelRunner:
         if self.quantization is not None:
             self.hf_config.quant_config = get_quant_config(self.hf_config, self.quantization, self.model_path)
         self.check_model_cfg()
+        self.update_model_cfg()
         self.model = loader.load_model(config=self.hf_config, model_cls=model,
-                                       runner_settings=self.runner_settings, model_path=self.model_path)
+                                       runner_settings=self.runner_settings, model_path=self.model_path, **kwargs)
 
-    def _init_model_with_offline_splited_weight(self, model, config):
+    def _init_model_with_offline_splited_weight(self, model, config, **kwargs):
         if self.use_pretrained_model:
-            self._load_model_with_manual_splited_weight(model)
+            self._load_model_with_manual_splited_weight(model, **kwargs)
         else:
-            self._init_model_from_config(model, config=config)
+            self._init_model_from_config(model, config=config, **kwargs)
 
-    def _init_model_from_config(self, model, config):
+    def _init_model_from_config(self, model, config, **kwargs):
         if config is None:
             raise Exception("config cannot be None")
         config_file = os.path.join(self.model_path, "config.json")
         model_config = config.from_pretrained(config_file, torch_dtype=self.dtype)
-        self.model = model(model_config, runner_settings=self.runner_settings).to(self.dtype)
+        self.model = model(model_config, runner_settings=self.runner_settings, **kwargs).to(self.dtype)
 
-    def _load_model_with_manual_splited_weight(self, model):
+    def _load_model_with_manual_splited_weight(self, model, **kwargs):
         logging.info("Try to load pretrained model in path: %s", self.model_path)
         self.model = model.from_pretrained(self.model_path,
                                             low_cpu_mem_usage=True,
                                             ignore_mismatched_sizes=True,
                                             torch_dtype="auto", # 使用权重的默认数据类型
-                                            runner_settings=self.runner_settings)
+                                            runner_settings=self.runner_settings,
+                                            **kwargs)
 
     def save_model(self):
         pass
@@ -208,6 +214,12 @@ class ModelRunner:
         pass
 
     def init_tokenizer(self):
+        if "deepseek_vl2" in self.model_name:
+            self.tokenizer = AutoProcessor.from_pretrained(
+                self.model_path, trust_remote_code=True, use_fast=True
+            )
+            logging.info(f"use deepseek_vl2 tokenizer.")
+            return
         self.tokenizer = AutoTokenizer.from_pretrained(
             self.model_path,
             padding_side="right",
@@ -387,4 +399,7 @@ class ModelRunner:
         pass
 
     def check_model_cfg(self):
+        pass
+
+    def update_model_cfg(self):
         pass
