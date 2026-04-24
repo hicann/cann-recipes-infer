@@ -20,10 +20,10 @@
 
 ## Outline
 
-- [NPU DeepSeek-V4 Ascend C 融合算子优化](#npu-deepseek-v33-ascend-c-融合算子优化)
+- [NPU DeepSeek-V4 Ascend C 融合算子优化](#npu-deepseek-v4-ascend-c-融合算子优化)
   - [Highlights](#highlights)
   - [Outline](#outline)
-  - [DeepSeek-V4 Attention 整体结构](#deepseek-v33-attention-整体结构)
+  - [DeepSeek-V4 Attention 整体结构](#deepseek-v4-attention-整体结构)
   - [Compressor](#compressor)
     - [计算公式](#计算公式)
     - [Tiling 设计](#tiling-设计)
