@@ -253,6 +253,8 @@ dit_cache:
 
 **性能分析**：本样例支持Ascend PyTorch Profiler接口采集并分析模型性能，在脚本中传入参数`--prof-dit`，启用性能分析，分析文件默认保存在`.prof`路径。具体使用方法请参考CANN社区文档[性能分析](https://www.hiascend.com/document/detail/zh/canncommercial/80RC3/devaids/devtools/profiling/atlasprofiling_16_0006.html)。**支持多卡推理**。
 
+**多卡推理支持**：块稀疏 Attention 支持与 Ulysses / Ring Attention 序列并行组合使用。在脚本中同时启用 `--sparse-method` 和多卡并行配置即可，例如通过 YAML 设置 `world_size`、`ulysses-degree`、`ring-degree` 等参数，并选择 `TopK` 或 `SVG` 稀疏策略。多卡稀疏推理仍需满足下文的并行度、视频规格和 head 数约束。
+
 ### 多卡推理约束与并行配置组合
 
 本样例适配了 Ulysses / Ring Attention 两种序列并行方法，原生 HunyuanVideo 在 8 卡 Atlas 800I A2 上支持 `720*1280*129` 及以上规格。多卡推理需满足以下约束：

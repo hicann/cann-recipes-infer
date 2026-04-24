@@ -20,6 +20,7 @@ except ImportError:
 import torch_npu
 import yaml
 from loguru import logger
+from module.unified_sp.uaa import all_gather_anything, _maybe_pad_qkv_head, _maybe_unpad_qkv_head
 
 DEFAULT_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sparse_config.yaml")
 yaml.SafeLoader.add_constructor("!env", lambda loader, node: os.path.expandvars(node.value))
@@ -143,6 +144,139 @@ class BaseSparsePredictor(ABC):
             "num_steps": self.total_steps
         }
 
+    @staticmethod
+    def _route_heads_bsnd(x: torch.Tensor, head_index: torch.Tensor) -> torch.Tensor:
+        head_index = head_index.to(device=x.device, dtype=torch.long)
+        return x.index_select(2, head_index).contiguous()
+
+    @staticmethod
+    def _slice_ulysses_local_heads_with_uaa(runtime_attn, q, k, v, global_head_num):
+        if runtime_attn.ulysses_anything:
+            h = q.shape[2]
+            padded_tensors = []
+            h_pad = 0
+            for idx, tensor in enumerate((q, k, v)):
+                padded_tensor, tensor_h_pad = _maybe_pad_qkv_head(tensor, h, runtime_attn.ulysses_world_size)
+                padded_tensors.append(padded_tensor)
+                if idx == 0:
+                    h_pad = tensor_h_pad
+            head_per_rank = (h + h_pad) // runtime_attn.ulysses_world_size
+            head_start = runtime_attn.ulysses_rank * head_per_rank
+            head_end = head_start + head_per_rank
+            sliced_tensors = [
+                tensor[:, :, head_start:head_end, :].contiguous()
+                for tensor in padded_tensors
+            ]
+            sliced_tensors = [
+                _maybe_unpad_qkv_head(
+                    tensor,
+                    h_pad,
+                    runtime_attn.ulysses_rank,
+                    runtime_attn.ulysses_world_size,
+                    runtime_attn.ulysses_pg,
+                ).contiguous()
+                for tensor in sliced_tensors
+            ]
+            return tuple(sliced_tensors)
+
+        if global_head_num <= 0 or global_head_num % runtime_attn.ulysses_world_size != 0:
+            raise ValueError("global head num must be divisible by ulysses_world_size in standard ulysses.")
+        head_per_rank = global_head_num // runtime_attn.ulysses_world_size
+        head_start = runtime_attn.ulysses_rank * head_per_rank
+        head_end = head_start + head_per_rank
+        return tuple(
+            tensor[:, :, head_start:head_end, :].contiguous()
+            for tensor in (q, k, v)
+        )
+
+    @staticmethod
+    def _ulysses_all_gather_heads_bshd(runtime_attn, x: torch.Tensor) -> torch.Tensor:
+        if runtime_attn.ulysses_world_size <= 1:
+            return x
+        return all_gather_anything(
+            tensor=x,
+            dim=2,
+            world_size=runtime_attn.ulysses_world_size,
+            group=runtime_attn.ulysses_pg,
+        ).contiguous()
+
+    @staticmethod
+    def _ulysses_all_to_all_qkv(runtime_attn, x: torch.Tensor) -> torch.Tensor:
+        if runtime_attn.ulysses_anything:
+            return getattr(runtime_attn, "_all_to_all_qkv_anything")(x)()
+        return getattr(runtime_attn, "_all_to_all_qkv")(x)
+
+    @staticmethod
+    def _ulysses_all_to_all_o(
+        runtime_attn,
+        x: torch.Tensor,
+        *,
+        num_qo_head: int,
+        q_s_local: int,
+    ) -> torch.Tensor:
+        if runtime_attn.ulysses_anything:
+            return getattr(runtime_attn, "_all_to_all_o_anything")(
+                x,
+                NUM_QO_HEAD=num_qo_head,
+                Q_S_LOCAL=q_s_local,
+            )()
+        return getattr(runtime_attn, "_all_to_all_o")(x)
+
+    def _ulysses_all_to_all_qkv_triplet(self, runtime_attn, q, k, v):
+        return (
+            self._ulysses_all_to_all_qkv(runtime_attn, q),
+            self._ulysses_all_to_all_qkv(runtime_attn, k),
+            self._ulysses_all_to_all_qkv(runtime_attn, v),
+        )
+
+    @staticmethod
+    def _split_img_txt_qkv(q_full, k_full, v_full, img_q_len: int, img_kv_len: int):
+        return {
+            "q_img": q_full[:, :img_q_len, :, :].contiguous(),
+            "k_img": k_full[:, :img_kv_len, :, :].contiguous(),
+            "v_img": v_full[:, :img_kv_len, :, :].contiguous(),
+            "txt_q": q_full[:, img_q_len:, :, :].contiguous(),
+            "txt_k": k_full[:, img_kv_len:, :, :].contiguous(),
+            "txt_v": v_full[:, img_kv_len:, :, :].contiguous(),
+        }
+
+    def _get_local_seq_remap_indices(
+        self,
+        device: torch.device,
+        *,
+        ulysses_world_size: int,
+        reverse: bool = False,
+    ) -> torch.Tensor:
+        cache = getattr(self, "_seq_remap_index_cache", None)
+        if cache is None:
+            cache = {}
+            self._seq_remap_index_cache = cache
+        frame_num = int(getattr(self, "frame_num", 0))
+        frame_patch_h = int(getattr(self, "frame_patch_h", 0))
+        frame_patch_w = int(getattr(self, "frame_patch_w", 0))
+        img_token_len = int(getattr(self, "img_token_len", 0))
+        cache_key = (device, ulysses_world_size, frame_num, frame_patch_h, frame_patch_w)
+        cached = cache.get(cache_key)
+        if cached is None:
+            cpu = torch.device("cpu")
+            base = frame_patch_w // ulysses_world_size
+            extra = frame_patch_w % ulysses_world_size
+            width_splits = [base + (1 if rank < extra else 0) for rank in range(ulysses_world_size)]
+            token_splits = [frame_num * frame_patch_h * w for w in width_splits]
+            idx_current = torch.arange(img_token_len, dtype=torch.long, device=cpu).view(1, 1, img_token_len, 1)
+            idx_split = torch.split(idx_current, token_splits, dim=2)
+            idx_split = [
+                chunk.view(1, 1, frame_num, frame_patch_h, width_splits[idx], 1)
+                for idx, chunk in enumerate(idx_split)
+            ]
+            idx_canonical = torch.cat(idx_split, dim=4).reshape(1, 1, img_token_len, 1).contiguous()
+            cur2can_cpu = idx_canonical.view(-1).long()
+            can2cur_cpu = torch.empty_like(cur2can_cpu)
+            can2cur_cpu.index_copy_(0, cur2can_cpu, torch.arange(img_token_len, dtype=torch.long, device=cpu))
+            cached = (cur2can_cpu.to(device=device), can2cur_cpu.to(device=device))
+            cache[cache_key] = cached
+        return cached[1] if reverse else cached[0]
+
     def get_effective_indices(self) -> Tuple[int, int]:
         """获取当前有效的(step, layer)索引"""
         # 对于无时序模型（如VGGT），始终返回step=0
@@ -159,6 +293,158 @@ class BaseSparsePredictor(ABC):
         self.current["step"] = self.step
         self.current["layer"] = self.layer_counter
         return self.get_effective_indices()
+
+    def _apply_local_seq_remap_tensor(
+        self,
+        x: torch.Tensor,
+        *,
+        ulysses_world_size: int,
+        reverse: bool = False,
+    ) -> torch.Tensor:
+        remap_index = self._get_local_seq_remap_indices(
+            x.device,
+            ulysses_world_size=ulysses_world_size,
+            reverse=reverse,
+        )
+        img_token_len = int(self.img_token_len)
+        if x.shape[2] < img_token_len:
+            raise ValueError(
+                f"Ulysses seq len ({x.shape[2]}) is smaller than img_token_len ({img_token_len})."
+            )
+        x_img = x[:, :, :img_token_len, :].index_select(2, remap_index)
+        x_ctx = x[:, :, img_token_len:, :]
+        return torch.cat((x_img, x_ctx), dim=2).contiguous() if x_ctx.shape[2] > 0 else x_img.contiguous()
+
+    def forward_ulysses_sparse(
+        self,
+        runtime_attn,
+        block_args: dict,
+        softmax_scale: Optional[float] = None,
+    ) -> torch.Tensor:
+        q_img_local, k_img_local, v_img_local = (
+            block_args["q_img_local"], block_args["k_img_local"], block_args["v_img_local"]
+        )
+        txt_q, txt_k, txt_v = block_args["txt_q"], block_args["txt_k"], block_args["txt_v"]
+        route_head_perm = route_inv_head_perm = None
+        if (
+            getattr(self, "ulysses_head_routing_enabled", False)
+            and runtime_attn.ulysses_world_size > 1
+            and hasattr(self, "get_runtime_head_route")
+        ):
+            route_head_perm, route_inv_head_perm = self.get_runtime_head_route()
+            if route_head_perm is not None:
+                q_local_full = self._route_heads_bsnd(
+                    torch.cat([q_img_local, txt_q], dim=1).contiguous(),
+                    route_head_perm,
+                )
+                k_local_full = self._route_heads_bsnd(
+                    torch.cat([k_img_local, txt_k], dim=1).contiguous(),
+                    route_head_perm,
+                )
+                v_local_full = self._route_heads_bsnd(
+                    torch.cat([v_img_local, txt_v], dim=1).contiguous(),
+                    route_head_perm,
+                )
+                img_q_len_local = q_img_local.shape[1]
+                img_kv_len_local = k_img_local.shape[1]
+                split_args = self._split_img_txt_qkv(
+                    q_local_full,
+                    k_local_full,
+                    v_local_full,
+                    img_q_len_local,
+                    img_kv_len_local,
+                )
+                q_img_local, k_img_local, v_img_local = split_args["q_img"], split_args["k_img"], split_args["v_img"]
+                txt_q, txt_k, txt_v = split_args["txt_q"], split_args["txt_k"], split_args["txt_v"]
+
+        q_img_global, k_img_global, v_img_global = self._ulysses_all_to_all_qkv_triplet(
+            runtime_attn,
+            q_img_local,
+            k_img_local,
+            v_img_local,
+        )
+
+        txt_q_local_h, txt_k_local_h, txt_v_local_h = self._slice_ulysses_local_heads_with_uaa(
+            runtime_attn,
+            txt_q, txt_k, txt_v, q_img_local.shape[2]
+        )
+        predictor_name = str(getattr(self, "predictor_name", ""))
+        is_svg_mode = predictor_name.lower() == "svg" or "svg" in self.__class__.__name__.lower()
+        build_kwargs = {}
+        attn_kwargs = {}
+        img_seq_len = int(q_img_global.shape[1])
+        if is_svg_mode:
+            q_full = torch.cat([q_img_global, txt_q_local_h], dim=1).contiguous()
+            k_full = torch.cat([k_img_global, txt_k_local_h], dim=1).contiguous()
+            v_full = torch.cat([v_img_global, txt_v_local_h], dim=1).contiguous()
+            build_kwargs["joint_q_local_bnsd"] = txt_q_local_h
+            attn_kwargs["joint_q_local_bnsd"] = txt_q_local_h
+        else:
+            h_local = q_img_global.shape[2]
+            img_packed = torch.cat([q_img_global, k_img_global, v_img_global], dim=2)
+            txt_packed = torch.cat([txt_q_local_h, txt_k_local_h, txt_v_local_h], dim=2)
+            qkv_full = torch.cat([img_packed, txt_packed], dim=1).contiguous()
+            q_full, k_full, v_full = torch.split(qkv_full, [h_local, h_local, h_local], dim=2)
+        head_sabi = None
+        prefix_q_len = int(q_full.shape[1])
+        prefix_kv_len = int(k_full.shape[1])
+        out_full = self.attention(
+            q=q_full,
+            k=k_full,
+            v=v_full,
+            head_sabi=head_sabi,
+            ulysses_pg=runtime_attn.ulysses_pg,
+            ulysses_rank=runtime_attn.ulysses_rank,
+            ulysses_world_size=runtime_attn.ulysses_world_size,
+            cu_seqlens_q=[0, prefix_q_len],
+            cu_seqlens_kv=[0, prefix_kv_len],
+            return_bshd=True,
+            softmax_scale=softmax_scale,
+            **attn_kwargs,
+        )
+
+        img_out_global = out_full[:, :img_seq_len, :, :].contiguous()
+        txt_out_local_h = out_full[:, img_seq_len:, :, :].contiguous()
+        if runtime_attn.ulysses_anything:
+            img_out_local = self._ulysses_all_to_all_o(
+                runtime_attn,
+                img_out_global,
+                num_qo_head=q_img_local.shape[2],
+                q_s_local=q_img_local.shape[1],
+            )
+            txt_out = all_gather_anything(
+                tensor=txt_out_local_h,
+                dim=2,
+                world_size=runtime_attn.ulysses_world_size,
+                group=runtime_attn.ulysses_pg,
+            ).contiguous()
+        else:
+            img_out_local = self._ulysses_all_to_all_o(
+                runtime_attn,
+                img_out_global,
+                num_qo_head=q_img_local.shape[2],
+                q_s_local=q_img_local.shape[1],
+            )
+            txt_out = self._ulysses_all_gather_heads_bshd(runtime_attn, txt_out_local_h)
+
+        out = torch.cat([img_out_local, txt_out], dim=1).contiguous()
+        expected_local_seq_len = int(q_img_local.shape[1]) + int(txt_q.shape[1])
+        if out.shape[1] != expected_local_seq_len:
+            img_expected = int(q_img_local.shape[1])
+            txt_expected = int(txt_q.shape[1])
+            img_actual = int(img_out_local.shape[1])
+            txt_actual = int(txt_out.shape[1])
+            if img_actual >= img_expected:
+                img_out_local = img_out_local[:, :img_expected, :, :].contiguous()
+            if txt_actual >= txt_expected:
+                txt_out = txt_out[:, :txt_expected, :, :].contiguous()
+            out = torch.cat([img_out_local, txt_out], dim=1).contiguous()
+            if int(out.shape[1]) > expected_local_seq_len:
+                out = out[:, :expected_local_seq_len, :, :].contiguous()
+
+        if route_inv_head_perm is not None:
+            out = self._route_heads_bsnd(out, route_inv_head_perm)
+        return out
 
     def load_sparsity(self, path: Union[str, Path], step_pattern: str = "step-{}.pt", step_num: int = 50):
         path = Path(path)
@@ -188,7 +474,7 @@ class BaseSparsePredictor(ABC):
 
     
     def get_block_mask(self, q, sabi):
-        b, h, n, d = q.shape
+        b, h, n, _ = q.shape
 
         block_num_q = math.ceil(n / self.block_size_q)
         block_num_k = math.ceil(n / self.block_size_k)
@@ -243,14 +529,87 @@ class TopKPredictor(BaseSparsePredictor):
         self.sparse_time_step = topk_config['sparse_time_step']
         self.sparsity_files_path = topk_config['sparsity_files_path']
         self.cac_threshold = topk_config['CAC_threshold']
-        self.predictor_name = topk_config['predictor_name']
 
         self.sparsity_dict = {}
         self.load_sparsity(self.sparsity_files_path, self.total_steps)
+        sample_step = next(iter(self.sparsity_dict.keys()))
+        sample_layer = self.sparsity_dict[sample_step][0]
+        self.head_num = int(torch.as_tensor(sample_layer).numel())
+        self.ulysses_degree_for_lb = 1
+        self.ulysses_head_routing_enabled = False
+        self.step_layer_head_perm = {}
+        self.step_layer_inv_head_perm = {}
+        self._ulysses_head_split_cache = {}
+
+    def _get_layer_sparsity_tensor(self, step_idx: int, layer_idx: int, device=None) -> torch.Tensor:
+        raw_sparsity = self.sparsity_dict[step_idx][layer_idx]
+        sparsity_cpu = torch.as_tensor(raw_sparsity, dtype=torch.float32, device="cpu").contiguous()
+        if device is None:
+            return sparsity_cpu
+        if isinstance(device, torch.device) and device.type == "cpu":
+            return sparsity_cpu
+        if isinstance(device, str) and device.lower().startswith("cpu"):
+            return sparsity_cpu
+        return torch.tensor(sparsity_cpu.tolist(), dtype=torch.float32, device=device).contiguous()
+
+    def _get_layer_sparsity_runtime_head_order(self, step_idx: int, layer_idx: int, device=None) -> torch.Tensor:
+        sparsity = self._get_layer_sparsity_tensor(step_idx, layer_idx, device=device)
+        if not self.ulysses_head_routing_enabled:
+            return sparsity
+        perm = self.step_layer_head_perm.get((int(step_idx), int(layer_idx)))
+        if perm is None:
+            return sparsity
+        if not torch.is_tensor(perm):
+            perm = torch.as_tensor(perm, dtype=torch.long)
+        perm = perm.to(device=sparsity.device, dtype=torch.long)
+        return sparsity.index_select(0, perm).contiguous()
+
+    def apply_head_reorder_for_load_balance(self, ulysses_degree: int):
+        self.ulysses_degree_for_lb = int(ulysses_degree)
+        self.step_layer_head_perm.clear()
+        self.step_layer_inv_head_perm.clear()
+        if self.ulysses_degree_for_lb <= 1:
+            self.ulysses_head_routing_enabled = False
+            return
+        for step_idx, layer_sparsity_list in self.sparsity_dict.items():
+            total_layers = len(layer_sparsity_list)
+            for layer_idx in range(total_layers):
+                sparsity = self._get_layer_sparsity_tensor(int(step_idx), int(layer_idx), device="cpu")
+                sparsity_list = sparsity.tolist()
+                rank_buckets = [[] for _ in range(self.ulysses_degree_for_lb)]
+                rank_costs = [0.0 for _ in range(self.ulysses_degree_for_lb)]
+                ranked_heads = sorted(
+                    range(len(sparsity_list)),
+                    key=lambda idx: (1.0 - float(sparsity_list[idx])),
+                    reverse=True,
+                )
+                for head_idx in ranked_heads:
+                    target_rank = min(
+                        range(self.ulysses_degree_for_lb),
+                        key=lambda rank: (rank_costs[rank], len(rank_buckets[rank]), rank),
+                    )
+                    rank_buckets[target_rank].append(head_idx)
+                    rank_costs[target_rank] += 1.0 - float(sparsity_list[head_idx])
+                perm_list = [head_idx for bucket in rank_buckets for head_idx in bucket]
+                perm = torch.tensor(perm_list, dtype=torch.long)
+                inv_list = [0] * len(perm_list)
+                for new_idx, old_idx in enumerate(perm_list):
+                    inv_list[old_idx] = new_idx
+                inv = torch.tensor(inv_list, dtype=torch.long)
+                self.step_layer_head_perm[(int(step_idx), int(layer_idx))] = perm
+                self.step_layer_inv_head_perm[(int(step_idx), int(layer_idx))] = inv
+        self.ulysses_head_routing_enabled = True
+
+    def get_runtime_head_route(self):
+        step_idx, layer_idx = self.get_effective_indices()
+        return (
+            self.step_layer_head_perm.get((int(step_idx), int(layer_idx))),
+            self.step_layer_inv_head_perm.get((int(step_idx), int(layer_idx))),
+        )
 
     
     def get_block_attn(self, q: torch.Tensor, k, block_num_q, block_num_k):
-        b, h, n_q, d = q.shape
+        _, _, n_q, _ = q.shape
         n_k = k.shape[-2]
         q_list = []
         k_list = []
@@ -273,7 +632,7 @@ class TopKPredictor(BaseSparsePredictor):
         return attn, q_list, k_list
 
     def pooling_matmul(self, q, block_size, block_num):
-        b, h, n, d = q.shape
+        b, h, _, d = q.shape
         q_bmm = q.view(b * h * block_num, block_size, d)
         weight = torch.full((b * h * block_num, 1, block_size), 1.0 / block_size, device=q.device, dtype=q.dtype)
         q_mean = torch.bmm(weight, q_bmm).squeeze(1).view(b, h, block_num, d)
@@ -286,15 +645,18 @@ class TopKPredictor(BaseSparsePredictor):
         attn = attn.softmax(dim=-1)
         return attn
 
-    def get_sabi(self, q: torch.Tensor, k: torch.Tensor):
-        b, h, n_q, d = q.shape
+    def get_sabi(self, q: torch.Tensor, k: torch.Tensor, sparsity_override: Optional[torch.Tensor] = None):
+        b, h, n_q, _ = q.shape
         n_k = k.shape[-2]
         block_num_q = math.ceil(n_q / self.block_size_q)
         block_num_k = math.ceil(n_k / self.block_size_k)
-        attn, q_list, k_list = self.get_block_attn(q, k, block_num_q, block_num_k)
+        attn, _, _ = self.get_block_attn(q, k, block_num_q, block_num_k)
         new_sabi_list = []
-        step_idx, layer_idx = self.get_effective_indices()
-        sparsity = self.sparsity_dict[step_idx][layer_idx]
+        if sparsity_override is None:
+            step_idx, layer_idx = self.get_effective_indices()
+            sparsity = self._get_layer_sparsity_runtime_head_order(step_idx, layer_idx, device=attn.device)
+        else:
+            sparsity = sparsity_override.to(device=attn.device, dtype=torch.float32).contiguous()
         for batch in range(b):
             for head in range(h):
                 k_num = int((1 - sparsity[head]) * block_num_k)
@@ -303,8 +665,8 @@ class TopKPredictor(BaseSparsePredictor):
                 new_sabi_list.append(indices)
         return new_sabi_list
 
-    def get_sabi_v2(self, q: torch.Tensor, k: torch.Tensor):
-        b, h, n_q, d = q.shape
+    def get_sabi_v2(self, q: torch.Tensor, k: torch.Tensor, sparsity_override: Optional[torch.Tensor] = None):
+        b, h, n_q, _ = q.shape
         n_k = k.shape[-2]
         block_num_q = math.ceil(n_q / self.block_size_q)
         block_num_k = math.ceil(n_k / self.block_size_k)
@@ -312,8 +674,11 @@ class TopKPredictor(BaseSparsePredictor):
 
         new_sabi_tensor = torch.full(size=(b, h, block_num_q, block_num_k),
                                         fill_value=-1, dtype=self.index_type, device=q.device)
-        step_idx, layer_idx = self.get_effective_indices()
-        sparsity = self.sparsity_dict[step_idx][layer_idx]
+        if sparsity_override is None:
+            step_idx, layer_idx = self.get_effective_indices()
+            sparsity = self._get_layer_sparsity_runtime_head_order(step_idx, layer_idx, device=attn.device)
+        else:
+            sparsity = sparsity_override.to(device=attn.device, dtype=torch.float32).contiguous()
         k_nums = ((1.0 - sparsity) * block_num_k).to(torch.int32)
         max_k = int(k_nums.max().item())
         _, indices = torch.topk(attn, max_k, dim=-1)
@@ -329,6 +694,7 @@ class TopKPredictor(BaseSparsePredictor):
         '''sabi连接must_keep的block indices，得到final_sabi'''
         sink_frame_len = kwargs["sink_frame_len"]
         img_token_len = kwargs["img_token_len"]
+        sparsity_override = kwargs.get("sparsity_override")
         all_token_len = q.shape[2]
         txt_token_len = all_token_len - img_token_len
         n_q = q.shape[2]
@@ -344,7 +710,7 @@ class TopKPredictor(BaseSparsePredictor):
         mid_q, mid_k = q[:, :, : (block_num_q - sink_txt_blocks_q) * self.block_size_q, :],\
             k[:, :, : (block_num_k - sink_txt_blocks_k) * self.block_size_k, :]
         
-        mid_sabi_list = self.get_sabi(mid_q, mid_k)
+        mid_sabi_list = self.get_sabi(mid_q, mid_k, sparsity_override=sparsity_override)
         final_sabi = self.combined_sabi_tensor_list(mid_sabi_list, must_keep_indices_q, 
                         must_keep_indices_k, block_num_k).unsqueeze(0)
         return final_sabi
@@ -353,6 +719,7 @@ class TopKPredictor(BaseSparsePredictor):
         '''sabi连接must_keep的block indices，得到final_sabi'''
         sink_frame_len = kwargs["sink_frame_len"]
         img_token_len = kwargs["img_token_len"]
+        sparsity_override = kwargs.get("sparsity_override")
         all_token_len = q.shape[2]
         txt_token_len = all_token_len - img_token_len
         n_q = q.shape[2]
@@ -370,7 +737,7 @@ class TopKPredictor(BaseSparsePredictor):
         mid_q = mid_q.contiguous()
         mid_k = mid_k.contiguous()
 
-        mid_sabi_tensor = self.get_sabi_v2(mid_q, mid_k)
+        mid_sabi_tensor = self.get_sabi_v2(mid_q, mid_k, sparsity_override=sparsity_override)
         final_sabi = self.combined_sabi_tensor(mid_sabi_tensor, must_keep_indices_q, must_keep_indices_k, block_num_k)
         return final_sabi
 
@@ -421,7 +788,6 @@ def get_row_indices(block):
     for row in block:
         row_false_indices = torch.where(~row)[0]
         indices_list.append(row_false_indices)
-    max_len = max(len(indices) for indices in indices_list)
     result = torch.full((len(indices_list), block.shape[1]), -1, dtype=torch.long)
     for i, indices in enumerate(indices_list):
         if len(indices) > 0:
@@ -430,7 +796,6 @@ def get_row_indices(block):
 
 
 def block2sabi(block_mask):
-    sabi_list = []
     sabi_mask = get_row_indices(block_mask)
 
     return sabi_mask
@@ -447,10 +812,11 @@ class SVGPredictor(BaseSparsePredictor):
         self.context_length = svg_config['context_length']
         self.sample_mse_max_row = svg_config['sample_mse_max_row']
         self.attention_masks = []
+        self.sabi_tensor = None
+        self._svg_mask_cache_key = None
 
     def sparsity_to_width(self, sparsity, num_frame, frame_size):
         seq_len = self.context_length + num_frame * frame_size
-        total_elements = seq_len**2
 
         width = seq_len * (1 - math.sqrt(sparsity)) - self.context_length
         width_frame = width / frame_size
@@ -458,16 +824,17 @@ class SVGPredictor(BaseSparsePredictor):
         return width_frame
     
     def sample_mse(self, query, key, value, context_length):
-
-        key = key[:, :, :-context_length]
-        value = value[:, :, :-context_length]
+        if context_length > 0:
+            key = key[:, :, :-context_length]
+            value = value[:, :, :-context_length]
 
         mask_name = ["spatial", "temporal"]
         num_sampled_rows = 64
 
-        cfg, num_heads, seq_len, dim = query.size()
+        _, _, seq_len, dim = query.size()
         num_sampled_rows = min(num_sampled_rows, seq_len)
-        sampled_rows = torch.randint(low=0, high=self.sample_mse_max_row, size=(num_sampled_rows,))
+        sampled_row_high = min(seq_len, self.sample_mse_max_row)
+        sampled_rows = torch.randint(low=0, high=sampled_row_high, size=(num_sampled_rows,), device=query.device)
         sampled_q = query[:, :, sampled_rows, :]
         sampled_qk_scores = torch.matmul(sampled_q, key.transpose(-2, -1)) / (dim**0.5)
 
@@ -563,24 +930,35 @@ class SVGPredictor(BaseSparsePredictor):
         return attention_mask, block_mask
     
     def get_sabi(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_frames: int, frame_size: int):
-        b, h, s, d = q.shape
+        b, h, s, _ = q.shape
         
         device = q.device
         self.device = device
         frame_width = self.sparsity_to_width(self.sparsity, num_frames, frame_size)
         context_length_cu = s - num_frames * frame_size
+        cache_key = (
+            int(s),
+            int(num_frames),
+            int(frame_size),
+            str(device),
+            int(self.sample_mse_max_row),
+        )
 
-        if len(self.attention_masks) == 0:
+        if self._svg_mask_cache_key != cache_key:
             spatial_mask, block_mask = self.get_attention_mask("spatial", s, num_frames, 
                                                                 frame_size, frame_width, device=device)
             temporal_mask, _ = self.get_attention_mask("temporal", s, num_frames,
                                                                 frame_size, frame_width, device=device)
 
             self.attention_masks = [spatial_mask, temporal_mask]
-            self.sabi_tensor = block2sabi(block_mask)
-
-            block_num_q, block_num_k = self.sabi_tensor.shape[0], self.sabi_tensor.shape[1]
-            self.sabi_tensor = self.sabi_tensor.unsqueeze(0).unsqueeze(0).expand(b, h, block_num_q, block_num_k)
+            base_sabi_tensor = block2sabi(block_mask)
+            block_num_q, block_num_k = base_sabi_tensor.shape[0], base_sabi_tensor.shape[1]
+            self.sabi_tensor = base_sabi_tensor.unsqueeze(0).unsqueeze(0).expand(b, h, block_num_q, block_num_k)
+            self._svg_mask_cache_key = cache_key
+        elif self.sabi_tensor is None or self.sabi_tensor.shape[0] != b or self.sabi_tensor.shape[1] != h:
+            base_sabi_tensor = self.sabi_tensor[0, 0]
+            block_num_q, block_num_k = base_sabi_tensor.shape[0], base_sabi_tensor.shape[1]
+            self.sabi_tensor = base_sabi_tensor.unsqueeze(0).unsqueeze(0).expand(b, h, block_num_q, block_num_k)
         
         mse_result = self.sample_mse(q, k, v, context_length_cu)
         pattern = (mse_result["spatial"] < mse_result["temporal"]).flatten()
@@ -594,18 +972,12 @@ class SVGPredictor(BaseSparsePredictor):
 
         all_token_len = q.shape[2]
         txt_token_len = q.shape[2] - num_frames * frame_size
-        b, h, n_q, d = q.shape
-        n_k = k.shape[-2]
-        block_num_q = math.ceil(n_q / self.block_size_q)
-        block_num_k = math.ceil(n_k / self.block_size_k)
+        self.get_must_keep_blocks_indices(
+            token_len=all_token_len,
+            sink_frame_len=sink_frame_len,
+            txt_token_len=txt_token_len,
+        )
 
-        sink_txt_blocks_q, must_keep_indices_q, sink_txt_blocks_k, must_keep_indices_k = \
-            self.get_must_keep_blocks_indices(token_len=all_token_len, sink_frame_len=sink_frame_len,
-                                                txt_token_len=txt_token_len)
-
-        mid_q, mid_k = q[:, :, : (block_num_q - sink_txt_blocks_q) * self.block_size_q, :],\
-            k[:, :, : (block_num_k - sink_txt_blocks_k) * self.block_size_k, :]
-        
         pattern = self.get_sabi(q, k, v, num_frames, frame_size)
         return pattern, self.sabi_tensor
 
@@ -620,6 +992,9 @@ class HunyuanVideoTopKAdapter(TopKPredictor):
         # HyVideo特定参数
         self.sink_frame_len = sparse_params.get("sink_frame_len", 0)
         self.img_token_len = sparse_params.get("img_token_len", 0)
+        self.frame_num = sparse_params.get("frame_num", 0)
+        self.frame_patch_h = sparse_params.get("frame_patch_h", 0)
+        self.frame_patch_w = sparse_params.get("frame_patch_w", 0)
         logger.info(f"update sparse params successfully, sink_frame_len: {self.sink_frame_len}\
                     img_token_len: {self.img_token_len}. ")
 
@@ -699,7 +1074,47 @@ class HunyuanVideoTopKAdapter(TopKPredictor):
         padded_sabi_tensor = torch.cat((sink_txt_suffix, mid_sabi_tensor), dim=3)[:, :, :, :total_num_blocks_k]
         padded_sabi_tensor = torch.cat((padded_sabi_tensor, full_k_indices), dim=2)
         return padded_sabi_tensor
-    
+
+    def _resolve_ulysses_local_sparsity_override(
+        self,
+        *,
+        local_head_num: int,
+        device: torch.device,
+        ulysses_pg=None,
+        ulysses_rank: int = 0,
+        ulysses_world_size: int = 1,
+    ) -> Optional[torch.Tensor]:
+        if ulysses_world_size <= 1:
+            return None
+
+        step_idx, layer_idx = self.get_effective_indices()
+        layer_sparsity = self._get_layer_sparsity_runtime_head_order(step_idx, layer_idx, device=device)
+        if int(layer_sparsity.numel()) == local_head_num:
+            return layer_sparsity
+
+        head_start = ulysses_rank * local_head_num
+        head_end = head_start + local_head_num
+        if ulysses_pg is not None and dist.is_initialized():
+            cache_key = (
+                int(ulysses_world_size),
+                int(ulysses_rank),
+                int(local_head_num),
+                str(device),
+                int(layer_sparsity.numel()),
+            )
+            cached = self._ulysses_head_split_cache.get(cache_key)
+            if cached is not None:
+                head_start, head_end = cached
+            else:
+                local_h = torch.tensor([local_head_num], dtype=torch.int64, device=device)
+                gathered_h = torch.empty((ulysses_world_size, 1), dtype=torch.int64, device=device)
+                dist.all_gather_into_tensor(gathered_h, local_h, group=ulysses_pg)
+                head_splits = gathered_h.view(-1).to(device="cpu", dtype=torch.long).tolist()
+                head_start = int(sum(head_splits[:ulysses_rank]))
+                head_end = head_start + int(head_splits[ulysses_rank])
+                self._ulysses_head_split_cache[cache_key] = (head_start, head_end)
+        return layer_sparsity[head_start:head_end].contiguous()
+
     def attention(self, q,
             k,
             v,
@@ -710,47 +1125,97 @@ class HunyuanVideoTopKAdapter(TopKPredictor):
             cu_seqlens_kv=None,
             max_seqlen_q=None,
             max_seqlen_kv=None,
-            batch_size=1,):
+            batch_size=1,
+            head_sabi: Optional[torch.Tensor] = None,
+            ulysses_pg=None,
+            ulysses_rank: int = 0,
+            ulysses_world_size: int = 1,
+            return_bshd: bool = False,
+            softmax_scale: Optional[float] = None,):
         pre_attn_layout, post_attn_layout = MEMORY_LAYOUT["BNSD"]
         b, s, n, d = q.shape
         q = pre_attn_layout(q)
         k = pre_attn_layout(k)
         v = pre_attn_layout(v)
-        scale = 1.0 / math.sqrt(d)
-        if cu_seqlens_q is None:
+        scale = softmax_scale if softmax_scale is not None else 1.0 / math.sqrt(d)
+        if cu_seqlens_q is None or cu_seqlens_kv is None:
+            if cu_seqlens_q is not None or cu_seqlens_kv is not None:
+                raise ValueError("TopK sparse attention requires both cu_seqlens_q and cu_seqlens_kv, or neither.")
             x = torch_npu.npu_fused_infer_attention_score(
                 q, k, v,
                 num_heads=n,
                 input_layout="BNSD",
                 scale=scale,
             )[0]
-        else:
-            q1 = q[:, :, :cu_seqlens_q[1], :]
-            k1 = k[:, :, :cu_seqlens_kv[1], :]
-            v1 = v[:, :, :cu_seqlens_kv[1], :]
-            q1, k1, v1 = self.move_sink_frame_to_end(q1, k1, v1, self.sink_frame_len)
-            start_time = sync_and_get_time()
-            sabi_tensor = self.get_final_sabi_v2(q1, k1, sink_frame_len=self.sink_frame_len,
-                                                    img_token_len=self.img_token_len)
-            exec_time = sync_and_get_time(start_time)
-            logger.info(f"get sabi time:{exec_time*1000:.2f} ms")
-            sabi_tensor = sabi_tensor.to(torch.uint16)
-            actseqlen = [cu_seqlens_q[1]] * b
-            actseqlenkv = [cu_seqlens_kv[1]] * b
-            attn1 = torch_bsa.blitz_sparse_attention(q1,
-                k1,
-                v1,
-                sabi=sabi_tensor,
-                actual_seq_lengths=actseqlen,
-                actual_seq_lengths_kv=actseqlenkv,
+            x = post_attn_layout(x)
+            if return_bshd:
+                return x
+            return x.reshape(b, s, -1)
+        q1 = q[:, :, :cu_seqlens_q[1], :].contiguous()
+        k1 = k[:, :, :cu_seqlens_kv[1], :].contiguous()
+        v1 = v[:, :, :cu_seqlens_kv[1], :].contiguous()
+        qkv1 = torch.cat([q1, k1, v1], dim=1).contiguous()
+        qkv1 = self._apply_local_seq_remap_tensor(
+            qkv1,
+            ulysses_world_size=ulysses_world_size,
+        )
+        q1, k1, v1 = torch.split(qkv1, [n, n, n], dim=1)
+        sink_dense_q_len = min(int(self.sink_frame_len), int(q1.shape[2]))
+        q1_dense_ref = q1
+        k1_dense_ref = k1
+        v1_dense_ref = v1
+        q1, k1, v1 = self.move_sink_frame_to_end(q1, k1, v1, self.sink_frame_len)
+        sparsity_override = self._resolve_ulysses_local_sparsity_override(
+            local_head_num=n,
+            device=q1.device,
+            ulysses_pg=ulysses_pg,
+            ulysses_rank=ulysses_rank,
+            ulysses_world_size=ulysses_world_size,
+        )
+        sabi_tensor = self.get_final_sabi_v2(
+            q1,
+            k1,
+            sink_frame_len=self.sink_frame_len,
+            img_token_len=self.img_token_len,
+            sparsity_override=sparsity_override,
+        )
+        sabi_tensor = sabi_tensor.to(device=q1.device, dtype=torch.uint16).contiguous()
+        actseqlen = [cu_seqlens_q[1]] * b
+        actseqlenkv = [cu_seqlens_kv[1]] * b
+        attn1 = torch_bsa.blitz_sparse_attention(
+            q1,
+            k1,
+            v1,
+            sabi=sabi_tensor,
+            actual_seq_lengths=actseqlen,
+            actual_seq_lengths_kv=actseqlenkv,
+            num_heads=n,
+            num_key_value_heads=n,
+            input_layout="BNSD",
+            scale_value=scale,
+            atten_mask=None,
+            sparse_mode=0,
+        )
+        attn1 = self.move_sink_frame_back(attn1, self.sink_frame_len)
+        if sink_dense_q_len > 0:
+            dense_first_frame = torch_npu.npu_fused_infer_attention_score(
+                q1_dense_ref[:, :, :sink_dense_q_len, :].contiguous(),
+                k1_dense_ref,
+                v1_dense_ref,
                 num_heads=n,
-                num_key_value_heads=n,
                 input_layout="BNSD",
-                scale_value=scale,
-                atten_mask=None,
-                sparse_mode=0
-            )
-            attn1 = self.move_sink_frame_back(attn1, self.sink_frame_len)
+                scale=scale,
+            )[0]
+            if sink_dense_q_len < attn1.shape[2]:
+                attn1 = torch.cat([dense_first_frame, attn1[:, :, sink_dense_q_len:, :]], dim=2).contiguous()
+            else:
+                attn1 = dense_first_frame.contiguous()
+        attn1 = self._apply_local_seq_remap_tensor(
+            attn1,
+            ulysses_world_size=ulysses_world_size,
+            reverse=True,
+        )
+        if cu_seqlens_q[1] < s:
             attn2 = torch_npu.npu_fused_infer_attention_score(
                 q[:, :, cu_seqlens_q[1]:, :],
                 k[:, :, cu_seqlens_kv[1]:, :],
@@ -760,7 +1225,11 @@ class HunyuanVideoTopKAdapter(TopKPredictor):
                 scale=scale,
             )[0]
             x = torch.cat([attn1, attn2], dim=2)
+        else:
+            x = attn1
         x = post_attn_layout(x)
+        if return_bshd:
+            return x
         out = x.reshape(b, s, -1)
         return out
 
@@ -776,6 +1245,8 @@ class HunyuanVideoSVGAdapter(SVGPredictor):
         self.sink_frame_len = sparse_params.get("sink_frame_len", 0)
         self.img_token_len = sparse_params.get("img_token_len", 0)
         self.frame_num = sparse_params.get("frame_num", 0)
+        self.frame_patch_h = sparse_params.get("frame_patch_h", 0)
+        self.frame_patch_w = sparse_params.get("frame_patch_w", 0)
         logger.info(f"update sparse params successfully, sink_frame_len: {self.sink_frame_len}\
                     img_token_len: {self.img_token_len}, frame_num:{self.frame_num}. ")
     
@@ -810,7 +1281,7 @@ class HunyuanVideoSVGAdapter(SVGPredictor):
         return sink_txt_blocks_q, must_keep_indices_q, sink_txt_blocks_k, must_keep_indices_k
 
     def rearrange_x(self, x, frame_num, frame_size):
-        s, d = x.shape
+        _, d = x.shape
         s_wocontext = frame_num * frame_size
         x_wocontext = x[:s_wocontext]
         x_context = x[s_wocontext:]
@@ -822,7 +1293,7 @@ class HunyuanVideoSVGAdapter(SVGPredictor):
         return x
 
     def inv_rearrange_x(self, x, frame_num, frame_size):
-        s, d = x.shape
+        _, d = x.shape
         s_wocontext = frame_num * frame_size
         x_wocontext = x[:s_wocontext]
         x_context = x[s_wocontext:]
@@ -832,6 +1303,36 @@ class HunyuanVideoSVGAdapter(SVGPredictor):
                         .contiguous()
         x = torch.cat([x_wocontext, x_context], dim=0)
         return x
+
+    def build_sp_sabi_before_head_shard(self, block_args: dict):
+        if block_args["v_local_bnsd"] is None:
+            raise ValueError("SVG sparse path requires v_local_bnsd.")
+        q_local_bnsd, k_local_bnsd, v_local_bnsd = (
+            block_args["q_local_bnsd"], block_args["k_local_bnsd"], block_args["v_local_bnsd"]
+        )
+        q_local = q_local_bnsd.transpose(1, 2).contiguous()
+        k_local = k_local_bnsd.transpose(1, 2).contiguous()
+        v_local = v_local_bnsd.transpose(1, 2).contiguous()
+        joint_q_local = block_args.get("joint_q_local_bnsd")
+        if joint_q_local is not None:
+            joint_q_local = joint_q_local.transpose(1, 2).contiguous()
+        q_global, k_global, v_global = q_local, k_local, v_local
+
+        if block_args["ulysses_world_size"] > 1:
+            qkv_global = torch.cat([q_global, k_global, v_global], dim=1).contiguous()
+            qkv_global = self._apply_local_seq_remap_tensor(
+                qkv_global,
+                ulysses_world_size=block_args["ulysses_world_size"],
+            )
+            h = q_global.shape[1]
+            q_global, k_global, v_global = torch.split(qkv_global, [h, h, h], dim=1)
+
+        frame_size = self.img_token_len // self.frame_num
+        q_meta = q_global
+        pattern, sabi_tensor = self.get_final_sabi(q_meta, k_global, v_global, self.frame_num, frame_size)
+        img_blocks_q = math.ceil(self.img_token_len / self.block_size_q)
+        sabi_tensor = sabi_tensor[:, :, :img_blocks_q, :].contiguous()
+        return {"pattern": pattern, "sabi": sabi_tensor}
 
     def attention(self, q,
             k,
@@ -844,6 +1345,13 @@ class HunyuanVideoSVGAdapter(SVGPredictor):
             max_seqlen_q=None,
             max_seqlen_kv=None,
             batch_size=1,
+            head_sabi: Optional[Dict[str, torch.Tensor]] = None,
+            ulysses_pg=None,
+            ulysses_rank: int = 0,
+            ulysses_world_size: int = 1,
+            return_bshd: bool = False,
+            softmax_scale: Optional[float] = None,
+            joint_q_local_bnsd: Optional[torch.Tensor] = None,
             ):
         pre_attn_layout, post_attn_layout = MEMORY_LAYOUT["BNSD"]
 
@@ -854,11 +1362,10 @@ class HunyuanVideoSVGAdapter(SVGPredictor):
         q = pre_attn_layout(q)
         k = pre_attn_layout(k)
         v = pre_attn_layout(v)
-        scale = 1.0 / math.sqrt(d)
-
-        actseqlen = [cu_seqlens_q[1]] * b
-        actseqlenkv = [cu_seqlens_kv[1]] * b
-        if cu_seqlens_q is None:
+        scale = softmax_scale if softmax_scale is not None else 1.0 / math.sqrt(d)
+        if cu_seqlens_q is None or cu_seqlens_kv is None:
+            if cu_seqlens_q is not None or cu_seqlens_kv is not None:
+                raise ValueError("SVG sparse attention requires both cu_seqlens_q and cu_seqlens_kv, or neither.")
             x = torch_npu.npu_fused_infer_attention_score(
                 q, k, v,
                 num_heads=n,
@@ -866,10 +1373,35 @@ class HunyuanVideoSVGAdapter(SVGPredictor):
                 scale=scale,
             )[0]
         else:
+            actseqlen = [cu_seqlens_q[1]] * b
+            actseqlenkv = [cu_seqlens_kv[1]] * b
             q1 = q[:, :, :cu_seqlens_q[1], :].contiguous()
             k1 = k[:, :, :cu_seqlens_kv[1], :].contiguous()
             v1 = v[:, :, :cu_seqlens_kv[1], :].contiguous()
-            pattern, sabi_tensor = self.get_final_sabi(q1, k1, v1, frame_num, frame_size)
+            qkv1 = torch.cat([q1, k1, v1], dim=1).contiguous()
+            qkv1 = self._apply_local_seq_remap_tensor(
+                qkv1,
+                ulysses_world_size=ulysses_world_size,
+            )
+            q1, k1, v1 = torch.split(qkv1, [n, n, n], dim=1)
+            if head_sabi is None:
+                if joint_q_local_bnsd is None:
+                    prefix_q_len = int(cu_seqlens_q[1])
+                    img_q_len = min(int(self.img_token_len), prefix_q_len)
+                    joint_q_local_bnsd = q[:, :, img_q_len:prefix_q_len, :].transpose(1, 2).contiguous()
+                head_sabi = self.build_sp_sabi_before_head_shard(
+                    {
+                        "q_local_bnsd": q.transpose(1, 2).contiguous(),
+                        "k_local_bnsd": k.transpose(1, 2).contiguous(),
+                        "v_local_bnsd": v.transpose(1, 2).contiguous(),
+                        "joint_q_local_bnsd": joint_q_local_bnsd,
+                        "ulysses_pg": ulysses_pg,
+                        "ulysses_rank": ulysses_rank,
+                        "ulysses_world_size": ulysses_world_size,
+                    }
+                )
+            pattern = head_sabi["pattern"]
+            sabi_tensor = head_sabi["sabi"]
 
             for h in range(n):
                 if pattern[h] == False:
@@ -894,21 +1426,30 @@ class HunyuanVideoSVGAdapter(SVGPredictor):
                 atten_mask=None,
                 sparse_mode=0,
             )
-            attn2 = torch_npu.npu_fused_infer_attention_score(
-                q[:, :, cu_seqlens_q[1]:, :],
-                k[:, :, cu_seqlens_kv[1]:, :],
-                v[:, :, cu_seqlens_kv[1]:, :],
-                num_heads=n,
-                input_layout="BNSD",
-                scale=scale,
-            )[0]
             for h in range(n):
                 if pattern[h] == False:
                     attn1_h = attn1[0, h]
                     attn1[0, h] = self.inv_rearrange_x(attn1_h, frame_num, frame_size).contiguous()
-            x = torch.cat([attn1, attn2], dim=2)
+            attn1 = self._apply_local_seq_remap_tensor(
+                attn1,
+                ulysses_world_size=ulysses_world_size,
+                reverse=True,
+            )
+            if cu_seqlens_q[1] < s:
+                attn2 = torch_npu.npu_fused_infer_attention_score(
+                    q[:, :, cu_seqlens_q[1]:, :],
+                    k[:, :, cu_seqlens_kv[1]:, :],
+                    v[:, :, cu_seqlens_kv[1]:, :],
+                    num_heads=n,
+                    input_layout="BNSD",
+                    scale=scale,
+                )[0]
+                x = torch.cat([attn1, attn2], dim=2)
+            else:
+                x = attn1
         x = post_attn_layout(x)
-
+        if return_bshd:
+            return x
         out = x.reshape(b, s, -1)
         return out
 

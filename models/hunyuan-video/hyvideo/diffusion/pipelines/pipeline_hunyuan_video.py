@@ -967,6 +967,8 @@ class HunyuanVideoPipeline(DiffusionPipeline):
                         "sink_frame_len": sink_frame_len,
                         "img_token_len": img_token_len,
                         "frame_num": video_length,
+                        "frame_patch_h": int(height) // self.vae_scale_factor // 2,
+                        "frame_patch_w": int(width) // self.vae_scale_factor // 2,
                     }
                 )
         # 6. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline

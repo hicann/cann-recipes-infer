@@ -107,7 +107,17 @@ def main():
         "device": f"npu:{args.device}"
     }
     if args.sparse_method != "no_sparse":
+        if getattr(args, "ring_degree", 1) > 1:
+            raise ValueError("Sparse attention does not support ring_degree > 1 in the current runtime.")
         sparse_predictor_manager.from_config(f"./hyvideo/sparse/sparse_config.yaml", args.sparse_method, sparse_params)
+        if (
+            getattr(args, "ulysses_degree", 1) > 1
+            and hasattr(
+                sparse_predictor_manager.sparse_attn_mode,
+                "apply_head_reorder_for_load_balance",
+            )
+        ):
+            sparse_predictor_manager.sparse_attn_mode.apply_head_reorder_for_load_balance(args.ulysses_degree)
         for block in hunyuan_video_sampler.pipeline.transformer.double_blocks:
             block.forward = sparse_double_block_forward.__get__(block, type(block))
         for block in hunyuan_video_sampler.pipeline.transformer.single_blocks:

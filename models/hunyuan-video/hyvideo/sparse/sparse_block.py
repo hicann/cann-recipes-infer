@@ -9,7 +9,11 @@ import torch.nn.functional as F
 from loguru import logger
 
 from module.blockwise_sparse.sparse_method import sparse_predictor_manager, sync_and_get_time
-from ..modules.attention import attention
+from ..modules.attention import (
+    attention,
+    parallel_attention,
+    parallel_sparse_attention,
+)
 from ..modules.posemb_layers import apply_rotary_emb
 from ..modules.mlp_layers import MLP
 from ..modules.modulate_layers import modulate, apply_gate
@@ -85,16 +89,44 @@ def sparse_double_block_forward(
     sparse_time_step = sparse_predictor_manager.sparse_attn_mode.sparse_time_step
     if current["step"] not in sparse_time_step:
         start_time = sync_and_get_time()
-        attn = attention(q, k, v, mode='flash', cu_seqlens_q=cu_seqlens_q, 
-                        cu_seqlens_kv=cu_seqlens_kv, max_seqlen_q=max_seqlen_q, 
-                        max_seqlen_kv=max_seqlen_kv, batch_size=img.shape[0])
+        if not self.hybrid_seq_parallel_attn:
+            attn = attention(q, k, v, mode='flash', cu_seqlens_q=cu_seqlens_q, 
+                            cu_seqlens_kv=cu_seqlens_kv, max_seqlen_q=max_seqlen_q, 
+                            max_seqlen_kv=max_seqlen_kv, batch_size=img.shape[0])
+        else:
+            attn = parallel_attention(
+                self.hybrid_seq_parallel_attn,
+                q,
+                k,
+                v,
+                img_q_len=img_q.shape[1],
+                img_kv_len=img_k.shape[1],
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_kv=cu_seqlens_kv,
+            )
         exec_time = sync_and_get_time(start_time)
         logger.info(f"Full Double Attention time: {exec_time * 1000:.2f} ms")
     else:
         start_time = sync_and_get_time()
-        attn = sparse_predictor_manager.sparse_attn_mode.attention(q, k, v, cu_seqlens_q=cu_seqlens_q, 
-                        cu_seqlens_kv=cu_seqlens_kv, max_seqlen_q=max_seqlen_q, 
-                        max_seqlen_kv=max_seqlen_kv, batch_size=img.shape[0])
+        if not self.hybrid_seq_parallel_attn:
+            attn = sparse_predictor_manager.sparse_attn_mode.attention(q, k, v, cu_seqlens_q=cu_seqlens_q,
+                            cu_seqlens_kv=cu_seqlens_kv, max_seqlen_q=max_seqlen_q,
+                            max_seqlen_kv=max_seqlen_kv, batch_size=img.shape[0])
+        else:
+            prefix_q_end = int(cu_seqlens_q[1]) if cu_seqlens_q is not None else int(q.shape[1])
+            attn = parallel_sparse_attention(
+                self.hybrid_seq_parallel_attn,
+                {
+                    "q": q,
+                    "k": k,
+                    "v": v,
+                    "img_q_len": img_q.shape[1],
+                    "img_kv_len": img_k.shape[1],
+                    "cu_seqlens_q": cu_seqlens_q,
+                    "cu_seqlens_kv": cu_seqlens_kv,
+                    "joint_q_local_bnsd": q[:, img_q.shape[1]:prefix_q_end, :, :].contiguous(),
+                },
+            )
         exec_time = sync_and_get_time(start_time)
         logger.info(f"Sparse Double Attention time: {exec_time * 1000:.2f} ms")
 
@@ -163,18 +195,48 @@ def sparse_single_block_forward(
     
     current = sparse_predictor_manager.sparse_attn_mode.current
     sparse_time_step = sparse_predictor_manager.sparse_attn_mode.sparse_time_step
+    img_q_len = q.shape[1] - txt_len
+    img_kv_len = k.shape[1] - txt_len
     if current["step"] not in sparse_time_step:
         start_time = sync_and_get_time()
-        attn = attention(q, k, v, mode='flash', cu_seqlens_q=cu_seqlens_q, 
-                        cu_seqlens_kv=cu_seqlens_kv, max_seqlen_q=max_seqlen_q, 
-                        max_seqlen_kv=max_seqlen_kv, batch_size=x.shape[0])
+        if not self.hybrid_seq_parallel_attn:
+            attn = attention(q, k, v, mode='flash', cu_seqlens_q=cu_seqlens_q, 
+                            cu_seqlens_kv=cu_seqlens_kv, max_seqlen_q=max_seqlen_q, 
+                            max_seqlen_kv=max_seqlen_kv, batch_size=x.shape[0])
+        else:
+            attn = parallel_attention(
+                self.hybrid_seq_parallel_attn,
+                q,
+                k,
+                v,
+                img_q_len=img_q_len,
+                img_kv_len=img_kv_len,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_kv=cu_seqlens_kv,
+            )
         exec_time = sync_and_get_time(start_time)
         logger.info(f"Full Single Attention time: {exec_time * 1000:.2f} ms")
     else:
         start_time = sync_and_get_time()
-        attn = sparse_predictor_manager.sparse_attn_mode.attention(q, k, v, cu_seqlens_q=cu_seqlens_q, 
-                        cu_seqlens_kv=cu_seqlens_kv, max_seqlen_q=max_seqlen_q, 
-                        max_seqlen_kv=max_seqlen_kv, batch_size=x.shape[0])
+        if not self.hybrid_seq_parallel_attn:
+            attn = sparse_predictor_manager.sparse_attn_mode.attention(q, k, v, cu_seqlens_q=cu_seqlens_q,
+                            cu_seqlens_kv=cu_seqlens_kv, max_seqlen_q=max_seqlen_q,
+                            max_seqlen_kv=max_seqlen_kv, batch_size=x.shape[0])
+        else:
+            prefix_q_end = int(cu_seqlens_q[1]) if cu_seqlens_q is not None else int(q.shape[1])
+            attn = parallel_sparse_attention(
+                self.hybrid_seq_parallel_attn,
+                {
+                    "q": q,
+                    "k": k,
+                    "v": v,
+                    "img_q_len": img_q_len,
+                    "img_kv_len": img_kv_len,
+                    "cu_seqlens_q": cu_seqlens_q,
+                    "cu_seqlens_kv": cu_seqlens_kv,
+                    "joint_q_local_bnsd": q[:, img_q_len:prefix_q_end, :, :].contiguous(),
+                },
+            )
         exec_time = sync_and_get_time(start_time)
         logger.info(f"Sparse Single Attention time: {exec_time * 1000:.2f} ms")
 

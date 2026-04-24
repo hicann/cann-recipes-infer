@@ -270,3 +270,52 @@ def parallel_attention(
     attn = attn.reshape(b, s, -1)
     
     return attn
+
+
+def parallel_sparse_attention(
+    hybrid_seq_parallel_attn,
+    block_args: dict,
+):
+    q, k, v = block_args["q"], block_args["k"], block_args["v"]
+    img_q_len, img_kv_len = block_args["img_q_len"], block_args["img_kv_len"]
+    cu_seqlens_q, cu_seqlens_kv = block_args["cu_seqlens_q"], block_args["cu_seqlens_kv"]
+    joint_q_local_bnsd = block_args.get("joint_q_local_bnsd")
+    b, s, n, d = q.shape
+    from module.blockwise_sparse.sparse_method import sparse_predictor_manager
+
+    q_img, k_img, v_img = q[:, :img_q_len, :, :], k[:, :img_kv_len, :, :], v[:, :img_kv_len, :, :]
+    txt_q = (
+        joint_q_local_bnsd
+        if joint_q_local_bnsd is not None
+        else q[:, img_q_len:cu_seqlens_q[1], :, :]
+    )
+    txt_k, txt_v = k[:, img_kv_len:cu_seqlens_kv[1], :, :], v[:, img_kv_len:cu_seqlens_kv[1], :, :]
+
+    sparse_mode = getattr(sparse_predictor_manager, "sparse_attn_mode", None)
+    sp_attn = getattr(hybrid_seq_parallel_attn, "__self__", None)
+    attn_prefix = sparse_mode.forward_ulysses_sparse(
+        runtime_attn=sp_attn,
+        block_args={
+            "q_img_local": q_img,
+            "k_img_local": k_img,
+            "v_img_local": v_img,
+            "txt_q": txt_q,
+            "txt_k": txt_k,
+            "txt_v": txt_v,
+        },
+        softmax_scale=q.shape[-1] ** (-0.5),
+    )
+
+    attn = attn_prefix
+    if int(attn_prefix.shape[1]) < s:
+        attn2 = torch_npu.npu_fused_infer_attention_score(
+            q[:, cu_seqlens_q[1]:],
+            k[:, cu_seqlens_kv[1]:],
+            v[:, cu_seqlens_kv[1]:],
+            num_heads=n,
+            input_layout="BSND",
+            scale=q.shape[-1] ** (-0.5),
+        )[0]
+        attn = torch.cat([attn_prefix, attn2], dim=1)
+    attn = attn.reshape(b, s, -1)
+    return attn
