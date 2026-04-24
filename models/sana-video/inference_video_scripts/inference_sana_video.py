@@ -659,4 +659,35 @@ if __name__ == "__main__":
         colored(f"Sana inference has finished. Results stored at ", "green"),
         colored(f"{img_save_dir}", attrs=["bold"]),
         ".",
+        flush=True,
     )
+
+    # Skip Python's interpreter shutdown to avoid a torch_npu C-extension
+    # double-free SIGABRT that fires after all outputs are already on disk.
+    # SIGKILL every direct child (DataLoader workers, multiprocessing
+    # resource_tracker) so they cannot notice ppid==1 and print leaked-
+    # semaphore warnings via their own inherited fd 2. CANN TBE grandchildren
+    # are out of reach here and handled by a shell-level grep in infer_platform.sh.
+    import shutil
+    import signal
+    import subprocess
+
+    pgrep_bin = shutil.which("pgrep") or "/usr/bin/pgrep"
+    try:
+        child_pids = subprocess.run(
+            [pgrep_bin, "-P", str(os.getpid())],
+            capture_output=True, text=True, check=False,
+        ).stdout.split()
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.warning("shutdown child-kill sweep: pgrep failed: %s", exc)
+        child_pids = []
+    for pid in child_pids:
+        try:
+            os.kill(int(pid), signal.SIGKILL)
+        except (ProcessLookupError, ValueError):
+            continue
+
+    # os._exit bypasses atexit / C-extension destructors; this is the
+    # documented POSIX-style fast exit and the right tool here, though
+    # pylint flags the underscore.
+    os._exit(0)  # pylint: disable=protected-access
