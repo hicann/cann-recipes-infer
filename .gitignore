@@ -6,3 +6,6 @@
 **.tar.gz
 **/res/**
 **/experiment_results_*.log
+/.claude/
+/.opencode/
+/CLAUDE.md

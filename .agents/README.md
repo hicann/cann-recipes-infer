@@ -103,7 +103,7 @@ model-infer-optimize（编排入口）
 ## 目录结构
 
 ```
-.agent/
+.agents/
 ├── README.md                                    # 本文件
 ├── agents/                                      # SubAgent 角色定义
 │   ├── model-infer-analyzer.md                  # 分析专家
@@ -139,7 +139,20 @@ Skill 中引用的外部文档：
 
 ### 安装
 
-将 `.agent/` 目录放置到项目根目录下（本项目已放置，clone 后可直接使用）。支持 [Agent Skills 规范](https://agentskills.io/home) 的工具（如 OpenCode 等）会自动扫描并加载这些 Skill。
+根据使用的客户端选择对应命令：
+
+```bash
+bash scripts/init-agent.sh --claude     # Claude Code 用户
+bash scripts/init-agent.sh --opencode   # OpenCode 用户
+bash scripts/init-agent.sh              # 两个客户端都要用时（可选）
+```
+
+脚本作用：
+- 在 `.claude/` 下创建 skills/agents/hooks 的 symlink（指向 `.agents/`），并复制 `settings.json`
+- 在 `.opencode/` 下创建 skills/agents 的 symlink
+- 根目录生成 `CLAUDE.md` → `AGENTS.md` 的 symlink
+
+生成物（`.claude/` / `.opencode/` / `CLAUDE.md`）已加入仓库 `.gitignore`，不会被提交。
 
 ### 触发方式
 
