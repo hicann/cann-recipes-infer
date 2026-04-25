@@ -2338,7 +2338,7 @@ class DeepseekV3ModelMTP(DeepseekV3ForCausalLM):
             = self._load_weight_map()
 
         params_dict = dict(self.named_parameters())
-        params_dict = adapt_safetensors_field_MTP(params_dict)
+        params_dict = adapt_safetensors_field_mtp(params_dict, self.config.num_hidden_layers)
         loaded_params: Set[str] = set()
         dequant_cache = {}
         for name, loaded_weight in weights:
@@ -2517,13 +2517,13 @@ def adapt_safetensors_field(params_dict: Dict):
     return fix_dict
 
 
-def adapt_safetensors_field_MTP(params_dict: Dict):
+def adapt_safetensors_field_mtp(params_dict: Dict, num_hidden_layers: int):
     fix_dict = {}
     for k, v in params_dict.items():
         if "model" in k:
-            k = k.replace("model","mtp.0")
-        if "layers.43." in k:
-            k = k.replace("layers.43.", "")
+            k = k.replace("model", "mtp.0")
+        if f"layers.{num_hidden_layers}." in k:
+            k = k.replace(f"layers.{num_hidden_layers}.", "")
         if k in ["enorm.weight", "hnorm.weight", "shared_head_norm.weight", "e_proj.weight",
             "h_proj.weight", "e_proj.weight_scale", "h_proj.weight_scale", "e_proj.scale", "h_proj.scale"]:
             k = "mtp.0." + k
