@@ -4,14 +4,14 @@ world_size: 16
 model_config:
   model_name: "qwen3-moe"
   model_path: "/data/models/Qwen3-235B-A22B"
-  exe_mode: "eager"        # ["ge_graph", "eager", "acl_graph"]
+  exe_mode: "eager"        # ["ge_graph", "eager", "npugraph_ex"]
   enable_profiler: False  # [False, True]
   with_ckpt: True # [False, True]
   enable_cache_compile: False
-  packed_sequence: False
 
 data_config:
   dataset: "LongBench"  # ["default", "LongBench"]
+  input_truncated_len: 4096
 
 parallel_config:
   world_size: 16
@@ -21,6 +21,5 @@ parallel_config:
   lmhead_tp_size: 1
 
 scheduler_config:
-  input_max_len: 4096
   max_new_tokens: 256
   batch_size: 16  # global batch_size, should be divisible by ep_size

@@ -14,7 +14,7 @@
 # limitations under the License.
 
 from dataclasses import dataclass, replace
-from typing import Optional
+from typing import Optional, Dict
 import torch
 
 
@@ -26,7 +26,15 @@ class ForwardMetaData:
     kv_len: Optional[torch.Tensor] = None
     actual_seq_lengths_kv: Optional[torch.Tensor] = None
     actual_seq_lengths_q: Optional[torch.Tensor] = None
-
+    actual_seq_lengths_cu_kv: Optional[torch.Tensor] = None
+    actual_seq_lengths_cu_q: Optional[torch.Tensor] = None
+    actual_seq_lengths_cu_list_kv: Optional[list] = None
+    actual_seq_lengths_cu_list_q: Optional[list] = None
+    actual_seq_lengths_list_kv: Optional[list] = None
+    actual_seq_lengths_list_q: Optional[list] = None
+    prompt_tokens: int = 0
+    block_table: Optional[Dict[str, torch.Tensor]] = None
+    slot_mapping: Optional[Dict[str, torch.Tensor]] = None
 
 _forward_metadata = ForwardMetaData()
 

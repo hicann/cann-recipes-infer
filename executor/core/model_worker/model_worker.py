@@ -32,6 +32,7 @@ import torch
 import torch_npu
 
 from executor.core.config import InferenceConfig
+from executor.core.kv_cache.cache_info import CacheEntry, LayerCacheInfo, ModelCacheInfo
 from executor.utils.forward_metadata import set_forward_metadata, get_forward_metadata
 from executor.model_loader.default_loader import DefaultModelLoader
 from executor.model_loader.dummy_loader import DummyModelLoader
@@ -122,8 +123,8 @@ class ModelWorker:
         model_cls,
         config_cls,
         comm_manager,
-    ):
-        """Load model from weights, process weights, and initialize KV cache."""
+    ) -> ModelCacheInfo:
+        """Load model from weights, process weights, and return KV cache information."""
         # Select appropriate loader based on configuration
         if self.use_pretrained_model:
             logging.info("Try to load pretrained model in path: %s", self.model_path)
@@ -169,19 +170,23 @@ class ModelWorker:
         # Process weights after loading (transpose for NPU)
         self._process_weights_after_loading()
 
-        # Initialize KV cache
-        self._init_kvcache()
-
     def _process_weights_after_loading(self):
         """Process weights after loading (transpose for NPU format)."""
         if hasattr(self.model, "process_weights_after_loading"):
             self.model.process_weights_after_loading()
             self.model.to(self.device)
 
+    def get_cache_info(self):
+        """Get the model's overall cache information."""
+        if hasattr(self.model, "get_cache_info"):
+            return self.model.get_cache_info()
+        else:
+            return None
+
     def _init_kvcache(self):
         """Initialize pre-allocated KV cache tensors."""
         batch_size = self.infer_config.scheduler_config.batch_size_per_dp_rank
-        cache_seq_len = self.infer_config.scheduler_config.input_max_len + \
+        cache_seq_len = self.infer_config.data_config.input_max_len + \
             self.infer_config.scheduler_config.max_new_tokens
 
         # Bind kv_cache to model modules
@@ -229,12 +234,13 @@ class ModelWorker:
         """Execute model inference and log timing information."""
         # Generate expert indices for force EPLB if enabled
         if self.force_eplb:
-            batch_size, seq_len = model_inputs["input_ids"].shape
+            input_ids = model_inputs["input_ids"]
+            total_tokens = input_ids.numel() if input_ids.dim() == 1 else input_ids.shape[0] * input_ids.shape[1]
             if is_prefill:
-                self.prefill_topk_list = self.gen_force_eplb_topk_idx(is_prefill, batch_size, seq_len)
+                self.prefill_topk_list = self.gen_force_eplb_topk_idx(is_prefill, total_tokens)
             elif self.decode_topk_list is None:
                 # Only generate once for decode phase
-                self.decode_topk_list = self.gen_force_eplb_topk_idx(is_prefill, batch_size, seq_len)
+                self.decode_topk_list = self.gen_force_eplb_topk_idx(is_prefill, total_tokens)
             model_inputs.update({"cur_topk_list": self.prefill_topk_list if is_prefill else self.decode_topk_list})
 
         # Synchronize and start timing
@@ -257,13 +263,7 @@ class ModelWorker:
 
         # Determine stage name for logging
         model = "Main" if not is_mtp else "MTP"
-        if not is_prefill:
-            stage = "decode"
-        else:
-            if model_inputs.get("cycle_idx"):
-                stage = "prefill round " + str(model_inputs.get("cycle_idx"))
-            else:
-                stage = "prefill"
+        stage = "prefill" if is_prefill else "decode"
         logging.info(f"[{model}] Inference time ({stage}): {inference_time*1000:.2f} ms")
 
         return output, inference_time
@@ -288,8 +288,7 @@ class ModelWorker:
     def gen_force_eplb_topk_idx(
         self,
         is_prefill: bool,
-        batch_size: int,
-        seq_len: int,
+        total_tokens: int,
     ) -> Optional[torch.Tensor]:
         """Generate expert indices for force EPLB (Expert Per-Token Load Balance).
 
@@ -316,26 +315,30 @@ class ModelWorker:
 
         if is_prefill:
             # Prefill phase: allocate experts with rank-aware distribution
-            tokens_per_rank_prefill = (batch_size * seq_len + self.attn_tp_size - 1) // self.attn_tp_size \
-                if self.moe_ep_size != 1 else batch_size * seq_len * self.attn_dp_size
+            tokens_per_rank_prefill = (total_tokens + self.attn_tp_size - 1) // self.attn_tp_size \
+                if self.moe_ep_size != 1 else total_tokens * self.attn_dp_size
             step_prefill = tokens_per_rank_prefill * num_experts_per_tok
             cur_topk_list_prefill = [
                 (i + self.global_rank) % num_experts for i in range(step_prefill)]
             cur_topk_list = torch.tensor(cur_topk_list_prefill, dtype=torch.int).view(tokens_per_rank_prefill, -1).npu()
         else:
+            # The input are distributed according to attention parallelism (attn_dp_size),
+            # but when computing topk_list in force_eplb mode, the token count should follow MoE
+            # parallelism (moe_ep_size). Thus, the token count should be recacculated.
+            total_tokens = total_tokens * self.attn_dp_size // self.moe_ep_size
             # Decode phase: allocation depends on MoE tensor parallelism
             if self.moe_tp_size > 1:
                 # MoE TP mode: contiguous expert ranges per EP rank
-                expanded_tokens = batch_size * num_experts_per_tok * seq_len
+                expanded_tokens = total_tokens * num_experts_per_tok
                 cur_topk_list_decode = []
                 for offset in range(self.moe_ep_size):
                     expert_start = offset * experts_per_rank
                     expert_end = expert_start + expanded_tokens
                     cur_topk_list_decode = cur_topk_list_decode + [i for i in range(expert_start, expert_end)]
-                cur_topk_list = torch.tensor(cur_topk_list_decode, dtype=torch.int).view(batch_size * seq_len, -1).npu()
+                cur_topk_list = torch.tensor(cur_topk_list_decode, dtype=torch.int).view(total_tokens, -1).npu()
             else:
                 # Non-TP mode: round-robin allocation across EP ranks
-                expanded_tokens = batch_size * num_experts_per_tok * seq_len
+                expanded_tokens = total_tokens * num_experts_per_tok
                 step_gap = num_experts // self.moe_ep_size
                 expanded_offset = expanded_tokens * self.global_rank + self.global_rank
 
@@ -346,5 +349,5 @@ class ModelWorker:
                     row = (expanded_offset + idx) // self.moe_ep_size % step_gap
                     expert_idx = row + col * step_gap
                     cur_topk_list_decode.append(expert_idx)
-                cur_topk_list = torch.tensor(cur_topk_list_decode, dtype=torch.int).view(batch_size * seq_len, -1).npu()
+                cur_topk_list = torch.tensor(cur_topk_list_decode, dtype=torch.int).view(total_tokens, -1).npu()
         return cur_topk_list

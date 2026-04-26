@@ -13,18 +13,18 @@
 
 1. 安装CANN软件包。
 
-   本样例的编译执行依赖CANN开发套件包（cann-toolkit）与CANN二进制算子包（cann-kernels）。支持的CANN软件版本为`CANN 8.5.0.alpha002`。
+   本样例的编译执行依赖CANN开发套件包（cann-toolkit）与CANN二进制算子包（cann-kernels），支持的CANN软件版本为`CANN 8.5.0`。
 
-   请从[软件包下载地址](https://www.hiascend.com/developer/download/community/result?module=cann&cann=8.5.0.alpha002)下载`Ascend-cann-toolkit_${version}_linux-${arch}.run`与`Ascend-cann-kernels-910b_${version}_linux-${arch}.run`软件包，并参考[CANN安装文档](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/850alpha002/softwareinst/instg/instg_0001.html?Mode=PmIns&OS=Debian&Software=cannToolKit)进行安装。
+   请从[软件包下载地址](https://www.hiascend.com/developer/download/community/result?module=cann&cann=8.5.0)下载`Ascend-cann-toolkit_${version}_linux-${arch}.run`与`Ascend-cann-A3-ops_<version>_linux-<arch>.run`软件包，并参考[CANN安装文档](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/850/softwareinst/instg/instg_0090.html?Mode=PmIns&InstallType=localpack&OS=Ubuntu)进行安装。
 
-    - `${version}`表示CANN包版本号，如8.5.0.alpha002。
+    - `${version}`表示CANN包版本号，如8.5.0。
     - `${arch}`表示CPU架构，如aarch64、x86_64。
 
 
 2. 安装Ascend Extension for PyTorch（torch_npu）。
 
    Ascend Extension for PyTorch（torch_npu）为支撑PyTorch框架运行在NPU上的适配插件。
-   请从[软件包下载地址](https://gitcode.com/Ascend/pytorch/tree/v2.6.0-7.3.0)下载`v2.6.0-7.3.0`源码，参考[源码编译安装](https://www.hiascend.com/document/detail/zh/Pytorch/710/configandinstg/instg/insg_0005.html)。
+   请从[软件包下载地址](https://gitcode.com/Ascend/pytorch/releases/v7.3.0-pytorch2.8.0)下载`torch_npu-2.8.0.post2-cp311-cp311-manylinux_2_28_${arch}.whl`安装包，参考[torch_npu安装文档](https://www.hiascend.com/document/detail/zh/Pytorch/730/configandinstg/instg/docs/zh/installation_guide/installation_via_binary_package.md)进行安装。
 
 
 3. 下载项目源码并安装依赖的python库。
@@ -95,5 +95,3 @@
    > - 默认使用`eager`单算子模式推理。
    > - 对于20b模型提供单device推理，对于120b模型提供8卡推理（仅支持tp切分）。
    > - YAML文件中默认设置`enable_online_split_weight: True`，模型权重会在加载过程中[在线切分](../../docs/common/online_split_weight_guide.md)到各个设备上，无需离线切分。
-
-

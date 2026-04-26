@@ -12,6 +12,7 @@
 管理输入数据相关的参数。
 - `dataset`: 数据集名称（默认 "default"）。
 - `dataset_path`: 数据集路径（默认 ""），非"default"数据集时必须指定。
+- `input_truncated_len`: 最大输入序列长度（默认 256），如果prompt超过这一长度会被截断。
 
 ### 2.2 ModelConfig (模型配置)
 管理模型运行时的特有行为。
@@ -26,7 +27,6 @@
 - `enable_cache_compile`: 是否启用缓存编译（默认 False）。
 - `force_eplb`: 是否为 MoE 模型开启强制的专家负载均衡（默认 False）。
 - `enable_profiler`: 是否启用性能分析器（默认 False）。
-- `packed_sequence`: 输入序列是否打包（batch+seq 轴合并），默认 True。
 - `enable_weight_nz`: 是否启用权重 NZ 格式（默认 True）。
 - `custom_params`：存放模型特有特性的字典（默认{}）。
 
@@ -50,9 +50,13 @@
 ### 2.4 SchedulerConfig (调度配置)
 控制请求调度器的策略。
 - `batch_size`: 全局总 Batch Size（默认 1）。
-- `input_max_len`: Scheduler最大输入序列长度（默认 1024），如果prompt超过这一长度会被截断。
 - `max_new_tokens`: 最大生成 token 数（默认 32）。
+- `max_prefill_tokens`: 单次 prefill batch 的最大 prompt token 预算（默认 0）。
+  当设置为 0 时，框架默认按 `input_truncated_len * batch_size_per_dp_rank` 计算预算。
+  在 executor-core 支持的模型中，prefill 默认采用 packed sequence 方式执行，该参数用于限制 packed 后单批次的 token 总量。
 - `batch_size_per_dp_rank`: **不支持配置**。每个 Rank 的 Batch Size。推导方式：`batch_size // attn_dp_size`。
+- `mem_fraction_static`: 静态内存分配比例（默认 0.85），用于控制推理阶段可用于静态占用的设备内存比例。
+- `block_size`: 单个 KV Cache block 可容纳的 token 数（默认 128），用于控制 Paged Attention 的 block 粒度。
 
 ## 3. 基本用法
 
@@ -69,8 +73,8 @@ with open("config.yaml", "r") as f:
 
 # 构造配置对象，需要传入 rank 信息
 config = InferenceConfig.from_dict(
-    yaml_data, 
-    global_rank=0, 
+    yaml_data,
+    global_rank=0,
     local_rank=0
 )
 

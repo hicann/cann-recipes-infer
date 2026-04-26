@@ -17,11 +17,10 @@ import os
 import argparse
 import logging
 import yaml
-import torch
 from executor.core import InferenceConfig, OfflineInference
 from executor.utils.data_utils import generate_default_prompt, load_longbench_dataset, build_dataset_input, \
     load_infinitebench_dataset
-from executor.utils.common_utils import process_infer_time, obtain_mtp_stats
+from executor.utils.common_utils import process_infer_time
 
 
 def parse_args():
@@ -48,12 +47,12 @@ def generate_prompt(dataset, dataset_path):
         raise Exception(f"your dataset {dataset} is not supported, dataset supported: LongBench, InfiniteBench")
     return preset_prompts
 
-def preprocess_prompts_for_scheduler(prompts, tokenizer, scheduler_config):
+def preprocess_prompts_for_scheduler(prompts, tokenizer, scheduler_config, data_config):
     bsz = scheduler_config.batch_size
     prompts = prompts * (bsz // len(prompts) + 1)
     prompts = prompts[:bsz]
-    return build_dataset_input(tokenizer, prompts, scheduler_config.input_max_len,
-                               scheduler_config.max_new_tokens, False)
+    return build_dataset_input(tokenizer, prompts, data_config.input_truncated_len,
+                               scheduler_config.max_new_tokens, is_chat=True)
 
 
 def log_results(results, mtp_stats, infer_time, next_n, model_name):
@@ -71,30 +70,37 @@ def log_results(results, mtp_stats, infer_time, next_n, model_name):
     for i, res in enumerate(results):
         logging.info("Request %s: outputs: %s\n", i, res.output_text)
 
+    # Skip the first time which is the prefill inference time
     decode_infer_time = infer_time[1:] if infer_time and len(infer_time) > 1 else []
-    if decode_infer_time:
-        # Calculate and log total MTP acceptance rate if MTP is enabled
-        if next_n > 0:
-            cnt = mtp_stats["spec_num_forward_ct"] - 1
-            spec_num_accepted_tokens = [x - cnt for x in mtp_stats["spec_num_accepted_tokens"]]
-            accept_token_num = torch.tensor(spec_num_accepted_tokens, dtype=torch.float)
-            obtain_mtp_stats(
-                next_n,
-                model_name,
-                accept_token_num,
-                cnt,
-                decode_infer_time,
-            )
-            avg_accepted_num = torch.mean(accept_token_num).item()
-            total_accept_rate = avg_accepted_num / cnt + 1
-            logging.info("Total speculation accept rate: %.4f", total_accept_rate)
-        else:
-            avg_infer_time = sum(decode_infer_time) / len(decode_infer_time)
-            logging.info(
-                "%s decode average inference time cost is %.2f ms",
-                model_name,
-                avg_infer_time * 1000,
-            )
+    # Get average decode inference time
+    avg_decode_time = process_infer_time(decode_infer_time, len(decode_infer_time))
+    # Calculate and log total MTP acceptance rate if MTP is enabled
+    if next_n > 0:
+        spec_num_forward_ct = sum(mtp_stats['spec_num_forward_ct'])
+        total_spec_tokens = spec_num_forward_ct * next_n
+        total_accept_tokens = sum(mtp_stats['spec_num_accepted_tokens'])
+        valid_output_len = sum(mtp_stats['valid_output_len'])
+
+        avg_accept_rate = total_accept_tokens / total_spec_tokens
+        avg_accept_length = total_accept_tokens / spec_num_forward_ct + 1
+        avg_equivalent_time = avg_decode_time / avg_accept_length
+
+        logging.info(f"Finished inference, the number of valid output tokens is {valid_output_len}, "
+                    f"total number of draft tokens is {total_spec_tokens}, "
+                    f"total accepted number is {total_accept_tokens}")
+        logging.info(
+            f"{model_name} main and mtp model average inference time cost is {avg_decode_time*1000:.2f} ms")
+        logging.info(
+            f"{model_name} model average equivalent latency of MTP{next_n}"
+            f" is {avg_equivalent_time*1000:.2f} ms")
+        logging.info("The speculation accept length: %.4f", avg_accept_length)
+        logging.info("The speculation accept rate: %.4f", avg_accept_rate)
+    else:
+        logging.info(
+            "%s decode average inference time cost is %.2f ms",
+            model_name,
+            avg_decode_time * 1000,
+        )
 
 
 def main():
@@ -143,7 +149,7 @@ def main():
     llm = OfflineInference(config)
 
     if config.data_config.dataset != "default":
-        prompts = preprocess_prompts_for_scheduler(prompts, llm.engine.tokenizer, config.scheduler_config)
+        prompts = preprocess_prompts_for_scheduler(prompts, llm.engine.tokenizer, config.scheduler_config, config.data_config)
     results, mtp_stats, infer_time = llm.generate(prompts)
     log_results(results, mtp_stats, infer_time, llm.engine.next_n, llm.engine.main_worker.model_name)
 

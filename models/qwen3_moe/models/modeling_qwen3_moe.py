@@ -19,7 +19,7 @@
 """ PyTorch Qwen3_MOE model."""
 import os
 import math
-from typing import List, Optional, Tuple, Union, Iterable
+from typing import List, Optional, Tuple, Iterable
 
 import torch
 import torch.nn.functional as F
@@ -40,6 +40,7 @@ from module.fuse_moe_gmm import FusedMoEGMM
 from executor.utils import init_comm_group, get_default_group
 from executor.utils.forward_metadata import ForwardMetaData, get_forward_metadata
 from executor.core.config import InferenceConfig, CommManager
+from executor.core.kv_cache.cache_info import CacheEntry, LayerCacheInfo, ModelCacheInfo
 from executor.model_loader.weight_utils import default_weight_loader
 from .configuration_qwen3_moe import Qwen3MoeConfig
 
@@ -99,22 +100,17 @@ class Qwen3MoeRotaryEmbedding(nn.Module):
             dtype=torch.get_default_dtype(),
         )
 
-    def forward(self, x, seq_len, kv_len, max_seq_len=None):
-        # x shape is [bs, num_attention_heads, seq_len, head_size]
+    def forward(self, x, position_ids, max_seq_len=None):
+        if position_ids.dim() != 1:
+            raise RuntimeError("Qwen3-MoE expects packed 1D position_ids.")
         if max_seq_len is None:
+            kv_len = position_ids.max().item() + 1 if position_ids.numel() > 0 else 1
             self._set_cos_sin_cache(seq_len=kv_len, device=x.device, dtype=x.dtype)
         elif max_seq_len > self.max_seq_len_cached:
             self._set_cos_sin_cache(seq_len=max_seq_len, device=x.device, dtype=x.dtype)
 
-        batch_size, _, _ = x.size()
-        if seq_len == 1:
-            # BD -> BNSD
-            cos = torch.index_select(self.cos_cached, dim=0, index=kv_len).unsqueeze(1).unsqueeze(1)
-            sin = torch.index_select(self.sin_cached, dim=0, index=kv_len).unsqueeze(1).unsqueeze(1)
-        else:
-            # SD -> BSND
-            cos = self.cos_cached[:seq_len].unsqueeze(0).unsqueeze(2).repeat(batch_size, 1, 1, 1)
-            sin = self.sin_cached[:seq_len].unsqueeze(0).unsqueeze(2).repeat(batch_size, 1, 1, 1)
+        cos = self.cos_cached[position_ids].unsqueeze(1)
+        sin = self.sin_cached[position_ids].unsqueeze(1)
 
         return (
             cos.to(dtype=x.dtype),
@@ -143,7 +139,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         self.hidden_dim = config.hidden_size
         self.batch_size_decode = infer_config.scheduler_config.batch_size
         self.local_rank = int(os.getenv("LOCAL_RANK", "1"))
-        self.input_len = infer_config.scheduler_config.input_max_len
+        self.input_len = infer_config.data_config.input_truncated_len
         self.batch_size_prefill = 1
         self.num_experts_per_tok = config.num_experts_per_tok
         self.num_experts = config.num_experts
@@ -189,7 +185,6 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         )
 
     def _forward_gate(self, hidden_states):
-        bsz, seq_len, _ = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
 
         logits = self.gate(hidden_states)
@@ -254,11 +249,11 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                 return self.moe_infer_dispatch_combine(hidden_states, topk_idx, topk_weight)
 
     def moe_infer_tp(self, hidden_states, topk_idx, topk_weight):
-        batch_size, sequence_length, h = hidden_states.shape
+        token_count, h = hidden_states.shape
         hidden_states = hidden_states.view(-1, h)
         routing_args = {
             "expert_idx": topk_idx,
-            "active_num": batch_size * sequence_length * self.top_k,
+            "active_num": token_count * self.top_k,
             "expert_num": self.num_experts,
             "expert_tokens_num_type": 1,  # 0: cumsum mode(not supported now); 1: count mode
             "expert_tokens_num_flag": True,
@@ -285,8 +280,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         if self.moe_tp_size > 1:
             dist.all_reduce(hidden_states, group=self.comm_manager.get_group("moe_tp_group"))
 
-        y = hidden_states.view(batch_size, -1, self.hidden_dim)
-        return y
+        return hidden_states.view(token_count, self.hidden_dim)
 
     def dispatch_double_routing(self, tokens_per_expert, expanded_x):
         moe_ep_group = self.comm_manager.get_group("moe_ep_group")
@@ -305,9 +299,8 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         return tokens_per_expert_group, gathered_tokens, input_splits, output_splits
 
     def moe_infer_double_routing(self, hidden_states, topk_ids, topk_weight):
-        batch_size, sequence_length, h = hidden_states.shape
+        token_count, h = hidden_states.shape
         hidden_states = hidden_states.view(-1, h)
-        bs_qlen = hidden_states.shape[0]
         expanded_x, expanded_row_idx, tokens_per_expert, _ = torch_npu.npu_moe_init_routing_v2(
             hidden_states,
             expert_idx=topk_ids,
@@ -345,14 +338,13 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             expanded_src_to_dst_row=expanded_row_idx,
             export_for_source_row=None, drop_pad_mode=2
         )
-        hidden_states = hidden_states.view(bs_qlen, self.hidden_dim)
-        return hidden_states.view(batch_size, -1, h)
+        return hidden_states.view(token_count, self.hidden_dim)
 
     def moe_infer_dispatch_combine(self, x, topk_ids, topk_weight):
         """
         support ep for decode stage
         """
-        batch_size, sequence_length, h = x.shape
+        token_count, h = x.shape
         hidden_states = x.view(-1, h)
         self.set_mc2_kwargs()
 
@@ -386,8 +378,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         }
         hidden_states = torch_npu.npu_moe_distribute_combine_v2(**combine_args)
 
-        hidden_states = hidden_states.view(batch_size, sequence_length, self.hidden_dim)
-        return hidden_states
+        return hidden_states.view(token_count, self.hidden_dim)
 
 
 class Qwen3MoeAttention(nn.Module):
@@ -404,6 +395,7 @@ class Qwen3MoeAttention(nn.Module):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
+        self.attn_type = "FullAttention"
         if layer_idx is None:
             logger.warning_once(
                 f"Instantiating {self.__class__.__name__} without passing `layer_idx` is not recommended and will "
@@ -417,6 +409,8 @@ class Qwen3MoeAttention(nn.Module):
         self.moe_ep_size = infer_config.parallel_config.moe_ep_size
 
         self.enable_gegraph = infer_config.model_config.exe_mode == "ge_graph"
+        self.enable_npugraph_ex = infer_config.model_config.exe_mode == "npugraph_ex"
+        self.block_size = infer_config.scheduler_config.block_size
 
         self.num_heads = config.num_attention_heads
         self.num_heads_per_rank = self.num_heads // self.attn_tp_size
@@ -445,7 +439,7 @@ class Qwen3MoeAttention(nn.Module):
         self.q_norm = Qwen3MoeRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = Qwen3MoeRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.batch_size = infer_config.scheduler_config.batch_size
-        self.input_len = infer_config.scheduler_config.input_max_len
+        self.input_len = infer_config.data_config.input_truncated_len
 
         self.o_proj = RowParallelLinear(self.attn_intermediate_size,
                                         config.hidden_size,
@@ -455,74 +449,141 @@ class Qwen3MoeAttention(nn.Module):
                                         input_is_parallel=True,
                                         prefix=f"{prefix}.o_proj")
         self.scale_fa = 1 / (self.head_dim ** 0.5)
-        self.k_cache = self.v_cache = torch.Tensor([])
-        self.cache_unit = (self.head_dim * self.num_key_value_heads_per_rank,)
+        self.k_cache = torch.Tensor([])
+        self.v_cache = torch.Tensor([])
+        self.cache_entries = [
+            CacheEntry(
+                cache_name="k_cache",
+                attn_type=self.attn_type,
+                dim=self.head_dim,
+                num_head=self.num_key_value_heads_per_rank,
+                dtype=self.config.torch_dtype,
+                needs_block=True,
+                tensor_setter=lambda tensor, layer=self: setattr(layer, "k_cache", tensor),
+            ),
+            CacheEntry(
+                cache_name="v_cache",
+                attn_type=self.attn_type,
+                dim=self.head_dim,
+                num_head=self.num_key_value_heads_per_rank,
+                dtype=self.config.torch_dtype,
+                needs_block=True,
+                tensor_setter=lambda tensor, layer=self: setattr(layer, "v_cache", tensor),
+            ),
+        ]
 
     def exec_qkv(
         self,
         qkv: torch.Tensor,
         cos_sin: Optional[Tuple[torch.Tensor]] = None,
         forward_metadata: ForwardMetaData = None,
+        slot_mapping: Optional[torch.Tensor] = None,
+        block_table: Optional[torch.Tensor] = None,
         **kwargs,
     ):
-        bsz, q_len, _ = qkv.size()
+        is_prefill = forward_metadata.is_prefill if forward_metadata else False
+        kv_len = forward_metadata.kv_len
+        attention_mask = forward_metadata.attention_mask
+        q_len = qkv.size(0)
+        prompt_tokens = forward_metadata.prompt_tokens if forward_metadata else q_len
+
+        if is_prefill:
+            padded_q_len = q_len
+            if prompt_tokens < padded_q_len:
+                qkv = qkv[:prompt_tokens]
+                q_len = prompt_tokens
 
         query_states, key_states, value_states = qkv.split((self.num_heads_per_rank * self.head_dim, \
                                                             self.num_key_value_heads_per_rank * self.head_dim, \
-                                                            self.num_key_value_heads_per_rank * self.head_dim), dim=2)
+                                                            self.num_key_value_heads_per_rank * self.head_dim), dim=1)
 
-        query_shape = (bsz, q_len, self.num_heads_per_rank, self.head_dim)
-        key_value_shape = (bsz, q_len, self.num_key_value_heads_per_rank, self.head_dim)
+        query_shape = (q_len, self.num_heads_per_rank, self.head_dim)
+        key_value_shape = (q_len, self.num_key_value_heads_per_rank, self.head_dim)
 
         query_states = self.q_norm(query_states.view(query_shape).contiguous())
         key_states = self.k_norm(key_states.view(key_value_shape).contiguous())
+        value_states = value_states.view(key_value_shape)
 
         cos, sin = cos_sin
-        query_states, key_states = torch_npu.npu_apply_rotary_pos_emb(query_states, key_states, cos, sin, layout='BSH')
-        query_states = query_states.view(bsz, q_len, -1)
-        key_states = key_states.view(bsz, q_len, -1)
+        query_states, key_states = torch_npu.npu_apply_rotary_pos_emb(
+            query_states,
+            key_states,
+            cos,
+            sin,
+            layout='TND'
+        )
 
-        kv_len = forward_metadata.kv_len
-        actual_seq_lengths_kv = forward_metadata.actual_seq_lengths_kv
         attention_mask = forward_metadata.attention_mask
 
         k_cache, v_cache = self.k_cache, self.v_cache
         if not k_cache.numel() or not v_cache.numel():
             raise RuntimeError("A BUG: k_cache or v_cache are not initialized properly.")
 
-        torch_npu.scatter_update_(k_cache, kv_len, key_states, -2)
-        torch_npu.scatter_update_(v_cache, kv_len, value_states, -2)
-
         sparse_mode = 3
         fa_ops = torch.ops.npu
-        if not forward_metadata.is_prefill:
-            key_states, value_states = k_cache, v_cache
-            attention_mask = None
-            sparse_mode = 0
-            if self.enable_gegraph:
-                fa_ops = torchair.ops
+        if not forward_metadata.is_prefill and self.enable_gegraph:
+            fa_ops = torchair.ops
+
+        tmp_slot_mapping = slot_mapping.view(-1)
+        torch_npu.npu_scatter_nd_update_(
+            k_cache.view(-1, self.num_key_value_heads_per_rank, self.head_dim),
+            tmp_slot_mapping.view(-1, 1),
+            key_states,
+        )
+        torch_npu.npu_scatter_nd_update_(
+            v_cache.view(-1, self.num_key_value_heads_per_rank, self.head_dim),
+            tmp_slot_mapping.view(-1, 1),
+            value_states,
+        )
+
+        key_states, value_states = k_cache, v_cache
+        if not is_prefill and self.enable_npugraph_ex:
+            actual_seq_kvlen = forward_metadata.actual_seq_lengths_list_kv
+            actual_seq_qlen = forward_metadata.actual_seq_lengths_cu_list_q
+        else:
+            actual_seq_kvlen = forward_metadata.actual_seq_lengths_kv
+            actual_seq_qlen = forward_metadata.actual_seq_lengths_cu_q
 
         attn_output, _ = fa_ops.npu_fused_infer_attention_score_v2(
-            query_states, key_states, value_states,
+            query_states,
+            key_states.view(*key_states.shape[:2], -1),
+            value_states.view(*value_states.shape[:2], -1),
             num_query_heads=self.num_heads_per_rank,
             num_key_value_heads=self.num_key_value_heads_per_rank,
             softmax_scale=self.scale_fa,
-            input_layout="BSH",
+            input_layout="TND",
             sparse_mode=sparse_mode,
             atten_mask=attention_mask,
-            actual_seq_kvlen=actual_seq_lengths_kv
+            actual_seq_qlen=actual_seq_qlen,
+            actual_seq_kvlen=actual_seq_kvlen,
+            block_table=block_table,
+            block_size=self.block_size,
         )
 
-        attn_output = attn_output.reshape(bsz, q_len, self.attn_intermediate_size_per_rank)
+        attn_output = attn_output.reshape(q_len, self.attn_intermediate_size_per_rank)
         attn_output = self.o_proj(attn_output)
-        bsz, q_len, h = attn_output.size()
+        if is_prefill and q_len < padded_q_len:
+            pad_len = padded_q_len - q_len
+            attn_output = torch.cat([
+                attn_output,
+                torch.zeros(
+                    (pad_len, attn_output.size(-1)),
+                    dtype=attn_output.dtype,
+                    device=attn_output.device,
+                ),
+            ], dim=0)
+            q_len = padded_q_len
         if self.attn_tp_size > 1 and self.attn_dp_size > 1:
-            # attn_TP + attn_DP
-            new_output = torch.empty([bsz // self.attn_tp_size, q_len, h], dtype=attn_output.dtype, device="npu")
-            dist.reduce_scatter_tensor(new_output, attn_output, group=self.comm_manager.get_group("attn_tp_group"))
+            token_count, h = attn_output.size()
+            new_output = torch.empty([token_count // self.attn_tp_size, h],
+                                     dtype=attn_output.dtype, device="npu")
+            dist.reduce_scatter_tensor(
+                new_output,
+                attn_output.view(token_count, h),
+                group=self.comm_manager.get_group("attn_tp_group"),
+            )
             attn_output = new_output
         elif self.attn_tp_size > 1:
-            # attention_TP + moe_TP
             dist.all_reduce(attn_output, group=self.comm_manager.get_group("attn_tp_group"))
 
         return attn_output
@@ -532,15 +593,16 @@ class Qwen3MoeAttention(nn.Module):
         hidden_states: torch.Tensor,
         cos_sin: torch.Tensor = None,
         forward_metadata: ForwardMetaData = None,
+        slot_mapping: Optional[torch.Tensor] = None,
+        block_table: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-
-        bsz, q_len, h = hidden_states.size()
+        is_prefill = forward_metadata.is_prefill if forward_metadata else False
+        q_len, h = hidden_states.size()
         if self.attn_tp_size > 1 and self.attn_dp_size > 1:
-            # attn_TP + attn_DP
             h_dtype = hidden_states.dtype
             attn_tp_group = self.comm_manager.get_group("attn_tp_group")
-            new_hidden_states = torch.empty([bsz * self.attn_tp_size, q_len, h], dtype=h_dtype, device="npu")
+            new_hidden_states = torch.empty([q_len * self.attn_tp_size, h], dtype=h_dtype, device="npu")
             dist.all_gather_into_tensor(new_hidden_states, hidden_states, group=attn_tp_group)
             hidden_states = new_hidden_states
         qkv = self.merged_qkv_proj(hidden_states)
@@ -548,6 +610,8 @@ class Qwen3MoeAttention(nn.Module):
             qkv=qkv,
             cos_sin=cos_sin,
             forward_metadata=forward_metadata,
+            slot_mapping=slot_mapping[self.attn_type],
+            block_table=block_table[self.attn_type],
         )
         return output
 
@@ -588,7 +652,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
         self.batch_size = infer_config.scheduler_config.batch_size
-        self.input_len = infer_config.scheduler_config.input_max_len
+        self.input_len = infer_config.data_config.input_truncated_len
 
     def forward(
         self,
@@ -596,6 +660,8 @@ class Qwen3MoeDecoderLayer(nn.Module):
         cos_sin: torch.Tensor,
         past_residual: Optional[torch.Tensor] = None,
         forward_metadata: ForwardMetaData = None,
+        slot_mapping: Optional[torch.Tensor] = None,
+        block_table: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Tuple[torch.FloatTensor]:
 
@@ -606,6 +672,8 @@ class Qwen3MoeDecoderLayer(nn.Module):
             hidden_states=hidden_states,
             cos_sin=cos_sin,
             forward_metadata=forward_metadata,
+            slot_mapping=slot_mapping,
+            block_table=block_table,
             **kwargs
         )
 
@@ -659,23 +727,31 @@ class Qwen3MoeModel(nn.Module):
         forward_metadata: ForwardMetaData = None,
         **kwargs,
     ):
-
-        batch_size, seq_length = input_ids.shape
-        position_ids = position_ids.view(-1, seq_length).long()
-
-        # TP+DP: Split batch within TP group, each rank processes different samples
+        is_prefill = forward_metadata.is_prefill if forward_metadata else False
+        token_count = input_ids.shape[0]
+        position_ids = position_ids.view(-1).long()
         if self.attn_tp_size > 1 and self.attn_dp_size > 1:
-            samples_per_rank = batch_size // self.attn_tp_size
             rank_in_tp_group = self.comm_manager.get_rank("attn_tp_group")
-            start_idx = rank_in_tp_group * samples_per_rank
-            end_idx = start_idx + samples_per_rank
-            input_ids = input_ids[start_idx:end_idx]
-            position_ids = position_ids[start_idx:end_idx]
-            batch_size = samples_per_rank
+            if is_prefill:
+                prompt_tokens = forward_metadata.prompt_tokens
+                padded_tokens = ((prompt_tokens + self.attn_tp_size - 1) // self.attn_tp_size) * self.attn_tp_size
+                if padded_tokens > token_count:
+                    pad = torch.zeros((padded_tokens - token_count,), dtype=input_ids.dtype, device=input_ids.device)
+                    input_ids = torch.cat([input_ids, pad], dim=0)
+                    token_count = padded_tokens
+                tokens_per_rank = token_count // self.attn_tp_size
+                start_idx = rank_in_tp_group * tokens_per_rank
+                end_idx = start_idx + tokens_per_rank
+                input_ids = input_ids[start_idx:end_idx]
+            else:
+                tokens_per_rank = token_count // self.attn_tp_size
+                start_idx = rank_in_tp_group * tokens_per_rank
+                end_idx = start_idx + tokens_per_rank
+                input_ids = input_ids[start_idx:end_idx]
 
         if self.embed_tp_size > 1:
             new_input_ids = input_ids - self.rank_id * self.vocab_size_per_rank
-            mask = (new_input_ids >= 0) & (new_input_ids < self.vocab_size_per_rank) # (bs, qlen)
+            mask = (new_input_ids >= 0) & (new_input_ids < self.vocab_size_per_rank)
             new_input_ids_per_rank = new_input_ids * mask
             inputs_embeds = self.embed_tokens(new_input_ids_per_rank) * mask.unsqueeze(-1)
             dist.all_reduce(inputs_embeds, group=self.comm_manager.get_group("embed_tp_group"))
@@ -684,11 +760,9 @@ class Qwen3MoeModel(nn.Module):
         hidden_states = inputs_embeds
 
         kv_len = forward_metadata.kv_len
-        if self.attn_tp_size > 1 and self.attn_dp_size > 1:
-            cos_sin = self.rotary_emb(hidden_states.repeat(self.attn_tp_size, 1, 1),
-                                      seq_length, kv_len, self.max_position_embeddings)
-        else:
-            cos_sin = self.rotary_emb(hidden_states, seq_length, kv_len, self.max_position_embeddings)
+        block_table = forward_metadata.block_table
+        slot_mapping = forward_metadata.slot_mapping
+        cos_sin = self.rotary_emb(hidden_states, position_ids, self.max_position_embeddings)
         residual = None
 
         for decoder_layer in self.layers:
@@ -697,16 +771,37 @@ class Qwen3MoeModel(nn.Module):
                 cos_sin=cos_sin,
                 past_residual=residual,
                 forward_metadata=forward_metadata,
+                slot_mapping=slot_mapping,
+                block_table=block_table,
                 **kwargs
             )
             residual, hidden_states = layer_outputs
 
         hidden_states, _ = self.norm(hidden_states, residual)
+        cu_seq_lens_q = forward_metadata.actual_seq_lengths_cu_q if forward_metadata else None
+        if cu_seq_lens_q is None:
+            raise RuntimeError("actual_seq_lengths_cu_q is required.")
 
-        if hidden_states.size()[1] > 1:
-            gather_index, _ = torch.max(position_ids, dim=-1)
-            gather_index = gather_index.unsqueeze(1).unsqueeze(2).repeat(1, 1, hidden_states.shape[-1])
-            hidden_states = torch.gather(hidden_states, 1, gather_index)
+        if is_prefill:
+            seq_index = cu_seq_lens_q - 1
+            if self.attn_tp_size > 1 and self.attn_dp_size > 1:
+                q_len, hidden_size = hidden_states.size()
+                gathered_hidden_states = torch.empty(
+                    [self.attn_tp_size * q_len, hidden_size],
+                    dtype=hidden_states.dtype,
+                    device=hidden_states.device,
+                )
+                dist.all_gather_into_tensor(
+                    gathered_hidden_states,
+                    hidden_states,
+                    group=self.comm_manager.get_group("attn_tp_group"),
+                )
+                hidden_states = gathered_hidden_states
+
+            hidden_states = torch.index_select(hidden_states, 0, seq_index)
+            hidden_states = hidden_states.view(seq_index.numel(), 1, hidden_states.size(-1))
+        else:
+            hidden_states = hidden_states.view(hidden_states.shape[0], 1, hidden_states.shape[-1])
 
         return hidden_states
 
@@ -722,7 +817,7 @@ class Qwen3MoeForCausalLM(nn.Module):
         self.config = config
         self.num_experts_per_tok = config.num_experts_per_tok
         self.num_experts = config.num_experts
-        self.input_max_len = infer_config.scheduler_config.input_max_len
+        self.input_max_len = infer_config.data_config.input_truncated_len
         self.lmhead_tp_size = infer_config.parallel_config.lmhead_tp_size
         self.moe_ep_size = infer_config.parallel_config.moe_ep_size
         self.attn_tp_size = infer_config.parallel_config.attn_tp_size
@@ -756,11 +851,11 @@ class Qwen3MoeForCausalLM(nn.Module):
         logits = self.lm_head(hidden_states)
 
         # TP+DP: all_gather after LM Head to reduce communication volume
-        if self.attn_tp_size > 1 and self.attn_dp_size > 1:
+        if not forward_metadata.is_prefill and self.attn_tp_size > 1 and self.attn_dp_size > 1:
             bsz, q_len, v = logits.size()
             new_logits = torch.empty([bsz * self.attn_tp_size, q_len, v],
-                                    dtype=logits.dtype, device="npu")
-            dist.all_gather_into_tensor(new_logits, logits, 
+                                     dtype=logits.dtype, device="npu")
+            dist.all_gather_into_tensor(new_logits, logits,
                                         group=self.comm_manager.get_group("attn_tp_group"))
             logits = new_logits
 
@@ -770,6 +865,24 @@ class Qwen3MoeForCausalLM(nn.Module):
             logits = torch.concat(new_logits, dim=-1)
         logits = logits.float()
         return logits
+
+    def get_cache_info(
+        self,
+    ) -> ModelCacheInfo:
+        layer_infos = []
+        for layer_idx, layer in enumerate(self.model.layers):
+            layer_infos.append(
+                LayerCacheInfo(
+                    layer_idx=layer_idx,
+                    caches=list(layer.self_attn.cache_entries),
+                )
+            )
+
+        return ModelCacheInfo(
+            num_layers=len(layer_infos),
+            block_size=self.infer_config.scheduler_config.block_size,
+            layer_infos=layer_infos,
+        )
 
     # Adapted from vllm.model_executor.models.qwen3moe.Qwen3MoeModel.load_weights
     def load_weights(self, weights: Iterable[tuple[str,
@@ -838,6 +951,9 @@ class Qwen3MoeForCausalLM(nn.Module):
 
                     # Skip loading extra parameters for GPTQ/modelopt models.
                     if name_mapped.endswith(".bias") and name_mapped not in params_dict:
+                        continue
+
+                    if name_mapped not in params_dict:
                         continue
 
                     param = params_dict[name_mapped]

@@ -1,4 +1,4 @@
-# coding=utf-8
+﻿# coding=utf-8
 # Copyright (c) 2026 Huawei Technologies Co., Ltd.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -29,6 +29,7 @@ from executor.core.config import InferenceConfig
 from executor.core.model_worker.model_worker import ModelWorker
 from executor.utils.forward_metadata import set_forward_metadata, get_forward_metadata
 from ..types_.types import MTPInfo, Batch
+from executor.core.kv_cache.cache_utils import prepare_slot_mapping
 
 
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
@@ -50,7 +51,6 @@ class MTPWorker:
             infer_config: Inference configuration containing all runtime settings.
             next_n: Number of speculative tokens to predict per step.
             exe_mode: Execution mode (eager, npugraph_ex, etc.).
-            prefill_mini_batch: Mini-batch size for prefill phase.
             batch_size_per_dp_rank: Batch size for each dp rank.
 
         Model Components:
@@ -64,8 +64,8 @@ class MTPWorker:
         self.infer_config = infer_config
         self.next_n = self.infer_config.model_config.next_n
         self.exe_mode = self.infer_config.model_config.exe_mode
-        self.prefill_mini_batch = self.infer_config.scheduler_config.prefill_mini_batch
         self.batch_size_per_dp_rank = self.infer_config.scheduler_config.batch_size_per_dp_rank
+        self.block_size = self.infer_config.scheduler_config.block_size
 
         # Model Components
         self.device = device
@@ -102,7 +102,7 @@ class MTPWorker:
         """Pad or truncate tensor to the specified size along sequence dimension."""
         if tensor.dim() < 2:
             raise ValueError("Tensor must have at least 2 dimensions, where dim 1 is seq_len")
-        if tensor.shape[0] >= size:
+        if tensor.shape[1] >= size:
             # Truncate if tensor is already larger than target size
             return tensor[:, :size]
         else:
@@ -117,40 +117,52 @@ class MTPWorker:
             )
 
     def get_main_model_inputs(self, input_ids, batch):
+        """Build main model decode inputs. Returns 1D packed input_ids and position_ids."""
         kv_len = get_forward_metadata().kv_len.to(self.device)
         q_len = self.next_n + 1
         if batch:
-            # Not dummy
             spec_tokens = batch.mtp_infos.spec_tokens
-            accepted_num = batch.mtp_infos.accepted_num
-            input_ids = torch.cat([input_ids, spec_tokens], dim=1)
-            input_ids = input_ids[:, - (self.next_n + 1):]
+            # input_ids is [B] 1D, unsqueeze to [B, 1] for concat with spec_tokens [B, next_n]
+            input_ids = torch.cat([input_ids.unsqueeze(1), spec_tokens], dim=1)
+            input_ids = input_ids[:, -q_len:].reshape(-1).clone()
             # Rewind kv_len to the accepted prefix before the next main-model verification step.
-            kv_len = kv_len - (self.next_n - 1) + accepted_num + 1
+            # The draft and main models share forward_metadata, and draft inference
+            # increments kv_len by (self.next_n - 1), so we subtract it here and add
+            # 1 back to align with the current main-model verification step.
+            kv_len = kv_len - (self.next_n - 1) + 1
         indices = torch.arange(q_len - 1, -1, -1, device=self.mtp_model_worker.device)
-        position_ids = (kv_len.unsqueeze(1) - indices).clamp(min=0)
+        position_ids = (kv_len.unsqueeze(1) - indices).clamp(min=0).reshape(-1)
 
         return input_ids, kv_len, position_ids
 
-    @staticmethod
     def get_mtp_model_inputs(
+        self,
         batch: Batch,
         main_next_tokens: torch.Tensor,
         model_inputs_main: Dict,
         prev_hidden_states: torch.Tensor,
     ) -> Dict:
         """Prepare inputs for MTP model inference based on current phase."""
-        batch_size = batch.input_ids.shape[0]
         if batch.is_prefill:
-            # Prefill phase: first forward pass, concatenate input_ids with accepted tokens
-            input_ids_main = batch.input_ids[:, 1:]
-            input_ids_mtp = torch.cat([input_ids_main, main_next_tokens], dim=-1)
-            position_ids_mtp = model_inputs_main.get("position_ids")
-            forward_metadata_mtp = model_inputs_main.get("forward_metadata")
-            prev_hidden_states = prev_hidden_states.view(batch_size, -1, prev_hidden_states.shape[-1])
+            if batch.seq_lens is None:
+                raise RuntimeError("seq_lens is required for packed MTP prefill.")
+
+            seq_lens = batch.seq_lens.to(device=self.device, dtype=torch.long)
+            packed_input_ids = batch.input_ids.to(self.device).view(-1)
+            packed_hidden_states = prev_hidden_states.to(self.device).view(-1, prev_hidden_states.shape[-1])
+            total_tokens = int(seq_lens.sum().item())
+            if packed_hidden_states.shape[0] < total_tokens:
+                raise RuntimeError("Packed prev_hidden_states is shorter than seq_lens in MTP prefill.")
+
+            cu_seq_lens = seq_lens.cumsum(0)
+            input_ids_mtp = packed_input_ids.roll(-1)
+            input_ids_mtp[cu_seq_lens - 1] = main_next_tokens[:, 0].to(self.device)
+            input_ids_mtp = input_ids_mtp[:total_tokens]
+            prev_hidden_states = packed_hidden_states[:total_tokens]
+            position_ids_mtp = model_inputs_main["position_ids"]
+            forward_metadata_mtp = model_inputs_main["forward_metadata"]
         else:
-            # Decode phase: mask positions beyond accepted_num for each sample
-            input_ids_mtp = main_next_tokens
+            input_ids_mtp = main_next_tokens.reshape(-1).clone()
             position_ids_mtp = model_inputs_main["position_ids"]
             forward_metadata_mtp = get_forward_metadata()
         model_inputs = {
@@ -160,8 +172,9 @@ class MTPWorker:
             "forward_metadata": forward_metadata_mtp,
         }
         if batch.is_prefill:
-            # Add cycle_idx for mini-batch prefill mode
-            model_inputs.update(({"cycle_idx": model_inputs_main.get("cycle_idx", 0)}))
+            model_inputs.update({
+                "request_offset": model_inputs_main.get("request_offset", 0),
+            })
 
         return model_inputs
 
@@ -172,9 +185,9 @@ class MTPWorker:
         mtp_infos: MTPInfo,
     ) -> Dict:
         """Process MTP model output and update state for the next inference step."""
-        batch_size = model_inputs['input_ids'].shape[0]
         forward_metadata = get_forward_metadata()
         next_tokens = torch.argmax(logits, dim=-1)
+        batch_size = next_tokens.shape[0]
         q_len = self.next_n + 1
         # is_prefill_step = mtp_info.is_prefill
         if mtp_infos.is_prefill:
@@ -182,15 +195,6 @@ class MTPWorker:
             kv_len = forward_metadata.kv_len + q_len - 1
             kv_len += self.next_n - 1
             spec_token = MTPWorker._pad_seq_len_to_size(next_tokens[:, -1:], self.next_n)
-            actual_seq_lengths_q = \
-                torch.arange(1, batch_size + 1, dtype=torch.long, device=self.device) * q_len
-            actual_seq_lengths_kv = kv_len + 1
-            if self.mtp_model_worker.exe_mode == "npugraph_ex":
-                # Convert to list for npugraph_ex graph execution mode
-                actual_seq_lengths_q = actual_seq_lengths_q.detach().cpu().numpy().tolist()
-                actual_seq_lengths_kv = actual_seq_lengths_kv.detach().cpu().numpy().tolist()
-            set_forward_metadata(kv_len=kv_len, is_prefill=False, actual_seq_lengths_q=actual_seq_lengths_q,
-                                 actual_seq_lengths_kv=actual_seq_lengths_kv)
             mtp_infos.is_prefill = False
         else:
             # Decode branch: update state based on accepted tokens
@@ -213,25 +217,44 @@ class MTPWorker:
     ) -> Dict:
         """Build model inputs for the next MTP iteration from processed outputs."""
         input_ids = model_inputs["input_ids"]
-        batch_size, q_len = input_ids.shape
+        q_len = self.next_n + 1
+        batch_size = input_ids.shape[0] // q_len
         forward_metadata = get_forward_metadata()
         kv_len = forward_metadata.kv_len + 1
         actual_seq_lengths_kv = kv_len + 1
+        actual_seq_lengths_q = torch.full((batch_size,), q_len, dtype=torch.long, device=self.device)
+        actual_seq_lengths_cu_q = actual_seq_lengths_q.cumsum(0)
+        actual_seq_lengths_cu_kv = actual_seq_lengths_kv.cumsum(0)
+        actual_seq_lengths_cu_list_q = None
+        actual_seq_lengths_cu_list_kv = None
+        actual_seq_lengths_list_q = None
+        actual_seq_lengths_list_kv = None
         if self.mtp_model_worker.exe_mode == "npugraph_ex":
-            # Convert to list for npugraph_ex graph execution mode
-            actual_seq_lengths_kv = actual_seq_lengths_kv.detach().cpu().numpy().tolist()
-        set_forward_metadata(kv_len=kv_len, is_prefill=False, actual_seq_lengths_kv=actual_seq_lengths_kv)
+            actual_seq_lengths_cu_list_q = actual_seq_lengths_cu_q.detach().cpu().numpy().tolist()
+            actual_seq_lengths_cu_list_kv = actual_seq_lengths_cu_kv.detach().cpu().numpy().tolist()
+            actual_seq_lengths_list_q = actual_seq_lengths_q.detach().cpu().numpy().tolist()
+            actual_seq_lengths_list_kv = actual_seq_lengths_kv.detach().cpu().numpy().tolist()
+        set_forward_metadata(kv_len=kv_len, is_prefill=False,
+                             actual_seq_lengths_kv=actual_seq_lengths_kv,
+                             actual_seq_lengths_cu_q=actual_seq_lengths_cu_q,
+                             actual_seq_lengths_cu_kv=actual_seq_lengths_cu_kv,
+                             actual_seq_lengths_cu_list_q=actual_seq_lengths_cu_list_q,
+                             actual_seq_lengths_cu_list_kv=actual_seq_lengths_cu_list_kv,
+                             actual_seq_lengths_list_q=actual_seq_lengths_list_q,
+                             actual_seq_lengths_list_kv=actual_seq_lengths_list_kv)
         indices = torch.arange(q_len - 1, -1, -1, device=self.mtp_model_worker.device)
-        position_ids = kv_len.unsqueeze(1) - indices
-        position_ids = position_ids.view(-1, q_len)
-        cur_tokens = MTPWorker._pad_seq_len_to_size(input_ids, q_len + 1)
+        position_ids = (kv_len.unsqueeze(1) - indices).reshape(-1)
+        slot_mapping = prepare_slot_mapping(position_ids, actual_seq_lengths_cu_q,
+                                             forward_metadata.block_table, self.block_size)
+        set_forward_metadata(slot_mapping=slot_mapping)
+        input_ids_2d = input_ids.view(batch_size, q_len)
+        cur_tokens = MTPWorker._pad_seq_len_to_size(input_ids_2d, q_len + 1)
         cur_idx = (mtp_infos.accepted_num.view(-1, 1) + 1).long()
         last_spec_token = mtp_infos.spec_tokens[:, -1:]
-        input_ids = cur_tokens.scatter_(dim=1, index=cur_idx, src=last_spec_token)[:, 1:].contiguous()
-        prev_hidden_states = prev_hidden_states.view(batch_size, -1, prev_hidden_states.shape[-1])
+        input_ids = cur_tokens.scatter_(dim=1, index=cur_idx, src=last_spec_token)[:, 1:].reshape(-1).clone()
 
         return {
-            "input_ids": input_ids.contiguous(),
+            "input_ids": input_ids,
             "position_ids": position_ids,
             "prev_hidden_states": prev_hidden_states,
             "forward_metadata": get_forward_metadata(),
@@ -255,7 +278,7 @@ class MTPWorker:
             accepted_num=accepted_num, is_prefill=batch.is_prefill, next_n=self.next_n, spec_tokens=None)
 
         # Step 1: Get initial MTP model inputs
-        model_inputs_mtp = MTPWorker.get_mtp_model_inputs(
+        model_inputs_mtp = self.get_mtp_model_inputs(
             batch,
             main_next_tokens,
             model_inputs_main,

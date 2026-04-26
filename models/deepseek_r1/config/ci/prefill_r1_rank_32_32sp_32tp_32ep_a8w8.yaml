@@ -10,8 +10,6 @@ model_config:
   force_eplb: False                 # [False, True]
   enable_cache_compile: False       # [False, True]
   custom_params:
-    enable_pa: True                   # [False, True]
-    pa_block_size: 128
     enable_weight_nz: True            # [False, True]
     enable_mla_prolog: True           # [False, True]
     enable_multi_streams: True        # [False, True]
@@ -22,6 +20,7 @@ model_config:
 
 data_config:
   dataset: "default"  # ["default", "LongBench", "InfiniteBench"]
+  input_truncated_len: 32
 
 parallel_config:
   world_size: 32
@@ -33,7 +32,6 @@ parallel_config:
   moe_ep_size: 32
 
 scheduler_config:
-  input_max_len: 32
+  block_size: 128
   max_new_tokens: 100
   batch_size: 2
-  prefill_mini_batch: 0

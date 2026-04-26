@@ -11,8 +11,6 @@ model_config:
   force_eplb: False                 # [False, True]
   enable_cache_compile: False       # [False, True]
   custom_params:
-    enable_pa: True                   # [False, True]
-    pa_block_size: 128
     enable_mla_prolog: True           # [False, True]
     enable_multi_streams: True        # [False, True]
     enable_superkernel: False         # [False, True]
@@ -21,6 +19,7 @@ model_config:
 
 data_config:
   dataset: "LongBench"  # ["default", "LongBench"]
+  input_truncated_len: 256
 
 parallel_config:
   world_size: 16
@@ -31,7 +30,7 @@ parallel_config:
   lmhead_tp_size: 16
 
 scheduler_config:
-  input_max_len: 256
+  block_size: 128
   max_new_tokens: 100
+  max_prefill_tokens: 256
   batch_size: 1
-  prefill_mini_batch: 1

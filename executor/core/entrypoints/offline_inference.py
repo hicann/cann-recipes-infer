@@ -15,7 +15,7 @@
 
 """Offline batch inference entrypoint using Scheduler and ExecutionEngine."""
 
-from typing import List, Optional
+from typing import Dict, List, Optional
 import logging
 
 import torch
@@ -23,8 +23,9 @@ import torch
 from executor.core.config import InferenceConfig
 from executor.core.engine import ExecutionEngine
 from executor.core.scheduler import Scheduler
-from executor.core.types_ import GenerationOutput
+from executor.core.types_ import GenerationOutput, Request
 from .support_models import model_dict
+from executor.utils.common_utils import process_infer_time
 
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
 
@@ -87,7 +88,7 @@ class OfflineInference:
     def generate(
         self,
         prompts: List[str],
-    ) -> tuple[List[GenerationOutput], List[Optional[dict]]]:
+    ) -> tuple[List[GenerationOutput], Optional[dict], List[float]]:
         """Generate text for a batch of prompts.
 
         This method processes prompts using batching:
@@ -101,17 +102,23 @@ class OfflineInference:
         Returns:
             A tuple containing:
             - List of GenerationOutput objects, one per prompt.
-            - List of MTP statistics dicts for each request (None if MTP not enabled).
-              Each dict contains 'spec_num_accepted_tokens' and 'spec_num_forward_ct'.
+            - Aggregated MTP statistics dict (None if MTP not enabled).
+            - Batch-level inference time list. Index 0 is prefill time and the rest are decode batches.
         """
         if not prompts:
-            return []
+            return [], None, []
 
         # Reset scheduler for new batch
         self.scheduler.reset()
 
         # Use batch_size_per_dp_rank for distributed inference
         batch_size = self.scheduler.config.batch_size_per_dp_rank
+
+        # Convert str prompts to chat message format for chat template tokenization
+        prompts = [
+            [{"role": "user", "content": p}] if isinstance(p, str) else p
+            for p in prompts
+        ]
 
         # Add all requests to scheduler
         request_ids = []
@@ -143,7 +150,8 @@ class OfflineInference:
         # Store raw MTP statistics
         mtp_stats = {
             "spec_num_accepted_tokens": [],
-            "spec_num_forward_ct": 0
+            "spec_num_forward_ct": [],
+            "valid_output_len": []
         }
         for request_id in request_ids[:original_request_count]:
             request = self.scheduler.get_finished_request(request_id)
@@ -155,16 +163,34 @@ class OfflineInference:
                 ))
                 continue
 
-            # Decode output
-            output_text = self.engine.tokenizer.decode(torch.tensor(request.output_id_list), skip_special_tokens=True)
+            # Decode only the valid output segment truncated by max output length or EOS.
+            valid_output_id_list=self.get_valid_output(request)
+            output_text = self.engine.tokenizer.decode(
+                torch.tensor(valid_output_id_list), skip_special_tokens=True)
             # Caculate mtp accept rate
             if request.mtp_info:
                 mtp_stats["spec_num_accepted_tokens"].append(request.spec_num_accepted_tokens)
+                mtp_stats["spec_num_forward_ct"].append(request.spec_num_forward_ct)
+                mtp_stats["valid_output_len"].append(request.valid_output_len)
 
             results.append(GenerationOutput(
                 prompt=prompt_map[request_id],
                 output_text=output_text,
                 finish_reason=request.finish_reason,
             ))
-        mtp_stats["spec_num_forward_ct"] = request.spec_num_forward_ct
+
         return results, mtp_stats, request.infer_time
+
+    def get_valid_output(self, request: Request) -> List[int]:
+        """Get valid output tokens for the request.
+
+        When the request hits EOS or max_new_tokens, stop_valid_generation is set to True
+        and valid_output_len records the length of valid output tokens. This method returns
+        only the valid portion of output tokens, truncating any extra tokens generated beyond
+        the valid boundary (e.g., speculative tokens in MTP scenario)."""
+        if request.stop_valid_generation and request.valid_output_len is not None:
+            # Return only valid output tokens, truncating extra tokens beyond EOS/max_new_tokens
+            return request.output_id_list[:request.valid_output_len]
+        else:
+            # Return full output when generation hasn't reached valid stop condition
+            return request.output_id_list

@@ -119,32 +119,22 @@ class DeepseekV3RotaryEmbedding(nn.Module):
         self.register_buffer("cos_cached", emb.cos().to(dtype), persistent=False)
         self.register_buffer("sin_cached", emb.sin().to(dtype), persistent=False)
 
-    def forward(self, x, kv_len, max_seq_len=None, is_prefill=True, enable_pa=True):
+    def forward(self, x, kv_len, max_seq_len=None, is_prefill=True, enable_pa=True, position_ids=None):
         # x shape is [bs, num_attention_heads, seq_len, head_size]
         if max_seq_len is None:
             self._set_cos_sin_cache(seq_len=kv_len, device=x.device, dtype=x.dtype)
         elif max_seq_len > self.max_seq_len_cached:
             self._set_cos_sin_cache(seq_len=max_seq_len, device=x.device, dtype=x.dtype)
 
-        batch_size, seq_len, _ = x.size()
-        if is_prefill:
-            if not enable_pa:
-                # SD -> BNSD
-                cos = self.cos_cached[:seq_len].unsqueeze(0).unsqueeze(1).repeat(batch_size, 1, 1, 1)
-                sin = self.sin_cached[:seq_len].unsqueeze(0).unsqueeze(1).repeat(batch_size, 1, 1, 1)
-            else:
-                # SD -> TND
-                cos = []
-                sin = []
-                for i in kv_len:
-                    cos.append(self.cos_cached[:i].unsqueeze(1))
-                    sin.append(self.sin_cached[:i].unsqueeze(1))
-                cos = torch.cat(cos, dim=0)
-                sin = torch.cat(sin, dim=0)
+        if not enable_pa:
+            batch_size, seq_len, _ = x.size()
+            # SD -> BNSD
+            cos = self.cos_cached[:seq_len].unsqueeze(0).unsqueeze(1).repeat(batch_size, 1, 1, 1)
+            sin = self.sin_cached[:seq_len].unsqueeze(0).unsqueeze(1).repeat(batch_size, 1, 1, 1)
         else:
-            # BD -> BNSD
-            cos = torch.index_select(self.cos_cached, dim=0, index=kv_len.view(-1)).unsqueeze(1).unsqueeze(1)
-            sin = torch.index_select(self.sin_cached, dim=0, index=kv_len.view(-1)).unsqueeze(1).unsqueeze(1)
+            # token-first: use position_ids for both prefill and decode
+            cos = self.cos_cached[position_ids].unsqueeze(1)
+            sin = self.sin_cached[position_ids].unsqueeze(1)
 
         return (
             cos.to(dtype=x.dtype),

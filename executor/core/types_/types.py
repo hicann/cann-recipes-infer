@@ -27,11 +27,11 @@ class GenerationOutput:
     """Output from batch generation.
 
     Attributes:
-        prompt: Original input prompt string.
+        prompt: Original input prompt in chat message format.
         output_text: Generated text output.
         finish_reason: Reason for generation completion (default: "length").
     """
-    prompt: str
+    prompt: List[dict]
     output_text: str
     finish_reason: str = "length"
 
@@ -75,7 +75,8 @@ class Request:
         request_id: Unique identifier for this request.
         prompt: Input text prompt.
         input_ids: Tokenized input IDs (populated during prefill).
-        kv_len: Per-request KV cache length used to rebuild batch kv_len during decode.
+        computed_len: Per-request computed token length.
+        prompt_tokens: Actual number of prompt tokens (excluding right padding).
         output_id_list: Generated token IDs (appended during decode).
         is_prefill_done: Whether prefill phase is completed.
         is_finished: Whether generation is complete.
@@ -83,11 +84,14 @@ class Request:
         spec_num_forward_ct: Number of speculative forward passes for MTP acceptance statistics.
         spec_num_accepted_tokens: Number of accepted speculative tokens for MTP acceptance statistics.
         decode_step_count: Number of decode steps completed (each step generates one or more tokens).
+        stop_valid_generation: Mark request as stop_valid_generation.
+        valid_output_len: Length of valid output tokens when hitting EOS or max_new_tokens.
     """
     request_id: int
-    prompt: str
+    prompt: List[dict]
     input_ids: torch.Tensor = field(default_factory=lambda: torch.tensor([]))
-    kv_len: int = 0
+    computed_len: int = 0
+    prompt_tokens: int = 0
     output_id_list: List[int] = field(default_factory=list)
     is_prefill_done: bool = False
     is_finished: bool = False
@@ -100,10 +104,14 @@ class Request:
     infer_time: List[float] = field(default_factory=list)
     # Step counter for decode phase
     decode_step_count: int = 0
+    # Mark whether the request has completed valid text generation
+    stop_valid_generation: bool = False
+    valid_output_len: Optional[int] = None
 
     def get_all_token_ids(self) -> List[int]:
         """Get concatenated input and output token IDs."""
-        input_list = self.input_ids.tolist() if self.input_ids.numel() > 0 else []
+        input_len = self.prompt_tokens or self.input_ids.numel()
+        input_list = self.input_ids[:input_len].tolist() if self.input_ids.numel() > 0 else []
         return input_list + self.output_id_list
 
     def get_last_token_id(self) -> Optional[int]:
@@ -111,23 +119,25 @@ class Request:
         if self.output_id_list:
             return self.output_id_list[-1]
         if self.input_ids.numel() > 0:
-            return self.input_ids.tolist()[-1]
+            input_len = self.prompt_tokens or self.input_ids.numel()
+            if input_len > 0:
+                return int(self.input_ids[input_len - 1].item())
         return None
 
     def get_seq_len(self) -> int:
         """Get total sequence length (input + output)."""
-        input_len = self.input_ids.numel()
+        input_len = self.prompt_tokens or self.input_ids.numel()
         output_len = len(self.output_id_list)
         return input_len + output_len
 
-    def set_mtp_info(self, accepted_num, spec_tokens):
+    def update_mtp_info(self, accepted_num, spec_tokens):
         if not self.mtp_info:
             self.mtp_info = MTPInfo()
         # Update metrics
-        self.spec_num_forward_ct += 1
-        self.spec_num_accepted_tokens += accepted_num + 1
+        if not self.stop_valid_generation:
+            self.spec_num_forward_ct += 1
+            self.spec_num_accepted_tokens += accepted_num
         self.mtp_info.set_mtp_info(
-            accepted_num=accepted_num,
             spec_tokens=spec_tokens,
         )
 
@@ -142,9 +152,11 @@ class Batch:
     Attributes:
         requests: List of requests in this batch.
         is_prefill: Whether this batch is in prefill phase.
-        input_ids: Padded input token IDs [batch_size, max_seq_len].
-        position_ids: Padded position IDs [batch_size, max_seq_len].
+        input_ids: Prefill token stream [total_tokens] or decode query tokens [total_query_tokens].
+        position_ids: Position IDs built by the execution engine.
         seq_lens: Original sequence lengths for each request [batch_size].
+        total_tokens: Total number of valid prompt tokens in prefill.
+        request_offset: Absolute request-slot offset for packed prefill batches.
         request_indices: Mapping from request_id to batch index.
         mtp_infos: Original MTP state containing speculative tokens and accepted num.
     """
@@ -155,9 +167,8 @@ class Batch:
     input_ids: Optional[torch.Tensor] = None
     position_ids: Optional[torch.Tensor] = None
     seq_lens: Optional[torch.Tensor] = None
-
-    # Prefill Mini Batch
-    cycle_idx: int = 0
+    total_tokens: int = 0
+    request_offset: int = 0
 
     # Metadata
     request_indices: Dict[int, int] = field(default_factory=dict)
@@ -189,48 +200,53 @@ class Batch:
     def build_tensors_from_requests(self) -> None:
         """Collect request data and build batch tensors in-place."""
         if self.is_prefill:
-            self.input_ids = torch.stack([request.input_ids for request in self.requests])
+            actual_lens = []
+            prefill_tokens = []
+            for req in self.requests:
+                actual_lens.append(req.prompt_tokens)
+                prefill_tokens.append(req.input_ids[:req.prompt_tokens])
+            self.seq_lens = torch.tensor(actual_lens, dtype=torch.long)
+            self.total_tokens = int(sum(actual_lens))
+            self.input_ids = torch.cat(prefill_tokens) if prefill_tokens else torch.tensor([], dtype=torch.long)
             return
 
         self.input_ids = torch.tensor(
             [request.get_last_token_id() for request in self.requests],
             dtype=torch.long,
-        ).unsqueeze(1)
+        )
 
-        kv_lens = torch.tensor([request.kv_len for request in self.requests], dtype=torch.long)
+        kv_lens = torch.tensor([request.computed_len for request in self.requests], dtype=torch.long)
         set_forward_metadata(kv_len=kv_lens)
 
         spec_tokens_list = []
-        accepted_num_list = []
         for request in self.requests:
             if request.mtp_info:
                 spec_tokens_list.append(request.mtp_info.spec_tokens)
-                accepted_num_list.append(request.mtp_info.accepted_num)
             else:
                 self.mtp_infos = None
                 return
 
         self.mtp_infos = MTPInfo(
             spec_tokens=torch.stack(spec_tokens_list, dim=0),
-            accepted_num=torch.stack(accepted_num_list, dim=0),
         )
 
     def update_requests_from_batch(
         self,
+        is_prefill: bool,
         next_tokens: Optional[torch.Tensor],
-        infer_time: Optional[List]
+        infer_time: Optional[List],
     ) -> Dict[int, List[int]]:
         """Split batch outputs by index and update each request in-place."""
         next_tokens_by_request: Dict[int, List[int]] = {}
-        kv_lens = get_forward_metadata().kv_len
+        computed_lens = get_forward_metadata().kv_len
 
         if next_tokens is not None and next_tokens.shape[0] != len(self.requests):
             raise ValueError(
                 f"next_tokens batch size {next_tokens.shape[0]} does not match request count {len(self.requests)}"
             )
-        if kv_lens is not None and kv_lens.shape[0] != len(self.requests):
+        if computed_lens is not None and computed_lens.shape[0] != len(self.requests):
             raise ValueError(
-                f"kv_len batch size {kv_lens.shape[0]} does not match request count {len(self.requests)}"
+                f"kv_len batch size {computed_lens.shape[0]} does not match request count {len(self.requests)}"
             )
 
         for i, request in enumerate(self.requests):
@@ -239,7 +255,7 @@ class Batch:
             if self.mtp_infos:
                 accepted_num = self.mtp_infos.accepted_num[i] if self.mtp_infos.accepted_num is not None else None
                 spec_tokens = self.mtp_infos.spec_tokens[i] if self.mtp_infos.spec_tokens is not None else None
-                request.set_mtp_info(accepted_num, spec_tokens)
+                request.update_mtp_info(accepted_num, spec_tokens)
 
             if next_tokens is not None:
                 if accepted_num is not None:
@@ -249,8 +265,10 @@ class Batch:
                 request.output_id_list += request_next_tokens
                 next_tokens_by_request[request.request_id] = request_next_tokens
 
-            if kv_lens is not None:
-                request.kv_len = kv_lens[i]
+            if computed_lens is not None:
+                request.computed_len = computed_lens[i].item()
+                if accepted_num is not None:
+                    request.computed_len += accepted_num.item()
 
             if infer_time is not None:
                 request.infer_time.append(infer_time)

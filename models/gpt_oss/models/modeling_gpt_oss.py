@@ -22,10 +22,12 @@ from torch import nn
 from torch.nn import functional as F
 import torch.distributed as dist
 import torch_npu
+import torchair
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 
 from executor.utils.forward_metadata import ForwardMetaData
 from executor.core.config import InferenceConfig, CommManager
+from executor.core.kv_cache.cache_info import CacheEntry, LayerCacheInfo, ModelCacheInfo
 from module.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -136,7 +138,6 @@ class GptOssMLP(nn.Module):
         self.experts = GptOssExperts(config, infer_config)
 
     def forward(self, hidden_states):
-        batch_size = hidden_states.shape[0]
         router_scores, router_indices, row_idx = self._forward_router(hidden_states)  # (num_experts, seq_len)
         hidden_states_ordered_by_experts, routing_weights, expanded_row_idx, expert_idx \
                 = self.moe_infer_fusion(hidden_states, router_indices, router_scores, row_idx)
@@ -148,8 +149,7 @@ class GptOssMLP(nn.Module):
                 expanded_src_to_dst_row=expanded_row_idx,
                 export_for_source_row=expert_idx
             )
-        y = hidden_states.view(batch_size, -1, self.hidden_dim)
-        return y
+        return hidden_states.view(-1, self.hidden_dim)
 
     def _forward_router(self, hidden_states):
         hidden_states = hidden_states.view(-1, self.hidden_dim)
@@ -160,27 +160,24 @@ class GptOssMLP(nn.Module):
         return topk_weight, topk_idx, row_idx
 
     def moe_infer_fusion(self, x, topk_ids, topk_weight, row_idx):
-        batch_size, sequence_length, h = x.shape
+        token_count, h = x.shape
         hidden_states = x.view(-1, h)
 
         routing_weights = topk_weight.to(x.dtype)
         expert_idx = topk_ids.int()
         if row_idx is None:
-            # decode
-            if sequence_length == 1:
-                row_idx = self.row_idx_decode
-            else:
-                row_idx_prefill_len = batch_size * sequence_length * self.top_k
-                row_idx_prefill = torch.arange(
-                    0, row_idx_prefill_len, dtype=torch.int32,
-                    device=topk_weight.device).view(self.top_k, -1).permute(1, 0).contiguous()
-                row_idx = row_idx_prefill
+            row_idx = torch.arange(
+                0,
+                token_count * self.top_k,
+                dtype=torch.int32,
+                device=topk_weight.device,
+            ).view(self.top_k, -1).permute(1, 0).contiguous()
 
         expanded_x, expanded_row_idx, expanded_expert_idx = torch_npu.npu_moe_init_routing(
             hidden_states,
             row_idx=row_idx,
             expert_idx=expert_idx,
-            active_num=batch_size * sequence_length
+            active_num=token_count
         )
         expert_tokens = torch_npu.npu_moe_compute_expert_tokens(expanded_expert_idx, self.num_experts)
         expert_tokens = expert_tokens.to(torch.int64)
@@ -209,13 +206,15 @@ class GptOssRotaryEmbedding(nn.Module):
         self.original_inv_freq = self.inv_freq
 
     @torch.no_grad()
-    @dynamic_rope_update  # power user: used with advanced RoPE types (e.g. dynamic rope)
+    @dynamic_rope_update
     def forward(self, x, position_ids):
+        if position_ids.dim() != 1:
+            raise RuntimeError("GPT-OSS expects packed 1D position_ids.")
+        position_ids = position_ids.unsqueeze(0)
         inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
         position_ids_expanded = position_ids[:, None, :].float()
-
         device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
-        with torch.autocast(device_type=device_type, enabled=False):  # Force float32
+        with torch.autocast(device_type=device_type, enabled=False):
             freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
             emb = freqs
             cos = emb.cos() * self.attention_scaling
@@ -225,8 +224,8 @@ class GptOssRotaryEmbedding(nn.Module):
 
 
 def npu_apply_rotary_pos_emb(q, k, cos, sin, layout):
-    cos = cos.unsqueeze(2)
-    sin = sin.unsqueeze(2)
+    cos = cos.squeeze(0).unsqueeze(1)
+    sin = sin.squeeze(0).unsqueeze(1)
     cos = torch.concat((cos, cos), -1)
     sin = torch.concat((sin, sin), -1)
 
@@ -275,76 +274,163 @@ class GptOssAttention(nn.Module):
             prefix=f"{prefix}.o_proj"
         )
         self.sliding_window = config.sliding_window if config.layer_types[layer_idx] == "sliding_attention" else None
+        self.attn_type = "SlidingWindow" if self.sliding_window is not None else "FullAttention"
+        self.block_size = infer_config.scheduler_config.block_size
         self.sinks = nn.Parameter(torch.empty(self.num_attention_heads_per_rank))
-        self.k_cache = self.v_cache = torch.Tensor([])  # will be set in runner's init_kvcache
-        self.cache_unit = (self.num_key_value_heads_per_rank, self.head_dim)
+        self.k_cache = torch.Tensor([])
+        self.v_cache = torch.Tensor([])
+        cache_dtype = torch.bfloat16 if self.config.torch_dtype is None else self.config.torch_dtype
+        self.cache_entries = [
+            CacheEntry(
+                cache_name="k_cache",
+                attn_type=self.attn_type,
+                dim=self.head_dim,
+                num_head=self.num_key_value_heads_per_rank,
+                dtype=cache_dtype,
+                needs_block=True,
+                tensor_setter=lambda tensor, layer=self: setattr(layer, "k_cache", tensor),
+                sliding_window=self.sliding_window if self.sliding_window else None,
+            ),
+            CacheEntry(
+                cache_name="v_cache",
+                attn_type=self.attn_type,
+                dim=self.head_dim,
+                num_head=self.num_key_value_heads_per_rank,
+                dtype=cache_dtype,
+                needs_block=True,
+                tensor_setter=lambda tensor, layer=self: setattr(layer, "v_cache", tensor),
+                sliding_window=self.sliding_window if self.sliding_window else None,
+            ),
+        ]
+
+    def _pack_cache_for_tnd(
+        self,
+        cache_states: torch.Tensor,
+        seq_lens: torch.Tensor,
+    ) -> torch.Tensor:
+        """Pack padded KV cache [B, S, H, D] into valid TND tokens."""
+        if seq_lens.numel() == 0:
+            return cache_states.new_empty((0, *cache_states.shape[2:]))
+        _, seq_len = cache_states.shape[:2]
+        mask = torch.arange(seq_len, device=cache_states.device).unsqueeze(0) < seq_lens.unsqueeze(1)
+        return cache_states[mask]
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         forward_metadata: ForwardMetaData,
+        slot_mapping: Optional[torch.Tensor] = None,
+        block_table: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        is_prefill = forward_metadata.is_prefill if forward_metadata else False
         qkv = self.qkv_proj(hidden_states)
-        bsz, q_len, _ = qkv.size()
+        q_len = qkv.size(0)
+        padded_q_len = q_len
+        prompt_tokens = forward_metadata.prompt_tokens if forward_metadata else q_len
+        if is_prefill and prompt_tokens < padded_q_len:
+            qkv = qkv[:prompt_tokens]
+            q_len = prompt_tokens
+
         query_states, key_states, value_states = qkv.split((
             self.num_attention_heads_per_rank * self.head_dim,\
             self.num_key_value_heads_per_rank * self.head_dim,\
-            self.num_key_value_heads_per_rank * self.head_dim), dim=2)
-        input_shape = hidden_states.shape[:-1]
-        # (bz, q_len, -1, head_dim)
-        hidden_shape = (*input_shape, -1, self.head_dim)
-
-        query_states = query_states.view(hidden_shape)
-        key_states = key_states.view(hidden_shape)
-        value_states = value_states.view(hidden_shape)
+            self.num_key_value_heads_per_rank * self.head_dim), dim=1)
+        query_states = query_states.view(q_len, -1, self.head_dim)
+        key_states = key_states.view(q_len, -1, self.head_dim)
+        value_states = value_states.view(q_len, -1, self.head_dim)
 
         cos, sin = position_embeddings
-        query_states, key_states = npu_apply_rotary_pos_emb(query_states, key_states, cos, sin, layout="BSND")
+        query_states, key_states = npu_apply_rotary_pos_emb(
+            query_states,
+            key_states,
+            cos,
+            sin,
+            layout="TND",
+        )
 
-        kv_len = forward_metadata.kv_len
-        actual_seq_lengths_kv = forward_metadata.actual_seq_lengths_kv
+        actual_seq_kvlen = forward_metadata.actual_seq_lengths_kv
+        actual_seq_qlen = forward_metadata.actual_seq_lengths_cu_q
         attention_mask = forward_metadata.attention_mask
 
         k_cache, v_cache = self.k_cache, self.v_cache
         if not (k_cache.numel() and v_cache.numel()):
             raise RuntimeError("A BUG: k_cache and v_cache are not initialized properly.")
-        torch_npu.scatter_update_(k_cache, kv_len, key_states, 1)
-        torch_npu.scatter_update_(v_cache, kv_len, value_states, 1)
-        if q_len == 1:
-            key_states, value_states = k_cache, v_cache
-            key_states = key_states[:, :kv_len + 1, :, :]
-            value_states = value_states[:, :kv_len + 1, :, :]
 
-        actual_seq_qlen = [query_states.shape[1]]
+        if forward_metadata.is_prefill:
+            # prefill phase: attention computation first, then update KV cache
+            attn_output, attn_weights = torch.ops.npu.npu_fused_infer_attention_score_v2(
+                query_states,
+                key_states,
+                value_states,
+                num_query_heads=self.num_attention_heads_per_rank,
+                num_key_value_heads=self.num_key_value_heads_per_rank,
+                input_layout="TND",
+                softmax_scale=self.scaling,
+                sparse_mode=4 if self.sliding_window else 3,
+                pre_tokens=self.sliding_window if self.sliding_window else torch.iinfo(torch.int32).max,
+                next_tokens=0,
+                actual_seq_qlen=actual_seq_qlen,
+                actual_seq_kvlen=actual_seq_qlen,
+                atten_mask=attention_mask,
+                learnable_sink=self.sinks,
+                )
+            self.update_cache(slot_mapping, key_states, value_states)
+        else:
+            # decode phase: update KV cache first, then attention computation
+            # (new KV states must be written to cache before attention reads from cache)
+            self.update_cache(slot_mapping, key_states, value_states)
+            attn_output, attn_weights = torch.ops.npu.npu_fused_infer_attention_score_v2(
+                query_states,
+                self.k_cache.view(*self.k_cache.shape[:2], -1), # [bn, bs, num_head*dim]
+                self.v_cache.view(*self.v_cache.shape[:2], -1), # [bn, bs, num_head*dim]
+                num_query_heads=self.num_attention_heads_per_rank,
+                num_key_value_heads=self.num_key_value_heads_per_rank,
+                input_layout="TND",
+                softmax_scale=self.scaling,
+                sparse_mode=4 if self.sliding_window else 3,
+                pre_tokens=self.sliding_window if self.sliding_window else torch.iinfo(torch.int32).max,
+                next_tokens=0,
+                actual_seq_qlen=actual_seq_qlen,
+                actual_seq_kvlen=actual_seq_kvlen,
+                atten_mask=attention_mask,
+                learnable_sink=self.sinks,
+                block_table=block_table[self.attn_type],
+                block_size=self.block_size,
+                )
 
-        query_states = query_states.reshape(-1, self.num_attention_heads_per_rank, self.head_dim)
-        key_states = key_states.reshape(-1, self.num_key_value_heads_per_rank, self.head_dim)
-        value_states = value_states.reshape(-1, self.num_key_value_heads_per_rank, self.head_dim)
-
-        attn_output, attn_weights = torch_npu.npu_fused_infer_attention_score_v2(
-            query_states,
-            key_states,
-            value_states,
-            num_query_heads=self.num_attention_heads_per_rank,
-            num_key_value_heads=self.num_key_value_heads_per_rank,
-            input_layout="TND",
-            softmax_scale=self.scaling,
-            sparse_mode=4 if self.sliding_window else 3,
-            pre_tokens=self.sliding_window if self.sliding_window else torch.iinfo(torch.int32).max,
-            next_tokens=0,
-            actual_seq_qlen=actual_seq_qlen,
-            actual_seq_kvlen=actual_seq_lengths_kv,
-            atten_mask=attention_mask,
-            learnable_sink=self.sinks
-            )
-
-        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+        attn_output = attn_output.reshape(q_len, -1).contiguous()
         attn_output = self.o_proj(attn_output)
+        if is_prefill and q_len < padded_q_len:
+            pad_len = padded_q_len - q_len
+            attn_output = torch.cat([
+                attn_output,
+                torch.zeros(
+                    (pad_len, attn_output.size(-1)),
+                    dtype=attn_output.dtype,
+                    device=attn_output.device,
+                ),
+            ], dim=0)
         if self.commute_type == "all_reduce":
             dist.all_reduce(attn_output)
         return attn_output, attn_weights
+
+    def update_cache(self, slot_mapping, key_states, value_states):
+        k_cache, v_cache = self.k_cache, self.v_cache
+        if not (k_cache.numel() and v_cache.numel()):
+            raise RuntimeError("A BUG: k_cache and v_cache are not initialized properly.")
+
+        torch_npu.npu_scatter_nd_update_(
+            k_cache.view(-1, self.num_key_value_heads_per_rank, self.head_dim),
+            slot_mapping[self.attn_type].view(-1, 1),
+            key_states.view(-1, self.num_key_value_heads_per_rank, self.head_dim),
+        )
+        torch_npu.npu_scatter_nd_update_(
+            v_cache.view(-1, self.num_key_value_heads_per_rank, self.head_dim),
+            slot_mapping[self.attn_type].view(-1, 1),
+            value_states.view(-1, self.num_key_value_heads_per_rank, self.head_dim),
+        )
 
 
 class GptOssDecoderLayer(nn.Module):
@@ -363,6 +449,8 @@ class GptOssDecoderLayer(nn.Module):
         position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
         past_residual: Optional[torch.Tensor] = None,
         forward_metadata: ForwardMetaData = None,
+        slot_mapping: Optional[torch.Tensor] = None,
+        block_table: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Tuple[torch.FloatTensor]:
         hidden_states, residual = self.input_layernorm(hidden_states, past_residual)
@@ -371,6 +459,8 @@ class GptOssDecoderLayer(nn.Module):
             hidden_states=hidden_states,
             position_embeddings=position_embeddings,
             forward_metadata=forward_metadata,
+            slot_mapping=slot_mapping,
+            block_table=block_table,
             **kwargs,
         )
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
@@ -409,9 +499,10 @@ class GptOssModel(nn.Module):
     ):
         inputs_embeds = self.embed_tokens(input_ids)
 
-        # (bz, seq_len, hidden_d)
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        block_table = forward_metadata.block_table
+        slot_mapping = forward_metadata.slot_mapping
         residual = None
 
         for decoder_layer in self.layers:
@@ -420,6 +511,8 @@ class GptOssModel(nn.Module):
                 position_embeddings=position_embeddings,
                 past_residual=residual,
                 forward_metadata=forward_metadata,
+                slot_mapping=slot_mapping,
+                block_table=block_table,
                 **kwargs,
             )
             residual, hidden_states = layer_outputs
@@ -459,16 +552,16 @@ class GptOssForCausalLM(nn.Module):
             forward_metadata=forward_metadata,
             **kwargs,
         )
-        bs, q_len, hidden_size = hidden_states.shape
+        hidden_size = hidden_states.shape[-1]
         if forward_metadata.is_prefill:
-            bs = position_ids.shape[0]
-            gather_index, _ = torch.max(position_ids, dim=-1)
-            seq_index = ((gather_index + 1).to(torch.int32).cumsum(-1) - 1).npu()
-            hidden_states = \
-                (torch.index_select(hidden_states.view(1, -1, hidden_size), 1, seq_index.view(-1))).view(bs, 1, -1)
-            q_len = 1 # prefill takes th last token
-        else: # combine bs and q_len axes for lm_head
-            hidden_states = hidden_states.view(bs * q_len, 1, hidden_size)
+            cu_seq_lens_q = forward_metadata.actual_seq_lengths_cu_q
+            seq_index = (cu_seq_lens_q.to(torch.int32) - 1).npu()
+            bs = seq_index.numel()
+            hidden_states = torch.index_select(hidden_states.reshape(-1, hidden_size), 0, seq_index.view(-1))
+            hidden_states = hidden_states.view(bs, 1, hidden_size)
+        else:
+            bs = hidden_states.shape[0]
+            hidden_states = hidden_states.view(bs, 1, hidden_size)
 
         logits = self.lm_head(hidden_states)
 
@@ -477,7 +570,7 @@ class GptOssForCausalLM(nn.Module):
             dist.all_gather(new_logits, logits)
             logits = torch.concat(new_logits, dim=-1)
 
-        return logits.reshape(bs, q_len, -1).float()
+        return logits.float()
 
     # Adapted from vllm.model_executor.models.gpt_oss.GptOssModel._load_weights_other
     # (https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/gpt_oss.py)
@@ -578,6 +671,24 @@ class GptOssForCausalLM(nn.Module):
             quant_method = getattr(module, "quant_method", None)
             if quant_method is not None:
                 quant_method.process_weights_after_loading(module, is_nz=False)
+
+    def get_cache_info(
+        self,
+    ) -> ModelCacheInfo:
+        layer_infos = []
+        for layer_idx, layer in enumerate(self.model.layers):
+            layer_infos.append(
+                LayerCacheInfo(
+                    layer_idx=layer_idx,
+                    caches=list(layer.self_attn.cache_entries),
+                )
+            )
+
+        return ModelCacheInfo(
+            num_layers=len(layer_infos),
+            block_size=self.infer_config.scheduler_config.block_size,
+            layer_infos=layer_infos,
+        )
 
 
 __all__ = ["GptOssForCausalLM", "GptOssModel"]

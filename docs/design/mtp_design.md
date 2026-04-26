@@ -209,3 +209,38 @@ sequenceDiagram
         deactivate MW
     end
 ```
+
+## 3. MTP 指标介绍
+
+当 MTP 启用时，框架会统计并计算以下三个核心指标，用于评估 decode 阶段的性能收益：
+
+### 3.1 指标计算公式
+
+**1. 平均接受率 (avg_accept_rate)**
+
+```
+avg_accept_rate = total_accept_tokens / total_spec_tokens
+```
+
+- `total_spec_tokens = sum(spec_num_forward_ct) × next_n`：MTP 模型推测的总 token 数
+- `total_accept_tokens = sum(spec_num_accepted_tokens)`：主模型验证后接受的总 token 数
+- 含义：衡量 MTP 预测的准确程度，越高表示 MTP model 与主模型越一致
+
+**2. 平均接受长度 (avg_accept_length)**
+
+```
+avg_accept_length = total_accept_tokens / spec_num_forward_ct + 1
+```
+
+- `spec_num_forward_ct = sum(spec_num_forward_ct)`：前向传播次数
+- 加 1 表示主模型每次验证至少产出 1 个有效 token
+- 含义：平均每次 decode 迭代实际产出的 token 数
+
+**3. 平均等效时间 (avg_equivalent_time)**
+
+```
+avg_equivalent_time = avg_decode_time / avg_accept_length
+```
+
+- `avg_decode_time`：decode 阶段平均前向推理耗时，包括一次主模型推理耗时和 next_n 次 MTP 模型推理耗时
+- 含义：等效于每生成一个有效 token 的平均耗时
