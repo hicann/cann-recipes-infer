@@ -27,7 +27,7 @@
   - [Compressor](#compressor)
     - [计算公式](#计算公式)
     - [Tiling 设计](#tiling-设计)
-    - [错位矩阵乘](#错位矩阵乘)
+    - [错位写入](#错位写入)
   - [LightningIndexer](#lightningindexer)
     - [计算公式](#计算公式-1)
     - [Tiling 设计](#tiling-设计-1)
@@ -178,7 +178,7 @@ $i = 1, \cdots, \frac{s}{128},$ 其中 $B \in \mathbb{R}^{128 \times d}$ 为 $C$
     <figcaption> C4A Compressor 数据重排</figcaption>
 </figure>
 
-如上图所示，C4A 层的 Compressor 会引入一个较为复杂的数据重排操作，即将每个 token 映射为两个 $d$ 大小的向量后 (图中的红色方块与黄色方块)，将每 4 个 token 对应的黄色方块向量与前 4 个 token 对应的红色方块向量重排为连续存储。该操作如果用小算子单独实现，同样会引入大量非计算的向量操作。而在该融合算子中，我们利用错位的矩阵乘法巧妙地完成了这一部分的数据重排，可参考后续章节[错位矩阵乘](#错位矩阵乘)。
+如上图所示，C4A 层的 Compressor 会引入一个较为复杂的数据重排操作，即将每个 token 映射为两个 $d$ 大小的向量后 (图中的红色方块与黄色方块)，将每 4 个 token 对应的黄色方块向量与前 4 个 token 对应的红色方块向量重排为连续存储。该操作如果用小算子单独实现，同样会引入大量非计算的向量操作。而在该融合算子中，我们巧妙地完成了这一部分的数据重排，可参考后续章节[错位写入](#错位写入)。
 
 ### Tiling 设计
 **Atlas-A3**
@@ -193,7 +193,7 @@ Atlas-A3 上算子 Tiling 如下：
 
 对于 C4A:
 - L1 空间划分为如下部分：
-    - $X$ 矩阵：$ 128 \times 256 \times 2 \text{ Bytes}=64 \text{ KB}$, L1 层级基本块为 $(128, 256)$
+    - $X$ 矩阵：$128 \times 256 \times 2 \text{ Bytes}=64 \text{ KB}$, L1 层级基本块为 $(128, 256)$
     - $W^{KV}, W^{Gate}$ 矩阵：$4 \times 256 \times 64 \times 2 \text{ Bytes}=128 \text{ KB}$, L1 层级基本块为 $(256, 128)$，一轮迭代会搬入 $W^{aKV}, W^{bKV}, W^{aGate}, W^{bGate}$ 各 $1$ 个 $(256, 64)$ 的矩阵块。
 - L0A, L0B 使能 double buffer, 分别划分为 $2\times32\text{ KB},2\times32\text{ KB}$，一次搬入 L0A 和 L0B 的矩阵块大小都为 $(128,128)$； L0C 使能 double buffer，划分成 $2\times64\text{ KB}$，分别存放 $2$ 个 $X$ 分块与 $1$ 个 KV+Gate 矩阵相乘的结果，并且在 L0C 上累加。
 
@@ -220,14 +220,14 @@ $$
 - 对于 Atlas-A3, C128A 中选取 $(baseM, baseN, baseK)=(256, 128, 512)$, C4A 中选取 $(baseM, baseN, baseK)=(128, 256, 512)$，这里 $baseK$ 的选取主要是考虑昇腾亲和 Cacheline 对齐，提高搬运效率。
 - 对于 950PR/DT，考虑 L0A，L0B 容量限制，可取 $baseM=baseN=baseK=256$ 达成条件。
 
-### 错位矩阵乘
-注意到在计算 C4A 时，$Z^b, C^b$ 计算 $C_{i}^{\text{Comp}}$ 的下标与 $Z^a, C^a$ 计算 $C_{i+1}^{\text{Comp}}$ 的下标有重叠，在这里我们用错位矩阵乘来实现这个处理。
+### 错位写入
+注意到在计算 C4A 时，$Z^b, C^b$ 计算 $C_{i}^{\text{Comp}}$ 的下标与 $Z^a, C^a$ 计算 $C_{i+1}^{\text{Comp}}$ 的下标有重叠，在这里我们用错位写入来实现这个处理。
 
-在搬运 $X$ 矩阵块到 L1 时，会额外多搬运一个压缩组 $r=4$ 的数据，与 $W^{aKV}, W^{aGate}$ 相乘时，用的是忽略最后一个压缩组的数据，而与 $W^{bKV}, W^{bGate}$ 相乘时，用的是忽略第一个压缩组的数据。从而最后矩阵乘的结果中 $Z^a, C^a$ 的下标与$Z^b, C^b$ 的下标自然错开，后续的向量计算无需额外的下标偏移处理。
+如下图所示，完成前序的矩阵乘计算后，红色部分的计算结果在写入目标地址时会制定一个额外的地址偏移，保证红色部分和黄色部分的计算结果对齐，将 state_cache 里所需要的数据读入 UB 即可直接进行后续的向量计算。
 
 <figure align = "center">
-    <img src="./figures/overlap_matmul.jpg" width="600"/>
-    <figcaption> 错位矩阵乘 </figcaption>
+    <img src="./figures/overlap_proc.png" width="600"/>
+    <figcaption> 错位写入 </figcaption>
 </figure>
 
 ## LightningIndexer
