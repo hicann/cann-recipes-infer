@@ -250,7 +250,7 @@ A8C8：A8表示LI中的Q使用动态Per-Token-Head Int8量化，Indexer Cache使
 - LightningIndexer: `batch_matmul`使用FP8计算；
 - Compressor: Linear不量化；
 - MLAEpilog：`o_a_proj`和`o_b_proj`使用W8A8量化；
-- MoE：路由专家的Linear使用W8A8量化，共享专家的Linear使用W4A8量化；
+- MoE：路由专家的Linear使用W4A8量化，共享专家的Linear使用W8A8量化；
 - LMHead：不量化。
 
 > 注：
