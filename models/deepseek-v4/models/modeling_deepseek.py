@@ -85,6 +85,7 @@ class DeepseekV3SharedExpert(nn.Module):
             config.quant_config.mm_quant_mode
             if config.quant_config is not None
             else "w16a16")
+        self.swiglu_limit = config.swiglu_limit if hasattr(config, "swiglu_limit") else None
         self.moe_tp_size = self.runner_settings.get("parallel_config").get("moe_tp_size", 1)
         self.moe_ep_size = self.runner_settings.get("parallel_config").get("moe_ep_size", 1)
         self.config = config
@@ -123,11 +124,20 @@ class DeepseekV3SharedExpert(nn.Module):
 
     def forward_w8a8int8(self, x):
         merged_x, pertoken_scale = self.gate_up_proj(x, out_dtype=torch.int32)
-        intermediate_hidden_states, pertoken_scale = torch_npu.npu_dequant_swiglu_quant(
+        swiglu_limit_args = {}
+        if self.swiglu_limit:
+            swiglu_limit_args.update({
+                "swiglu_mode": 1,
+                "clamp_limit": self.swiglu_limit,
+                "glu_alpha": 1,
+                "glu_bias": 0
+            })
+        intermediate_hidden_states, pertoken_scale = torch_npu.npu_dequant_swiglu_clamp_quant(
             merged_x, weight_scale=self.gate_up_proj.weight_scale,
             quant_scale=self.down_proj.smooth_scales,
             quant_mode=1, activate_left=True,
             activation_scale=pertoken_scale,
+            **swiglu_limit_args
         )
         return self.down_proj(intermediate_hidden_states, pertoken_scale)
 
@@ -137,6 +147,7 @@ class DeepseekV3SharedExpert(nn.Module):
             merged_x,
             dst_type=torch.float8_e4m3fn,
             quant_mode=2 if "mx" in self.mm_quant_mode else 1,
+            clamp_value=self.swiglu_limit if self.swiglu_limit else 0
             )
         return self.down_proj(intermediate_hidden_states, pergroup_scale)
 
