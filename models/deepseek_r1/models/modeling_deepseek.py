@@ -128,7 +128,8 @@ class DeepseekV3DenseMLP(nn.Module):
             num_tokens = x.shape[0]
             x_output = torch.empty([num_tokens * self.dense_tp_size, self.hidden_size], \
                                    dtype=x.dtype, device="npu")
-            dist.all_gather_into_tensor(x_output, x.view(-1, self.hidden_size), group=self.comm_manager.get_group("dense_tp_group"))
+            dist.all_gather_into_tensor(x_output, x.view(-1, self.hidden_size),
+                                        group=self.comm_manager.get_group("dense_tp_group"))
             x = x_output
 
         down_proj = self.down_proj_forward(x)

@@ -23,10 +23,10 @@ from executor.core.config import SchedulerConfig
 from executor.utils.forward_metadata import set_forward_metadata, get_forward_metadata
 from ..types_.types import Request, Batch, StepOutput, MTPInfo
 from ..engine import ExecutionEngine
+from ..kv_cache import KVCacheManager
 
 logger = logging.getLogger(__name__)
-from ..kv_cache import KVCacheManager
-from ..engine import ExecutionEngine
+
 
 class Scheduler:
     """Core scheduler managing request lifecycle with batch support.
@@ -179,14 +179,11 @@ class Scheduler:
         request_offset = self.prefilled_request_count
         total_prefill_tokens = 0
         max_prefill_tokens = self.config.max_prefill_tokens
-        available_batches = self.config.batch_size_per_dp_rank - len(self.running_requests)
-        if available_batches <= 0:
-            return None
 
         # Strict FIFO: only consider the queue head. If the head request
         # cannot fit in the current prefill batch budget, stop scheduling
         # instead of skipping ahead to shorter requests behind it.
-        while self.waiting_queue and len(selected) < available_batches:
+        while self.waiting_queue:
             request = self.waiting_queue[0]
             self._prepare_request_prompt(request, engine.input_truncated_len)
 
@@ -256,7 +253,7 @@ class Scheduler:
             # Offline mode requires that all requests in the running list are used for inference.
             if engine.kvcache_manager and not engine.kvcache_manager.allocate_slots(
                 req.request_id, computed_tokens=req.computed_len + 1,
-                num_new_tokens=1+engine.next_n,
+                num_new_tokens=1 + engine.next_n,
                 lookahead_tokens=max(engine.next_n - 1, 0)
                 ):
                 break

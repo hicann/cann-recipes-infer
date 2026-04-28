@@ -123,7 +123,8 @@ def calculate_fixed_block_memory_bytes(infer_config, cache_info: ModelCacheInfo)
                 # Main model verification requires next_n + 1 positions, while MTP further speculates
                 # next_n - 1 positions based on the main model's output, totaling 2 * next_n positions.
                 # Pre-reserving 2 * next_n positions avoids frequent allocation failures during decode.
-                fixed_block_num_per_batch = (2 * infer_config.model_config.next_n + cache.sliding_window + cache_info.block_size - 1) \
+                fixed_block_num_per_batch = \
+                    (2 * infer_config.model_config.next_n + cache.sliding_window + cache_info.block_size - 1) \
                     // cache_info.block_size
                 # The additional blocks are designed for sliding window spanning across block boundaries,
                 # ensuring all blocks within the window are preserved;
@@ -183,9 +184,6 @@ def calculate_block_num(
     if not paged_attn_types:
         return block_num_by_type
 
-    if per_token_bytes <= 0:
-        raise ValueError("per_token_bytes must be positive when calculating block_num")
-
     # In offline mode, block_num can be computed directly from the fixed token length.
     if offline_max_len:
         block_num = int((offline_max_len + cache_info.block_size - 1) / cache_info.block_size)
@@ -193,6 +191,16 @@ def calculate_block_num(
         for attn_type in paged_attn_types:
             # The extra one block is allocated for the null block.
             block_num_by_type[attn_type] = block_num + 1
+
+        # Validate that current free_memory can support all requested block memory
+        paged_attention_memory_bytes = (block_num + 1) * cache_info.block_size * per_token_bytes
+        required_memory_bytes = paged_attention_memory_bytes + fixed_block_memory_bytes
+        free_memory, total_memory = torch.npu.mem_get_info()
+        if required_memory_bytes > free_memory:
+            raise MemoryError(
+                f"Insufficient memory for offline mode cache allocation. "
+                f"Please reduce the length of requests or the total batch size."
+            )
         return block_num_by_type
 
     # Estimate how many paged-attention tokens can fit into the configured

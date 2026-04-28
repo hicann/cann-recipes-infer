@@ -183,10 +183,10 @@ class ModelWorker:
         else:
             return None
 
-    def _init_kvcache(self):
+    def init_kvcache(self):
         """Initialize pre-allocated KV cache tensors."""
         batch_size = self.infer_config.scheduler_config.batch_size_per_dp_rank
-        cache_seq_len = self.infer_config.data_config.input_max_len + \
+        cache_seq_len = self.infer_config.data_config.input_truncated_len + \
             self.infer_config.scheduler_config.max_new_tokens
 
         # Bind kv_cache to model modules

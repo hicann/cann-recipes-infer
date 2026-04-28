@@ -164,7 +164,7 @@ class OfflineInference:
                 continue
 
             # Decode only the valid output segment truncated by max output length or EOS.
-            valid_output_id_list=self.get_valid_output(request)
+            valid_output_id_list = self.get_valid_output(request)
             output_text = self.engine.tokenizer.decode(
                 torch.tensor(valid_output_id_list), skip_special_tokens=True)
             # Caculate mtp accept rate

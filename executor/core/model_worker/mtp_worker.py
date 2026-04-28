@@ -27,9 +27,9 @@ import torch
 
 from executor.core.config import InferenceConfig
 from executor.core.model_worker.model_worker import ModelWorker
+from executor.core.kv_cache.cache_utils import prepare_slot_mapping
 from executor.utils.forward_metadata import set_forward_metadata, get_forward_metadata
 from ..types_.types import MTPInfo, Batch
-from executor.core.kv_cache.cache_utils import prepare_slot_mapping
 
 
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
@@ -195,6 +195,7 @@ class MTPWorker:
             kv_len = forward_metadata.kv_len + q_len - 1
             kv_len += self.next_n - 1
             spec_token = MTPWorker._pad_seq_len_to_size(next_tokens[:, -1:], self.next_n)
+            set_forward_metadata(kv_len=kv_len, is_prefill=False)
             mtp_infos.is_prefill = False
         else:
             # Decode branch: update state based on accepted tokens

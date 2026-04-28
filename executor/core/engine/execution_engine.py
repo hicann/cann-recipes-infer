@@ -54,11 +54,11 @@ class ExecutionEngine:
         self.block_size = self.infer_config.scheduler_config.block_size
         self.next_n = self.infer_config.model_config.next_n
         self.is_online = is_online
-        if self.is_online or self.next_n == 0:
+        if self.is_online:
             self.max_total_len = self.input_truncated_len + self.max_new_tokens
         else:
             # In offline MTP mode, reserve extra KV cache for the draft model's speculative forwards.
-            self.max_total_len = self.input_truncated_len + (self.max_new_tokens + 1) * (self.next_n + 1)
+            self.max_total_len = self.input_truncated_len + self.max_new_tokens * (self.next_n + 1) + self.next_n
         self.block_table_max_len = int((self.max_total_len + self.block_size - 1) / self.block_size)
         self.exe_mode = self.infer_config.model_config.exe_mode
 
@@ -133,13 +133,14 @@ class ExecutionEngine:
         # Initialize KV cache
         if cache_info is not None:
             # Support page attention management
+            logging.info("Initializing KV cache with PageAttention management.")
             self._init_cache_manager(cache_info)
         else:
             # Not support page attention
-            self.main_worker._init_kvcache()
+            self.main_worker.init_kvcache()
             if self.mtp_worker is not None:
                 # Support MTP
-                self.mtp_worker.mtp_model_worker._init_kvcache()
+                self.mtp_worker.mtp_model_worker.init_kvcache()
 
     def _init_cache_manager(self, cache_info: ModelCacheInfo):
         validate_cache_info(cache_info)

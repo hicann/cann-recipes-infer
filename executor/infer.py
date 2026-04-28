@@ -28,6 +28,7 @@ def parse_args():
     parser.add_argument('--yaml_file_path', type=str, required=True, help="inference configurations")
     return parser.parse_args()
 
+
 def generate_prompt(dataset, dataset_path):
     if dataset == "default":
         preset_prompts = generate_default_prompt(dataset_path)
@@ -46,6 +47,7 @@ def generate_prompt(dataset, dataset_path):
     else:
         raise Exception(f"your dataset {dataset} is not supported, dataset supported: LongBench, InfiniteBench")
     return preset_prompts
+
 
 def preprocess_prompts_for_scheduler(prompts, tokenizer, scheduler_config, data_config):
     bsz = scheduler_config.batch_size
@@ -149,7 +151,8 @@ def main():
     llm = OfflineInference(config)
 
     if config.data_config.dataset != "default":
-        prompts = preprocess_prompts_for_scheduler(prompts, llm.engine.tokenizer, config.scheduler_config, config.data_config)
+        prompts = preprocess_prompts_for_scheduler(
+            prompts, llm.engine.tokenizer, config.scheduler_config, config.data_config)
     results, mtp_stats, infer_time = llm.generate(prompts)
     log_results(results, mtp_stats, infer_time, llm.engine.next_n, llm.engine.main_worker.model_name)
 
