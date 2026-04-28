@@ -1,4 +1,5 @@
 model_args:
+  model-base: "ckpts"                # weight root dir; modify if weights are not under models/hunyuan-video/ckpts
   dit-weight: "/path/to/HunyuanVideo_model_states_fp8.pt"  # must modify: path to FP8-quantized DiT checkpoint
   prompt: "A cat walks on the grass, realistic style."
   video-size: [720, 1280]            # [H, W]
@@ -8,7 +9,7 @@ model_args:
   embedded-cfg-scale: 6.0
   flow-shift: 7.0
   flow-reverse: true
-  use-cpu-offload: true
+  use-cpu-offload: true             # enabling slows down VAE; required when TaylorSeer cache is enabled
   use-fp8: true                      # enable FP8 FA activation quantization (950PR only)
 
 model_name: "hunyuan-video"

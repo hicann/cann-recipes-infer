@@ -27,10 +27,36 @@ yaml.SafeLoader.add_constructor("!env", lambda loader, node: os.path.expandvars(
 
 
 def load_sparse_config_from_file(config_path=DEFAULT_CONFIG_PATH):
+    """Load sparse config from YAML.
+
+    Supports two layouts:
+    1. Inline (new): the launch YAML has a top-level ``sparse`` section with
+       ``method``, ``block_size_Q/K``, ``model`` and per-method params nested
+       under ``params.<Method>``. The section is flattened to the legacy shape
+       expected downstream.
+    2. Flat (legacy): a standalone ``sparse_config.yaml`` whose root is the
+       flat structure (``block_size_Q`` / ``block_size_K`` / ``model`` at the
+       top, method keys ``TopK`` / ``SVG`` holding per-method params).
+    """
     with open(config_path, 'r', encoding='utf-8') as f:
         raw_content = f.read()
     expanded_content = os.path.expandvars(raw_content)
-    config = yaml.safe_load(expanded_content)
+    full_cfg = yaml.safe_load(expanded_content)
+
+    if isinstance(full_cfg, dict) and isinstance(full_cfg.get("sparse"), dict):
+        sparse = full_cfg["sparse"]
+        config = {
+            "block_size_Q": sparse.get("block_size_Q"),
+            "block_size_K": sparse.get("block_size_K"),
+            "model": sparse.get("model"),
+        }
+        for method, params in (sparse.get("params") or {}).items():
+            method_cfg = dict(params)
+            method_cfg.setdefault("predictor_name", method)  # TopKPredictor/SVGPredictor legacy field
+            config[method] = method_cfg
+    else:
+        config = full_cfg
+
     logger.info(config)
     _validate_config_keys(config)
     return config
@@ -1385,21 +1411,25 @@ class HunyuanVideoSVGAdapter(SVGPredictor):
             )
             q1, k1, v1 = torch.split(qkv1, [n, n, n], dim=1)
             if head_sabi is None:
-                if joint_q_local_bnsd is None:
-                    prefix_q_len = int(cu_seqlens_q[1])
-                    img_q_len = min(int(self.img_token_len), prefix_q_len)
-                    joint_q_local_bnsd = q[:, :, img_q_len:prefix_q_len, :].transpose(1, 2).contiguous()
-                head_sabi = self.build_sp_sabi_before_head_shard(
-                    {
-                        "q_local_bnsd": q.transpose(1, 2).contiguous(),
-                        "k_local_bnsd": k.transpose(1, 2).contiguous(),
-                        "v_local_bnsd": v.transpose(1, 2).contiguous(),
-                        "joint_q_local_bnsd": joint_q_local_bnsd,
-                        "ulysses_pg": ulysses_pg,
-                        "ulysses_rank": ulysses_rank,
-                        "ulysses_world_size": ulysses_world_size,
-                    }
-                )
+                if ulysses_world_size <= 1:
+                    pattern, sabi_tensor = self.get_final_sabi(q1, k1, v1, frame_num, frame_size)
+                    head_sabi = {"pattern": pattern, "sabi": sabi_tensor}
+                else:
+                    if joint_q_local_bnsd is None:
+                        prefix_q_len = int(cu_seqlens_q[1])
+                        img_q_len = min(int(self.img_token_len), prefix_q_len)
+                        joint_q_local_bnsd = q[:, :, img_q_len:prefix_q_len, :].transpose(1, 2).contiguous()
+                    head_sabi = self.build_sp_sabi_before_head_shard(
+                        {
+                            "q_local_bnsd": q.transpose(1, 2).contiguous(),
+                            "k_local_bnsd": k.transpose(1, 2).contiguous(),
+                            "v_local_bnsd": v.transpose(1, 2).contiguous(),
+                            "joint_q_local_bnsd": joint_q_local_bnsd,
+                            "ulysses_pg": ulysses_pg,
+                            "ulysses_rank": ulysses_rank,
+                            "ulysses_world_size": ulysses_world_size,
+                        }
+                    )
             pattern = head_sabi["pattern"]
             sabi_tensor = head_sabi["sabi"]
 

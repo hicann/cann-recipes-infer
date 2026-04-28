@@ -1,6 +1,8 @@
 model_args:
-  config: "configs/sana_video_config/Sana_2000M_480px_AdamW_fsdp.yaml"  # must modify if using custom upstream config
-  model_path: "hf://Efficient-Large-Model/SANA-Video_2B_480p/checkpoints/SANA_Video_2B_480p.pth"  # must modify: weight path, or hf:// URI for auto-download
+  config: "configs/sana_video_config/Sana_2000M_480px_AdamW_fsdp.yaml"  # upstream Sana-Video model config
+  model_path: "./SANA-Video_2B_480p/checkpoints/SANA_Video_2B_480p.pth"  # local DiT/transformer checkpoint .pth
+  vae.vae_pretrained: "./SANA-Video_2B_480p/vae/Wan2.1_VAE.pth"          # local WanVAE checkpoint .pth
+  text_encoder.text_encoder_name: "./gemma-2-2b-it"   # local Gemma HF snapshot dir containing config.json
   txt_file: "asset/samples/video_prompts_samples.txt"                    # text prompts file (one prompt per line)
   work_dir: "output/sana_t2v_video_results"                              # output directory
   cfg_scale: 6                       # CFG guidance strength
@@ -19,3 +21,6 @@ launcher_args:
 
 env_vars:
   DISABLE_XFORMERS: "1"              # route attention to NPU fused kernel
+  HF_HUB_OFFLINE: "1"                # offline mode: do not access HuggingFace Hub
+  TRANSFORMERS_OFFLINE: "1"          # offline mode: transformers uses local files only
+  HF_DATASETS_OFFLINE: "1"           # offline mode: datasets uses local files only

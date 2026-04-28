@@ -1,7 +1,7 @@
 # coding=utf-8
 # Adapted from  
 # https://github.com/Tencent-Hunyuan/HunyuanVideo,
-# Copyright (c) Huawei Technologies Co., Ltd. 2025.
+# Copyright (c) Huawei Technologies Co., Ltd. 2025-2026.
 # Copyright (C) 2024 THL A29 Limited, a Tencent company. All rights reserved.
 #
 # This code is based on Tencent-Hunyuan's HunyuanVideo library and the HunyuanVideo
@@ -48,12 +48,14 @@ def add_sparse_args(parser: argparse.ArgumentParser):
     group.add_argument(
         "--sparse-attention-config",
         type=str,
-        default="hyvideo/sparse/sparse_config.yaml",
-        help="Path to sparse config."
+        default="config/single_sparse.yaml",
+        help="Path to sparse config YAML (reads the top-level sparse section). "
+             "Overridden by infer.sh via mm_function.sh when sparse is set in the launch YAML."
     )
     group.add_argument(
         "--sparse-method",
         type=str,
+        default="no_sparse",
         choices=["no_sparse", "TopK", "SVG"]
     )
     return parser
@@ -274,8 +276,10 @@ def add_inference_args(parser: argparse.ArgumentParser):
     group.add_argument(
         "--dit-weight",
         type=str,
-        default="ckpts/hunyuan-video-t2v-720p/transformers/mp_rank_00_model_states.pt",
-        help="Path to the HunyuanVideo model. If None, search the model in the args.model_root."
+        default="hunyuan-video-t2v-720p/transformers/mp_rank_00_model_states.pt",
+        help="Path to the HunyuanVideo DiT weight. Relative paths are joined with --model-base "
+        "at load time, so changing only --model-base is enough for non-FP8 inference. "
+        "Set this to an absolute path when using a custom checkpoint (e.g., FP8 quantized)."
         "1. If it is a file, load the model directly."
         "2. If it is a directory, search the model in the directory. Support two types of models: "
         "1) named `pytorch_model_*.pt`"
@@ -480,8 +484,8 @@ def add_cache_args(parser: argparse.ArgumentParser):
     group.add_argument(
         "--cache-config",
         type=str,
-        default="hyvideo/cache/cache_config.json",
-        help="Path to cache config."
+        default="config/single.yaml",
+        help="Path to cache config YAML (reads the dit_cache section). Overridden by infer.sh via mm_function.sh."
     )
 
     return parser

@@ -270,8 +270,8 @@ def _parse_args():
     parser.add_argument(
         "--cache_config",
         type=str,
-        default="./wan/cache/cache_config.json",
-        help="Path for cache_config")
+        default="./config/14b_single.yaml",
+        help="Path to cache config YAML (reads the dit_cache section). Overridden by infer.sh via mm_function.sh.")
     args = parser.parse_args()
     _validate_args(args)
 

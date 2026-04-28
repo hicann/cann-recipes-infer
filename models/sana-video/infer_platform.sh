@@ -74,9 +74,9 @@ else
     TORCH_WHL=torch-2.6.0+cpu-cp310-cp310-manylinux_2_28_aarch64.whl
     TORCH_NPU_WHL=torch_npu-2.6.0-cp310-cp310-manylinux_2_28_aarch64.whl
     [ -f "$TORCH_WHL" ] || wget "https://download.pytorch.org/whl/cpu/torch-2.6.0%2Bcpu-cp310-cp310-manylinux_2_28_aarch64.whl" || die "wget torch failed"
-    pip install "$TORCH_WHL" || die "pip install torch failed"
+    python -m pip install "$TORCH_WHL" || die "pip install torch failed"
     [ -f "$TORCH_NPU_WHL" ] || wget "https://gitcode.com/Ascend/pytorch/releases/download/v7.1.0-pytorch2.6.0/$TORCH_NPU_WHL" || die "wget torch_npu failed"
-    pip install "$TORCH_NPU_WHL" || die "pip install torch_npu failed"
+    python -m pip install "$TORCH_NPU_WHL" || die "pip install torch_npu failed"
 fi
 
 # 2. upstream Sana source merge
@@ -97,12 +97,12 @@ fi
 # the inference entry). Then install a curated list of runtime deps that the
 # inference path actually touches; skipping CLIP and dev-only packages like
 # gradio / wandb / spaces / yapf / pre-commit / image-reward / pytorch-fid.
-if pip show sana &>/dev/null || [ -d "$SANA_DIR/sana.egg-info" ]; then
+if python -m pip show sana &>/dev/null || [ -d "$SANA_DIR/sana.egg-info" ]; then
     echo "[platform] sana package already installed, skipping pip install -e ."
 else
     echo "[platform] installing sana (pip install -e . --no-deps, skips CLIP git dep)"
     cd "$SANA_DIR" || die "cd $SANA_DIR failed"
-    pip install -e . --no-deps > /dev/null || die "pip install -e . --no-deps failed"
+    python -m pip install -e . --no-deps > /dev/null || die "pip install -e . --no-deps failed"
 fi
 
 RUNTIME_DEPS=(
@@ -151,7 +151,7 @@ RUNTIME_DEPS=(
     "qwen-vl-utils"
 )
 echo "[platform] ensuring runtime dependencies"
-pip install "${RUNTIME_DEPS[@]}" > /dev/null || die "install runtime deps failed"
+python -m pip install "${RUNTIME_DEPS[@]}" > /dev/null || die "install runtime deps failed"
 
 # ensure opencv-python-headless (mmcv imports cv2 at runtime; force-install to
 # avoid `import mmcv` failing and being misdiagnosed as "mmcv not installed").
@@ -162,11 +162,11 @@ if python -c "import cv2" &>/dev/null; then
     echo "[platform] opencv-python (cv2) already importable, skipping"
 else
     echo "[platform] installing opencv-python-headless"
-    pip uninstall -y opencv-python 2>/dev/null
-    pip install opencv-python-headless==4.8.0.76 > /dev/null || die "install opencv-python-headless failed"
+    python -m pip uninstall -y opencv-python 2>/dev/null
+    python -m pip install opencv-python-headless==4.8.0.76 > /dev/null || die "install opencv-python-headless failed"
     if ! python -c "import cv2" &>/dev/null; then
         echo "[platform] cv2 still missing after install (likely stale dist-info), force-reinstalling"
-        pip install --force-reinstall --no-deps opencv-python-headless==4.8.0.76 > /dev/null \
+        python -m pip install --force-reinstall --no-deps opencv-python-headless==4.8.0.76 > /dev/null \
             || die "force-reinstall opencv-python-headless failed"
         python -c "import cv2" &>/dev/null \
             || die "cv2 still not importable after force-reinstall"
@@ -205,7 +205,7 @@ TMP_YAML=$(mktemp -t sana_platform.XXXXXX.yaml) || die "mktemp failed"
 trap 'rm -f "$TMP_YAML"' EXIT
 python - <<PYEOF || die "generate temp yaml failed"
 import yaml
-with open("$SANA_DIR/config/2b_480p_single.yaml") as f:
+with open("$SANA_DIR/config/2b_480p_single_platform.yaml") as f:
     cfg = yaml.safe_load(f)
 ma = cfg.setdefault("model_args", {})
 ma["model_path"] = "$DIT_PATH"

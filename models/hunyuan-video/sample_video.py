@@ -109,7 +109,7 @@ def main():
     if args.sparse_method != "no_sparse":
         if getattr(args, "ring_degree", 1) > 1:
             raise ValueError("Sparse attention does not support ring_degree > 1 in the current runtime.")
-        sparse_predictor_manager.from_config(f"./hyvideo/sparse/sparse_config.yaml", args.sparse_method, sparse_params)
+        sparse_predictor_manager.from_config(args.sparse_attention_config, args.sparse_method, sparse_params)
         if (
             getattr(args, "ulysses_degree", 1) > 1
             and hasattr(

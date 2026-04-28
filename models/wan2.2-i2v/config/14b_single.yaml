@@ -3,7 +3,7 @@ model_args:
   image: "examples/i2v_input.JPG"    # input reference image
   prompt: "Summer beach vacation style, a white cat wearing sunglasses sits on a surfboard."
   task: "i2v-A14B"
-  size: "832*480"                    # HxW; supported 1280*720, 832*480
+  size: "640*360"                    
   frame_num: 61                      # frame count; 4n+1 form
   sample_steps: 40                   # denoising steps
   base_seed: 100
@@ -23,5 +23,14 @@ env_vars:
   CPU_AFFINITY_CONF: "1"
 
 dit_cache:
-  method: "NoCache"                  # NoCache / FBCache / TeaCache
+  method: "NoCache"                  # [NoCache, FBCache, TeaCache]
   enable_separate_cfg: true
+  # Uncomment the params block matching the method above; only that block is read.
+  # params:
+  #   # FBCache:
+  #   rel_l1_thresh: 0.05            # L1 diff threshold
+  #
+  #   # TeaCache:
+  #   rel_l1_thresh: 0.1             # accumulated L1 threshold
+  #   coefficients: [733.226126, -401.131952, 67.5869174, -3.149879, 0.0961237896]
+  #   warmup: 2                      # first N steps compute fully

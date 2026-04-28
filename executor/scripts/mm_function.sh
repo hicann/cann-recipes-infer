@@ -20,9 +20,11 @@ function mm_launch()
 {
     mm_init_env
     mm_check_launch
+    mm_validate_yaml
     mm_parse_yaml
     mm_setup_env
     mm_generate_cache_config
+    mm_generate_sparse_config
     mm_launch_task
 }
 
@@ -35,6 +37,80 @@ function mm_check_launch()
     fi
     if [ ! -f "${YAML}" ]; then
         echo "[ERROR] YAML file not found: ${YAML}"
+        exit 1
+    fi
+}
+
+# Validate YAML structure: required top-level keys, allowed-keys whitelist, and enum
+# values for nested dit_cache.method / sparse.method. Fails fast with a clear message
+# before any subprocess is launched. model_args sub-keys are intentionally NOT checked
+# here: argparse in the entry script already rejects unknown flags.
+function mm_validate_yaml()
+{
+    python3 - <<PY_VALIDATE
+import sys, yaml
+try:
+    with open("${YAML}", "r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f) or {}
+except Exception as e:
+    print(f"[ERROR] Failed to parse YAML ${YAML}: {e}")
+    sys.exit(1)
+
+if not isinstance(cfg, dict):
+    print("[ERROR] YAML root must be a mapping.")
+    sys.exit(1)
+
+ALLOWED_TOP = {
+    "model_name", "world_size", "master_port", "entry_script",
+    "launcher", "launcher_args", "env_vars",
+    "dit_cache", "sparse", "model_args",
+}
+REQUIRED_TOP = {"model_name", "world_size", "entry_script"}
+CACHE_METHODS = {"NoCache", "FBCache", "TeaCache", "TaylorSeer"}
+SPARSE_METHODS = {"no_sparse", "TopK", "SVG"}
+
+unknown = set(cfg.keys()) - ALLOWED_TOP
+if unknown:
+    print(f"[ERROR] Unknown top-level YAML key(s): {sorted(unknown)}. Allowed: {sorted(ALLOWED_TOP)}")
+    sys.exit(1)
+
+missing = REQUIRED_TOP - set(cfg.keys())
+if missing:
+    print(f"[ERROR] Missing required top-level YAML key(s): {sorted(missing)}")
+    sys.exit(1)
+
+ws = cfg.get("world_size")
+if not isinstance(ws, int) or ws <= 0:
+    print(f"[ERROR] world_size must be a positive int, got {ws!r}")
+    sys.exit(1)
+mp = cfg.get("master_port", 29600)
+if not isinstance(mp, int):
+    print(f"[ERROR] master_port must be int, got {mp!r}")
+    sys.exit(1)
+
+dit_cache = cfg.get("dit_cache")
+if dit_cache is not None:
+    if not isinstance(dit_cache, dict):
+        print("[ERROR] dit_cache must be a mapping.")
+        sys.exit(1)
+    m = dit_cache.get("method", "NoCache")
+    if m not in CACHE_METHODS:
+        print(f"[ERROR] dit_cache.method must be one of {sorted(CACHE_METHODS)}, got {m!r}")
+        sys.exit(1)
+
+sparse = cfg.get("sparse")
+if sparse is not None:
+    if not isinstance(sparse, dict):
+        print("[ERROR] sparse must be a mapping.")
+        sys.exit(1)
+    m = sparse.get("method", "no_sparse")
+    if m not in SPARSE_METHODS:
+        print(f"[ERROR] sparse.method must be one of {sorted(SPARSE_METHODS)}, got {m!r}")
+        sys.exit(1)
+
+print("[INFO] YAML validation passed.")
+PY_VALIDATE
+    if [ $? -ne 0 ]; then
         exit 1
     fi
 }
@@ -64,6 +140,17 @@ function mm_setup_env()
     export CPU_AFFINITY_CONF=${CPU_AFFINITY_CONF:-"1"}
     export TOKENIZERS_PARALLELISM=${TOKENIZERS_PARALLELISM:-"false"}
 
+    # Work around glibc static-TLS exhaustion when CANN libraries are loaded
+    # before cv2's libGLdispatch dependency. Preloading libGLdispatch puts it
+    # into the loader's initial TLS allocation.
+    for _glx in /lib/aarch64-linux-gnu/libGLdispatch.so.0 /usr/lib/aarch64-linux-gnu/libGLdispatch.so.0; do
+        if [ -f "$_glx" ] && [[ ":${LD_PRELOAD:-}:" != *":$_glx:"* ]]; then
+            export LD_PRELOAD="$_glx${LD_PRELOAD:+:$LD_PRELOAD}"
+            echo "[INFO] LD_PRELOAD += $_glx (TLS workaround)"
+            break
+        fi
+    done
+
     # Export model-specific environment variables from YAML (overrides defaults above)
     eval "$(python3 -c "
 import yaml
@@ -72,6 +159,26 @@ env_vars = cfg.get('env_vars', {})
 for k, v in env_vars.items():
     print(f'export {k}=\"{v}\"')
 ")"
+
+    # Auto-derive MODEL_BASE env from model_args.model-base if user didn't set it explicitly.
+    # HunyuanVideo's hyvideo/constants.py reads MODEL_BASE at import time and bakes it into
+    # VAE_PATH / TEXT_ENCODER_PATH / TOKENIZER_PATH; the argparse --model-base only controls
+    # DiT weight resolution. Without this auto-export, users must specify model-base twice
+    # (once in model_args, once in env_vars) for VAE / text encoders to find local weights.
+    # Only triggers when MODEL_BASE is not already exported (yaml env_vars takes precedence).
+    if [ -z "${MODEL_BASE}" ]; then
+        AUTO_MODEL_BASE=$(python3 -c "
+import yaml
+cfg = yaml.safe_load(open('$YAML')) or {}
+ma = cfg.get('model_args') or {}
+val = ma.get('model-base') or ma.get('model_base')
+print(val if val is not None else '')
+")
+        if [ -n "${AUTO_MODEL_BASE}" ]; then
+            export MODEL_BASE="${AUTO_MODEL_BASE}"
+            echo "[INFO] Auto-derived MODEL_BASE from model_args.model-base: ${MODEL_BASE}"
+        fi
+    fi
 
     # HCCL distributed communication settings
     LOCAL_HOST=$(hostname -I | awk -F " " '{print$1}')
@@ -126,6 +233,34 @@ print('cache-config' if 'hunyuan-video' in model else 'cache_config')
     echo "[INFO] Cache config: --${CACHE_CONFIG_ARG_NAME} ${CACHE_CONFIG_PATH}"
 }
 
+# If sparse is present in YAML, pass the YAML file directly as sparse config and
+# propagate sparse.method via --sparse-method. load_sparse_config_from_file reads
+# the `sparse` section natively. If sparse is absent, do nothing (argparse default
+# --sparse-method=no_sparse keeps the sparse branch disabled).
+function mm_generate_sparse_config()
+{
+    export SPARSE_METHOD_VALUE=""
+    export SPARSE_CONFIG_PATH=""
+
+    HAS_SPARSE=$(python3 -c "
+import yaml
+cfg = yaml.safe_load(open('$YAML')) or {}
+print('1' if 'sparse' in cfg else '0')
+")
+    if [ "${HAS_SPARSE}" != "1" ]; then
+        echo "[INFO] No sparse section in YAML, skipping sparse config."
+        return
+    fi
+
+    SPARSE_METHOD_VALUE=$(python3 -c "
+import yaml
+cfg = yaml.safe_load(open('$YAML'))
+print(cfg['sparse'].get('method', 'no_sparse'))
+")
+    SPARSE_CONFIG_PATH="${YAML}"
+    echo "[INFO] Sparse config: --sparse-method ${SPARSE_METHOD_VALUE} --sparse-attention-config ${SPARSE_CONFIG_PATH}"
+}
+
 # Build command-line arguments from YAML model_args section
 # Rules:
 #   list value           -> --key val1 val2 ... (expanded, for nargs="+")
@@ -161,6 +296,11 @@ print(' '.join(parts))
         MODEL_ARGS="${MODEL_ARGS} --${CACHE_CONFIG_ARG_NAME} ${CACHE_CONFIG_PATH}"
     fi
 
+    # Append sparse args if sparse section was present in YAML
+    if [ -n "${SPARSE_METHOD_VALUE}" ] && [ -n "${SPARSE_CONFIG_PATH}" ]; then
+        MODEL_ARGS="${MODEL_ARGS} --sparse-method ${SPARSE_METHOD_VALUE} --sparse-attention-config ${SPARSE_CONFIG_PATH}"
+    fi
+
     echo "${MODEL_ARGS}"
 }
 
@@ -179,6 +319,23 @@ print(' '.join(parts))
     echo "${ACCELERATE_ARGS}"
 }
 
+# Resolve accelerate from the active Python environment instead of relying on
+# PATH, which may pick up a user-site script bound to a different interpreter.
+function mm_resolve_accelerate_bin()
+{
+    ACCELERATE_BIN=$(python -c "
+import os
+import sys
+print(os.path.join(os.path.dirname(sys.executable), 'accelerate'))
+")
+    if [ -x "${ACCELERATE_BIN}" ]; then
+        echo "${ACCELERATE_BIN}"
+        return
+    fi
+
+    command -v accelerate
+}
+
 # Launch inference task using the configured launcher
 function mm_launch_task()
 {
@@ -190,12 +347,18 @@ function mm_launch_task()
 
     if [ "${LAUNCHER}" == "accelerate" ]; then
         ACCELERATE_EXTRA=$(mm_build_accelerate_args)
+        ACCELERATE_BIN=$(mm_resolve_accelerate_bin)
+        if [ -z "${ACCELERATE_BIN}" ]; then
+            echo "[ERROR] accelerate not found in current Python env or PATH."
+            exit 1
+        fi
         echo "[INFO] Launching with accelerate (num_processes=${WORLD_SIZE}, main_process_port=${MASTER_PORT})"
+        echo "[INFO] Accelerate command: ${ACCELERATE_BIN}"
         echo "[INFO] Accelerate extra args: ${ACCELERATE_EXTRA}"
         echo "==================================>"
 
         eval PYTHONPATH=${RECIPES_ROOT}:\$PYTHONPATH \
-                 accelerate launch \
+                 ${ACCELERATE_BIN} launch \
                  --num_processes=${WORLD_SIZE} \
                  --num_machines=1 \
                  --main_process_port=${MASTER_PORT} \

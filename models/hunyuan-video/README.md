@@ -136,18 +136,7 @@ hunyuan-video/
 
 #### 自定义模型权重路径
 
-用户可选自定义模型权重路径，按照如下方式修改测试脚本：
-
-```shell
-ckpts_path=/path/to/ckpts/
-export MODEL_BASE=${ckpts_path}
-export DIT_CKPT_PATH=${MODEL_BASE}/hunyuan-video-t2v-720p/transformers/mp_rank_00_model_states.pt
-python sample_video.py \
-    --model-base ${MODEL_BASE} \
-    --dit-weight ${DIT_CKPT_PATH} \
-    ...
-// 其他参数不变，参考models/hunyuan-video/scripts/test.sh
-```
+所有预置 YAML 的 `model_args.model-base` 默认写为 `"ckpts"`（相对 `models/hunyuan-video/`），如需自定义权重路径，直接修改该字段即可——`mm_function.sh` 会同时把这个值自动 export 为 `MODEL_BASE` 环境变量，覆盖 `hyvideo/constants.py` 里 `VAE_PATH` / `TEXT_ENCODER_PATH` / `TOKENIZER_PATH` 三套默认路径（这三者在 import 时就 freeze，必须通过 env 控制）。DiT 权重默认按 `hunyuan-video-t2v-720p/transformers/mp_rank_00_model_states.pt` 在 `model-base` 下自动定位（`--dit-weight` 相对路径会与 `--model-base` 自动拼接，绝对路径则按原样使用）。如需单独指定 DiT 权重（例如使用 FP8 checkpoint），在 `model_args` 中增补 `dit-weight: "/abs/path/to/ckpt.pt"` —— `single_fp8.yaml` 即为该用法的参考样例。如确需把 `MODEL_BASE` 指向与 `model-base` 不同的目录，在 `env_vars` 中显式写 `MODEL_BASE: "..."` 即可覆盖自动派生。
 
 ### 快速启动
 
@@ -167,17 +156,13 @@ source /usr/local/Ascend/ascend-toolkit/set_env.sh
 
 `config/` 目录下已预置以下 YAML，分别对应不同的推理场景：
 
-| YAML 文件 | 卡数 | Dit-Cache | 适用场景 |
-|-----------|------|-----------|----------|
-| `single.yaml` | 1 | NoCache | 单卡基线，无加速 |
-| `single_fbcache.yaml` | 1 | FBCache | 单卡 + FBCache 加速 |
-| `single_teacache.yaml` | 1 | TeaCache | 单卡 + TeaCache 累积 L1 阈值 + warmup |
-| `single_taylorseer.yaml` | 1 | TaylorSeer | 单卡 + TaylorSeer，Taylor 展开 + CPU offload |
-| `single_fp8.yaml` | 1 | NoCache | 单卡 + FP8 量化权重（950PR） |
-| `sp8.yaml` | 8 | NoCache | 8 卡 Ulysses 序列并行 + VAE 并行，原生规格 `720*1280*129` |
-| `sp8_fbcache.yaml` | 8 | FBCache | 8 卡 SP + FBCache 加速 |
-| `sp8_teacache.yaml` | 8 | TeaCache | 8 卡 SP + TeaCache 加速 |
-| `sp8_taylorseer.yaml` | 8 | TaylorSeer | 8 卡 SP + TaylorSeer，Taylor 展开 + CPU offload |
+| YAML 文件 | 卡数 | 适用场景 |
+|-----------|------|----------|
+| `single.yaml` | 1 | 单卡基线；`dit_cache.method` 可选 `NoCache / FBCache / TeaCache / TaylorSeer`，yaml 内有注释展示各方法参数 |
+| `single_fp8.yaml` | 1 | 单卡 + FP8 量化权重（950PR） |
+| `single_sparse.yaml` | 1 | 单卡 + 块稀疏 Attention（默认 SVG，可切 TopK），`320*480*65` 规格对齐官方 sanctioned 测试 |
+| `sp8.yaml` | 8 | 8 卡 Ulysses 序列并行 + VAE 并行，原生规格 `720*1280*129`；`dit_cache.method` 同上可选 |
+| `sp8_sparse.yaml` | 8 | 8 卡 Ulysses + 块稀疏 Attention（默认 SVG，可切 TopK），`720*1280*129` 规格；与 Dit-Cache 互斥（`dit_cache.method: NoCache`） |
 
 #### 3. 修改模型权重路径与提示词
 
@@ -200,8 +185,8 @@ YAML 中 `model_args` 会按以下规则透传给 `sample_video.py`：
 # 默认：8 卡多卡推理
 export YAML_FILE_NAME=sp8.yaml
 
-# 单卡 + TeaCache
-# export YAML_FILE_NAME=single_teacache.yaml
+# 单卡（通过 dit_cache.method 切换 FBCache / TeaCache / TaylorSeer）
+# export YAML_FILE_NAME=single.yaml
 ```
 
 #### 5. 拉起推理
@@ -222,7 +207,7 @@ bash infer.sh
 
 ```yaml
 dit_cache:
-  method: "TeaCache"                # NoCache / FBCache / TeaCache / TaylorSeer
+  method: "TeaCache"                # [NoCache, FBCache, TeaCache, TaylorSeer]
   enable_separate_cfg: true
   params:                           # 方法特有参数（覆盖内置默认值）
     rel_l1_thresh: 0.15
@@ -247,13 +232,20 @@ dit_cache:
 
 量化**支持多卡推理**，**仅支持 950PR**。
 
+### 块稀疏 Attention
+
+在启动 YAML 顶层加 `sparse:` 段即可启用（单卡参考 `config/single_sparse.yaml`，多卡参考 `config/sp8_sparse.yaml`），`sparse.method` 可选 `no_sparse / TopK / SVG`；无 `sparse:` 段或 `method: no_sparse` 时稀疏分支关闭。`block_size_Q/K`、`model`、以及 `params.TopK / params.SVG` 各自的策略参数全部内联到同一份 yaml 中，不再依赖独立的 `sparse_config.yaml`。
+
+约束与注意事项：
+- **支持单卡和 Ulysses 多卡**：`hyvideo/sparse/sparse_block.py` 已适配 Ulysses 序列并行的 all-to-all 通信，`sample_video.py` 在 `ulysses_degree > 1` 时会自动调用 `apply_head_reorder_for_load_balance` 做 head 级负载均衡（详见[优化文档](https://gitcode.com/cann/cann-recipes-infer/blob/master/docs/models/hunyuan-video/hunyuan_video_optimization.md) `Ulysses + TopK/SVG 联合优化` 章节）。
+- **不支持 Ring Attention**：`sample_video.py` 在 `ring_degree > 1` 时会直接抛 `ValueError`；多卡 sparse 仅可与 Ulysses 组合（`ring-degree: 1`），不可与 Ring 组合。
+- **与 Dit-Cache 互斥**：`sample_video.py` 启用 sparse 时会替换**所有** double/single block 的 forward，会覆盖 FBCache / TeaCache / TaylorSeer 设置的 block forward；同时启用时只有 sparse 生效，故 `single_sparse.yaml` / `sp8_sparse.yaml` 都固定 `dit_cache.method: NoCache`。
+- **算子依赖**：基于[blitz_sparse_attention 算子](https://gitcode.com/cann/ops-transformer/blob/master/experimental/attention/blitz_sparse_attention/README.md)实现，运行前需依据参考文档编译算子库。
+- **TopK 前置**：选择 `TopK` 时需先运行 `module/blockwise_sparse/offline_profiling/offline_profiling_hyvideo.py` 生成 sparsity 文件（路径由 yaml 中 `sparse.params.TopK.sparsity_files_path` 指定，规格须与 `video-size / video-length` 一致——单卡默认 `320*480*65`，多卡默认 `720*1280*129`），详见[优化文档](https://gitcode.com/cann/cann-recipes-infer/blob/master/docs/models/hunyuan-video/hunyuan_video_optimization.md) `TopK` 章节。
+
 ### 性能分析
 
-**块稀疏 Attention**：传入参数`--sparse-method` 启用块稀疏 Attention，可选的稀疏策略为`TopK`和`SVG`，在`models/hunyuan-video/hyvideo/sparse/sparse_config.yaml`文件中可以调整参数配置。该优化方法基于[blitz_sparse_attention算子](https://gitcode.com/cann/ops-transformer/blob/master/experimental/attention/blitz_sparse_attention/README.md)实现，运行前需要依据参考文档编译算子。当选择稀疏策略为TopK时，需要运行`offline-profiling`程序，可参考[优化文档](https://gitcode.com/cann/cann-recipes-infer/blob/master/docs/models/hunyuan-video/hunyuan_video_optimization.md)中，`TopK`章节实现过程。
-
-**性能分析**：本样例支持Ascend PyTorch Profiler接口采集并分析模型性能，在脚本中传入参数`--prof-dit`，启用性能分析，分析文件默认保存在`.prof`路径。具体使用方法请参考CANN社区文档[性能分析](https://www.hiascend.com/document/detail/zh/canncommercial/80RC3/devaids/devtools/profiling/atlasprofiling_16_0006.html)。**支持多卡推理**。
-
-**多卡推理支持**：块稀疏 Attention 支持与 Ulysses / Ring Attention 序列并行组合使用。在脚本中同时启用 `--sparse-method` 和多卡并行配置即可，例如通过 YAML 设置 `world_size`、`ulysses-degree`、`ring-degree` 等参数，并选择 `TopK` 或 `SVG` 稀疏策略。多卡稀疏推理仍需满足下文的并行度、视频规格和 head 数约束。
+本样例支持 Ascend PyTorch Profiler 接口采集并分析模型性能，在 YAML 的 `model_args` 中添加 `prof-dit: true` 即可启用性能分析，分析文件默认保存在 `.prof` 路径。具体使用方法请参考 CANN 社区文档[性能分析](https://www.hiascend.com/document/detail/zh/canncommercial/80RC3/devaids/devtools/profiling/atlasprofiling_16_0006.html)。**支持多卡推理**。
 
 ### 多卡推理约束与并行配置组合
 

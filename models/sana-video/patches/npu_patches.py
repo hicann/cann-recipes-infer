@@ -18,6 +18,7 @@
 
 import importlib
 import math
+import os
 
 import torch
 import torch.nn as nn
@@ -216,9 +217,30 @@ def patch_rotary_mul() -> None:
     sana_blocks.LiteLAReLURope.forward = forward
 
 
+def patch_local_text_encoder_path() -> None:
+    builder = importlib.import_module("diffusion.model.builder")
+    original_get_tokenizer_and_text_encoder = builder.get_tokenizer_and_text_encoder
+
+    def get_tokenizer_and_text_encoder(name="T5", device="cuda"):
+        if not os.path.exists(name):
+            return original_get_tokenizer_and_text_encoder(name=name, device=device)
+
+        tokenizer = builder.AutoTokenizer.from_pretrained(name)
+        tokenizer.padding_side = "right"
+        text_encoder = (
+            builder.AutoModelForCausalLM.from_pretrained(name, torch_dtype=torch.bfloat16)
+            .get_decoder()
+            .to(device)
+        )
+        return tokenizer, text_encoder
+
+    builder.get_tokenizer_and_text_encoder = get_tokenizer_and_text_encoder
+
+
 def apply_npu_optimization_patches() -> None:
     patch_conv1x1_matmul()
     patch_temporal_conv_swap()
     patch_rms_norm()
     patch_fusion_attention()
     patch_rotary_mul()
+    patch_local_text_encoder_path()

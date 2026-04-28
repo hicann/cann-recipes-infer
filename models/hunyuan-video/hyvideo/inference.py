@@ -368,6 +368,8 @@ class Inference(object):
     def load_state_dict(args, model, pretrained_model_path):
         load_key = args.load_key
         dit_weight = Path(args.dit_weight)
+        if not dit_weight.is_absolute():
+            dit_weight = Path(args.model_base) / dit_weight
 
         if dit_weight is None:
             model_dir = pretrained_model_path / f"t2v_{args.model_resolution}"

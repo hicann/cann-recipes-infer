@@ -3,7 +3,7 @@ model_args:
   image: "examples/i2v_input.JPG"    # input reference image
   prompt: "Summer beach vacation style, a white cat wearing sunglasses sits on a surfboard. The fluffy-furred feline gazes directly at the camera with a relaxed expression. Blurred beach scenery forms the background featuring crystal-clear waters, distant green hills, and a blue sky dotted with white clouds. The cat assumes a naturally relaxed posture, as if savoring the sea breeze and warm sunlight. A close-up shot highlights the feline's intricate details and the refreshing atmosphere of the seaside."
   task: "i2v-A14B"
-  size: "1280*720"                   # HxW; supported 1280*720, 832*480
+  size: "1280*720"                   
   frame_num: 81                      # frame count; 4n+1 form
   sample_steps: 40                   # denoising steps
   base_seed: 100

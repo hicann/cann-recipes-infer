@@ -81,9 +81,15 @@ MMCV_WITH_OPS=1 FORCE_NPU=1 python setup.py install
 cd ..
 ```
 ## 模型权重
-执行脚本会自动下载模型权重到`/root/.cache/huggingdace/hub/`目录下。
-若下载失败，可手动下载[SANA-Video_2B_480p](https://huggingface.co/Efficient-Large-Model/SANA-Video_2B_480p)模型到该目录下。
+普通 `infer.sh` 默认使用本地离线权重路径，运行前需准备以下文件或目录，并按实际存放位置修改 `config/2b_480p_single.yaml`：
 
+| 权重类型 | YAML 字段 | 默认相对路径 | 说明 |
+|----------|-----------|--------------|------|
+| DiT / transformer | `model_args.model_path` | `./SANA-Video_2B_480p/checkpoints/SANA_Video_2B_480p.pth` | SANA-Video 主模型权重 |
+| VAE | `model_args.vae.vae_pretrained` | `./SANA-Video_2B_480p/vae/Wan2.1_VAE.pth` | WanVAE 权重 |
+| 文本编码器 | `model_args.text_encoder.text_encoder_name` | `./gemma-2-2b-it` | 本地 Gemma HuggingFace 目录，需包含 `config.json`、tokenizer 文件和模型权重 |
+
+权重可从 [SANA-Video_2B_480p](https://huggingface.co/Efficient-Large-Model/SANA-Video_2B_480p) 和 [gemma-2-2b-it](https://huggingface.co/Efficient-Large-Model/gemma-2-2b-it) 下载后放置到上述目录。`infer_platform.sh` 面向一站式平台场景，会使用 `config/2b_480p_single_platform.yaml` 和脚本内的 `WEIGHTS_DIR` 自动下载/定位权重。
 
 ## 快速启动
 
@@ -105,7 +111,8 @@ source /usr/local/Ascend/ascend-toolkit/set_env.sh
 
 | YAML 文件 | 卡数 | 启动器 | 适用场景 |
 |-----------|------|--------|----------|
-| `2b_480p_single.yaml` | 1 | accelerate（`mixed_precision: bf16`） | SANA-Video 2B 480p 单卡文生视频 |
+| `2b_480p_single.yaml` | 1 | accelerate（`mixed_precision: bf16`） | SANA-Video 2B 480p 单卡文生视频，本地离线权重 |
+| `2b_480p_single_platform.yaml` | 1 | python 直接拉起 | 一站式平台专用模板，由 `infer_platform.sh` 读取并生成临时本地权重配置 |
 
 YAML 中的关键字段：
 
@@ -115,9 +122,14 @@ launcher_args:
   mixed_precision: "bf16"          # 透传 accelerate launch --mixed_precision=bf16
 env_vars:
   DISABLE_XFORMERS: "1"            # 屏蔽 xformers，走 NPU 融合算子
+  HF_HUB_OFFLINE: "1"              # 普通 infer.sh 默认离线运行
+  TRANSFORMERS_OFFLINE: "1"
+  HF_DATASETS_OFFLINE: "1"
 model_args:
   config: "configs/sana_video_config/Sana_2000M_480px_AdamW_fsdp.yaml"
-  model_path: "hf://Efficient-Large-Model/SANA-Video_2B_480p/checkpoints/SANA_Video_2B_480p.pth"
+  model_path: "./checkpoints/SANA_Video_2B_480p.pth"
+  vae.vae_pretrained: "./vae/Wan2.1_VAE.pth"
+  text_encoder.text_encoder_name: "./gemma-2-2b-it"
   txt_file: "asset/samples/video_prompts_samples.txt"
   cfg_scale: 6
   motion_score: 30
@@ -133,7 +145,9 @@ model_args:
 | YAML 字段 | 含义 |
 |-----------|------|
 | `config` | 推理使用的配置文件（上游 Sana 的 YAML） |
-| `model_path` | 推理使用的权重文件路径，默认从 HuggingFace 自动下载 |
+| `model_path` | 推理使用的 DiT / transformer 权重文件路径 |
+| `vae.vae_pretrained` | 推理使用的 VAE 权重文件路径 |
+| `text_encoder.text_encoder_name` | 推理使用的文本编码器，普通离线配置中填写本地 Gemma HuggingFace 目录 |
 | `txt_file` | 推理使用的文本提示词文件 |
 | `cfg_scale` | 提示词对齐强度 |
 | `motion_score` | 运动强度分数 |
@@ -206,6 +220,8 @@ bash infer_platform.sh
 ```
 
 前置条件：已完成 §1（conda 环境已激活）。脚本本身会依次完成：source CANN 环境脚本 → 安装 torch / torch_npu → 合入上游 Sana 源码 → 安装项目依赖与 NPU mmcv → 通过 hf-mirror 下载权重 → 生成指向本地权重的临时 YAML → 调用 python 启动单卡推理。各步骤均幂等，已完成的环节会自动跳过。
+
+说明：`infer_platform.sh` 不直接读取普通离线配置 `2b_480p_single.yaml`，而是读取 `2b_480p_single_platform.yaml` 作为平台模板，再按 `WEIGHTS_DIR` 生成临时 YAML。普通 `infer.sh` 与一站式平台启动互不影响。
 
 生成结果位于 `output/sana_t2v_video_results/vis/*.mp4`，一条 prompt 对应一个 mp4。
 
