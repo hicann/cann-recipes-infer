@@ -173,8 +173,10 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_hc_pre_npu(
     // get soc name
     static const char* socName = aclrtGetSocName();
     static const char* prefix = "Ascend950";
+    static const std::set<std::string> invalid_versions = {"Ascend910_9362", "Ascend910_9372", "Ascend910B3",
+                                                           "Ascend910B4-1", "Ascend910B4"};
     const bool is_ascend950 = socName != nullptr && std::string(socName).find(prefix) == 0;
-
+    const bool isValidAscend910 = socName != nullptr && invalid_versions.count(std::string(socName)) == 0;
     check_hc_pre_shape_and_dtype(x, hc_fn, hc_scale, hc_base, is_ascend950);
     // get x shape
     auto xDims = x.dim();
@@ -200,7 +202,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_hc_pre_npu(
         ASCEND_LOGI("For current bs %d, implemented hc_pre using a concatenation of small operators.", bs);
         return hc_pre_composite(x, hc_fn, hc_scale, hc_base, hc_mult, hc_sinkhorn_iters, norm_eps, hc_eps);
     } else {
-        if (bs > SINGLE_OP_MAX_BS || bs % SINGLE_OP_BS_ALIGN_FACTOR != 0) {
+        if (!isValidAscend910 || bs > SINGLE_OP_MAX_BS || bs % SINGLE_OP_BS_ALIGN_FACTOR != 0) {
             ASCEND_LOGI("For current bs %d, implemented hc_pre using a concatenation of small operators.", bs);
             return hc_pre_composite(x, hc_fn, hc_scale, hc_base, hc_mult, hc_sinkhorn_iters, norm_eps, hc_eps);
         }
