@@ -83,8 +83,6 @@ def check_parallel_settings(world_size, runner_settings):
         raise ValueError(f"{world_size=} is not divisible by {attn_tp_size=}")
     if world_size % oproj_tp_size != 0:
         raise ValueError(f"{world_size=} is not divisible by {oproj_tp_size=}")
-    if oproj_tp_size > 8:
-        raise ValueError(f"{oproj_tp_size=} should not be greater than 8")
     if moe_tp_size != 1:
         raise ValueError(f"{moe_tp_size=} is invalid. The moe_tp_size supports only 1.")
     if attn_tp_size > 1 and oproj_tp_size > 1:

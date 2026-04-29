@@ -75,6 +75,7 @@ from .modules.registry import OpKernel
 logger = logging.get_logger(__name__)
 
 HADAMARD_SIZE = 128
+MATMUL_MAX_AXIS_VALUE = 65535
 
 
 class DeepseekV3SharedExpert(nn.Module):
@@ -555,6 +556,8 @@ class Attention(nn.Module):
         self.attn_tp_size = self.runner_settings.get("parallel_config").get("attn_tp_size", 1)
         self.attn_dp_size = self.runner_settings.get("parallel_config").get("attn_dp_size", 1)
         self.oproj_tp_size = self.runner_settings.get("parallel_config").get("oproj_tp_size", 1)
+        if self.oproj_tp_size > config.o_groups:
+            raise ValueError(f"{self.oproj_tp_size=} should not be greater than {config.o_groups =}")
         self.moe_tp_size = self.runner_settings.get("parallel_config").get("moe_tp_size", 1)
         self.moe_ep_size = self.runner_settings.get("parallel_config").get("moe_ep_size", 1)
         self.world_size = self.runner_settings.get("world_size", 16)
@@ -1173,7 +1176,11 @@ class Attention(nn.Module):
  	                                                        group_sizes=(0, 0, 32),perm_x1=(1, 0, 2),perm_x2=(0, 1, 2),
                                                             perm_y=(1, 0, 2))
         else:
-            o = torch_npu.npu_transpose_batchmatmul(o, self.wo_a.weight, perm_x1=(1, 0, 2), perm_y=(1, 0, 2))
+            if self.n_heads * self.head_dim // self.oproj_tp_size > MATMUL_MAX_AXIS_VALUE and \
+               self.platform_version == "A3":
+                o = torch.matmul(o.transpose(0, 1), self.wo_a.weight).transpose(0, 1).contiguous()
+            else:
+                o = torch_npu.npu_transpose_batchmatmul(o, self.wo_a.weight, perm_x1=(1, 0, 2), perm_y=(1, 0, 2))
         if self.oproj_tp_size > 1:
             # [oproj_tp_size, bsz * seq_len, num_groups_per_rank // oproj_tp_size * o_lora_rank]
             o = o.view(self.oproj_tp_size, bsz * seq_len, -1)

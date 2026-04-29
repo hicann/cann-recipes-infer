@@ -50,6 +50,7 @@ logging.getLogger("paramiko").setLevel(logging.ERROR)
 
 torch.manual_seed(42)
 torch.npu.manual_seed_all(42)
+MATMUL_MAX_AXIS_VALUE = 65535
 
 
 class DeepSeekRunner(ModelRunner):
@@ -136,7 +137,9 @@ class DeepSeekRunner(ModelRunner):
                     scales_dtype['smooth_scale_dtype'] = torch.float
                     break
 
-            is_weight_nz = False if "compressor" in module_name else self.enable_weight_nz
+            is_wq_b_transpose = self.hf_config.num_attention_heads * self.hf_config.head_dim > MATMUL_MAX_AXIS_VALUE
+            is_weight_nz = False if "compressor" in module_name or (is_wq_b_transpose and "wq_b" in module_name) \
+                                 else self.enable_weight_nz
             is_transpose = False if "compressor" in module_name else True
             if isinstance(quant_method, QuantizeMethodBase):
                 quant_method.process_weights_after_loading(\
