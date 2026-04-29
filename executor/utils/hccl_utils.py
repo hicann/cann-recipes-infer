@@ -60,10 +60,11 @@ def init_comm_group(
 
         cur_group_list = [start_rank_id + i * group_stride for i in range(group_size)]
         if default_pg is not None and group_type is None:
-            use_default_pg = (group_num == world_size) or (group_num == 1)
             # fullmesh v2, communication for Expert Parallelism shall be exclusively occupied
-            if use_default_pg and "moe_ep_group" not in group_name:
+            if group_num == world_size and "moe_ep_group" not in group_name:
                 cur_group = None
+            elif group_num == 1 and "moe_ep_group" not in group_name:
+                cur_group = default_pg
             else:
                 logging.info(f"group:{group_name} create default type comm group")
                 options = torch_npu._C._distributed_c10d.ProcessGroupHCCL.Options()
