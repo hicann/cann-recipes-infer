@@ -576,14 +576,46 @@ class HunyuanImage3NpuFIA(HunyuanImage3SDPAAttention):
         if self.moe_ep_size > 1:
             if pad_len > 0:
                 attn_output = F.pad(attn_output, (0, 0, 0, pad_len), mode="constant", value=0.0)
-            attn_output = rearrange(attn_output, 'b n s d -> (s b) (n d)')
-            attn_output = torch_npu.npu_mm_reduce_scatter_base(attn_output, self.o_proj.weight.transpose(0, 1),
-                self.moe_ep_group._get_backend(torch.device("npu")).get_hccl_comm_name(local_rank),
-                self.moe_ep_size, reduce_op='sum')
-            attn_output = rearrange(attn_output, '(s b) h -> b s h', b=bsz)
-            ep_rank = self.hccl_comm_dict.get("ep_rank")
-            if ep_rank == self.moe_ep_size - 1 and pad_len > 0:
-                attn_output = attn_output[:, :-pad_len, :]
+
+            cur_device_name = torch.npu.get_device_name()
+
+            if "Ascend910B" in cur_device_name:
+                attn_output = rearrange(attn_output, 'b n s d -> b s (n d)')
+                attn_output = self.o_proj(attn_output)
+
+                h = attn_output.shape[-1]
+                new_output = torch.empty(
+                    [bsz, s_per_rank, h],
+                    dtype=attn_output.dtype,
+                    device=torch.device(f"npu:{local_rank}")
+                )
+                dist.reduce_scatter(
+                    new_output,
+                    [attn_output[:, idx * s_per_rank:(idx + 1) * s_per_rank, :].contiguous()
+                     for idx in range(self.moe_ep_size)],
+                    op=dist.ReduceOp.SUM,
+                    group=self.moe_ep_group
+                )
+
+                ep_rank = torch.distributed.get_rank(self.hccl_comm_dict.get("moe_ep_group"))
+                if ep_rank == self.moe_ep_size - 1 and pad_len > 0:
+                    attn_output = new_output[:, :-pad_len, :]
+                else:
+                    attn_output = new_output
+            else:
+                attn_output = rearrange(attn_output, 'b n s d -> (s b) (n d)')
+                attn_output = torch_npu.npu_mm_reduce_scatter_base(
+                    attn_output,
+                    self.o_proj.weight.transpose(0, 1),
+                    self.moe_ep_group._get_backend(torch.device("npu")).get_hccl_comm_name(local_rank),
+                    self.moe_ep_size,
+                    reduce_op='sum'
+                )
+                attn_output = rearrange(attn_output, '(s b) h -> b s h', b=bsz)
+
+                ep_rank = self.hccl_comm_dict.get("ep_rank")
+                if ep_rank == self.moe_ep_size - 1 and pad_len > 0:
+                    attn_output = attn_output[:, :-pad_len, :]
         else:
             attn_output = rearrange(attn_output, 'b n s d -> b s (n d)')
             attn_output = self.o_proj(attn_output)

@@ -85,7 +85,7 @@ MoE模块中，路由专家采用TP部署。共享专家的计算与路由专家
 
 #### MMReduceScatter
 
-对于o_proj与ReduceScatter，可以考虑使用[torch_npu.npu_mm_reduce_scatter_base](https://www.hiascend.com/document/detail/zh/Pytorch/730/apiref/torchnpuCustomsapi/docs/context/torch_npu-npu_mm_reduce_scatter_base.md)进行替换。须注意的是，该算子仅支持2维tensor作为输入，且只能沿着第0轴切分。因此，调用此算子前需要先将hidden_states的layout由`[b n s d]`转为`[(s b) (n d)]`，调用之后再转回`[b s (n d)]`。注意调用时s轴必须在最内侧，否则会出现精度问题。
+对于o_proj与ReduceScatter，可以考虑使用[torch_npu.npu_mm_reduce_scatter_base](https://www.hiascend.com/document/detail/zh/Pytorch/730/apiref/torchnpuCustomsapi/docs/context/torch_npu-npu_mm_reduce_scatter_base.md)进行替换。须注意的是，该算子仅支持2维tensor作为输入，且只能沿着第0轴切分。因此，调用此算子前需要先将hidden_states的layout由`[b n s d]`转为`[(s b) (n d)]`，调用之后再转回`[b s (n d)]`。注意调用时s轴必须在最内侧，否则会出现精度问题(A2平台下暂未使能该融合算子)。
 
 ### GMM使能&&Routing优化
 在MoE模块中，如果通过for循环处理每个专家，单独计算`expert_num`个前馈神经网络（FFN），容易导致计算效率较低。CANN提供了`GroupedMatmul`算子，可以同时计算多个专家，从而提高计算和搬运效率。具体实现可参考在`HunyuanMoE`类中的`npu_grouped_matmul`模式下的实现。
