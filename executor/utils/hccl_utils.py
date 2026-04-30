@@ -16,6 +16,8 @@ import torch_npu
 import torch.distributed as dist
 from torch.distributed.distributed_c10d import _world
 
+logger = logging.getLogger(__name__)
+
 from executor.utils import align_up
 
 WIN_ADDR_ALIGN = 512
@@ -41,11 +43,17 @@ def init_comm_group(
     world_size,
     group_stride=1,
     group_name="default",
-    hccl_buffer_size=200,
+    hccl_buffer_size=None,
     return_name=False,
     group_type=None, # 1：hostcpu_ts 2 aicpu_ts 3:aiv 4:aiv_only 5:ccu_ms 6:ccu_sch 7 aicpu_ub 0 default
     platform_version="A3",
 ):
+    # Respect HCCL_BUFFSIZE env var when caller doesn't pass an explicit size.
+    # ProcessGroupHCCL options.hccl_config does NOT read the env var, so
+    # without this fallback an `export HCCL_BUFFSIZE=...` from launch scripts
+    # has no effect on moe_ep groups created via comm_manager.
+    if hccl_buffer_size is None:
+        hccl_buffer_size = int(os.environ.get("HCCL_BUFFSIZE", 200))
     group_size = world_size // group_num
     default_pg = get_default_group()
 
@@ -96,14 +104,14 @@ def init_comm_group(
 
         if start_rank_id == init_rank_id:
             cur_group_set = cur_group
-            logging.info(f"group_name is {group_name}, group_list: {cur_group_list}")
-    logging.info(f"{group_name} hccl comm init rank_id: {global_rank}")
+            logger.info(f"group_name is {group_name}, group_list: {cur_group_list}")
+    logger.info(f"{group_name} hccl comm init rank_id: {global_rank}")
     if not return_name:
         return cur_group_set
     else:
-        logging.info(f"{group_name} hccl comm init in else branch rank_id: {global_rank}")
+        logger.info(f"{group_name} hccl comm init in else branch rank_id: {global_rank}")
         comm_name = get_group_name(cur_group_set, global_rank)
-        logging.info(f"{group_name} rank_{global_rank} hccl comm init in else branch comm_name: {comm_name}")
+        logger.info(f"{group_name} rank_{global_rank} hccl comm init in else branch comm_name: {comm_name}")
         return cur_group_set, comm_name
 
 
@@ -152,9 +160,9 @@ def calc_moe_hccl_buffer_size(
     else:
         hccl_buffer_size = moe_buffer_size
 
-    logging.info(f"batch_size:{batch_size} world_size:{world_size} moe_ep_size:{moe_ep_size}")
-    logging.info(f"experts_per_rank:{experts_per_rank} hidden_size:{hidden_size} spec_len:{spec_len}")
-    logging.info(f"dispatch_size:{dispatch_size} combine_size:{combine_size}")
-    logging.info(f"hccl_buffer_size:{hccl_buffer_size} (MB) moe_buffer_size:{moe_buffer_size} (MB)")
+    logger.info(f"batch_size:{batch_size} world_size:{world_size} moe_ep_size:{moe_ep_size}")
+    logger.info(f"experts_per_rank:{experts_per_rank} hidden_size:{hidden_size} spec_len:{spec_len}")
+    logger.info(f"dispatch_size:{dispatch_size} combine_size:{combine_size}")
+    logger.info(f"hccl_buffer_size:{hccl_buffer_size} (MB) moe_buffer_size:{moe_buffer_size} (MB)")
 
     return hccl_buffer_size

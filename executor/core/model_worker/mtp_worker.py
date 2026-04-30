@@ -32,7 +32,7 @@ from executor.utils.forward_metadata import set_forward_metadata, get_forward_me
 from ..types_.types import MTPInfo, Batch
 
 
-logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 class MTPWorker:
@@ -121,6 +121,11 @@ class MTPWorker:
         kv_len = get_forward_metadata().kv_len.to(self.device)
         q_len = self.next_n + 1
         if batch:
+            # Move spec_tokens to NPU (may be CPU when sourced from PD transfer
+            # metadata or the dummy-batch synthesizer) and write back so the
+            # later verify_spec_tokens read in execution_engine sees an NPU
+            # tensor — otherwise that comparison hits a device mismatch.
+            batch.mtp_infos.spec_tokens = batch.mtp_infos.spec_tokens.to(self.device)
             spec_tokens = batch.mtp_infos.spec_tokens
             # input_ids is [B] 1D, unsqueeze to [B, 1] for concat with spec_tokens [B, next_n]
             input_ids = torch.cat([input_ids.unsqueeze(1), spec_tokens], dim=1)
@@ -269,10 +274,14 @@ class MTPWorker:
         model_inputs_main: Dict,
         prev_hidden_states: torch.Tensor,
     ):
-        """Execute multi-step speculative inference to generate draft tokens."""
+        """Execute multi-step speculative inference to generate draft tokens.
+
+        Returns per-step inference times so the scheduler can log each step
+        individually instead of only seeing the summed total.
+        """
         # Determine number of MTP steps: single for mini-batch prefill, else next_n steps
         loop_mtp = 1 if batch.is_prefill else self.next_n
-        infer_time_mtp = 0
+        infer_times: list[float] = []
         if not batch.mtp_infos:
             batch.mtp_infos = MTPInfo()
         batch.mtp_infos.set_mtp_info(
@@ -296,7 +305,7 @@ class MTPWorker:
                 is_prefill=batch.mtp_infos.is_prefill,
                 is_mtp=True
             )
-            infer_time_mtp += infer_time
+            infer_times.append(infer_time)
             logits, prev_hidden_states = output
 
             # Process output after inference
@@ -305,4 +314,4 @@ class MTPWorker:
                 logits,
                 mtp_infos=batch.mtp_infos,
             )
-        return infer_time_mtp
+        return infer_times

@@ -1033,10 +1033,6 @@ class DeepseekV3Attention(nn.Module):
         cos = cos.view(-1, 1, 1, self.qk_rope_head_dim)
         sin = sin.view(-1, 1, 1, self.qk_rope_head_dim)
 
-        if self.kv_cache_quant_mode == "int8" and self.ckv_scale_reci is None:
-            self.ckv_scale_reci = torch.reciprocal(self.ckv_scale)
-            self.ckv_scale_reci_repeat = self.ckv_scale_reci.repeat(self.kv_lora_rank).view(1, -1)
-
         k_rope, k_nope = torch_npu.npu_kv_rmsnorm_rope_cache_v2(
             latent_cache,
             self.kv_a_layernorm.weight,
@@ -1355,6 +1351,9 @@ class DeepseekV3Attention(nn.Module):
             "block_table": block_table[self.attn_type]
         }
         # Only suuport PA
+        if self.kv_cache_quant_mode == "int8" and self.ckv_scale_reci is None:
+            self.ckv_scale_reci = torch.reciprocal(self.ckv_scale)
+            self.ckv_scale_reci_repeat = self.ckv_scale_reci.repeat(self.kv_lora_rank).view(1, -1)
         if is_prefill:
             fn = self.forward_page_attention_normal
         elif self.enable_mla_prolog:
@@ -2445,6 +2444,7 @@ class DeepseekV3ForCausalLM(nn.Module):
             num_layers=len(layer_infos),
             block_size=self.block_size,
             layer_infos=layer_infos,
+            is_mla_backend=True,
         )
 
     # Adapted from vllm.model_executor.models.deepseek_v2.DeepseekV2ForCausalLM.load_weights

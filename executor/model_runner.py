@@ -26,13 +26,12 @@ from module.quantization import (QUANTIZATION_METHODS,
                                  get_quantization_config,
                                  get_quant_config)
 
+from executor.utils.logging_config import setup_logging
+
 torch.npu.config.allow_internal_format = True
 
-root_logger = logging.getLogger()
-root_logger.handlers.clear()
-logging.basicConfig(format='%(asctime)s - %(levelname)s - [LLM](%(filename)s:%(lineno)d): %(message)s',
-                    level=logging.INFO)
-logging.getLogger("paramiko").setLevel(logging.ERROR)
+setup_logging()
+logger = logging.getLogger(__name__)
 
 torch.manual_seed(42)
 torch.npu.manual_seed_all(42)
@@ -118,12 +117,9 @@ class ModelRunner:
         return profiler
 
     def init_device(self):
-        logging.info("Set execution using npu index: %s, global: %s", self.local_rank, self.global_rank)
+        logger.info("Set execution using npu index: %s, global: %s", self.local_rank, self.global_rank)
         self.device = torch.device("%s:%s" % ("npu", self.local_rank))
         torch.npu.set_device(self.device)
-
-        master_addr = os.environ["MASTER_ADDR"]
-        master_port = int(os.environ["MASTER_PORT"])
 
         if torch.npu.is_available() and self.world_size > 1:
             default_pg = get_default_group()
@@ -159,7 +155,7 @@ class ModelRunner:
         if config is None:
             raise Exception("config cannot be None")
         if self.use_pretrained_model:
-            logging.info("Try to load pretrained model in path: %s", self.model_path)
+            logger.info("Try to load pretrained model in path: %s", self.model_path)
             loader = DefaultModelLoader()
 
         else:
@@ -192,7 +188,7 @@ class ModelRunner:
         self.model = model(model_config, runner_settings=self.runner_settings, **kwargs).to(self.dtype)
 
     def _load_model_with_manual_splited_weight(self, model, **kwargs):
-        logging.info("Try to load pretrained model in path: %s", self.model_path)
+        logger.info("Try to load pretrained model in path: %s", self.model_path)
         self.model = model.from_pretrained(self.model_path,
                                             low_cpu_mem_usage=True,
                                             ignore_mismatched_sizes=True,
@@ -208,7 +204,7 @@ class ModelRunner:
 
     def to_device(self):
         self.model.to(self.device)
-        logging.info("Model weights H2D finished.")
+        logger.info("Model weights H2D finished.")
 
     def cast_format(self):
         pass
@@ -245,9 +241,9 @@ class ModelRunner:
         return inputs
 
     def compile_model(self):
-        logging.info("The final model structure is: \n %s", self.model)
+        logger.info("The final model structure is: \n %s", self.model)
         if "graph" in self.execute_mode:
-            logging.info("Try to compile model")
+            logger.info("Try to compile model")
             self.graph_compile()
 
     def graph_compile(self):
@@ -297,7 +293,7 @@ class ModelRunner:
         end_time = time.time()
         inference_time = end_time - start_time
         inference_stage = "prefill" if is_prefill else "decode"
-        logging.info(f"{self.model_name} inference time cost of {inference_stage} is {(inference_time)*1000:.2f} ms")
+        logger.info(f"{self.model_name} inference time cost of {inference_stage} is {(inference_time)*1000:.2f} ms")
         return (logits, inference_time)
 
     # Copied from vllm.config._parse_quant_hf_config
@@ -333,7 +329,7 @@ class ModelRunner:
                     f"be one of {supported_quantization}.")
 
     def model_generate(self, input_dict, input_lens, warm_up=False):
-        logging.info("Prompt lens is : %d", input_lens)
+        logger.info("Prompt lens is : %d", input_lens)
         generate_tokens = 0
         cnt = 0
         infer_time_rec = []
@@ -377,7 +373,7 @@ class ModelRunner:
 
         if not warm_up:
             avg_infer_time = process_infer_time(infer_time_rec, cnt)
-            logging.info(f"{self.model_name} average inference time cost is {(avg_infer_time)*1000:.2f} ms")
+            logger.info(f"{self.model_name} average inference time cost is {(avg_infer_time)*1000:.2f} ms")
 
         # detokenize outputs
         generate_ids = input_dict["generate_ids"].clip(0,\

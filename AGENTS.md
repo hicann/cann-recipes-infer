@@ -33,13 +33,17 @@ scripts/        # 工具脚本
 
 ## 参考模型速查
 
-| 模型特性 | 参考模型 |
-|---------|---------|
-| 大语言模型（普通） | deepseek-r1, gpt-oss |
-| MoE 架构 | deepseek-v3.2-exp, qwen3-moe |
-| 长序列（256K+） | kimi-k2-thinking, longcat-flash |
-| 视频生成 | hunyuan-video, wan2.2-i2v |
-| 图像生成 | hunyuan-image-3.0 |
+当前模型存在两种方式，**统一流程**（推荐优先采用，参考 [统一流程方案](docs/design/executor_design.md)）与**ModelRunner**（逐渐废弃）。
+
+| 流程 | 类别 | 模型 |
+|---|---|---|
+| **统一流程** | Dense LLM | `gpt_oss` |
+| | MoE LLM | `deepseek_r1`, `qwen3_moe` |
+| **ModelRunner** | LLM (Dense / MoE) | `deepseek-v3.2-exp`, `deepseek-v4` |
+| | 长序列 LLM | `kimi-k2-thinking`, `longcat-flash` |
+| | 视频生成 | `hunyuan-video`, `wan2.2-i2v`, `sana-video` |
+| | 图像生成 | `hunyuan-image-3.0` |
+| | 推荐 / 其他 | `hstu` |
 
 ---
 

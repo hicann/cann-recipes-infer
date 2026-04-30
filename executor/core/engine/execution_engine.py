@@ -22,7 +22,7 @@ from typing import Dict, Optional, Any
 import torch
 from transformers import AutoTokenizer
 
-from executor.core.config import InferenceConfig, CommManager
+from executor.core.config import InferenceConfig
 from executor.utils import get_default_group
 from executor.utils.forward_metadata import set_forward_metadata, get_forward_metadata
 from executor.utils.profiler_context import ProfilerManager
@@ -33,12 +33,12 @@ from executor.core.kv_cache.cache_utils import allocate_cache_tensors, calculate
 from ..types_.types import MTPInfo, Batch, StepOutput
 
 torch.npu.config.allow_internal_format = True
-logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 class ExecutionEngine:
 
-    def __init__(self, infer_config: InferenceConfig, is_online: bool = False):
+    def __init__(self, infer_config: InferenceConfig):
         """Initialize engine with configuration.
 
         Args:
@@ -49,13 +49,18 @@ class ExecutionEngine:
         self.tokenizer = None
         self.hf_config = None
         self.kvcache_manager = None
+        self.comm_manager = None
         self.max_new_tokens = self.infer_config.scheduler_config.max_new_tokens
         self.input_truncated_len = self.infer_config.data_config.input_truncated_len
         self.block_size = self.infer_config.scheduler_config.block_size
         self.next_n = self.infer_config.model_config.next_n
-        self.is_online = is_online
+        # PD (prefill or decode) roles hold only their own KV and do not need the MTP draft-token buffer
+        self.is_online = (
+            infer_config.disagg_config.disaggregation_mode in ("PREFILL", "DECODE")
+        )
         if self.is_online:
-            self.max_total_len = self.input_truncated_len + self.max_new_tokens
+            # no chunk so max_prefill_tokens is the max len of kv
+            self.max_total_len = self.infer_config.scheduler_config.max_prefill_tokens + self.max_new_tokens
         else:
             # In offline MTP mode, reserve extra KV cache for the draft model's speculative forwards.
             self.max_total_len = self.input_truncated_len + self.max_new_tokens * (self.next_n + 1) + self.next_n
@@ -78,39 +83,38 @@ class ExecutionEngine:
         self.profiler = ProfilerManager(self.enable_profiler, self.output_path)
 
     def _init_device(self):
-        """Initialize NPU device and communication."""
-        logging.info("Set execution using npu index: %s, global: %s", self.local_rank, self.global_rank)
+        """Initialize NPU device and the dist process group.
+
+        CommManager is built later by ModelWorker.init() — it needs the
+        loaded hf_config to size the moe_ep buffer correctly.
+        """
+        logger.info("Set execution using npu index: %s, global: %s", self.local_rank, self.global_rank)
         self.device = torch.device("%s:%s" % ("npu", self.local_rank))
         torch.npu.set_device(self.device)
 
-        # Initialize distributed process group for multi-card scenarios
         if torch.npu.is_available() and self.world_size > 1:
             default_pg = get_default_group()
             if default_pg is None:
-                master_addr = os.environ["MASTER_ADDR"]
-                master_port = int(os.environ["MASTER_PORT"])
                 torch.distributed.init_process_group(
                     backend="hccl", world_size=self.world_size, rank=self.global_rank)
 
-        # Initialize communication manager after process group is set up
-        self.comm_manager = CommManager(self.infer_config.parallel_config)
-        self.comm_manager.initialize()
-
-    def load_model(
-        self,
-        config_cls,
-        main_model_cls,
-        mtp_model_cls=None,
-    ):
-        """Load model with optional MTP model for speculative decoding."""
-        logging.info("Loading main model...")
-        self.main_worker.load_model(main_model_cls, config_cls, self.comm_manager)
+    def init(self, config_cls, main_model_cls, mtp_model_cls=None):
+        """Bring the engine to ready: load the model (and MTP draft if any),
+        build the comm_manager, set up tokenizer + KV cache.
+        """
+        logger.info("Loading main model...")
+        # Primary worker creates the process-wide comm_manager (sized from
+        # hf_config); secondary workers (e.g. MTP) reuse it.
+        self.main_worker.init(main_model_cls, config_cls)
+        self.comm_manager = self.main_worker.comm_manager
         cache_info = self.main_worker.get_cache_info()
 
         if self.mtp_worker is not None:
             if mtp_model_cls is not None:
-                logging.info("Loading mtp model...")
-                self.mtp_worker.mtp_model_worker.load_model(mtp_model_cls, config_cls, self.comm_manager)
+                logger.info("Loading mtp model...")
+                self.mtp_worker.mtp_model_worker.init(
+                    mtp_model_cls, config_cls, comm_manager=self.comm_manager,
+                )
                 cache_info_mtp = self.mtp_worker.mtp_model_worker.get_cache_info()
                 if cache_info and cache_info_mtp:
                     # Support page attention
@@ -164,6 +168,7 @@ class ExecutionEngine:
         self.kvcache_manager = KVCacheManager(
             max_model_len=self.max_total_len,
             single_type_managers=single_type_managers,
+            cache_info=cache_info,
         )
 
     @property
@@ -210,11 +215,29 @@ class ExecutionEngine:
         else:
             if self.mtp_worker:
                 input_ids, kv_len, position_ids = self.mtp_worker.get_main_model_inputs(input_ids, batch)
-                batch_size = kv_len.shape[0]
                 seq_len = self.mtp_worker.next_n + 1
+                # Pad to batch_size_per_dp_rank. kv_len is [actual_bs];
+                # input_ids / position_ids are [actual_bs * seq_len].
+                # _pad_batch works on dim-0, so only kv_len can use it directly;
+                # the others need a seq_len multiplier.
+                actual_bs = kv_len.shape[0]
+                target_bs = self.infer_config.scheduler_config.batch_size_per_dp_rank
+                if actual_bs < target_bs:
+                    pad_bs = target_bs - actual_bs
+                    pad_tokens = pad_bs * seq_len
+                    input_ids = torch.cat([
+                        input_ids,
+                        torch.zeros(pad_tokens, dtype=input_ids.dtype, device=input_ids.device),
+                    ])
+                    position_ids = torch.cat([  # [batch, next_n + 1]
+                        position_ids,
+                        torch.zeros(pad_tokens, dtype=position_ids.dtype, device=position_ids.device),
+                    ])
+                kv_len = self._pad_batch(kv_len)
+                batch_size = kv_len.shape[0]
             else:
                 input_ids = self._pad_batch(input_ids)
-                kv_len = self._pad_batch(get_forward_metadata().kv_len.to(self.device)) + 1
+                kv_len = self._pad_batch(get_forward_metadata().kv_len.to(self.device) + 1)
                 position_ids = kv_len.clone()
                 batch_size, seq_len = input_ids.shape[0], 1
             actual_seq_lengths_kv = kv_len + 1
@@ -296,55 +319,57 @@ class ExecutionEngine:
         """Execute warm-up by running exactly one prefill and one decode step of main and mtp model.
         Triggers graph compilation during decode if graph mode enabled.
         """
-        logging.info("Starting warm-up...")
+        logger.info("Starting warm-up...")
 
         # 1. Get warm-up shape info from config
         prefill_batch_size, decode_batch_size, seq_len = self._get_warmup_shape()
 
-        # 2. Execute ONE prefill step with dummy inputs (packed sequence format)
-        logging.info("Warm-up [Main]: executing model prefill step...")
-        dummy_seq_lens = torch.tensor([seq_len] * prefill_batch_size, dtype=torch.long, device=self.device)
-        dummy_input_ids = torch.zeros(prefill_batch_size * seq_len, dtype=torch.long, device=self.device)
-        model_inputs = self._build_model_inputs(dummy_input_ids, is_prefill=True, seq_lens=dummy_seq_lens)
-        output, _ = self.main_worker.inference(model_inputs, is_prefill=True)
-        if self.mtp_worker:
-            logging.info("Warm-up [MTP]: executing model prefill step...")
-            prev_hidden_states = output[1]
-            model_inputs['prev_hidden_states'] = prev_hidden_states
-            output, _ = self.mtp_worker.mtp_model_worker.inference(model_inputs, is_prefill=True, is_mtp=True)
+        if self.infer_config.disagg_config.disaggregation_mode in ["NONE", "PREFILL"]:
+            # 2. Execute ONE prefill step with dummy inputs (packed sequence format)
+            logger.info("Warm-up [Main]: executing model prefill step...")
+            dummy_seq_lens = torch.tensor([seq_len] * prefill_batch_size, dtype=torch.long, device=self.device)
+            dummy_input_ids = torch.zeros(prefill_batch_size * seq_len, dtype=torch.long, device=self.device)
+            model_inputs = self._build_model_inputs(dummy_input_ids, is_prefill=True, seq_lens=dummy_seq_lens)
+            output, _ = self.main_worker.inference(model_inputs, is_prefill=True)
+            if self.mtp_worker:
+                logger.info("Warm-up [MTP]: executing model prefill step...")
+                prev_hidden_states = output[1]
+                model_inputs['prev_hidden_states'] = prev_hidden_states
+                output, _ = self.mtp_worker.mtp_model_worker.inference(model_inputs, is_prefill=True, is_mtp=True)
 
-        dummy_kv_len = torch.full(
-            (decode_batch_size,),
-            seq_len - 1,
-            dtype=torch.long,
-            device=self.device,
-        )
-        set_forward_metadata(kv_len=dummy_kv_len)
 
-        # 3. Execute ONE decode step with graph compilation
-        seq_len = 1 if self.next_n == 0 else self.next_n + 1
-        logging.info("Warm-up [Main]: executing model decode step...")
-        if self.mtp_worker:
-            dummy_input_ids = torch.zeros(decode_batch_size * seq_len, dtype=torch.long, device=self.device)
-        else:
-            dummy_input_ids = torch.zeros(decode_batch_size, dtype=torch.long, device=self.device)
-        model_inputs = self._build_model_inputs(dummy_input_ids, is_prefill=False)
+        if self.infer_config.disagg_config.disaggregation_mode in ["NONE", "DECODE"]:
+            dummy_kv_len = torch.full(
+                (decode_batch_size,),
+                seq_len - 1,
+                dtype=torch.long,
+                device=self.device,
+            )
+            set_forward_metadata(kv_len=dummy_kv_len)
+            # 3. Execute ONE decode step with graph compilation
+            seq_len = 1 if self.next_n == 0 else self.next_n + 1
+            logger.info("Warm-up [Main]: executing model decode step...")
+            if self.mtp_worker:
+                dummy_input_ids = torch.zeros(decode_batch_size * seq_len, dtype=torch.long, device=self.device)
+            else:
+                dummy_input_ids = torch.zeros(decode_batch_size, dtype=torch.long, device=self.device)
+            model_inputs = self._build_model_inputs(dummy_input_ids, is_prefill=False)
 
-        # Trigger graph compilation if graph mode enabled and not yet compiled
-        if self.exe_mode in ["ge_graph", "npugraph_ex"]:
-            logging.info("Warm-up: triggering graph compilation...")
-            self.main_worker.compile_model()
-        output, _ = self.main_worker.inference(model_inputs, is_prefill=False)
-
-        if self.mtp_worker:
-            logging.info("Warm-up [MTP]: executing mtp model decode step...")
-            model_inputs['prev_hidden_states'] = output[1]
+            # Trigger graph compilation if graph mode enabled and not yet compiled
             if self.exe_mode in ["ge_graph", "npugraph_ex"]:
-                logging.info("Warm-up: triggering graph compilation...")
-                self.mtp_worker.mtp_model_worker.compile_model()
-            _ = self.mtp_worker.mtp_model_worker.inference(model_inputs, is_prefill=False, is_mtp=True)
+                logger.info("Warm-up: triggering graph compilation...")
+                self.main_worker.compile_model()
+            output, _ = self.main_worker.inference(model_inputs, is_prefill=False)
 
-        logging.info("Warm-up completed successfully.")
+            if self.mtp_worker:
+                logger.info("Warm-up [MTP]: executing mtp model decode step...")
+                model_inputs['prev_hidden_states'] = output[1]
+                if self.exe_mode in ["ge_graph", "npugraph_ex"]:
+                    logger.info("Warm-up: triggering graph compilation...")
+                    self.mtp_worker.mtp_model_worker.compile_model()
+                _ = self.mtp_worker.mtp_model_worker.inference(model_inputs, is_prefill=False, is_mtp=True)
+
+        logger.info("Warm-up completed successfully.")
 
     def forward_batch(self, batch: Batch) -> Dict[str, Any]:
         """Execute forward pass for a batch of requests.
@@ -374,7 +399,7 @@ class ExecutionEngine:
         )
 
         # Run inference
-        output, infer_time = self.main_worker.inference(model_inputs, is_prefill=batch.is_prefill)
+        output, infer_time_main = self.main_worker.inference(model_inputs, is_prefill=batch.is_prefill)
 
         # Handle different output formats: tuple (logits, prev_hidden_states) or tensor (logits)
         if isinstance(output, tuple):
@@ -388,11 +413,11 @@ class ExecutionEngine:
 
         next_tokens = self._sample_tokens(batch, logits)
 
+        infer_times_mtp: list[float] = []
         if self.mtp_worker:
             accepted_num = self.verify_spec_tokens(batch, next_tokens)
-            infer_time_mtp = self.mtp_worker.inference(batch, next_tokens, accepted_num,
-                                                       model_inputs, prev_hidden_states)
-            infer_time += infer_time_mtp
+            infer_times_mtp = self.mtp_worker.inference(batch, next_tokens, accepted_num,
+                                                        model_inputs, prev_hidden_states)
 
         self.profiler.step()
 
@@ -404,14 +429,18 @@ class ExecutionEngine:
         if kv_len is not None and kv_len.shape[0] > actual_batch:
             set_forward_metadata(kv_len=kv_len[:actual_batch])
 
+        infer_time_total = infer_time_main + sum(infer_times_mtp)
         next_tokens_by_request = batch.update_requests_from_batch(
             batch.is_prefill,
             next_tokens,
-            infer_time,
+            infer_time_total,
         )
         return {
             "next_tokens": next_tokens_by_request,
             "logits": logits,
+            "inference_time": infer_time_total,
+            "inference_time_main": infer_time_main,
+            "inference_times_mtp": infer_times_mtp,
         }
 
     def _sample_tokens(

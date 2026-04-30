@@ -129,6 +129,7 @@ flowchart LR
 **`get_main_model_inputs`**
 - 构建主模型验证窗口：拼接 input_ids 和 spec_tokens
 - 回退 kv_len 到接受的前缀位置，为下次主模型验证做准备
+- 兼容 `batch.mtp_infos is None` 的情形：构造零填充的 `spec_tokens`；并将 CPU 上的 `spec_tokens` 自动搬到设备上——这是 PD prefill 后首个 decode 步的必要处理（此时 `mtp_info` 是从 JSON 元数据重建的 CPU tensor）。
 
 **`get_mtp_model_inputs`**
 - 处理两个阶段：prefill 和 decode

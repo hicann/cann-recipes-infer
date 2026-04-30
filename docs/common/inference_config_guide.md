@@ -57,10 +57,20 @@
 - `batch_size_per_dp_rank`: **不支持配置**。每个 Rank 的 Batch Size。推导方式：`batch_size // attn_dp_size`。
 - `mem_fraction_static`: 静态内存分配比例（默认 0.85），用于控制推理阶段可用于静态占用的设备内存比例。
 - `block_size`: 单个 KV Cache block 可容纳的 token 数（默认 128），用于控制 Paged Attention 的 block 粒度。
+- `num_reserved_decode_tokens`: （仅 PD decode 端）每个在途请求保留的 KV token 数（默认 64），由 `DecodePreallocQueue.pop_preallocated` 用于准入控制。prealloc/transfer/running 流水线中的每条请求都会按此值预留近期 decode 步所需的 KV block 余量；若新请求的接纳会令 KV 池超出该余量，则不再准入。值越小吞吐越高，但突发负载下 retraction 抖动也越多。
 
-## 3. 基本用法
+## 3. 日志配置
 
-### 3.1 从字典创建
+在线/离线主入口（`executor/online/server.py`、`executor/model_runner.py`、`executor/offline/infer.py::main()`）启动时统一调用 `executor/utils/logging_config.py::setup_logging()` 完成根日志器配置，保证所有模块共享一致的格式与级别。
+
+- **日志格式**：`2026-04-25 19:35:12.345 - INFO - module:lineno - message`，时间精度到毫秒。
+- **级别控制**：通过环境变量 `CANN_RECIPES_LOG_LEVEL` 指定，默认 `INFO`，支持 `DEBUG` / `INFO` / `WARNING` / `ERROR` / `CRITICAL`。
+- **库代码规范**：所有库模块统一使用 `logger = logging.getLogger(__name__)`，**不要**在库代码中调用 `logging.basicConfig`，避免覆盖根配置。
+- **第三方降噪**：`paramiko` / `httpx` / `httpcore` / `urllib3` 自动降级到 `WARNING`，避免 INFO 级别的握手 / 连接日志淹没业务输出。
+
+## 4. 基本用法
+
+### 4.1 从字典创建
 通常与 YAML 解析器配合使用：
 
 ```python

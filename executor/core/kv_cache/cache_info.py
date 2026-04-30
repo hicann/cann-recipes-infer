@@ -33,6 +33,7 @@ class CacheEntry:
     needs_block: bool
     tensor_setter: Optional[Callable[[torch.Tensor], None]] = None
     sliding_window: Optional[int] = None
+    tensor: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -50,12 +51,23 @@ class ModelCacheInfo:
     num_layers: int
     block_size: int
     layer_infos: List[LayerCacheInfo]
+    # True for MLA backends (latent KV replicated across TP ranks). Set
+    # explicitly by the model's get_cache_info(); PD transfer uses it to
+    # pick a single target TP rank and mark the rest as dummy.
+    # Do NOT infer from num_head==1 — GQA with num_kv_heads<=tp_size also
+    # yields per-rank num_head==1 but is not MLA.
+    is_mla_backend: bool = False
 
     def merge(self, other: "ModelCacheInfo") -> "ModelCacheInfo":
         """Merge two cache-info objects into one complete model description."""
         if self.block_size != other.block_size:
             raise ValueError(
                 f"block_size mismatch: {self.block_size} != {other.block_size}"
+            )
+        if self.is_mla_backend != other.is_mla_backend:
+            raise ValueError(
+                "is_mla_backend mismatch across merged cache infos: "
+                f"{self.is_mla_backend} vs {other.is_mla_backend}"
             )
 
         merged_layer_infos = list(self.layer_infos)
@@ -67,4 +79,5 @@ class ModelCacheInfo:
             num_layers=len(merged_layer_infos),
             block_size=self.block_size,
             layer_infos=merged_layer_infos,
+            is_mla_backend=self.is_mla_backend,
         )

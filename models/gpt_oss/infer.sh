@@ -25,7 +25,18 @@ source ${FUNCTION_ABS_PATH}
 
 export MODEL_DIR=$(basename "$SCRIPT_PATH")
 export YAML_PARENT_PATH="${SCRIPT_PATH}/config"
-export YAML_FILE_NAME=gpt_oss_20b.yaml  # modify to your yaml file name
-export YAML=${YAML_PARENT_PATH}/${YAML_FILE_NAME}
 
-launch
+mode="$1"
+pd_role="$2"
+
+if [ "$mode" = "online" ]; then
+    export PD_ROLE="$pd_role"
+    export P_YAML="${YAML_PARENT_PATH}/gpt_oss_20b_pd.yaml"
+    export D_YAML="${YAML_PARENT_PATH}/gpt_oss_20b_pd.yaml"
+    echo "====================> launch online inference (${PD_ROLE:-auto})"
+else
+    export YAML="${YAML_PARENT_PATH}/gpt_oss_20b.yaml"
+    echo "====================> launch offline inference"
+fi
+
+launch "$mode"

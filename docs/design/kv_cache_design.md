@@ -65,6 +65,8 @@ graph TD
 - `allocate_slots(request_id, computed_tokens, num_new_tokens, lookahead_tokens=0)`
 - `get_block_ids(request_id)`
 - `free(request_id)`
+- `format_usage() -> str`：返回**逐 attention type** 的 `used/total` 汇总字符串，例如 `"full:12/100,sliding:8/100"`；由 `Scheduler._log_step` 调用，用于在每步状态日志中暴露各 type 的 KV 压力。
+- `get_contiguous_buf_infos() -> (data_ptrs, data_lens, item_lens, attn_types)`：把 paged-attention 管理的所有物理 cache tensor 扁平化导出，供 PD KV 传输使用——按 `layer_idx` 升序、再按层内 `cache` 原始定义序遍历，仅导出 `needs_block=True` 的 cache。返回四个等长 list：`data_ptrs`（每个 tensor 的 `data_ptr()`）、`data_lens`（每个 tensor 总字节数）、`item_lens`（每块字节数 = `block_size × num_head × dim × element_size`）、`attn_types`（每项的 attention type，用于在对端按 type 查 block id）。Prefill 与 Decode 各自独立调用，返回顺序由模型配置决定，两端必然对齐。
 
 其中 `allocate_slots` 的关键点是”两阶段处理”（具体实现可见：[块分配核心流程](#3-块分配核心流程allocate_slots)）：
 

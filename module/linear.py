@@ -123,7 +123,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
         out = torch.matmul(x, layer.weight.data)
         if bias is not None:
             out = out + bias
-        out = out.view(*origin_shape[:-1], -1)
+        out = out.view(*origin_shape[:-1], out.shape[-1])
         return out
 
     def process_weights_after_loading(self, layer, is_transpose=True, is_nz=True, **kwargs):

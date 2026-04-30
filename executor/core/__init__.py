@@ -15,7 +15,7 @@
 
 from executor.core.config import InferenceConfig, SchedulerConfig
 from executor.core.engine import ExecutionEngine
-from executor.core.entrypoints import OfflineInference
+from executor.offline.offline_inference import OfflineInference
 from executor.core.kv_cache import (
     BlockPool,
     FullAttentionManager,

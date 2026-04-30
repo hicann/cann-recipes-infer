@@ -18,6 +18,7 @@
 from .comm_manager import CommManager
 from .inference_config import (
     DataConfig,
+    DisaggConfig,
     InferenceConfig,
     ModelConfig,
     ParallelConfig,
@@ -27,9 +28,9 @@ from .inference_config import (
 __all__ = [
     "CommManager",
     "DataConfig",
+    "DisaggConfig",
     "InferenceConfig",
     "ModelConfig",
     "ParallelConfig",
     "SchedulerConfig",
 ]
-

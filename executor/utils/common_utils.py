@@ -20,6 +20,8 @@ import numpy as np
 import torchair as tng
 
 
+logger = logging.getLogger(__name__)
+
 
 def get_had_pow2(n, norm=True):
     if not ((n & (n - 1) == 0) and (n > 0)):
@@ -37,9 +39,9 @@ def read_yaml(yaml_file_path):
         with open(yaml_file_path, "r", encoding="utf-8") as file:
             data = yaml.safe_load(file)
     except FileNotFoundError:
-        logging.error(f"No such yaml file: {yaml_file_path}")
+        logger.error(f"No such yaml file: {yaml_file_path}")
     except yaml.YAMLERROR as e:
-        logging.error(f"Load yaml file failed: {e}")
+        logger.error(f"Load yaml file failed: {e}")
     return data
 
 
@@ -76,7 +78,7 @@ def update_settings(runner_settings: Dict, module_name: str, key: str, value):
         raise Exception(f"runner_settings doesn't have submodule ({module_name})!")
     module = runner_settings.get(module_name)
     module.update({key: value})
-    logging.info(f"add ({key}: {value}) to runner_settings.")
+    logger.info(f"add ({key}: {value}) to runner_settings.")
     return runner_settings
 
 
@@ -142,7 +144,7 @@ def npu_prefetch(switch_flag, weight, depend, size, offset=0):
 
 def process_infer_time(infer_time_rec, token_count):
     if len(infer_time_rec) == 0: # no time recorded
-        logging.info(f"precoss infer time receives empty time record")
+        logger.info(f"precoss infer time receives empty time record")
         return 0
     elif len(infer_time_rec) == 1 or (token_count <= 1): # only prefill
         return infer_time_rec[0]
@@ -214,9 +216,9 @@ def detokenize_outputs(generate_ids_list, tokenizer, input_lens):
             res = res.split(tokenizer.eos_token)[0]
         res_list.append(res)
     if isinstance(res_list, list):
-        logging.info("Inference decode result for batch 0: \n%s", res_list[0])
+        logger.info("Inference decode result for batch 0: \n%s", res_list[0])
     else:
-        logging.info("Inference decode result: \n%s", res_list)
+        logger.info("Inference decode result: \n%s", res_list)
     return res_list
 
 
@@ -259,16 +261,16 @@ def update_common_vars(world_size, runner_settings):
 
 def obtain_mtp_stats(next_n, model_name, total_accepted_num, cnt, infer_time_rec):
     avg_accepted_num = torch.mean(total_accepted_num)
-    logging.info(f"Finished inference, number of loop step is {cnt}, "
+    logger.info(f"Finished inference, number of loop step is {cnt}, "
                     f"draft tokens per batch is {cnt}*{next_n}, "
                     f"average accepted number per batch is {avg_accepted_num.to(torch.int32)}")
 
     total_tokens = avg_accepted_num + cnt
     equivalent_infer_time = process_infer_time(infer_time_rec, total_tokens)
     avg_infer_time = process_infer_time(infer_time_rec, len(infer_time_rec))
-    logging.info(
+    logger.info(
         f"{model_name} main and mtp model average inference time cost is {(avg_infer_time)*1000:.2f} ms")
-    logging.info(
+    logger.info(
         f"{model_name} model average equivalent latency of MTP{next_n}"
         f" is {(equivalent_infer_time)*1000:.2f} ms")
 

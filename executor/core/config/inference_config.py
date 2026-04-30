@@ -76,6 +76,7 @@ class ModelConfig:
     dtype: str = "bfloat16"
     with_ckpt: bool = True
     next_n: int = 0
+    platform_version: str = "A3"
 
     exe_mode: str = "eager"
     enable_cache_compile: bool = False
@@ -98,6 +99,7 @@ class ModelConfig:
             dtype=model_config_dict.get("dtype", "bfloat16"),
             with_ckpt=model_config_dict.get("with_ckpt", True),
             next_n=model_config_dict.get("next_n", 0),
+            platform_version=model_config_dict.get("platform_version", "A3"),
             exe_mode=model_config_dict.get("exe_mode", "eager"),
             enable_cache_compile=model_config_dict.get("enable_cache_compile", False),
             enable_static_kernel=model_config_dict.get("enable_static_kernel", False),
@@ -180,7 +182,10 @@ class ParallelConfig:
         )
         parallel_config._validate()
 
-        parallel_config.attn_dp_size = parallel_config.world_size // parallel_config.attn_tp_size
+        parallel_config.attn_dp_size = (
+            parallel_config.world_size
+            // (parallel_config.attn_tp_size * parallel_config.cp_size)
+        )
         parallel_config.moe_ep_size = parallel_config.world_size // parallel_config.moe_tp_size
         parallel_config.embed_dp_size = parallel_config.world_size // parallel_config.embed_tp_size
         return parallel_config
@@ -204,6 +209,12 @@ class ParallelConfig:
             raise ValueError(f"world_size={self.world_size} not divisible by o_proj_tp_size={self.o_proj_tp_size}")
         if self.world_size % self.cp_size != 0:
             raise ValueError(f"world_size={self.world_size} not divisible by cp_size={self.cp_size}")
+        attn_group_size = self.attn_tp_size * self.cp_size
+        if self.world_size % attn_group_size != 0:
+            raise ValueError(
+                f"world_size={self.world_size} not divisible by "
+                f"attn_tp_size*cp_size={attn_group_size}"
+            )
         if self.world_size % self.kvp_size != 0:
             raise ValueError(f"world_size={self.world_size} not divisible by kvp_size={self.kvp_size}")
 
@@ -235,6 +246,13 @@ class SchedulerConfig:
         batch_size_per_dp_rank: Batch size per rank for distributed inference (default: 1)
         mem_fraction_static: Fraction of device memory reserved for static allocation (default: 0.85)
         block_size: Number of tokens contained in one KV cache block (default: 128)
+        num_reserved_decode_tokens: Per-in-flight-request KV reservation used by
+            online PD decode admission control.  Each request in the prealloc /
+            transfer / running pipeline reserves this many tokens of KV space
+            for its near-future decode steps; new requests are not admitted if
+            granting their input + reservation would push the pool below this
+            margin.  Smaller value = higher throughput but more retraction
+            churn under bursty load.
     """
     batch_size: int = 1
     max_new_tokens: int = 32
@@ -242,6 +260,7 @@ class SchedulerConfig:
     batch_size_per_dp_rank: int = 1  # This will be calculated based on batch_size and parallel config
     mem_fraction_static: float = 0.85
     block_size: int = 128
+    num_reserved_decode_tokens: int = 64
 
     @classmethod
     def from_dict(cls, scheduler_config_dict: dict) -> "SchedulerConfig":
@@ -251,24 +270,52 @@ class SchedulerConfig:
             max_new_tokens=scheduler_config_dict.get("max_new_tokens", 32),
             max_prefill_tokens=scheduler_config_dict.get("max_prefill_tokens", 0),
             mem_fraction_static=scheduler_config_dict.get("mem_fraction_static", 0.85),
-            block_size=scheduler_config_dict.get("block_size", 128)
+            block_size=scheduler_config_dict.get("block_size", 128),
+            num_reserved_decode_tokens=scheduler_config_dict.get(
+                "num_reserved_decode_tokens", 64
+            ),
         )
 
 
 @dataclass
-class InferenceConfig:
-    """Unified inference configuration (replaces runner_settings dictionary).
+class DisaggConfig:
+    """Configuration for PD disaggregation runtime."""
 
-    This class encapsulates all configuration from YAML file with structured access.
-    """
+    disaggregation_mode: str = "NONE"
+    bootstrap_host: str = "0.0.0.0"
+    bootstrap_port: int = 18800
+    # MemFabric config store address, tcp://<P primary IP>:<port>. All ranks
+    # (prefill + decode, all instances) must agree on this single URL.
+    store_url: str = ""
+    # True only on the PREFILL instance-0 leader node — the sole node that
+    # should run create_config_store. Set explicitly by server.py based on
+    # node_index/role; combining with local_rank==0 inside the engine picks
+    # exactly one worker out of the whole service.
+    is_store_creator_node: bool = False
+    # Local IP advertised to PD peers as this rank's contact address. Sourced
+    # from the launch config (--ips[node_index]) so the auto-detection magic
+    # never sees ambiguous multi-NIC hosts.
+    local_ip: str = ""
+
+
+@dataclass
+class InferenceConfig:
+    """Unified inference configuration loaded from YAML with structured access."""
     # Nested configuration objects
     model_config: ModelConfig
     data_config: DataConfig
     parallel_config: ParallelConfig
     scheduler_config: SchedulerConfig
+    disagg_config: DisaggConfig = field(default_factory=DisaggConfig)
 
     @classmethod
-    def from_dict(cls, yaml_dict: dict, global_rank: int, local_rank: int) -> "InferenceConfig":
+    def from_dict(
+        cls,
+        yaml_dict: dict,
+        global_rank: int,
+        local_rank: int,
+        disagg_config: "DisaggConfig | None" = None,
+    ) -> "InferenceConfig":
         """Create InferenceConfig from YAML-parsed dictionary."""
 
         infer_config = cls(
@@ -280,6 +327,7 @@ class InferenceConfig:
                 local_rank=local_rank
             ),
             scheduler_config=SchedulerConfig.from_dict(yaml_dict.get("scheduler_config", {})),
+            disagg_config=disagg_config or DisaggConfig(),
         )
 
         infer_config.scheduler_config.batch_size_per_dp_rank = \

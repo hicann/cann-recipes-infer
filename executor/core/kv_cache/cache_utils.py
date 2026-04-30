@@ -104,6 +104,7 @@ def allocate_cache_tensors(device, cache_info: ModelCacheInfo, block_num_by_type
                 )
 
             cache.tensor_setter(cache_tensor)
+            cache.tensor = cache_tensor
 
 
 def calculate_fixed_block_memory_bytes(infer_config, cache_info: ModelCacheInfo) -> Tuple[Dict[str, int], int]:
@@ -273,10 +274,8 @@ def prepare_block_tables(
         attn_type = manager.attn_type
         null_block_id = manager.block_pool.get_null_block()
 
-        if requests is None and batch_size > 0:
-            # dummy
-            block_table_tensor = torch.zeros([batch_size, max_block_num], dtype=torch.int32, device=device)
-        else:
+        block_table_tensor = torch.zeros([batch_size, max_block_num], dtype=torch.int32, device=device)
+        if requests is not None:
             block_table_list: List[List[int]] = []
             for request in requests:
                 request_id = request.request_id
@@ -290,7 +289,9 @@ def prepare_block_tables(
                 block_table_list.append(padded_blocks)
 
             # Convert to tensor
-            block_table_tensor = torch.tensor(block_table_list, dtype=torch.int32, device=device).view(batch_size, -1)
+            actual_batch = len(block_table_list)
+            block_table_tensor[:actual_batch, :] = torch.tensor(block_table_list, dtype=torch.int32, device=device
+                                                                ).view(actual_batch, -1)
         block_tables_by_type[attn_type] = block_table_tensor
 
     return block_tables_by_type

@@ -13,6 +13,8 @@ import logging
 import math
 from datasets import load_dataset  # requires version == 3.6.0
 
+logger = logging.getLogger(__name__)
+
 
 def load_infinitebench_dataset(data_path):
     prompts = []
@@ -49,7 +51,7 @@ def generate_default_prompt(dataset_dir):
     except FileNotFoundError as e:
         raise FileNotFoundError(f"prompt error: prompt file({json_path}) not find.") from e
     except json.JSONDecodeError as e:
-        logging.error(f"prompt error: the json format of prompt file({json_path}) is incorrect.")
+        logger.error(f"prompt error: the json format of prompt file({json_path}) is incorrect.")
         raise e
     except Exception as e:
         raise e
@@ -63,7 +65,7 @@ def get_prompts_for_cur_rank(preset_prompts, global_bs, batch_size_per_rank, glo
     preset_prompts = preset_prompts * (global_bs // len(preset_prompts) + 1)
     preset_prompts = preset_prompts[global_dp_rank * batch_size_per_rank: (global_dp_rank + 1) * batch_size_per_rank]
     query_id_list = list(range(global_dp_rank * batch_size_per_rank, (global_dp_rank + 1) * batch_size_per_rank))
-    logging.info(f"prompt batch size: {len(preset_prompts)}/{global_bs}, {query_id_list=}")
+    logger.info(f"prompt batch size: {len(preset_prompts)}/{global_bs}, {query_id_list=}")
     return (preset_prompts, query_id_list)
 
 
@@ -116,7 +118,7 @@ def tokenizer_in_loop(tokenizer, prompts, input_max_len=32, section_size=1024):
         prompts_input_ids = tokenizer(each_prompts, truncation=True, max_length=input_max_len,
                                       return_attention_mask=False).input_ids
         input_ids_list.extend(prompts_input_ids)
-        logging.info(f"{len(input_ids_list)} of {total_num} prompts have been tokenized...")
+        logger.info(f"{len(input_ids_list)} of {total_num} prompts have been tokenized...")
     return input_ids_list
 
 
@@ -133,7 +135,7 @@ def build_dataset_input(tokenizer, prompts, input_max_len, max_new_tokens=32, is
     else:
         system_prompt_len = len(tokenizer(prefix + suffix).input_ids)
     if system_prompt_len > input_max_len:
-        logging.info("The parameter 'input_max_len' should be greater than the length of system prompt. " + \
+        logger.info("The parameter 'input_max_len' should be greater than the length of system prompt. " + \
          "Please modify the input_max_len in the YAML file or modify system prompt in executor/utils/data_utils.py.")
 
     # use tokenizer loop to avoid host oom when query num is large

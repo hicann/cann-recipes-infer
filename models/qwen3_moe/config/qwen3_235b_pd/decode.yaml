@@ -1,0 +1,23 @@
+model_name: "qwen3-moe"  # keep it for backward compatibility.
+world_size: 16  # keep it for backward compatibility.
+
+model_config:
+  model_name: "qwen3-moe"
+  model_path: "/data/models/Qwen3-235B-A22B"
+  exe_mode: "ge_graph"        # ["ge_graph", "eager", "npugraph_ex"]
+  enable_profiler: False  # [False, True]
+  with_ckpt: True
+  enable_cache_compile: False
+
+parallel_config:  # Set the values of attn_tp_size, moe_tp_size, and lmhead_tp_size to be the same.
+  world_size: 16
+  attn_tp_size: 1
+  moe_tp_size: 1
+  embed_tp_size: 1
+  lmhead_tp_size: 1
+
+scheduler_config:
+  batch_size: 64
+  max_prefill_tokens: 16384
+  max_new_tokens: 65536
+  mem_fraction_static: 0.9

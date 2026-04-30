@@ -9,7 +9,15 @@
 
 #!/bin/bash
 export ON_CLOUD=0 # 0: local deployment, 1: for internal use on cloud servers
-export IPs=('xxx.xxx.xxx.xxx' 'xxx.xxx.xxx.xxx') # IPs of all servers. Please seperate multiple servers with blank space in between. The first one is the master server.
+
+# only offline need
+export IPs=('xx.xx.xx.xx' 'xx.xx.xx.xx') # IPs of all servers. Please seperate multiple servers with blank space in between. The first one is the master server.
+
+# only online need
+# When prefill and decode share the same host, set ASCEND_RT_VISIBLE_DEVICES
+# before calling infer.sh to isolate NPUs per role.
+PREFILL_IPS=('xx.xx.xx.xx')
+DECODE_IPS=('xx.xx.xx.xx')
 
 rm -rf /root/atc_data/
 

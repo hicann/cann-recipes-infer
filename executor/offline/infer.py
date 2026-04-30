@@ -17,10 +17,14 @@ import os
 import argparse
 import logging
 import yaml
-from executor.core import InferenceConfig, OfflineInference
+from executor.core.config import InferenceConfig
+from executor.offline.offline_inference import OfflineInference
 from executor.utils.data_utils import generate_default_prompt, load_longbench_dataset, build_dataset_input, \
     load_infinitebench_dataset
 from executor.utils.common_utils import process_infer_time
+from executor.utils.logging_config import setup_logging
+
+logger = logging.getLogger(__name__)
 
 
 def parse_args():
@@ -70,7 +74,7 @@ def log_results(results, mtp_stats, infer_time, next_n, model_name):
     """
     # Log output text for each request
     for i, res in enumerate(results):
-        logging.info("Request %s: outputs: %s\n", i, res.output_text)
+        logger.info("Request %s: outputs: %s\n", i, res.output_text)
 
     # Skip the first time which is the prefill inference time
     decode_infer_time = infer_time[1:] if infer_time and len(infer_time) > 1 else []
@@ -87,18 +91,18 @@ def log_results(results, mtp_stats, infer_time, next_n, model_name):
         avg_accept_length = total_accept_tokens / spec_num_forward_ct + 1
         avg_equivalent_time = avg_decode_time / avg_accept_length
 
-        logging.info(f"Finished inference, the number of valid output tokens is {valid_output_len}, "
+        logger.info(f"Finished inference, the number of valid output tokens is {valid_output_len}, "
                     f"total number of draft tokens is {total_spec_tokens}, "
                     f"total accepted number is {total_accept_tokens}")
-        logging.info(
+        logger.info(
             f"{model_name} main and mtp model average inference time cost is {avg_decode_time*1000:.2f} ms")
-        logging.info(
+        logger.info(
             f"{model_name} model average equivalent latency of MTP{next_n}"
             f" is {avg_equivalent_time*1000:.2f} ms")
-        logging.info("The speculation accept length: %.4f", avg_accept_length)
-        logging.info("The speculation accept rate: %.4f", avg_accept_rate)
+        logger.info("The speculation accept length: %.4f", avg_accept_length)
+        logger.info("The speculation accept rate: %.4f", avg_accept_rate)
     else:
-        logging.info(
+        logger.info(
             "%s decode average inference time cost is %.2f ms",
             model_name,
             avg_decode_time * 1000,
@@ -106,6 +110,7 @@ def log_results(results, mtp_stats, infer_time, next_n, model_name):
 
 
 def main():
+    setup_logging()
     local_rank = int(os.getenv("LOCAL_RANK", "0"))
     rank_offset = int(os.getenv("RANK_OFFSET", "0"))
     global_rank = local_rank + rank_offset
@@ -116,10 +121,10 @@ def main():
     config = InferenceConfig.from_dict(yaml_dict, global_rank=global_rank, local_rank=local_rank)
     if config.model_config.output_path == "":
         config.model_config.output_path = os.path.dirname(args.yaml_file_path)
-    logging.info("Inference Configuration")
-    logging.info(config)
+    logger.info("Inference Configuration")
+    logger.info(config)
 
-    dataset_path = os.path.join(os.path.dirname(__file__), f"../dataset")
+    dataset_path = os.path.join(os.path.dirname(__file__), f"../../dataset")
     if config.data_config.dataset_path != "":
         dataset_path = config.data_config.dataset_path
 

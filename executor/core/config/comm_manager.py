@@ -43,13 +43,25 @@ class CommManager:
         group_name = comm_manager.get_group_name("moe_ep_group")  # Only moe_ep_group has name
     """
 
-    def __init__(self, parallel_config: ParallelConfig):
+    def __init__(
+        self,
+        parallel_config: ParallelConfig,
+        moe_ep_buffer_size: Optional[int] = None,
+    ):
         """Initialize CommManager with parallel configuration.
 
         Args:
             parallel_config: ParallelConfig instance
+            moe_ep_buffer_size: HCCL buffer size (MB) to allocate for the
+                moe_ep_group only.  Computed by calc_moe_hccl_buffer_size
+                from yaml + HF config.  MoE EP dispatch/combine ops fail
+                with HCCL_BUFFSIZE=200MB on big batches, so sizing this
+                group explicitly removes the dependency on a shell-level
+                HCCL_BUFFSIZE export.  None falls back to init_comm_group's
+                env-var default.
         """
         self.config = parallel_config
+        self.moe_ep_buffer_size = moe_ep_buffer_size
 
         # Storage for communication groups and metadata
         self._groups: Dict[str, Optional[dist.ProcessGroup]] = {}
@@ -139,6 +151,9 @@ class CommManager:
 
         # Initialize moe_ep_group (needs HCCL name for NPU dispatch operators)
         if cfg.moe_ep_size > 1:
+            moe_ep_kwargs = {}
+            if self.moe_ep_buffer_size is not None:
+                moe_ep_kwargs["hccl_buffer_size"] = self.moe_ep_buffer_size
             moe_ep_group, moe_ep_group_name = init_comm_group(
                 global_rank=global_rank,
                 group_num=world_size // cfg.moe_ep_size,
@@ -146,6 +161,7 @@ class CommManager:
                 group_stride=world_size // cfg.moe_ep_size,
                 group_name="moe_ep_group",
                 return_name=True,
+                **moe_ep_kwargs,
             )
 
             self._groups["moe_ep_group"] = moe_ep_group
@@ -193,8 +209,53 @@ class CommManager:
             else:
                 self._ranks["o_proj_tp_group"] = 0
 
+        # Initialize CPU communication groups for online mode
+        self._init_cpu_groups(global_rank, world_size, cfg)
+
         # Add default process group
         self._groups["default_pg"] = get_default_group()
+
+    def _init_cpu_groups(self, global_rank: int, world_size: int, cfg: ParallelConfig):
+        """Initialize gloo-backend CPU groups for online mode coordination.
+
+        Creates:
+        - dp_leader_group: cross-DP synchronization among DP leaders
+        - tp_cpu_group: DP leader -> TP workers broadcast of Python objects
+        """
+        dp_size = cfg.attn_dp_size
+        tp_size = cfg.attn_tp_size
+        cp_size = cfg.cp_size
+        group_size = tp_size * cp_size
+
+        # dp_leader_group: ranks where global_rank % group_size == 0
+        if dp_size > 1:
+            dp_leader_ranks = [i * group_size for i in range(dp_size)]
+            if global_rank in dp_leader_ranks:
+                dp_leader_group = dist.new_group(dp_leader_ranks, backend="gloo")
+                self._ranks["dp_leader_group"] = dist.get_rank(dp_leader_group)
+            else:
+                dp_leader_group = None
+                self._ranks["dp_leader_group"] = 0
+            self._groups["dp_leader_group"] = dp_leader_group
+            logger.info(f"dp_leader_group initialized: ranks={dp_leader_ranks}")
+        else:
+            self._groups["dp_leader_group"] = None
+            self._ranks["dp_leader_group"] = 0
+
+        # tp_cpu_group: same partitioning as a full DP partition, gloo backend
+        if group_size > 1:
+            for dp_idx in range(dp_size):
+                tp_ranks = [dp_idx * group_size + i for i in range(group_size)]
+                group = dist.new_group(tp_ranks, backend="gloo")
+                if global_rank in tp_ranks:
+                    self._groups["tp_cpu_group"] = group
+                    self._ranks["tp_cpu_group"] = dist.get_rank(group)
+            logger.info(
+                f"tp_cpu_group initialized: tp_size={tp_size}, cp_size={cp_size}, dp_size={dp_size}"
+            )
+        else:
+            self._groups["tp_cpu_group"] = None
+            self._ranks["tp_cpu_group"] = 0
 
     def get_group(self, name: str) -> Optional[dist.ProcessGroup]:
         """Get communication group by name."""

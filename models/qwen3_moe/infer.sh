@@ -19,7 +19,19 @@ source ${FUNCTION_ABS_PATH}
 
 export MODEL_DIR=$(basename "$SCRIPT_PATH")
 export YAML_PARENT_PATH="${SCRIPT_PATH}/config"
-export YAML_FILE_NAME="your_yaml_file_name" # modify to your yaml file name
-export YAML=${YAML_PARENT_PATH}/${YAML_FILE_NAME}
 
-launch
+mode="$1"
+pd_role="$2"
+
+if [ "$mode" = "online" ]; then
+    export PD_ROLE="$pd_role"
+    export P_YAML="${YAML_PARENT_PATH}/qwen3_235b_pd/prefill.yaml"
+    export D_YAML="${YAML_PARENT_PATH}/qwen3_235b_pd/decode.yaml"
+    echo "====================> launch online inference"
+else
+    export YAML_FILE_NAME="${2:-qwen3_235b_16tp}" # override via 2nd arg, e.g. qwen3_235b_128ep
+    export YAML="${YAML_PARENT_PATH}/${YAML_FILE_NAME}.yaml"
+    echo "====================> launch offline inference (${YAML_FILE_NAME})"
+fi
+
+launch "$mode"

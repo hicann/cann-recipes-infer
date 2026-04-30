@@ -16,7 +16,7 @@
 """Core type definitions for Executor Core."""
 
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional
+from typing import Any, List, Dict, Optional
 
 import torch
 from executor.utils.forward_metadata import get_forward_metadata, set_forward_metadata
@@ -65,6 +65,19 @@ class MTPInfo:
 
 
 @dataclass
+class SamplingParams:
+    """Sampling parameters for generation.
+
+    Attributes:
+        max_tokens: Maximum tokens to generate.
+        ignore_eos: If True, do not stop on EOS token.
+    """
+
+    max_tokens: Optional[int] = None
+    ignore_eos: bool = False
+
+
+@dataclass
 class Request:
     """Enhanced request representation for batch processing.
 
@@ -74,6 +87,7 @@ class Request:
     Attributes:
         request_id: Unique identifier for this request.
         prompt: Input text prompt.
+        sampling_params: Per-request sampling parameters (used in online mode).
         input_ids: Tokenized input IDs (populated during prefill).
         computed_len: Per-request computed token length.
         prompt_tokens: Actual number of prompt tokens (excluding right padding).
@@ -84,11 +98,11 @@ class Request:
         spec_num_forward_ct: Number of speculative forward passes for MTP acceptance statistics.
         spec_num_accepted_tokens: Number of accepted speculative tokens for MTP acceptance statistics.
         decode_step_count: Number of decode steps completed (each step generates one or more tokens).
-        stop_valid_generation: Mark request as stop_valid_generation.
         valid_output_len: Length of valid output tokens when hitting EOS or max_new_tokens.
     """
     request_id: int
-    prompt: List[dict]
+    prompt: "str | List[dict]"
+    sampling_params: SamplingParams = field(default_factory=SamplingParams)
     input_ids: torch.Tensor = field(default_factory=lambda: torch.tensor([]))
     computed_len: int = 0
     prompt_tokens: int = 0
@@ -104,9 +118,21 @@ class Request:
     infer_time: List[float] = field(default_factory=list)
     # Step counter for decode phase
     decode_step_count: int = 0
-    # Mark whether the request has completed valid text generation
-    stop_valid_generation: bool = False
     valid_output_len: Optional[int] = None
+    # PD disaggregation fields (only populated in online PD mode).
+    bootstrap_host: str = ""
+    bootstrap_port: int = -1
+    bootstrap_room: int = -1
+    disagg_prefill_dp_rank: int = -1
+    metadata_buffer_index: int = -1
+    disagg_kv_sender: Optional[Any] = None
+
+    @property
+    def bootstrap_addr(self) -> str:
+        """Derived "host:port" of the Prefill bootstrap for this request."""
+        if self.bootstrap_host and self.bootstrap_port >= 0:
+            return f"{self.bootstrap_host}:{self.bootstrap_port}"
+        return ""
 
     def get_all_token_ids(self) -> List[int]:
         """Get concatenated input and output token IDs."""
@@ -134,7 +160,7 @@ class Request:
         if not self.mtp_info:
             self.mtp_info = MTPInfo()
         # Update metrics
-        if not self.stop_valid_generation:
+        if self.valid_output_len is None:
             self.spec_num_forward_ct += 1
             self.spec_num_accepted_tokens += accepted_num
         self.mtp_info.set_mtp_info(
@@ -175,6 +201,11 @@ class Batch:
 
     # MTPInfo
     mtp_infos: Optional[MTPInfo] = None
+
+    # True when this batch was synthesized to keep DP+TP collectives aligned
+    # on ranks with no local work (online PD). Engine runs forward normally so
+    # collectives complete, but scheduler skips state updates / output emit.
+    is_dummy: bool = False
 
     def __len__(self) -> int:
         """Return number of requests in batch."""

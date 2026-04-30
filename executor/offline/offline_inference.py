@@ -24,10 +24,10 @@ from executor.core.config import InferenceConfig
 from executor.core.engine import ExecutionEngine
 from executor.core.scheduler import Scheduler
 from executor.core.types_ import GenerationOutput, Request
-from .support_models import model_dict
+from executor.core.support_models import model_dict
 from executor.utils.common_utils import process_infer_time
 
-logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 class OfflineInference:
@@ -66,6 +66,7 @@ class OfflineInference:
         self.scheduler = Scheduler(
             tokenizer=self.engine.tokenizer,
             config=self.infer_config.scheduler_config,
+            input_truncated_len=self.infer_config.data_config.input_truncated_len,
         )
 
     def _load_model(self) -> None:
@@ -80,7 +81,7 @@ class OfflineInference:
             else:
                 model_class, model_mtp_class, config_class = model_config_cls
                 model_mtp_class = None if self.engine.next_n == 0 else model_mtp_class
-            self.engine.load_model(config_class, model_class, model_mtp_class)
+            self.engine.init(config_class, model_class, model_mtp_class)
             self.engine.warm_up()
         else:
             raise ValueError(f"Unsupported model: {model_name}")
@@ -142,7 +143,7 @@ class OfflineInference:
         while self.scheduler.has_work():
             step_output = self.scheduler.run_step(self.engine)
             if step_output is None:
-                logging.warning("Scheduler has work but no batch was scheduled. Breaking loop to avoid infinite wait.")
+                logger.warning("Scheduler has work but no batch was scheduled. Breaking loop to avoid infinite wait.")
                 break
 
         # Collect results (only for original requests, not padded ones)
@@ -156,6 +157,10 @@ class OfflineInference:
         for request_id in request_ids[:original_request_count]:
             request = self.scheduler.get_finished_request(request_id)
             if request is None:
+                logger.warning(
+                    "request %s: not found in finished_requests after scheduler "
+                    "loop exited — returning empty result", request_id,
+                )
                 results.append(GenerationOutput(
                     prompt=prompt_map[request_id],
                     output_text="",
@@ -182,14 +187,7 @@ class OfflineInference:
         return results, mtp_stats, request.infer_time
 
     def get_valid_output(self, request: Request) -> List[int]:
-        """Get valid output tokens for the request.
-
-        When the request hits EOS or max_new_tokens, stop_valid_generation is set to True
-        and valid_output_len records the length of valid output tokens. This method returns
-        only the valid portion of output tokens, truncating any extra tokens generated beyond
-        the valid boundary (e.g., speculative tokens in MTP scenario)."""
-        if request.stop_valid_generation and request.valid_output_len is not None:
-            # Return only valid output tokens, truncating extra tokens beyond EOS/max_new_tokens
+        if request.valid_output_len is not None:
             return request.output_id_list[:request.valid_output_len]
         else:
             # Return full output when generation hasn't reached valid stop condition

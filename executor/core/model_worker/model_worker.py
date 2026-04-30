@@ -31,14 +31,15 @@ from typing import Dict, Optional, Tuple
 import torch
 import torch_npu
 
-from executor.core.config import InferenceConfig
+from executor.core.config import InferenceConfig, CommManager
 from executor.core.kv_cache.cache_info import CacheEntry, LayerCacheInfo, ModelCacheInfo
+from executor.utils import calc_moe_hccl_buffer_size
 from executor.utils.forward_metadata import set_forward_metadata, get_forward_metadata
 from executor.model_loader.default_loader import DefaultModelLoader
 from executor.model_loader.dummy_loader import DummyModelLoader
 from module.quantization import (QUANTIZATION_METHODS, get_quant_config)
 
-logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 class ModelWorker:
@@ -118,20 +119,20 @@ class ModelWorker:
         self.moe_ep_size = self.infer_config.parallel_config.moe_ep_size
         self.moe_tp_size = self.infer_config.parallel_config.moe_tp_size
 
-    def load_model(
+    def init(
         self,
         model_cls,
         config_cls,
-        comm_manager,
-    ) -> ModelCacheInfo:
-        """Load model from weights, process weights, and return KV cache information."""
-        # Select appropriate loader based on configuration
-        if self.use_pretrained_model:
-            logging.info("Try to load pretrained model in path: %s", self.model_path)
-            loader = DefaultModelLoader()
-        else:
-            loader = DummyModelLoader()
+        comm_manager: Optional[CommManager] = None,
+    ) -> None:
+        """Bring the worker to ready: load HF config, build (or reuse) the
+        comm_manager, instantiate model layers, and load weights.
 
+        When ``comm_manager`` is None this worker creates one — that's the primary worker.
+        Secondary workers (e.g. the MTP draft model worker) pass the main worker's
+        comm_manager to share the single process-wide instance.
+        """
+        # Phase 1: HF config (cpu-only) + custom_params override + quant metadata + validation
         # Load HuggingFace config
         self.hf_config = config_cls.from_pretrained(
             self.model_path,
@@ -139,6 +140,11 @@ class ModelWorker:
             ignore_mismatched_sizes=True,
             runner_settings=self.infer_config
         )
+
+        # Allow custom_params to override hf_config fields (e.g. num_hidden_layers for reduced-layer testing)
+        custom_params = self.infer_config.model_config.custom_params
+        if "num_hidden_layers" in custom_params:
+            self.hf_config.num_hidden_layers = int(custom_params["num_hidden_layers"])
 
         # Handle quantization configuration
         self._verify_quantization()
@@ -152,13 +158,58 @@ class ModelWorker:
         # Validate configuration
         self.infer_config.validate(self.hf_config)
 
+        # Phase 2: comm_manager — moe_ep buffer size needs hf_config, so this
+        # is the natural place to size it.  Secondary workers (MTP) pass the
+        # main worker's comm_manager so we don't recreate process-wide state.
+        if comm_manager is None:
+            comm_manager = self._build_comm_manager()
+        self.comm_manager = comm_manager
+
+        # Phase 3: build model layers and load weights
+        self._load_weights(model_cls)
+
+    def _build_comm_manager(self) -> CommManager:
+        """Construct and initialize the process-wide CommManager.
+
+        moe_ep buffer is sized from yaml + the just-loaded hf_config so the
+        moe_ep_group registers with enough RDMA window for dispatch/combine
+        — the default 200MB is too small for full DeepSeek-R1 (needs ~479MB).
+        """
+        cfg = self.infer_config.parallel_config
+        moe_ep_buf = None
+        if cfg.moe_ep_size > 1 and hasattr(self.hf_config, "n_routed_experts"):
+            runner_settings = {
+                "world_size": cfg.world_size,
+                "data_config": {
+                    "batch_size": self.infer_config.scheduler_config.batch_size,
+                },
+                "model_config": {
+                    "next_n": self.infer_config.model_config.next_n,
+                    "platform_version": self.infer_config.model_config.platform_version,
+                },
+                "parallel_config": {"moe_ep_size": cfg.moe_ep_size},
+            }
+            moe_ep_buf = calc_moe_hccl_buffer_size(runner_settings, self.hf_config)
+        comm_manager = CommManager(cfg, moe_ep_buffer_size=moe_ep_buf)
+        comm_manager.initialize()
+        return comm_manager
+
+    def _load_weights(self, model_cls) -> None:
+        """Build model layers (using comm_manager) and load weights into them."""
+        # Select appropriate loader based on configuration
+        if self.use_pretrained_model:
+            logger.info("Try to load pretrained model in path: %s", self.model_path)
+            loader = DefaultModelLoader()
+        else:
+            loader = DummyModelLoader()
+
         # Load model
         self.model = loader.load_model(
             config=self.hf_config,
             model_cls=model_cls,
             runner_settings=self.infer_config,
             model_path=self.model_path,
-            comm_manager=comm_manager
+            comm_manager=self.comm_manager,
         )
 
         # Check model settings
@@ -261,10 +312,9 @@ class ModelWorker:
         end_time = time.time()
         inference_time = end_time - start_time
 
-        # Determine stage name for logging
-        model = "Main" if not is_mtp else "MTP"
-        stage = "prefill" if is_prefill else "decode"
-        logging.info(f"[{model}] Inference time ({stage}): {inference_time*1000:.2f} ms")
+        # Per-step timing log moved to Scheduler._log_step (the scheduler has
+        # the queue/kv-usage context that makes a single combined log line
+        # more useful than separate per-worker prints).
 
         return output, inference_time
 
@@ -272,9 +322,9 @@ class ModelWorker:
         """Compile model forward for graph mode."""
         from executor.utils.graph_utils import compile_model_forward
 
-        logging.info("The final model structure is: \n %s", self.model)
+        logger.info("The final model structure is: \n %s", self.model)
         if self.exe_mode in ["ge_graph", "npugraph_ex"]:
-            logging.info("Try to compile model")
+            logger.info("Try to compile model")
             self.model_compiled = compile_model_forward(
                 self.model.forward,
                 exe_mode=self.exe_mode,

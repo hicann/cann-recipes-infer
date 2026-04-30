@@ -1,0 +1,21 @@
+model_name: "gpt-oss"  # keep it for backward compatibility.
+world_size: 1  # keep it for backward compatibility.
+
+model_config:
+  model_name: "gpt-oss"
+  model_path: "/data/models/gpt-oss-20b-bf16"
+  exe_mode: "eager"  # ["eager"]
+  enable_profiler: False  # [False, True]
+
+parallel_config:  # Set the values of attn_tp_size, moe_tp_size, and lmhead_tp_size to be the same.
+  world_size: 1
+  attn_tp_size: 1
+  moe_tp_size: 1
+  lmhead_tp_size: 1
+  cp_size: 1
+  pp_size: 1
+
+scheduler_config:
+  batch_size: 1
+  max_prefill_tokens: 16384
+  max_new_tokens: 65535

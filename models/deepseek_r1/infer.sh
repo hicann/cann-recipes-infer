@@ -19,7 +19,19 @@ source ${FUNCTION_ABS_PATH}
 
 export MODEL_DIR=$(basename "$SCRIPT_PATH")
 export YAML_PARENT_PATH="${SCRIPT_PATH}/config"
-export YAML_FILE_NAME=decode_r1_rank_16_16ep_a8w8.yaml # modify to your yaml file name
-export YAML=${YAML_PARENT_PATH}/${YAML_FILE_NAME}
 
-launch
+mode="$1"
+pd_role="$2"
+
+if [ "$mode" = "online" ]; then
+    export PD_ROLE="$pd_role"
+    export P_YAML="${YAML_PARENT_PATH}/deepseek_r1_pd/prefill.yaml"
+    export D_YAML="${YAML_PARENT_PATH}/deepseek_r1_pd/decode.yaml"
+    echo "====================> launch online inference (${PD_ROLE:-auto})"
+else
+    export YAML_FILE_NAME=decode_r1_rank_16_16ep_a8w8.yaml # modify to your yaml file name
+    export YAML=${YAML_PARENT_PATH}/${YAML_FILE_NAME}
+    echo "====================> launch offline inference (${YAML_FILE_NAME})"
+fi
+
+launch "$mode"

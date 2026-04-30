@@ -1,0 +1,32 @@
+model_name: "deepseek_r1"  # keep it for backward compatibility.
+world_size: 16  # keep it for backward compatibility.
+
+model_config:
+  model_name: "deepseek_r1"
+  model_path: "/data/models/DeepSeek-R1-W8A8"
+  with_ckpt: True                   # [False, True]
+  exe_mode: "eager"
+  enable_static_kernel: False             # [False, True] Only takes effect in npugraph_ex mode.
+  enable_profiler: False            # [False, True]
+  force_eplb: False                 # [False, True]
+  enable_cache_compile: False       # [False, True]
+  custom_params:
+    enable_mla_prolog: True           # [False, True]
+    enable_multi_streams: False        # [False, True]
+    enable_superkernel: False         # [False, True]
+    moe_chunk_max_len: 65536
+    micro_batch_mode: 0               # [0, 1]
+
+parallel_config:
+  world_size: 16
+  attn_tp_size: 16
+  dense_tp_size: 16
+  moe_tp_size: 16
+  embed_tp_size: 16
+  lmhead_tp_size: 16
+
+scheduler_config:
+  block_size: 128
+  max_prefill_tokens: 8192
+  max_new_tokens: 1
+  batch_size: 8

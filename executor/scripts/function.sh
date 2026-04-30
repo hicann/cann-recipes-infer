@@ -11,10 +11,10 @@
 function launch()
 {
     check_launch
-    get_rank
-    check_env_vars
+    get_rank $1
+    check_env_vars $1
     set_hccl
-    launch_infer_task
+    launch_infer_task $1
 }
 
 function check_launch()
@@ -27,8 +27,77 @@ function check_launch()
     fi
 }
 
+# Resolve PD_ROLE from the explicit argument or infer it from the local IP.
+# Sets and exports PD_ROLE; exits with an error if the role cannot be determined.
+# Usage: resolve_pd_role [prefill|decode|""]
+function resolve_pd_role()
+{
+    local role="$1"
+    local local_host
+    local_host=$(hostname -I | awk '{print $1}')
+
+    local in_prefill=0 in_decode=0
+    for pip in "${PREFILL_IPS[@]}"; do
+        [ "$local_host" = "$pip" ] && in_prefill=1 && break
+    done
+    for dip in "${DECODE_IPS[@]}"; do
+        [ "$local_host" = "$dip" ] && in_decode=1 && break
+    done
+
+    if [ "$role" = "prefill" ]; then
+        if [ "$in_prefill" -ne 1 ]; then
+            echo "Error: --role prefill given but local IP ${local_host} not in PREFILL_IPS=(${PREFILL_IPS[*]})."
+            echo "Hint: role only needs to be passed when PREFILL_IPS and DECODE_IPS overlap (single-server PD); otherwise omit it and let it be inferred from the local IP."
+            exit 1
+        fi
+        export PD_ROLE="prefill"
+    elif [ "$role" = "decode" ]; then
+        if [ "$in_decode" -ne 1 ]; then
+            echo "Error: --role decode given but local IP ${local_host} not in DECODE_IPS=(${DECODE_IPS[*]})."
+            echo "Hint: role only needs to be passed when PREFILL_IPS and DECODE_IPS overlap (single-server PD); otherwise omit it and let it be inferred from the local IP."
+            exit 1
+        fi
+        export PD_ROLE="decode"
+    elif [ "$in_prefill" -eq 1 ] && [ "$in_decode" -eq 1 ]; then
+        echo "Error: local IP ${local_host} appears in both PREFILL_IPS and DECODE_IPS (single-server PD); cannot infer PD_ROLE."
+        echo "Please pass 'prefill' or 'decode' explicitly."
+        exit 1
+    elif [ "$in_prefill" -eq 1 ]; then
+        echo "Inferred PD_ROLE=prefill from local IP ${local_host}"
+        export PD_ROLE="prefill"
+    elif [ "$in_decode" -eq 1 ]; then
+        echo "Inferred PD_ROLE=decode from local IP ${local_host}"
+        export PD_ROLE="decode"
+    else
+        echo "Error: local IP ${local_host} not found in PREFILL_IPS or DECODE_IPS."
+        echo "Please pass 'prefill' or 'decode' explicitly."
+        exit 1
+    fi
+
+    # Single-server PD: prefill and decode share the host, so the two roles
+    # must be pinned to disjoint NPU sets — otherwise both grab NPU 0 and OOM.
+    if [ "$in_prefill" -eq 1 ] && [ "$in_decode" -eq 1 ]; then
+        if [ -z "${ASCEND_RT_VISIBLE_DEVICES+x}" ]; then
+            echo "Error: single-server PD (local IP ${local_host} is in both PREFILL_IPS and DECODE_IPS) requires ASCEND_RT_VISIBLE_DEVICES to be set explicitly."
+            echo "Hint: split the NPUs between roles, e.g. ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 for prefill and =4,5,6,7 for decode."
+            exit 1
+        fi
+    fi
+}
+
 function get_rank()
 {
+    mode=$1
+    if [ "$mode" = "online" ]; then
+        resolve_pd_role "${PD_ROLE}"
+        if [ "${PD_ROLE}" = "prefill" ]; then
+            export YAML="${P_YAML}"
+            IPs=("${PREFILL_IPS[@]}")
+        else
+            export YAML="${D_YAML}"
+            IPs=("${DECODE_IPS[@]}")
+        fi
+    fi
     filename=$(basename "$YAML")
     world_size=$(python3 -c "import yaml; print(yaml.safe_load(open('$YAML'))['world_size'])")
     platform_version=$(python3 -c "import yaml; print(yaml.safe_load(open('$YAML'))['model_config'].get('platform_version'))")
@@ -45,7 +114,7 @@ function get_rank()
         echo "server_num is: $SERVER_NUM"
 
         if [ "$SERVER_NUM" -eq 1 ]; then
-            LOCAL_HOST=`hostname -I|awk -F " " '{print$1}'`
+            LOCAL_HOST=$(hostname -I|awk -F " " '{print$1}')
             export IPs=($LOCAL_HOST)
         else
             export IPs=(${IPs[@]:0:$SERVER_NUM})
@@ -58,6 +127,7 @@ function get_rank()
 
 function check_env_vars()
 {
+    mode=$1
     export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
     LOCAL_HOST=`hostname -I|awk -F " " '{print$1}'`       # Obtain current server's IP
     if [[ ${ON_CLOUD} -eq 0 ]]; then
@@ -111,7 +181,11 @@ function check_env_vars()
     export CASE_NAME=$NAME
 
     if [[ ${ON_CLOUD} -eq 0 ]]; then
-        export RES_PATH="${DIR_PREFIX}/${DATE}/${NAME}"
+        if [ "$mode" = "online" ]; then
+            export RES_PATH="${DIR_PREFIX}/${DATE}/${NAME}/${PD_ROLE}_node${VC_TASK_INDEX}"
+        else
+            export RES_PATH="${DIR_PREFIX}/${DATE}/${NAME}"
+        fi
         WORK_DIR=`pwd`
         DUMP_PRECISION_PATH=${WORK_DIR}'/'${RES_PATH}'/dump_data'
         mkdir -p ${WORK_DIR}'/'${RES_PATH}
@@ -125,13 +199,7 @@ function check_env_vars()
 
     SCRIPT_PATH=$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
     PARENT_PARENT_DIR=$(cd "$SCRIPT_PATH/../.." &>/dev/null && pwd)
-    INFER_PATH=${PARENT_PARENT_DIR}/models/${MODEL_DIR}/infer.py
-    if [ ! -f "${INFER_PATH}" ]; then
-        INFER_PATH="${PARENT_PARENT_DIR}/executor/infer.py"
-    fi
-
     echo "==================================>"
-
 }
 
 function set_hccl()
@@ -148,7 +216,6 @@ function set_hccl()
     fi
 
     if [[ ${micro_batch_mode} -eq 1 ]]; then
-        # if enable micro_batch, disable AIV
         unset HCCL_OP_EXPANSION_MODE
     fi
 
@@ -159,6 +226,61 @@ function set_hccl()
 
 function launch_infer_task()
 {
+    mode=$1
+    if [ "$mode" = "online" ]; then
+        SERVER_PATH=${PARENT_PARENT_DIR}/executor/online/server.py
+        if [ "${PD_ROLE}" = "decode" ]; then
+            export MASTER_PORT=6239
+            export HCCL_IF_BASE_PORT=23556
+        fi
+
+        # Router: prefill node 0 only. Reads both YAMLs to compute leader strides.
+        if [ "${PD_ROLE}" = "prefill" ] && [ "${VC_TASK_INDEX}" = "0" ]; then
+            P_WS=$(python3 -c "import yaml; print(yaml.safe_load(open('${P_YAML}'))['parallel_config']['world_size'])")
+            D_WS=$(python3 -c "import yaml; print(yaml.safe_load(open('${D_YAML}'))['parallel_config']['world_size'])")
+            P_STEP=$(( P_WS / MA_NUM_GPUS )); [ "$P_STEP" -lt 1 ] && P_STEP=1
+            prefill_leaders=()
+            for ((i=0; i<${#PREFILL_IPS[@]}; i+=P_STEP)); do
+                prefill_leaders+=("${PREFILL_IPS[$i]}")
+            done
+            D_STEP=$(( D_WS / MA_NUM_GPUS )); [ "$D_STEP" -lt 1 ] && D_STEP=1
+            decode_leaders=()
+            for ((i=0; i<${#DECODE_IPS[@]}; i+=D_STEP)); do
+                decode_leaders+=("${DECODE_IPS[$i]}")
+            done
+
+            python3 "${SERVER_PATH}" \
+                --role router \
+                --prefill-addrs "${prefill_leaders[@]}" \
+                --decode-addrs "${decode_leaders[@]}" \
+                2>&1 > "${WORK_DIR}/${RES_PATH}/log_router.log" &
+        fi
+
+        # Both roles receive PREFILL_IPS and DECODE_IPS (flat cross-instance)
+        # so server.py can derive the memfabric store host (PREFILL_IPS[0])
+        # symmetrically on prefill and decode without per-role CLI or env plumbing.
+        server_cmd=(
+            python3 "${SERVER_PATH}"
+            --role "${PD_ROLE}"
+            --yaml-file-path "${YAML}"
+            --node-index "${VC_TASK_INDEX}"
+            --devices-per-node "${MA_NUM_GPUS}"
+            --ips "${IPs[@]}"
+            --prefill-ips "${PREFILL_IPS[@]}"
+            --decode-ips "${DECODE_IPS[@]}"
+        )
+
+        "${server_cmd[@]}" 2>&1 > "${WORK_DIR}/${RES_PATH}/log_server.log" &
+        return
+    fi
+
+    # Offline mode
+    INFER_PATH=${PARENT_PARENT_DIR}/models/${MODEL_DIR}/infer.py
+    if [ ! -f "${INFER_PATH}" ]; then
+        INFER_PATH="${PARENT_PARENT_DIR}/executor/offline/infer.py"
+    fi
+    EXTRA_ARGS=()
+
     cores=`cat /proc/cpuinfo|grep "processor" |wc -l`
     avg_core_per_rank=`expr $cores \/ $MA_NUM_GPUS`
     core_gap=`expr $avg_core_per_rank \- 1`
@@ -170,13 +292,11 @@ function launch_infer_task()
         cmdopt=$start"-"$end
         export LOCAL_RANK=$i
         export RANK_ID=$(expr $i + $RANK_OFFSET)
+        cmd=(taskset -c "$cmdopt" python3 "${INFER_PATH}" --yaml_file_path="${YAML}" "${EXTRA_ARGS[@]}")
         if [ $i -eq 0 ] && [[ $LAUNCH_MODE -ne 1 ]];then
-
-        taskset -c $cmdopt python3 ${INFER_PATH} \
-                            --yaml_file_path=${YAML} 2>&1 | tee ${WORK_DIR}/${RES_PATH}/log_${LOCAL_RANK}.log &
+            "${cmd[@]}" 2>&1 | tee ${WORK_DIR}/${RES_PATH}/log_${LOCAL_RANK}.log &
         else
-        taskset -c $cmdopt python3 ${INFER_PATH} \
-                            --yaml_file_path=${YAML} &> ${WORK_DIR}/${RES_PATH}/log_${LOCAL_RANK}.log &
+            "${cmd[@]}" &> ${WORK_DIR}/${RES_PATH}/log_${LOCAL_RANK}.log &
         fi
     done
     wait

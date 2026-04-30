@@ -13,8 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Entrypoints Module"""
+"""Scheduler variants for PD disaggregation."""
 
-from executor.core.entrypoints.offline_inference import OfflineInference
+from .decode import DecodeDisaggScheduler
+from .prefill import PrefillDisaggScheduler
 
-__all__ = ["OfflineInference"]
+__all__ = ["DecodeDisaggScheduler", "PrefillDisaggScheduler"]
