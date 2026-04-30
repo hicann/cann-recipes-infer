@@ -55,14 +55,23 @@ std::tuple<at::Tensor, at::Tensor> npu_sparse_attn_sharedkv_npu(const at::Tensor
     std::tuple<at::Tensor, at::Tensor> output = construct_output_tensor(q, layout_q_str, return_softmax_lse);
     at::Tensor attn_out = std::get<0>(output);
     at::Tensor softmax_lse = std::get<1>(output);
-
+    int64_t ori_kv_stride = 0;
+    int64_t cmp_kv_stride = 0;
+    if (ori_kv.has_value()){
+        const at::Tensor& tmp_kv = *ori_kv;
+        ori_kv_stride = tmp_kv.stride(0);
+    }
+    if (cmp_kv.has_value()){
+        const at::Tensor& tmp_kv = *cmp_kv;
+        cmp_kv_stride = tmp_kv.stride(0);
+    }
     // convert str
     char *layout_q_ptr = const_cast<char *>(layout_q_str.c_str());
     char *layout_kv_ptr = const_cast<char *>(layout_kv_str.c_str());
     // 调用aclnn接口
     EXEC_NPU_CMD_V1(aclnnSparseAttnSharedkv, q, ori_kv, cmp_kv, ori_sparse_indices, cmp_sparse_indices,
         ori_block_table, cmp_block_table, cu_seqlens_q, cu_seqlens_ori_kv, cu_seqlens_cmp_kv, seqused_q, seqused_kv, sinks,
-        metadata, softmax_scale, cmp_ratio, ori_mask_mode, cmp_mask_mode, ori_win_left, ori_win_right, layout_q_ptr,
+        metadata, softmax_scale, cmp_ratio, ori_mask_mode, cmp_mask_mode, ori_kv_stride, cmp_kv_stride, ori_win_left, ori_win_right, layout_q_ptr,
         layout_kv_ptr, return_softmax_lse, attn_out, softmax_lse);
     return std::tuple<at::Tensor, at::Tensor>(attn_out, softmax_lse);
 }
