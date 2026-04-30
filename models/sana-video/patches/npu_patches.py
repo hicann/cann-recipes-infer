@@ -24,6 +24,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch_npu
+from einops import rearrange
 
 _npu_available = torch.npu.is_available() and torch_npu.__version__ >= "2.6.0"
 
@@ -40,21 +41,20 @@ def patch_rms_norm() -> None:
     norms.RMSNorm.forward = forward
 
 
-def patch_conv1x1_matmul() -> None:
+def patch_conv1x1_matmul(enable_quant) -> None:
     basic_modules = importlib.import_module("diffusion.model.nets.basic_modules")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.dropout is not None:
             x = self.dropout(x)
-        if self.conv.kernel_size == (1, 1):
-            batch_size, in_channels, height, width = x.shape
-            out_channels, *_ = self.conv.weight.shape
-            x_trans = x.view(batch_size, in_channels, -1).permute(0, 2, 1).contiguous()
-            kernel_trans = self.conv.weight.view(out_channels, in_channels)
+        if self.conv.kernel_size == (1, 1) and not enable_quant:
+            _, _, height, width = x.shape
+            x_trans = rearrange(x, "b c h w -> b (h w) c")
+            kernel_trans = rearrange(self.conv.weight, "o i 1 1 -> o i")
             x = x_trans @ kernel_trans.T
             if self.conv.bias is not None:
                 x += self.conv.bias
-            x = x.permute(0, 2, 1).contiguous().view(batch_size, out_channels, height, width)
+            x = rearrange(x, "b (h w) o -> b o h w", h=height, w=width)
         else:
             x = self.conv(x)
         if self.norm:
@@ -237,10 +237,9 @@ def patch_local_text_encoder_path() -> None:
     builder.get_tokenizer_and_text_encoder = get_tokenizer_and_text_encoder
 
 
-def apply_npu_optimization_patches() -> None:
-    patch_conv1x1_matmul()
+def apply_npu_optimization_patches(enable_quant) -> None:
+    patch_conv1x1_matmul(enable_quant)
     patch_temporal_conv_swap()
     patch_rms_norm()
     patch_fusion_attention()
     patch_rotary_mul()
-    patch_local_text_encoder_path()

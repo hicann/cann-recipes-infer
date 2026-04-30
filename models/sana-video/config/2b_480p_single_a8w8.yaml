@@ -1,0 +1,27 @@
+model_args:
+  config: "configs/sana_video_config/Sana_2000M_480px_AdamW_fsdp.yaml"  # upstream Sana-Video model config
+  model_path: "./SANA-Video_2B_480p/checkpoints/SANA_Video_2B_480p.pth"  # local DiT/transformer checkpoint .pth
+  vae.vae_pretrained: "./SANA-Video_2B_480p/vae/Wan2.1_VAE.pth"          # local WanVAE checkpoint .pth
+  text_encoder.text_encoder_name: "./gemma-2-2b-it"   # local Gemma HF snapshot dir containing config.json
+  txt_file: "asset/samples/video_prompts_samples.txt"                    # text prompts file (one prompt per line)
+  work_dir: "output/sana_t2v_video_results"                              # output directory
+  cfg_scale: 6                       # CFG guidance strength
+  motion_score: 30                   # motion strength hint
+  flow_shift: 8                      # flow solver shift
+  model.fp32_attention: "False"      # quoted str literal; bypasses pyrallis bool parsing
+  quant_type: "a8w8"
+
+model_name: "sana-video"
+world_size: 1                        # also supports multi-card DP; set to target card count
+master_port: 29600
+entry_script: "inference_video_scripts/inference_sana_video.py"
+launcher: "accelerate"
+
+launcher_args:
+  mixed_precision: "bf16"            # no / fp16 / bf16 / fp8
+
+env_vars:
+  DISABLE_XFORMERS: "1"              # route attention to NPU fused kernel
+  HF_HUB_OFFLINE: "1"                # offline mode: do not access HuggingFace Hub
+  TRANSFORMERS_OFFLINE: "1"          # offline mode: transformers uses local files only
+  HF_DATASETS_OFFLINE: "1"           # offline mode: datasets uses local files only

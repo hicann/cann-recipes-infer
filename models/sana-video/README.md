@@ -112,6 +112,8 @@ source /usr/local/Ascend/ascend-toolkit/set_env.sh
 | YAML 文件 | 卡数 | 启动器 | 适用场景 |
 |-----------|------|--------|----------|
 | `2b_480p_single.yaml` | 1 | accelerate（`mixed_precision: bf16`） | SANA-Video 2B 480p 单卡文生视频，本地离线权重 |
+| `2b_480p_single_a8w8.yaml` | 1 | accelerate（`mixed_precision: bf16`） | SANA-Video 2B 480p 做mxfp_a8w8单卡文生视频 |
+| `2b_480p_single_a4w4.yaml` | 1 | accelerate（`mixed_precision: bf16`） | SANA-Video 2B 480p 做mxfp_a4w4单卡文生视频(部分回退a8w8) |
 | `2b_480p_single_platform.yaml` | 1 | python 直接拉起 | 一站式平台专用模板，由 `infer_platform.sh` 读取并生成临时本地权重配置 |
 
 YAML 中的关键字段：
@@ -136,6 +138,7 @@ model_args:
   flow_shift: 8
   work_dir: "output/sana_t2v_video_results"
   model.fp32_attention: "False"    # 用字符串 "False"，argparse 侧按字面量接收
+  quant_type: "bf16"               # 8bit量化:"a8w8" 4bit量化:"a4w4" 
 ```
 
 ### 3. 修改推理输入
@@ -154,6 +157,7 @@ model_args:
 | `flow_shift` | 流偏移参数，用于调整扩散模型去噪时间步 |
 | `work_dir` | 生成视频输出路径 |
 | `model.fp32_attention` | attn 是否使用 fp32 精度，推理时置 `"False"` 以提升性能 |
+| `quant_type` | 量化配置可选 bf16 / a8w8 / a4w4 |
 
 透传规则（适用于所有字段）：
 
@@ -232,3 +236,10 @@ bash infer_platform.sh
 | 规格| 单步时延(s) | Diffusion sampling总时长(s) |
 |--|--| --|
 | 480p81f | 2.75 | 132 |
+
+本样例在 Atlas A5 的推理性能如下表所示：
+|量化方式 | 规格| 单步时延(s) | Diffusion sampling总时长(s) | 整网耗时(s) |
+|--|--|--|--| -- |
+|bf16| 480p81f | 1.67 | 83.5 | 90.44 |
+|8bit| 480p81f | 1.46 | 73   | 79.38 |
+|4bit| 480p81f | 1.43 | 71.5 | 77.92 |

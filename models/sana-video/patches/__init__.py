@@ -24,6 +24,8 @@ import torch
 
 from .npu_patches import apply_npu_optimization_patches
 
+VALID_QUANT_TYPES = {"bf16", "a8w8", "a4w4"}
+
 
 def patch_triton_rms_norm_import() -> None:
     module_name = "diffusion.model.dc_ae.efficientvit.models.nn.triton_rms_norm"
@@ -45,31 +47,45 @@ def patch_wan_rotary_npu() -> None:
     sana_blocks = importlib.import_module("diffusion.model.nets.sana_blocks")
 
     def forward(self, fhw: torch.Tensor, device: torch.device) -> torch.Tensor:
-        ppf, pph, ppw = fhw
+        f_len, h_len, w_len = map(int, fhw)
 
-        freqs = self.freqs.to(dtype=torch.complex64).to(device)
-        freqs = freqs.split_with_sizes(
+        freqs = self.freqs.to(device=device, dtype=torch.complex64)
+
+        axis_dim = self.attention_head_dim // 6
+        f_dim = self.attention_head_dim // 2 - 2 * axis_dim
+
+        f_freq, h_freq, w_freq = torch.split(freqs, [f_dim, axis_dim, axis_dim], dim=-1)
+
+        f_part = f_freq[:f_len].reshape(f_len, 1, 1, f_dim)
+        h_part = h_freq[:h_len].reshape(1, h_len, 1, axis_dim)
+        w_part = w_freq[:w_len].reshape(1, 1, w_len, axis_dim)
+
+        out = torch.cat(
             [
-                self.attention_head_dim // 2 - 2 * (self.attention_head_dim // 6),
-                self.attention_head_dim // 6,
-                self.attention_head_dim // 6,
+                f_part.expand(f_len, h_len, w_len, f_dim),
+                h_part.expand(f_len, h_len, w_len, axis_dim),
+                w_part.expand(f_len, h_len, w_len, axis_dim),
             ],
-            dim=1,
+            dim=-1,
         )
 
-        freqs_f = freqs[0][:ppf].view(ppf, 1, 1, -1).expand(ppf, pph, ppw, -1)
-        freqs_h = freqs[1][:pph].view(1, pph, 1, -1).expand(ppf, pph, ppw, -1)
-        freqs_w = freqs[2][:ppw].view(1, 1, ppw, -1).expand(ppf, pph, ppw, -1)
-        freqs = torch.cat([freqs_f, freqs_h, freqs_w], dim=-1).reshape(1, 1, ppf * pph * ppw, -1)
-        return freqs
+        return out.flatten(0, 2).unsqueeze(0).unsqueeze(0)
 
     sana_blocks.WanRotaryPosEmbed.forward = forward
 
 
-def apply_all() -> None:
+def apply_all(quant_type: str) -> None:
+
+    if quant_type not in VALID_QUANT_TYPES:
+        raise ValueError(
+            f"Invalid quant_type: {quant_type}. "
+            f"Expected one of {VALID_QUANT_TYPES}"
+        )
+
+    enable_quant = quant_type != "bf16"
+    
     # NPU adaptation patches.
-    patch_triton_rms_norm_import()
     patch_wan_rotary_npu()
     
     # NPU optimization patches.
-    apply_npu_optimization_patches()
+    apply_npu_optimization_patches(enable_quant)

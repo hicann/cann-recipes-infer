@@ -35,13 +35,17 @@ import torch.nn as nn
 import torch_npu
 from torch_npu.contrib import transfer_to_npu
 from accelerate import Accelerator
-from patches import apply_all
 from termcolor import colored
 from tqdm import tqdm
+from patches import apply_all, patch_triton_rms_norm_import
+from patches.quant_module import replace_quant_module
+from patches.npu_patches import patch_local_text_encoder_path
+
 
 warnings.filterwarnings("ignore")  # ignore warning
 os.environ["DISABLE_XFORMERS"] = "1"
-apply_all()
+patch_triton_rms_norm_import()
+patch_local_text_encoder_path()
 
 from diffusion import DPMS, FlowEuler, LongLiveFlowEuler, LTXFlowEuler
 from diffusion.data.datasets.utils import *
@@ -397,12 +401,15 @@ class SanaInference(SanaVideoConfig):
     stg_scale: float = 0.0
     apg_mode: str = "hw"
     num_cached_blocks: int = -1
+    quant_type: str = "bf16"
 
 
 if __name__ == "__main__":
 
     args = get_args()
     config = args = pyrallis.parse(config_class=SanaInference, config_path=args.config)
+
+    apply_all(args.quant_type)
 
     args.image_size = config.model.image_size
     set_env(args.seed, args.image_size // config.vae.vae_downsample_rate)
@@ -540,6 +547,10 @@ if __name__ == "__main__":
     logger.warning(f"Missing keys: {missing}")
     logger.warning(f"Unexpected keys: {unexpected}")
     model.eval().to(weight_dtype)
+
+    logger.info(f"model quant type - {args.quant_type}")
+    if args.quant_type in ["a8w8", "a4w4"]:
+        replace_quant_module(model, quant_mode=args.quant_type)
 
     args.sampling_algo = config.scheduler.vis_sampler if args.sampling_algo is None else args.sampling_algo
     if config.task == "ltx" or config.task == "ti2v":
