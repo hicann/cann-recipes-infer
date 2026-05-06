@@ -1,0 +1,26 @@
+model_name: "qwen3_8b"
+world_size: 2
+
+model_config:
+  model_name: "qwen3_8b"
+  model_path: "/data/models/origin/Qwen3-8B"
+  exe_mode: "ge_graph"        # ["ge_graph", "eager", "npugraph_ex"]
+  enable_profiler: False  # [False, True]
+  with_ckpt: True # [False, True]
+  enable_cache_compile: False # [False, True]
+  enable_static_kernel: False # [False, True] only for npugraph_ex
+
+data_config:
+  dataset: "default"  # ["default", "LongBench"]
+  input_truncated_len: 4096
+
+parallel_config:
+  world_size: 2
+  attn_tp_size: 2
+  moe_tp_size: 2
+  embed_tp_size: 1
+  lmhead_tp_size: 2
+
+scheduler_config:
+  max_new_tokens: 256
+  batch_size: 1
