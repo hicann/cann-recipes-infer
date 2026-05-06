@@ -284,7 +284,8 @@ class MxFp8MoEGMMMethod(QuantizeMethodBase):
             intermediate_h, pertoken_scale , _ = torch.ops.custom.npu_swiglu_group_quant(mm1_mm3,
                                                                                         dst_type=torch.float8_e4m3fn,
                                                                                         quant_mode=2,
-                                                                                        clamp_value=swiglu_limit)
+                                                                                        clamp_value=swiglu_limit,
+                                                                                        group_index=expert_tokens)
         else:
             mm1_mm3 = torch_npu.npu_swiglu(mm1_mm3)
             intermediate_h, pertoken_scale = torch_npu.npu_dynamic_mx_quant(mm1_mm3, dst_type=torch.float8_e4m3fn)
