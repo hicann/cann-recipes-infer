@@ -338,6 +338,8 @@ for layer in model_layers:
 | 256  | 16  | 3   | Hybrid MXFP8-MXFP4    | 8192     | 9.84      | 1625.31 |
 | 1536 | 16  | 1   | Hybrid MXFP8-MXFP4    | 8192     | 20.33     | 4722.22 |
 | 16   | 16  | 3   | Hybrid MXFP8-MXFP4    | 131072   | 7.80      | 128.15  |
+| 256  | 16  | 3   | Hybrid MXFP8-MXFP4    | 131072   | 12.83     | 1246.89 |
+| 768  | 16  | 1   | Hybrid MXFP8-MXFP4    | 131072   | 21.65     | 2217.09 |
 | 256  | 16  | 3   | Hybrid FP8-MXFP4      | 8192     | 11.06     | 1447.00 |
 | 1536 | 16  | 1   | Hybrid FP8-MXFP4      | 8192     | 24.28     | 3953.49 |
 
@@ -347,11 +349,13 @@ DeepSeek-V4 Pro 8K序列场景Decode单卡吞吐c，不同Batch Size和序列长
 
 | Global Batch Size | Chips | MTP | DataType | Seq Length | TPOT (ms) | Throughput (Tokens/p/s) |
 | ----------------- | ---------|----------  | ----- | ----------------- | ----------------- |----------------- |
-| 16   | 16  | 3   | Hybrid MXFP8-MXFP4    | 8192     | 17.64      | 56.7  |
+| 16   | 16  | 3   | Hybrid MXFP8-MXFP4    | 8192     | 17.64      | 56.7   |
 | 64   | 16  | 3   | Hybrid MXFP8-MXFP4    | 8192     | 19.03      | 210.16 |
 | 128  | 16  | 3   | Hybrid MXFP8-MXFP4    | 8192     | 20.61      | 388.23 |
+| 16   | 16  | 3   | Hybrid MXFP8-MXFP4    | 131072   | 19.46      | 51.38  |
+| 64   | 16  | 3   | Hybrid MXFP8-MXFP4    | 131072   | 21.23      | 188.42 |
 
-> 注：Global Batch Size为16及256的性能数据基于MTP3与强制EPLB配置采集，平均3个Draft Token中Accepted Token个数为1.44。Global Batch Size为1536的性能数据基于MTP1与强制EPLB配置采集，平均1个Draft Token中Accepted Token个数为0.7，用户可按照数据集实际接受率自行折算benchmark性能。
+> 注：性能数据基于MTP投机与强制EPLB配置采集，MTP3场景下平均3个Draft Token中Accepted Token个数为1.44，MTP1场景下平均1个Draft Token中Accepted Token个数为0.7，用户可按照数据集实际接受率自行折算benchmark性能。
 
 > 注：Hybrid FP8-MXFP4指转换后的权重中部分Matmul FP8量化 + MoE模块MXFP4量化；Hybrid MXFP8-MXFP4指转换后的权重中部分Matmul MXFP8量化 + MoE模块MXFP4量化，详情见[量化策略](#量化策略)。
 
