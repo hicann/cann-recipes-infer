@@ -343,7 +343,7 @@ for layer in model_layers:
 | 256  | 16  | 3   | Hybrid FP8-MXFP4      | 8192     | 11.06     | 1447.00 |
 | 1536 | 16  | 1   | Hybrid FP8-MXFP4      | 8192     | 24.28     | 3953.49 |
 
-DeepSeek-V4 Pro 8K序列场景Decode单卡吞吐c，不同Batch Size和序列长度的性能Benchmark测试如下：
+DeepSeek-V4 Pro 8K序列场景Decode单卡吞吐，不同Batch Size和序列长度的性能Benchmark测试如下：
 
 **950DT Deepseek-V4 Pro Benchmark**
 
