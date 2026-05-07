@@ -13,11 +13,7 @@
  * \brief
  */
 
-#include <iostream>
-#include <cmath>
 #include <cstdint>
-#include <vector>
-#include <sstream>
 #include "tilefwk/tilefwk.h"
 #include "tilefwk/op_registry.h"
 #include "tilefwk/tilefwk_op.h"
