@@ -1,0 +1,30 @@
+model_name: "gemma-4"
+world_size: 8  # keep it for backward compatibility.
+
+model_config:
+  model_name: "gemma-4"
+  model_path: "/data/models/gemma-4-26B-A4B"
+  exe_mode: "eager"
+  with_ckpt: true
+  enable_profiler: false
+  enable_weight_nz: true
+  custom_params:
+    enable_pa: false
+    enable_multi_streams: false
+    enable_online_split_weight: true
+    moe_ep_decode_mode: "local_experts"
+
+data_config:
+  dataset: "default"
+  input_truncated_len: 256
+
+parallel_config:
+  world_size: 8
+  attn_tp_size: 1
+  moe_tp_size: 1
+  embed_tp_size: 8
+  lmhead_tp_size: 8
+
+scheduler_config:
+  max_new_tokens: 32
+  batch_size: 8

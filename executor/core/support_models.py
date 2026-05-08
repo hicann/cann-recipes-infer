@@ -21,6 +21,8 @@ from models.deepseek_r1.models.modeling_deepseek import DeepseekV3ForCausalLM, D
 from models.deepseek_r1.models.configuration_deepseek import DeepseekV3Config
 from models.qwen.models.modeling_qwen import QwenForCausalLM
 from models.qwen.models.configuration_qwen import Qwen2Config, Qwen3Config
+from models.gemma4_26b_a4b.models.modeling_gemma4 import Gemma4ForCausalLM
+from models.gemma4_26b_a4b.models.configuration_gemma4 import Gemma4TextConfig
 
 model_dict = {
     "gpt-oss": (GptOssForCausalLM, GptOssConfig),
@@ -28,4 +30,5 @@ model_dict = {
     "deepseek_r1": (DeepseekV3ForCausalLM, DeepseekV3ModelMTP, DeepseekV3Config),
     "qwen3_8b": (QwenForCausalLM, Qwen3Config),
     "qwen25_7b_instruct": (QwenForCausalLM, Qwen2Config),
+    "gemma-4": (Gemma4ForCausalLM, Gemma4TextConfig),
 }
