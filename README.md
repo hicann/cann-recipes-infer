@@ -1,6 +1,8 @@
 # cann-recipes-infer
 
 ## 🚀Latest News
+- [2026/05] hy_v3模型基于模型优化Agent（底座DeepSeek-V4-Pro），在昇腾Atlas A3系列上已完成端到端优化适配，支持推理部署。
+- [2026/05] Gemma4_26b_a4b模型基于模型优化Agent，在昇腾Atlas A2/A3系列上已完成端到端优化适配，支持推理部署。
 - [2026/04] DeepSeek-V4模型在昇腾Atlas A3系列和950PR/DT系列上已0day支持推理部署。
 - [2026/03] SANA-Video模型在昇腾Atlas A2系列上已支持推理部署。
 - [2026/03] 模型优化 Agent Skills已开源，支持 Agent 在昇腾Atlas A2/A3系列上完成端到端推理优化部署。

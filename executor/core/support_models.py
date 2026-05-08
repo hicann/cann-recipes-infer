@@ -23,6 +23,8 @@ from models.qwen.models.modeling_qwen import QwenForCausalLM
 from models.qwen.models.configuration_qwen import Qwen2Config, Qwen3Config
 from models.gemma4_26b_a4b.models.modeling_gemma4 import Gemma4ForCausalLM
 from models.gemma4_26b_a4b.models.configuration_gemma4 import Gemma4TextConfig
+from models.hy3.models.modeling_hy_v3 import HYV3ForCausalLM
+from models.hy3.models.configuration_hy_v3 import HYV3Config
 
 model_dict = {
     "gpt-oss": (GptOssForCausalLM, GptOssConfig),
@@ -31,4 +33,5 @@ model_dict = {
     "qwen3_8b": (QwenForCausalLM, Qwen3Config),
     "qwen25_7b_instruct": (QwenForCausalLM, Qwen2Config),
     "gemma-4": (Gemma4ForCausalLM, Gemma4TextConfig),
+    "hy3": (HYV3ForCausalLM, HYV3Config),
 }
