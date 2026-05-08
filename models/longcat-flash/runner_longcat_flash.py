@@ -61,7 +61,7 @@ class LongcatFlashRunner(ModelRunner):
         self.ep_size = runner_settings.get("parallel_config").get("ep_size", 1)
         self.batch_size = runner_settings.get("data_config").get("batch_size")
         self.with_ckpt = runner_settings.get("model_config").get("with_ckpt", True)
-        self.enable_multi_stream = runner_settings.get("model_config").get("enable_multi_stream", 0)
+        self.enable_multi_streams = runner_settings.get("model_config").get("enable_multi_streams", 0)
         self.enable_cache_compile = runner_settings.get("model_config").get("enable_cache_compile", False)
         self.batch_size_per_rank = runner_settings.get("data_config").get("batch_size_per_rank")
         self.decode_only = runner_settings.get("model_config").get("decode_only", False)
@@ -104,7 +104,7 @@ class LongcatFlashRunner(ModelRunner):
         compiler_config.experimental_config.frozen_parameter = True
         compiler_config.experimental_config.tiling_schedule_optimize = True
         compiler_config.experimental_config.topology_sorting_strategy = "StableRDFS"
-        compiler_config.ge_config.enable_single_stream = False if self.enable_multi_stream else True
+        compiler_config.ge_config.enable_single_stream = False if self.enable_multi_streams else True
 
         npu_backend = tng.get_npu_backend(compiler_config=compiler_config)
         if self.enable_cache_compile:

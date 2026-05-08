@@ -15,7 +15,7 @@ Model Config
   perfect_eplb: False        # Whether enable, test uniform scenario of MoE experts. Support [False, True]
   moe_chunk_max_len: 1024    # Moe layer chunk max length. Int type
   next_n: 0                  # Number of steps using multi-token prediction. Support [0, 1, 2]
-  enable_multi_stream: 0 # Whether enable multistream for better performance, set for different core numbers. Support [0, 1, 2] with 0 for not using multistream. AFD scenario, the switch will not take effect.
+  enable_multi_streams: 0 # Whether enable multistream for better performance, set for different core numbers. Support [0, 1, 2] with 0 for not using multistream. AFD scenario, the switch will not take effect.
   enable_mla_prolog: True    # Whether use mla_prolog fusion operator. Support [False, True]
   enable_cache_compile: False # Whether enable cache compile for better performance. Support [False, True]
   enable_superkernel: False   # Whether enable superkernel. Support [False, True]

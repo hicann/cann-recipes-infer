@@ -314,7 +314,7 @@ class LongcatFlashMoE(nn.Module):
         self.moe_tp_size = self.runner_settings.get("parallel_config").get("moe_tp_size", 1)
         self.moe_ep_size = self.runner_settings.get("parallel_config").get("moe_ep_size", 1)
         self.moe_chunk_max_len = self.runner_settings.get("model_config").get("moe_chunk_max_len", 65536)
-        self.enable_multi_stream = self.runner_settings.get("model_config").get("enable_multi_stream", 0)
+        self.enable_multi_streams = self.runner_settings.get("model_config").get("enable_multi_streams", 0)
 
         self.hccl_comm_dict = kwargs.get("hccl_comm_dict", None)
         self.moe_ep_group = self.hccl_comm_dict.get("moe_ep_group", None)
@@ -1094,7 +1094,7 @@ class LongcatFlashDecoderLayer(GradientCheckpointingLayer):
         self.enable_afd = self.runner_settings.get("model_config").get("enable_afd", False)
         if not self.enable_afd:
             self.mlp = LongcatFlashMoE(config, self.runner_settings, layer_idx, prefix=f"{prefix}.mlp", **kwargs)
-        self.enable_multi_stream = self.runner_settings.get("model_config").get("enable_multi_stream", 0)
+        self.enable_multi_streams = self.runner_settings.get("model_config").get("enable_multi_streams", 0)
         self.enable_superkernel = self.runner_settings.get("model_config").get("enable_superkernel", False)
         self.enable_prefetch = self.runner_settings.get("model_config").get("enable_prefetch", False)
         self.ffn_world_size = self.runner_settings.get("ffn_world_size", 0)
@@ -1103,7 +1103,7 @@ class LongcatFlashDecoderLayer(GradientCheckpointingLayer):
         # ensure recv/send comm tags do not overlap. Attn send tag value should equal to FFN recv tag.
         self.send_tag = layer_idx
         self.recv_tag = layer_idx + config.num_hidden_layers
-        if self.enable_multi_stream == 2: # takes effects only when enable_multi_stream > 0
+        if self.enable_multi_streams == 2: # takes effects only when enable_multi_streams > 0
             self.aic_num1 = "12"
             self.aiv_num1 = "24"
             self.aic_num2 = "12"
@@ -1153,7 +1153,7 @@ class LongcatFlashDecoderLayer(GradientCheckpointingLayer):
         next_layer: Optional['LongcatFlashDecoderLayer'] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.FloatTensor, Optional[tuple[torch.FloatTensor, torch.FloatTensor]]]:
-        if (self.enable_multi_stream > 0) and not is_prefill:
+        if (self.enable_multi_streams > 0) and not is_prefill:
             return self.multi_stream_forward(
                 hidden_states,
                 kv_len,

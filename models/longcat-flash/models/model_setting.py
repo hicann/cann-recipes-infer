@@ -34,27 +34,29 @@ def update_vars(world_size, runner_settings):
                                         align_up(align_up(max_position_embeddings, kvp_size) // kvp_size, pa_block_size)
                                         )
 
-    enable_multi_stream = runner_settings.get("model_config").get("enable_multi_stream", 0)
+    enable_multi_streams = runner_settings.get("model_config").get("enable_multi_streams", 0)
     exe_mode = runner_settings.get("exe_mode", "eager")
     # multi_stream is only supported for ge_graph mode in this model
-    if enable_multi_stream and exe_mode == "eager":
-        runner_settings = update_settings(runner_settings, "model_config", "enable_multi_stream", 0)
-        logging.warning(f"{exe_mode=} doesn't support {enable_multi_stream=}, force set {enable_multi_stream=} to run")
-        enable_multi_stream = 0
+    if enable_multi_streams and exe_mode == "eager":
+        runner_settings = update_settings(runner_settings, "model_config", "enable_multi_streams", 0)
+        logging.warning(f"{exe_mode=} doesn't support {enable_multi_streams=}, "
+                        f"force set {enable_multi_streams=} to run")
+        enable_multi_streams = 0
 
     enable_prefetch = runner_settings.get("model_config").get("enable_prefetch", False)
     # prefetch is only supported on the multi stream branch in this model
-    if enable_prefetch and not enable_multi_stream:
+    if enable_prefetch and not enable_multi_streams:
         runner_settings = update_settings(runner_settings, "model_config", "enable_prefetch", False)
         enable_prefetch = False
-        logging.warning(f"Prefetch is only supported when enable_multi_stream > 0, force set {enable_prefetch=} to run")
+        logging.warning(f"Prefetch is only supported when enable_multi_streams > 0, "
+                        f"force set {enable_prefetch=} to run")
 
 
 def check_model_settings(world_size, runner_settings):
     exe_mode = runner_settings.get("exe_mode")
     enable_cache_compile = runner_settings.get("model_config").get("enable_cache_compile", False)
     moe_chunk_max_len = runner_settings.get("model_config").get("moe_chunk_max_len", 65536)
-    enable_multi_stream = runner_settings.get("model_config").get("enable_multi_stream", 0)
+    enable_multi_streams = runner_settings.get("model_config").get("enable_multi_streams", 0)
     enable_superkernel = runner_settings.get("model_config").get("enable_superkernel", False)
     next_n = runner_settings.get("model_config").get("next_n", 0)
     kvp_size = runner_settings.get("parallel_config").get("kvp_size", 1)
@@ -63,7 +65,7 @@ def check_model_settings(world_size, runner_settings):
         raise ValueError(f"{exe_mode=} does not supported!")
     if moe_chunk_max_len <= 0:
         raise ValueError(f"{moe_chunk_max_len=} should be a positive integer.")
-    dynamo_feat = (enable_cache_compile or enable_multi_stream or enable_superkernel)
+    dynamo_feat = (enable_cache_compile or enable_multi_streams or enable_superkernel)
     if exe_mode == "eager" and dynamo_feat:
         raise ValueError(f"{exe_mode=} does not support cache compile, aclgraph, multi_streams or superkernel!")
     if next_n > 2:

@@ -10,7 +10,7 @@ model_config:
   pa_block_size: 128
   perfect_eplb: False     # [False, True]
   moe_chunk_max_len: 1024
-  enable_multi_stream: 1
+  enable_multi_streams: 1
   enable_mla_prolog: True
   decode_only: True      # [False, True], for TPOT test only, this will influence accuracy
 

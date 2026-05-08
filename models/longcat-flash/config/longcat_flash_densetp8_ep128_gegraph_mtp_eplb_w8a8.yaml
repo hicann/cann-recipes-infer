@@ -11,7 +11,7 @@ model_config:
   perfect_eplb: True     # [False, True], for TPOT test only, this will influence accuracy
   moe_chunk_max_len: 1024
   next_n: 2
-  enable_multi_stream: 1 # [0, 1, 2] with 1 for set core num with 8c16v
+  enable_multi_streams: 1 # [0, 1, 2] with 1 for set core num with 8c16v
   enable_mla_prolog: True
   enable_cache_compile: True
   enable_superkernel: True
