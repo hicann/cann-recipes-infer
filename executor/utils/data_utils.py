@@ -55,9 +55,10 @@ def generate_default_prompt(dataset_dir):
         raise e
     except Exception as e:
         raise e
-    preset_prompts = [
-        text,
-    ]
+    if isinstance(text, list):
+        preset_prompts = text
+    else:
+        preset_prompts = [text]
     return preset_prompts
 
 

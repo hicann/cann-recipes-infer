@@ -199,31 +199,32 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
     def set_mc2_kwargs(self):
         global_rank = self.comm_manager.config.global_rank
-        moe_ep_group_name = self.comm_manager.get_group_name("moe_ep_group")
+        mc2_group_name = self.comm_manager.get_group_name("moe_ep_group_mc2")
         self.dispatch_kwargs = {
                 "x_active_mask": None,
                 "moe_expert_num": self.num_experts,
                 "global_bs": 0,
                 "scales": None,
-                "group_ep": moe_ep_group_name,
+                "group_ep": mc2_group_name,
                 "ep_world_size": self.moe_ep_size,
                 "ep_rank_id": global_rank // self.moe_tp_size,
-                "group_tp": moe_ep_group_name,
+                "group_tp": mc2_group_name,
                 "tp_world_size": self.moe_tp_size,
                 "tp_rank_id": global_rank % self.moe_tp_size,
                 "expert_shard_type": 0,
                 "shared_expert_num": 0,
                 "shared_expert_rank_num": 0,
-                "quant_mode": 0
+                "quant_mode": 0,
+                "comm_alg": "fullmesh_v2",
             }
         self.combine_kwargs = {
                 "x_active_mask": None,
                 "moe_expert_num": self.num_experts,
                 "global_bs": 0,
-                "group_ep": moe_ep_group_name,
+                "group_ep": mc2_group_name,
                 "ep_world_size": self.moe_ep_size,
                 "ep_rank_id": global_rank // self.moe_tp_size,
-                "group_tp": moe_ep_group_name,
+                "group_tp": mc2_group_name,
                 "tp_world_size": self.moe_tp_size,
                 "tp_rank_id": global_rank % self.moe_tp_size,
                 "expert_shard_type": 0,

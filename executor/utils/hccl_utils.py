@@ -11,6 +11,8 @@
 import logging
 import math
 import os
+from typing import Optional
+
 import torch
 import torch_npu
 import torch.distributed as dist
@@ -34,6 +36,16 @@ def get_default_group():
 def get_group_name(comm_group, global_rank):
     return None if comm_group is None\
         else comm_group._get_backend(torch.device("npu")).get_hccl_comm_name(global_rank)
+
+
+def get_global_routed_expert_num(config) -> Optional[int]:
+    """Normalize the config field used as the global routed expert count for MoE EP buffer sizing."""
+    if hasattr(config, "n_routed_experts"):
+        return config.n_routed_experts
+    if hasattr(config, "num_experts"):
+        return config.num_experts
+    return None
+
 
 created_group = {}
 
@@ -137,7 +149,12 @@ def calc_moe_hccl_buffer_size(
     moe_ep_size = runner_settings.get("parallel_config").get("moe_ep_size", 1)
     platform_version = runner_settings.get("model_config").get("platform_version", "A3")
 
-    experts_per_rank = config.n_routed_experts // moe_ep_size
+    total_experts = get_global_routed_expert_num(config)
+    if total_experts is None:
+        raise AttributeError(
+            f"{type(config).__name__} does not provide n_routed_experts or num_experts"
+        )
+    experts_per_rank = total_experts // moe_ep_size
     hidden_size = config.hidden_size
     top_k = config.num_experts_per_tok
     shared_expert_rank_num = 0 # route and share on same card = 0

@@ -46,22 +46,18 @@ class CommManager:
     def __init__(
         self,
         parallel_config: ParallelConfig,
-        moe_ep_buffer_size: Optional[int] = None,
+        moe_ep_mc2_buffer_size: Optional[int] = None,
     ):
         """Initialize CommManager with parallel configuration.
 
         Args:
             parallel_config: ParallelConfig instance
-            moe_ep_buffer_size: HCCL buffer size (MB) to allocate for the
-                moe_ep_group only.  Computed by calc_moe_hccl_buffer_size
-                from yaml + HF config.  MoE EP dispatch/combine ops fail
-                with HCCL_BUFFSIZE=200MB on big batches, so sizing this
-                group explicitly removes the dependency on a shell-level
-                HCCL_BUFFSIZE export.  None falls back to init_comm_group's
-                env-var default.
+            moe_ep_mc2_buffer_size: HCCL buffer size (MB) for
+                moe_ep_group_mc2 (fullmesh_v2 dispatch/combine).
+                None falls back to init_comm_group's default.
         """
         self.config = parallel_config
-        self.moe_ep_buffer_size = moe_ep_buffer_size
+        self.moe_ep_mc2_buffer_size = moe_ep_mc2_buffer_size
 
         # Storage for communication groups and metadata
         self._groups: Dict[str, Optional[dist.ProcessGroup]] = {}
@@ -151,9 +147,6 @@ class CommManager:
 
         # Initialize moe_ep_group (needs HCCL name for NPU dispatch operators)
         if cfg.moe_ep_size > 1:
-            moe_ep_kwargs = {}
-            if self.moe_ep_buffer_size is not None:
-                moe_ep_kwargs["hccl_buffer_size"] = self.moe_ep_buffer_size
             moe_ep_group, moe_ep_group_name = init_comm_group(
                 global_rank=global_rank,
                 group_num=world_size // cfg.moe_ep_size,
@@ -161,7 +154,6 @@ class CommManager:
                 group_stride=world_size // cfg.moe_ep_size,
                 group_name="moe_ep_group",
                 return_name=True,
-                **moe_ep_kwargs,
             )
 
             self._groups["moe_ep_group"] = moe_ep_group
@@ -170,6 +162,27 @@ class CommManager:
                 self._ranks["moe_ep_group"] = dist.get_rank(moe_ep_group)
             else:
                 self._ranks["moe_ep_group"] = 0
+
+            # Initialize moe_ep_group_mc2 (independent MC2 comm domain for dispatch_v2/combine_v2)
+            moe_mc2_kwargs = {}
+            if self.moe_ep_mc2_buffer_size is not None:
+                moe_mc2_kwargs["hccl_buffer_size"] = self.moe_ep_mc2_buffer_size
+            moe_ep_group_mc2, moe_ep_group_mc2_name = init_comm_group(
+                global_rank=global_rank,
+                group_num=world_size // cfg.moe_ep_size,
+                world_size=world_size,
+                group_stride=world_size // cfg.moe_ep_size,
+                group_name="moe_ep_group_mc2",
+                return_name=True,
+                **moe_mc2_kwargs,
+            )
+
+            self._groups["moe_ep_group_mc2"] = moe_ep_group_mc2
+            self._group_names["moe_ep_group_mc2"] = moe_ep_group_mc2_name
+            if moe_ep_group_mc2 is not None:
+                self._ranks["moe_ep_group_mc2"] = dist.get_rank(moe_ep_group_mc2)
+            else:
+                self._ranks["moe_ep_group_mc2"] = 0
 
         # Initialize dense_tp_group if needed
         if cfg.dense_tp_size > 1:

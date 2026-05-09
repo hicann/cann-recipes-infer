@@ -363,7 +363,7 @@ class GlmMoeDsaMoE(nn.Module):
 
     def set_mc2_kwargs(self):
         global_rank = dist.get_rank()
-        moe_ep_group_name = self.hccl_comm_dict.get("moe_ep_group_name", None)
+        mc2_group_name = self.hccl_comm_dict.get("moe_ep_group_mc2_name", None)
         self.dispatch_kwargs = {
                 "x_active_mask": None,
                 "expert_shard_type": 0,
@@ -372,12 +372,13 @@ class GlmMoeDsaMoE(nn.Module):
                 "global_bs": 0,
                 "scales": self.experts.smooth_scale_1 if "a8" in self.gmm_quant_mode else None,
                 "quant_mode": 2 if "a8" in self.gmm_quant_mode else 0,
-                "group_ep": moe_ep_group_name,
+                "group_ep": mc2_group_name,
                 "ep_world_size": self.moe_ep_size,
                 "ep_rank_id": global_rank // self.moe_tp_size,
-                "group_tp": moe_ep_group_name,
+                "group_tp": mc2_group_name,
                 "tp_world_size": self.moe_tp_size,
                 "tp_rank_id": global_rank % self.moe_tp_size,
+                "comm_alg": "fullmesh_v2",
             }
         self.combine_kwargs = {
                 "x_active_mask": None,
@@ -385,10 +386,10 @@ class GlmMoeDsaMoE(nn.Module):
                 "shared_expert_rank_num": self.shared_expert_rank_num,
                 "moe_expert_num": self.n_routed_experts,
                 "global_bs": 0,
-                "group_ep": moe_ep_group_name,
+                "group_ep": mc2_group_name,
                 "ep_world_size": self.moe_ep_size,
                 "ep_rank_id": global_rank // self.moe_tp_size,
-                "group_tp": moe_ep_group_name,
+                "group_tp": mc2_group_name,
                 "tp_world_size": self.moe_tp_size,
                 "tp_rank_id": global_rank % self.moe_tp_size
             }
@@ -1936,6 +1937,12 @@ class GlmMoeDsaForCausalLM(GlmMoeDsaPreTrainedModel):
             group_stride=self.moe_tp_size, group_name="moe_ep_group", return_name=True,
             hccl_buffer_size=hccl_buffer_size)
 
+        hccl_buffer_size_mc2 = calc_moe_hccl_buffer_size(self.runner_settings, self.config, is_full_mesh_v2=True)
+        moe_ep_group_mc2, moe_ep_group_mc2_name = init_comm_group(
+            global_rank=global_rank, group_num=self.moe_tp_size, world_size=world_size,
+            group_stride=self.moe_tp_size, group_name="moe_ep_group_mc2", return_name=True,
+            hccl_buffer_size=hccl_buffer_size_mc2)
+
         cp_group = init_comm_group(
             global_rank=global_rank, group_num=world_size // self.cp_size, world_size=world_size,
             group_stride=1, group_name="cp_group")
@@ -1945,6 +1952,8 @@ class GlmMoeDsaForCausalLM(GlmMoeDsaPreTrainedModel):
                 "attn_tp_group": attn_tp_group, "embed_tp_group": embed_tp_group,
                 "moe_tp_group": moe_tp_group, "moe_ep_group": moe_ep_group,
                 "moe_ep_group_name": moe_ep_group_name,
+                "moe_ep_group_mc2": moe_ep_group_mc2,
+                "moe_ep_group_mc2_name": moe_ep_group_mc2_name,
                 "lmhead_tp_group": lmhead_tp_group,
                 "dense_tp_group": dense_tp_group,
                 "oproj_tp_group": oproj_tp_group,

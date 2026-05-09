@@ -444,7 +444,7 @@ class LongcatFlashMoE(nn.Module):
 
     def set_mc2_kwargs(self):
         global_rank = dist.get_rank()
-        moe_ep_group_name = self.hccl_comm_dict.get("moe_ep_group_name", None)
+        mc2_group_name = self.hccl_comm_dict.get("moe_ep_group_mc2_name", None)
         self.dispatch_kwargs = {
                 "x_active_mask": None,
                 "expert_shard_type": 0,
@@ -454,10 +454,10 @@ class LongcatFlashMoE(nn.Module):
                 "global_bs": 0,
                 "scales": self.experts.smooth_scale_1 if "a8" in self.gmm_quant_mode else None,
                 "quant_mode": 2 if "a8" in self.gmm_quant_mode else 0,
-                "group_ep": moe_ep_group_name,
+                "group_ep": mc2_group_name,
                 "ep_world_size": self.moe_ep_size,
                 "ep_rank_id": global_rank // self.moe_tp_size,
-                "group_tp": moe_ep_group_name,
+                "group_tp": mc2_group_name,
                 "tp_world_size": self.moe_tp_size,
                 "tp_rank_id": global_rank % self.moe_tp_size,
             }
@@ -468,10 +468,10 @@ class LongcatFlashMoE(nn.Module):
                 "moe_expert_num": self.n_routed_experts,
                 "copy_expert_num": self.num_zero_experts,
                 "global_bs": 0,
-                "group_ep": moe_ep_group_name,
+                "group_ep": mc2_group_name,
                 "ep_world_size": self.moe_ep_size,
                 "ep_rank_id": global_rank // self.moe_tp_size,
-                "group_tp": moe_ep_group_name,
+                "group_tp": mc2_group_name,
                 "tp_world_size": self.moe_tp_size,
                 "tp_rank_id": global_rank % self.moe_tp_size
             }
@@ -1041,8 +1041,8 @@ class LongcatFlashAttention(nn.Module):
             # This AllToAll can't be merged with the previous one, due to the
             # dtype difference between attn and lse.
             # BNSD -> NBSD
-            lse_partial = lse_partial.transpose(0, 1).contiguous()                    
-            lse_scatter = _all_to_all_along_headdim(lse_partial, self.kvp_group)            
+            lse_partial = lse_partial.transpose(0, 1).contiguous()
+            lse_scatter = _all_to_all_along_headdim(lse_partial, self.kvp_group)
             attn_output = (attn_scatter * lse_scatter.softmax(dim=0)).sum(dim=0).to(torch.bfloat16)
 
             attn_output = attn_output.view(self.num_heads_per_rank // self.kvp_size, bsz * q_len, -1)
@@ -1370,7 +1370,7 @@ class LongcatFlashModel(LongcatFlashPreTrainedModel):
                 .expand(batch_size * self.attn_tp_size, -1)
                 )
         mask = slot_mapping % self.kvp_size != self.kvp_rank
-        return torch.where(mask, -1, 
+        return torch.where(mask, -1,
                             slot_mapping // self.kvp_size + self.kv_len_offset[:batch_size * self.attn_tp_size])
 
     def prepare_inputs_for_layer(self, input_ids, kv_len, position_ids, actual_seq_lengths_kv, is_prefill):
@@ -1393,9 +1393,9 @@ class LongcatFlashModel(LongcatFlashPreTrainedModel):
             inputs_embeds_attn = inputs_embeds.new_empty(batch_size, seq_length, inputs_embeds.shape[-1])
             dist.reduce_scatter_tensor(inputs_embeds_attn, inputs_embeds, group=embed_tp_group)
             inputs_embeds = inputs_embeds_attn
-            
+
         elif self.embed_tp_size > 1 and self.kvp_size > 1:
-            embed_tp_group = self.hccl_comm_dict.get("embed_tp_group", None)            
+            embed_tp_group = self.hccl_comm_dict.get("embed_tp_group", None)
             # Map the token IDs in input_ids to the vocab shard range assigned to the current rank
             new_input_ids = input_ids - (self.global_rank % self.embed_tp_size) * self.vocab_size_per_rank
             # Mark which tokens belong to the current rank's vocab shard
@@ -1485,7 +1485,7 @@ class LongcatFlashForCausalLM(LongcatFlashPreTrainedModel, GenerationMixin):
             if dist.get_world_size() > 1:
                 self.hccl_comm_dict = self.init_parallel_comm_group()
                 kwargs.update({"hccl_comm_dict": self.hccl_comm_dict})
-                
+
         kvp_group = self.hccl_comm_dict["kvp_group"]
         self.kvp_size = dist.get_world_size(kvp_group) if kvp_group is not None else 1
         self.kvp_rank = dist.get_rank(kvp_group) if kvp_group is not None else 0
@@ -1605,10 +1605,16 @@ class LongcatFlashForCausalLM(LongcatFlashPreTrainedModel, GenerationMixin):
             moe_ep_group, moe_ep_group_name = init_comm_group(
                 global_rank=global_rank, group_num=world_size // self.moe_ep_size, world_size=world_size,
                 group_stride=self.moe_tp_size, group_name="moe_ep_group", return_name=True)
+
+            moe_ep_group_mc2, moe_ep_group_mc2_name = init_comm_group(
+                global_rank=global_rank, group_num=world_size // self.moe_ep_size, world_size=world_size,
+                group_stride=self.moe_tp_size, group_name="moe_ep_group_mc2", return_name=True)
         else:
             moe_tp_group = None
             moe_ep_group = None
             moe_ep_group_name = None
+            moe_ep_group_mc2 = None
+            moe_ep_group_mc2_name = None
 
         kvp_group = init_comm_group(
             global_rank=global_rank, group_num=world_size // self.kvp_size, world_size=world_size,
@@ -1620,6 +1626,8 @@ class LongcatFlashForCausalLM(LongcatFlashPreTrainedModel, GenerationMixin):
                 "o_proj_tp_group": o_proj_tp_group,
                 "moe_tp_group": moe_tp_group, "moe_ep_group": moe_ep_group,
                 "moe_ep_group_name": moe_ep_group_name,
+                "moe_ep_group_mc2": moe_ep_group_mc2,
+                "moe_ep_group_mc2_name": moe_ep_group_mc2_name,
                 "lmhead_tp_group": lmhead_tp_group,
                 "dense_tp_group": dense_tp_group,
                 "kvp_group": kvp_group,
@@ -2052,13 +2060,13 @@ class LongcatFlashModelMTP(LongcatFlashForCausalLM):
         self.eh_proj = ReplicatedLinear(2 * config.hidden_size, config.hidden_size, bias=False)
 
     def get_slot_mapping(self, input_ids, kv_len, is_prefill, device):
-        batch_size, seq_len = input_ids.size()            
+        batch_size, seq_len = input_ids.size()
         if not is_prefill:
             kv_len = kv_len.view(batch_size * self.attn_tp_size, -1) + \
                 self.kv_len_offset[:batch_size * self.attn_tp_size]
             return kv_len
         else:
-            all_tensors = []        
+            all_tensors = []
             for i in range(batch_size * self.attn_tp_size):
                 new_index = torch.arange(self.pa_max_length * i, seq_len + self.pa_max_length * i,
                                         dtype=kv_len.dtype, device=device)
@@ -2215,4 +2223,3 @@ def is_main_weight(config, weight_name: str) -> Optional[int]:
 
 
 __all__ = ["LongcatFlashPreTrainedModel", "LongcatFlashModel", "LongcatFlashForCausalLM"]
-
