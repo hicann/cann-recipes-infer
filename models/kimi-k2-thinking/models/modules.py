@@ -46,14 +46,20 @@ from transformers.utils import (
     add_start_docstrings,
     logging,
 )
-from transformers.utils.import_utils import is_torch_fx_available
 
 from .configuration_deepseek import DeepseekV3Config
 
 
 # This makes `_prepare_4d_causal_attention_mask` a leaf function in the FX graph.
 # It means that the function will not be traced through and simply appear as a node in the graph.
-if is_torch_fx_available():
+# Compatibility fix for transformers 5.0.0: is_torch_fx_available was removed
+try:
+    import torch.fx
+    _torch_fx_available = True
+except ImportError:
+    _torch_fx_available = False
+
+if _torch_fx_available:
     if not is_torch_greater_or_equal_than_1_13:
         import torch.fx
 
