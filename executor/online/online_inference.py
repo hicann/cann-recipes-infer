@@ -68,6 +68,9 @@ class OnlineInference(OfflineInference):
         self.batch_size = infer_config.scheduler_config.batch_size_per_dp_rank
         self.router_port, self.pull_port = zmq_ports_for_role(self.disaggregation_mode)
 
+        # Gloo CPU groups (tp_cpu_group, dp_leader_group) are online-only.
+        self.engine.comm_manager.init_cpu_groups()
+
         self._compute_parallel_ranks()
 
         self.kv_transfer_manager = None

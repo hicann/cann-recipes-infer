@@ -209,19 +209,18 @@ class CommManager:
             else:
                 self._ranks["o_proj_tp_group"] = 0
 
-        # Initialize CPU communication groups for online mode
-        self._init_cpu_groups(global_rank, world_size, cfg)
-
         # Add default process group
         self._groups["default_pg"] = get_default_group()
 
-    def _init_cpu_groups(self, global_rank: int, world_size: int, cfg: ParallelConfig):
+    def init_cpu_groups(self):
         """Initialize gloo-backend CPU groups for online mode coordination.
 
         Creates:
         - dp_leader_group: cross-DP synchronization among DP leaders
         - tp_cpu_group: DP leader -> TP workers broadcast of Python objects
         """
+        cfg = self.config
+        global_rank = cfg.global_rank
         dp_size = cfg.attn_dp_size
         tp_size = cfg.attn_tp_size
         cp_size = cfg.cp_size

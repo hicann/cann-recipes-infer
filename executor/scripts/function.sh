@@ -228,6 +228,8 @@ function launch_infer_task()
 {
     mode=$1
     if [ "$mode" = "online" ]; then
+        export GLOO_IGNORE_IPV6=1
+        export GLOO_SOCKET_IFNAME=${GLOO_SOCKET_IFNAME:-$(ip route show default | awk '{print $5}' | head -n1)}
         SERVER_PATH=${PARENT_PARENT_DIR}/executor/online/server.py
         if [ "${PD_ROLE}" = "decode" ]; then
             export MASTER_PORT=6239

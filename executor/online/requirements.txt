@@ -1,0 +1,4 @@
+fastapi
+uvicorn
+pyzmq
+memfabric_hybrid==1.0.5
