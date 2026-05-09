@@ -2133,6 +2133,7 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
 
         params_dict = dict(self.named_parameters())
         params_dict = adapt_safetensors_field(params_dict)
+        is_replace_expert_scale_name = any("w13_weight_scale" in key for key in params_dict)
         loaded_params: Set[str] = set()
         dequant_cache = {}
         for name, loaded_weight in weights:
@@ -2187,7 +2188,8 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
                     if weight_name not in name:
                         continue
                     name = name.replace(weight_name, param_name)
-                    name = name.replace("scale", "weight_scale")
+                    if is_replace_expert_scale_name:
+                        name = name.replace("scale", "weight_scale")
 
                     if name not in params_dict:
                         continue
@@ -2359,6 +2361,7 @@ class DeepseekV3ModelMTP(DeepseekV3ForCausalLM):
         params_dict = adapt_safetensors_field_mtp(params_dict, self.config.num_hidden_layers)
         loaded_params: Set[str] = set()
         dequant_cache = {}
+        is_replace_expert_scale_name = any("w13_weight_scale" in key for key in params_dict)
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
@@ -2424,7 +2427,8 @@ class DeepseekV3ModelMTP(DeepseekV3ForCausalLM):
                     if weight_name not in name:
                         continue
                     name = name.replace(weight_name, param_name)
-                    name = name.replace("scale", "weight_scale")
+                    if is_replace_expert_scale_name:
+                        name = name.replace("scale", "weight_scale")
 
                     if name not in params_dict:
                         continue
