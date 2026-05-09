@@ -88,7 +88,7 @@ class Qwen3MoeRotaryEmbedding(nn.Module):
         self.config = config
         self.dim = self.config.head_dim
         self.max_position_embeddings = max_position_embeddings
-        self.base = self.config.rope_theta
+        self.base = self.config.rope_parameters.get("rope_theta", 1000000.0)
         inv_freq = 1.0 / (
             self.base ** (torch.arange(0, self.dim, 2).float().to(device) / self.dim)
         )
@@ -418,7 +418,7 @@ class Qwen3MoeAttention(nn.Module):
         self.num_key_value_heads = config.num_key_value_heads
         self.num_key_value_heads_per_rank = max(self.num_key_value_heads // self.attn_tp_size, 1)
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
-        self.rope_theta = config.rope_theta
+        self.rope_theta = config.rope_parameters.get("rope_theta", 1000000.0)
         self.is_causal = True
         self.attn_intermediate_size = self.head_dim * self.num_heads
         self.attn_intermediate_size_per_rank = self.attn_intermediate_size // self.attn_tp_size

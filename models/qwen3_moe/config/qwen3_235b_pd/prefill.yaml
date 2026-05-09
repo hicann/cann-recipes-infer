@@ -1,6 +1,3 @@
-model_name: "qwen3-moe"  # keep it for backward compatibility.
-world_size: 16  # keep it for backward compatibility.
-
 model_config:
   model_name: "qwen3-moe"
   model_path: "/data/models/Qwen3-235B-A22B"

@@ -99,7 +99,7 @@ function get_rank()
         fi
     fi
     filename=$(basename "$YAML")
-    world_size=$(python3 -c "import yaml; print(yaml.safe_load(open('$YAML'))['world_size'])")
+    world_size=$(python3 -c "import yaml; cfg=yaml.safe_load(open('$YAML')); print(cfg.get('parallel_config', {}).get('world_size', cfg.get('world_size')))")
     platform_version=$(python3 -c "import yaml; print(yaml.safe_load(open('$YAML'))['model_config'].get('platform_version'))")
     if [ "$platform_version" = "950" ]; then
         chip_num=8
@@ -174,7 +174,7 @@ function check_env_vars()
     DATE=`date +%Y%m%d`
     # set result path
     DIR_PREFIX="res"
-    MODEL_NAME=$(python3 -c "import yaml; print(yaml.safe_load(open('$YAML'))['model_name'])")
+    MODEL_NAME=$(python3 -c "import yaml; cfg=yaml.safe_load(open('$YAML')); print(cfg.get('model_config', {}).get('model_name', cfg.get('model_name')))")
     PREFIX=$(basename "$YAML")
     PREFIX="${PREFIX%.*}"
     NAME=${MODEL_NAME}_${PREFIX}

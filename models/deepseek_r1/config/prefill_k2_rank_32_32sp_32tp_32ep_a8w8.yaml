@@ -1,6 +1,3 @@
-model_name: "kimi_k2"  # keep it for backward compatibility.
-world_size: 32  # keep it for backward compatibility.
-
 model_config:
   model_name: "kimi_k2"
   model_path: "/data/models/origin/kimi-k2-int8-pertoken/"
@@ -10,7 +7,6 @@ model_config:
   force_eplb: False                 # [False, True]
   enable_cache_compile: False       # [False, True]
   custom_params:
-    enable_weight_nz: True            # [False, True]
     enable_mla_prolog: True           # [False, True]
     enable_multi_streams: True        # [False, True]
     enable_superkernel: False         # [False, True]

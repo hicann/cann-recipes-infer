@@ -1,6 +1,3 @@
-model_name: "longcat-flash-lite"
-world_size: 8
-
 # Throughput EP deployment (b=8) — exposes per-rank batch > 1 path.
 # Same topology as canonical ep8 yaml, only batch_size differs:
 #   batch=8 / attn_dp=2 -> batch_per_dp_rank = 4 (vs 1 for canonical b=2).

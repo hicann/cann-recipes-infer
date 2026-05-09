@@ -328,7 +328,16 @@ class ExecutionEngine:
             # 2. Execute ONE prefill step with dummy inputs (packed sequence format)
             logger.info("Warm-up [Main]: executing model prefill step...")
             dummy_seq_lens = torch.tensor([seq_len] * prefill_batch_size, dtype=torch.long, device=self.device)
-            dummy_input_ids = torch.zeros(prefill_batch_size * seq_len, dtype=torch.long, device=self.device)
+            if not hasattr(self.hf_config, "vocab_size") or self.hf_config.vocab_size is None:
+                raise ValueError(
+                    "hf_config is missing 'vocab_size', which is required to generate dummy input_ids "
+                    "for the warmup phase. Please check that the model's config.json contains a valid "
+                    "vocab_size field."
+                )
+            dummy_input_ids = torch.randint(
+                0, self.hf_config.vocab_size,
+                (prefill_batch_size * seq_len,), dtype=torch.long, device=self.device,
+            )
             model_inputs = self._build_model_inputs(dummy_input_ids, is_prefill=True, seq_lens=dummy_seq_lens)
             output, _ = self.main_worker.inference(model_inputs, is_prefill=True)
             if self.mtp_worker:
@@ -349,10 +358,10 @@ class ExecutionEngine:
             # 3. Execute ONE decode step with graph compilation
             seq_len = 1 if self.next_n == 0 else self.next_n + 1
             logger.info("Warm-up [Main]: executing model decode step...")
-            if self.mtp_worker:
-                dummy_input_ids = torch.zeros(decode_batch_size * seq_len, dtype=torch.long, device=self.device)
-            else:
-                dummy_input_ids = torch.zeros(decode_batch_size, dtype=torch.long, device=self.device)
+            dummy_input_ids = torch.randint(
+                0, self.hf_config.vocab_size,
+                (decode_batch_size * seq_len,), dtype=torch.long, device=self.device,
+            )
             model_inputs = self._build_model_inputs(dummy_input_ids, is_prefill=False)
 
             # Trigger graph compilation if graph mode enabled and not yet compiled
@@ -370,6 +379,7 @@ class ExecutionEngine:
                 _ = self.mtp_worker.mtp_model_worker.inference(model_inputs, is_prefill=False, is_mtp=True)
 
         logger.info("Warm-up completed successfully.")
+
 
     def forward_batch(self, batch: Batch) -> Dict[str, Any]:
         """Execute forward pass for a batch of requests.

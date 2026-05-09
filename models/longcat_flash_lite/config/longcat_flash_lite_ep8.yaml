@@ -1,6 +1,3 @@
-model_name: "longcat-flash-lite"
-world_size: 8
-
 # Canonical EP deployment for LongCat-Flash-Lite (A3 + ge_graph).
 #
 # Parallel topology:

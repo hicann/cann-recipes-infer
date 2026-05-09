@@ -1,6 +1,3 @@
-model_name: "qwen3_8b"
-world_size: 1
-
 model_config:
   model_name: "qwen3_8b"
   model_path: "/data/models/origin/Qwen3-8B"

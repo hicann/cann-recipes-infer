@@ -32,6 +32,8 @@ model_dict = {
     "gpt-oss": (GptOssForCausalLM, GptOssConfig),
     "qwen3-moe": (Qwen3MoeForCausalLM, Qwen3MoeConfig),
     "deepseek_r1": (DeepseekV3ForCausalLM, DeepseekV3ModelMTP, DeepseekV3Config),
+    "deepseek_v2_lite": (DeepseekV3ForCausalLM, DeepseekV3Config),
+    "kimi_k2": (DeepseekV3ForCausalLM, DeepseekV3Config),
     "qwen3_8b": (QwenForCausalLM, Qwen3Config),
     "qwen25_7b_instruct": (QwenForCausalLM, Qwen2Config),
     "gemma-4": (Gemma4ForCausalLM, Gemma4TextConfig),

@@ -13,18 +13,17 @@
 
 1. 安装CANN软件包。
 
-   本样例的编译执行依赖CANN开发套件包（cann-toolkit）与CANN二进制算子包（cann-kernels），支持的CANN软件版本为`CANN 8.5.0`。
+   本样例的编译执行依赖CANN开发套件包（cann-toolkit）与CANN二进制算子包（cann-kernels），支持的CANN软件版本为`CANN 9.0.0`。
 
-   请从[软件包下载地址](https://www.hiascend.com/developer/download/community/result?module=cann&cann=8.5.0)下载`Ascend-cann-toolkit_${version}_linux-${arch}.run`与`Ascend-cann-A3-ops_<version>_linux-<arch>.run`软件包，并参考[CANN安装文档](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/850/softwareinst/instg/instg_0090.html?Mode=PmIns&InstallType=localpack&OS=Ubuntu)进行安装。
+   请从[软件包下载地址](https://www.hiascend.com/developer/download/community/result?module=cann&cann=9.0.0)下载`Ascend-cann-toolkit_${version}_linux-${arch}.run`与`Ascend-cann-A3-ops_<version>_linux-<arch>.run`软件包，并参考[CANN安装文档](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/900/softwareinst/instg/instg_0090.html?OS=Ubuntu&InstallType=localpack)进行安装。
 
-    - `${version}`表示CANN包版本号，如8.5.0。
+    - `${version}`表示CANN包版本号，如9.0.0。
     - `${arch}`表示CPU架构，如aarch64、x86_64。
-
 
 2. 安装Ascend Extension for PyTorch（torch_npu）。
 
-   Ascend Extension for PyTorch（torch_npu）为支撑PyTorch框架运行在NPU上的适配插件。
-   请从[软件包下载地址](https://gitcode.com/Ascend/pytorch/releases/v7.3.0-pytorch2.8.0)下载`torch_npu-2.8.0.post2-cp311-cp311-manylinux_2_28_${arch}.whl`安装包，参考[torch_npu安装文档](https://www.hiascend.com/document/detail/zh/Pytorch/730/configandinstg/instg/docs/zh/installation_guide/installation_via_binary_package.md)进行安装。
+   Ascend Extension for PyTorch（torch_npu）为支撑PyTorch框架运行在NPU上的适配插件，本样例支持的Ascend Extension for PyTorch版本为`v26.0.0`，PyTorch版本为`2.8.0`。
+   请从[软件包下载地址](https://gitcode.com/Ascend/pytorch/releases/v26.0.0-pytorch2.8.0)下载`torch_npu-2.8.0.post4-cp311-cp311-manylinux_2_28_${arch}.whl`安装包，参考[torch_npu安装文档](https://www.hiascend.com/document/detail/zh/Pytorch/2600/configandinstg/instg/docs/zh/installation_guide/installation_via_binary_package.md)进行安装。
 
 
 3. 下载项目源码并安装依赖的python库。
@@ -41,7 +40,7 @@
 
    修改`executor/scripts/set_env.sh`脚本中的如下字段：
    - `cann_path`: CANN软件包安装路径，例如`/usr/local/Ascend/ascend-toolkit/latest`。
-    > 说明：HCCL相关配置，如`HCCL_SOCKET_IFNAME`、`HCCL_OP_EXPANSION_MODE`，可以参考[集合通信文档](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/83RC1alpha002/maintenref/envvar/envref_07_0001.html#ZH-CN_TOPIC_0000002449945377__section163522499503)并在`executor/scripts/function.sh`中自定义配置。
+    > 说明：HCCL相关配置，如：`HCCL_SOCKET_IFNAME`、`HCCL_OP_EXPANSION_MODE`，可以参考[集合通信文档](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/900/maintenref/envvar/envref_07_0001.html)并在`executor/scripts/function.sh`中自定义配置。
 
 ## 权重准备
 
@@ -61,6 +60,8 @@
    - 修改YAML文件中的`model_path`参数。
 
      在`models/gpt_oss/config`目录下已提供了较优性能的YAML样例供您参考，您可以根据权重的不同选择对应的YAML文件，本文以`gpt_oss_20b.yaml`文件为例，修改其中的`model_path`参数，将其设置为[权重准备](#权重准备)阶段准备好的权重文件存储路径，例如`/data/models/gpt-oss-20b-bf16`。
+
+     关于YAML文件中的更多配置说明可参见[YAML参数描述](../../docs/common/inference_config_guide.md)。
 
    - 修改`models/gpt_oss/infer.sh`脚本中`YAML`参数。
 

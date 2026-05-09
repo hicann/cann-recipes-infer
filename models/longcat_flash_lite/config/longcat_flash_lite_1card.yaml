@@ -1,6 +1,3 @@
-model_name: "longcat-flash-lite"
-world_size: 1
-
 model_config:
   model_name: "longcat-flash-lite"
   model_path: "/data/models/LongCat-Flash-Lite"

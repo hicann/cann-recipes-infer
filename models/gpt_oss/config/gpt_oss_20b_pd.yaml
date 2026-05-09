@@ -1,6 +1,3 @@
-model_name: "gpt-oss"  # keep it for backward compatibility.
-world_size: 1  # keep it for backward compatibility.
-
 model_config:
   model_name: "gpt-oss"
   model_path: "/data/models/gpt-oss-20b-bf16"
