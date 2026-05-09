@@ -1,0 +1,29 @@
+model_name: "longcat-flash-lite"
+world_size: 8
+
+# Throughput EP deployment (b=8) — exposes per-rank batch > 1 path.
+# Same topology as canonical ep8 yaml, only batch_size differs:
+#   batch=8 / attn_dp=2 -> batch_per_dp_rank = 4 (vs 1 for canonical b=2).
+# Tests whether the model handles packed 1D framework input correctly when
+# more than one request per rank lands in a single forward.
+model_config:
+  model_name: "longcat-flash-lite"
+  model_path: "/data/models/LongCat-Flash-Lite"
+  exe_mode: "ge_graph"
+  with_ckpt: true
+  custom_params:
+    enable_mla_prolog: true
+    ngram_embed_tp_size: 8
+
+parallel_config:
+  world_size: 8
+  attn_tp_size: 4
+  dense_tp_size: 1
+  moe_tp_size: 1
+  embed_tp_size: 1
+  lmhead_tp_size: 8
+
+scheduler_config:
+  input_max_len: 1024
+  max_new_tokens: 128
+  batch_size: 8          # 8 prompts split across 2 DP groups (4 per group)

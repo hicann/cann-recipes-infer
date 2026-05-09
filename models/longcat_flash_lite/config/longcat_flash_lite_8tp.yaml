@@ -1,0 +1,28 @@
+model_name: "longcat-flash-lite"
+world_size: 8
+
+model_config:
+  model_name: "longcat-flash-lite"
+  model_path: "/data/models/LongCat-Flash-Lite"
+  exe_mode: "ge_graph"
+  with_ckpt: true
+  custom_params:
+    enable_mla_prolog: true   # set false to disable npu_mla_prolog_v3 fused decode
+
+parallel_config:
+  world_size: 8
+  attn_tp_size: 8
+  dense_tp_size: 8
+  moe_tp_size: 8
+  embed_tp_size: 8
+  lmhead_tp_size: 8
+
+scheduler_config:
+  input_max_len: 1024
+  max_new_tokens: 128
+  batch_size: 1
+
+pa_config:
+  enable_pa: true
+  pa_block_size: 128
+  pa_max_length: 1152  # input_max_len + max_new_tokens, must be multiple of block_size

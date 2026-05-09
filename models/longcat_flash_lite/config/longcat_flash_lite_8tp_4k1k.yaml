@@ -1,0 +1,34 @@
+model_name: "longcat-flash-lite"
+world_size: 8
+
+model_config:
+  model_name: "longcat-flash-lite"
+  model_path: "/data/models/LongCat-Flash-Lite"
+  exe_mode: "ge_graph"
+  with_ckpt: true
+  custom_params:
+    enable_mla_prolog: true   # MLA prolog v3 fused decode (default on)
+
+parallel_config:
+  world_size: 8
+  attn_tp_size: 8
+  dense_tp_size: 8     # MLP follows attn TP (CommManager aliases dense_tp_group → attn_tp_group when sizes match)
+  moe_tp_size: 8
+  embed_tp_size: 8
+  lmhead_tp_size: 8
+
+scheduler_config:
+  input_max_len: 4096
+  max_new_tokens: 1024
+  batch_size: 1
+
+data_config:
+  dataset: "default"
+  # The default prompt in `dataset/default_prompt.json` is short (~256 tokens).
+  # To exercise the 4K prefill path with a real long-context prompt, replace
+  # the contents of that file with a ~4K-token prompt before running this yaml.
+
+pa_config:
+  enable_pa: true
+  pa_block_size: 128
+  pa_max_length: 5120  # input_max_len(4096) + max_new_tokens(1024)

@@ -136,14 +136,6 @@ def main():
         if batch_size % attn_dp_size != 0:
             raise ValueError(f"batch_size ({batch_size}) must be divisible by attn_dp_size ({attn_dp_size})")
         batch_size_per_rank = batch_size // attn_dp_size
-        # For BSH/BSND format, some modules within TP group split along batch dimension,
-        # so each TP rank must process the same number of samples.
-        # Note: TND format splits by token count, this validation does not apply.
-        if batch_size_per_rank % attn_tp_size != 0:
-            raise ValueError(
-                f"batch_size_per_rank ({batch_size_per_rank}) "
-                f"must be divisible by attn_tp_size ({attn_tp_size})"
-            )
         global_dp_rank = global_rank // attn_tp_size
         all_prompts = generate_prompt(config.data_config.dataset, dataset_path)
         all_prompts = all_prompts * (batch_size // len(all_prompts) + 1)
