@@ -207,7 +207,7 @@ class DeepseekV3MoE(nn.Module):
             prefix=f"{prefix}.experts",
         )
         self.gmm_int_quant = "a8" in self.gmm_quant_mode and "float" not in self.gmm_quant_mode
-
+        self.moe_ffn = self.experts_w4a8int4 if self.gmm_quant_mode == "w4a8int4" else self.experts
         self._init_gate(prefix)
         if config.n_shared_experts is not None:
             self.shared_experts = DeepseekV3SharedExpert(config, self.runner_settings,
@@ -215,6 +215,7 @@ class DeepseekV3MoE(nn.Module):
         self.dispatch_quant_mode = {
             "w16a16": 0,
             "w8a8int8": 2,
+            "w4a8int4": 2,
             "w8a8float8": 3,
             "w8a8mxfloat8": 4,
             "w4a8mxfloat4": 4,
@@ -368,10 +369,68 @@ class DeepseekV3MoE(nn.Module):
                 # match GMM operator requirement (dim0, dim1)->(dim0, dim1//2, 2)
                 gathered_pertoken_scale = reshape_mx_scale(gathered_pertoken_scale)
             gmm_args.update({"pertoken_scale": gathered_pertoken_scale})
-        hidden_states_ordered_by_experts = self.experts(**gmm_args)
+        hidden_states_ordered_by_experts = self.moe_ffn(**gmm_args)
         # finalize-rerouting
         new_x = torch.index_select(hidden_states_ordered_by_experts, 0, gathered_ids_unsort.float().argsort().int())
         return new_x
+
+    def experts_w4a8int4(
+        self,
+        x: torch.Tensor,
+        expert_tokens: torch.Tensor,
+        group_list_type: int,
+        pertoken_scale: torch.Tensor = None,
+        final_output_dtype: torch.dtype = torch.bfloat16,
+        **kwargs,
+    ):
+        hidden_size = x.size(-1)
+
+        if pertoken_scale is None:
+            x, pertoken_scale = torch_npu.npu_dynamic_quant(x)
+
+        if pertoken_scale.dim() > 1:
+            pertoken_scale = pertoken_scale.reshape(-1)
+            x = x.view(-1, hidden_size)
+
+        mm1_mm3 = torch_npu.npu_grouped_matmul(
+            [x], [self.experts.w13_weight], bias=[self.experts.w13_bias],
+            scale=[self.experts.w13_weight_scale], per_token_scale=[pertoken_scale],
+            group_list=expert_tokens, split_item=3,
+            output_dtype=final_output_dtype, group_type=0,
+            group_list_type=group_list_type,
+            act_type=0
+        )[0]
+
+        # fusion kernel: swiglu + clip + dynamic_quant
+        # To enhance quantization accuracy, a clip kernel has been introduced prior to the dynamic_quant kernel
+        swiglu_limit = kwargs.get("swiglu_limit", None)
+        swiglu_limit_args = {}
+        if swiglu_limit:
+            swiglu_limit_args.update({
+                "swiglu_mode": 1,
+                "clamp_limit": swiglu_limit,
+                "glu_alpha": 1,
+                "glu_bias": 0
+            })
+        intermediate_h, pertoken_scale = torch_npu.npu_dequant_swiglu_clamp_quant(
+            mm1_mm3, 
+            quant_scale=self.experts.smooth_scale_2,
+            group_index=expert_tokens,
+            activate_left=True,
+            quant_mode=1,
+            **swiglu_limit_args,
+            )
+
+        out_hidden = torch_npu.npu_grouped_matmul(
+            [intermediate_h], [self.experts.w2_weight], bias=[self.experts.w2_bias],
+            scale=[self.experts.w2_weight_scale], per_token_scale=[pertoken_scale],
+            group_list=expert_tokens, split_item=3,
+            output_dtype=final_output_dtype, group_type=0,
+            group_list_type=group_list_type,
+            act_type=0
+        )[0]
+
+        return out_hidden
 
     def combine_double_routing(self, new_x, expanded_x, input_splits, output_splits):
         moe_ep_group = self.hccl_comm_dict.get("moe_ep_group", None)
@@ -523,7 +582,7 @@ class DeepseekV3MoE(nn.Module):
                 dynamic_scale = reshape_mx_scale(dynamic_scale)
             gmm_args.update({"pertoken_scale": dynamic_scale})
 
-        hidden_states_ordered_by_experts = self.experts(**gmm_args)
+        hidden_states_ordered_by_experts = self.moe_ffn(**gmm_args)
 
         wait_event(self.enable_multi_streams, self.npu_events, 1)
 
@@ -2236,8 +2295,9 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
 
         # add checkpoint load check
         weights_not_loaded = set(params_dict.keys()) - loaded_params
+        key_weights = {"smooth_scale", "q_b_norm", "w2_alpha"}
         if weights_not_loaded:
-            if all("smooth_scale" in name or "q_b_norm" in name for name in weights_not_loaded):
+            if all(any(key in name for key in key_weights) for name in weights_not_loaded):
                 logger.warning(
                     "Smooth scales were not initialized from checkpoint.")
             else:
@@ -2474,8 +2534,9 @@ class DeepseekV3ModelMTP(DeepseekV3ForCausalLM):
             loaded_params.add(name)
 
         weights_not_loaded = set(params_dict.keys()) - loaded_params
+        key_weights = {"smooth_scale", "q_b_norm", "w2_alpha"}
         if weights_not_loaded:
-            if all("smooth_scale" in name or "q_b_norm" in name for name in weights_not_loaded):
+            if all(any(key in name for key in key_weights) for name in weights_not_loaded):
                 logger.warning(
                     "Smooth scales were not initialized from checkpoint.")
             else:

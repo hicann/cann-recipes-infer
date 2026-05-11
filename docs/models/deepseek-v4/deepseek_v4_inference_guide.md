@@ -328,7 +328,7 @@ for layer in model_layers:
 
 [profile_data](https://cann-ai.obs.cn-north-4.myhuaweicloud.com/cann-quantization/DeepSeek/profile_data/trace_view_950DT_decode.json)
 
-在`950DT`平台上，本实践使用16卡部署W8A8C8模型，部署策略采用 Attention Data Parallel (DP) 和 MoE Expert Parallel (EP)并行。DeepSeek-V4 Flash 8K序列场景Decode单卡吞吐1625TPS@10ms，对应的Profile数据已在上方链接开源，不同Batch Size和序列长度的性能Benchmark测试如下：
+在`950DT`平台上，本实践使用16卡对模型进行部署，部署策略采用 Attention Data Parallel (DP) 和 MoE Expert Parallel (EP)并行。DeepSeek-V4 Flash 8K序列场景Decode单卡吞吐1625TPS@10ms，对应的Profile数据已在上方链接开源，不同Batch Size和序列长度的性能Benchmark测试如下：
 
 **950DT Deepseek-V4 Flash Benchmark**
 
