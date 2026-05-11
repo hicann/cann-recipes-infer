@@ -8,7 +8,6 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 
 #!/bin/bash
-export ON_CLOUD=0 # 0: local deployment, 1: for internal use on cloud servers
 
 # only offline need
 export IPs=('xx.xx.xx.xx' 'xx.xx.xx.xx') # IPs of all servers. Please seperate multiple servers with blank space in between. The first one is the master server.

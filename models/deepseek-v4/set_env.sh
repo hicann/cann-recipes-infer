@@ -14,7 +14,6 @@
 # limitations under the License.
 
 #!/bin/bash
-export ON_CLOUD=0 # 0: local deployment, 1: for internal use on cloud servers
 export IPs=('xxx.xxx.xxx.xxx' 'xxx.xxx.xxx.xxx') # IPs of all servers. Please seperate multiple servers with blank space in between. The first one is the master server.
 
 rm -rf /root/atc_data/

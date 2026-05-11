@@ -8,7 +8,6 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 
 #!/bin/bash
-export ON_CLOUD=0 # 0: local deployment, 1: for internal use on cloud servers
 ## The IP addresses of all nodes. Ensure the first IP is the master, and multiple node IPs are separated by spaces
 export IPs=('xxx.xxx.xxx.xxx' 'xxx.xxx.xxx.xxx')
 

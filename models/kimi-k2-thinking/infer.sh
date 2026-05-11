@@ -21,4 +21,3 @@ export YAML=${YAML_PARENT_PATH}/${YAML_FILE_NAME}
 get_rank
 check_env_vars
 launch_infer_task
-save_key_info
