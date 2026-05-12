@@ -14,6 +14,11 @@
     
     namespace custom {
     using namespace at_npu::native;
+
+    inline TensorWrapper make_wrapper(const at::Tensor& tensor, aclDataType tensor_acltype)
+    {
+        return {tensor, tensor_acltype};
+    }
     
     // 工具函数，推导输出shape
     std::tuple<at::Tensor, at::Tensor> construct_temp_output_tensor(const at::Tensor &q, std::string layout,
@@ -75,11 +80,26 @@
             const at::Tensor& cmp_kv_tensor = cmp_kv.value();
             cmp_kv_stride0 = cmp_kv_tensor.stride(0);
         }
+
         // 调用aclnn接口
-        EXEC_NPU_CMD_V1(aclnnKvQuantSparseAttnSharedkv, q, ori_kv, cmp_kv, ori_sparse_indices, cmp_sparse_indices,
-            ori_block_table, cmp_block_table, cu_seqlens_q, cu_seqlens_ori_kv, cu_seqlens_cmp_kv, seqused_q, seqused_kv,
-            sinks, metadata, kv_quant_mode, tile_size, rope_head_dim, softmax_scale, cmp_ratio, ori_mask_mode,
-            cmp_mask_mode, ori_win_left, ori_win_right, layout_q_ptr, layout_kv_ptr, ori_kv_stride0, cmp_kv_stride0, return_softmax_lse, attn_out, softmax_lse);
+        if (kv_quant_mode == 10) { // 10 for hif8 kv quant
+            at::Tensor null_tensor;
+            auto ori_kv_value = ori_kv.has_value() ? ori_kv.value() : null_tensor;
+            auto cmp_kv_value = cmp_kv.has_value() ? cmp_kv.value() : null_tensor;
+            TensorWrapper ori_kv_wrapper = make_wrapper(ori_kv_value, ACL_HIFLOAT8);
+            TensorWrapper cmp_kv_wrapper = make_wrapper(cmp_kv_value, ACL_HIFLOAT8);
+            EXEC_NPU_CMD_V1(aclnnKvQuantSparseAttnSharedkv, q, ori_kv_wrapper, cmp_kv_wrapper, ori_sparse_indices,
+                cmp_sparse_indices, ori_block_table, cmp_block_table, cu_seqlens_q, cu_seqlens_ori_kv,
+                cu_seqlens_cmp_kv, seqused_q, seqused_kv, sinks, metadata, kv_quant_mode, tile_size, rope_head_dim,
+                softmax_scale, cmp_ratio, ori_mask_mode, cmp_mask_mode, ori_win_left, ori_win_right, layout_q_ptr,
+                layout_kv_ptr, ori_kv_stride0, cmp_kv_stride0, return_softmax_lse, attn_out, softmax_lse);
+        } else {
+            EXEC_NPU_CMD_V1(aclnnKvQuantSparseAttnSharedkv, q, ori_kv, cmp_kv, ori_sparse_indices, cmp_sparse_indices,
+                ori_block_table, cmp_block_table, cu_seqlens_q, cu_seqlens_ori_kv, cu_seqlens_cmp_kv, seqused_q,
+                seqused_kv, sinks, metadata, kv_quant_mode, tile_size, rope_head_dim, softmax_scale, cmp_ratio,
+                ori_mask_mode, cmp_mask_mode, ori_win_left, ori_win_right, layout_q_ptr, layout_kv_ptr, ori_kv_stride0,
+                cmp_kv_stride0, return_softmax_lse, attn_out, softmax_lse);
+        }
         return std::tuple<at::Tensor, at::Tensor>(attn_out, softmax_lse);
     }
     

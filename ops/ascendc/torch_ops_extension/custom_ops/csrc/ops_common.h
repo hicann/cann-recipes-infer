@@ -718,10 +718,6 @@ inline aclTensor *ConvertType(const TensorWrapper &tensor_r)
     if (!at_tensor.defined()) {
         return nullptr;
     }
-    TORCH_CHECK(torch_npu::utils::is_npu(at_tensor),
-        "Expected all tensors to be on the same device. "
-        "Expected NPU tensor, please check whether the input tensor device is correct.",
-        OPS_ERROR(ErrCode::TYPE));
 
     aclDataType acl_data_type = tensor_r.dtype;
     c10::SmallVector<int64_t, MAX_DIM_NUM> storageDims;
@@ -730,13 +726,11 @@ inline aclTensor *ConvertType(const TensorWrapper &tensor_r)
 
     const auto dimNum = at_tensor.sizes().size();
     aclFormat format = ACL_FORMAT_ND;
-    if (!at_npu::native::FormatHelper::IsOpInputBaseFormat(at_tensor)) {
-        format = torch_npu::NPUBridge::GetNpuStorageImpl(at_tensor)->npu_desc_.npu_format_;
-        // if acl_data_type is ACL_STRING, storageDims is empty.
+    if (!IsOpInputBaseFormatCommon(at_tensor)) {
+        format = static_cast<NPUStorageImpl *>(at_tensor.storage().unsafeGetStorageImpl())->npu_desc_.npu_format_;
         if (acl_data_type != ACL_STRING) {
-            TORCH_CHECK(at_tensor.itemsize() > 0, "the itemsize of tensor must be greater than 0.",
-                OPS_ERROR(ErrCode::VALUE));
-            storageDims = torch_npu::NPUBridge::GetNpuStorageImpl(at_tensor)->npu_desc_.storage_sizes_;
+            TORCH_CHECK(at_tensor.itemsize() > 0, "the itemsize of tensor must be greater than 0.");
+            storageDims = static_cast<NPUStorageImpl *>(at_tensor.storage().unsafeGetStorageImpl())->npu_desc_.storage_sizes_;
         }
     } else {
         switch (dimNum) {
@@ -754,8 +748,7 @@ inline aclTensor *ConvertType(const TensorWrapper &tensor_r)
         }
         // if acl_data_type is ACL_STRING, storageDims is empty.
         if (acl_data_type != ACL_STRING) {
-            TORCH_CHECK(at_tensor.itemsize() > 0, "the itemsize of tensor must be greater than 0.",
-                        OPS_ERROR(ErrCode::VALUE));
+            TORCH_CHECK(at_tensor.itemsize() > 0, "the itemsize of tensor must be greater than 0.");
             storageDims.push_back(at_tensor.storage().nbytes() / at_tensor.itemsize());
         }
     }
