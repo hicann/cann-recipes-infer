@@ -1,1 +1,2 @@
 from .sparse_block import sparse_double_block_forward, sparse_single_block_forward
+from .sparse_block_extract_qk_data import extract_q_k_double_block_forward, extract_q_k_single_block_forward

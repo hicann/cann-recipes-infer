@@ -33,7 +33,8 @@ import torch.distributed as dist
 
 
 import hyvideo.monkey_patch
-from hyvideo.sparse import sparse_double_block_forward, sparse_single_block_forward
+from hyvideo.sparse import sparse_double_block_forward, sparse_single_block_forward, \
+                                extract_q_k_double_block_forward, extract_q_k_single_block_forward
 from hyvideo.utils.file_utils import save_videos_grid, load_json
 from hyvideo.config import parse_args
 from hyvideo.inference import HunyuanVideoSampler
@@ -50,15 +51,13 @@ WORLD_SIZE = int(os.getenv("WORLD_SIZE", 1))
 
 def main():
     args = parse_args()
+    if args.extract_path is None:
+        raise ValueError("extract_path can not be None")
+    else:
+        os.environ["EXTRACT_PATH"] = args.extract_path
+        
     device = f"npu:{args.device}"
     torch.npu.set_device(device)
-    log_dir = os.environ.get("LOG_DIR", os.path.join(args.save_path, "logs"))
-    logger.add(os.path.join(log_dir, "hy_{time:YYYY-MM-DD}.log"),
-           rotation="00:00",
-           retention="7 days",
-           compression="zip",
-           encoding="utf-8",
-           level="DEBUG")
     logger.info(args)
     models_root_path = Path(args.model_base)
     if not models_root_path.exists():
@@ -106,7 +105,14 @@ def main():
         "single_stream_layers": single_layer_num,
         "device": f"npu:{args.device}"
     }
-    if args.sparse_method != "no_sparse":
+    if args.extract_q_k_data:
+        sparse_predictor_manager.from_config(args.sparse_attention_config, args.sparse_method, sparse_params)
+        for block in hunyuan_video_sampler.pipeline.transformer.double_blocks:
+            block.forward = extract_q_k_double_block_forward.__get__(block, type(block))
+        for block in hunyuan_video_sampler.pipeline.transformer.single_blocks:
+            block.forward = extract_q_k_single_block_forward.__get__(block, type(block))
+
+    elif args.sparse_method != "no_sparse":
         if getattr(args, "ring_degree", 1) > 1:
             raise ValueError("Sparse attention does not support ring_degree > 1 in the current runtime.")
         sparse_predictor_manager.from_config(args.sparse_attention_config, args.sparse_method, sparse_params)

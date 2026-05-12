@@ -66,7 +66,20 @@ cp -rn HunyuanVideo/* cann-recipes-infer/models/hunyuan-video
 cd models/hunyuan-video
 pip install -r requirements.txt
 ```
-
+块稀疏算法基于[blitz_sparse_attention算子](https://gitcode.com/cann/ops-transformer/blob/master/experimental/attention/blitz_sparse_attention/README.md)实现，根据以下命令编译算子：
+ ```bash 
+ git clone https://gitcode.com/cann/ops-transformer.git 
+ cd ops-transformer 
+ 
+ 
+ yum/apt install patch # 安装依赖 Centos用yum Ubuntu用apt
+ pip install -r requirements.txt 
+ 
+ 
+ bash build.sh --make_clean --experimental -j96 --pkg --soc=ascend910_93 --ops=blitz_sparse_attention #（--soc，A2：ascend910b，A3：ascend910_93） 
+ ./build/cann-ops-transformer-custom_linux-"$(uname -i)".run 
+ cd experimental/attention/blitz_sparse_attention/torch_interface && bash build.sh custom 
+ ```
 
 ### 准备模型权重
 

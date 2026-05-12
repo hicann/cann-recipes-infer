@@ -531,19 +531,22 @@ def _sync_scalar_for_sp(self, value: float) -> float:
 
 ### 块稀疏 Attention
 
-稀疏Attention算法的主要思路，是根据一定稀疏度选取注意力分数最高，对结果影响最大的块，而跳过其余块的计算。基于这一前提，这里实现了两种不同的稀疏算法，其原理都是尽可能选取注意力分数更高的块，接下来将依次介绍两种不同的方法。该优化方法基于[blitz_sparse_attention算子](https://gitcode.com/cann/ops-transformer/blob/master/experimental/attention/blitz_sparse_attention/README.md)实现，运行前需要依据参考文档编译算子。编译算子运行命令如下：
-
-```bash
-git clone https://gitcode.com/cann/ops-transformer.git
-cd ops-transformer
-
-yum install patch # 安装相关依赖
-pip install -r requirements.txt
-
-bash build.sh --make_clean --experimental -j96 --pkg --soc=ascend910_93 --ops=blitz_sparse_attention #（--soc，A2：ascend910b，A3：ascend910_93）
-./build/cann-ops-transformer-custom_linux-"$(uname -i)".run
-cd experimental/attention/blitz_sparse_attention/torch_interface && bash build.sh custom
-```
+稀疏Attention算法的主要思路，是根据一定稀疏度选取注意力分数最高，对结果影响最大的块，而跳过其余块的计算。基于这一前提，这里实现了两种不同的稀疏算法，其原理都是尽可能选取注意力分数更高的块，接下来将依次介绍两种不同的方法。该优化方法基于[blitz_sparse_attention算子](https://gitcode.com/cann/ops-transformer/blob/master/experimental/attention/blitz_sparse_attention/README.md)实现，运行前需要依据参考文档编译算子。编译算子运行命令如下：	 
+ 
+ 
+ ```bash 
+ git clone https://gitcode.com/cann/ops-transformer.git 
+ cd ops-transformer 
+ 
+ 
+ yum/apt install patch # 安装依赖 Centos用yum Ubuntu用apt
+ pip install -r requirements.txt 
+ 
+ 
+ bash build.sh --make_clean --experimental -j96 --pkg --soc=ascend910_93 --ops=blitz_sparse_attention #（--soc，A2：ascend910b，A3：ascend910_93） 
+ ./build/cann-ops-transformer-custom_linux-"$(uname -i)".run 
+ cd experimental/attention/blitz_sparse_attention/torch_interface && bash build.sh custom 
+ ```
 
 #### TopK
 
@@ -553,15 +556,26 @@ TopK算法分为两个阶段：
 $$
 CAC = \frac{\sum_{(i,j) \in \text{Top-K}} \text{Softmax}\left(\frac{QK^{T}}{\sqrt{d_{k}}}\right)_{ij}}{\sum_{i,j} \text{Softmax}\left(\frac{QK^{T}}{\sqrt{d_{k}}}\right)_{ij}}
 $$
+offline-profiling前首先需要保存一份完整推理过程的qk_data，在`single_sparse.yaml`中`model_args`字段下设置
+```python
+extract_q_k_data: true
+extract_path: "path/to/qk_dir"
+```
+运行下列命令
+```bash
+export YAML_FILE_NAME=single_sparse.yaml
+bash infer.sh
+```
+
 offline-profiling代码存放在`/module/blockwise_sparse/offline_profiling/`，参考以下命令执行。offline-profiling会执行个别样例的推理，对于dit过程中的每个step、layer和head，根据预先设定的CAC阈值，遍历不同的稀疏度，找出满足该CAC的最大稀疏度，并进行记录。在后续的推理中，每次做块稀疏attention时，会根据先前设定好的稀疏度进行计算。offline-profiling的运行命令如下：
 
 ```bash
-cd /module/blockwise_sparse/offline_profiling/
+cd module/blockwise_sparse/offline_profiling/
 python offline_profiling_hyvideo.py  --qk_dir_path /path/to/qk_dir --target_dir_path /path/to/target_dir --global_layer_num 60 --head_num 24 --target_coverage 0.66 --step_start 0 --step_end 50
 ```
 需要保存各step和layer的q和k的张量，放置在`/path/to/qk_dir`，结果将被保存在`/path/to/target_dir`。`global_layer_num`和`head_num`表示总层数数和头的个数，`target_coverage`表示目标CAC，`step_start`和`step_end`分别表示开始进行稀疏的step id和结束稀疏的step id。
 
-
+![](figures/topk.png)
 2.online推理阶段，首先将q，k按行进行分块，池化，得到简化后的q和k。计算该注意力分数。对于每一行根据预先计算得到的稀疏度，选取前k个分数作为需要计算的块，其余的块作为稀疏。最后记录选取q和k中块的id，构造稀疏mask和sabi tensor。
 
 #### SVG

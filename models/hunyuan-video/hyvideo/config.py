@@ -46,6 +46,16 @@ def parse_args(namespace=None):
 def add_sparse_args(parser: argparse.ArgumentParser):
     group = parser.add_argument_group(title="HunyuanVideo sparse args")
     group.add_argument(
+        "--extract_q_k_data",
+        action="store_true",
+        help="Extract q_k_data for offline profiling.",
+    )
+    group.add_argument(
+        "--extract_path",
+        type=str,
+        help="q_k_data path.",
+    )
+    group.add_argument(
         "--sparse-attention-config",
         type=str,
         default="config/single_sparse.yaml",

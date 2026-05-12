@@ -9,6 +9,8 @@ model_args:
   flow-shift: 7.0
   flow-reverse: true
   use-cpu-offload: true             # enabling slows down VAE; required when TaylorSeer cache is enabled
+  extract_q_k_data: false
+  extract_path: "path/to/qk_dir"
 
 model_name: "hunyuan-video"
 world_size: 1                        # single-card sparse; for multi-card sparse use sp8_sparse.yaml
