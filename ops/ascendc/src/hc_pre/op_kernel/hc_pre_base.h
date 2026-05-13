@@ -34,6 +34,9 @@ constexpr int32_t CV_RATIO = 2;
 constexpr uint64_t N_SIZE = 24;
 constexpr uint64_t NUM_TWO = 2;
 constexpr uint64_t SQUARE_SUM_SIZE = 16;
+constexpr uint64_t MASK_PATTERN_BASE_SIZE = 16;
+constexpr uint64_t MASK_PATTERN_REPEAT_SIZE = 8;
+constexpr uint64_t MASK_PATTERN_DIM_SIZE = 16;
 constexpr uint64_t MM_CACHE_LINE_BYTES = 512;
 
 __aicore__ inline int32_t CeilDiv(int32_t a, int32_t b)
@@ -56,7 +59,7 @@ __aicore__ inline int32_t RoundUp(int32_t num)
     return CeilAlign(num, elemNum);
 }
 
-__aicore__ inline void SetGatherMaskPattern(const LocalTensor<uint32_t>& maskPattern) 
+__aicore__ inline void SetGatherMaskPattern(const LocalTensor<uint32_t>& maskPattern)
 {
     uint32_t base = ONE;
     for (uint32_t i = 0; i < 16; i++) {
@@ -66,17 +69,21 @@ __aicore__ inline void SetGatherMaskPattern(const LocalTensor<uint32_t>& maskPat
     PipeBarrier<PIPE_V>();
 }
 
-__aicore__ inline void GatherMaskByDiagonal(const LocalTensor<float>& output, const LocalTensor<float>& input, 
-                                            const LocalTensor<uint32_t> maskPattern, uint16_t dim0) 
+__aicore__ inline void GatherMaskByDiagonal(const LocalTensor<float>& output, const LocalTensor<float>& input,
+                                            const LocalTensor<uint32_t> maskPattern, uint16_t dim0)
 {
-    uint32_t totalCount = 16 * 16;
-    uint32_t remainCount = (dim0 % 16) * 16;
-    uint32_t loopCount = dim0 / 16;
+    uint32_t totalCount = MASK_PATTERN_DIM_SIZE * MASK_PATTERN_DIM_SIZE;
+    uint32_t remainCount = (dim0 % MASK_PATTERN_DIM_SIZE) * MASK_PATTERN_DIM_SIZE;
+    uint32_t loopCount = dim0 / MASK_PATTERN_DIM_SIZE;
     uint64_t rsvdCnt = 0;
     for (uint32_t loopIdx = 0; loopIdx < loopCount; loopIdx++) {
-        GatherMask(output[loopIdx * 16], input[loopIdx * totalCount], maskPattern, true, totalCount, {1, 1, 8, 8}, rsvdCnt);
+        GatherMask(output[loopIdx * MASK_PATTERN_DIM_SIZE],
+            input[loopIdx * totalCount], maskPattern, true, totalCount,
+            {1, 1, 8, 8}, rsvdCnt);
     }
-    GatherMask(output[loopCount * 16], input[loopCount * totalCount], maskPattern, true, remainCount, {1, 1, 8, 8}, rsvdCnt);
+    GatherMask(output[loopCount * MASK_PATTERN_DIM_SIZE],
+        input[loopCount * totalCount], maskPattern, true, remainCount,
+        {1, 1, 8, 8}, rsvdCnt);
     PipeBarrier<PIPE_V>();
 }
 
@@ -642,15 +649,18 @@ __aicore__ inline void CopyInWithOuterFor(const GlobalTensor<T> &inputGm, const 
 }
 
 template <typename T>
-__aicore__ inline void CopyInWithOuterFor(const GlobalTensor<T> &inputGm, const LocalTensor<T> &inputTensor, const uint16_t outerLoop,
-                                          const uint16_t nBurst, const uint32_t copyLen, const uint32_t gmFirstDim, 
-                                          const uint32_t gmLastDim)
+__aicore__ inline void CopyInWithOuterFor(const GlobalTensor<T> &inputGm,
+const LocalTensor<T> &inputTensor, const uint16_t outerLoop,
+const uint16_t nBurst, const uint32_t copyLen, const uint32_t gmFirstDim,
+const uint32_t gmLastDim)
 {
     uint32_t elemInOneBlock = BLOCK_SIZE / sizeof(T);
     uint32_t ubLastDimAlign = RoundUp<T>(copyLen);
     if (outerLoop <= nBurst) {
         for (uint32_t i = 0; i < outerLoop; i++) {
-            CopyIn(inputGm[i * nBurst * gmLastDim], inputTensor[i * nBurst * ubLastDimAlign], nBurst, copyLen, gmLastDim - copyLen); 
+            CopyIn(inputGm[i * gmFirstDim * gmLastDim],
+            inputTensor[i * nBurst * ubLastDimAlign], nBurst, copyLen,
+            gmLastDim - copyLen);
         }
     } else {
         uint32_t srcStride = (gmLastDim - copyLen) + (gmFirstDim - 1) * gmLastDim;

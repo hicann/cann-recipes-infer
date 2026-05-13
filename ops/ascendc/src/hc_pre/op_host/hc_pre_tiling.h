@@ -125,7 +125,6 @@ public:
     ge::graphStatus GetAttr();
     ge::graphStatus GetShapeAttrsInfoInner();
     ge::graphStatus CalcOpTiling();
-    ge::graphStatus CalcMembaseOpTiling();
     ge::graphStatus CalcMKSplitCoreMembasePart2Tiling();
 
 private:

@@ -366,7 +366,7 @@ private:
 
     TBuf<QuePosition::VECCALC> rsqrtBuf;
     TBuf<QuePosition::VECCALC> squareReduceBuf;
-    TBuf<QuePosition::VECCALC> mxies01ReduceBuf;
+    TBuf<QuePosition::VECCALC> mixes01ReduceBuf;
 
     TBuf<QuePosition::VECCALC> xCastBuf;
     TBuf<QuePosition::VECCALC> yCastBuf;

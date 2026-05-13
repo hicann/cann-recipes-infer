@@ -131,6 +131,8 @@
 
 ### 自定义融合算子编译
 
+#### 编译所有算子
+
 Atlas A3 执行如下命令编译所有自定义算子：
 
   ```bash
@@ -143,6 +145,18 @@ Atlas A3 执行如下命令编译所有自定义算子：
   ```bash
   cd /home/code/cann-recipes-infer/ops/ascendc
   bash build.sh -c ascend950
+  ```
+
+#### 编译部分算子
+
+使用 `-n` 参数指定要编译的算子名称，多个算子用分号分隔：
+
+  ```bash
+  # 编译单个算子
+  bash build.sh -n "swiglu_clip_quant"
+
+  # 编译多个算子
+  bash build.sh -n "swiglu_clip_quant;gather_selection_kv_cache;hc_pre"
   ```
 
 **说明：**
@@ -188,5 +202,6 @@ examples用例运行命令如下：
 
 ## 附录
 ### FAQ
+- **如何查看 build.sh 支持的所有参数**：执行 `bash build.sh --help` 查看完整的参数列表。
 - **A2环境如何编译执行ascendc算子**：ascendc算子默认基于A3环境编译，包含Atlas A3 训练系列产品/Atlas A3 推理系列产品。其他环境需要在编译时通过`-c ${soc_version}`指定NPU型号，如Atlas A2 训练系列产品/Atlas 800I A2 推理产品/A200I A2 Box 异构组件使用`ascend910b`，编译命令为`bash build.sh -c ascend910b`。
 - **非标准镜像CANN包如何编译执行ascendc算子**：建议使用镜像版本，如果要使用不配套的cann包需要在算子编译时加上`--disable-check-compatible`配置项。

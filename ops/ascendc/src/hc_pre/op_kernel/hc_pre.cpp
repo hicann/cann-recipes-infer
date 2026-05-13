@@ -24,7 +24,6 @@
 #else
     #include "lib/matmul_intf.h"
     #include "hc_pre_m_k_split_core.h"
-    #include "hc_pre_m_split_core.h"
     #include "hc_pre_base.h"
     using namespace HcPre;
 #endif

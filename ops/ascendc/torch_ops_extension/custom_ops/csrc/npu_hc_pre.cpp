@@ -118,7 +118,7 @@ void check_hc_pre_shape_and_dtype(
 
 // hc_pre 小算子拼接实现
 std::tuple<at::Tensor, at::Tensor, at::Tensor> hc_pre_composite(
-    const at::Tensor& x, const at::Tensor& hc_fn, const at::Tensor& hc_scale, const at::Tensor& hc_base, 
+    const at::Tensor& x, const at::Tensor& hc_fn, const at::Tensor& hc_scale, const at::Tensor& hc_base,
     int64_t hc_mult, int64_t hc_sinkhorn_iters, double norm_eps, double hc_eps)
 {
     auto xDims = x.dim();
@@ -140,7 +140,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> hc_pre_composite(
     at::Tensor y = std::get<0>(output_tensors);
     at::Tensor post = std::get<1>(output_tensors);
     at::Tensor comb_frag = std::get<2>(output_tensors);
-    EXEC_NPU_CMD_V1(aclnnHcPreSinkhorn, mixes, rsqrt, hc_scale, hc_base, x, hc_mult, hc_sinkhorn_iters, hc_eps, 
+    EXEC_NPU_CMD_V1(aclnnHcPreSinkhorn, mixes, rsqrt, hc_scale, hc_base, x, hc_mult, hc_sinkhorn_iters, hc_eps,
                     y, post, comb_frag);
     y = y.to(original_type);
 
@@ -149,14 +149,14 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> hc_pre_composite(
 
 // hc_pre 融合算子实现
 std::tuple<at::Tensor, at::Tensor, at::Tensor> hc_pre_fusion(
-    const at::Tensor& x, const at::Tensor& hc_fn, const at::Tensor& hc_scale, const at::Tensor& hc_base, 
+    const at::Tensor& x, const at::Tensor& hc_fn, const at::Tensor& hc_scale, const at::Tensor& hc_base,
     int64_t hc_mult, int64_t hc_sinkhorn_iters, double norm_eps, double hc_eps)
 {
     auto output_tensors = construct_hc_pre_output_tensor(x, hc_mult);
     at::Tensor y = std::get<0>(output_tensors);
     at::Tensor post = std::get<1>(output_tensors);
     at::Tensor comb_frag = std::get<2>(output_tensors);
-                    
+
     EXEC_NPU_CMD_V1(aclnnHcPre, x, hc_fn, hc_scale, hc_base, hc_mult, hc_sinkhorn_iters, hc_eps, norm_eps,
                     y, post, comb_frag);
 
@@ -167,17 +167,13 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> hc_pre_fusion(
 
 // step2 为NPU设备实现前向接口
 std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_hc_pre_npu(
-    const at::Tensor& x, const at::Tensor& hc_fn, const at::Tensor& hc_scale, const at::Tensor& hc_base, 
+    const at::Tensor& x, const at::Tensor& hc_fn, const at::Tensor& hc_scale, const at::Tensor& hc_base,
     int64_t hc_mult, int64_t hc_sinkhorn_iters, double norm_eps, double hc_eps)
 {
-    // get soc name
     static const char* socName = aclrtGetSocName();
-    static const char* prefix = "Ascend950";
-    static const std::set<std::string> invalid_versions = {"Ascend910_9362", "Ascend910_9372", "Ascend910B3",
-                                                           "Ascend910B4-1", "Ascend910B4"};
-    const bool is_ascend950 = socName != nullptr && std::string(socName).find(prefix) == 0;
-    const bool isValidAscend910 = socName != nullptr && invalid_versions.count(std::string(socName)) == 0;
-    check_hc_pre_shape_and_dtype(x, hc_fn, hc_scale, hc_base, is_ascend950);
+    static const char* prefix950 = "Ascend950";
+    const bool isAscend950 = socName != nullptr && std::string(socName).find(prefix950) == 0;
+    check_hc_pre_shape_and_dtype(x, hc_fn, hc_scale, hc_base, isAscend950);
     // get x shape
     auto xDims = x.dim();
     int32_t bs = x.size(0) * x.size(1);
@@ -188,12 +184,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_hc_pre_npu(
     } else if (xDims == 4) {
         d = x.size(3);
     }
-    // 非Ascend950场景，d=7168路由到小算子拼接
-    if (!is_ascend950 && d == D_LIMIT_EXTEND) {
-        ASCEND_LOGI("For non-Ascend950 with d=%d, implemented hc_pre using a concatenation of small operators.", d);
-        return hc_pre_composite(x, hc_fn, hc_scale, hc_base, hc_mult, hc_sinkhorn_iters, norm_eps, hc_eps);
-    }
-    if (is_ascend950) { // if socVersion is Ascend950
+    if (isAscend950) {
         ASCEND_LOGI("The matched SoC version is Ascend950.");
         if (bs <= FUSION_SPLIT_K_MAX_BS || bs % FUSION_BASE_BS == 0) {
             ASCEND_LOGI("Use fused operator for current bs %d.", bs);
@@ -201,26 +192,22 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_hc_pre_npu(
         }
         ASCEND_LOGI("For current bs %d, implemented hc_pre using a concatenation of small operators.", bs);
         return hc_pre_composite(x, hc_fn, hc_scale, hc_base, hc_mult, hc_sinkhorn_iters, norm_eps, hc_eps);
-    } else {
-        if (!isValidAscend910 || bs > SINGLE_OP_MAX_BS || bs % SINGLE_OP_BS_ALIGN_FACTOR != 0) {
-            ASCEND_LOGI("For current bs %d, implemented hc_pre using a concatenation of small operators.", bs);
-            return hc_pre_composite(x, hc_fn, hc_scale, hc_base, hc_mult, hc_sinkhorn_iters, norm_eps, hc_eps);
-        }
-        return hc_pre_fusion(x, hc_fn, hc_scale, hc_base, hc_mult, hc_sinkhorn_iters, norm_eps, hc_eps);
     }
+    ASCEND_LOGI("The matched SoC version is %s, use fused operator.", socName);
+    return hc_pre_fusion(x, hc_fn, hc_scale, hc_base, hc_mult, hc_sinkhorn_iters, norm_eps, hc_eps);
 }
 
 // step3, 为META设备实现前向接口
 std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_hc_pre_meta(
-    const at::Tensor& x, const at::Tensor& hc_fn, const at::Tensor& hc_scale, const at::Tensor& hc_base, 
+    const at::Tensor& x, const at::Tensor& hc_fn, const at::Tensor& hc_scale, const at::Tensor& hc_base,
     int64_t hc_mult, int64_t hc_sinkhorn_iters, double norm_eps, double hc_eps)
 {
     // get soc name
     static const char* socName = aclrtGetSocName();
-    static const char* prefix = "Ascend950";
-    const bool is_ascend950 = socName != nullptr && std::string(socName).find(prefix) == 0;
+    static const char* prefix950 = "Ascend950";
+    const bool isAscend950 = socName != nullptr && std::string(socName).find(prefix950) == 0;
 
-    check_hc_pre_shape_and_dtype(x, hc_fn, hc_scale, hc_base, is_ascend950);
+    check_hc_pre_shape_and_dtype(x, hc_fn, hc_scale, hc_base, isAscend950);
     // construct the output tensor
     auto output_tensors = construct_hc_pre_output_tensor(x, hc_mult);
     at::Tensor y = std::get<0>(output_tensors);
