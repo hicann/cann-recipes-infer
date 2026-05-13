@@ -1,46 +1,40 @@
 # 框架架构总览
 
-本文档介绍 executor 中提供的模型执行的公共流程机制。该模块旨在统一模型执行流程，以避免不同模型需要适配大量的重复流程代码，从而将工作重点集中在模型本身的性能优化上。提供 offline 和 online两种执行方式：
+本文档介绍 executor 中提供的模型执行的公共流程机制。该模块旨在统一模型执行流程，以避免不同模型需要适配大量的重复流程代码，从而将工作重点集中在模型本身的性能优化上。提供 offline 和 online 两种执行方式：
 
-1. offline 为核心功能，与原有流程功能保持一致，有确定的输入数据和调度，以提供稳定的性能分析和问题定位的执行方式；
-2. online 参考开源框架提供的简易在线功能，以方便用 evalscope 等评测工具进行精度评测；保证基础功能，不做流程相关的性能优化；以 PD 分离的方式支持 P 和 D 按不同并行切分策略进行测试；模型需要按[KV Cache 管理](kv_cache_design.md)适配（offline 提供了非 KV Cache管理机制），除此之外的适配要求同 offline。
+1. **offline 推理**：批处理模式，是框架的核心使用场景，按YAML 配置所有需要处理的 prompts，有确定的输入数据和调度，关注单步执行时间、吞吐与资源利用率，为性能分析和问题定位提供稳定的执行方式；
+2. **online 推理**：Client-Server 服务模式，客户端通过 HTTP 发起请求并实时拿到结果。参考开源框架的简易在线功能，方便用 evalscope 等评测工具做精度评测；以 PD 分离的方式支持 Prefill / Decode 各自选用最优并行策略；保证基础功能，不做流程相关的性能优化。模型需按 [KV Cache 管理](kv_cache_design.md) 适配（offline 另提供非 KV Cache 管理机制）。
 
-细节专题：
-- [在线推理（PD 分离）执行机制](online_inference_design.md)
+本文档介绍关键模块和主要流程、逻辑，细节专题见以下文档：
 - [KV Cache 管理](kv_cache_design.md)
 - [MTP 投机采样执行流程](mtp_design.md)
+- [在线推理（PD 分离）执行机制](online_inference_design.md)
 
 ---
 
-## 1. 目录结构
+## 1. executor 目录结构
 
 ```
-cann-recipes-infer/
-├── executor/                  # 推理框架核心
-│   ├── core/                  # 核心引擎组件
-│   │   ├── config/            # 配置类（InferenceConfig、CommManager）
-│   │   ├── engine/            # 执行引擎（ExecutionEngine）
-│   │   ├── kv_cache/          # Paged KV cache 管理（KVCacheManager / BlockPool）
-│   │   ├── model_worker/      # 模型 Worker（ModelWorker、MTPWorker）
-│   │   ├── scheduler/         # 调度器基类（Scheduler）
-│   │   └── types_/            # 公共类型（Request、Batch、ForwardMetaData 等）
-│   ├── offline/               # 离线推理入口（OfflineInference）
-│   ├── online/                # 在线推理入口
-│   │   ├── server.py          #   FastAPI HTTP 入口 + WorkerManager
-│   │   ├── dp_dispatcher.py   #   DPDispatcher（父进程经 ZMQ 把请求派给 worker、收回 worker 算出的结果）
-│   │   ├── online_inference.py#   OnlineInference 推理循环（继承 OfflineInference）
-│   │   ├── router.py          #   PD Router sidecar（双发 prefill/decode）
-│   │   ├── bootstrap.py       #   PD Bootstrap server（rank table / dp_rank 路由）
-│   │   ├── kv_transfer/       #   KV 传输（buffer / conn / transfer_engine / transfer_manager）
-│   │   └── scheduler/         #   PD 调度器（PrefillDisaggScheduler / DecodeDisaggScheduler）
-│   ├── model_loader/          # 权重加载
-│   ├── scripts/               # 启动脚本（function.sh / set_env.sh）
-│   └── utils/                 # 工具函数（forward_metadata、graph_utils、hccl_utils、profiler 等）
-├── models/                    # 各模型实现（每个子目录一个模型）
-├── module/                    # 公共模块（并行 Linear、MoE GMM、量化、blockwise sparse 等）
-├── ops/                       # 自定义算子（AscendC、TileLang、PyPTO）
-├── dataset/                   # 默认评测数据集
-└── docs/                      # 文档
+executor/
+├── core/                  # 核心引擎组件
+│   ├── config/            # 配置类（InferenceConfig、CommManager）
+│   ├── engine/            # 执行引擎（ExecutionEngine）
+│   ├── kv_cache/          # Paged KV cache 管理（KVCacheManager / BlockPool）
+│   ├── model_worker/      # 模型 Worker（ModelWorker、MTPWorker）
+│   ├── scheduler/         # 调度器基类（Scheduler）
+│   └── types_/            # 公共类型（Request、Batch、ForwardMetaData 等）
+├── offline/               # 离线推理入口（OfflineInference）
+├── online/                # 在线推理入口
+│   ├── server.py          #   FastAPI HTTP 入口 + WorkerManager
+│   ├── dp_dispatcher.py   #   DPDispatcher（父进程经 ZMQ 把请求派给 worker、收回 worker 算出的结果）
+│   ├── online_inference.py#   OnlineInference 推理循环（继承 OfflineInference）
+│   ├── router.py          #   PD Router
+│   ├── bootstrap.py       #   PD Bootstrap server（rank table / dp_rank 路由）
+│   ├── kv_transfer/       #   KV 传输（buffer / conn / transfer_engine / transfer_manager）
+│   └── scheduler/         #   PD 调度器（PrefillDisaggScheduler / DecodeDisaggScheduler）
+├── model_loader/          # 权重加载
+├── scripts/               # 启动脚本（function.sh / set_env.sh）
+└── utils/                 # 工具函数（forward_metadata、graph_utils、hccl_utils、profiler 等）
 ```
 
 ## 2. 模块依赖关系
@@ -108,61 +102,64 @@ flowchart TB
 
 ### 3.1 InferenceConfig
 
-统一配置容器，从 YAML 文件加载，包含五个子配置：
+统一配置容器，包含五个子配置：
 
 ```
 InferenceConfig
 ├── DataConfig       # 数据集、序列长度上限等
 ├── ModelConfig      # 模型路径、执行模式（eager/graph）、MTP 等
-├── ParallelConfig   # TP/DP/EP 并行规模、rank 信息、ZMQ 端口
-├── SchedulerConfig  # batch_size、max_new_tokens、每 DP rank 的 batch 限额
-└── DisaggConfig     # PD 分离运行时（disaggregation_mode ∈ {NONE, PREFILL, DECODE}、
-                     #                bootstrap_host/port、store_url、is_store_creator_node、local_ip）
+├── ParallelConfig   # TP/DP/EP 并行规模、rank 信息
+├── SchedulerConfig  # batch_size_per_dp_rank（每个 DP rank 的最大并发请求数）、max_new_tokens 等
+└── DisaggConfig     # PD 分离运行时（disaggregation_mode、bootstrap_host/port、store_url、local_ip 等）
 ```
 
-`DisaggConfig.disaggregation_mode == "NONE"` 即离线，`PREFILL` / `DECODE` 即在线（在线即 PD 分离，见 §5）。
+前四个由 YAML 加载，入口 `executor/core/config/inference_config.py`；`DisaggConfig` 由 `executor/online/server.py` 启动时按 CLI 参数构造（YAML 不含该字段）。
 
-配置加载入口：`executor/core/config/inference_config.py`
+`disaggregation_mode` 取值：
+- `NONE`：离线（默认）
+- `PREFILL` / `DECODE`：在线 PD 分离的两种角色（见 §5）
 
 ### 3.2 CommManager
 
-通信组管理器，在初始化阶段一次性创建所有通信组并按用途分两类：
+通信组管理器，分两阶段创建：模型计算用的 HCCL 组离线 / 在线都建，调度用的 Gloo 组只在 online 模式下追加。
 
-**模型计算通信域**（HCCL），模型中的各模块（attention / FFN / MoE / embedding / lm_head 等）对应的 yaml 并行参数进行配置，具体所需的组随模型结构而异。
+**模型计算 HCCL 组**（`CommManager.initialize()`，由 `ModelWorker._build_comm_manager` 在权重加载前调用）：模型中各模块（attention / ffn / moe / embedding / lm_head 等）按 YAML 并行参数申请的 HCCL 组；具体所需的 HCCL 组随模型结构而异。
 
-**调度通信域**（gloo，承载 Python 对象在父子进程或 leader 间广播 / 同步）：
+**调度用 Gloo 组**（`CommManager.init_cpu_groups()`，仅在 `OnlineInference.__init__` 中追加调用，用于在 DP leader 之间或 DP leader 与 TP worker 之间广播 / 同步 Python 对象，例如请求 dict、phase 标记）：
 
-- `dp_leader_group`：各 **DP leader**（每个 DP 组内 `attn_tp_rank == 0` 的 rank，承担该组对外的代理）之间跨 DP 同步
-- `tp_cpu_group`：每个 DP 组内由 DP leader 向 TP worker 广播请求
+- `dp_leader_group`：跨 DP 组同步，各 DP 组内 `attn_tp_rank == 0` 的 rank 称为 **DP leader**，参与跨实例协商
+- `tp_cpu_group`：DP 组内同步，DP leader 向同组其他 TP worker 广播请求
 
 ### 3.3 ModelWorker
 
 模型执行的直接载体，持有：
 - 模型实例（`self.model`）
-- KV cache tensor（`self.kv_cache`）
-- 图编译后的 forward 函数（`self.model_compiled`，graph 模式下）
+- KV cache（`self.kv_cache`）
+- 图编译后的执行图（`self.model_compiled`，graph 模式下）
 
 核心方法：
-- `init(model_cls, config_cls)`：实际启动入口；加载 HF config + 权重，并按 `hf_config` 构造 `CommManager`（其 `moe_ep` buffer 大小依赖 `hf_config`，必须在权重加载后建）
-- `init_kvcache()`：**legacy（非 paged）模式**才调用——按 `module.cache_unit` 形状为各 attention 层分配 `module.k_cache / module.v_cache`。**paged 模式**下不调用，KV 块由 `ExecutionEngine._init_cache_manager()` 通过 `KVCacheManager` 统一管理（见 §3.6）
-- `compile_model()`：图模式下编译 forward；由 `ExecutionEngine.warm_up()` 在执行完 dummy prefill 后调用
-- `inference(model_inputs, is_prefill, is_mtp=False)`：执行单次 forward，返回 `(output, infer_time)`。`is_mtp` 当前不参与分支，仅保留签名兼容；每步推理耗时日志已迁到 `Scheduler._log_step`
+- `init(model_cls, config_cls)`：初始化顺序为，加载 `hf_config` → 构造 `CommManager` → 加载权重
+- `init_kvcache()`：分配 KV Cache
+- `compile_model()`：图模式下编译执行图，由 `ExecutionEngine.warm_up()` 在执行完 dummy prefill 后调用
+- `inference(model_inputs, is_prefill)`：执行单次 forward，返回 `(output, infer_time)`
 
 **模型加载流程：**
 
 ```mermaid
 flowchart TB
-    A[ModelWorker.init] --> B{with_ckpt?}
+    A[ModelWorker.init] --> E[加载 HF Config]
+    E --> H[构造 CommManager (moe 模型依赖 hf_config 初始化通信域)]
+    H --> B{with_ckpt?}
     B -->|Yes| C[DefaultModelLoader]
     B -->|No| D[DummyModelLoader]
-    C --> E[加载 HF Config]
-    D --> E
-    E --> F[加载 Model 权重到 NPU]
+    C --> F[加载 Model 权重到 NPU]
+    D --> F
     F --> G[_process_weights_after_loading]
-    G --> H[构造 CommManager（按 hf_config sizing）]
-    H --> I{paged 模式?}
-    I -->|Yes| J[由 ExecutionEngine._init_cache_manager 建 KVCacheManager]
-    I -->|No| K[ModelWorker.init_kvcache：按 cache_unit 绑定到各层]
+    G --> I{模型实现 init_cache?}
+    I -->|Yes| J[model.init_cache 自行构造 KV]
+    I -->|No| K[按 module.cache_unit 预分配 k_cache / v_cache]
+    J --> L[ExecutionEngine._init_cache_manager 创建 KVCacheManager]
+    K --> L
 ```
 
 **图编译流程：**
@@ -179,10 +176,10 @@ flowchart LR
 
 ### 3.4 ExecutionEngine
 
-框架的核心驱动层，连接调度器与模型：
-- `_build_model_inputs(batch)`：调用 `build_tensors_from_requests` 将 requests 拼装为 tensor，再构建 position_ids、ForwardMetaData 等模型输入；paged 模式下同时通过 `prepare_block_tables` / `prepare_slot_mapping` 写入 `block_table` / `slot_mapping`
-- `forward_batch(batch)`：调用 `_build_model_inputs` → `ModelWorker.inference` 执行前向 → `_sample_tokens` 采样 → `Batch.update_requests_from_batch` 回写到 `Request`；返回 dict 含 `next_tokens` / `logits` / `inference_time`（聚合，等于 main + sum(mtp)）/ `inference_time_main` / `inference_times_mtp`
-- `warm_up()`：执行一次 dummy prefill + decode，触发算子预热；图模式下在 dummy prefill 之后调用 `ModelWorker.compile_model`
+框架的核心驱动层，连接 `Scheduler` 与 `ModelWorker`：
+- `_build_model_inputs(batch)`：将 requests 拼装为 tensor 并构建 `position_ids` 与 `ForwardMetaData`；启用 paged KV cache 时（`kvcache_manager` 非空）额外通过 `prepare_block_tables` / `prepare_slot_mapping` 写入 `block_table` / `slot_mapping`
+- `forward_batch(batch)`：依次调用 `_build_model_inputs` → `ModelWorker.inference` → `_sample_tokens` → `Batch.update_requests_from_batch`，把采样结果回写到 `Request`，并返回包含 `next_tokens` / `logits` / 推理耗时的 dict
+- `warm_up()`：执行一次 dummy prefill + decode 触发算子预热；图模式下在 dummy prefill 后 dummy decode 前调用 `ModelWorker.compile_model` 编译 decode 阶段的执行图，减少运行时开销
 
 > 日志：`executor/utils/logging_config.py` 中 `setup_logging()` 是统一入口，环境变量 `CANN_RECIPES_LOG_LEVEL`（默认 `INFO`）控制级别。
 
@@ -196,7 +193,7 @@ stateDiagram-v2
 
     state Waiting {
         [*] --> Queued
-        Queued --> Tokenized: _schedule_prefill_batch()<br/>tokenize_request()
+        Queued --> Tokenized: _schedule_prefill_batch()<br/>→ _prepare_request_prompt()（按需 tokenize）
     }
 
     Waiting --> Prefilling: 选入 prefill batch
@@ -207,31 +204,34 @@ stateDiagram-v2
         Forward --> SampleFirst: _sample_tokens() → 首个 output token
     }
 
-    Prefilling --> Running: is_prefill_done=True<br/>加入 running_requests
+    Prefilling --> Running: _process_batch_output() → _on_prefill_complete()<br/>入 running_requests
 
     state Running {
         [*] --> DecodeStep
-        DecodeStep --> DecodeStep: output_id_list.append(token)<br/>kv_len += 1
+        DecodeStep --> DecodeStep: Batch.update_requests_from_batch()<br/>output_id_list += next_tokens、computed_len ← kv_len[i]
     }
 
-    Running --> Finished_length: decode_step_count ≥ max_new_tokens
-    Running --> Finished_stop: 生成 EOS token
+    Running --> Finished_length: _should_finish() True (length)
+    Running --> Finished_stop:   _should_finish() True (stop)
 
     Finished_length --> [*]: finish_reason="length"
     Finished_stop --> [*]: finish_reason="stop"
 ```
 
-状态转换的关键位置：
+状态转换的关键接口：
 
 | 转换 | 代码位置 |
 |------|----------|
-| Waiting → Prefilling | `_schedule_prefill_batch()`: 从 waiting_queue 取出，tokenize（若未 tokenize），创建 Batch |
-| Prefilling → Running | `_process_batch_output()`: `request.is_prefill_done = True`，加入 `running_requests` |
-| Running → Running | `_process_batch_output()`: `decode_step_count += 1`，追加 output token |
-| Running → Finished | `_should_finish()`: 检查 `decode_step_count >= max_new_tokens` 或 EOS，设 `finish_reason` |
+| Waiting → Prefilling | `_schedule_prefill_batch()`：从 `waiting_queue` 取出，按需 tokenize，创建 Batch |
+| Prefilling → Running | `_process_batch_output()` → `_on_prefill_complete()`：`is_prefill_done=True`，加入 `running_requests` |
+| Running → Finished | `_process_batch_output()` → `_should_finish()`：命中后设 `is_finished=True`、出 `running_requests`、入 `finished_requests`，并调用 `kvcache_manager.free(rid)` 与 `_on_request_finished` |
 
-- **离线模式**（`disaggregation_mode == NONE`）：基类 `Scheduler`，prefill 优先、无 prefill 则 decode
-- **在线模式**（`disaggregation_mode ∈ {PREFILL, DECODE}`，即 PD 分离）：`PrefillDisaggScheduler` / `DecodeDisaggScheduler` 在基类基础上扩展角色专一队列、bootstrap 同步、KV 传输衔接，详见 §5
+`_should_finish` 在 decode 阶段每步检查两类结束条件：
+
+1. **遇到 EOS**：未设 `sampling_params.ignore_eos` 且最后一个 output token 为 `tokenizer.eos_token_id` 时，设置状态 `finish_reason="stop"`
+2. **达到长度限制**：decode 步数达到 `max_new_tokens` 或 `sampling_params.max_tokens` 时，设置状态 `finish_reason="length"`
+
+> 离线模式没有 DP 间的状态同步，需额外保证各 DP rank 步数对齐：上述两类条件命中后只回填 `finish_reason` 与 `valid_output_len`，请求仍走完 `max_new_tokens` 步；`generate()` 处理输出结果时按 `valid_output_len` 截掉提早结束后的填充 token。
 
 ### 3.6 KV Cache Manager
 
@@ -243,7 +243,7 @@ KV cache 采用 paged attention 三层结构，定义在 `executor/core/kv_cache
 | `SingleTypeKVCacheManager` | 单一 attention type（Full / Sliding Window）的逻辑块管理：决定每请求所需 block、回收旧块、维护 block table |
 | `BlockPool` | 物理 block 池：发放与回收 block id |
 
-调度层通过 `manager.allocate_slots(request, num_tokens)` 申请块；attention 内核读写时按 `block_table/slot_mapping` 索引到具体物理块。
+调度层通过 `manager.allocate_slots(request_id, computed_tokens, num_new_tokens, lookahead_tokens=0)` 申请 Block；模型读写时按 `block_table` / `slot_mapping` 索引到具体物理 Block。
 
 详见 [kv_cache_design.md](kv_cache_design.md)。
 
@@ -275,7 +275,7 @@ bash models/<model>/infer.sh
             │       ├─ ModelWorker(config, device)          #   仅构造，不加载模型
             │       └─ ProfilerManager()                    #   profiler 配置
             │
-            ├─ ExecutionEngine.init(model_cls, config_cls)  # Phase 2: 真正装载
+            ├─ ExecutionEngine.init(config_cls, main_model_cls, mtp_model_cls=None)  # Phase 2: 真正装载
             │       ├─ main_worker.init()                   #   加载 hf_config + 权重 → 构造 CommManager
             │       ├─ AutoTokenizer.from_pretrained()      #   加载 tokenizer
             │       └─ if cache_info: _init_cache_manager() #   paged：建 KVCacheManager + 块池
@@ -370,7 +370,7 @@ Scheduler._process_batch_output()                       ← 状态机推进：Pr
 
 | 组件 | 文件 | 部署位置 | 职责 |
 |------|------|----------|------|
-| Router | `router.py` | Decode 实例 node 0 的 sidecar 进程 | 按 `bootstrap_room % N` 选 prefill/decode 实例并双发请求 |
+| Router | `router.py` | 与 Prefill 实例 node 0 同机的独立进程 | 按 `bootstrap_room % N` 选 prefill/decode 实例并双发请求 |
 | Bootstrap Server | `bootstrap.py` | Prefill 实例 leader 父进程的独立线程 | 提供 rank table 注册/查询、`bootstrap_room → dp_rank` 路由 |
 | KVTransferManager | `kv_transfer/` | 每个 worker 子进程 | 控制面走 ZMQ，数据面走 RDMA / HCCL，metadata 直写对端 buffer |
 | PD Scheduler | `scheduler/{prefill,decode}.py` | 每个 worker 子进程，替换基类 `Scheduler` | Prefill 完成后释放 KV；Decode 等待 KV 到齐后才进入计算 |
@@ -378,7 +378,7 @@ Scheduler._process_batch_output()                       ← 状态机推进：Pr
 ### 5.2 请求路径
 
 ```
-Client ──POST /generate──▶ Router (decode-node-0:8000)
+Client ──POST /generate──▶ Router (prefill-node-0:8000)
                               │   注入 bootstrap_room / bootstrap_host / bootstrap_port
                               │
                               │   asyncio.gather 并发双发：
@@ -430,6 +430,25 @@ bash models/<model>/infer.sh online decode
 
 > 进程拓扑、Bootstrap 协议、Router 路由规则、KVTransferManager 数据面、DPDispatcher / worker 进程模型、配置项与启动流程详见 [online_inference_design.md](online_inference_design.md)。
 
+### 5.5 请求方式
+
+提供的 http 请求接口：`/v1/completions`、`/v1/chat/completions`，如上文所述，Router 启动在 Prefill 实例 node 0 上，因此，Client的服务请求地址为：`https://prefill.node0.ip:8000`，其中端口8000由代码常量`ROUTER_HTTP_PORT`指定。请求方式如（在prefill首节点可直接用 `localhost`）：
+
+```shell
+# 单请求
+curl -s -X POST http://localhost:8000/v1/chat/completions -H 'Content-Type: application/json' -d '{"model":"default","messages":[{"role":"user","content":"hello"}],"max_tokens":10}'
+
+# 数据集评测
+evalscope eval \
+    --model default \
+    --api-url http://localhost:8000/v1 \
+    --datasets gsm8k \
+    --eval-batch 32 \
+    --generation-config '{"max_tokens":65535}'
+```
+
+> *当前尚未支持 temperature、top_k等采样参数*
+
 ---
 
 ## 6. 框架对模型的接口契约
@@ -438,16 +457,15 @@ bash models/<model>/infer.sh online decode
 
 ### 6.1 模型必须提供
 
-1. **`model.forward(input_ids, position_ids, forward_metadata, slot_mapping=None, block_table=None, **kwargs)`**
-   - `input_ids` 已由框架按 packed 布局拼装为一维 `[TotalTokens]`（packed 是框架唯一的输入布局）
-   - `forward_metadata: ForwardMetaData` 携带 `is_prefill` / `kv_len` / `actual_seq_lengths_kv/q`（含 cu/list 变体）/ `attention_mask` / `prompt_tokens` 等 attention 所需元数据
-   - **Paged 模式**（默认）：`block_table` 与 `slot_mapping` 由 `ExecutionEngine._build_model_inputs` 通过 `prepare_block_tables` / `prepare_slot_mapping` 构造后透传；attention 层据此索引 `KVCacheManager` 管理的物理块
-   - **Legacy 模式**：两个参数为 `None`，KV 通过 `ModelWorker.init_kvcache()` 按各层 `module.cache_unit` 形状预分配并绑定到 `self.k_cache` / `self.v_cache`，attention 层直接访问
-   - 返回 `logits`（packed 输出 `[TotalTokens, vocab]`）
+1. `model.forward(input_ids, position_ids, forward_metadata, **kwargs)`
+   - `input_ids` 按 packed 布局拼装为一维 `[TotalTokens]`
+   - `forward_metadata: ForwardMetaData` 携带 `is_prefill` / `kv_len` / `actual_seq_lengths_kv/q`（含 cu/list 变体）/ `attention_mask` / `prompt_tokens` / `block_table` / `slot_mapping` 等 attention 所需元数据
+   - 返回 `logits`，形状 `[batch_size, 1, vocab]`（模型内先取每请求最后位置再计算 lm_head）
 
-2. **`module.cache_unit`（仅 legacy 模式生效）**——每层 attention 模块声明 KV head 形状 `(num_kv_heads_per_rank, head_dim)`，`ModelWorker.init_kvcache` 据此为每层分配 `k_cache` / `v_cache` tensor。Paged 模式不读此字段，KV 块由 `cache_info` 接管。
+2. KV cache 形状声明 (online 必须)：
+   - 实现 `init_cache(device)`：`ModelWorker.init_kvcache` 会全权委托给模型构造 KV（paged 模型通常返回 paged-shape `past_key_values` 并自行挂载到各层）
 
-3. **权重加载**——框架根据 `ModelConfig.with_ckpt` 在 `DefaultModelLoader`（真实 ckpt）与 `DummyModelLoader`（随机权重）之间二选一，模型本身不暴露 loader hook。需要自定义分片/格式转换时，继承 `BaseModelLoader`（`executor/model_loader/base_loader.py`）并替换装载入口。
+3. `load_weights(weights_iterator)`：从 `DefaultModelLoader` 提供的 `(name, tensor)` 迭代器读权重并写入模型参数；自定义分片 / 格式转换在此完成。`ModelConfig.with_ckpt=False` 时启用 `DummyModelLoader`，跳过该调用并随机初始化。
 
 ### 6.2 框架提供的能力
 
@@ -455,6 +473,6 @@ bash models/<model>/infer.sh online decode
 |------|----------|
 | 通信域创建 | 根据 yaml 配置文件中的e并行参数创建对应 HCCL 通信域 |
 | Paged KV cache | `KVCacheManager` 按 `cache_info` 申请块；attention forward 按 `block_table` / `slot_mapping` 索引 |
-| Packed Sequence | 唯一输入布局：`Batch.input_ids` 始终为 `[TotalTokens]` 一维；attention 用 TND 格式 + `sparse_mode`（参见 `models/gpt_oss/`：`sparse_mode = 4 if sliding_window else 3`） |
+| Packed Sequence | 唯一输入布局：`Batch.input_ids` 始终为 `[TotalTokens]` 一维；
 | 图编译 | `ModelConfig.exe_mode ∈ {ge_graph, npugraph_ex}` 开启；`ExecutionEngine.warm_up()` 在 dummy prefill 后调用 `compile_model()`；模型需保证输入 shape 静态 |
 | Profiler | `ModelConfig.enable_profiler=True` 开启；`ProfilerManager` 自动插入 profiling 桩 |
