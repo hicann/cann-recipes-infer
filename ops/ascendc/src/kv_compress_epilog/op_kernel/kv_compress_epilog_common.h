@@ -131,9 +131,6 @@ __aicore__ inline void VFProcessDynamicBlockQuant(
     __local_mem__ T1* yLocalAddr = (__local_mem__ T1*)yLocal.GetPhyAddr();
     __local_mem__ T1* scaleLocalAddr = (__local_mem__ T1*)yLocal.GetPhyAddr();
     __local_mem__ T0* xLocalAddr = (__local_mem__ T0*)xLocal.GetPhyAddr();
-    __local_mem__ T0* ropeXLocalAddr = (__local_mem__ T0*)xLocal.GetPhyAddr();
-    __local_mem__ T0* ropeYLocalAddr = (__local_mem__ T0*)yLocal.GetPhyAddr();
-    __local_mem__ T1* padLocalAddr = (__local_mem__ T1*)yLocal.GetPhyAddr();
     static constexpr AscendC::MicroAPI::DivSpecificMode mode = {AscendC::MicroAPI::MaskMergeMode::ZEROING, false};
     uint32_t maxValueInt = 0;
     if constexpr (IsSameType<T1, fp8_e5m2_t>::value) {
@@ -190,8 +187,8 @@ __aicore__ inline void VFProcessDynamicBlockQuant(
             uint32_t sreg = sregNum;
             for (uint16_t j = 0; j < loopCountFoldTwo; j++) {
                 pregLoop = UpdateMask<float>(sreg);
-                LoadInputData<T0>(xLeft, xLocalAddr, pregMain, 2 * j * VL_FP32 + i * curColNum);
-                LoadInputData<T0>(xRight, xLocalAddr, pregLoop, (2 * j + 1) * VL_FP32 + i * curColNum);
+                LoadInputData<T0>(xLeft, xLocalAddr, pregMain, 2 * j * VL_FP32 + i * curColNumAlign);
+                LoadInputData<T0>(xRight, xLocalAddr, pregLoop, (2 * j + 1) * VL_FP32 + i * curColNumAlign);
                 Muls(xAbsLeft, xLeft, 0.0f, pregMain);
  	            Compare<float, CMPMODE::NE>(compareLeft, xAbsLeft, xAbsLeft, pregMain);
  	            MaskNot(compareLeft, compareLeft, pregMain);
@@ -224,7 +221,7 @@ __aicore__ inline void VFProcessDynamicBlockQuant(
             // 处理尾块, 这里只有一个for循环
             pregLoop = UpdateMask<float>(tailReminder);
             for (uint16_t j = 0; j < loopCountReminder; j++) {
-                LoadInputData<T0>(xLeft, xLocalAddr, pregLoop, loopCountFoldTwo * 2 * VL_FP32 + i * curColNum);
+                LoadInputData<T0>(xLeft, xLocalAddr, pregLoop, loopCountFoldTwo * 2 * VL_FP32 + i * curColNumAlign);
                 Abs(xAbsLeft, xLeft, pregLoop);
                 ReduceMax(scale, xAbsLeft, pregLoop);
                 CompareScalar<float, CMPMODE::NE>(compareScalar, scale, (float)0.0, preg1);
@@ -242,20 +239,20 @@ __aicore__ inline void VFProcessDynamicBlockQuant(
             }
             LocalMemBar<MemType::VEC_STORE, MemType::VEC_STORE>();
             // cat rope
-            ropeXLocalAddr = ropeXLocalAddr + quantColNum;
-            ropeYLocalAddr = ropeYLocalAddr + quantColNum / 2;
+            __local_mem__ T0* rowRopeXLocalAddr = xLocalAddr + i * curColNumAlign + quantColNum;
+            __local_mem__ T0* rowRopeYLocalAddr =
+                (__local_mem__ T0*)(yLocalAddr + i * dstCurColNumAlign + quantColNum);
 
-            LoadUnAlignPre(ureg0, ropeXLocalAddr);
-            LoadUnAlign(ropeReg, ureg0, ropeXLocalAddr, 64);
-            StoreUnAlign(ropeYLocalAddr, ropeReg, ureg1, 64);
-            StoreUnAlignPost(ropeYLocalAddr, ureg1, 0);
+            LoadUnAlignPre(ureg0, rowRopeXLocalAddr);
+            LoadUnAlign(ropeReg, ureg0, rowRopeXLocalAddr, 64);
+            StoreUnAlign(rowRopeYLocalAddr, ropeReg, ureg1, 64);
+            StoreUnAlignPost(rowRopeYLocalAddr, ureg1, 0);
 
             // pad zero
-            padLocalAddr = padLocalAddr + concatColNum;
-            StoreUnAlign(padLocalAddr, (RegTensor<T1>&)zeros, ureg1, padColNum);
-            StoreUnAlignPost(padLocalAddr, ureg1, 0);
-            
-            ropeYLocalAddr = ropeYLocalAddr + scaleColNum * 2 + padColNum / 2;
+            __local_mem__ T1* rowPadLocalAddr = yLocalAddr + i * dstCurColNumAlign + concatColNum;
+            StoreUnAlign(rowPadLocalAddr, (RegTensor<T1>&)zeros, ureg1, padColNum);
+            StoreUnAlignPost(rowPadLocalAddr, ureg1, 0);
+
             scaleLocalAddr = scaleLocalAddr + padColNum;
         }
     }
@@ -269,9 +266,7 @@ __aicore__ inline void VFProcessDynamicMxFP8Quant(
     __local_mem__ T1* yLocalAddr = (__local_mem__ T1*)yLocal.GetPhyAddr();
     __local_mem__ T0* xLocalAddr = (__local_mem__ T0*)xLocal.GetPhyAddr();
     __local_mem__ T1* scaleLocalAddr = (__local_mem__ T1*)yLocal.GetPhyAddr();
-    __local_mem__ T0* ropeXLocalAddr = (__local_mem__ T0*)xLocal.GetPhyAddr();
     __local_mem__ T0* ropeYLocalAddr = (__local_mem__ T0*)yLocal.GetPhyAddr();
-    __local_mem__ T1* padLocalAddr = (__local_mem__ T1*)yLocal.GetPhyAddr();
 
     uint32_t quantColNum = curColNum - 64;
     uint16_t scaleColNum = CeilDiv(quantColNum, 128);
@@ -324,10 +319,10 @@ __aicore__ inline void VFProcessDynamicMxFP8Quant(
         Duplicate(tmp3, static_cast<uint32_t>(127), pregMerge);
         for (uint16_t i = 0; i < curRowNum; i++) {
             // cat rope
-            ropeXLocalAddr = ropeXLocalAddr + quantColNum;
+            __local_mem__ T0* rowRopeXLocalAddr = xLocalAddr + i * curColNumAlign + quantColNum;
             
-            LoadUnAlignPre(ureg0, ropeXLocalAddr);
-            LoadUnAlign(ropeReg, ureg0, ropeXLocalAddr, 64);
+            LoadUnAlignPre(ureg0, rowRopeXLocalAddr);
+            LoadUnAlign(ropeReg, ureg0, rowRopeXLocalAddr, 64);
             DataCopy(ropeYLocalAddr + i * dstCurColNumAlign / 2, ropeReg, pregRope);
             LocalMemBar<MemType::VEC_STORE, MemType::VEC_STORE>();
             uint32_t sreg = sregNum;
@@ -363,9 +358,9 @@ __aicore__ inline void VFProcessDynamicMxFP8Quant(
             LocalMemBar<MemType::VEC_STORE, MemType::VEC_STORE>();
 
             // pad zero
-            padLocalAddr = padLocalAddr + concatColNum;
-            StoreUnAlign(padLocalAddr, (RegTensor<T1>&)zero, ureg1, padColNum);
-            StoreUnAlignPost(padLocalAddr, ureg1, 0);
+            __local_mem__ T1* rowPadLocalAddr = yLocalAddr + i * dstCurColNumAlign + concatColNum;
+            StoreUnAlign(rowPadLocalAddr, (RegTensor<T1>&)zero, ureg1, padColNum);
+            StoreUnAlignPost(rowPadLocalAddr, ureg1, 0);
         }
     }
 }
