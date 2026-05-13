@@ -54,9 +54,10 @@ Qwen3-MoE模型是2025年开源的大语言模型，包括Qwen3-235B-A22B与Qwen
 
      在`models/qwen3_moe/config`目录下已提供了较优性能的YAML样例供您参考，您可以根据模型类型选择对应的YAML文件，本文以`models/qwen3_moe/config/qwen3_235b_16tp.yaml`文件为例，修改其中的`model_path`参数，将其设置为[权重准备](#权重准备)阶段准备好的权重文件存储路径，例如`/data/models/qwen3_origin_weight/`。
 
-   - 修改`models/qwen3_moe/infer.sh`脚本中`YAML_FILE_NAME`参数。
+   - 配置`executor/scripts/infer.sh`脚本中的参数。
 
-     将`YAML_FILE_NAME`设置为`config`文件夹下YAML文件的名字，例如`qwen3_235b_16tp.yaml`。
+     离线推理模式下，将`--yaml`设置为`config`文件夹下YAML文件名称，例如`qwen3_235b_16tp.yaml`。
+     在线推理模式下，将`--mode`设置为`online`，`--pd_role`设置为`prefill`或`decode`。
 
 2. 准备输入prompt。
 
@@ -74,13 +75,44 @@ Qwen3-MoE模型是2025年开源的大语言模型，包括Qwen3-235B-A22B与Qwen
      2. 本样例已在`dataset/default_prompt.json`中内置了输入prompt，您可以直接使用或在该文件中自定义prompt输入。
 
 
-3. 执行推理脚本。
+3. 执行统一推理脚本。
 
+   统一入口脚本位于 `executor/scripts/infer.sh`，通过以下参数控制启动：
+
+   | 参数 | 含义 | 取值示例 |
+   | --- | --- | --- |
+   | `--model` | 模型目录名，对应 `models/` 下的子目录 | `qwen3_moe` |
+   | `--mode` | 推理模式 | `offline`（离线推理）/ `online`（在线PD分离推理） |
+   | `--yaml` | 离线模式：yaml 文件名 | `qwen3_235b_16tp.yaml` |
+   | `--pd_role` | 在线模式：PD 角色 | `prefill` / `decode` |
+   | `--p_yaml_name` | 可选，在线模式：prefill yaml 文件名，不传则默认 `qwen3_moe_pd/prefill.yaml` | `qwen3_moe_pd/prefill.yaml` |
+   | `--d_yaml_name` | 可选，在线模式：decode yaml 文件名，不传则默认 `qwen3_moe_pd/decode.yaml` | `qwen3_moe_pd/decode.yaml` |
+
+   **使用方式一：命令行传参**
    ```shell
-   cd models/qwen3_moe
-   bash infer.sh
+   # offline 模式
+   bash executor/scripts/infer.sh --model qwen3_moe --yaml qwen3_235b_16tp.yaml
+   # online 模式
+   bash executor/scripts/infer.sh --model qwen3_moe --mode online --pd_role prefill
    ```
-   > 说明：如果是多机环境，需要在每个节点上执行。
+
+   如需查看参数说明，可以执行 `bash executor/scripts/infer.sh --help`。
+
+   **使用方式二：直接修改脚本默认值后执行**
+    编辑 executor/scripts/infer.sh，修改 MODEL / MODE / YAML_FILE / PD_ROLE 等参数的默认值，例如：
+    ```shell
+      MODEL=qwen3_moe
+      MODE=offline
+      YAML_FILE=qwen3_235b_16tp.yaml
+    ```
+    保存后直接执行：
+   ```shell
+   bash executor/scripts/infer.sh
+   ```
+
+   > 说明：
+   > - 如果是多机环境，需要在每个节点上执行。
+   > - 推理日志和结果保存在 `models/qwen3_moe/res/` 路径下。
 
 ## 优化点参考
 

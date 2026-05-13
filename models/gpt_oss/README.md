@@ -63,9 +63,10 @@
 
      关于YAML文件中的更多配置说明可参见[YAML参数描述](../../docs/common/inference_config_guide.md)。
 
-   - 修改`models/gpt_oss/infer.sh`脚本中`YAML`参数。
+   - 配置`executor/scripts/infer.sh`脚本中的参数。
 
-     将`YAML`设置为`config`文件夹下YAML文件名称，例如`gpt_oss_20b.yaml`。
+     离线推理模式下，将`--yaml`设置为`config`文件夹下YAML文件名称，例如`gpt_oss_20b.yaml`。
+     在线推理模式下，将`--mode`设置为`online`，`--pd_role`设置为`prefill`或`decode`。
 
 2. 准备输入prompt。
 
@@ -84,12 +85,42 @@
      2. 若您的机器无法联网，需要您从[huggingface](http://huggingface.co/datasets/zai-org/LongBench/tree/main)手动下载数据集至`dataset/LongBench`目录下，`LongBench`文件夹需手工创建，目录中包含`LongBench.py`和`data`目录，并需要在`LongBench.py`中修改数据集加载路径；若您的机器可正常联网，样例执行过程中会自动在线读取LongBench数据集，您无需手工下载。
       > 说明：使用LongBench数据集时，默认执行文本摘要任务，可在`cann-recipes-infer/executor/utils/data_utils.py`的`build_dataset_input`函数里修改默认的system prompt。
 
-3. 执行推理脚本。
+3. 执行统一推理脚本。
 
+   统一入口脚本位于 `executor/scripts/infer.sh`，通过以下参数控制启动：
+
+   | 参数 | 含义 | 取值示例 |
+   | --- | --- | --- |
+   | `--model` | 模型目录名，对应 `models/` 下的子目录 | `gpt_oss` |
+   | `--mode` | 推理模式 | `offline`（离线推理）/ `online`（在线PD分离推理） |
+   | `--yaml` | 离线模式：yaml 文件名 | `gpt_oss_20b.yaml` |
+   | `--pd_role` | 在线模式：PD 角色 | `prefill` / `decode` |
+   | `--p_yaml_name` | 可选，在线模式：prefill yaml 文件名，不传则默认 `gpt_oss_pd/prefill.yaml` | `gpt_oss_pd/prefill.yaml` |
+   | `--d_yaml_name` | 可选，在线模式：decode yaml 文件名，不传则默认 `gpt_oss_pd/decode.yaml` | `gpt_oss_pd/decode.yaml` |
+
+   **使用方式一：命令行传参**
+   ```shell
+   # offline 模式
+   bash executor/scripts/infer.sh --model gpt_oss --yaml gpt_oss_20b.yaml
+   # online 模式
+   bash executor/scripts/infer.sh --model gpt_oss --mode online --pd_role prefill
+   ```
+
+   如需查看参数说明，可以执行 `bash executor/scripts/infer.sh --help`。
+
+   **使用方式二：直接修改脚本默认值后执行**
+    编辑 executor/scripts/infer.sh，修改 MODEL / MODE / YAML_FILE / PD_ROLE 等参数的默认值，例如：
     ```shell
-    cd models/gpt_oss
-    bash infer.sh
+      MODEL=gpt_oss
+      MODE=offline
+      YAML_FILE=gpt_oss_20b.yaml
     ```
+    保存后直接执行：
+   ```shell
+   bash executor/scripts/infer.sh
+   ```
+
+   > 说明：推理日志和结果保存在 `models/gpt_oss/res/` 路径下。
 
    > **需要注意**
    > - 目前仅支持prompt的batch_size为1。

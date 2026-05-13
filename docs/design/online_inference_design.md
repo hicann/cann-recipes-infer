@@ -629,12 +629,31 @@ BOOTSTRAP_PORT    = 18800
 
 ### 7.3 启动命令
 
-```bash
-# Prefill 节点
-bash infer.sh online [prefill/decode]
-```
+在线推理统一通过 `executor/scripts/infer.sh` 拉起，各参数说明如下：
 
-同机 PD 分卡：分两次调用infer.sh，在调用 `infer.sh` 之前设 `ASCEND_RT_VISIBLE_DEVICES` 隔离 NPU，且需添加prefill/decode参数
+| 参数 | 必填 | 含义 | 取值 |
+|---|---|---|---|
+| `--model` | 是 | 模型目录名，对应 `models/` 下的子目录 | `deepseek_r1`, `qwen3_moe`, `gpt_oss` 等 |
+| `--mode` | 是 | 推理模式，在线场景固定为 `online` | `online` |
+| `--pd_role` | 是 | 当前节点的 PD 角色 | `prefill` / `decode` |
+| `--p_yaml_name` | 否 | 覆盖默认的 prefill yaml 文件名 | 如 `my_prefill.yaml`，默认 `${MODEL}_pd/prefill.yaml` |
+| `--d_yaml_name` | 否 | 覆盖默认的 decode yaml 文件名 | 如 `my_decode.yaml`，默认 `${MODEL}_pd/decode.yaml` |
+
+YAML 文件统一存放在 `models/<MODEL>/config/` 目录下。默认情况下，脚本自动拼接路径为 `models/<MODEL>/config/${MODEL}_pd/prefill.yaml` 和 `decode.yaml`；仅当需要指定自定义文件名时才传入 `--p_yaml_name` / `--d_yaml_name`。
+
+**启动步骤：**
+
+1. 在各 Prefill 节点执行：
+   ```bash
+   bash executor/scripts/infer.sh --model <name> --mode online --pd_role prefill [--p_yaml_name <name>] [--d_yaml_name <name>]
+   ```
+
+2. 在各 Decode 节点执行：
+   ```bash
+   bash executor/scripts/infer.sh --model <name> --mode online --pd_role decode [--p_yaml_name <name>] [--d_yaml_name <name>]
+   ```
+
+> 同机 PD 分卡：分两次调用 `infer.sh`，在调用前设置 `ASCEND_RT_VISIBLE_DEVICES` 隔离 NPU，且两次调用分别传入 `--pd_role prefill` 和 `--pd_role decode`。
 
 ### 7.4 `server.py` CLI
 

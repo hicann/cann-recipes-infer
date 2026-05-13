@@ -997,3 +997,6 @@ class Qwen3MoeForCausalLM(nn.Module):
                 quant_method.process_weights_after_loading(
                     module, is_nz=self.infer_config.model_config.enable_weight_nz
                 )
+                if "gate" in module_name:
+                    # Avoid GE graph performance degradation: make gate tensor contiguous after transpose.
+                    module.weight.data = module.weight.data.contiguous()

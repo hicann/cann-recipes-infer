@@ -174,18 +174,19 @@ function check_env_vars()
     NAME=${MODEL_NAME}_${PREFIX}
     export CASE_NAME=$NAME
 
+    SCRIPT_PATH=$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
+    PARENT_PARENT_DIR=$(cd "$SCRIPT_PATH/../.." &>/dev/null && pwd)
+
     if [ "$mode" = "online" ]; then
         export RES_PATH="${DIR_PREFIX}/${DATE}/${NAME}/${PD_ROLE}_node${VC_TASK_INDEX}"
     else
         export RES_PATH="${DIR_PREFIX}/${DATE}/${NAME}"
     fi
-    WORK_DIR=`pwd`
+    export WORK_DIR="${PARENT_PARENT_DIR}/models/${MODEL_DIR}"
     DUMP_PRECISION_PATH=${WORK_DIR}'/'${RES_PATH}'/dump_data'
     mkdir -p ${WORK_DIR}'/'${RES_PATH}
     mkdir -p ${DUMP_PRECISION_PATH}
 
-    SCRIPT_PATH=$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
-    PARENT_PARENT_DIR=$(cd "$SCRIPT_PATH/../.." &>/dev/null && pwd)
     echo "==================================>"
 }
 

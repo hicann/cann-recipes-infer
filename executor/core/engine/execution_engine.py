@@ -79,7 +79,7 @@ class ExecutionEngine:
 
         # Profiling configuration
         self.enable_profiler = self.infer_config.model_config.enable_profiler
-        self.output_path = os.getenv("RES_PATH", "./")
+        self.output_path = os.path.join(os.getenv("WORK_DIR", "."), os.getenv("RES_PATH", ""))
         self.profiler = ProfilerManager(self.enable_profiler, self.output_path)
 
     def _init_device(self):

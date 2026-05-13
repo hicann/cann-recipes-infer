@@ -97,9 +97,10 @@ source ${cann_path}/bin/setenv.bash
         | `micro_batch_mode` | int | `0` | 控制 prefill 阶段的 micro batch 执行模式：`0` 表示关闭；`1` 表示按 DP/EP 维度切分 micro batch；`2` 表示按 SP/TP/EP 维度切分 micro batch。 |
         | `enable_o_proj_alltoall` | bool | `false` | 启用 attention 中 o_proj 的 all-to-all 通信优化。 |
 
-   - 修改`models/deepseek_r1/infer.sh`脚本中`YAML_FILE_NAME`参数。
+   - 配置`executor/scripts/infer.sh`脚本中的参数。
 
-     将`YAML_FILE_NAME`设置为`config`文件夹下YAML文件名称，例如`decode_r1_rank_16_16ep_a8w8.yaml`。
+     离线推理模式下，将`--yaml`设置为`config`文件夹下YAML文件名称，例如`decode_r1_rank_16_16ep_a8w8.yaml`。
+     在线推理模式下，将`--mode`设置为`online`，`--pd_role`设置为`prefill`或`decode`。
 
 2. 准备输入prompt。
 
@@ -125,13 +126,44 @@ source ${cann_path}/bin/setenv.bash
      > - 在使用LongBench/InfiniteBench数据集或其他自定义数据集时，默认执行文本摘要任务，可在`cann-recipes-infer/executor/utils/data_utils.py`的`build_dataset_input`函数里修改默认的system prompt。
      > - 长序列请求执行中若出现`out of memory`问题，可参见附录中的[长序列请求out of memory问题处理](#long_bench_faq)。
 
-3. 执行推理脚本。
+3. 执行统一推理脚本。
 
+   统一入口脚本位于 `executor/scripts/infer.sh`，通过以下参数控制启动：
+
+   | 参数 | 含义 | 取值示例 |
+   | --- | --- | --- |
+   | `--model` | 模型目录名，对应 `models/` 下的子目录 | `deepseek_r1` |
+   | `--mode` | 推理模式 | `offline`（离线推理）/ `online`（在线PD分离推理） |
+   | `--yaml` | 离线模式：yaml 文件名 | `decode_r1_rank_16_16ep_a8w8.yaml` |
+   | `--pd_role` | 在线模式：PD 部署角色 | `prefill` / `decode` |
+   | `--p_yaml_name` | 可选，在线模式：prefill yaml 文件名，不传则默认 `deepseek_r1_pd/prefill.yaml` | `deepseek_r1_pd/prefill.yaml` |
+   | `--d_yaml_name` | 可选，在线模式：decode yaml 文件名，不传则默认 `deepseek_r1_pd/decode.yaml` | `deepseek_r1_pd/decode.yaml` |
+
+   **使用方式一：命令行传参**
    ```shell
-   cd models/deepseek_r1
-   bash infer.sh
+   # offline 模式
+   bash executor/scripts/infer.sh --model deepseek_r1 --yaml decode_r1_rank_16_16ep_a8w8.yaml
+   # online 模式
+   bash executor/scripts/infer.sh --model deepseek_r1 --mode online --pd_role prefill
    ```
-   > 说明：如果是多机环境，需要在每个节点上执行。
+
+   如需查看参数说明，可以执行 `bash executor/scripts/infer.sh --help`。
+
+   **使用方式二：直接修改脚本默认值后执行**
+    编辑 executor/scripts/infer.sh，按照需求修改 MODEL / MODE / YAML_FILE / PD_ROLE 等参数的默认值，例如：
+    ```shell
+      MODEL=deepseek_r1
+      MODE=offline
+      YAML_FILE=decode_r1_rank_16_16ep_a8w8.yaml
+    ```
+    保存后直接执行：
+   ```shell
+   bash executor/scripts/infer.sh
+   ```
+
+   > 说明：
+   > - 如果是多机环境，需要在每个节点上执行。
+   > - 推理日志和结果保存在 `models/deepseek_r1/res/` 路径下。
 
 
 ## 优化点参考

@@ -454,7 +454,7 @@ class DeepseekV3MoE(nn.Module):
         if self.n_shared_experts > 0:
             if enable_gegraph_and_multistream:
                 hidden_states_share = None
-                with npu_stream_switch_gegraph(self.enable_gegraph_and_multistream, "22"):
+                with npu_stream_switch_gegraph(True, "22"):
                     hidden_states = npu_wait_tensor(True, hidden_states, topk_idx)
                     if "a8" in self.mm_quant_mode:
                         merged_x, pertoken_scale = self.shared_experts.gate_up_proj(
@@ -478,7 +478,7 @@ class DeepseekV3MoE(nn.Module):
         hidden_states_params = (hidden_states_share, merged_x, pertoken_scale)
         if self.moe_tp_size > 1:
             # MoE TP
-            return self.moe_infer_tp(hidden_states, topk_idx, topk_weight, hidden_states_params)
+            return self.moe_infer_tp(hidden_states, topk_idx, topk_weight, hidden_states_params, is_prefill)
         else:
             # MoE EP
             if is_prefill:
@@ -564,7 +564,9 @@ class DeepseekV3MoE(nn.Module):
                 hidden_states_share = self.shared_experts.down_proj(intermediate_hidden_states)
         return hidden_states_share
 
-    def moe_infer_tp(self, x, topk_ids, topk_weight, hidden_states_params):
+    def moe_infer_tp(self, x, topk_ids, topk_weight, hidden_states_params, is_prefill):
+        enable_gegraph_and_multistream = self.enable_gegraph_and_multistream and not is_prefill
+        enable_npugraphex_and_multistream = self.enable_npugraphex_and_multistream and not is_prefill
         hidden_states_share, merged_x, pertoken_scale = hidden_states_params
         num_tokens, h = x.shape
         routing_args = {
@@ -596,8 +598,8 @@ class DeepseekV3MoE(nn.Module):
                 "group_list_type": 2,
                 "pertoken_scale": dynamic_scale
             })
-        if self.enable_gegraph_and_multistream:
-            with npu_stream_switch_gegraph(self.enable_gegraph_and_multistream, "22"):
+        if enable_gegraph_and_multistream:
+            with npu_stream_switch_gegraph(True, "22"):
                 merged_x = npu_wait_tensor(True, merged_x, expanded_x)
                 if "a8" in self.mm_quant_mode:
                     intermediate_hidden_states, pertoken_scale = torch_npu.npu_dequant_swiglu_quant(
@@ -610,12 +612,12 @@ class DeepseekV3MoE(nn.Module):
                     intermediate_hidden_states = torch_npu.npu_swiglu(merged_x)
 
         hidden_states_ordered_by_experts = self.experts(expanded_x, tokens_per_expert, **moe_args)
-        if self.enable_gegraph_and_multistream:
+        if enable_gegraph_and_multistream:
             hidden_states_share = self.shared_experts_down_proj(
                 intermediate_hidden_states, hidden_states_ordered_by_experts, pertoken_scale
             )
 
-        wait_event(self.enable_npugraphex_and_multistream, self.npu_events, 1)
+        wait_event(enable_npugraphex_and_multistream, self.npu_events, 1)
         hidden_states = torch_npu.npu_moe_finalize_routing(
             hidden_states_ordered_by_experts,
             skip1=hidden_states_share, skip2=None,
@@ -2585,6 +2587,9 @@ class DeepseekV3ForCausalLM(nn.Module):
             if isinstance(quant_method, QuantizeMethodBase):
                 quant_method.process_weights_after_loading(
                     module, is_nz=self.enable_weight_nz, scales_dtype=scales_dtype)
+                if "gate" in module_name:
+                    # Avoid GE graph performance degradation: make gate tensor contiguous after transpose.
+                    module.weight.data = module.weight.data.contiguous()
             # Dynamic quant for input_avtivation of first grouped matmul requies complete smooth scale.
             # When applying expert parallel, each device only reserves smooth scales of mapping experts.
             # Need to do all gather to obtain complete smooth scale.
