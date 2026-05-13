@@ -142,7 +142,7 @@ Atlas A3 执行如下命令编译所有自定义算子：
 
   ```bash
   cd /home/code/cann-recipes-infer/ops/ascendc
-  bash build.sh -c ascend910_95
+  bash build.sh -c ascend950
   ```
 
 **说明：**
