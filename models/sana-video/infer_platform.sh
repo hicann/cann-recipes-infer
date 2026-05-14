@@ -232,7 +232,7 @@ mm_generate_cache_config
 
 MODEL_ARGS=$(mm_build_args)
 cd "$MM_MODEL_DIR" || die "cd $MM_MODEL_DIR failed"
-LOG_FILE="$LOG_DIR/log_$(date +%Y%m%d_%H%M%S).log"
+LOG_FILE="$MM_LOG_DIR/log_$(date +%Y%m%d_%H%M%S).log"
 
 set -o pipefail
 # CANN TBE compile-subprocesses are grandchildren of the Python process and

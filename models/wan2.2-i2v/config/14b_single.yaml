@@ -1,13 +1,13 @@
 model_args:
-  ckpt_dir: "/path/to/Wan2.2-I2V-14B"  # must modify: path to downloaded weight directory
-  image: "examples/i2v_input.JPG"    # input reference image
+  ckpt_dir: "/path/to/Wan2.2-I2V-14B"
+  image: "examples/i2v_input.JPG"
   prompt: "Summer beach vacation style, a white cat wearing sunglasses sits on a surfboard."
   task: "i2v-A14B"
-  size: "640*360"                    
-  frame_num: 61                      # frame count; 4n+1 form
-  sample_steps: 40                   # denoising steps
+  size: "640*360"
+  frame_num: 61                      # 4n+1
+  sample_steps: 40
   base_seed: 100
-  convert_model_dtype: true          # cast to inference dtype; saves memory on single card
+  convert_model_dtype: true          # [false, true]
   cfg_size: 1
   ulysses_size: 1
   ring_size: 1
@@ -25,12 +25,11 @@ env_vars:
 dit_cache:
   method: "NoCache"                  # [NoCache, FBCache, TeaCache]
   enable_separate_cfg: true
-  # Uncomment the params block matching the method above; only that block is read.
   # params:
   #   # FBCache:
-  #   rel_l1_thresh: 0.05            # L1 diff threshold
+  #   rel_l1_thresh: 0.05
   #
   #   # TeaCache:
-  #   rel_l1_thresh: 0.1             # accumulated L1 threshold
+  #   rel_l1_thresh: 0.1
   #   coefficients: [733.226126, -401.131952, 67.5869174, -3.149879, 0.0961237896]
-  #   warmup: 2                      # first N steps compute fully
+  #   warmup: 2

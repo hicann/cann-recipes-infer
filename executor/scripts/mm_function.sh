@@ -192,9 +192,10 @@ print(val if val is not None else '')
     SCRIPT_PATH_FUNC=$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
     PARENT_PARENT_DIR=$(cd "$SCRIPT_PATH_FUNC/../.." &>/dev/null && pwd)
     export MM_MODEL_DIR="${PARENT_PARENT_DIR}/models/${MODEL_DIR}"
-    export LOG_DIR="${MM_MODEL_DIR}/res/${DATE}/${MODEL_NAME}"
-    mkdir -p "${LOG_DIR}"
-    echo "[INFO] Log directory: ${LOG_DIR}"
+    unset LOG_DIR
+    export MM_LOG_DIR="${MM_MODEL_DIR}/res/${DATE}/${MODEL_NAME}"
+    mkdir -p "${MM_LOG_DIR}"
+    echo "[INFO] Log directory: ${MM_LOG_DIR}"
 
     # Resolve entry script path (relative to model directory)
     export ENTRY_SCRIPT_PATH="${MM_MODEL_DIR}/${ENTRY_SCRIPT}"
@@ -365,7 +366,7 @@ function mm_launch_task()
                  ${ACCELERATE_EXTRA} \
                  ${ENTRY_SCRIPT_PATH} \
                  ${MODEL_ARGS} \
-                 '2>&1 | tee "${LOG_DIR}/log_$(date +%Y%m%d_%H%M%S).log"'
+                 '2>&1 | tee "${MM_LOG_DIR}/log_$(date +%Y%m%d_%H%M%S).log"'
     else
         echo "[INFO] Launching with torchrun (nproc_per_node=${WORLD_SIZE}, master_port=${MASTER_PORT})"
         echo "==================================>"
@@ -375,6 +376,6 @@ function mm_launch_task()
                  --nproc_per_node=${WORLD_SIZE} \
                  ${ENTRY_SCRIPT_PATH} \
                  ${MODEL_ARGS} \
-                 '2>&1 | tee "${LOG_DIR}/log_$(date +%Y%m%d_%H%M%S).log"'
+                 '2>&1 | tee "${MM_LOG_DIR}/log_$(date +%Y%m%d_%H%M%S).log"'
     fi
 }

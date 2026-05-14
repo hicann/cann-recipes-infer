@@ -51,11 +51,11 @@ WORLD_SIZE = int(os.getenv("WORLD_SIZE", 1))
 
 def main():
     args = parse_args()
-    if args.extract_path is None:
-        raise ValueError("extract_path can not be None")
-    else:
+    if args.extract_q_k_data:
+        if args.extract_path is None:
+            raise ValueError("extract_path can not be None when extract_q_k_data is enabled")
         os.environ["EXTRACT_PATH"] = args.extract_path
-        
+
     device = f"npu:{args.device}"
     torch.npu.set_device(device)
     logger.info(args)

@@ -531,21 +531,18 @@ def _sync_scalar_for_sp(self, value: float) -> float:
 
 ### 块稀疏 Attention
 
-稀疏Attention算法的主要思路，是根据一定稀疏度选取注意力分数最高，对结果影响最大的块，而跳过其余块的计算。基于这一前提，这里实现了两种不同的稀疏算法，其原理都是尽可能选取注意力分数更高的块，接下来将依次介绍两种不同的方法。该优化方法基于[blitz_sparse_attention算子](https://gitcode.com/cann/ops-transformer/blob/master/experimental/attention/blitz_sparse_attention/README.md)实现，运行前需要依据参考文档编译算子。编译算子运行命令如下：	 
- 
- 
- ```bash 
- git clone https://gitcode.com/cann/ops-transformer.git 
- cd ops-transformer 
- 
- 
+稀疏Attention算法的主要思路，是根据一定稀疏度选取注意力分数最高，对结果影响最大的块，而跳过其余块的计算。基于这一前提，这里实现了两种不同的稀疏算法，其原理都是尽可能选取注意力分数更高的块，接下来将依次介绍两种不同的方法。该优化方法基于[blitz_sparse_attention算子](https://gitcode.com/cann/ops-transformer/blob/master/experimental/attention/blitz_sparse_attention/README.md)实现，运行前需要依据参考文档编译算子。编译算子运行命令如下：
+
+ ```bash
+ git clone https://gitcode.com/cann/ops-transformer.git
+ cd ops-transformer
+
  yum/apt install patch # 安装依赖 Centos用yum Ubuntu用apt
- pip install -r requirements.txt 
- 
- 
- bash build.sh --make_clean --experimental -j96 --pkg --soc=ascend910_93 --ops=blitz_sparse_attention #（--soc，A2：ascend910b，A3：ascend910_93） 
- ./build/cann-ops-transformer-custom_linux-"$(uname -i)".run 
- cd experimental/attention/blitz_sparse_attention/torch_interface && bash build.sh custom 
+ pip install -r requirements.txt
+
+ bash build.sh --make_clean --experimental -j96 --pkg --soc=ascend910_93 --ops=blitz_sparse_attention #（--soc，A2：ascend910b，A3：ascend910_93）
+ ./build/cann-ops-transformer-custom_linux-"$(uname -i)".run
+ cd experimental/attention/blitz_sparse_attention/torch_interface && bash build.sh custom
  ```
 
 #### TopK
@@ -584,7 +581,7 @@ SVG算法的计算过程如下：1.构造得到两种不同的稀疏范式对应
 ![](figures/svg.png)
 图片来源：[svg](https://icml.cc/virtual/2025/poster/43743)
 
-通过在启动 YAML 顶层增加 `sparse:` 段使能 Sparse Attention（无该段或 `method: no_sparse` 即关闭）。`config/single_sparse.yaml` 是单卡 SVG 参考配置（`320*480*65` 规格），`config/sp8_sparse.yaml` 是 8 卡 Ulysses + SVG 参考配置（`720*1280*129` 规格）。**Sparse Attention 支持单卡和 Ulysses 多卡**（详见下文 `Ulysses + TopK/SVG 联合优化`），但**不支持 Ring Attention**——`sample_video.py` 检测到 `ring_degree > 1` 会直接抛 `ValueError`。启用 sparse 后会覆盖 Dit-Cache 的 block forward，二者互斥，所以 sparse YAML 都固定 `dit_cache.method: NoCache`。`sparse:` 段内联了原独立 `sparse_config.yaml` 的全部字段，结构如下：
+通过在启动 YAML 顶层增加 `sparse:` 段使能 Sparse Attention（无该段或 `method: no_sparse` 即关闭）。`config/single_sparse.yaml` 是单卡 SVG 参考配置（`720*1280*129` 规格），`config/sp8_sparse.yaml` 是 8 卡 Ulysses + SVG 参考配置（`720*1280*129` 规格）。**Sparse Attention 支持单卡和 Ulysses 多卡**（详见下文 `Ulysses + TopK/SVG 联合优化`），但**不支持 Ring Attention**——`sample_video.py` 检测到 `ring_degree > 1` 会直接抛 `ValueError`。启用 sparse 后会覆盖 Dit-Cache 的 block forward，二者互斥，所以 sparse YAML 都固定 `dit_cache.method: NoCache`。`sparse:` 段内联了原独立 `sparse_config.yaml` 的全部字段，结构如下：
 ```yaml
 sparse:
   method: "SVG"                      # [no_sparse, TopK, SVG]
@@ -594,7 +591,7 @@ sparse:
   params:
     TopK:                            # only used when method == TopK
       sparse_time_step: "10-49"      # 应用稀疏的 step
-      sparsity_files_path: "./sparsity/320x480x65/v3"  # 离线 profiling 产物路径
+      sparsity_files_path: "./sparsity/720x1280x129/v3"  # 离线 profiling 产物路径
       CAC_threshold: 0.66            # CAC 阈值
     SVG:                             # only used when method == SVG
       sparse_time_step: "14-49"

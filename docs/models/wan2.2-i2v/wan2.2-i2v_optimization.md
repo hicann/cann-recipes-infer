@@ -175,7 +175,7 @@ for step_idx, t in enumerate(tqdm(timesteps)):
 
 ###  Ring Attention Overlap
 
-在多卡Ring Attention中，通过异步启动AllGather收集其他卡的KV数据，同时立即使用本地KV计算第一个FA，让NPU计算与网络通信并行执行以掩盖通信延迟；待AllGather完成后，将其他多个远程chunks合并为一个长序列一次性计算第二个FA，最后用LSE（Log-Sum-Exp）算法正确合并两次attention输出，[达成将通信时间隐藏在本地计算中](https://gitcode.com/weixin_45381022/cann-recipes-infer_wan_overlap/blob/master/module/unified_sp/core.py)。
+在多卡Ring Attention中，通过异步启动AllGather收集其他卡的KV数据，同时立即使用本地KV计算第一个FA，让NPU计算与网络通信并行执行以掩盖通信延迟；待AllGather完成后，将其他多个远程chunks合并为一个长序列一次性计算第二个FA，最后用LSE（Log-Sum-Exp）算法正确合并两次attention输出，[达成将通信时间隐藏在本地计算中](https://gitcode.com/cann/cann-recipes-infer/blob/master/module/unified_sp/core.py)。
 
 ![](figures/overlap.png)
 =======

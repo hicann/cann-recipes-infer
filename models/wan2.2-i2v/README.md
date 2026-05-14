@@ -1,7 +1,7 @@
 # 在昇腾Atlas A2/A3环境上适配Wan2.2-I2V模型的推理
 Wan2.2-I2V模型是一款多模态视频生成模型，提供了图生视频功能。本项目旨在提供 Wan2.2-I2V 模型的 Atlas A2 适配版本，为开发者开展相关 NPU 迁移工作提供参考。
 
-本项目基于NPU主要完成以下优化点，具体内容可至[NPU Wan2.2-I2V模型推理优化实践](https://gitcode.com/weixin_45381022/cann-recipes-infer/blob/master/docs/models/Wan2.2-I2V/Wan2.2-I2V_optimization.md)查看：
+本项目基于NPU主要完成以下优化点，具体内容可至[NPU Wan2.2-I2V模型推理优化实践](https://gitcode.com/cann/cann-recipes-infer/blob/master/docs/models/wan2.2-i2v/wan2.2-i2v_optimization.md)查看：
 
 - 支持NPU npu_fused_infer_attention_score融合算子；
 - 支持NPU npu_rotary_mul融合算子；

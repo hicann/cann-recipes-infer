@@ -23,6 +23,9 @@ import json
 import os
 import random
 import re
+import shutil
+import signal
+import subprocess
 import time
 import warnings
 from dataclasses import dataclass, field
@@ -33,9 +36,9 @@ import pyrallis
 import torch
 import torch.nn as nn
 import torch_npu
-from torch_npu.contrib import transfer_to_npu
 from accelerate import Accelerator
 from termcolor import colored
+from torch_npu.contrib import transfer_to_npu
 from tqdm import tqdm
 from patches import apply_all, patch_triton_rms_norm_import
 from patches.quant_module import replace_quant_module
@@ -673,16 +676,21 @@ if __name__ == "__main__":
         flush=True,
     )
 
+    # Clean up CANN TBE knowledge-bank subprocesses before the fast exit below.
+    # Without this, RouteServer.task_distribute subprocesses notice that their
+    # parent disappeared and print "main process disappeared" during shutdown.
+    try:
+        from tbe.common.repository_manager.route import RouteServer
+
+        RouteServer.finalize()
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.warning("TBE RouteServer finalize failed during shutdown: %s", exc)
+
     # Skip Python's interpreter shutdown to avoid a torch_npu C-extension
     # double-free SIGABRT that fires after all outputs are already on disk.
     # SIGKILL every direct child (DataLoader workers, multiprocessing
     # resource_tracker) so they cannot notice ppid==1 and print leaked-
-    # semaphore warnings via their own inherited fd 2. CANN TBE grandchildren
-    # are out of reach here and handled by a shell-level grep in infer_platform.sh.
-    import shutil
-    import signal
-    import subprocess
-
+    # semaphore warnings via their own inherited fd 2.
     pgrep_bin = shutil.which("pgrep") or "/usr/bin/pgrep"
     try:
         child_pids = subprocess.run(
