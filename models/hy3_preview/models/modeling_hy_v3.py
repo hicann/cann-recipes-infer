@@ -587,6 +587,14 @@ class HYV3MoE(nn.Module):
         self.enable_multi_streams = infer_config.model_config.custom_params.get(
             "enable_multi_streams", False
         )
+        # Maximum token count per MoE chunk during prefill.
+        # Splits the expert dispatch/combine along the sequence dimension to
+        # bound peak memory of the expanded_x / gathered_tokens intermediates
+        # (each ~ hidden * top_k per token).  Default 65536: effectively no
+        # chunking for typical prefill lengths; set to e.g. 4096 to reduce peak.
+        self.moe_chunk_max_len = infer_config.model_config.custom_params.get(
+            "moe_chunk_max_len", 65536
+        )
 
         # Router: replicated (all ranks have full router)
         self.router = HYV3TopKRouter(config)
@@ -610,18 +618,34 @@ class HYV3MoE(nn.Module):
         batch_size, seq_len, hidden_dim = hidden_states.shape
         hidden_states_flat = hidden_states.view(-1, hidden_dim)
 
-        # Router: produces global topk indices
-        _, top_k_weights, top_k_index, row_idx = self.router(hidden_states_flat, self.expert_bias)
+        # Router must see all tokens for correct top-k selection (not chunked).
+        _, top_k_weights, top_k_index, _ = self.router(hidden_states_flat, self.expert_bias)
         top_k_index = top_k_index.to(torch.int32)
 
-        if self.moe_ep_size > 1:
+        num_tokens = hidden_states_flat.shape[0]
+        if is_prefill:
+            # Split expert dispatch/combine along the token dim to bound
+            # peak memory of expanded_x / gathered_tokens intermediates.
+            routed_output_list = []
+            for chunk_x, chunk_ids, chunk_weights in zip(
+                *self._split_tensors(num_tokens, hidden_states_flat,
+                                     top_k_index, top_k_weights)
+            ):
+                if self.moe_ep_size > 1:
+                    chunk_out = self._moe_ep_manual(chunk_x, chunk_ids, chunk_weights)
+                else:
+                    chunk_out = self.experts(chunk_x, chunk_ids, chunk_weights)
+                routed_output_list.append(chunk_out)
+            routed_output = (torch.cat(routed_output_list, dim=0)
+                             if len(routed_output_list) > 1 else routed_output_list[0])
+        elif self.moe_ep_size > 1:
             if self.exe_mode == "ge_graph" and not is_prefill:
                 routed_output = self._moe_ep_mc2_decode(
                     hidden_states_flat, top_k_index, top_k_weights
                 )
             else:
                 routed_output = self._moe_ep_manual(
-                    hidden_states, hidden_states_flat, top_k_index, top_k_weights, row_idx
+                    hidden_states_flat, top_k_index, top_k_weights
                 )
         else:
             routed_output = self.experts(hidden_states_flat, top_k_index, top_k_weights)
@@ -640,7 +664,26 @@ class HYV3MoE(nn.Module):
 
         return hidden_states_out.reshape(batch_size, seq_len, hidden_dim)
 
-    def _moe_ep_manual(self, hidden_states, hidden_states_flat, topk_ids, topk_weight, row_idx):
+    def _split_tensors(self, num_tokens, hidden_states_flat, topk_ids, topk_weight):
+        """Chunk MoE inputs along the token dimension to bound peak memory.
+
+        When num_tokens > self.moe_chunk_max_len, splits each tensor into
+        ceil(num_tokens / moe_chunk_max_len) chunks so that each chunk's
+        expanded_x / gathered_tokens intermediate stays within a predictable
+        size (~ moe_chunk_max_len * top_k * hidden_dim).
+        """
+        if num_tokens > self.moe_chunk_max_len:
+            num_chunks = (num_tokens + self.moe_chunk_max_len - 1) // self.moe_chunk_max_len
+            x_list = hidden_states_flat.chunk(num_chunks, dim=0)
+            topk_ids_list = topk_ids.chunk(num_chunks, dim=0)
+            topk_weight_list = topk_weight.chunk(num_chunks, dim=0)
+        else:
+            x_list = [hidden_states_flat]
+            topk_ids_list = [topk_ids]
+            topk_weight_list = [topk_weight]
+        return x_list, topk_ids_list, topk_weight_list
+
+    def _moe_ep_manual(self, hidden_states_flat, topk_ids, topk_weight):
         """Manual EP routing via npu_moe_init_routing_v2 + all_to_all + re_routing + finalize."""
         moe_ep_group = self.comm_manager.get_group("moe_ep_group")
 
@@ -956,12 +999,14 @@ class HYV3Model(nn.Module):
 
         hidden_states = inputs_embeds
 
-        # RoPE: position_ids is 2D (batch, seq_len) after reshaping
+        # RoPE: position_ids is 2D (batch, seq_len) after reshaping.
         flat_position_ids = position_ids.view(-1)
         if self.attn_tp_size > 1 and self.attn_dp_size > 1:
-            repeated_hidden = hidden_states.repeat(self.attn_tp_size, 1, 1)
-            repeated_pos = flat_position_ids.repeat(self.attn_tp_size)
-            cos_sin = self.rotary_emb(repeated_hidden, repeated_pos, self.max_position_embeddings)
+            cos_sin = self.rotary_emb(
+                hidden_states.repeat(self.attn_tp_size, 1, 1),
+                flat_position_ids.repeat(self.attn_tp_size),
+                self.max_position_embeddings,
+            )
         else:
             cos_sin = self.rotary_emb(hidden_states, flat_position_ids, self.max_position_embeddings)
 

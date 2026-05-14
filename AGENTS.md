@@ -49,19 +49,19 @@ scripts/        # 工具脚本
 
 ## 硬件平台映射
 
-`npu-smi info` 输出的芯片型号与 Atlas 系列的对应关系：
+`asys info -r=status` 输出的 Chip Name 与 Atlas 系列的对应关系：
 
-| Atlas 系列 | 芯片型号 | 单卡 HBM |
+| Atlas 系列 | Chip Name | 单卡 HBM |
 |-----------|---------|----------|
-| Atlas A2 | Ascend 910B | 32/64 GB |
-| Atlas A3 | Ascend 910C | 64 GB |
-| Atlas A5 | Ascend 910D | — |
+| Atlas A2 | Ascend 910B* | 32/64 GB |
+| Atlas A3 | Ascend 910_93* | 64 GB |
+| Atlas A5 | Ascend 950* | — |
 
 ---
 
 ## 推荐环境
 
-CANN 8.5.0 + PyTorch 2.8.0 + torch_npu 2.8.0
+CANN 9.0.0 + PyTorch 2.8.0 + torch_npu 2.8.0 + transformers 5.0.0
 
 ## 常用命令
 
@@ -109,8 +109,10 @@ bash executor/scripts/test_all_case.sh
 - **失败时回到 skill**：修复失败后不盲目重试，重新读取对应 skill 的排查流程，按步骤定位根因再动手
 - **调用而非重建**：需要 skill 覆盖的工作流，调用对应 skill 按步骤执行，不要凭记忆重建步骤
 - **及时持久化**：长任务中关键结论、设计决策、调试发现要及时写入文件（如 progress.md），上下文压缩会丢失未保存的信息
+- **事实性信息不推断**：硬件型号、卡数、die 数、显存容量、模型路径、权重路径等事实性配置信息，必须从已告知的获取方式或用户明确确认中获取。缺失时向用户确认，不猜测。获取后及时记录到 progress.md
 - **前置条件检查**：执行任务前，确认所需信息（模型路径、权重路径、部署配置等）是否可从 YAML 配置或 progress.md 中获取，缺失时向用户确认，不盲目搜索或猜测。单独使用 model-infer 系列 skill 时，若模型尚未完成框架适配或基线采集，应建议用户先通过 model-infer-optimize 完成阶段 0（模型分析与基线建立）
 - **工作目录规范**：运行推理、采集基线等操作必须先 `cd` 到模型目录（`models/{model_name}/`）再执行，不要从仓库根目录直接运行，避免日志和输出文件生成在错误位置
+- **证据优先**：所有判断、结论或决策都必须有来自代码库、需求或文档的明确证据支撑。没有证据，就不能下结论。被要求做判断时，先说明证据来源，再给出结论。禁止凭经验、印象或类比推断
 
 ---
 

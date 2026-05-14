@@ -9,10 +9,10 @@
 
 | 项目 | 内容 |
 |------|------|
-| 模型名称 | Hunyuan3 (Hy3 preview)，Tencent Hy Team |
+| 模型名称 | Hy3-preview，Tencent Hy Team |
 | 模型架构 | MoE Transformer（Dense + Sparse MoE with Shared Expert, GQA） |
-| 模型路径 | models/hy3 |
-| 权重路径 | /data/models/hy3-preview |
+| 模型路径 | models/hy3_preview |
+| 权重路径 | /data/models/hy3_preview |
 | 硬件平台 | Atlas A3 (Ascend 910C), 16 die (8 卡 × 2 die/卡) |
 | 单 die HBM | 64 GB, 总 1024 GB |
 | 量化模式 | BF16 (16×64GB=1024GB, 295B BF16 参数 590 GB 可行) |
@@ -155,7 +155,7 @@ Embedding (120832 × 4096, 495M params)
 |------|--------|--------|---------|------|
 | MoE Router | Python sigmoid+topk+gather+norm+scale (7 ops) | `npu_moe_gating_top_k(norm_type=1)` | 79次/forward | **通过** |
 
-> P1 精度说明: HY3 的 `e_score_correction_bias` 在 sigmoid 后加（仅影响 topk 选择），而 `npu_moe_gating_top_k` 的 bias 在 sigmoid 内。该语义差异未造成可见输出质量退化。
+> P1 精度说明: Hy3-preview 的 `e_score_correction_bias` 在 sigmoid 后加（仅影响 topk 选择），而 `npu_moe_gating_top_k` 的 bias 在 sigmoid 内。该语义差异未造成可见输出质量退化。
 
 #### P2 (进阶, 待性能门槛验证)
 
@@ -168,7 +168,7 @@ Embedding (120832 × 4096, 495M params)
 
 | 算子 | 不适配原因 |
 |------|----------|
-| `npu_kv_rmsnorm_rope_cache` | MLA 专用, HY3 为 GQA + per-head QK Norm |
+| `npu_kv_rmsnorm_rope_cache` | MLA 专用, Hy3-preview 为 GQA + per-head QK Norm |
 | `npu_mla_prolog_v3` | MLA absorb 模式专用 |
 | `npu_moe_distribute_combine_add_rms_norm` | 需配合 dispatch_v2 使用, 且手动 EP 链路不匹配 |
 
@@ -268,8 +268,8 @@ Embedding (120832 × 4096, 495M params)
 | 候选 | 结论 | 阻塞原因 |
 |------|------|---------|
 | `npu_ffn(expert_tokens=...)` | **不可行** | API 硬约束：swiglu 模式不接受 expert_tokens |
-| `npu_ffn(activation='swiglu')` Dense | **不可行** | API 硬约束：swiglu 仅支持 float16 (HY3 用 bf16) |
-| `npu_moe_distribute_combine_add_rms_norm` | **不可行** | 数学不等价：API 计算 `norm(A+B+res)` vs HY3 deferred residual `norm(A)+res` |
+| `npu_ffn(activation='swiglu')` Dense | **不可行** | API 硬约束：swiglu 仅支持 float16 (Hy3-preview 用 bf16) |
+| `npu_moe_distribute_combine_add_rms_norm` | **不可行** | 数学不等价：API 计算 `norm(A+B+res)` vs Hy3-preview deferred residual `norm(A)+res` |
 | `combine_v2 + shared_expert_x` | **已回退** | SuperKernel 编译失败：融合链过长超过 2-stream 限制 (CANN 8.5.0)。代码已还原，待 CANN 更新后可重新启用 |
 
 ### 10.2 已验证最终性能 (2026-04-28 实际推理)

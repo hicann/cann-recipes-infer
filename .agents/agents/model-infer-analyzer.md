@@ -60,9 +60,9 @@ skills:
 ## 阶段 0：模型分析
 
 ### 运行环境
-- NPU 型号:（通过 `npu-smi info` 确认）
+- NPU 型号:（通过 `asys info -r=status` 确认）
 - 单卡 HBM:
-- 部署卡数:
+- 部署卡数:（注意Atlas A3 系列为单卡双die模式，部署时以 die 数为单位（world_size = 物理卡数 × 每卡 die 数））
 - 量化模式:
 - 执行模式:
 

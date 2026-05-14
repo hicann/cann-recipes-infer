@@ -1,7 +1,7 @@
 # hy3-preview Baseline
 
 > 采集时间：2026-04-27 ~ 2026-04-28
-> 基线目的：记录 hy3-preview (Hunyuan3) 模型在 NPU 上的初始部署性能，以及各优化阶段的性能演进
+> 基线目的：记录 Hy3-preview 模型在 NPU 上的初始部署性能，以及各优化阶段的性能演进
 
 ---
 
@@ -25,7 +25,7 @@
 
 | 参数 | 值 |
 |------|-----|
-| 模型名称 | Hunyuan3 (Hy3 preview) |
+| 模型名称 | Hy3-preview |
 | 开发者 | Tencent Hy Team |
 | 架构类型 | MoE Transformer (Dense + Sparse MoE + Shared Expert) |
 | 总参数量 | 295B (295,033,543,488) |

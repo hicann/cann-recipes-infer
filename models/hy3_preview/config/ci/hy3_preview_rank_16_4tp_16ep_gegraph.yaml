@@ -1,9 +1,6 @@
-model_name: "hy3"
-world_size: 16 # keep it for backward compatibility.
-
 model_config:
-  model_name: "hy3"
-  model_path: "/data/models/hy3-preview"
+  model_name: "hy3_preview"
+  model_path: "/data/models/hy3_preview"
   exe_mode: "ge_graph"
   enable_profiler: False
   with_ckpt: True

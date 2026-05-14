@@ -8,10 +8,10 @@
 - 执行模式: **ge_graph**（图模式 + MC2 dispatch/combine + GMM）
 
 ### 模型架构
-- 模型名称: Hunyuan3 (Hy3 preview)，由 Tencent Hy Team 开发
+- 模型名称: Hy3-preview，由 Tencent Hy Team 开发
 - 架构类型: MoE Transformer（Dense + Sparse MoE with Shared Expert）
-- 模型路径: models/hy3（已完成适配）
-- 权重路径: /data/models/hy3-preview
+- 模型路径: models/hy3_preview（已完成适配）
+- 权重路径: /data/models/hy3_preview
 - HF 源码: /tmp/transformers_hy3_check/src/transformers/models/hy_v3/
 
 #### 关键参数
@@ -133,7 +133,7 @@ Embedding (120832 × 4096, 495M params)
 
 | 参考模型 | 相似点 | 差异 |
 |---------|--------|------|
-| **qwen3-moe** | MoE + GQA + Shared Expert + 大规模 | Hy3 总参数量更大 (295B vs 235B)，有 QK Norm，sigmoid router |
+| **qwen3-moe** | MoE + GQA + Shared Expert + 大规模 | Hy3-preview 总参数量更大 (295B vs 235B)，有 QK Norm，sigmoid router |
 | **deepseek-r1** | MoE + 大规模部署 | R1 使用 MLA Attention（非 GQA），架构差异大 |
 | **kimi-k2-thinking** | 大 MoE 模型 | K2 使用 MLA + DSA，架构差异大 |
 
