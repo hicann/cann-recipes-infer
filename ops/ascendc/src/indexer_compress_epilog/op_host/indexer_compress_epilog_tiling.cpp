@@ -42,12 +42,14 @@ constexpr int64_t INPUT_X_IDX = 2;
 constexpr int64_t INPUT_SLOT_MAPPING_IDX = 3;
 constexpr int64_t ATTR_QUANT_MODE_INDEX = 0;
 constexpr int64_t ATTR_ROUND_SCALE_INDEX = 1;
+constexpr int64_t ATTR_SCALE_INDEX = 2;
 constexpr int64_t BLOCK_SIZE = 32;
 constexpr int64_t REPEAT_SIZE = 256;
 constexpr int64_t DOUBLE_BUFFER = 2;
 // per_block量化,每128个f16需要量化出一个scale, 因此切分尾轴时，以128为factor进行切分
 constexpr int64_t PER_BLOCK_FP16 = 128;
 constexpr int64_t NORMAL_QUANT_MODE = 1;
+constexpr int64_t HIFLOAT_QUANT_MODE = 2;
 constexpr int64_t SINGLE_ROW = 1;
 }
 
@@ -81,6 +83,9 @@ ge::graphStatus IndexerCompressEpilogTiling::GetAttr()
 
     auto roundScale = attrs->GetAttrPointer<int64_t>(ATTR_ROUND_SCALE_INDEX);
     roundScale_ = roundScale == nullptr ? true : *roundScale;
+
+    auto scaleAttr = attrs->GetAttrPointer<float>(ATTR_SCALE_INDEX);
+    scalesAttr_ = scaleAttr == nullptr ? 1.0f : *scaleAttr;
 
     return ge::GRAPH_SUCCESS;
 }
@@ -124,10 +129,10 @@ ge::graphStatus IndexerCompressEpilogTiling::CalcOpTiling()
     int64_t perBlockScaleElemNum = BLOCK_SIZE / scaleByteSize;
     // d全载,尝试搬入更多的bs
     while (rowFactor_ <= rowOfFormerBlock_) {
-        int64_t xSize = rowFactor_ * RoundUp(d_, 16) * 2 * DOUBLE_BUFFER;     
-        int64_t ySize = rowFactor_ * RoundUp(d_, 32) * 1 * DOUBLE_BUFFER;    
+        int64_t xSize = rowFactor_ * RoundUp(d_, 16) * 2 * DOUBLE_BUFFER;
+        int64_t ySize = rowFactor_ * RoundUp(d_, 32) * 1 * DOUBLE_BUFFER;
         int64_t scaleSize = rowFactor_ * RoundUp(scaleCol_, perBlockScaleElemNum) * scaleByteSize * DOUBLE_BUFFER;
-        int64_t tmpBufferSize = RoundUp(rowFactor_, 8) * 4; 
+        int64_t tmpBufferSize = RoundUp(rowFactor_, 8) * 4;
         int64_t totalSize = xSize + ySize + scaleSize + tmpBufferSize;
         if (totalSize > ubSize_) {
             rowFactor_ = rowFactor_ - 1;
@@ -155,6 +160,7 @@ ge::graphStatus IndexerCompressEpilogTiling::CalcOpTiling()
     tilingData_.set_tailRowFactorOfFormerBlock(tailRowFactorOfFormerBlock_);
     tilingData_.set_tailRowFactorOfTailBlock(tailRowFactorOfTailBlock_);
     tilingData_.set_quantMode(quantMode_);
+    tilingData_.set_scalesAttr(scalesAttr_);
     int64_t roundScaleData = roundScale_ ? 1 : 0;
     tilingData_.set_roundScale(roundScaleData);
 
@@ -166,7 +172,7 @@ ge::graphStatus IndexerCompressEpilogTiling::CalcOpTiling()
     if (rowFactor_ != SINGLE_ROW) {
         tilingKey_ += 10;
     }
-    if (quantMode_ == NORMAL_QUANT_MODE) {
+    if (quantMode_ == NORMAL_QUANT_MODE || quantMode_ == HIFLOAT_QUANT_MODE) {
         tilingKey_ += 1;
     }
 

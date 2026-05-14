@@ -18,6 +18,7 @@ import torch.nn.functional as F
 from torch_npu.testing.testcase import TestCase, run_tests
 from ml_dtypes import bfloat16 as bf16
 from ml_dtypes import float8_e4m3fn, float8_e5m2
+from en_dtypes import hifloat8
 
 np.random.seed(121)
 np.set_printoptions(suppress=True)
@@ -28,6 +29,7 @@ torch_npu.npu.set_device(int(DEVICE_ID))
 DATA_TYPE_INT_TO_STR = {
     1: 'float16',
     27: 'bfloat16',
+    34: 'hifloat8',
     35: 'float8_e5m2',
     36: 'float8_e4m3fn',
 }
@@ -53,11 +55,11 @@ def replace_inf_nan_with_zero(x):
     mask_tensor = np.zeros_like(x, dtype=int)
     mask_tensor[mask] = 1
     return x_cleand, mask_tensor
-    
+
 def block_max_with_padding(x, row_block_size, col_block_size):
     rows, cols = x.shape
     pad_rows = (row_block_size - rows % row_block_size) % row_block_size
-    pad_cols = (col_block_size - cols % col_block_size) % col_block_size    
+    pad_cols = (col_block_size - cols % col_block_size) % col_block_size
 
     x_padded = np.pad(x, ((0, pad_rows), (0, pad_cols)), mode='constant', constant_values=0)
     padded_rows, padded_cols = x_padded.shape
@@ -69,27 +71,40 @@ def block_max_with_padding(x, row_block_size, col_block_size):
         for j in range(col_blocks):
             block = x_padded[i * row_block_size: (i + 1) * row_block_size, j * col_block_size: (j + 1) * col_block_size]
             result[i, j] = np.max(block)
-    
+
     return result
 
-def requantize_compare(golden, output, dtype_str):
+
+def requantize_compare(golden, output, dtype_str, print_diff_limit=100):
     if dtype_str in ('float8_e5m2', 'float8_e4m3fn', 'hifloat8'):
-        output_0 = output.view(torch.int8)
-        golden_0 = golden.view(torch.int8)
-    
-    diff_results = torch.abs(torch.subtract(output_0.view(-1), golden_0.view(-1)))
-    diff_indices = torch.where(diff_results > 1)[0]
+        # 将浮点数据重新解释为 int8（保持位模式）
+        output_for_compare = output.view(torch.int8)
+        golden_for_compare = golden.view(torch.int8)
+    else:
+        raise ValueError(f"Unsupported dtype_str: {dtype_str}")
 
-    npu_nan, golden_nan = torch.isnan(output.view([-1])), torch.isnan(golden.view([-1]))
-    diff_nan = torch.logical_and(npu_nan, golden_nan)
-    both_nan_idx = torch.where(diff_nan)
+    # 计算 int8 表示下的绝对差值
+    diff_abs = torch.abs(output_for_compare.view(-1) - golden_for_compare.view(-1))
+    diff_indices = torch.where(diff_abs > 1)[0]
 
-    diff_indices = torch.where(torch.logical_not(torch.isin(diff_indices, both_nan_idx[0])))[0]
-    del diff_results, npu_nan, golden_nan, diff_nan
+    # 处理双方均为 NaN 的情况（NaN 的位模式在 int8 下没有固定值，这里用浮点 isNaN 判断）
+    output_flat_float = output.view(-1).float()   # 转为 float32 方便判断 NaN
+    golden_flat_float = golden.view(-1).float()
+    both_nan = torch.isnan(output_flat_float) & torch.isnan(golden_flat_float)
+    both_nan_idx = torch.where(both_nan)[0]
 
-    golden_size, diff_size = golden.numel(), diff_indices.numel()
-    precision = (golden_size - diff_size) / golden_size
-    is_pass = (1 - precision) <= 0.001
+    # 从差异中排除双方均为 NaN 的位置（它们不算错误）
+    diff_indices = diff_indices[~torch.isin(diff_indices, both_nan_idx)]
+
+    # 打印差异信息
+    num_diff = len(diff_indices)
+
+    # 计算精度
+    total_elements = golden.numel()
+    good_elements = total_elements - num_diff
+    precision = good_elements / total_elements
+    is_pass = (1 - precision) <= 0.001  # 差异率 <= 0.1%
+
     return is_pass
 
 def fast_log2_ceil(x):
@@ -138,7 +153,7 @@ def act_quant(x, dst_type, round_scale):
     for i in range(scale.shape[0]):
         for j in range(scale.shape[1]):
             scale_expanded[i * row_block_size: (i + 1) * row_block_size, j * col_block_size: (j + 1) * col_block_size] = scale[i, j]
-    
+
     x_f32 = x_cleaned.astype(np.float32)
     out_f32 = x_f32 / scale_expanded
     out_f32[mask_tensor==1] = x[mask_tensor==1]
@@ -154,7 +169,7 @@ def act_quant(x, dst_type, round_scale):
         round_data = round_data.astype(float8_e5m2, copy=False)
     elif dst_type == 36:
         round_data = round_data.astype(float8_e4m3fn, copy=False)
-    
+
     return round_data, output_scale
 
 def dynamic_block_quant(x, dst_type):
@@ -162,7 +177,9 @@ def dynamic_block_quant(x, dst_type):
     col_block_size = 128
     dst_type_str = DATA_TYPE_INT_TO_STR[dst_type]
     max_value = 0
-    if dst_type_str == 'float8_e5m2':
+    if dst_type_str == 'hifloat8':
+        max_value = pow(2, 15)
+    elif dst_type_str == 'float8_e5m2':
         max_value = (2 - pow(2, -2)) * pow(2, 15)
     elif dst_type_str == 'float8_e4m3fn':
         max_value = (2 - pow(2, -2)) * pow(2, 8)
@@ -177,7 +194,7 @@ def dynamic_block_quant(x, dst_type):
     for i in range(scale.shape[0]):
         for j in range(scale.shape[1]):
             scale_expanded[i * row_block_size: (i + 1) * row_block_size, j * col_block_size: (j + 1) * col_block_size] = scale[i, j]
-    
+
     x_f32 = x_cleaned.astype(np.float32)
     out_f32 = x_f32 / scale_expanded
     out_f32[mask_tensor==1] = x[mask_tensor==1]
@@ -190,7 +207,9 @@ def dynamic_block_quant(x, dst_type):
         round_data = round_data.astype(float8_e5m2, copy=False)
     elif dst_type == 36:
         round_data = round_data.astype(float8_e4m3fn, copy=False)
-    
+    elif dst_type == 34:
+        round_data = round_data.astype(hifloat8, copy=False)
+
     return round_data, output_scale
 
 def index_compress_epilog_(indexer_compress_cache, indexer_compress_cache_scale, x, slot_mapping, dst_type, quant_mode, round_scale):
@@ -201,10 +220,28 @@ def index_compress_epilog_(indexer_compress_cache, indexer_compress_cache_scale,
         y, scale = act_quant(x, dst_type, round_scale)
     elif quant_mode == 1:
         y, scale = dynamic_block_quant(x, dst_type)
-    indexer_compress_cache = indexer_compress_cache.astype(float8_e5m2)
+    if dst_type == 34:
+        indexer_compress_cache = indexer_compress_cache.astype(hifloat8)
+    else:
+        indexer_compress_cache = indexer_compress_cache.astype(float8_e5m2)
     indexer_compress_cache[slot_mapping] = y
     indexer_compress_cache_scale[slot_mapping] = scale
     return indexer_compress_cache, indexer_compress_cache_scale
+
+
+def hifp8_block_quant(indexer_compress_cache, x, slot_mapping, scale):
+    valid_mask = slot_mapping != -1
+    if not np.any(valid_mask):
+        return indexer_compress_cache.astype(hifloat8)
+
+    x_valid = x[valid_mask].astype(np.float32)
+    slots_valid = slot_mapping[valid_mask]
+    scale_f32 = np.float32(scale)
+    y_f32 = x_valid * scale_f32
+    y_hifp8 = y_f32.astype(hifloat8)
+    new_cache = indexer_compress_cache.astype(hifloat8)
+    new_cache[slots_valid] = y_hifp8
+    return new_cache
 
 class TestCustomIndexerCompressEpilog(TestCase):
     def test_indexer_compress_epilog_normal_quant(self):
@@ -242,7 +279,7 @@ class TestCustomIndexerCompressEpilog(TestCase):
 
         indexer_compress_cache_golden, indexer_compress_cache_scale_golden = index_compress_epilog_(indexer_compress_cache.view(torch.int8).numpy().copy(), indexer_compress_cache_scale.numpy().copy().astype(np.float32), \
             x.numpy().copy().astype(np.float16), slot_mapping.numpy().copy().astype(np.int32), dst_type, quant_mode, round_scale)
-        
+
         x_npu = x.to("npu:%s" % DEVICE_ID)
         slot_mapping_npu = slot_mapping.to("npu:%s" % DEVICE_ID)
         indexer_compress_cache_npu = indexer_compress_cache.to("npu:%s" % DEVICE_ID)
@@ -302,7 +339,7 @@ class TestCustomIndexerCompressEpilog(TestCase):
 
         indexer_compress_cache_golden, indexer_compress_cache_scale_golden = index_compress_epilog_(indexer_compress_cache.view(torch.int8).numpy().copy(), \
             indexer_compress_cache_scale.view(torch.int8).numpy().copy().astype(np.int8), x.numpy().copy().astype(np.float16), slot_mapping.numpy().copy().astype(np.int32), dst_type, quant_mode, round_scale)
-        
+
         x_npu = x.to("npu:%s" % DEVICE_ID)
         slot_mapping_npu = slot_mapping.to("npu:%s" % DEVICE_ID)
         indexer_compress_cache_npu = indexer_compress_cache.to("npu:%s" % DEVICE_ID)
@@ -318,6 +355,72 @@ class TestCustomIndexerCompressEpilog(TestCase):
 
         self.assertTrue(cache_close, f"indexer_compress_cache precision compare fail")
         self.assertTrue(cache_scale_close, f"indexer_compress_cache_scale precision compare fail")
+
+    def test_indexer_compress_epilog_hifloat8_quant(self):
+        torch_npu.npu.set_device(int(DEVICE_ID))
+
+        class Network(nn.Module):
+            def __init__(self):
+                super(Network, self).__init__()
+
+            def forward(self, indexer_compress_cache, indexer_compress_cache_scale, x,
+                        slot_mapping, quant_mode, round_scale, scale):
+                torch.ops.custom.indexer_compress_epilog(indexer_compress_cache, indexer_compress_cache_scale, x,
+                        slot_mapping, quant_mode=quant_mode, round_scale=round_scale, scale=scale)
+
+        b = 1
+        s = 8192
+        d = 4096
+        dst_type = 35
+        scale_factor = int((d + 127) / 128)
+        quant_mode = 2
+        round_scale = True
+        scale_val = 0.5
+
+        np.random.seed(42)
+
+        x_np = np.random.uniform(-2, 2, (b * s, d)).astype(np.float16)
+        #x = torch.tensor(np.random.uniform(-2, 2, (b * s, d))).to(torch.float16)
+        # 构造slot_mapping
+        slot_mapping = np.arange(b * s) # 生成下标序列
+        np.random.shuffle(slot_mapping) # 随机打乱顺序
+        #slot_mapping = torch.tensor(slot_mapping).to(torch.int32)
+
+        # 1: 'float16',
+        # 27: 'bfloat16',
+        # 34: 'hifloat8'
+        # 35: 'float8_e5m2',
+        # 36: 'float8_e4m3fn',
+        dst_type = 34
+        indexer_compress_cache_np = np.random.uniform(-2, 2, (b * s, d)).astype(np.float16)
+        indexer_compress_cache_scale = torch.tensor(np.random.uniform(0, 0, (b * s, scale_factor))).to(torch.float32)
+        indexer_compress_cache_golden = hifp8_block_quant(indexer_compress_cache_np.copy().astype(np.int8),
+                                                          x_np.copy(), slot_mapping.copy().astype(np.int32), scale_val)
+
+        x_npu = torch.tensor(x_np).to(torch.float16).to("npu:%s" % DEVICE_ID)
+        slot_mapping_npu = torch.tensor(slot_mapping).to(torch.int32).to("npu:%s" % DEVICE_ID)
+        indexer_compress_cache_npu = torch.tensor(indexer_compress_cache_np).to("npu:%s" % DEVICE_ID)
+        indexer_compress_cache_npu = torch_npu.npu_dtype_cast(indexer_compress_cache_npu, torch_npu.hifloat8)
+        indexer_compress_cache_scale_npu = indexer_compress_cache_scale.to("npu:%s" % DEVICE_ID)
+
+        torch.ops.custom.indexer_compress_epilog(indexer_compress_cache_npu, indexer_compress_cache_scale_npu,
+            x_npu, slot_mapping_npu, quant_mode=quant_mode, round_scale=round_scale, scale=scale_val)
+
+        npu_mode = Network().to("npu:%s" % DEVICE_ID)
+        from torchair.configs.compiler_config import CompilerConfig
+        config = CompilerConfig()
+        config.mode = "reduce-overhead"
+        npu_backend = torchair.get_npu_backend(compiler_config=config)
+        npu_mode = torch.compile(npu_mode, fullgraph=True, backend=npu_backend, dynamic=False)
+        npu_mode(indexer_compress_cache_npu, indexer_compress_cache_scale_npu, x_npu, slot_mapping_npu, quant_mode,
+                 round_scale, scale_val)
+
+        indexer_compress_cache_cpu = indexer_compress_cache_npu.cpu()
+        dst_type_str = DATA_TYPE_INT_TO_STR[dst_type]
+        cache_close = requantize_compare(torch.from_numpy(indexer_compress_cache_golden.view(np.int8)),
+                                         indexer_compress_cache_cpu, dst_type_str)
+
+        self.assertTrue(cache_close, f"indexer_compress_cache precision compare fail")
 
 if __name__ == "__main__":
     run_tests()

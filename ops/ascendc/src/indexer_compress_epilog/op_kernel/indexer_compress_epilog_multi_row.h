@@ -33,6 +33,8 @@ public:
     {
         pipe = pipePtr;
         tilingData = tilingDataPtr;
+        scalesAttr_ = tilingData->scalesAttr;
+        quantMode_ = tilingData->quantMode;
 
         xGm.SetGlobalBuffer((__gm__ T0*)x);
         slotMappingGm.SetGlobalBuffer((__gm__ int32_t*)slotMapping);
@@ -81,11 +83,15 @@ public:
             }
             xQue.template EnQue(xLocal);
             xLocal = xQue.template DeQue<T0>();
-
             indexerCompressCacheLocal = indexerCompressCacheQue.template AllocTensor<T1>();
             indexerCompressCacheScaleLocal = indexerCompressCacheScaleQue.AllocTensor<float>();
-            VFProcessDynamicBlockQuant(
-                indexerCompressCacheLocal, indexerCompressCacheScaleLocal, xLocal, maxValue, validIdx, tilingData->d);
+            if (quantMode_ == HIFLOAT_QUANT_MODE) {
+                VFProcessHifp8Quant(indexerCompressCacheLocal, indexerCompressCacheScaleLocal, xLocal,
+                                    maxValue, validIdx, tilingData->d, scalesAttr_);
+            } else {
+                VFProcessDynamicBlockQuant(indexerCompressCacheLocal, indexerCompressCacheScaleLocal, xLocal,
+                                           maxValue, validIdx, tilingData->d);
+            }
             xQue.template FreeTensor(xLocal);
             indexerCompressCacheQue.template EnQue(indexerCompressCacheLocal);
             indexerCompressCacheScaleQue.template EnQue(indexerCompressCacheScaleLocal);
@@ -139,9 +145,11 @@ private:
     LocalTensor<float> indexerCompressCacheScaleLocal;
     LocalTensor<int32_t> indexLocal;
     int64_t validIdx = 0;
+    int64_t quantMode_ = 0;
     float maxValue = 0.0f;
     float fp8Min = 0.0f;
     float fp8Max = 0.0f;
+    float scalesAttr_ = 1.0f;
 };
 
 } // namespace IndexerCompressEpilog

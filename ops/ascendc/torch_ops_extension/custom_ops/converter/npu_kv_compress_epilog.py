@@ -25,30 +25,29 @@ from torchair.ge import attr
 
 
 # 为自定义算子注册converter，用于torch.compile 场景成图
-
 # 注意： meta_outputs形参名为固定写法，若写错会影响ge节点的输出dtype与shape推导
-@register_fx_node_ge_converter(torch.ops.custom.indexer_compress_epilog.default)
-def convert_indexer_compress_epilog(
-    indexer_compress_cache: Tensor,
-    indexer_compress_cache_scale: Tensor,
-    x: Tensor,
-    slot_mapping: Tensor,
-    *,
-    quant_mode: int = 1,
-    round_scale: bool = True,
-    scale: float = 1.0,
-    meta_outputs: Any = None):
+@register_fx_node_ge_converter(torch.ops.custom.kv_compress_epilog.default)
+def convert_kv_compress_epilog(
+        kv_compress_cache: Tensor,
+        x: Tensor,
+        slot_mapping: Tensor,
+        *,
+        quant_group_size: int = 128,
+        quant_mode: int = 1,
+        round_scale: bool = True,
+        scale: float = 1.0,
+        meta_outputs: Any = None):
     return torchair.ge.custom_op(
-        "IndexerCompressEpilog",
-        inputs={"indexer_compress_cache": indexer_compress_cache,
-                "indexer_compress_cache_scale": indexer_compress_cache_scale,
+        "KvCompressEpilog",
+        inputs={"kv_compress_cache": kv_compress_cache,
                 "x": x,
                 "slot_mapping": slot_mapping,
                 },
         attrs={
-                "quant_mode": attr.Int(quant_mode),
-                "round_scale": attr.Bool(round_scale),
-                "scale": attr.Float(scale),
-            },
-        outputs=['indexer_compress_cache', 'indexer_comress_cache_scale']
+            "quant_group_size": attr.Int(quant_group_size),
+            "quant_mode": attr.Int(quant_mode),
+            "round_scale": attr.Bool(round_scale),
+            "scale": attr.Float(scale),
+        },
+        outputs=['kv_compress_cache']
     )

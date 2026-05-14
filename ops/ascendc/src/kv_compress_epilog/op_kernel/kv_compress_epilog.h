@@ -58,6 +58,7 @@ private:
     float maxValue = 0.0f;
     float fp8Min = 0.0f;
     float fp8Max = 0.0f;
+    float scalesAttr_ = 1.0f;
 
     // Tiling data
     const KvCompressEpilogTilingData* tilingData = nullptr;
@@ -73,6 +74,7 @@ __aicore__ inline void KvCompressEpilogRegBase<T0, U, T1>::Init(
     const KvCompressEpilogTilingData* tilingDataPtr)
 {
         tilingData = tilingDataPtr;
+        scalesAttr_ = tilingData->scalesAttr;
         
         int64_t xGmBaseOffset = GetBlockIdx() * tilingData->rowOfFormerBlock * tilingData->d;
 
@@ -125,6 +127,9 @@ template <typename T0, typename U, typename T1>
             if (tilingData->quantMode == QUANT_MDOE_GROUP_FP8) {
                 VFProcessDynamicBlockQuant(
                     kvCacheLocal, xLocal, maxValue, validIdx, tilingData->d, tilingData->concatCol, tilingData->padCol);
+            } else if (tilingData->quantMode == QUANT_MDOE_HIFLOAT) {
+                VFProcessHifp8Quant(
+                    kvCacheLocal, xLocal, validIdx, tilingData->d, scalesAttr_);
             } else {
               if (tilingData->roundScale == 1) {
                 VFProcessDynamicMxFP8Quant<T0, T1, true>(
@@ -139,12 +144,20 @@ template <typename T0, typename U, typename T1>
 
             kvCacheQue.template EnQue(kvCacheLocal);
             kvCacheLocal = kvCacheQue.template DeQue<T1>();
-
-            for (int32_t curValidIdx = 0; curValidIdx < validIdx; curValidIdx++) {
-                int32_t slot = indexLocal.GetValue(curValidIdx);
-                CopyOut(
-                    kvCacheLocal[curValidIdx * RoundUp<T1>(tilingData->kvCacheCol)],
-                    kvCacheGm[slot * tilingData->kvCacheCol], 1, tilingData->kvCacheCol);
+            if (tilingData->quantMode == QUANT_MDOE_HIFLOAT) {
+                for (int32_t curValidIdx = 0; curValidIdx < validIdx; curValidIdx++) {
+                    int32_t slot = indexLocal.GetValue(curValidIdx);
+                    CopyOut(
+                        kvCacheLocal[curValidIdx * RoundUp<T1>(tilingData->d)],
+                        kvCacheGm[slot * tilingData->d], 1, tilingData->d);
+                }
+            } else {
+                for (int32_t curValidIdx = 0; curValidIdx < validIdx; curValidIdx++) {
+                    int32_t slot = indexLocal.GetValue(curValidIdx);
+                    CopyOut(
+                        kvCacheLocal[curValidIdx * RoundUp<T1>(tilingData->kvCacheCol)],
+                        kvCacheGm[slot * tilingData->kvCacheCol], 1, tilingData->kvCacheCol);
+                }
             }
             kvCacheQue.template FreeTensor(kvCacheLocal);
         }

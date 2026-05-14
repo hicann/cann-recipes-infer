@@ -19,8 +19,8 @@ TORCH_LIBRARY(custom, m) {
     m.def("npu_swiglu_clip_quant(Tensor x, Tensor group_index, Tensor group_alpha, *, bool activate_left=False, int quant_mode=1, int clamp_mode=1) -> (Tensor, Tensor)");
     m.def("npu_swiglu_group_quant(Tensor x, *, Tensor? topk_weight=None, Tensor? group_index=None, ScalarType dst_type, int quant_mode=1, int group_size=128, bool round_scale=False, bool ue8m0_scale=False, bool output_origin=False, int group_list_type=0, float clamp_value=0.0) -> (Tensor, Tensor, Tensor)");
     m.def("npu_hc_post(Tensor x, Tensor residual, Tensor post, Tensor comb) -> Tensor");
-    m.def("indexer_compress_epilog(Tensor(a!) indexer_compress_cache, Tensor(b!) indexer_compress_scale, Tensor x, Tensor slot_mapping,  *, int quant_mode=1, bool round_scale=True) -> ()");
-
+    m.def("indexer_compress_epilog(Tensor(a!) indexer_compress_cache, Tensor(b!) indexer_compress_scale, Tensor x, "
+          "Tensor slot_mapping, *, int quant_mode=1, bool round_scale=True, float scale=1.0) -> ()");
     m.def("inplace_partial_rotary_mul(Tensor(a!) x, Tensor r1, Tensor r2, *, str rotary_mode, int[2] partial_slice) -> ()");
     
     m.def("npu_gather_selection_kv_cache(Tensor(a!) selection_k_rope, Tensor(b!) selection_kv_cache, Tensor(c!) "
@@ -62,7 +62,7 @@ TORCH_LIBRARY(custom, m) {
         "str layout_q='BSND', str layout_kv='PA_ND', bool has_ori_kv=True, bool has_cmp_kv=True, str device='npu:0') -> Tensor");
     
     m.def("kv_compress_epilog(Tensor(a!) kv_compress_cache, Tensor x, Tensor slot_mapping, "
-          " *, int quant_group_size=64, int quant_mode = 2, bool round_scale_flag=True) -> ()");
+          " *, int quant_group_size=64, int quant_mode = 2, bool round_scale_flag=True, float scale=1.0) -> ()");
 
     m.def("npu_sparse_attn_sharedkv(Tensor q, *, Tensor? ori_kv=None, Tensor? cmp_kv=None, Tensor? ori_sparse_indices=None, Tensor? cmp_sparse_indices=None, Tensor? ori_block_table=None, "
         "Tensor? cmp_block_table=None, Tensor? cu_seqlens_q=None, Tensor? cu_seqlens_ori_kv=None, Tensor? cu_seqlens_cmp_kv=None, Tensor? seqused_q=None, Tensor? seqused_kv=None, "

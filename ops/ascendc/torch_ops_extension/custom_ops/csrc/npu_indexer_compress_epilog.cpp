@@ -19,11 +19,13 @@ void indexer_compress_epilog_npu(
     at::Tensor& indexer_compress_cache, 
     at::Tensor& indexer_compress_cache_scale, 
     const at::Tensor& x, 
-    const at::Tensor& slot_mapping, 
+    const at::Tensor& slot_mapping,
     int64_t quant_mode=1, 
-    bool round_scale=true)
+    bool round_scale = true,
+    double scale = 1.0)
 {
-    EXEC_NPU_CMD_V1(aclnnIndexerCompressEpilog, indexer_compress_cache, indexer_compress_cache_scale, x, slot_mapping, quant_mode, round_scale);
+    EXEC_NPU_CMD_V1(aclnnIndexerCompressEpilog, indexer_compress_cache, indexer_compress_cache_scale,
+                    x, slot_mapping, quant_mode, round_scale, scale);
 }
 
 // step3, 为META设备实现前向接口
@@ -31,9 +33,10 @@ void indexer_compress_epilog_meta(
     at::Tensor& indexer_compress_cache, 
     at::Tensor& indexer_compress_cache_scale, 
     const at::Tensor& x, 
-    const at::Tensor& slot_mapping, 
+    const at::Tensor& slot_mapping,
     int64_t quant_mode=1, 
-    bool round_scale=true)
+    bool round_scale = true,
+    double scale = 1.0)
 {
     return;
 }

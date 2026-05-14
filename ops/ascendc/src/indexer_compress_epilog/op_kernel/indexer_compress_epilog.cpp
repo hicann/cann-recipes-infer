@@ -28,9 +28,9 @@ using namespace AscendC;
 extern "C" __global__ __aicore__ void indexer_compress_epilog(
     GM_ADDR indexer_compress_cache, 
     GM_ADDR indexer_compress_cache_scale,
-    GM_ADDR x, 
-    GM_ADDR slot_mapping, 
-    GM_ADDR indexer_compress_cache_out, 
+    GM_ADDR x,
+    GM_ADDR slot_mapping,
+    GM_ADDR indexer_compress_cache_out,
     GM_ADDR indexer_compress_cache_scale_out, 
     GM_ADDR workspace, 
     GM_ADDR tiling)

@@ -45,8 +45,9 @@ void validate_kv_compress_epilog_inputs(
     TORCH_CHECK(slot_mapping.dtype() == at::kInt || slot_mapping.dtype() == at::kLong,
         "slot_mapping must be INT32 or INT64, but got ", slot_mapping.dtype());
     TORCH_CHECK(kv_compress_cache.dtype() == at::ScalarType::Float8_e5m2 ||
-                kv_compress_cache.dtype() == at::ScalarType::Float8_e4m3fn,
-        "kv_compress_cache must be FP8_E5M2 or FP8_E4M3, but got ", kv_compress_cache.dtype());
+                kv_compress_cache.dtype() == at::ScalarType::Float8_e4m3fn ||
+                kv_compress_cache.dtype() == at::ScalarType::Byte,
+        "kv_compress_cache must be FP8_E5M2 、FP8_E4M3 or HIFLOAT8, but got ", kv_compress_cache.dtype());
 }
 
 // step1, 为NPU设备实现前向接口 (In-place版本)
@@ -56,7 +57,8 @@ void kv_compress_epilog_npu(
     const at::Tensor& slot_mapping,
     int64_t quant_group_size, 
     int64_t quant_mode, 
-    bool round_scale_flag)
+    bool round_scale_flag,
+    double scale = 1.0)
 {
     validate_kv_compress_epilog_inputs(x, slot_mapping, kv_compress_cache);
 
@@ -67,8 +69,7 @@ void kv_compress_epilog_npu(
 
     // 调用NPU算子
     EXEC_NPU_CMD_V1(aclnnKvCompressEpilog,
-                    kv_compress_cache, x, slot_mapping, quant_group_size, quant_mode, round_scale);
-
+                    kv_compress_cache, x, slot_mapping, quant_group_size, quant_mode, round_scale, scale);
 }
 
 // step2, 为META设备实现前向接口 (In-place版本)
@@ -78,7 +79,8 @@ void kv_compress_epilog_meta(
     const at::Tensor& slot_mapping,
     int64_t quant_group_size, 
     int64_t quant_mode, 
-    bool round_scale_flag)
+    bool round_scale_flag,
+    double scale = 1.0)
 {
     validate_kv_compress_epilog_inputs(x, slot_mapping, kv_compress_cache);
 

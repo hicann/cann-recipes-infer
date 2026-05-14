@@ -33,6 +33,8 @@ public:
     {
         pipe = pipePtr;
         tilingData = tilingDataPtr;
+        scalesAttr_ = tilingData->scalesAttr;
+        quantMode_ = tilingData->quantMode;
 
         xGm.SetGlobalBuffer((__gm__ T0*)x);
         slotMappingGm.SetGlobalBuffer((__gm__ int32_t*)slotMapping);
@@ -71,10 +73,13 @@ public:
 
             indexerCompressCacheLocal = indexerCompressCacheQue.template AllocTensor<T1>();
             indexerCompressCacheScaleLocal = indexerCompressCacheScaleQue.AllocTensor<float>();
-
-            VFProcessDynamicBlockQuant(
-                indexerCompressCacheLocal, indexerCompressCacheScaleLocal, xLocal, maxValue, 1, tilingData->d);
-                
+            if (quantMode_ == HIFLOAT_QUANT_MODE) {
+                VFProcessHifp8Quant(indexerCompressCacheLocal, indexerCompressCacheScaleLocal,
+                                    xLocal, maxValue, 1, tilingData->d, scalesAttr_);
+            } else {
+                VFProcessDynamicBlockQuant(
+                    indexerCompressCacheLocal, indexerCompressCacheScaleLocal, xLocal, maxValue, 1, tilingData->d);
+            }
             xQue.template FreeTensor(xLocal);
             indexerCompressCacheQue.template EnQue(indexerCompressCacheLocal);
             indexerCompressCacheScaleQue.template EnQue(indexerCompressCacheScaleLocal);
@@ -99,6 +104,8 @@ public:
             maxValue = static_cast<float>(1.0) / FP8_E5M2_MAX_VALUE;
         } else if constexpr (IsSameType<T1, fp8_e4m3fn_t>::value) {
             maxValue = static_cast<float>(1.0) / FP8_E4M3FN_MAX_VALUE;
+        } else if constexpr (IsSameType<T1, fp8_e4m3fn_t>::value) {
+            maxValue = static_cast<float>(1.0) / HIFLOAT8_MAX_VALUE;
         }
     }
 
@@ -118,7 +125,9 @@ private:
     LocalTensor<T0> xLocal;
     LocalTensor<T1> indexerCompressCacheLocal;
     LocalTensor<float> indexerCompressCacheScaleLocal;
+    int64_t quantMode_ = 0;
     float maxValue = 0.0f;
+    float scalesAttr_ = 1.0f;
 };
 
 } // namespace IndexerCompressEpilog

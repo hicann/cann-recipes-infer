@@ -37,9 +37,11 @@ constexpr int64_t KV_COMPRESS_CACHE_OUTPUT_INDEX = 0;
 constexpr int64_t QUANT_GROUP_SIZE_ATTR_INDEX = 0;
 constexpr int64_t QUANT_MODE_ATTR_INDEX = 1;
 constexpr int64_t ROUND_SCALE_ATTR_INDEX = 2;
+constexpr int64_t SCALE_ATTR_INDEX = 3;
 
 constexpr int64_t QUANT_MDOE_GROUP_FP8 = 1;
 constexpr int64_t QUANT_MDOE_GROUP_MXFP8 = 2;
+constexpr int64_t QUANT_MDOE_HIFLOAT = 3;
 
 constexpr int64_t DEFAULT_QUANT_GROUP_SIZE = 128;
 constexpr int64_t DEFAULT_WORKSPACE_SIZE = 32;
@@ -70,6 +72,7 @@ TILING_DATA_FIELD_DEF(int64_t, rowLoopOfTailBlock);
 TILING_DATA_FIELD_DEF(int64_t, rowFactor);
 TILING_DATA_FIELD_DEF(int64_t, tailRowFactorOfFormerBlock);
 TILING_DATA_FIELD_DEF(int64_t, tailRowFactorOfTailBlock);
+TILING_DATA_FIELD_DEF(float, scalesAttr);
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(KvCompressEpilog, KvCompressEpilogTilingData)
@@ -139,6 +142,7 @@ private:
     int64_t quantGroupSize_ = DEFAULT_QUANT_GROUP_SIZE;
     int64_t quantMode_ = 1;
     int64_t roundScale_ = 1;
+    float scalesAttr_ = 0;
 
     // Data types
     ge::DataType xDtype_ = ge::DT_BF16;

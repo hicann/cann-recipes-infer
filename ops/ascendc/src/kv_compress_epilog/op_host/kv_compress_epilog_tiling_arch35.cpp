@@ -115,6 +115,9 @@ ge::graphStatus KvCompressEpilogTiling::GetAttributes()
         roundScale_ = *attrRoundScale;
     }
 
+    auto scaleAttr = attrs->GetAttrPointer<float>(SCALE_ATTR_INDEX);
+    scalesAttr_ = scaleAttr == nullptr ? 1.0f : *scaleAttr;
+
     OPS_LOG_I(context_->GetNodeName(), "quant_group_size: %ld quantMode_: %ld roundScale_: %ld", quantGroupSize_, quantMode_, roundScale_);
 
     return ge::GRAPH_SUCCESS;
@@ -170,7 +173,9 @@ ge::graphStatus KvCompressEpilogTiling::ValidateDtypes()
               return ge::GRAPH_FAILED);
 
     ge::DataType outputDtype = kvCacheOutputDesc->GetDataType();
-    OPS_ERR_IF((outputDtype != ge::DT_FLOAT8_E5M2 && outputDtype != ge::DT_FLOAT8_E4M3FN),
+    OPS_ERR_IF((outputDtype != ge::DT_FLOAT8_E5M2 &&
+                outputDtype != ge::DT_FLOAT8_E4M3FN &&
+                outputDtype != ge::DT_UINT8),
               OPS_LOG_E(context_, "kv_compress_cache dtype only support FLOAT8_E5M2/FLOAT8_E4M3FN, got %d",
                        static_cast<int>(kvCacheDtype_)),
               return ge::GRAPH_FAILED);
@@ -242,6 +247,7 @@ ge::graphStatus KvCompressEpilogTiling::DoOpTiling()
     tilingData_.set_rowFactor(rowFactor_);
     tilingData_.set_tailRowFactorOfFormerBlock(tailRowFactorOfFormerBlock_);
     tilingData_.set_tailRowFactorOfTailBlock(tailRowFactorOfTailBlock_);
+    tilingData_.set_scalesAttr(scalesAttr_);
 
     return ge::GRAPH_SUCCESS;
 }
