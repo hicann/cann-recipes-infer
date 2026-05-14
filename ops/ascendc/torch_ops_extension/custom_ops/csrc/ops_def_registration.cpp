@@ -54,7 +54,8 @@ TORCH_LIBRARY(custom, m) {
     m.def("npu_quant_lightning_indexer(Tensor query, Tensor key, Tensor weights, Tensor query_dequant_scale, Tensor key_dequant_scale,"
         "int query_quant_mode, int key_quant_mode, *, Tensor? actual_seq_lengths_query=None, Tensor? actual_seq_lengths_key=None, "
         "Tensor? block_table=None, Tensor? metadata=None, str layout_query='BSND', str layout_key='PA_BSND', int sparse_count=2048, int sparse_mode=3, "
-        "int pre_tokens=9223372036854775807, int next_tokens=9223372036854775807, int cmp_ratio=1, bool return_value=False) -> (Tensor, Tensor)");
+        "int pre_tokens=9223372036854775807, int next_tokens=9223372036854775807, int cmp_ratio=1, "
+        "bool return_value=False, int? query_dtype=None, int? key_dtype=None) -> (Tensor, Tensor)");
 
     m.def("npu_sparse_attn_sharedkv_metadata(int num_heads_q, int num_heads_kv, int head_dim,"
         " *, Tensor? cu_seqlens_q=None, Tensor? cu_seqlens_ori_kv=None, Tensor? cu_seqlens_cmp_kv=None, Tensor? seqused_q=None, Tensor? seqused_kv=None, "

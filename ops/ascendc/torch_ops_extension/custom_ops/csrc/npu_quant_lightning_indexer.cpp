@@ -15,12 +15,18 @@
 namespace custom {
 using namespace at_npu::native;
 
+inline TensorWrapper make_wrapper(const at::Tensor& tensor, aclDataType tensor_acltype)
+{
+    return {tensor, tensor_acltype};
+}
+
 // npu tensor max size
 const int SIZE = 8;
 const int DIM_0 = 0;
 const int DIM_1 = 1;
 const int DIM_2 = 2;
 const int DIM_3 = 3;
+const int G_TO_AClOFFSET = 256;
 
 // 工具函数，推导输出shape
 std::tuple<at::Tensor, at::Tensor> construct_quant_lightning_indexer_output_tensor(const at::Tensor& query, const at::Tensor& key,
@@ -86,10 +92,22 @@ std::tuple<at::Tensor, at::Tensor> npu_quant_lightning_indexer_npu(
     const c10::optional<at::Tensor> &block_table,
     const c10::optional<at::Tensor> &metadata,
     c10::string_view layout_query, c10::string_view layout_key, int64_t sparse_count,
-    int64_t sparse_mode, int64_t pre_tokens, int64_t next_tokens, int64_t cmp_ratio, bool return_value)
+    int64_t sparse_mode, int64_t pre_tokens, int64_t next_tokens, int64_t cmp_ratio, bool return_value,
+    c10::optional<int64_t> query_dtype, c10::optional<int64_t> key_dtype)
 {
     std::string query_layout_str = std::string(layout_query);
     std::string key_layout_str = std::string(layout_key);
+
+    bool check_qdtype = query_dtype.has_value() &&
+                        static_cast<aclDataType>(static_cast<int32_t>(query_dtype.value()) - G_TO_AClOFFSET) !=
+                        aclDataType::ACL_HIFLOAT8;
+    TORCH_CHECK(!check_qdtype, "The query_dtype is only used to support hifloat8, "
+                "and should be default when the dtype of query tensor is not hifloat8.")
+    bool check_kdtype = key_dtype.has_value() &&
+                        static_cast<aclDataType>(static_cast<int32_t>(query_dtype.value()) - G_TO_AClOFFSET) !=
+                        aclDataType::ACL_HIFLOAT8;
+    TORCH_CHECK(!check_kdtype, "The key_dtype is only used to support hifloat8, "
+                "and should be default when the dtype of key tensor is not hifloat8.")
 
     // construct the output tensor
     std::tuple<at::Tensor, at::Tensor>  quant_lightning_indexer_output = construct_quant_lightning_indexer_output_tensor(
@@ -109,11 +127,25 @@ std::tuple<at::Tensor, at::Tensor> npu_quant_lightning_indexer_npu(
         auto contiguous_axes_result_keyScale = is_contiguous_axes_qli(key_dequant_scale);
         TORCH_CHECK(contiguous_axes_result_keyScale[1] && contiguous_axes_result_keyScale[2], "key_dequant_scale must be contiguous on all axes except axis 0");
     }
-
-    EXEC_NPU_CMD_V1(aclnnQuantLightningIndexer, query,
-        key, weights, query_dequant_scale, key_dequant_scale, actual_seq_lengths_query, actual_seq_lengths_key,
-        block_table, metadata, query_quant_mode, key_quant_mode, query_layout_ptr, key_layout_ptr, sparse_count, sparse_mode,
-        pre_tokens, next_tokens, cmp_ratio, return_value, key_stride0, key_dequant_scale_stride0, sparse_indices_out, sparse_values_out);
+    bool is_hifloat8_qk = query_dtype.has_value() &&
+                          static_cast<aclDataType>(static_cast<int32_t>(query_dtype.value()) - G_TO_AClOFFSET) ==
+                          aclDataType::ACL_HIFLOAT8;
+    if (is_hifloat8_qk) {
+        TensorWrapper query_wrapper = make_wrapper(query, ACL_HIFLOAT8);
+        TensorWrapper key_wrapper = make_wrapper(key, ACL_HIFLOAT8);
+        EXEC_NPU_CMD_V1(aclnnQuantLightningIndexer, query_wrapper,
+            key_wrapper, weights, query_dequant_scale, key_dequant_scale, actual_seq_lengths_query,
+            actual_seq_lengths_key, block_table, metadata, query_quant_mode, key_quant_mode,
+            query_layout_ptr, key_layout_ptr, sparse_count, sparse_mode, pre_tokens, next_tokens,
+            cmp_ratio, return_value, key_stride0, key_dequant_scale_stride0,
+            sparse_indices_out, sparse_values_out);
+    } else {
+        EXEC_NPU_CMD_V1(aclnnQuantLightningIndexer, query,
+            key, weights, query_dequant_scale, key_dequant_scale, actual_seq_lengths_query, actual_seq_lengths_key,
+            block_table, metadata, query_quant_mode, key_quant_mode, query_layout_ptr, key_layout_ptr, sparse_count,
+            sparse_mode, pre_tokens, next_tokens, cmp_ratio, return_value, key_stride0, key_dequant_scale_stride0,
+            sparse_indices_out, sparse_values_out);
+    }
 
     return std::tuple<at::Tensor, at::Tensor>(sparse_indices_out, sparse_values_out);
 }
@@ -128,7 +160,8 @@ std::tuple<at::Tensor, at::Tensor> npu_quant_lightning_indexer_meta(
     const c10::optional<at::Tensor> &block_table,
     const c10::optional<at::Tensor> &metadata,
     c10::string_view layout_query, c10::string_view layout_key, int64_t sparse_count,
-    int64_t sparse_mode, int64_t pre_tokens, int64_t next_tokens, int64_t cmp_ratio, bool return_value)
+    int64_t sparse_mode, int64_t pre_tokens, int64_t next_tokens, int64_t cmp_ratio, bool return_value,
+    c10::optional<int64_t> query_dtype, c10::optional<int64_t> key_dtype)
 {
     std::string query_layout_str = std::string(layout_query);
     std::string key_layout_str = std::string(layout_key);
