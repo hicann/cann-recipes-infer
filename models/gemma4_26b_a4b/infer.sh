@@ -13,7 +13,6 @@
 #   bash infer.sh                                                  # offline + 默认 yaml (8卡 ge_graph + 8ep)
 #   bash infer.sh offline gemma4_rank_8_8ep_decode.yaml            # 8卡 eager + 8ep
 #   bash infer.sh offline gemma4_rank_8_8ep_npugraph_decode.yaml   # 8卡 npugraph + 8ep
-#   bash infer.sh offline gemma4_rank_1_eager.yaml                 # 单卡 eager 基线
 SCRIPT_PATH=$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
 SET_ENV_ABS_PATH=$(realpath "${SCRIPT_PATH}/../../executor/scripts/set_env.sh")
 FUNCTION_ABS_PATH=$(realpath "${SCRIPT_PATH}/../../executor/scripts/function.sh")

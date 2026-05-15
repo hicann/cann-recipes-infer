@@ -1,9 +1,28 @@
 # LongCat-Flash-Lite模型在NPU上推理
 
-> **注**: 本模型初版适配优化由 NPU 推理优化 Agent Skills 自动完成。
-
 ## 概述
 LongCat-Flash-Lite是基于MLA + Sparse MoE + N-gram Embedding架构的稀疏专家混合大语言模型。本样例基于LongCat-Flash-Lite开源代码进行迁移，并完成对应的NPU优化适配，包括 Paged Attention 缓存管理、融合算子替换、GE 图模式加速、专家并行（EP）路径与多 batch 支持。
+
+## Agent 工作流
+
+本样例由 NPU 推理优化 Agent Skills（`model-infer-optimize` 整体工作流）自动完成迁移与优化，覆盖并行切分、KVCache 与 Attention、算子融合、图模式适配等全流程。完整技术决策与各阶段实测数据归档在 [agentic/](agentic/) 目录：
+
+- [agentic/optimization_report_tp.md](agentic/optimization_report_tp.md) — TP 路径终态技术报告
+- [agentic/optimization_report_ep.md](agentic/optimization_report_ep.md) — EP 路径终态技术报告
+- [agentic/progress_tp.md](agentic/progress_tp.md) / [agentic/progress_ep.md](agentic/progress_ep.md) — 各阶段过程归档
+
+### 运行前置项
+
+运行任一 yaml 前需按所选配置准备以下内容：
+
+| 项 | 位置 | 说明 |
+|----|------|------|
+| 权重 | HuggingFace `meituan-longcat/LongCat-Flash-Lite` | 下载到本地路径 |
+| 权重路径 | yaml 内 `model_config.model_path` | 改为本地权重路径 |
+| CANN 路径 | `executor/scripts/set_env.sh` 的 `cann_path` | 改为本机 CANN 安装路径 |
+| 多机 IP | `executor/scripts/set_env.sh` 的 `IPs` | 多节点时按顺序填，单节点可忽略 |
+| 可见卡 | 环境变量 `ASCEND_RT_VISIBLE_DEVICES` | 指定与 yaml `parallel_config.world_size` 等量的卡 |
+| Python 依赖 | `requirements.txt` | `pip3 install -r requirements.txt` |
 
 ## 支持的产品型号
 <term>Atlas A2 系列产品</term>
@@ -40,40 +59,51 @@ LongCat-Flash-Lite是基于MLA + Sparse MoE + N-gram Embedding架构的稀疏专
 
 ## 权重准备
 
-请自行下载LongCat-Flash-Lite原始权重到本地路径，例如`/path/to/LongCat-Flash-Lite`。
+请从 HuggingFace 下载 LongCat-Flash-Lite 原始权重到本地路径，例如 `/data/models/LongCat-Flash-Lite`：
+
+- [meituan-longcat/LongCat-Flash-Lite](https://huggingface.co/meituan-longcat/LongCat-Flash-Lite)
+
+下载方式（任选其一）：
+
+```bash
+# 通过 huggingface-cli
+pip install -U huggingface_hub
+huggingface-cli download meituan-longcat/LongCat-Flash-Lite --local-dir /data/models/LongCat-Flash-Lite
+
+# 或通过 git lfs（需先 git lfs install）
+git clone https://huggingface.co/meituan-longcat/LongCat-Flash-Lite /data/models/LongCat-Flash-Lite
+```
 
 ## 数据集
 
 样例默认使用仓内自带的 `dataset/default_prompt.json`（~256 token 的关于 attention 的短句），无需额外下载，适用于短输入场景（input_len≤1024）的 1k yaml。
 
-长输入场景（如 `longcat_flash_lite_8tp_4k1k.yaml` 的 4K input）请将 `dataset/default_prompt.json` 的内容替换为约 4K token 的长 prompt 后再运行。也可将 yaml 的 `data_config.dataset` 改为 `"LongBench"` 或 `"InfiniteBench"` 使用公开 benchmark（需自行下载到本地或通过 HF 拉取）。
+长输入场景（如 `longcat_flash_lite_rank_8_8tp_4k1k.yaml` 的 4K input）请将 `dataset/default_prompt.json` 的内容替换为约 4K token 的长 prompt 后再运行。也可将 yaml 的 `data_config.dataset` 改为 `"LongBench"` 或 `"InfiniteBench"` 使用公开 benchmark（需自行下载到本地或通过 HF 拉取）。
 
 ## 推理执行
 
 1. 修改YAML文件中`model_path`参数。
 
    在`models/longcat_flash_lite/config`目录下已提供YAML配置供参考：
-   - `longcat_flash_lite_8tp.yaml`：8 卡 TP 推理（ge_graph 模式，BS=1 低延迟）
-   - `longcat_flash_lite_8tp_4k1k.yaml`：8 卡 TP，4K 输入 / 1K 输出
-   - `longcat_flash_lite_ep8.yaml`：8 卡 EP 推理（ge_graph + MC2，BS=2 平衡）
-   - `longcat_flash_lite_ep8_b8.yaml`：8 卡 EP 推理（BS=8 高吞吐）
-   - `longcat_flash_lite_1card.yaml`：单卡 eager 基线
+   - `longcat_flash_lite_rank_8_8tp.yaml`：8 卡 TP 推理（ge_graph 模式，BS=1 低延迟）
+   - `longcat_flash_lite_rank_8_8tp_4k1k.yaml`：8 卡 TP，4K 输入 / 1K 输出
+   - `longcat_flash_lite_rank_8_8ep.yaml`：8 卡 EP 推理（ge_graph + MC2，BS=2 平衡）
+   - `longcat_flash_lite_rank_8_8ep_b8.yaml`：8 卡 EP 推理（BS=8 高吞吐）
 
    将`model_path`设置为权重文件存储路径。
 
 2. 执行推理（`infer.sh` 接受 `$1=mode`、`$2=yaml`，与仓库其他模型一致）。
     ```bash
     cd models/longcat_flash_lite
-    bash infer.sh                                              # 默认 8卡TP (longcat_flash_lite_8tp.yaml)
-    bash infer.sh offline longcat_flash_lite_8tp_4k1k.yaml     # 8卡TP, 4K input + 1K output
-    bash infer.sh offline longcat_flash_lite_ep8.yaml          # 8卡EP, BS=2
-    bash infer.sh offline longcat_flash_lite_ep8_b8.yaml       # 8卡EP, BS=8 高吞吐
-    bash infer.sh offline longcat_flash_lite_1card.yaml        # 单卡基线
+    bash infer.sh                                              # 默认 8卡TP (longcat_flash_lite_rank_8_8tp.yaml)
+    bash infer.sh offline longcat_flash_lite_rank_8_8tp_4k1k.yaml     # 8卡TP, 4K input + 1K output
+    bash infer.sh offline longcat_flash_lite_rank_8_8ep.yaml          # 8卡EP, BS=2
+    bash infer.sh offline longcat_flash_lite_rank_8_8ep_b8.yaml       # 8卡EP, BS=8 高吞吐
     ```
 
 ## 优化点参考
 
-详见 [optimization_report.md](optimization_report.md)，主要优化包括：
+TP 与 EP 路径分别成稿，详见 [optimization_report_tp.md](agentic/optimization_report_tp.md) / [optimization_report_ep.md](agentic/optimization_report_ep.md)，主要优化包括：
 1. Paged Attention 内存管理：block-paged KV cache（block_size=128）；cache 内容形态由 MLA 架构决定（每 token 仅存 `kv_lora_rank + qk_rope_head_dim = 576` 维 latent KV，而非 vanilla MHA 的 ~12288 维）
 2. MLA absorb decode 路径：将 `q_b_proj` 投影吸收到 K 方向，避免 decode 时显式还原大维度 K
 3. 融合算子全量替换：`rms_norm` / `add_rms_norm` / `moe_gating_top_k` / `init_routing_v2` / `grouped_matmul + swiglu`
@@ -90,7 +120,7 @@ A3 8卡实测最佳性能（input_len=1024）：
 | TP8（低延迟） | 1 | 50.68 ms | 5.94 ms | 167 tok/s |
 | EP8（高吞吐） | 8 | 129.38 ms | 9.54 ms | 838 tok/s |
 
-> 详细性能拆解（含逐阶段贡献、A2 / A3 跨硬件对比）参见 [optimization_report.md](optimization_report.md) 与 [baselines/baseline_tp8.md](baselines/baseline_tp8.md)。
+> 详细性能拆解（含逐阶段贡献、A2 / A3 跨硬件对比）参见 [optimization_report_tp.md](agentic/optimization_report_tp.md)（TP 路径）与 [optimization_report_ep.md](agentic/optimization_report_ep.md)（EP 路径）。
 
 ## 模型结构
 
@@ -106,12 +136,3 @@ A3 8卡实测最佳性能（input_len=1024）：
 | vocab_size | 131072 |
 | dtype | bfloat16 |
 
-## 并行配置
-
-| 参数 | 值 |
-|------|-----|
-| world_size | 8 |
-| attn_tp_size | 8 |
-| moe_tp_size | 8 |
-| embed_tp_size | 8 |
-| lmhead_tp_size | 8 |

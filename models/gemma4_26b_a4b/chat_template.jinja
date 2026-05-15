@@ -1,0 +1,1 @@
+{{ bos_token }}{% for message in messages %}<|turn><|channel>{{ message['role'] }}<channel|>{{ message['content'] }}<turn|>{% endfor %}{% if add_generation_prompt %}<|turn><|channel>model<channel|>{% endif %}

@@ -10,9 +10,10 @@
 #!/bin/bash
 # LongCat-Flash-Lite TP8 推理入口
 # 用法（与仓库其他模型保持一致：$1=mode, $2=yaml）:
-#   bash infer.sh                                                # offline + 默认 yaml (longcat_flash_lite_8tp.yaml)
-#   bash infer.sh offline longcat_flash_lite_8tp_4k1k.yaml       # offline + 指定 yaml (4K input, 1K output)
-#   bash infer.sh offline longcat_flash_lite_1card.yaml          # offline + 单卡基线
+#   bash infer.sh                                                          # offline + 默认 yaml (rank_8_8tp)
+#   bash infer.sh offline longcat_flash_lite_rank_8_8tp_4k1k.yaml          # 8 卡 TP，4K input + 1K output
+#   bash infer.sh offline longcat_flash_lite_rank_8_8ep.yaml               # 8 卡 EP，BS=2
+#   bash infer.sh offline longcat_flash_lite_rank_8_8ep_b8.yaml            # 8 卡 EP，BS=8 高吞吐
 SCRIPT_PATH=$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
 SET_ENV_ABS_PATH=$(realpath "${SCRIPT_PATH}/../../executor/scripts/set_env.sh")
 FUNCTION_ABS_PATH=$(realpath "${SCRIPT_PATH}/../../executor/scripts/function.sh")
@@ -29,7 +30,7 @@ if [ "$mode" = "online" ]; then
     echo "[ERROR] longcat-flash-lite does not currently support online inference."
     exit 1
 else
-    export YAML_FILE_NAME="${2:-longcat_flash_lite_8tp.yaml}"
+    export YAML_FILE_NAME="${2:-longcat_flash_lite_rank_8_8tp.yaml}"
     export YAML="${YAML_PARENT_PATH}/${YAML_FILE_NAME}"
     if [[ ! -f "${YAML}" ]]; then
         echo "[ERROR] YAML not found: ${YAML}"

@@ -134,3 +134,8 @@ class Gemma4TextConfig(PretrainedConfig):
             tie_word_embeddings=tie_word_embeddings,
             **kwargs,
         )
+
+    @property
+    def num_experts_per_tok(self):
+        """HF-standard alias for top_k_experts; required by executor MoE EP utilities."""
+        return self.top_k_experts

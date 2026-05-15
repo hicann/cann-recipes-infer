@@ -1,7 +1,7 @@
 <!-- 本文件禁止全文加载（Read）。需要历史信息时请用 Grep 按关键字查找。 -->
 # 进度历史归档
 
-> **最终验证数据（benchmark_8tp.sh 3 轮实测）**
+> **最终验证数据（`infer.sh offline longcat_flash_lite_rank_8_8tp.yaml` 3 轮实测）**
 > | 阶段 | Prefill (ms) | Decode (ms) | 吞吐 (tok/s) | NPU 显存 (MB) | Decode 较基线 |
 > |------|-------------|------------|-------------|--------------|-------------|
 > | 基线 | 2580 | 273 | 3.66 | - | - |
@@ -12,15 +12,13 @@
 >
 > 以下归档记录为各阶段工作过程中的中间数据，最终性能以上表为准。
 >
-> **A3 (Atlas A3 / Ascend 910_93, 64GB HBM) 平台同代码实测对比** （2026-04-25）：
+> **Atlas A3 平台同代码实测对比**：
 > | 阶段 | Prefill (ms) | Decode (ms/tok) | 吞吐 (tok/s) | A3 vs A2 |
 > |------|-------------|----------------|-------------|---------|
 > | Phase 3 (Ngram 在 eager) | 57.12 | 12.01 | 83.9 | prefill −47%, decode −35% |
 > | Phase 3.5 (Ngram 进图) | ~62 | **5.86** | ~170 | prefill −42%, decode −18% |
 >
-> A3 数据来源：`baselines/baseline_longcat_flash_lite_w8_ge_graph_20260425_114125.json`（Phase 3 基线，commit 9ed6f41 之前）；`res/20260425/.../log_0.log`（Phase 3.5，commit 9ed6f41 之后）。
 > A3 端到端结论：**Ngram 进图收益在 A3 上仍然显著（decode -51%）**，绝对值从 12.01ms → 5.86ms。
-> A3 部署变更：`infer_8tp.sh` 添加 `ASCEND_RT_VISIBLE_DEVICES=8,9,10,11,12,13,14,15`；`executor/scripts/function.sh` 中 `MASTER_PORT` 由 6038 改为 26038（端口冲突规避）。两项均为环境适配，不影响模型代码。
 
 ## 常驻区快照（Phase 0）
 
@@ -30,7 +28,7 @@
 
 **MoE (Mixture of Experts) LLM** -- 基于 DeepSeek-V3 / MLA 架构的稀疏专家混合大语言模型，带 N-gram Embedding 增强。
 
-实际 config.json 关键参数（来自 `/data1/models/LongCat-Flash-Lite/config.json`）：
+实际 config.json 关键参数：
 - architecture: `LongcatFlashNgramForCausalLM`
 - hidden_size: 3072
 - num_layers: 14（每层包含 2 个 sub-layer，实际 attention 层数为 28）
@@ -136,16 +134,14 @@ KV Cache 存储为展开后的 (num_heads_per_rank, qk_head_dim) 和 (num_heads_
 
 | 项目 | 值 |
 |------|-----|
-| 硬件平台 | 8x Ascend 910B4 (32GB HBM each) |
-| CANN Toolkit | /usr/local/Ascend/ascend-toolkit/latest |
+| 硬件平台 | Atlas A2 / A3，8 卡 |
 | PyTorch | 2.8.0 |
 | torch_npu | 2.8.0.post2 |
-| transformers | 4.55.0 |
+| transformers | 5.0.0 |
 | 执行模式 | eager |
 | 量化模式 | BF16 (无量化) |
-| 模型路径 | /data1/models/LongCat-Flash-Lite |
 
-**YAML 配置 (longcat_flash_lite_8tp.yaml)**:
+**YAML 配置 (longcat_flash_lite_rank_8_8tp.yaml)**:
 - world_size: 8
 - attn_tp_size: 8, moe_tp_size: 8, embed_tp_size: 8, lmhead_tp_size: 8
 - batch_size: 1
@@ -156,7 +152,7 @@ KV Cache 存储为展开后的 (num_heads_per_rank, qk_head_dim) 和 (num_heads_
 
 ### 6. 性能与精度基线
 
-**基线来源**: baselines/baseline_tp8.md + 运行日志 res/20260328/
+**基线来源**: 历史归档基线文件 + 运行日志（详见 `res/` 目录最新日志）
 
 #### 6.1 性能基线
 
@@ -206,7 +202,7 @@ The **compatibility function**
 
 
 ---
-## 归档于 2026-03-28 18:31:17
+## 归档于 2026-03-28
 
 ## 阶段 1：KVCache + FA 分析
 
@@ -411,7 +407,7 @@ kv_b_proj_w_v = kv_b_proj_w[:, qk_nope_head_dim:, :]   # (N, 128, 512)
 4. **executor/core/model_worker/model_worker.py** — _init_kvcache 增加 PA cache 初始化分支
    - 检测 `init_pa_cache` 方法并调用
 
-5. **config/longcat_flash_lite_8tp.yaml** — 增加 pa_config 配置段
+5. **config/longcat_flash_lite_rank_8_8tp.yaml** — 增加 pa_config 配置段
 
 #### 关键改造点
 
@@ -495,7 +491,7 @@ The **compatibility function**
 
 
 ---
-## 归档于 2026-03-30 09:57:23
+## 归档于 2026-03-30（阶段 2）
 
 ## 阶段 2：融合算子分析
 
@@ -863,7 +859,7 @@ The **compatibility function**
 
 
 ---
-## 归档于 2026-03-30 19:34:14
+## 归档于 2026-03-30（阶段 3）
 
 ## 阶段 3：图模式适配分析
 
@@ -983,7 +979,7 @@ GE 图模式下 `dynamic=False`（框架默认），以下张量需要考虑 mar
 # 框架已封装在 executor/utils/graph_utils.py 的 compile_model_forward() 中
 # 只需修改 YAML 配置即可
 
-# longcat_flash_lite_8tp.yaml 修改：
+# longcat_flash_lite_rank_8_8tp.yaml 修改：
 # exe_mode: "ge_graph"  (从 "eager" 改为 "ge_graph")
 
 # 框架自动应用的配置：
@@ -1095,7 +1091,7 @@ logits = output_logits
 
 #### 5. YAML 配置更新
 
-`config/longcat_flash_lite_8tp.yaml` 中 `exe_mode` 从 `"eager"` 改为 `"ge_graph"`。
+`config/longcat_flash_lite_rank_8_8tp.yaml` 中 `exe_mode` 从 `"eager"` 改为 `"ge_graph"`。
 
 #### 6. _can_compile_fullgraph 标记
 
@@ -1107,7 +1103,7 @@ logits = output_logits
 |------|---------|
 | `models/modeling_longcat_flash_lite.py` | 新增 `compute_embedding()`、`decode()`、`_forward_lm_head()` 方法；lm_head all_gather 改为 all_gather_into_tensor；mark_static 调用；`_can_compile_fullgraph = True` |
 | `executor/core/model_worker/model_worker.py` | `compile_model()` 支持 decode 方法编译；`inference()` 支持 embedding+decode 分离调用；新增 `_use_decode_method` 标志 |
-| `config/longcat_flash_lite_8tp.yaml` | `exe_mode: "eager"` -> `"ge_graph"` |
+| `config/longcat_flash_lite_rank_8_8tp.yaml` | `exe_mode: "eager"` -> `"ge_graph"` |
 
 ### 待验证项
 
@@ -1126,9 +1122,9 @@ logits = output_logits
 验证过程中发现并修复了以下问题：
 
 #### 问题 1：support_models.py 导入路径未更新
-- **现象**：推理时加载的是 `models/longcat_flash_lite/` 下的原始模型代码，而非 `longcat_flash_lite_tp8_optimize/` 下的优化模型
-- **原因**：`executor/core/entrypoints/support_models.py` 中导入路径指向原始模型
-- **修复**：更新导入路径指向 `models.longcat_flash_lite_tp8_optimize.models`
+- **现象**：推理时加载的是原始模型代码，而非优化模型
+- **原因**：`executor/core/entrypoints/support_models.py` 中导入路径未指向优化模型实现
+- **修复**：更新导入路径到优化模型模块
 
 #### 问题 2：_init_absorb_weights 中 .view() 失败
 - **现象**：`RuntimeError: view size is not compatible with input tensor's size and stride`
@@ -1172,13 +1168,13 @@ logits = output_logits
 | 输出一致性（图模式 vs 基线） | **FAIL** | 图模式输出为乱码。但 eager 模式（同一优化代码）输出同样为乱码，说明精度问题来源于阶段 1/2 的模型优化（KVCache PA 重构 / FA 算子替换 / 融合算子替换），非阶段 3 图模式引入 |
 | 图模式 vs eager 模式一致性 | N/A | 两者输出均不正确，无法直接对比。但图编译成功且运行无报错，表明图模式适配本身是正确的 |
 
-原始模型（`longcat_flash_lite`）测试输出（正确）：
+原始模型测试输出（正确）：
 ```
 computed as a weighted sum of the values, where the weight assigned to each value is computed by a compatibility function of the query with the corresponding key. Can you explain this in simpler terms?
 Sure! Let's break it down in simpler terms: ...
 ```
 
-优化模型（`longcat_flash_lite_tp8_optimize`）eager 模式测试输出（错误）：
+优化模型 eager 模式测试输出（错误）：
 ```
 谱写by懂ing AN（ANS有的是棵ingans上ing[0ing[物的专[7ans Jad Ans.专[7ans上ing[0到 [7ans_l (.l..[Ans[0分 L (later/l:7 ${7uring于理论 ...
 ```
@@ -1205,7 +1201,7 @@ Sure! Let's break it down in simpler terms: ...
 
 | 文件 | 修改 | 原因 |
 |------|------|------|
-| `executor/core/entrypoints/support_models.py` | 导入路径从 `longcat_flash_lite` 改为 `longcat_flash_lite_tp8_optimize` | 否则加载的是未优化的原始模型 |
+| `executor/core/entrypoints/support_models.py` | 修正导入路径到优化模型模块 | 否则加载的是未优化的原始模型 |
 | `models/.../modeling_longcat_flash_lite.py` L240 | `self.kv_b_proj.weight.T` 后添加 `.contiguous()` | `.T` 产生非连续张量，`.view()` 失败 |
 | `models/.../modeling_longcat_flash_lite.py` L317,418 | `slot_mapping.view(-1).to(torch.int64)` | `npu_kv_rmsnorm_rope_cache` 要求 index 为 int64 |
 | `models/.../modeling_longcat_flash_lite.py` L604-612 | MoE 布尔掩码索引赋值改为乘法掩码 | GE graph 不支持 `tensor[bool_mask] = value` |
@@ -1461,7 +1457,7 @@ computed as a weighted sum of the values, where the weight assigned to each valu
 Sure! Let's break it down in simpler terms: ...
 ```
 
-与 eager 基线（20260328）完全匹配。
+与 eager 基线完全匹配。
 
 **性能数据：**
 - ge_graph decode 平均 ~19.7ms/token（修复前 17.88ms，差异在正常波动范围内）
@@ -1566,10 +1562,10 @@ prefix_max = torch.cat(parts, dim=-1)
 
 | 测试 | Prefill (ms) | Decode 平均 (ms) | 备注 |
 |------|--------------|----------------|------|
-| Step 1 baseline (NgramEmbedding eager) | 113.32 | 18.46 | 4-24 baseline_metadata_vectorized.json |
+| Step 1 baseline (NgramEmbedding eager) | 113.32 | 18.46 | 4-24 历史归档 vectorized 基线 |
 | Step 1 重测（同代码 4-25） | 115.14 | 19.74 | 验证可复现性，≈基线 |
 | **Step 1 + PROFILE 拆分** | - | compute_embedding=**11.20** + compiled_decode=**7.06** = 18.26 | inference 内插同步计时 |
-| Step 2 (NgramEmbedding 进图) - run 1 | 105.66 | 7.14 | baseline_metadata_in_graph.json |
+| Step 2 (NgramEmbedding 进图) - run 1 | 105.66 | 7.14 | 历史归档 in_graph 基线 |
 | Step 2 (NgramEmbedding 进图) - run 2 | 107.86 | 7.13 | 重测可复现 |
 
 PROFILE 数据正好解释了 11.3 ms 的减少幅度：原本 compute_embedding 在 eager 跑要 11.2 ms，进图后这部分被合并到一次 graph launch 中，host overhead ≈ 0。

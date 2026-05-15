@@ -18,8 +18,3 @@ scheduler_config:
   input_max_len: 1024
   max_new_tokens: 128
   batch_size: 1
-
-pa_config:
-  enable_pa: true
-  pa_block_size: 128
-  pa_max_length: 1152  # input_max_len + max_new_tokens, must be multiple of block_size
