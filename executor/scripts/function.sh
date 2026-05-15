@@ -19,7 +19,7 @@ function launch()
 
 function check_launch()
 {
-    if pgrep -f "python.*infer.py" > /dev/null; then
+    if pgrep -f "python.*[ /]infer\.py" > /dev/null; then
         echo "A Python process executing infer.py was detected to be running, and the script was interrupted and exited."
         exit 1
     else

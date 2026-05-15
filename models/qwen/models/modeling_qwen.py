@@ -464,7 +464,7 @@ class QwenModel(nn.Module):
         self.max_position_embeddings = config.max_position_embeddings
         self.rank_id = int(os.getenv("LOCAL_RANK", "0"))
         self.attn_tp_size = infer_config.parallel_config.attn_tp_size
-        self.padding_idx = config.pad_token_id
+        self.padding_idx = getattr(config, 'pad_token_id', None)
         self.vocab_size = config.vocab_size
         self.comm_manager = comm_manager
 
