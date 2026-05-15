@@ -40,7 +40,7 @@ def read_yaml(yaml_file_path):
             data = yaml.safe_load(file)
     except FileNotFoundError:
         logger.error(f"No such yaml file: {yaml_file_path}")
-    except yaml.YAMLERROR as e:
+    except yaml.YAMLError as e:
         logger.error(f"Load yaml file failed: {e}")
     return data
 
