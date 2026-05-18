@@ -17,6 +17,8 @@ Model Config
   perfect_eplb: False             # If enabled, will force uniform selection of MoE experts. Support [False, True]
   enable_online_split_weight: True  # Whether enable online-split weight. Support [False, True]
   next_n: 1                       # Steps using multi-token prediction. Support [0, 1, 2, 3]
+  enable_static_kernel: False     # Whether enable static kernel for npugraph_ex. Support [False, True]
+  enable_limit_core: False        # Whether enable limit core to improve performance for multi-stream. Support [False, True]
   platform_version: "A3"          # inference platform. Support ["A3", "950"]
   enable_pypto: False             # Whether enable pypto operators. Support ["True", "False"]
 
