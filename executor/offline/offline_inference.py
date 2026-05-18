@@ -24,7 +24,7 @@ from executor.core.config import InferenceConfig
 from executor.core.engine import ExecutionEngine
 from executor.core.scheduler import Scheduler
 from executor.core.types_ import GenerationOutput, Request
-from executor.core.support_models import model_dict
+from executor.core.support_models import load_model_classes
 from executor.utils.common_utils import process_infer_time
 
 logger = logging.getLogger(__name__)
@@ -73,18 +73,15 @@ class OfflineInference:
         """Load model based on configuration."""
         model_name = self.infer_config.model_config.model_name
 
-        if model_name in model_dict:
-            model_config_cls = model_dict[model_name]
-            if len(model_config_cls) == 2:
-                model_class, config_class = model_config_cls
-                model_mtp_class = None
-            else:
-                model_class, model_mtp_class, config_class = model_config_cls
-                model_mtp_class = None if self.engine.next_n == 0 else model_mtp_class
-            self.engine.init(config_class, model_class, model_mtp_class)
-            self.engine.warm_up()
+        model_config_cls = load_model_classes(model_name)
+        if len(model_config_cls) == 2:
+            model_class, config_class = model_config_cls
+            model_mtp_class = None
         else:
-            raise ValueError(f"Unsupported model: {model_name}")
+            model_class, model_mtp_class, config_class = model_config_cls
+            model_mtp_class = None if self.engine.next_n == 0 else model_mtp_class
+        self.engine.init(config_class, model_class, model_mtp_class)
+        self.engine.warm_up()
 
     def generate(
         self,

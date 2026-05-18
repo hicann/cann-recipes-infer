@@ -251,21 +251,23 @@ class DeepseekV3ModelMTP(DeepseekV3ForCausalLM):
 
 ### 3.2 步骤二：注册 MTP 模型
 
-将 MTP 模型类注册到框架的模型字典中。在 `executor/core/entrypoints/support_models.py` 中添加：
+将 MTP 模型类注册到框架的延迟解析表中。在 `executor/core/support_models.py` 的 `_specs` 表中添加一条目：
 
 ```python
-from models.deepseek_r1.models.modeling_deepseek import DeepseekV3ForCausalLM, DeepseekV3ModelMTP
-from models.deepseek_r1.models.configuration_deepseek import DeepseekV3Config
-
-model_dict = {
-    "deepseek_r1": (DeepseekV3ForCausalLM, DeepseekV3ModelMTP, DeepseekV3Config)
+# executor/core/support_models.py
+_specs = {
+    "deepseek_r1": [
+        ("models.deepseek_r1.models.modeling_deepseek",      "DeepseekV3ForCausalLM"),
+        ("models.deepseek_r1.models.modeling_deepseek",      "DeepseekV3ModelMTP"),
+        ("models.deepseek_r1.models.configuration_deepseek", "DeepseekV3Config"),
+    ],
 }
 ```
 
-**model_dict 结构说明：**
-- 第一个元素: 主模型类 (`DeepseekV3ForCausalLM`)
-- 第二个元素: MTP 模型类 (`DeepseekV3ModelMTP`)
-- 第三个元素: 配置类 (`DeepseekV3Config`)
+**spec 表结构说明：**
+- 第一项 `(module, attr)`：主模型类（必填）
+- 第二项 `(module, attr)`：MTP 模型类（可选；存在 MTP 时插在主模型和 Config 之间）
+- 末项 `(module, attr)`：配置类（必填）
 
 ### 3.3 步骤三：使能 MTP 的配置
 

@@ -13,14 +13,44 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import sys
+import types
 import unittest
+from unittest import mock
 from unittest.mock import Mock
 
 from executor.core.config import DisaggConfig
 from executor.online.kv_transfer import KVTransferManager
 
 
+def _fake_memfabric_module():
+    """Stub memfabric_hybrid so AscendTransferEngine.__init__ succeeds without
+    the native package installed. Mirrors test_transfer_engine_factory.py."""
+    fake = types.ModuleType("memfabric_hybrid")
+
+    class _FakeMFEngine:
+        @staticmethod
+        def get_rpc_port():
+            return 12345
+
+        @staticmethod
+        def initialize(*a, **kw):
+            return 0
+
+    fake.TransferEngine = _FakeMFEngine
+    return fake
+
+
 class TestKVManagerThreading(unittest.TestCase):
+    def setUp(self):
+        self._mf_patcher = mock.patch.dict(
+            sys.modules, {"memfabric_hybrid": _fake_memfabric_module()}
+        )
+        self._mf_patcher.start()
+
+    def tearDown(self):
+        self._mf_patcher.stop()
+
     def test_kv_manager_initializes_locks(self):
         kv_transfer_manager = KVTransferManager(
             disagg_config=DisaggConfig(

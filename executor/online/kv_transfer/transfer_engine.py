@@ -18,7 +18,10 @@
 - KVPoll: request-level transfer status
 - PrefillServerInfo / TargetRankMapping / PrefillRankInfo / KVArgsRegisterInfo: topology info
 - _KVTransferTask: payload submitted to KVTransferManager._transfer_executor
-- TransferEngine ABC + AscendTransferEngine (memfabric_hybrid wrapper)
+- TransferEngine ABC: abstract surface used by KVTransferManager
+- AscendTransferEngine: memfabric_hybrid impl (default backend)
+- MooncakeAscendTransferEngine: mooncake.engine.TransferEngine impl, protocol="ascend" (HIXL)
+- build_transfer_engine: factory dispatching on DisaggConfig.engine_backend
 - all_reduce_poll: TP/CP group poll consensus helper
 """
 
@@ -286,3 +289,138 @@ class AscendTransferEngine(TransferEngine):
         return self.engine.batch_transfer_sync(
             decode_session_id, list(src_addrs), list(dst_addrs), list(lengths)
         )
+
+
+class MooncakeAscendTransferEngine(TransferEngine):
+    """Mooncake AscendDirectTransport wrapper, protocol="ascend" + P2PHANDSHAKE.
+
+    Peer discovery via the Sock bootstrap in transfer_manager.py.
+    Requires Mooncake built with `cmake -DUSE_ASCEND_DIRECT=ON`; runtime deps
+    libcann_hixl.so + libllm_datadist.so (CANN-provided).
+    """
+
+    def __init__(
+        self,
+        hostname: str = "127.0.0.1",
+        disaggregation_mode: str = "PREFILL",
+        local_rank: int = 0,
+        device_name: str = "",
+    ):
+        # Mooncake reads the physical NPU id from the calling thread's Ascend
+        # context (torch_npu.set_device must run before this constructor).
+        self.hostname = hostname
+        self.disaggregation_mode = disaggregation_mode
+        self.local_rank = local_rank
+        self.device_name = device_name
+        # Lazy import: memfabric-only deployments don't need mooncake installed.
+        try:
+            from mooncake.engine import TransferEngine as _MooncakeTransferEngine
+        except ImportError as exc:
+            raise ImportError(
+                "mooncake is required for engine_backend='mooncake'. "
+                "Build it from source with `cmake -DUSE_ASCEND_DIRECT=ON && make install` "
+                "per https://kvcache-ai.github.io/Mooncake/getting_started/build.html"
+            ) from exc
+        self.engine = _MooncakeTransferEngine()
+        self._initialized = False
+        self._registered_ranges: list[tuple[int, int]] = []
+        self._rank_port: int = 0
+
+    @property
+    def rank_port(self) -> int:
+        return self._rank_port
+
+    def initialize(self) -> None:
+        """Initialize Mooncake with protocol="ascend" + P2PHANDSHAKE."""
+        if self._initialized:
+            return
+        # 4 strict positional args (pybind: no py::arg; kwargs rejected).
+        ret = self.engine.initialize(
+            self.hostname,
+            "P2PHANDSHAKE",
+            "ascend",
+            self.device_name,
+        )
+        if ret != 0:
+            raise RuntimeError(
+                f"Mooncake Ascend backend not available — was Mooncake built "
+                f"with -DUSE_ASCEND_DIRECT=ON? initialize returned {ret} "
+                f"(local_hostname={self.hostname})."
+            )
+        self._rank_port = int(self.engine.get_rpc_port())
+        # session_id "<ip>:<rpc_port>" is advertised to peers; conn.py reads it.
+        self.session_id = f"{self.hostname}:{self._rank_port}"
+        self._initialized = True
+        logger.info(
+            "MooncakeAscendTransferEngine initialized: hostname=%s rpc_port=%d session_id=%s",
+            self.hostname, self._rank_port, self.session_id,
+        )
+
+    def batch_register(self, ptrs: Iterable[int], lengths: Iterable[int]) -> None:
+        # HCCS IPC requires 2 MiB aligned ptrs; callers must allocate aligned
+        # buffers. ROCE path (HCCL_INTRA_ROCE_ENABLE=1) has no alignment requirement.
+        ptr_list = list(ptrs)
+        len_list = list(lengths)
+        if len(ptr_list) != len(len_list):
+            raise ValueError(
+                f"batch_register: ptrs/lengths length mismatch ({len(ptr_list)} vs {len(len_list)})"
+            )
+        for ptr, length in zip(ptr_list, len_list):
+            raw_ptr = int(ptr)
+            raw_len = int(length)
+            ret = self.engine.register_memory(raw_ptr, raw_len)
+            if ret != 0:
+                raise RuntimeError(
+                    f"Mooncake register_memory(ptr=0x{raw_ptr:x}, length={raw_len}) returned {ret}"
+                )
+            self._registered_ranges.append((raw_ptr, raw_len))
+
+    def batch_transfer_sync(
+        self,
+        decode_session_id: str,
+        src_addrs: Iterable[int],
+        dst_addrs: Iterable[int],
+        lengths: Iterable[int],
+    ) -> int:
+        """Transfer KV data to peer's NPU memory via Mooncake batch_transfer_sync_write.
+
+        decode_session_id is the peer's "<ip>:<rpc_port>" target_hostname.
+        Mooncake handles the first-time openSegment handshake lazily.
+        """
+        return self.engine.batch_transfer_sync_write(
+            decode_session_id, list(src_addrs), list(dst_addrs), list(lengths)
+        )
+
+
+def build_transfer_engine(
+    disagg_config,
+    *,
+    hostname: str,
+    local_rank: int = 0,
+    device_name: str = "",
+) -> TransferEngine:
+    """Build a TransferEngine for the backend specified by disagg_config.engine_backend.
+
+    "memfabric" -> AscendTransferEngine; "mooncake" -> MooncakeAscendTransferEngine (lazy import).
+    `local_rank` is the worker's per-host index (0..local_world_size-1).
+    """
+    backend = getattr(disagg_config, "engine_backend", "memfabric")
+    if backend == "memfabric":
+        # memfabric's npu_id is the per-process device slot; equals local_rank under our launch convention.
+        return AscendTransferEngine(
+            hostname=hostname,
+            npu_id=local_rank,
+            disaggregation_mode=disagg_config.disaggregation_mode,
+            store_url=disagg_config.store_url,
+            is_store_creator_node=disagg_config.is_store_creator_node,
+        )
+    if backend == "mooncake":
+        return MooncakeAscendTransferEngine(
+            hostname=hostname,
+            disaggregation_mode=disagg_config.disaggregation_mode,
+            local_rank=local_rank,
+            device_name=device_name,
+        )
+    raise ValueError(
+        f"unknown DisaggConfig.engine_backend: {backend!r} (expected 'memfabric' or 'mooncake')"
+    )

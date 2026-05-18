@@ -549,6 +549,16 @@ def parse_args():
     # role without extra CLI / YAML / env plumbing.
     parser.add_argument("--prefill-ips", nargs="+", help="all prefill node IPs (flat, cross-instance)")
     parser.add_argument("--decode-ips", nargs="+", help="all decode node IPs (flat, cross-instance)")
+    # Engine-backend selector for KV transfer. "memfabric" (default) keeps
+    # today's AscendTransferEngine (memfabric_hybrid). "mooncake" opts into
+    # the MooncakeAscendTransferEngine (mooncake.engine.TransferEngine,
+    # protocol="ascend"/HIXL). See DisaggConfig.engine_backend docstring.
+    parser.add_argument(
+        "--engine-backend",
+        choices=["memfabric", "mooncake"],
+        default="memfabric",
+        help="KV transfer engine backend (default: memfabric)",
+    )
     # Router-only args:
     parser.add_argument("--prefill-addrs", nargs="+", help="prefill leader IPs (router mode)")
     parser.add_argument("--decode-addrs", nargs="+", help="decode leader IPs (router mode)")
@@ -617,18 +627,26 @@ def main():
     # is a fixed convention, hardcoded.
     store_port = 10002
     first_prefill_leader = args.prefill_ips[0]
-    store_url = f"tcp://{first_prefill_leader}:{store_port}"
-    # Store creator = first prefill instance's leader node + its rank-0 worker.
-    # Decomposed (inst_idx == 0 and rank_in_inst == 0) rather than the
-    # equivalent (args.node_index == 0) so the "first instance's leader"
-    # semantics don't rely on the reader knowing the flat-list encoding.
-    is_store_creator_node = (
-        role == ROLE_PREFILL and inst_idx == 0 and rank_in_inst == 0
-    )
+    # store_url + is_store_creator_node are memfabric-specific. For mooncake
+    # we leave them at their defaults so DisaggConfig stays semantically clean
+    # (build_transfer_engine ignores them on the mooncake branch).
+    if args.engine_backend == "memfabric":
+        store_url = f"tcp://{first_prefill_leader}:{store_port}"
+        # Store creator = first prefill instance's leader node + its rank-0 worker.
+        # Decomposed (inst_idx == 0 and rank_in_inst == 0) rather than the
+        # equivalent (args.node_index == 0) so the "first instance's leader"
+        # semantics don't rely on the reader knowing the flat-list encoding.
+        is_store_creator_node = (
+            role == ROLE_PREFILL and inst_idx == 0 and rank_in_inst == 0
+        )
+    else:
+        store_url = ""
+        is_store_creator_node = False
     disagg_config = DisaggConfig(
         disaggregation_mode=role,
         bootstrap_host=bootstrap_host,
         bootstrap_port=args.bootstrap_port,
+        engine_backend=args.engine_backend,
         store_url=store_url,
         is_store_creator_node=is_store_creator_node,
         local_ip=args.ips[args.node_index],

@@ -114,7 +114,7 @@ class OnlineInference(OfflineInference):
             attn_tp_size=self.tp_size, attn_tp_rank=self.tp_rank,
             attn_cp_size=self.cp_size, attn_cp_rank=self.cp_rank,
             attn_dp_size=self.dp_size, attn_dp_rank=self.dp_rank,
-            npu_id=self.local_rank,
+            local_rank=self.local_rank,
             kv_cache_dtype=self.infer_config.model_config.dtype,
             is_mla_backend=self.engine.kvcache_manager.is_mla_backend,
             metadata_pool=metadata_pool,

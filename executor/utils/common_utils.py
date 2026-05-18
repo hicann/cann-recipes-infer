@@ -69,6 +69,19 @@ def align_up(a, b):
     return (a + b - 1) // b * b
 
 
+def align_memory(tensor: torch.Tensor, alignment: int) -> torch.Tensor:
+    """Return a view of `tensor` whose `data_ptr()` is `alignment`-byte aligned.
+
+    `alignment` is a byte count. The caller must over-allocate `tensor` by at
+    least `ceil(alignment / tensor.element_size())` elements so the returned
+    view can be safely narrowed to its target size.
+    """
+    data_ptr = tensor.data_ptr()
+    aligned_addr = (data_ptr + alignment - 1) // alignment * alignment
+    offset = int((aligned_addr - data_ptr) // tensor.element_size())
+    return tensor.narrow(0, offset, tensor.numel() - offset)
+
+
 def ceil_div(a, b):
     return (a + b - 1) // b
 

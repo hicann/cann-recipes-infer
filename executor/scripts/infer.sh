@@ -32,6 +32,7 @@ PD_ROLE=""                                     # required when MODE=online: pref
 YAML_FILE="decode_r1_rank_16_16ep_a8w8.yaml"   # required when MODE!=online: yaml filename under models/<MODEL>/config/
 P_YAML_NAME=""                                 # optional, overrides prefill yaml name (default: ${MODEL}_pd/prefill.yaml)
 D_YAML_NAME=""                                 # optional, overrides decode yaml name (default: ${MODEL}_pd/decode.yaml)
+ENGINE_BACKEND=""                              # optional, KV-transfer backend: memfabric | mooncake. Empty -> server.py default
 
 # Parse --key value arguments (overrides defaults above).
 while [[ $# -gt 0 ]]; do
@@ -42,17 +43,20 @@ while [[ $# -gt 0 ]]; do
         --yaml)         YAML_FILE="$2";      shift 2 ;;
         --p_yaml_name) P_YAML_NAME="$2";    shift 2 ;;
         --d_yaml_name) D_YAML_NAME="$2";    shift 2 ;;
+        --engine_backend) ENGINE_BACKEND="$2"; shift 2 ;;
         -h|--help)
-            echo "Usage: $0 --model <name> --mode <online|offline> [--pd_role <role>] [--yaml <file>] [--p_yaml_name <name>] [--d_yaml_name <name>]"
+            echo "Usage: $0 --model <name> --mode <online|offline> [--pd_role <role>] [--yaml <file>] [--p_yaml_name <name>] [--d_yaml_name <name>] [--engine_backend <backend>]"
             echo ""
             echo "  offline: $0 --model qwen3_moe --yaml qwen3_235b_16tp.yaml"
             echo "  online:  $0 --model deepseek_r1 --mode online --pd_role prefill"
-            echo "  online (custom yaml): $0 --model deepseek_r1 --mode online --pd_role prefill --p_yaml_name my_prefill.yaml --d_yaml_name my_decode.yaml"
+            echo "  online (mooncake KV transfer): $0 --model gpt_oss --mode online --pd_role prefill --engine_backend mooncake"
             exit 0
             ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
+
+export ENGINE_BACKEND
 
 export MODEL_DIR="$MODEL"
 export YAML_PARENT_PATH="${SCRIPT_PATH}/../../models/${MODEL}/config"

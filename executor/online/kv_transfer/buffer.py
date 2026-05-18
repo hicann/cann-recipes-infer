@@ -45,6 +45,8 @@ from typing import List, Optional
 
 import torch
 
+from executor.utils import align_memory
+
 
 # Max number of MTP spec tokens transferred per request — fits in the 32B
 # padding alongside a uint32 count.  Bump only by reshuffling the layout.
@@ -91,6 +93,11 @@ def unpack_metadata(raw: bytes) -> dict:
     return out
 
 
+# HIXL/HCCS IPC requires registered memory base addresses to be 2 MiB aligned.
+# Apply alignment at the allocation site.
+HIXL_ALIGNMENT = 2 * 1024 * 1024
+
+
 class MetadataBufferPool:
     """Slot allocator over a contiguous pinned-CPU byte buffer.
 
@@ -103,15 +110,20 @@ class MetadataBufferPool:
         self._free = deque(range(self.capacity))
         self._lock = threading.Lock()
         self._on_device = False
-        # Allocate on NPU HBM — memfabric DEVICE_RDMA requires device memory
-        # on both ends (CPU pinned is not addressable by the transfer engine).
+        # NPU HBM (memfabric DEVICE_RDMA / HIXL both need device memory).
+        # 2 MiB aligned for HIXL HCCS; harmless for memfabric.
         try:
-            self._buffer = torch.zeros(
-                self.capacity * SLOT_SIZE, dtype=torch.uint8, device="npu",
-            )
+            numel = self.capacity * SLOT_SIZE
+            raw = torch.zeros(numel + HIXL_ALIGNMENT, dtype=torch.uint8, device="npu")
+            self._buffer = align_memory(raw, HIXL_ALIGNMENT).narrow(0, 0, numel)
+            if self._buffer.data_ptr() % HIXL_ALIGNMENT != 0:
+                raise RuntimeError(
+                    f"slot buffer not aligned to {HIXL_ALIGNMENT} bytes "
+                    f"(ptr={self._buffer.data_ptr()})"
+                )
             self._on_device = True
         except Exception:
-            # Fallback to CPU for tests / non-NPU environments.
+            # CPU fallback (tests / non-NPU environments) needs no alignment.
             self._buffer = torch.zeros(self.capacity * SLOT_SIZE, dtype=torch.uint8)
         self._base_ptr = self._buffer.data_ptr()
 

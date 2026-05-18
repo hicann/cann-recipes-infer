@@ -76,7 +76,14 @@ def validate_cache_info(cache_info: ModelCacheInfo) -> None:
 
 
 def allocate_cache_tensors(device, cache_info: ModelCacheInfo, block_num_by_type: Dict[str, int]) -> None:
-    """Allocate per-layer cache tensors according to cache metadata."""
+    """Allocate per-layer cache tensors according to cache metadata.
+
+    KV-cache tensors are 2 MiB aligned (HIXL HCCS IPC contract) via the
+    over-allocate + `align_memory` slice pattern.
+    """
+    from executor.utils import align_memory
+    from executor.online.kv_transfer.buffer import HIXL_ALIGNMENT
+
     for layer_info in cache_info.layer_infos:
         for cache in layer_info.caches:
             if not cache.needs_block:
@@ -92,11 +99,18 @@ def allocate_cache_tensors(device, cache_info: ModelCacheInfo, block_num_by_type
 
             block_num = block_num_by_type[cache.attn_type]
             if cache.attn_type in ["FullAttention", "SlidingWindow"]:
-                cache_tensor = torch.empty(
-                    (block_num, cache_info.block_size, cache.num_head, cache.dim),
-                    dtype=cache.dtype,
-                    device=device,
-                )
+                shape = (block_num, cache_info.block_size, cache.num_head, cache.dim)
+                numel = block_num * cache_info.block_size * cache.num_head * cache.dim
+                # HIXL_ALIGNMENT is in bytes; convert to element count for the padding.
+                elem_size = dtype_itemsize(cache.dtype)
+                slack = (HIXL_ALIGNMENT + elem_size - 1) // elem_size
+                raw = torch.empty(numel + slack, dtype=cache.dtype, device=device)
+                cache_tensor = align_memory(raw, HIXL_ALIGNMENT).narrow(0, 0, numel).view(shape)
+                if cache_tensor.data_ptr() % HIXL_ALIGNMENT != 0:
+                    raise RuntimeError(
+                        f"cache_tensor not aligned to {HIXL_ALIGNMENT} bytes "
+                        f"(ptr={cache_tensor.data_ptr()})"
+                    )
             else:
                 raise ValueError(
                     f"Creating cache tensor for attn_type='{cache.attn_type}' is not supported. "

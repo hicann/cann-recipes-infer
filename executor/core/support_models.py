@@ -13,30 +13,59 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from models.gpt_oss.models.modeling_gpt_oss import GptOssForCausalLM
-from models.gpt_oss.models.configuration_gpt_oss import GptOssConfig
-from models.qwen3_moe.models.modeling_qwen3_moe import Qwen3MoeForCausalLM
-from models.qwen3_moe.models.configuration_qwen3_moe import Qwen3MoeConfig
-from models.deepseek_r1.models.modeling_deepseek import DeepseekV3ForCausalLM, DeepseekV3ModelMTP
-from models.deepseek_r1.models.configuration_deepseek import DeepseekV3Config
-from models.qwen.models.modeling_qwen import QwenForCausalLM
-from models.qwen.models.configuration_qwen import Qwen2Config, Qwen3Config
-from models.gemma4_26b_a4b.models.modeling_gemma4 import Gemma4ForCausalLM
-from models.gemma4_26b_a4b.models.configuration_gemma4 import Gemma4TextConfig
-from models.hy3_preview.models.modeling_hy_v3 import HYV3ForCausalLM
-from models.hy3_preview.models.configuration_hy_v3 import HYV3Config
-from models.longcat_flash_lite.models.modeling_longcat_flash_lite import LongcatFlashNgramForCausalLM
-from models.longcat_flash_lite.models.configuration_longcat_flash_lite import LongcatFlashNgramConfig
+"""Lazy registry mapping model name to (ForCausalLM, [ModelMTP,] Config) classes."""
 
-model_dict = {
-    "gpt-oss": (GptOssForCausalLM, GptOssConfig),
-    "qwen3-moe": (Qwen3MoeForCausalLM, Qwen3MoeConfig),
-    "deepseek_r1": (DeepseekV3ForCausalLM, DeepseekV3ModelMTP, DeepseekV3Config),
-    "deepseek_v2_lite": (DeepseekV3ForCausalLM, DeepseekV3Config),
-    "kimi_k2": (DeepseekV3ForCausalLM, DeepseekV3Config),
-    "qwen3_8b": (QwenForCausalLM, Qwen3Config),
-    "qwen25_7b_instruct": (QwenForCausalLM, Qwen2Config),
-    "gemma-4": (Gemma4ForCausalLM, Gemma4TextConfig),
-    "hy3_preview": (HYV3ForCausalLM, HYV3Config),
-    "longcat-flash-lite": (LongcatFlashNgramForCausalLM, LongcatFlashNgramConfig),
+import importlib
+
+_specs: dict[str, list[tuple[str, str]]] = {
+    "gpt-oss": [
+        ("models.gpt_oss.models.modeling_gpt_oss", "GptOssForCausalLM"),
+        ("models.gpt_oss.models.configuration_gpt_oss", "GptOssConfig"),
+    ],
+    "qwen3-moe": [
+        ("models.qwen3_moe.models.modeling_qwen3_moe", "Qwen3MoeForCausalLM"),
+        ("models.qwen3_moe.models.configuration_qwen3_moe", "Qwen3MoeConfig"),
+    ],
+    "deepseek_r1": [
+        ("models.deepseek_r1.models.modeling_deepseek", "DeepseekV3ForCausalLM"),
+        ("models.deepseek_r1.models.modeling_deepseek", "DeepseekV3ModelMTP"),
+        ("models.deepseek_r1.models.configuration_deepseek", "DeepseekV3Config"),
+    ],
+    "deepseek_v2_lite": [
+        ("models.deepseek_r1.models.modeling_deepseek", "DeepseekV3ForCausalLM"),
+        ("models.deepseek_r1.models.configuration_deepseek", "DeepseekV3Config"),
+    ],
+    "kimi_k2": [
+        ("models.deepseek_r1.models.modeling_deepseek", "DeepseekV3ForCausalLM"),
+        ("models.deepseek_r1.models.configuration_deepseek", "DeepseekV3Config"),
+    ],
+    "qwen3_8b": [
+        ("models.qwen.models.modeling_qwen", "QwenForCausalLM"),
+        ("models.qwen.models.configuration_qwen", "Qwen3Config"),
+    ],
+    "qwen25_7b_instruct": [
+        ("models.qwen.models.modeling_qwen", "QwenForCausalLM"),
+        ("models.qwen.models.configuration_qwen", "Qwen2Config"),
+    ],
+    "gemma-4": [
+        ("models.gemma4_26b_a4b.models.modeling_gemma4", "Gemma4ForCausalLM"),
+        ("models.gemma4_26b_a4b.models.configuration_gemma4", "Gemma4TextConfig"),
+    ],
+    "hy3_preview": [
+        ("models.hy3_preview.models.modeling_hy_v3", "HYV3ForCausalLM"),
+        ("models.hy3_preview.models.configuration_hy_v3", "HYV3Config"),
+    ],
+    "longcat-flash-lite": [
+        ("models.longcat_flash_lite.models.modeling_longcat_flash_lite", "LongcatFlashNgramForCausalLM"),
+        ("models.longcat_flash_lite.models.configuration_longcat_flash_lite", "LongcatFlashNgramConfig"),
+    ],
 }
+
+
+def load_model_classes(name: str) -> tuple:
+    if name not in _specs:
+        raise ValueError(f"Unsupported model: {name}")
+    try:
+        return tuple(getattr(importlib.import_module(m), a) for m, a in _specs[name])
+    except Exception as e:
+        raise ImportError(f"failed to load model '{name}': {e}") from e

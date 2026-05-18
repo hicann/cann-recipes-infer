@@ -42,12 +42,12 @@ import requests
 
 from executor.core.config import DisaggConfig
 from executor.online.kv_transfer.transfer_engine import (
-    AscendTransferEngine,
     KVArgsRegisterInfo,
     KVPoll,
     PrefillServerInfo,
     TargetRankMapping,
     _KVTransferTask,
+    build_transfer_engine,
 )
 from executor.online.kv_transfer.buffer import MetadataBufferPool
 
@@ -77,7 +77,7 @@ class KVTransferManager:
         attn_cp_rank: int = 0,
         attn_dp_size: int = 1,
         attn_dp_rank: int = 0,
-        npu_id: int = 0,
+        local_rank: int = 0,
         kv_cache_dtype: str | None = None,
         is_mla_backend: bool = False,
         metadata_pool: Optional[MetadataBufferPool] = None,
@@ -86,8 +86,12 @@ class KVTransferManager:
         heartbeat_interval: float = 5.0,
         heartbeat_max_failures: int = 3,
     ):
-        if not disagg_config.store_url:
-            raise ValueError("KVTransferManager requires DisaggConfig.store_url to be set")
+        engine_backend = getattr(disagg_config, "engine_backend", "memfabric")
+        if engine_backend == "memfabric" and not disagg_config.store_url:
+            raise ValueError(
+                "KVTransferManager requires DisaggConfig.store_url to be set "
+                "for engine_backend='memfabric'"
+            )
         if not disagg_config.local_ip:
             raise ValueError(
                 "KVTransferManager requires DisaggConfig.local_ip to be set "
@@ -96,13 +100,14 @@ class KVTransferManager:
         self.is_mla_backend = is_mla_backend
         self.disaggregation_mode = disagg_config.disaggregation_mode
         self.local_ip = disagg_config.local_ip
-        logger.info("KVTransferManager rank_ip=%s", self.local_ip)
-        self.transfer_engine = AscendTransferEngine(
+        logger.info(
+            "KVTransferManager rank_ip=%s engine_backend=%s",
+            self.local_ip, engine_backend,
+        )
+        self.transfer_engine = build_transfer_engine(
+            disagg_config,
             hostname=self.local_ip,
-            npu_id=npu_id,
-            disaggregation_mode=disagg_config.disaggregation_mode,
-            store_url=disagg_config.store_url,
-            is_store_creator_node=disagg_config.is_store_creator_node,
+            local_rank=local_rank,
         )
         # DECODE owns the metadata_pool — it's the NPU HBM buffer that prefill
         # RDMA-writes into. PREFILL passes None: its RDMA source is the

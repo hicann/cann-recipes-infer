@@ -16,7 +16,9 @@
 """KV-cache transfer subsystem for PD disaggregation.
 
 Modules:
-- transfer_engine: KVPoll + data structures + TransferEngine ABC + AscendTransferEngine
+- transfer_engine: KVPoll + data structures + TransferEngine ABC, plus the two
+  concrete backends (AscendTransferEngine / MooncakeAscendTransferEngine) and
+  the build_transfer_engine factory that dispatches on engine_backend
 - buffer: MetadataBufferPool (NPU-registered slots for RDMA metadata writes)
 - transfer_manager: KVTransferManager (ZMQ listener + transfer executor + bootstrap client)
 - conn: AscendKVSender / AscendKVReceiver (per-request)
@@ -29,11 +31,13 @@ from .transfer_engine import (
     AscendTransferEngine,
     KVArgsRegisterInfo,
     KVPoll,
+    MooncakeAscendTransferEngine,
     PrefillRankInfo,
     PrefillServerInfo,
     TargetRankMapping,
     TransferEngine,
     all_reduce_poll,
+    build_transfer_engine,
 )
 
 __all__ = [
@@ -44,11 +48,13 @@ __all__ = [
     "KVTransferManager",
     "KVPoll",
     "MetadataBufferPool",
+    "MooncakeAscendTransferEngine",
     "PrefillRankInfo",
     "PrefillServerInfo",
     "TargetRankMapping",
     "TransferEngine",
     "all_reduce_poll",
+    "build_transfer_engine",
     "pack_metadata",
     "unpack_metadata",
 ]

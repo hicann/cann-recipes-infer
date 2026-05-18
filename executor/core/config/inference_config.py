@@ -25,7 +25,7 @@ This module contains all configuration classes for the inference framework:
 import os
 import math
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 
 @dataclass
@@ -284,13 +284,22 @@ class DisaggConfig:
     disaggregation_mode: str = "NONE"
     bootstrap_host: str = "0.0.0.0"
     bootstrap_port: int = 18800
+    # Selects which TransferEngine subclass KVTransferManager constructs via
+    # build_transfer_engine() (in executor/online/kv_transfer/transfer_engine.py):
+    #   "memfabric" (default) -> AscendTransferEngine using memfabric_hybrid
+    #   "mooncake"            -> MooncakeAscendTransferEngine using
+    #                            mooncake.engine.TransferEngine (HIXL backend)
+    # Default keeps current behaviour byte-for-byte; mooncake is opt-in.
+    engine_backend: Literal["memfabric", "mooncake"] = "memfabric"
     # MemFabric config store address, tcp://<P primary IP>:<port>. All ranks
     # (prefill + decode, all instances) must agree on this single URL.
+    # Memfabric-specific: ignored when engine_backend == "mooncake".
     store_url: str = ""
     # True only on the PREFILL instance-0 leader node — the sole node that
     # should run create_config_store. Set explicitly by server.py based on
     # node_index/role; combining with local_rank==0 inside the engine picks
     # exactly one worker out of the whole service.
+    # Memfabric-specific: ignored when engine_backend == "mooncake".
     is_store_creator_node: bool = False
     # Local IP advertised to PD peers as this rank's contact address. Sourced
     # from the launch config (--ips[node_index]) so the auto-detection magic

@@ -148,7 +148,7 @@ InferenceConfig
 ```mermaid
 flowchart TB
     A[ModelWorker.init] --> E[加载 HF Config]
-    E --> H[构造 CommManager (moe 模型依赖 hf_config 初始化通信域)]
+    E --> H[构造 CommManager（moe 模型依赖 hf_config 初始化通信域）]
     H --> B{with_ckpt?}
     B -->|Yes| C[DefaultModelLoader]
     B -->|No| D[DummyModelLoader]
@@ -256,7 +256,7 @@ KV cache 采用 paged attention 三层结构，定义在 `executor/core/kv_cache
 ### 4.1 启动方式
 
 ```bash
-bash models/<model>/infer.sh
+bash executor/scripts/infer.sh --model <model> --mode offline [--yaml <name>]
 ```
 
 ### 4.2 初始化时序图
@@ -398,19 +398,19 @@ Client ──POST /generate──▶ Router (prefill-node-0:8000)
 
 ### 5.3 启动方式
 
-启动通过模型目录下的 `infer.sh` 调用 `executor/scripts/function.sh`：
+启动通过 `executor/scripts/infer.sh` 调用 `executor/scripts/function.sh`：
 
 ```bash
 # Prefill 节点（local IP 必须在 PREFILL_IPS 中）
-bash models/<model>/infer.sh online prefill
+bash executor/scripts/infer.sh --model <model> --mode online --pd_role prefill
 
 # Decode 节点（local IP 必须在 DECODE_IPS 中）
-bash models/<model>/infer.sh online decode
+bash executor/scripts/infer.sh --model <model> --mode online --pd_role decode
 ```
 
 1. `PREFILL_IPS` 与 `DECODE_IPS` 由 `executor/scripts/set_env.sh` 维护；
 2. 每角色用独立 YAML（`prefill.yaml` / `decode.yaml`），其 `parallel_config.world_size` 是**每实例** world size；
-3. `PREFILL_IPS` 与 `DECODE_IPS` 不重叠时，可省略 `prefill` / `decode` 参数，shell 会从 local IP 自动推断角色；
+3. `PREFILL_IPS` 与 `DECODE_IPS` 不重叠时，可省略 `--pd_role`，shell 会从 local IP 自动推断角色；
 4. 同机部署（PREFILL/DECODE 列表重叠）时必须显式传，并通过 `ASCEND_RT_VISIBLE_DEVICES` 隔离 NPU。
 
 ### 5.4 离线与在线的差异
