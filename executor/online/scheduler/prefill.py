@@ -20,7 +20,7 @@ import os
 from collections import deque
 
 from executor.core.scheduler import Scheduler
-from executor.core.types_.types import StepOutput
+from executor.core.forward_data_info import StepOutput
 from executor.online.kv_transfer import AscendKVSender, KVPoll
 
 logger = logging.getLogger(__name__)

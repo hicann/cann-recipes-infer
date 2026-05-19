@@ -19,10 +19,10 @@ executor/
 ├── core/                  # 核心引擎组件
 │   ├── config/            # 配置类（InferenceConfig、CommManager）
 │   ├── engine/            # 执行引擎（ExecutionEngine）
+│   ├── forward_data_info/ # 公共类型（Request、Batch 等）
 │   ├── kv_cache/          # Paged KV cache 管理（KVCacheManager / BlockPool）
 │   ├── model_worker/      # 模型 Worker（ModelWorker、MTPWorker）
-│   ├── scheduler/         # 调度器基类（Scheduler）
-│   └── types_/            # 公共类型（Request、Batch、ForwardMetaData 等）
+│   └── scheduler/         # 调度器基类（Scheduler）
 ├── offline/               # 离线推理入口（OfflineInference）
 ├── online/                # 在线推理入口
 │   ├── server.py          #   FastAPI HTTP 入口 + WorkerManager
@@ -33,7 +33,7 @@ executor/
 │   ├── kv_transfer/       #   KV 传输（buffer / conn / transfer_engine / transfer_manager）
 │   └── scheduler/         #   PD 调度器（PrefillDisaggScheduler / DecodeDisaggScheduler）
 ├── model_loader/          # 权重加载
-├── scripts/               # 启动脚本（function.sh / set_env.sh）
+├── scripts/               # 启动脚本（function.sh / set_env.sh / infer.sh）
 └── utils/                 # 工具函数（forward_metadata、graph_utils、hccl_utils、profiler 等）
 ```
 
@@ -402,15 +402,15 @@ Client ──POST /generate──▶ Router (prefill-node-0:8000)
 
 ```bash
 # Prefill 节点（local IP 必须在 PREFILL_IPS 中）
-bash executor/scripts/infer.sh --model <model> --mode online --pd_role prefill
+bash executor/scripts/infer.sh --model <model> --mode online --pd-role prefill
 
 # Decode 节点（local IP 必须在 DECODE_IPS 中）
-bash executor/scripts/infer.sh --model <model> --mode online --pd_role decode
+bash executor/scripts/infer.sh --model <model> --mode online --pd-role decode
 ```
 
 1. `PREFILL_IPS` 与 `DECODE_IPS` 由 `executor/scripts/set_env.sh` 维护；
 2. 每角色用独立 YAML（`prefill.yaml` / `decode.yaml`），其 `parallel_config.world_size` 是**每实例** world size；
-3. `PREFILL_IPS` 与 `DECODE_IPS` 不重叠时，可省略 `--pd_role`，shell 会从 local IP 自动推断角色；
+3. `PREFILL_IPS` 与 `DECODE_IPS` 不重叠时，可省略 `--pd-role`，shell 会从 local IP 自动推断角色；
 4. 同机部署（PREFILL/DECODE 列表重叠）时必须显式传，并通过 `ASCEND_RT_VISIBLE_DEVICES` 隔离 NPU。
 
 ### 5.4 离线与在线的差异
@@ -460,7 +460,8 @@ evalscope eval \
 1. `model.forward(input_ids, position_ids, forward_metadata, **kwargs)`
    - `input_ids` 按 packed 布局拼装为一维 `[TotalTokens]`
    - `forward_metadata: ForwardMetaData` 携带 `is_prefill` / `kv_len` / `actual_seq_lengths_kv/q`（含 cu/list 变体）/ `attention_mask` / `prompt_tokens` / `block_table` / `slot_mapping` 等 attention 所需元数据
-   - 返回 `logits`，形状 `[batch_size, 1, vocab]`（模型内先取每请求最后位置再计算 lm_head）
+   - 模型侧 forward 必须返回 `logits` 或 `(logits, prev_hidden_states)`，后者用于 MTP draft model
+   - 模型侧在 prefill 阶段返回的 logits 的 shape 是 `[batch_size, 1, vocab_size]`（模型内先取每请求最后位置再计算 lm_head）
 
 2. KV cache 形状声明 (online 必须)：
    - 实现 `init_cache(device)`：`ModelWorker.init_kvcache` 会全权委托给模型构造 KV（paged 模型通常返回 paged-shape `past_key_values` 并自行挂载到各层）

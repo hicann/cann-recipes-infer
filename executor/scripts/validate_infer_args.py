@@ -86,8 +86,8 @@ def validate_args(args):
     if args.mode == "online":
         if args.pd_role not in VALID_PD_ROLES:
             if args.pd_role:
-                return error(f"--pd_role must be prefill or decode in online mode, got: {args.pd_role}")
-            return error("online mode requires --pd_role (prefill or decode).")
+                return error(f"--pd-role must be prefill or decode in online mode, got: {args.pd_role}")
+            return error("online mode requires --pd-role (prefill or decode).")
 
         for path, label in ((args.p_yaml, "P_YAML"), (args.d_yaml, "D_YAML")):
             rc = validate_file(path, label)

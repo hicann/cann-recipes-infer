@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from executor.core.types_.types import Request
+from executor.core.forward_data_info import Request
 
 
 def test_request_has_pd_fields():

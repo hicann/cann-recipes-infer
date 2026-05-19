@@ -24,7 +24,7 @@ import torch
 
 from executor.core.scheduler.scheduler import Scheduler
 from executor.core.config import SchedulerConfig
-from executor.core.types_.types import Request, Batch
+from executor.core.forward_data_info import Request, Batch
 
 
 class MockTokenizer:

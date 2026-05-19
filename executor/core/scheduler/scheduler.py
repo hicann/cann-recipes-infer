@@ -20,7 +20,7 @@ from typing import List, Dict, Optional, Union
 from collections import deque
 import torch
 from executor.core.config import SchedulerConfig
-from ..types_.types import Request, Batch, StepOutput, MTPInfo, SamplingParams
+from ..forward_data_info import Request, Batch, StepOutput, MTPInfo, SamplingParams
 from ..engine import ExecutionEngine
 from ..kv_cache import KVCacheManager
 

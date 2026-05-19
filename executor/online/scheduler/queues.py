@@ -1,5 +1,8 @@
 # coding=utf-8
+# Adapted from
+# https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/disaggregation/decode.py
 # Copyright (c) 2026 Huawei Technologies Co., Ltd.
+# Copyright 2025 SGLang Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -22,7 +25,7 @@ from dataclasses import dataclass
 import torch
 
 from executor.online.kv_transfer import AscendKVReceiver, KVPoll
-from executor.core.types_.types import MTPInfo
+from executor.core.forward_data_info import MTPInfo
 
 logger = logging.getLogger(__name__)
 

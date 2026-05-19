@@ -23,7 +23,7 @@ import torch
 from executor.core.config import InferenceConfig
 from executor.core.engine import ExecutionEngine
 from executor.core.scheduler import Scheduler
-from executor.core.types_ import GenerationOutput, Request
+from executor.core.forward_data_info import GenerationOutput, Request
 from executor.core.support_models import load_model_classes
 from executor.utils.common_utils import process_infer_time
 

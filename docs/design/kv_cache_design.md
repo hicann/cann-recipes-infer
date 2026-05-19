@@ -1,16 +1,35 @@
 # KV Cache 管理设计文档
 
-## 1. 概述
+框架当前支持两种 KV Cache 使用方式：第一种是通过 `KVCacheManager` 统一管理 Cache，框架负责 block 分配、回收与生成运行时索引；第二种是不通过 `KVCacheManager`，由模型自行创建和维护 Cache。
 
-本文档描述了 LLM 推理框架中 KV Cache 管理的设计与实现。该模块采用 **Paged Attention** 技术，将 KV Cache 以块（Block）为单位进行管理，并兼容不同 attention 类型的块分配策略，实现高效的内存复用和并发请求支持。
+两种方式的区别和应用场景如下：
 
-### 1.1 核心目标
+| 维度 | `KVCacheManager` 管理 | 模型自行维护 Cache |
+|------|----------------------|-------------------|
+| 启用条件 | 模型返回 `ModelCacheInfo` 元信息供 `KVCacheManager` 管理 | 模型不返回 `ModelCacheInfo` 元信息 |
+| 初始化入口 | `ExecutionEngine._init_cache_manager()` | `ModelWorker.init_kvcache()` |
+| Cache tensor 分配 | `allocate_cache_tensors()` 根据 `CacheEntry` 分配 | `model.init_cache(device)` 或 legacy `cache_unit` 分配 |
+| 索引 | 框架提供 `block_table` / `slot_mapping` 作为 Cache 索引 | 需要根据 `request_offset`、`position_ids` 等参数自行计算 Cache 索引 |
+| 调度准入 | `allocate_slots()` 检查 block 是否足够 | 不做 KV slot 准入 |
+| 请求释放 | `KVCacheManager.free(request_id)` | 无统一请求级释放 |
+| 应用场景 | 用于online/offline 推理、Paged Attention 等场景 | 用于仅需 offline 推理、特殊 Cache 布局且暂不接入 Paged Attention 管理的场景 |
+
+
+本文档分为两个部分，将分别介绍两种方法的设计思路与适配 Checklist。
+
+## 第一部分：通过 KVCacheManager 管理 Cache
+
+### 1. 概述
+
+本章节描述了 LLM 推理框架中 KV Cache 管理的设计与实现。该模块采用 **Paged Attention** 技术，将 KV Cache 以块（Block）为单位进行管理，并兼容不同 attention 类型的块分配策略，实现高效的内存复用和并发请求支持。
+
+#### 1.1 核心目标
 
 - **内存效率**：通过分块管理避免为每个请求预分配完整序列长度的内存
 - **并发支持**：多请求共享有限的 NPU 内存资源
 - **灵活适配**：支持多种注意力机制（Full Attention、Sliding Window Attention）
 
-### 1.2 模块目录结构
+#### 1.2 模块目录结构
 
 ```
 executor/core/kv_cache/
@@ -23,9 +42,9 @@ executor/core/kv_cache/
 ```
 
 ---
-## 2. 三层结构设计
+### 2. 三层结构设计
 
-### 2.1 总体分层
+#### 2.1 总体分层
 
 KV cache 管理采用三层结构：
 
@@ -47,7 +66,7 @@ graph TD
     C2 --> D2[BlockPool]
 ```
 
-### 2.2 第一层：KVCacheManager
+#### 2.2 第一层：KVCacheManager
 
 `KVCacheManager` 是请求级入口，面向调度层提供统一接口。
 
@@ -77,7 +96,7 @@ graph TD
 
 
 
-### 2.3 第二层：SingleTypeKVCacheManager
+#### 2.3 第二层：SingleTypeKVCacheManager
 
 `SingleTypeKVCacheManager` 抽象”某一种 attention type 的 block 管理策略”。
 
@@ -129,7 +148,7 @@ ATTN_TYPE_MANAGER_MAP = {
 | `FullAttentionManager` | 全注意力，块随序列增长线性追加 | [single_type_kv_cache_manager.py](../../executor/core/kv_cache/single_type_kv_cache_manager.py) |
 | `SlidingWindowManager` | 滑动窗口注意力，支持过期块回收 | [single_type_kv_cache_manager.py](../../executor/core/kv_cache/single_type_kv_cache_manager.py) |
 
-#### 2.3.1 FullAttentionManager
+##### 2.3.1 FullAttentionManager
 
 `FullAttentionManager` 直接复用基类逻辑，特点是：
 
@@ -142,7 +161,7 @@ ATTN_TYPE_MANAGER_MAP = {
 - `validate_and_build_kwargs(_group_entries)`：返回空字典 `{}`，无额外参数。
 
 
-#### 2.3.2 SlidingWindowManager
+##### 2.3.2 SlidingWindowManager
 
 `SlidingWindowManager` 在基类上增加滑窗逻辑，目标是在逻辑位置保持对齐的同时，只为有效窗口保留真实物理 block。
 
@@ -162,7 +181,7 @@ ATTN_TYPE_MANAGER_MAP = {
 
 这使得滑窗类 attention 可以兼顾“逻辑位置连续”与“物理存储压缩”。
 
-### 2.4 第三层：BlockPool
+#### 2.4 第三层：BlockPool
 
 `BlockPool` 是最底层的物理资源管理器，只关心 block id 的生命周期。
 
@@ -189,11 +208,11 @@ ATTN_TYPE_MANAGER_MAP = {
 
 ---
 
-## 3. 块分配核心流程：allocate_slots
+### 3. 块分配核心流程：allocate_slots
 
 `allocate_slots` 是整个 KV cache 管理链路里的核心入口，它的设计重点是逐请求地进行不同 attention type 的块分配。调度层只需要关心当前请求是否还能继续推进，而 `KVCacheManager` 负责把这一请求广播到所有 `SingleTypeKVCacheManager`，分别计算所需块数、回收可跳过块，并在真正分配前完成一次整体可分配性检查。
 
-### 3.1 输入参数含义
+#### 3.1 输入参数含义
 
 `KVCacheManager.allocate_slots(request_id, computed_tokens, num_new_tokens, lookahead_tokens=0)` 中各入参的含义为：
 
@@ -209,9 +228,9 @@ ATTN_TYPE_MANAGER_MAP = {
 2. `num_tokens_need_slot = min(computed_tokens + num_new_tokens + lookahead_tokens, max_model_len)`
    表示本次分配后需要 block 覆盖到的总 token 范围。
 
-### 3.3 两阶段实现流程
+#### 3.2 两阶段实现流程
 
-#### 3.3.1 预检查阶段
+##### 3.2.1 预检查阶段
 
 预检查阶段是整个分配逻辑最关键的部分，它确保分配前先收敛状态。对`KVCacheManager` 中每个 `SingleTypeKVCacheManager`，依次执行：
 
@@ -229,7 +248,7 @@ ATTN_TYPE_MANAGER_MAP = {
 
 若任何一个 manager 的空闲块数少于需要新增的块数，则顶层立刻返回 `False`，该请求在本次迭代中不会发生任何新的 block 分配。
 
-#### 3.3.2 分配阶段
+##### 3.2.2 分配阶段
 
 只有全部 manager 都通过预检查，才进入分配阶段，此时 `KVCacheManager` 会再次遍历 managers，从 `BlockPool` 申请块并更新 request 对应的 block table。：
 
@@ -237,7 +256,7 @@ ATTN_TYPE_MANAGER_MAP = {
 allocate_new_blocks(request_id, block_num_to_allocate, num_tokens_need_slot)
 ```
 
-#### 3.4 allocate_slots 时序图
+#### 3.3 allocate_slots 时序图
 
 通过时序图展示这两个阶段的协作关系：
 ```mermaid
@@ -271,11 +290,11 @@ sequenceDiagram
 ```
 ---
 
-## 4. 辅助模块
+### 4. 辅助模块
 
 辅助模块包括 `cache_info.py` 和 `cache_utils.py`。`cache_info.py` 定义 KV cache 的元数据结构，`cache_utils.py` 负责初始化校验、资源分配以及运行期输入准备。
 
-### 4.1 CacheInfo
+#### 4.1 CacheInfo
 
 `cache_info.py` 定义了三层元数据结构：
 
@@ -318,7 +337,7 @@ graph TD
     F --> G[FullAttentionManager]
 ```
 
-### 4.2 CacheUtils
+#### 4.2 CacheUtils
 
 `cache_utils.py` 提供以下工具函数：
 
@@ -335,7 +354,7 @@ graph TD
 - `prepare_slot_mapping()`
   根据 `position_ids` 和 `block_table` 生成 `slot_mapping`。
 
-#### 4.2.1 详解 calculate_block_num()
+##### 4.2.1 详解 calculate_block_num()
 `calculate_block_num()` 会计算要给每种 `attn_type` 对应的 `SingleTypeKVCacheManager` 分配多少 block 数量。
 它会先按 `attn_type` 将 cache 分成两类，再分别计算 `block_num`：
 
@@ -377,7 +396,7 @@ graph TD
 
 整体上，`calculate_block_num()` 的顺序是：先为固定 block 类 cache 预留内存，再用剩余内存估算非固定 block 类 cache 的 block 数；这样可以避免 SWA 这类必须预留的 cache 挤占后续计算时出现不确定性。
 
-#### 4.2.2 构建 block_table 与 slot_mapping
+##### 4.2.2 构建 block_table 与 slot_mapping
 
 `prepare_block_tables()` 和 `prepare_slot_mapping()` 的输出均为字典结构，键为 `attn_type`，值为对应的`block_tables / slot_mapping` 张量，即：
 
@@ -388,13 +407,13 @@ graph TD
 
 ---
 
-## 5. 新模型适配 Cache 管理的 Checklist
+### 5. 新模型适配 Cache 管理的 Checklist
 
 本文档提供新模型接入 KV Cache 管理框架的完整步骤清单，涵盖必选和可选任务，帮助开发者定位具体代码位置。
 
-### 5.1 分析模型 Attention 形态【必选】
+#### 5.1 分析模型 Attention 形态【必选】
 
-#### 5.1.1 确定每个 cache 的 `attn_type`
+##### 5.1.1 确定每个 cache 的 `attn_type`
 
 在模型 attention 类中，分析每个 cache 的特性并确定其归属类型：
 
@@ -417,9 +436,9 @@ ATTN_TYPE_MANAGER_MAP: Dict[str, Type[SingleTypeKVCacheManager]] = {
 - 若现有 `ATTN_TYPE_MANAGER_MAP` 不满足需求，参考步骤 3 新增 SingleTypeKVCacheManager 类
 
 
-### 5.2 在模型中配置 Cache 信息【必选】
+#### 5.2 在模型中配置 Cache 信息【必选】
 
-#### 5.2.1 定义 cache 变量
+##### 5.2.1 定义 cache 变量
 
 在 attention 类的 `__init__()` 中，为每个 cache 定义占位 tensor，用于存放每一层的 cache 数据：
 
@@ -429,7 +448,7 @@ self.nope_cache = torch.Tensor([])
 self.rope_cache = torch.Tensor([])
 ```
 
-#### 5.2.2 创建 `CacheEntry` 实例列表
+##### 5.2.2 创建 `CacheEntry` 实例列表
 
 在 attention 类的 `__init__()` 中，为每个 cache 创建 `CacheEntry` 实例并存入列表 `self.cache_entries`。
 
@@ -470,7 +489,7 @@ self.cache_entries = [
 ]
 ```
 
-#### 5.2.3 遍历所有层构建 `ModelCacheInfo`
+##### 5.2.3 遍历所有层构建 `ModelCacheInfo`
 
 在模型类（如 `DeepseekV3ForCausalLM`）中实现 `get_cache_info()` 方法。
 
@@ -508,11 +527,11 @@ def get_cache_info(
 self.block_size = infer_config.scheduler_config.block_size
 ```
 
-### 5.3 新增 `SingleTypeKVCacheManager` 子类【可选】
+#### 5.3 新增 `SingleTypeKVCacheManager` 子类【可选】
 
 仅在现有 `ATTN_TYPE_MANAGER_MAP` 无法满足新 cache 类型需求时执行。
 
-#### 5.3.1 新建 Manager 子类
+##### 5.3.1 新建 Manager 子类
 
 **位置**：[single_type_kv_cache_manager.py](../../executor/core/kv_cache/single_type_kv_cache_manager.py)
 
@@ -528,7 +547,7 @@ self.block_size = infer_config.scheduler_config.block_size
 
 **参考实现**：[single_type_kv_cache_manager.py](../../executor/core/kv_cache/single_type_kv_cache_manager.py) 的 `FullAttentionManager`、`SlidingWindowManager`
 
-#### 5.3.2 注册到 `ATTN_TYPE_MANAGER_MAP`
+##### 5.3.2 注册到 `ATTN_TYPE_MANAGER_MAP`
 
 **位置**：[single_type_kv_cache_manager.py](../../executor/core/kv_cache/single_type_kv_cache_manager.py)
 
@@ -540,19 +559,19 @@ ATTN_TYPE_MANAGER_MAP: Dict[str, Type[SingleTypeKVCacheManager]] = {
 }
 ```
 
-### 5.4 扩展 `calculate_block_num()`【可选】
+#### 5.4 扩展 `calculate_block_num()`【可选】
 
 仅在新增 Manager 且现有 block 计算逻辑不满足需求时执行。
 
 `calculate_block_num()`会在 cache 管理初始化对每个 `attn_type` 分配 block 内存块，如果新增了 Manager，需要检查或新增分配逻辑。
 
-#### 5.4.1 判断是否属于固定 block 类型
+##### 5.4.1 判断是否属于固定 block 类型
 
 判断新增的 Manager 属于哪一种类型：
 - 固定 block 类型：block 数不随序列长度增长（如 SlidingWindow）
 - 非固定类型：block 数随序列长度线性增长（如 FullAttention）
 
-#### 5.4.2 固定 block 类型：扩展 `calculate_fixed_block_memory_bytes()`
+##### 5.4.2 固定 block 类型：扩展 `calculate_fixed_block_memory_bytes()`
 
 若新增固定 block 类型，首先在[cache_utils.py](../../executor/core/kv_cache/cache_utils.py) 的 `FIXED_BLOCK_ATTN_TYPES`中新增该 `attn_type`：
 
@@ -570,16 +589,31 @@ else:
     raise AttributeError(...)
 ```
 
-#### 5.4.3 确保 `calculate_block_num()` 正确处理
+##### 5.4.3 确保 `calculate_block_num()` 正确处理
 
 **位置**：[cache_utils.py](../../executor/core/kv_cache/cache_utils.py)
 
 若新增非固定 block 类型，检查现有的 block 计算逻辑是否满足新 Manager 需求。
 
 
-### 5.5 在 Attention forward 中接入 `block_table` / `slot_mapping`【必选】
+#### 5.5 扩展 `allocate_cache_tensors()`，为新的 attn_type 分配内存【可选】
 
-#### 5.5.1 从 `forward_metadata` 获取 block 信息
+**位置**：[cache_utils.py](../../executor/core/kv_cache/cache_utils.py)
+
+cache tensor 的物理布局默认匹配框架分配形状：`[block_num, block_size, num_head, dim]`。如果新增 `attn_type` 不满足默认分配的 shape，则可以在 `allocate_cache_tensors()` 中新增分支，按照该 `attn_type` 的需求 shape 分配物理 tensor。
+
+```python
+elif cache.attn_type in ["NewAttentionType"]:
+    cache_tensor = torch.empty(
+        (...), # tensor shape
+        dtype=cache.dtype,
+        device=device,
+    )
+```
+
+#### 5.6 在 Attention forward 中接入 `block_table` / `slot_mapping`【必选】
+
+##### 5.6.1 从 `forward_metadata` 获取 block 信息
 
 `block_table` 和 `slot_mapping` 存储在 `forward_metadata` 中，均为 `Dict[str, torch.Tensor]` 结构：
 
@@ -593,7 +627,7 @@ block_tables = forward_metadata.block_table  # Dict[attn_type, Tensor]
 slot_mapping = forward_metadata.slot_mapping  # Dict[attn_type, Tensor]
 ```
 
-#### 5.5.2 按 `attn_type` 取出对应 tensor
+##### 5.6.2 按 `attn_type` 取出对应 tensor
 
 在 attention forward 中，使用 `self.attn_type` 作为 key：
 
@@ -606,9 +640,9 @@ slot_mapping = forward_metadata.slot_mapping[self.attn_type]
 - 同一层多个 cache（如 `k_cache` 和 `v_cache`）共享相同的 `attn_type`，使用同一份 `block_table` 和 `slot_mapping`
 - 若一层包含多种 `attn_type` 的 cache，需分别取出对应的 tensor
 
-### 5.6 验证完整链路【必选】
+#### 5.7 验证完整链路【必选】
 
-#### 5.6.1 初始化链路验证
+##### 5.7.1 初始化链路验证
 
 以 [execution_engine.py](../../executor/core/engine/execution_engine.py) 的 `_init_cache_manager()` 函数为主线：
 
@@ -621,7 +655,7 @@ slot_mapping = forward_metadata.slot_mapping[self.attn_type]
 | 5 | `create_single_type_managers()` → [single_type_kv_cache_manager.py](../../executor/core/kv_cache/single_type_kv_cache_manager.py) | Manager 正确创建 |
 | 6 | `KVCacheManager(...)` → [kv_cache_manager.py](../../executor/core/kv_cache/kv_cache_manager.py) | 顶层 Manager 初始化完成 |
 
-#### 5.6.2 运行期链路验证
+##### 5.7.2 运行期链路验证
 
 | 步骤 | 函数位置 | 验证内容 |
 |-----|---------|---------|
@@ -635,7 +669,7 @@ slot_mapping = forward_metadata.slot_mapping[self.attn_type]
 - Decode 阶段：[scheduler.py](../../executor/core/scheduler/scheduler.py) 的 `_schedule_decode_batch()` 调用 `allocate_slots`
 - Engine 构建：[execution_engine.py](../../executor/core/engine/execution_engine.py) 的 `_build_model_inputs()` 调用 `prepare_block_tables` 和 `prepare_slot_mapping`
 
-#### 5.6.3 释放链路验证
+##### 5.7.3 释放链路验证
 
 | 步骤 | 函数位置 | 验证内容 |
 |-----|---------|---------|
@@ -644,3 +678,153 @@ slot_mapping = forward_metadata.slot_mapping[self.attn_type]
 | 3 | `BlockPool.free_blocks()` → [block_pool.py](../../executor/core/kv_cache/block_pool.py) | block 正确回收，无重复释放 |
 
 **调用点**：[scheduler.py](../../executor/core/scheduler/scheduler.py) 的 `_process_batch_output()` 在请求完成时调用 `kv_cache_manager.free(request.request_id)`
+
+---
+
+## 第二部分：不通过 KVCacheManager、由模型自行维护 Cache
+
+除上述通过 `KVCacheManager` 管理 Cache 的方式外，框架还支持不创建 `KVCacheManager`、由模型自行维护 KV Cache 的方式。该方式主要用于暂未接入 `KVCacheManager` 管理体系的离线推理模型，如果模型需要支持 online 推理功能，仍应优先参考[通过 KVCacheManager 管理 Cache](#第一部分通过-kvcachemanager-管理-cache)进行 Cache 管理。
+
+### 1. 设计思路
+
+#### 1.1 初始化流程
+
+模型自管 Cache 的初始化入口是 [model_worker.py](../../executor/core/model_worker/model_worker.py) 中的 `ModelWorker.init_kvcache()`：
+
+```python
+def init_kvcache(self):
+    batch_size = self.infer_config.scheduler_config.batch_size_per_dp_rank
+    cache_seq_len = self.infer_config.data_config.input_truncated_len + \
+        self.infer_config.scheduler_config.max_new_tokens
+
+    if hasattr(self.model, "init_cache"):
+        self.model.init_cache(self.device)
+    else:
+        for module in self.model.modules():
+            if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
+                module.k_cache = torch.empty((batch_size, cache_seq_len, *module.cache_unit), ...)
+                module.v_cache = torch.empty((batch_size, cache_seq_len, *module.cache_unit), ...)
+```
+
+因此自管 Cache 有两种实现形态：
+
+| 实现形态 | 触发条件 | 说明 |
+|---------|---------|------|
+| 模型实现 `init_cache(device)` | `hasattr(self.model, "init_cache")` 为真 | Cache tensor 完全由模型创建并挂载到对应层 |
+| 框架 legacy 连续 Cache 分配 | 模型未实现 `init_cache(device)`，且 attention 模块包含 `k_cache`、`v_cache`、`cache_unit` | 框架按 `[batch_size, cache_seq_len, *cache_unit]` 为每层分配 `k_cache` / `v_cache` |
+
+如果启用了 MTP，则主模型和 MTP 模型都会分别调用 `init_kvcache()`；两侧需要各自保证 Cache 初始化和后续访问逻辑正确。
+
+#### 1.2 运行时元数据差异
+
+模型自管 Cache 路径下，`self.kvcache_manager` 为 `None`，因此 [execution_engine.py](../../executor/core/engine/execution_engine.py) 的 `_build_model_inputs()` 不会调用 `prepare_block_tables()` 和 `prepare_slot_mapping()`：
+
+```python
+if self.kvcache_manager:
+    block_tables = prepare_block_tables(...)
+    slot_mapping = prepare_slot_mapping(...)
+else:
+    block_tables = None
+    slot_mapping = None
+```
+
+最终写入 `ForwardMetaData` 的 `block_table` 和 `slot_mapping` 均为 `None`。模型 forward 不能再依赖 `forward_metadata.block_table[self.attn_type]` 或 `forward_metadata.slot_mapping[self.attn_type]` 来定位 Cache，而需要自行根据长度信息和内部索引更新 Cache。
+
+在 prefill 阶段，框架会额外向模型 forward 入参中传入 `request_offset`：
+
+```python
+if is_prefill and not self.kvcache_manager:
+    model_inputs.update({
+        "request_offset": request_offset,
+    })
+```
+
+`request_offset` 来自 scheduler 构造 prefill batch 时的 `prefilled_request_count`，表示当前 prefill batch 第一个请求对应的全局 Cache slot 偏移。模型可以结合 batch 内请求长度计算写入位置。
+
+decode 阶段不再额外传入 `request_offset`，模型通常根据 `forward_metadata.kv_len`、`position_ids` 或其他参数来定位新增 token 的写入位置。
+
+---
+
+### 2. 模型自行维护 Cache 的 Checklist
+
+本节提供新模型不接入 `KVCacheManager`、由模型自行维护 Cache 的完整步骤清单，涵盖必选和可选任务，帮助开发者定位具体代码位置。
+
+#### 2.1 在模型中初始化 Cache【必选】
+
+模型可以选择实现 `init_cache(device)`，或使用框架 legacy 连续 Cache 分配逻辑。两种方式二选一。
+
+##### 2.1.1 实现 `init_cache(device)`【推荐】
+
+当模型存在非标准 Cache 个数、特殊 dtype、量化 Cache、indexer Cache 或临时 Cache 时，推荐在模型类中实现 `init_cache(device)`。
+
+**调用位置**：[model_worker.py](../../executor/core/model_worker/model_worker.py) 的 `init_kvcache()`：
+
+```python
+if hasattr(self.model, "init_cache"):
+    self.model.init_cache(self.device)
+```
+
+需要在模型类中实现 `init_cache(self, device)` 函数：
+- 在 `init_cache()` 内创建所有需要的 Cache tensor，并挂载到对应 attention 层或模型内部状态
+- Cache 的 batch 容量与 `scheduler_config.batch_size_per_dp_rank` 或模型内部 slot 管理策略一致
+- Cache 的最大长度覆盖 `data_config.input_truncated_len + scheduler_config.max_new_tokens`
+
+##### 2.1.2 使用 legacy `cache_unit` 自动分配【可选】
+
+如果模型只存在标准连续 `k_cache` / `v_cache`，且默认 shape 可以满足 forward 读写需求，可以让框架自动分配 Cache。
+
+**调用位置**：[model_worker.py](../../executor/core/model_worker/model_worker.py) 的 `init_kvcache()`：
+
+```python
+for module in self.model.modules():
+    if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
+        module.k_cache = torch.empty((batch_size, cache_seq_len, *module.cache_unit), ...)
+        module.v_cache = torch.empty((batch_size, cache_seq_len, *module.cache_unit), ...)
+```
+
+在模型类中无需新建函数，只需要按照说明在每个 attention 模块定义 `self.k_cache` 、`self.v_cache` 占位字段和 Cache 单元后缀 shape `self.cache_unit`:
+
+| 字段 | 说明 |
+|-----|------|
+| `k_cache` | key cache 占位字段，由框架分配后写入真实 tensor |
+| `v_cache` | value cache 占位字段，由框架分配后写入真实 tensor |
+| `cache_unit` | 单 token Cache 的后缀 shape，最终分配形状为 `[batch_size, cache_seq_len, *cache_unit]` |
+
+#### 2.2 在模型侧维护 Cache 索引【必选】
+
+##### 2.2.1 处理 prefill Cache 写入
+
+模型自管 Cache 路径下，prefill 阶段框架会额外传入 `request_offset`，用于标识当前 prefill batch 的全局 Cache slot 起始偏移。
+
+**生成位置**：[execution_engine.py](../../executor/core/engine/execution_engine.py) 的 `_build_model_inputs()`：
+
+```python
+if is_prefill and not self.kvcache_manager:
+    model_inputs.update({
+        "request_offset": request_offset,
+    })
+```
+因此，模型 `forward()` 需要能接收 `request_offset`，或通过 `**kwargs` 接收该参数，模型内需要将 `request_offset` 作为起始位置并往后写入 Cache，避免不同请求写入区间相互覆盖。
+
+##### 2.2.2 处理 decode Cache 写入
+
+decode 阶段不再额外传入 `request_offset`，模型需要根据 `forward_metadata` 或内部状态定位新增 token，例如，可以根据 `forward_metadata.kv_len`、`position_ids` 等参数计算出模型更新 Cache 的 `block_table` 和 `slot_mapping`。
+
+#### 2.3 验证完整链路【必选】
+
+##### 2.3.1 初始化链路验证
+
+| 步骤 | 函数位置 | 验证内容 |
+|-----|---------|---------|
+| 1 | `ModelWorker.get_cache_info()` → [model_worker.py](../../executor/core/model_worker/model_worker.py) | 返回 `None`，不会创建 `KVCacheManager` |
+| 2 | `ModelWorker.init_kvcache()` → [model_worker.py](../../executor/core/model_worker/model_worker.py) | 正确进入模型自管 Cache 初始化路径 |
+| 3 | `model.init_cache(device)` 或 legacy `cache_unit` 分配 | Cache tensor shape / dtype / device 正确 |
+
+##### 2.3.2 运行期链路验证
+
+| 步骤 | 验证内容 |
+|-----|---------|
+| 1 | prefill 阶段根据 `request_offset` 和 batch 内请求序号写入正确 Cache slot，不同请求写入区间互不覆盖 |
+| 2 | decode 阶段根据 `forward_metadata.kv_len`、`position_ids` 等参数写入正确位置 |
+| 3 | 使用目标 `input_truncated_len` 和 `max_new_tokens` 验证不会越界写 Cache |
+| 4 | 如支持 `npugraph_ex` / `ge_graph`，确认 warmup 后 decode 不重编译且精度正常 |

@@ -29,7 +29,7 @@ from executor.core.config import InferenceConfig
 from executor.core.model_worker.model_worker import ModelWorker
 from executor.core.kv_cache.cache_utils import prepare_slot_mapping
 from executor.utils.forward_metadata import set_forward_metadata, get_forward_metadata
-from ..types_.types import MTPInfo, Batch
+from ..forward_data_info import MTPInfo, Batch
 
 
 logger = logging.getLogger(__name__)

@@ -18,7 +18,7 @@ from __future__ import annotations
 import logging
 
 from executor.core.scheduler import Scheduler
-from executor.core.types_.types import StepOutput
+from executor.core.forward_data_info import StepOutput
 from executor.online.scheduler.queues import (
     DecodePreallocQueue,
     DecodeTransferQueue,

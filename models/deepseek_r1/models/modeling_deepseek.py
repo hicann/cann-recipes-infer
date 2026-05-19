@@ -47,8 +47,8 @@ from executor.core.config import InferenceConfig, CommManager
 from executor.core.kv_cache.cache_info import CacheEntry, LayerCacheInfo, ModelCacheInfo
 from executor.model_loader.weight_utils import default_weight_loader
 from executor.utils import npu_wait_tensor, superkernel_scope, MicroBatchMode, align_up
-from executor.utils import npu_stream_switch as npu_stream_switch_gegraph
-from executor.utils.stream_utils import record_event, wait_event, record_stream, npu_stream_switch
+from executor.utils.stream_utils import record_event, wait_event, record_stream, \
+                                        npu_stream_switch, npu_stream_switch_gegraph
 from module.linear import (
     ColumnParallelLinear,
     ReplicatedLinear,
@@ -554,7 +554,8 @@ class DeepseekV3MoE(nn.Module):
         return hidden_states
 
     def shared_experts_down_proj(self, intermediate_hidden_states, hidden_states_ordered_by_experts, pertoken_scale):
-        with npu_stream_switch_gegraph(self.enable_gegraph_and_multistream, "22"):
+        # Only used when multi-stream is enabled and GE graph is used on the decode phase.
+        with npu_stream_switch_gegraph(True, "22"):
             intermediate_hidden_states = npu_wait_tensor(
                 True, intermediate_hidden_states, hidden_states_ordered_by_experts
             )
@@ -718,7 +719,7 @@ class DeepseekV3MoE(nn.Module):
         expand_x, dynamic_scale, expand_idx, expert_token_num, ep_recv_counts, tp_recv_counts = output[:6]
 
         if self.enable_gegraph_and_multistream:
-            with npu_stream_switch_gegraph(self.enable_gegraph_and_multistream, "22"):
+            with npu_stream_switch_gegraph(True, "22"):
                 merged_x = npu_wait_tensor(True, merged_x, expand_x)
                 if "a8" in self.mm_quant_mode:
                     intermediate_hidden_states, pertoken_scale = torch_npu.npu_dequant_swiglu_quant(

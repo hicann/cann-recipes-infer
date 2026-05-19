@@ -25,7 +25,7 @@ VALIDATE_ABS_PATH=$(realpath "${VALIDATE_ABS_PATH}")
 source ${SET_ENV_ABS_PATH}
 source ${FUNCTION_ABS_PATH}
 
-# Set defaults here (edit directly) or override via command-line args (--model / --mode / --pd_role / --yaml).
+# Set defaults here (edit directly) or override via command-line args (--model / --mode / --pd-role / --yaml).
 MODEL="deepseek_r1"                           # model directory name under models/ (e.g. deepseek_r1, qwen3_moe, gpt_oss)
 MODE="offline"                                 # inference mode: "online" (prefill-decode disaggregation), or offline
 PD_ROLE=""                                     # required when MODE=online: prefill / decode
@@ -39,17 +39,18 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --model)   MODEL="$2";     shift 2 ;;
         --mode)    MODE="$2";      shift 2 ;;
-        --pd_role) PD_ROLE="$2";   shift 2 ;;
+        --pd-role) PD_ROLE="$2";   shift 2 ;;
         --yaml)         YAML_FILE="$2";      shift 2 ;;
-        --p_yaml_name) P_YAML_NAME="$2";    shift 2 ;;
-        --d_yaml_name) D_YAML_NAME="$2";    shift 2 ;;
-        --engine_backend) ENGINE_BACKEND="$2"; shift 2 ;;
+        --p-yaml-name) P_YAML_NAME="$2";    shift 2 ;;
+        --d-yaml-name) D_YAML_NAME="$2";    shift 2 ;;
+        --engine-backend) ENGINE_BACKEND="$2"; shift 2 ;;
         -h|--help)
-            echo "Usage: $0 --model <name> --mode <online|offline> [--pd_role <role>] [--yaml <file>] [--p_yaml_name <name>] [--d_yaml_name <name>] [--engine_backend <backend>]"
+            echo "Usage: $0 --model <name> --mode <online|offline> [--pd-role <role>] [--yaml <file>] [--p-yaml-name <name>] [--d-yaml-name <name>] [--engine-backend <backend>]"
             echo ""
             echo "  offline: $0 --model qwen3_moe --yaml qwen3_235b_16tp.yaml"
-            echo "  online:  $0 --model deepseek_r1 --mode online --pd_role prefill"
-            echo "  online (mooncake KV transfer): $0 --model gpt_oss --mode online --pd_role prefill --engine_backend mooncake"
+            echo "  online:  $0 --model deepseek_r1 --mode online --pd-role prefill"
+            echo "  online (custom yaml): $0 --model deepseek_r1 --mode online --pd-role prefill --p-yaml-name my_prefill.yaml --d-yaml-name my_decode.yaml"
+            echo "  online (mooncake KV transfer): $0 --model gpt_oss --mode online --pd-role prefill --engine-backend mooncake"
             exit 0
             ;;
         *) echo "Unknown option: $1"; exit 1 ;;

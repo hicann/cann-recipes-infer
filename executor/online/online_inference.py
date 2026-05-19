@@ -27,7 +27,7 @@ import torch.distributed as dist
 import zmq
 
 from executor.core.config import InferenceConfig
-from executor.core.types_.types import SamplingParams
+from executor.core.forward_data_info import SamplingParams
 from executor.offline.offline_inference import OfflineInference
 from executor.online.constants import zmq_ports_for_role
 from executor.online.kv_transfer import KVTransferManager, MetadataBufferPool

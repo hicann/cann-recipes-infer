@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import torch
+import torchair as tng
 
 
 class FakeContextManager:
@@ -30,6 +31,14 @@ class FakeContextManager:
 def npu_stream_switch(switch_flag: bool, stream: torch.npu.Stream):
     if switch_flag:
         return torch.npu.stream(stream)
+    else:
+        return FakeContextManager()
+
+
+def npu_stream_switch_gegraph(switch_flag: bool, stream_tag: str, stream_priority: int = 0):
+    '''Switch stream using tng.scope.npu_stream_switch on GE Graph.'''
+    if switch_flag:
+        return tng.scope.npu_stream_switch(stream_tag, stream_priority)
     else:
         return FakeContextManager()
 

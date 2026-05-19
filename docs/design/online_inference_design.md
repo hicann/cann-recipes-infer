@@ -110,7 +110,7 @@ Prefill 侧 **node 0**（`VC_TASK_INDEX=0`）额外起一个 Router 进程（`fu
 
 ### 2.4 集群拉起
 
-每个节点本地运行 `bash executor/scripts/infer.sh --model <name> --mode online --pd_role {prefill|decode}`，没有中心调度器；下列时序图描述各节点启动后**并行**进行的活动以及跨节点的 bootstrap 注册调用。
+每个节点本地运行 `bash executor/scripts/infer.sh --model <name> --mode online --pd-role {prefill|decode}`，没有中心调度器；下列时序图描述各节点启动后**并行**进行的活动以及跨节点的 bootstrap 注册调用。
 
 ```mermaid
 sequenceDiagram
@@ -642,12 +642,12 @@ BOOTSTRAP_PORT    = 18800
 |---|---|---|---|
 | `--model` | 是 | 模型目录名，对应 `models/` 下的子目录 | `deepseek_r1`, `qwen3_moe`, `gpt_oss` 等 |
 | `--mode` | 是 | 推理模式，在线场景固定为 `online` | `online` |
-| `--pd_role` | 是 | 当前节点的 PD 角色 | `prefill` / `decode` |
-| `--p_yaml_name` | 否 | 覆盖默认的 prefill yaml 文件名 | 如 `my_prefill.yaml`，默认 `${MODEL}_pd/prefill.yaml` |
-| `--d_yaml_name` | 否 | 覆盖默认的 decode yaml 文件名 | 如 `my_decode.yaml`，默认 `${MODEL}_pd/decode.yaml` |
-| `--engine_backend` | 否 | KV 传输引擎后端 | `memfabric` / `mooncake` |
+| `--pd-role` | 是 | 当前节点的 PD 角色 | `prefill` / `decode` |
+| `--p-yaml-name` | 否 | 覆盖默认的 prefill yaml 文件名 | 如 `my_prefill.yaml`，默认 `${MODEL}_pd/prefill.yaml` |
+| `--d-yaml-name` | 否 | 覆盖默认的 decode yaml 文件名 | 如 `my_decode.yaml`，默认 `${MODEL}_pd/decode.yaml` |
+| `--engine-backend` | 否 | KV 传输引擎后端 | `memfabric` / `mooncake` |
 
-YAML 文件统一存放在 `models/<MODEL>/config/` 目录下。默认情况下，脚本自动拼接路径为 `models/<MODEL>/config/${MODEL}_pd/prefill.yaml` 和 `decode.yaml`；仅当需要指定自定义文件名时才传入 `--p_yaml_name` / `--d_yaml_name`。
+YAML 文件统一存放在 `models/<MODEL>/config/` 目录下。默认情况下，脚本自动拼接路径为 `models/<MODEL>/config/${MODEL}_pd/prefill.yaml` 和 `decode.yaml`；仅当需要指定自定义文件名时才传入 `--p-yaml-name` / `--d-yaml-name`。
 
 指定 `--engine_backend mooncake` 时，`function.sh` 调用 `server.py` 追加 `--engine-backend mooncake`；`KVTransferManager` 通过 `build_transfer_engine` 选 `MooncakeAscendTransferEngine`，包装 `mooncake.engine.TransferEngine`（protocol=`ascend`，metadata mode=`P2PHANDSHAKE`）。`mooncake` 模块只在该路径下被 import。
 
@@ -657,15 +657,15 @@ HIXL HCCS IPC 要求注册内存基址 2 MiB 对齐。KV cache 和 metadata buff
 
 1. 在各 Prefill 节点执行：
    ```bash
-   bash executor/scripts/infer.sh --model <name> --mode online --pd_role prefill [--p_yaml_name <name>] [--d_yaml_name <name>]
+   bash executor/scripts/infer.sh --model <name> --mode online --pd-role prefill [--p-yaml-name <name>] [--d-yaml-name <name>]
    ```
 
 2. 在各 Decode 节点执行：
    ```bash
-   bash executor/scripts/infer.sh --model <name> --mode online --pd_role decode [--p_yaml_name <name>] [--d_yaml_name <name>]
+   bash executor/scripts/infer.sh --model <name> --mode online --pd-role decode [--p-yaml-name <name>] [--d-yaml-name <name>]
    ```
 
-> 同机 PD 分卡：分两次调用 `infer.sh`，在调用前设置 `ASCEND_RT_VISIBLE_DEVICES` 隔离 NPU，且两次调用分别传入 `--pd_role prefill` 和 `--pd_role decode`。
+> 同机 PD 分卡：分两次调用 `infer.sh`，在调用前设置 `ASCEND_RT_VISIBLE_DEVICES` 隔离 NPU，且两次调用分别传入 `--pd-role prefill` 和 `--pd-role decode`。
 
 ### 7.4 Mooncake 安装
 

@@ -100,7 +100,7 @@ source ${cann_path}/bin/setenv.bash
    - 配置`executor/scripts/infer.sh`脚本中的参数。
 
      离线推理模式下，将`--yaml`设置为`config`文件夹下YAML文件名称，例如`decode_r1_rank_16_16ep_a8w8.yaml`。
-     在线推理模式下，将`--mode`设置为`online`，`--pd_role`设置为`prefill`或`decode`。
+     在线推理模式下，将`--mode`设置为`online`，`--pd-role`设置为`prefill`或`decode`，可通过`--p-yaml-name`和`--d-yaml-name`指定prefill/decode的YAML文件。
 
 2. 准备输入prompt。
 
@@ -135,26 +135,28 @@ source ${cann_path}/bin/setenv.bash
    | `--model` | 模型目录名，对应 `models/` 下的子目录 | `deepseek_r1` |
    | `--mode` | 推理模式 | `offline`（离线推理）/ `online`（在线PD分离推理） |
    | `--yaml` | 离线模式：yaml 文件名 | `decode_r1_rank_16_16ep_a8w8.yaml` |
-   | `--pd_role` | 在线模式：PD 部署角色 | `prefill` / `decode` |
-   | `--p_yaml_name` | 可选，在线模式：prefill yaml 文件名，不传则默认 `deepseek_r1_pd/prefill.yaml` | `deepseek_r1_pd/prefill.yaml` |
-   | `--d_yaml_name` | 可选，在线模式：decode yaml 文件名，不传则默认 `deepseek_r1_pd/decode.yaml` | `deepseek_r1_pd/decode.yaml` |
+   | `--pd-role` | 在线模式：PD 部署角色 | `prefill` / `decode` |
+   | `--p-yaml-name` | 可选，在线模式：prefill yaml 文件名，不传则默认 `deepseek_r1_pd/prefill.yaml` | `deepseek_r1_pd/prefill.yaml` |
+   | `--d-yaml-name` | 可选，在线模式：decode yaml 文件名，不传则默认 `deepseek_r1_pd/decode.yaml` | `deepseek_r1_pd/decode.yaml` |
 
    **使用方式一：命令行传参**
    ```shell
    # offline 模式
    bash executor/scripts/infer.sh --model deepseek_r1 --yaml decode_r1_rank_16_16ep_a8w8.yaml
    # online 模式
-   bash executor/scripts/infer.sh --model deepseek_r1 --mode online --pd_role prefill
+   bash executor/scripts/infer.sh --model deepseek_r1 --mode online --pd-role prefill
+   # online 模式（指定 prefill/decode yaml）
+   bash executor/scripts/infer.sh --model deepseek_r1 --mode online --pd-role prefill --p-yaml-name deepseek_r1_pd/prefill.yaml --d-yaml-name deepseek_r1_pd/decode.yaml
    ```
 
    如需查看参数说明，可以执行 `bash executor/scripts/infer.sh --help`。
 
    **使用方式二：直接修改脚本默认值后执行**
-    编辑 executor/scripts/infer.sh，按照需求修改 MODEL / MODE / YAML_FILE / PD_ROLE 等参数的默认值，例如：
+    编辑 executor/scripts/infer.sh，按照需求修改 MODEL / MODE / YAML_FILE / PD_ROLE / P_YAML_NAME / D_YAML_NAME 等参数的默认值，例如：
     ```shell
-      MODEL=deepseek_r1
-      MODE=offline
-      YAML_FILE=decode_r1_rank_16_16ep_a8w8.yaml
+    MODEL=deepseek_r1
+    MODE=offline
+    YAML_FILE=decode_r1_rank_16_16ep_a8w8.yaml
     ```
     保存后直接执行：
    ```shell

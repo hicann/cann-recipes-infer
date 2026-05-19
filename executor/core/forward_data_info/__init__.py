@@ -13,8 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Types module"""
+"""Forward data info module"""
 
-from executor.core.types_.types import GenerationOutput, Request, StepOutput, Batch, MTPInfo
+from .forward_data_info import GenerationOutput, Request, StepOutput, Batch, MTPInfo, SamplingParams
 
-__all__ = ["GenerationOutput", "Request", "StepOutput", "Batch", "MTPInfo"]
+__all__ = ["GenerationOutput", "Request", "StepOutput", "Batch", "MTPInfo", "SamplingParams"]
