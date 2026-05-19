@@ -98,6 +98,8 @@
    | `--p-yaml-name` | 可选，在线模式：prefill yaml 文件名，不传则默认 `gpt_oss_pd/prefill.yaml` | `gpt_oss_pd/prefill.yaml` |
    | `--d-yaml-name` | 可选，在线模式：decode yaml 文件名，不传则默认 `gpt_oss_pd/decode.yaml` | `gpt_oss_pd/decode.yaml` |
 
+   > 在线模式 IP 等更多配置参见 [executor 设计文档 §5.1 启动方式](../../docs/design/executor_design.md#51-启动方式)。
+
    **使用方式一：命令行传参**
    ```shell
    # offline 模式

@@ -255,8 +255,28 @@ KV cache 采用 paged attention 三层结构，定义在 `executor/core/kv_cache
 
 ### 4.1 启动方式
 
+离线推理通过统一脚本 `executor/scripts/infer.sh` 拉起，各参数说明如下：
+
+| 参数 | 必填 | 含义 | 取值 |
+|---|---|---|---|
+| `--model` | 是 | 模型目录名，对应 `models/` 下的子目录 | 如 `deepseek_r1` |
+| `--mode` | 否 | 推理模式，默认 `offline` | `offline` |
+| `--yaml` | 是 | YAML 文件名，从 `models/<name>/config/` 读取 | 如 `decode_r1_rank_16_16ep_a8w8.yaml` |
+
+**启动前置：**
+
+1. 在 `executor/scripts/set_env.sh` 中配置 `IPs`，填入所有节点的 IP（按 rank 顺序、空格分隔，首个为 master 节点；单机场景填本机 IP 一项即可），例如：
+   ```bash
+   IPs=('xxx.xxx.xxx.xxx' 'xxx.xxx.xxx.xxx')
+   ```
+2. YAML 文件存放在 `models/<name>/config/` 下，将其中的 `model_path` 改为权重文件存放路径。
+
+**启动步骤：**
+
+在每个节点上执行：
+
 ```bash
-bash executor/scripts/infer.sh --model <model> --mode offline [--yaml <name>]
+bash executor/scripts/infer.sh --model <model> [--mode offline] [--yaml <name>]
 ```
 
 ### 4.2 初始化时序图
@@ -357,7 +377,46 @@ Scheduler._process_batch_output()                       ← 状态机推进：Pr
 
 代码层面 `disaggregation_mode ∈ {PREFILL, DECODE}` 即在线，`NONE` 即离线，没有prefill+decode 合并的在线模式。在线推理主要用于 benchmark 验证，不以吞吐为核心目标。
 
-### 5.1 进程结构与组件
+组件设计详见 [online_inference_design.md](online_inference_design.md)。
+
+### 5.1 启动方式
+
+在线（PD 分离）推理通过统一脚本 `executor/scripts/infer.sh` 拉起，各参数说明如下：
+
+| 参数 | 必填 | 含义 | 取值 |
+|---|---|---|---|
+| `--model` | 是 | 模型目录名，对应 `models/` 下的子目录 | `deepseek_r1`, `qwen3_moe`, `gpt_oss` |
+| `--mode` | 是 | 推理模式，在线场景固定为 `online` | `online` |
+| `--pd-role` | 否 | 当前节点的 PD 角色；不传时 shell 从 local IP 推断（仅 `PREFILL_IPS` / `DECODE_IPS` 不重叠时可用） | `prefill` / `decode` |
+| `--p-yaml-name` | 否 | 覆盖默认的 prefill yaml 文件名 | 默认 `${MODEL}_pd/prefill.yaml` |
+| `--d-yaml-name` | 否 | 覆盖默认的 decode yaml 文件名 | 默认 `${MODEL}_pd/decode.yaml` |
+| `--engine-backend` | 否 | KV 传输引擎后端 | `memfabric` / `mooncake` |
+
+YAML 文件统一存放在 `models/<MODEL>/config/` 目录下。默认情况下，脚本自动拼接路径为 `models/<MODEL>/config/${MODEL}_pd/prefill.yaml` 和 `decode.yaml`；仅当需要指定自定义文件名时才传入 `--p-yaml-name` / `--d-yaml-name`。
+
+**启动前置：**
+
+1. 在 `executor/scripts/set_env.sh` 中配置 `PREFILL_IPS` / `DECODE_IPS`，分别填入所有 Prefill / Decode 节点的 IP（与离线 `IPs` 同种格式：按 rank 顺序、空格分隔；首个 IP 为该角色的实例 leader，Prefill 首节点额外承载 Router 与 Bootstrap server），例如：
+   ```bash
+   PREFILL_IPS=('xxx.xxx.xxx.xxx' 'xxx.xxx.xxx.xxx')
+   DECODE_IPS=('xxx.xxx.xxx.xxx')
+   ```
+2. `prefill.yaml` 与 `decode.yaml` 各自独立维护，`parallel_config.world_size` 是**每实例** world size。
+3. 同机部署（PREFILL/DECODE 列表重叠）时：调用前需设置 `ASCEND_RT_VISIBLE_DEVICES` 隔离 NPU，并显式传 `--pd-role`（此时无法从 local IP 推断角色）。
+
+**启动步骤：**
+
+1. 在各 Prefill 节点执行：
+   ```bash
+   bash executor/scripts/infer.sh --model <name> --mode online --pd-role prefill
+   ```
+
+2. 在各 Decode 节点执行：
+   ```bash
+   bash executor/scripts/infer.sh --model <name> --mode online --pd-role decode
+   ```
+
+### 5.2 进程结构与组件
 
 每节点由 `executor/online/server.py main()` 拉起一个父进程，父进程根据 `--role` 参数 spawn 出 N 个 worker 子进程（一卡一 worker）。父进程跑 FastAPI HTTP + `DPDispatcher`（通过 ZMQ 把请求派发给 worker，再把 worker 算出的结果收回父进程），worker 子进程跑 `OnlineInference` 推理循环（继承 `OfflineInference`）。
 
@@ -375,7 +434,7 @@ Scheduler._process_batch_output()                       ← 状态机推进：Pr
 | KVTransferManager | `kv_transfer/` | 每个 worker 子进程 | 控制面走 ZMQ，数据面走 RDMA / HCCL，metadata 直写对端 buffer |
 | PD Scheduler | `scheduler/{prefill,decode}.py` | 每个 worker 子进程，替换基类 `Scheduler` | Prefill 完成后释放 KV；Decode 等待 KV 到齐后才进入计算 |
 
-### 5.2 请求路径
+### 5.3 请求路径
 
 ```
 Client ──POST /generate──▶ Router (prefill-node-0:8000)
@@ -395,23 +454,6 @@ Client ──POST /generate──▶ Router (prefill-node-0:8000)
 ```
 
 `bootstrap_room` 是请求级唯一 ID，prefill / decode 两侧用它关联同一请求。Router 用 `asyncio.gather` 并发 POST，等到 Decode 端 200 后取其响应 JSON 作为返回 body 透传给 Client；Prefill 端的 HTTP 响应在 Router 内被丢弃，仅用于检测后端是否在线（连接异常时 Router 抛 503）。
-
-### 5.3 启动方式
-
-启动通过 `executor/scripts/infer.sh` 调用 `executor/scripts/function.sh`：
-
-```bash
-# Prefill 节点（local IP 必须在 PREFILL_IPS 中）
-bash executor/scripts/infer.sh --model <model> --mode online --pd-role prefill
-
-# Decode 节点（local IP 必须在 DECODE_IPS 中）
-bash executor/scripts/infer.sh --model <model> --mode online --pd-role decode
-```
-
-1. `PREFILL_IPS` 与 `DECODE_IPS` 由 `executor/scripts/set_env.sh` 维护；
-2. 每角色用独立 YAML（`prefill.yaml` / `decode.yaml`），其 `parallel_config.world_size` 是**每实例** world size；
-3. `PREFILL_IPS` 与 `DECODE_IPS` 不重叠时，可省略 `--pd-role`，shell 会从 local IP 自动推断角色；
-4. 同机部署（PREFILL/DECODE 列表重叠）时必须显式传，并通过 `ASCEND_RT_VISIBLE_DEVICES` 隔离 NPU。
 
 ### 5.4 离线与在线的差异
 

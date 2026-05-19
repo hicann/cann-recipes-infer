@@ -88,6 +88,8 @@ Qwen3-MoE模型是2025年开源的大语言模型，包括Qwen3-235B-A22B与Qwen
    | `--p-yaml-name` | 可选，在线模式：prefill yaml 文件名，不传则默认 `qwen3_moe_pd/prefill.yaml` | `qwen3_moe_pd/prefill.yaml` |
    | `--d-yaml-name` | 可选，在线模式：decode yaml 文件名，不传则默认 `qwen3_moe_pd/decode.yaml` | `qwen3_moe_pd/decode.yaml` |
 
+   > 在线模式 IP 等更多配置参见 [executor 设计文档 §5.1 启动方式](../../docs/design/executor_design.md#51-启动方式)。
+
    **使用方式一：命令行传参**
    ```shell
    # offline 模式

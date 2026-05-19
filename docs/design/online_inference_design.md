@@ -636,36 +636,11 @@ BOOTSTRAP_PORT    = 18800
 
 ### 7.3 启动命令
 
-在线推理统一通过 `executor/scripts/infer.sh` 拉起，各参数说明如下：
+启动命令、参数说明与前置条件参见 [executor_design.md §5.1 启动方式](executor_design.md#51-启动方式)。
 
-| 参数 | 必填 | 含义 | 取值 |
-|---|---|---|---|
-| `--model` | 是 | 模型目录名，对应 `models/` 下的子目录 | `deepseek_r1`, `qwen3_moe`, `gpt_oss` 等 |
-| `--mode` | 是 | 推理模式，在线场景固定为 `online` | `online` |
-| `--pd-role` | 是 | 当前节点的 PD 角色 | `prefill` / `decode` |
-| `--p-yaml-name` | 否 | 覆盖默认的 prefill yaml 文件名 | 如 `my_prefill.yaml`，默认 `${MODEL}_pd/prefill.yaml` |
-| `--d-yaml-name` | 否 | 覆盖默认的 decode yaml 文件名 | 如 `my_decode.yaml`，默认 `${MODEL}_pd/decode.yaml` |
-| `--engine-backend` | 否 | KV 传输引擎后端 | `memfabric` / `mooncake` |
-
-YAML 文件统一存放在 `models/<MODEL>/config/` 目录下。默认情况下，脚本自动拼接路径为 `models/<MODEL>/config/${MODEL}_pd/prefill.yaml` 和 `decode.yaml`；仅当需要指定自定义文件名时才传入 `--p-yaml-name` / `--d-yaml-name`。
-
-指定 `--engine_backend mooncake` 时，`function.sh` 调用 `server.py` 追加 `--engine-backend mooncake`；`KVTransferManager` 通过 `build_transfer_engine` 选 `MooncakeAscendTransferEngine`，包装 `mooncake.engine.TransferEngine`（protocol=`ascend`，metadata mode=`P2PHANDSHAKE`）。`mooncake` 模块只在该路径下被 import。
+指定 `--engine-backend mooncake` 时，`function.sh` 调用 `server.py` 追加 `--engine-backend mooncake`；`KVTransferManager` 通过 `build_transfer_engine` 选 `MooncakeAscendTransferEngine`，包装 `mooncake.engine.TransferEngine`（protocol=`ascend`，metadata mode=`P2PHANDSHAKE`）。`mooncake` 模块只在该路径下被 import。
 
 HIXL HCCS IPC 要求注册内存基址 2 MiB 对齐。KV cache 和 metadata buffer 在分配时统一用 `align_memory(tensor, alignment)`，over-allocate `alignment` 个元素后 `narrow(0, 0, numel)` 切到对齐起点。
-
-**启动步骤：**
-
-1. 在各 Prefill 节点执行：
-   ```bash
-   bash executor/scripts/infer.sh --model <name> --mode online --pd-role prefill [--p-yaml-name <name>] [--d-yaml-name <name>]
-   ```
-
-2. 在各 Decode 节点执行：
-   ```bash
-   bash executor/scripts/infer.sh --model <name> --mode online --pd-role decode [--p-yaml-name <name>] [--d-yaml-name <name>]
-   ```
-
-> 同机 PD 分卡：分两次调用 `infer.sh`，在调用前设置 `ASCEND_RT_VISIBLE_DEVICES` 隔离 NPU，且两次调用分别传入 `--pd-role prefill` 和 `--pd-role decode`。
 
 ### 7.4 Mooncake 安装
 
