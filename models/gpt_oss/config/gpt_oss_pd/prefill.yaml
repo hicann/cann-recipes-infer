@@ -1,5 +1,5 @@
 model_config:
-  model_name: "gpt-oss"
+  model_name: "gpt_oss"
   model_path: "/data/models/gpt-oss-20b-bf16"
   exe_mode: "eager"  # ["eager"]
   enable_profiler: False  # [False, True]

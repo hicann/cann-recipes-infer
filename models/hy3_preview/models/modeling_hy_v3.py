@@ -30,7 +30,7 @@ import torch_npu
 import torch.distributed as dist
 
 from executor.model_loader.weight_utils import default_weight_loader
-from executor.utils import superkernel_scope, npu_stream_switch
+from executor.utils import calc_moe_hccl_buffer_size, superkernel_scope, npu_stream_switch
 from executor.utils.forward_metadata import ForwardMetaData, get_forward_metadata
 from executor.core.config import InferenceConfig, CommManager
 from module.linear import (
@@ -741,7 +741,7 @@ class HYV3MoE(nn.Module):
 
     def _moe_ep_mc2_decode(self, hidden_states_flat, topk_ids, topk_weight):
         """MC2 dispatch/combine for decode — graph-compatible, no data-dependent splits."""
-        moe_ep_group_name = self.comm_manager.get_group_name("moe_ep_group")
+        moe_ep_group_name = self.comm_manager.get_group_name("moe_ep_group_mc2")
         ep_rank = self.comm_manager.get_rank("moe_ep_group") if self.moe_ep_size > 1 else 0
 
         dispatch_kwargs = {
@@ -1081,6 +1081,7 @@ class HYV3ForCausalLM(nn.Module):
         self.moe_ep_size = infer_config.parallel_config.moe_ep_size
         self.lmhead_tp_size = infer_config.parallel_config.lmhead_tp_size
 
+        self.init_parallel_comm_group()
         self.model = HYV3Model(config, infer_config, comm_manager, prefix="model")
 
         # LM Head with ColumnParallelLinear
@@ -1093,6 +1094,52 @@ class HYV3ForCausalLM(nn.Module):
             tp_rank=comm_manager.get_rank("lmhead_tp_group") if self.lmhead_tp_size > 1 else 0,
             prefix="lm_head",
         )
+
+    def init_parallel_comm_group(self):
+        self.comm_manager.register_group(
+            name="attn_tp_group",
+            group_num=self.world_size // self.attn_tp_size,
+            group_size=self.attn_tp_size,
+        )
+        self.comm_manager.register_group(
+            name="embed_tp_group",
+            group_num=self.world_size // self.embed_tp_size,
+            group_size=self.embed_tp_size,
+        )
+        self.comm_manager.register_group(
+            name="lmhead_tp_group",
+            group_num=self.world_size // self.lmhead_tp_size,
+            group_size=self.lmhead_tp_size,
+        )
+        if self.dense_tp_size > 1:
+            self.comm_manager.register_group(
+                name="dense_tp_group",
+                group_num=self.world_size // self.dense_tp_size,
+                group_size=self.dense_tp_size,
+            )
+        if self.moe_ep_size > 1:
+            moe_ep_group_num = self.world_size // self.moe_ep_size
+            self.comm_manager.register_group(
+                name="moe_ep_group",
+                group_num=moe_ep_group_num,
+                group_size=self.moe_ep_size,
+                group_stride=moe_ep_group_num,
+                return_name=True,
+            )
+            if self.moe_tp_size == 1 and self.infer_config.model_config.exe_mode == "ge_graph":
+                moe_ep_mc2_buffer_size = calc_moe_hccl_buffer_size(
+                    self.infer_config, self.config, is_full_mesh_v2=True
+                )
+                self.comm_manager.register_group(
+                    name="moe_ep_group_mc2",
+                    group_num=moe_ep_group_num,
+                    group_size=self.moe_ep_size,
+                    group_stride=moe_ep_group_num,
+                    return_name=True,
+                    allow_physical_reuse=False,
+                    hccl_buffer_size=moe_ep_mc2_buffer_size,
+                    group_type=None,
+                )
 
     def init_cache(self, device):
         """Allocate BSH-format KV cache tensors on each attention layer.

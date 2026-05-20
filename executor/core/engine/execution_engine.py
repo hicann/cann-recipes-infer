@@ -20,6 +20,7 @@ import logging
 from typing import Dict, Optional, Any
 
 import torch
+import torch_npu
 from transformers import AutoTokenizer
 
 from executor.core.config import InferenceConfig
@@ -85,8 +86,8 @@ class ExecutionEngine:
     def _init_device(self):
         """Initialize NPU device and the dist process group.
 
-        CommManager is built later by ModelWorker.init() — it needs the
-        loaded hf_config to size the moe_ep buffer correctly.
+        CommManager is built later by ModelWorker.init(); model constructors
+        register their own business communication groups after it is available.
         """
         logger.info("Set execution using npu index: %s, global: %s", self.local_rank, self.global_rank)
         self.device = torch.device("%s:%s" % ("npu", self.local_rank))
@@ -95,8 +96,16 @@ class ExecutionEngine:
         if torch.npu.is_available() and self.world_size > 1:
             default_pg = get_default_group()
             if default_pg is None:
+                pg_options = None
+                if self.infer_config.model_config.platform_version.is_ascend_950():
+                    pg_options = torch_npu._C._distributed_c10d.ProcessGroupHCCL.Options()
+                    pg_options.hccl_config = {"hccl_op_expansion_mode": 5}
                 torch.distributed.init_process_group(
-                    backend="hccl", world_size=self.world_size, rank=self.global_rank)
+                    backend="hccl",
+                    world_size=self.world_size,
+                    rank=self.global_rank,
+                    pg_options=pg_options,
+                )
 
     def init(self, config_cls, main_model_cls, mtp_model_cls=None):
         """Bring the engine to ready: load the model (and MTP draft if any),

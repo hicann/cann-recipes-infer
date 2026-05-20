@@ -42,7 +42,6 @@ from module.linear import (
     RowParallelLinear,
     VocabParallelEmbedding,
 )
-from executor.utils import init_comm_group, get_default_group
 from executor.utils.forward_metadata import ForwardMetaData, get_forward_metadata
 from executor.core.config import InferenceConfig, CommManager
 from executor.core.kv_cache.cache_info import CacheEntry, LayerCacheInfo, ModelCacheInfo
@@ -546,6 +545,7 @@ class QwenForCausalLM(nn.Module):
         self.attn_tp_size = infer_config.parallel_config.attn_tp_size
         self.lmhead_tp_size = infer_config.parallel_config.lmhead_tp_size
 
+        self.init_parallel_comm_group()
         self.model = QwenModel(config, infer_config, comm_manager, prefix)
 
         self.lm_head = ColumnParallelLinear(
@@ -555,6 +555,18 @@ class QwenForCausalLM(nn.Module):
             tp_size=self.lmhead_tp_size,
             tp_rank=comm_manager.get_rank("lmhead_tp_group")
             if self.lmhead_tp_size > 1 else 0,
+        )
+
+    def init_parallel_comm_group(self):
+        self.comm_manager.register_group(
+            name="attn_tp_group",
+            group_num=self.world_size // self.attn_tp_size,
+            group_size=self.attn_tp_size,
+        )
+        self.comm_manager.register_group(
+            name="lmhead_tp_group",
+            group_num=self.world_size // self.lmhead_tp_size,
+            group_size=self.lmhead_tp_size,
         )
 
     def forward(

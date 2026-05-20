@@ -41,14 +41,25 @@ from transformers.utils import (
     logging,
 )
 
-from executor.utils import override
 from executor.utils.forward_metadata import ForwardMetaData
 from executor.core.config import InferenceConfig, CommManager
 from executor.core.kv_cache.cache_info import CacheEntry, LayerCacheInfo, ModelCacheInfo
 from executor.model_loader.weight_utils import default_weight_loader
-from executor.utils import npu_wait_tensor, superkernel_scope, MicroBatchMode, align_up
-from executor.utils.stream_utils import record_event, wait_event, record_stream, \
-                                        npu_stream_switch, npu_stream_switch_gegraph
+from executor.utils import (
+    MicroBatchMode,
+    align_up,
+    calc_moe_hccl_buffer_size,
+    npu_wait_tensor,
+    override,
+    superkernel_scope,
+)
+from executor.utils.stream_utils import (
+    record_event,
+    wait_event,
+    record_stream,
+    npu_stream_switch,
+    npu_stream_switch_gegraph,
+)
 from module.linear import (
     ColumnParallelLinear,
     ReplicatedLinear,
@@ -274,7 +285,12 @@ class DeepseekV3MoE(nn.Module):
         self.dispatch_kwargs = None
         self.combine_kwargs = None
         self.micro_batch_mode = MicroBatchMode(self.infer_config.model_config.custom_params.get("micro_batch_mode", 0))
-        self.moe_ep_group = self.comm_manager.get_group("moe_ep_group") if self.moe_ep_size > 1 else None
+        moe_ep_group_name = (
+            "moe_ep_group_stream1"
+            if self.comm_manager.has_group("moe_ep_group_stream1")
+            else "moe_ep_group"
+        )
+        self.moe_ep_group = self.comm_manager.get_group(moe_ep_group_name) if self.moe_ep_size > 1 else None
         self.enable_gegraph_and_multistream = self.enable_multi_streams and self.enable_gegraph
         self.enable_npugraphex_and_multistream = self.enable_multi_streams and self.enable_npugraph_ex
         self.npu_events = []
@@ -965,7 +981,12 @@ class DeepseekV3Attention(nn.Module):
         if self.enable_gegraph and not self.enable_npugraph_ex:
             self.fa_ops = tng.ops
         self.micro_batch_mode = MicroBatchMode(self.infer_config.model_config.custom_params.get("micro_batch_mode", 0))
-        self.attn_tp_group = self.comm_manager.get_group("attn_tp_group")
+        attn_tp_group_name = (
+            "attn_tp_group_stream1"
+            if self.comm_manager.has_group("attn_tp_group_stream1")
+            else "attn_tp_group"
+        )
+        self.attn_tp_group = self.comm_manager.get_group(attn_tp_group_name)
 
     def forward_page_attention_normal(
         self,
@@ -2240,7 +2261,9 @@ class DeepseekV3ForCausalLM(nn.Module):
         self.is_mtp = False
         self.kv_cache_quant_mode = config.quant_config.kv_cache_quant_mode \
             if config.quant_config is not None else "unquant"
+        self.micro_batch_mode = MicroBatchMode(self.infer_config.model_config.custom_params.get("micro_batch_mode", 0))
         self.get_parallel_settings()
+        self.init_parallel_comm_group()
         self.num_experts = config.n_routed_experts
         self.num_experts_per_tok = config.num_experts_per_tok
         self.force_eplb = self.infer_config.model_config.force_eplb
@@ -2270,8 +2293,6 @@ class DeepseekV3ForCausalLM(nn.Module):
             prefix="lm_head"
             )
 
-        self.micro_batch_mode = MicroBatchMode(self.infer_config.model_config.custom_params.get("micro_batch_mode", 0))
-
     @staticmethod
     def _repeat_batch(tensor, repeat_num):
         if repeat_num == 1:
@@ -2296,7 +2317,80 @@ class DeepseekV3ForCausalLM(nn.Module):
     def get_decoder(self):
         return self.model
 
+    def init_parallel_comm_group(self):
+        self.comm_manager.register_group(
+            name="attn_tp_group",
+            group_num=self.world_size // self.attn_tp_size,
+            group_size=self.attn_tp_size,
+        )
+        self.comm_manager.register_group(
+            name="embed_tp_group",
+            group_num=self.world_size // self.embed_tp_size,
+            group_size=self.embed_tp_size,
+        )
+        self.comm_manager.register_group(
+            name="lmhead_tp_group",
+            group_num=self.world_size // self.lmhead_tp_size,
+            group_size=self.lmhead_tp_size,
+        )
+        if self.dense_tp_size > 1:
+            self.comm_manager.register_group(
+                name="dense_tp_group",
+                group_num=self.world_size // self.dense_tp_size,
+                group_size=self.dense_tp_size,
+            )
+        if self.moe_tp_size > 1:
+            self.comm_manager.register_group(
+                name="moe_tp_group",
+                group_num=self.world_size // self.moe_tp_size,
+                group_size=self.moe_tp_size,
+            )
+        if self.moe_ep_size > 1:
+            moe_ep_group_num = self.world_size // self.moe_ep_size
+            self.comm_manager.register_group(
+                name="moe_ep_group",
+                group_num=moe_ep_group_num,
+                group_size=self.moe_ep_size,
+                group_stride=moe_ep_group_num,
+                return_name=True,
+            )
+
+        if self.micro_batch_mode == MicroBatchMode.PREFILL_MICRO_BATCH_SP_TP_EP:
+            if self.attn_tp_size > 1:
+                self.comm_manager.register_group(
+                    name="attn_tp_group_stream1",
+                    group_num=self.world_size // self.attn_tp_size,
+                    group_size=self.attn_tp_size,
+                    group_stride=1,
+                    allow_physical_reuse=False,
+                )
+
+            if self.moe_ep_size > 1:
+                self.comm_manager.register_group(
+                    name="moe_ep_group_stream1",
+                    group_num=self.world_size // self.moe_ep_size,
+                    group_size=self.moe_ep_size,
+                    group_stride=self.world_size // self.moe_ep_size,
+                    allow_physical_reuse=False,
+                )
+
+        if self.moe_ep_size > 1 and self.moe_tp_size == 1:
+            moe_ep_mc2_buffer_size = calc_moe_hccl_buffer_size(
+                self.infer_config, self.config, is_full_mesh_v2=True
+            )
+            self.comm_manager.register_group(
+                name="moe_ep_group_mc2",
+                group_num=self.world_size // self.moe_ep_size,
+                group_size=self.moe_ep_size,
+                group_stride=self.world_size // self.moe_ep_size,
+                return_name=True,
+                allow_physical_reuse=False,
+                hccl_buffer_size=moe_ep_mc2_buffer_size,
+                group_type=None,
+            )
+
     def get_parallel_settings(self):
+        self.world_size = self.infer_config.parallel_config.world_size
         self.embed_tp_size = self.infer_config.parallel_config.embed_tp_size
         self.attn_dp_size = self.infer_config.parallel_config.attn_dp_size
         self.attn_tp_size = self.infer_config.parallel_config.attn_tp_size

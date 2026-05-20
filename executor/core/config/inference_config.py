@@ -25,7 +25,32 @@ This module contains all configuration classes for the inference framework:
 import os
 import math
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any, Literal
+
+
+class PlatformVersion(Enum):
+    """Supported platform versions for the refactored executor."""
+
+    A3 = "A3"
+    ASCEND_950 = "950"
+
+    def is_ascend_950(self) -> bool:
+        """Return whether the platform is Ascend 950."""
+        return self is PlatformVersion.ASCEND_950
+
+    @classmethod
+    def from_value(cls, value: "PlatformVersion | str") -> "PlatformVersion":
+        """Normalize YAML/string input to a platform enum."""
+        if isinstance(value, cls):
+            return value
+        try:
+            return cls(value)
+        except ValueError as exc:
+            expected = [member.value for member in cls]
+            raise ValueError(
+                f"platform_version={value!r} is not supported, expected one of {expected}"
+            ) from exc
 
 
 @dataclass
@@ -76,7 +101,7 @@ class ModelConfig:
     dtype: str = "bfloat16"
     with_ckpt: bool = True
     next_n: int = 0
-    platform_version: str = "A3"
+    platform_version: PlatformVersion = PlatformVersion.A3
 
     exe_mode: str = "eager"
     enable_cache_compile: bool = False
@@ -99,7 +124,9 @@ class ModelConfig:
             dtype=model_config_dict.get("dtype", "bfloat16"),
             with_ckpt=model_config_dict.get("with_ckpt", True),
             next_n=model_config_dict.get("next_n", 0),
-            platform_version=model_config_dict.get("platform_version", "A3"),
+            platform_version=PlatformVersion.from_value(
+                model_config_dict.get("platform_version", PlatformVersion.A3.value)
+            ),
             exe_mode=model_config_dict.get("exe_mode", "eager"),
             enable_cache_compile=model_config_dict.get("enable_cache_compile", False),
             enable_static_kernel=model_config_dict.get("enable_static_kernel", False),
@@ -113,6 +140,7 @@ class ModelConfig:
 
     def _validate(self):
         """Validate model configuration consistency."""
+        self.platform_version = PlatformVersion.from_value(self.platform_version)
         if self.exe_mode not in ["eager", "ge_graph", "npugraph_ex"]:
             raise ValueError(
                 f"exe_mode={self.exe_mode} is not supported, expected one of ['eager', 'ge_graph', 'npugraph_ex']"

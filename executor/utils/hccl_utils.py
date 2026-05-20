@@ -49,6 +49,70 @@ def get_global_routed_expert_num(config) -> Optional[int]:
 
 created_group = {}
 
+
+def init_comm_group_by_ranks(
+    ranks,
+    global_rank,
+    group_name="unknown",
+    hccl_buffer_size=None,
+    group_type=None,
+    platform_version="A3",
+    return_name=False,
+):
+    """Pure low-level HCCL group builder.
+
+    Given an explicit ranks list and HCCL parameters, build one HCCL
+    ProcessGroup and optionally return its HCCL comm name.  All business-side
+    decisions (None/default_pg shortcuts, signature-based reuse, string
+    whitelist) live in ``CommManager`` — this helper only answers "how to
+    create", not "whether to create / reuse".
+
+    Pre-conditions (enforced by the caller, typically ``CommManager``):
+    - ``len(ranks) >= 2``.  Single-rank subgroups should be resolved to
+      ``None`` before reaching this helper.
+    - ``ranks`` is the full subgroup ranks list, identical across all world
+      ranks (torch collective contract for ``dist.new_group``).
+
+    Args:
+        ranks: All global ranks forming this subgroup.
+        global_rank: Caller's global rank, only used for HCCL comm name.
+        group_name: Logical group name, used only for logging.
+        hccl_buffer_size: HCCL buffer size in MB.  ``None`` falls back to the
+            ``HCCL_BUFFSIZE`` env var (default 200).
+        group_type: ``hccl_op_expansion_mode``.  ``None`` means unspecified;
+            values >= 1 map to specific expansion modes (1 hostcpu_ts,
+            2 aicpu_ts, 3 aiv, 4 aiv_only, 5 ccu_ms, 6 ccu_sch, 7 aicpu_ub).
+        platform_version: "A3" or "950".  On 950, ``HCCL_BUFFSIZE`` env is
+            rewritten to match the per-group buffer size.
+        return_name: If True, return ``(group, hccl_comm_name)``.
+
+    Returns:
+        The ``dist.ProcessGroup`` for the current rank's view of this
+        subgroup, or ``(group, name)`` when ``return_name`` is True.
+    """
+    if hccl_buffer_size is None:
+        hccl_buffer_size = int(os.environ.get("HCCL_BUFFSIZE", 200))
+
+    options = torch_npu._C._distributed_c10d.ProcessGroupHCCL.Options()
+    options.hccl_config = {"hccl_buffer_size": hccl_buffer_size}
+    if group_type is not None:
+        options.hccl_config["hccl_op_expansion_mode"] = group_type
+    if platform_version == "950":
+        os.environ["HCCL_BUFFSIZE"] = str(hccl_buffer_size)
+
+    logger.info(
+        f"init_comm_group_by_ranks: group={group_name} action=new_group ranks={list(ranks)} "
+        f"buffer_size={hccl_buffer_size}MB group_type={group_type} "
+        f"platform_version={platform_version}"
+    )
+    group = dist.new_group(list(ranks), pg_options=options)
+    if return_name and global_rank in ranks:
+        return group, get_group_name(group, global_rank)
+    if return_name:
+        return group, None
+    return group
+
+
 def init_comm_group(
     global_rank,
     group_num,
@@ -133,6 +197,7 @@ def calc_moe_hccl_buffer_size(
         is_full_mesh_v2=False):
     """
     calc hccl buffer size (MB) for MoE Dispatch and Combine ops.
+    runner_settings accepts either legacy runner_settings dict or refactored InferenceConfig.
     formula:
       not full_mesh_v2:
         (localMoeExpertNum * maxBs * ep_worldsize * align512(ceil480(align32(2*h)+44)) +
@@ -142,12 +207,28 @@ def calc_moe_hccl_buffer_size(
          (top_k + shardExpertNum) * maxBs * align512(2*h)) * 2 / 1024 / 1024
     """
     default_hccl_buffsize = 200 # MB
-    world_size = runner_settings.get("world_size", 16)
-    batch_size = runner_settings.get("data_config").get("batch_size", 16)
-    next_n = runner_settings.get("model_config").get("next_n", 0)
+    # Temporary compatibility layer for the framework refactor:
+    # legacy ModelRunner passes a runner_settings dict, while the refactored
+    # framework passes InferenceConfig directly.  Keep the parsing split here
+    # so the MC2 buffer formula below remains shared by both paths.
+    if isinstance(runner_settings, dict):
+        # Legacy ModelRunner path: parse values from runner_settings.
+        data_config = runner_settings.get("data_config", {})
+        model_config = runner_settings.get("model_config", {})
+        parallel_config = runner_settings.get("parallel_config", {})
+        world_size = runner_settings.get("world_size", 16)
+        batch_size = data_config.get("batch_size", 16)
+        next_n = model_config.get("next_n", 0)
+        moe_ep_size = parallel_config.get("moe_ep_size", 1)
+        platform_version = model_config.get("platform_version", "A3")
+    else:
+        # Refactored executor path: parse values from InferenceConfig.
+        world_size = runner_settings.parallel_config.world_size
+        batch_size = runner_settings.scheduler_config.batch_size
+        next_n = runner_settings.model_config.next_n
+        moe_ep_size = runner_settings.parallel_config.moe_ep_size
+        platform_version = runner_settings.model_config.platform_version
     spec_len = next_n + 1
-    moe_ep_size = runner_settings.get("parallel_config").get("moe_ep_size", 1)
-    platform_version = runner_settings.get("model_config").get("platform_version", "A3")
 
     total_experts = get_global_routed_expert_num(config)
     if total_experts is None:

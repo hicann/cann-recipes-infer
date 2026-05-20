@@ -15,7 +15,7 @@
 # custom_params.enable_moe_mc2_dispatch: false to keep graph + MLA prolog
 # but route decode through the double_routing AllToAll path.
 model_config:
-  model_name: "longcat-flash-lite"
+  model_name: "longcat_flash_lite"
   model_path: "/data/models/LongCat-Flash-Lite"
   exe_mode: "ge_graph"
   with_ckpt: true

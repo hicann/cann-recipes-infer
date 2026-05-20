@@ -39,7 +39,7 @@ from module.linear import (
 )
 from module.fuse_moe_gmm import FusedMoEGMM
 from executor.model_loader.weight_utils import default_weight_loader
-from executor.utils import get_init_attn_mask
+from executor.utils import calc_moe_hccl_buffer_size, get_init_attn_mask
 from .configuration_longcat_flash_lite import LongcatFlashNgramConfig
 
 
@@ -910,7 +910,7 @@ class LongcatFlashMoE(nn.Module):
         AllToAll hop.
         """
         global_rank = dist.get_rank()
-        ep_group_name = self.comm_manager.get_group_name("moe_ep_group")
+        ep_group_name = self.comm_manager.get_group_name("moe_ep_group_mc2")
         copy_expert_num = self.zero_expert_num
         common = {
             "x_active_mask": None,
@@ -1448,11 +1448,7 @@ class LongcatFlashNgramModel(nn.Module):
                 # (None → dist.all_reduce uses the world group).
                 ngram_tp_group = None
             else:
-                # Sub-group: contiguous ranks per group_stride=1 layout.
-                my_global = dist.get_rank()
-                gid = my_global // ngram_tp
-                ranks = list(range(gid * ngram_tp, (gid + 1) * ngram_tp))
-                ngram_tp_group = dist.new_group(ranks)
+                ngram_tp_group = comm_manager.get_group("ngram_embed_tp_group")
         self.ngram_embed_tp_size = ngram_tp_size if ngram_tp_size is not None else self.embed_tp_size
         self.ngram_embed_tp_rank = ngram_tp_rank if ngram_tp_rank is not None else self.embed_tp_rank
         self.ngram_embed_tp_group = ngram_tp_group  # None == use embed_tp_group fallback
@@ -1564,6 +1560,10 @@ class LongcatFlashNgramForCausalLM(nn.Module):
         self.infer_config = infer_config
         self.comm_manager = comm_manager
 
+        self.world_size = infer_config.parallel_config.world_size
+        self.attn_tp_size = infer_config.parallel_config.attn_tp_size
+        self.dense_tp_size = infer_config.parallel_config.dense_tp_size
+        self.embed_tp_size = infer_config.parallel_config.embed_tp_size
         self.lmhead_tp_size = infer_config.parallel_config.lmhead_tp_size
         self.lmhead_tp_rank = (
             (dist.get_rank() % self.lmhead_tp_size)
@@ -1571,12 +1571,14 @@ class LongcatFlashNgramForCausalLM(nn.Module):
             else 0
         )
         self.moe_tp_size = infer_config.parallel_config.moe_tp_size
+        self.moe_ep_size = infer_config.parallel_config.moe_ep_size
         self.moe_tp_rank = (
             (dist.get_rank() % self.moe_tp_size)
             if (self.moe_tp_size > 1 and dist.is_initialized())
             else 0
         )
 
+        self.init_parallel_comm_group()
         self.model = LongcatFlashNgramModel(config, infer_config, comm_manager)
         self.vocab_size = config.vocab_size
         self.lm_head = ColumnParallelLinear(
@@ -1586,6 +1588,75 @@ class LongcatFlashNgramForCausalLM(nn.Module):
             tp_size=self.lmhead_tp_size,
             tp_rank=self.lmhead_tp_rank,
         )
+
+    def init_parallel_comm_group(self):
+        self.comm_manager.register_group(
+            name="attn_tp_group",
+            group_num=self.world_size // self.attn_tp_size,
+            group_size=self.attn_tp_size,
+        )
+        self.comm_manager.register_group(
+            name="embed_tp_group",
+            group_num=self.world_size // self.embed_tp_size,
+            group_size=self.embed_tp_size,
+        )
+        self.comm_manager.register_group(
+            name="lmhead_tp_group",
+            group_num=self.world_size // self.lmhead_tp_size,
+            group_size=self.lmhead_tp_size,
+        )
+        if self.dense_tp_size > 1:
+            self.comm_manager.register_group(
+                name="dense_tp_group",
+                group_num=self.world_size // self.dense_tp_size,
+                group_size=self.dense_tp_size,
+            )
+        if self.moe_tp_size > 1:
+            self.comm_manager.register_group(
+                name="moe_tp_group",
+                group_num=self.world_size // self.moe_tp_size,
+                group_size=self.moe_tp_size,
+            )
+        if self.moe_ep_size > 1:
+            moe_ep_group_num = self.world_size // self.moe_ep_size
+            self.comm_manager.register_group(
+                name="moe_ep_group",
+                group_num=moe_ep_group_num,
+                group_size=self.moe_ep_size,
+                group_stride=moe_ep_group_num,
+                return_name=True,
+            )
+            custom_params = self.infer_config.model_config.custom_params or {}
+            enable_moe_mc2_dispatch = custom_params.get("enable_moe_mc2_dispatch", None)
+            if enable_moe_mc2_dispatch is None:
+                enable_moe_mc2_dispatch = self.infer_config.model_config.exe_mode == "ge_graph"
+            if self.moe_tp_size == 1 and enable_moe_mc2_dispatch:
+                moe_ep_mc2_buffer_size = calc_moe_hccl_buffer_size(
+                    self.infer_config, self.config, is_full_mesh_v2=False
+                )
+                self.comm_manager.register_group(
+                    name="moe_ep_group_mc2",
+                    group_num=moe_ep_group_num,
+                    group_size=self.moe_ep_size,
+                    group_stride=moe_ep_group_num,
+                    return_name=True,
+                    allow_physical_reuse=False,
+                    hccl_buffer_size=moe_ep_mc2_buffer_size,
+                    group_type=None,
+                )
+
+        custom = getattr(self.infer_config.model_config, "custom_params", {}) or {}
+        ngram_tp = int(custom.get("ngram_embed_tp_size", 0))
+        if (
+            ngram_tp > 0
+            and ngram_tp != self.embed_tp_size
+            and ngram_tp != self.world_size
+        ):
+            self.comm_manager.register_group(
+                name="ngram_embed_tp_group",
+                group_num=self.world_size // ngram_tp,
+                group_size=ngram_tp,
+            )
 
     def forward(
         self,

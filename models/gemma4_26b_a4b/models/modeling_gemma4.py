@@ -42,6 +42,7 @@ from module.linear import (
 from module.fuse_moe_gmm import FusedMoEGMM
 from module.quantization import QuantizeMethodBase
 from executor.core.config import InferenceConfig, CommManager
+from executor.utils import calc_moe_hccl_buffer_size
 from executor.utils.forward_metadata import ForwardMetaData, get_forward_metadata
 from executor.model_loader.weight_utils import default_weight_loader
 from .configuration_gemma4 import Gemma4TextConfig
@@ -414,7 +415,7 @@ class Gemma4SparseMoeBlock(nn.Module):
 
     def set_mc2_kwargs(self):
         global_rank = dist.get_rank()
-        moe_ep_group_name = self.comm_manager.get_group_name("moe_ep_group")
+        moe_ep_group_name = self.comm_manager.get_group_name("moe_ep_group_mc2")
         self.dispatch_kwargs = {
             "x_active_mask": None,
             "moe_expert_num": self.num_experts,
@@ -1044,6 +1045,7 @@ class Gemma4ForCausalLM(nn.Module):
         )
         self.batch_size = infer_config.scheduler_config.batch_size
 
+        self.init_parallel_comm_group()
         self.model = Gemma4TextModel(config, infer_config, comm_manager, prefix=f"{prefix}model" if prefix else "model")
         self.experts_per_rank = (
             config.num_experts // self.moe_ep_size if getattr(config, "num_experts", None) else 0
@@ -1060,6 +1062,63 @@ class Gemma4ForCausalLM(nn.Module):
             )
         else:
             self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+
+    def init_parallel_comm_group(self):
+        self.comm_manager.register_group(
+            name="attn_tp_group",
+            group_num=self.world_size // self.attn_tp_size,
+            group_size=self.attn_tp_size,
+        )
+        self.comm_manager.register_group(
+            name="embed_tp_group",
+            group_num=self.world_size // self.embed_tp_size,
+            group_size=self.embed_tp_size,
+        )
+        self.comm_manager.register_group(
+            name="lmhead_tp_group",
+            group_num=self.world_size // self.lmhead_tp_size,
+            group_size=self.lmhead_tp_size,
+        )
+        if self.moe_tp_size > 1:
+            self.comm_manager.register_group(
+                name="moe_tp_group",
+                group_num=self.world_size // self.moe_tp_size,
+                group_size=self.moe_tp_size,
+            )
+        if self.moe_ep_size > 1:
+            moe_ep_group_num = self.world_size // self.moe_ep_size
+            self.comm_manager.register_group(
+                name="moe_ep_group",
+                group_num=moe_ep_group_num,
+                group_size=self.moe_ep_size,
+                group_stride=moe_ep_group_num,
+                return_name=True,
+            )
+            experts_per_rank = (
+                self.config.num_experts // self.moe_ep_size
+                if getattr(self.config, "num_experts", None)
+                else 0
+            )
+            custom = getattr(self.infer_config.model_config, "custom_params", {}) or {}
+            default_mode = "mc2" if experts_per_rank <= 24 else "local_experts"
+            if (
+                self.moe_tp_size == 1
+                and experts_per_rank > 0
+                and custom.get("moe_ep_decode_mode", default_mode) == "mc2"
+            ):
+                moe_ep_mc2_buffer_size = calc_moe_hccl_buffer_size(
+                    self.infer_config, self.config, is_full_mesh_v2=True
+                )
+                self.comm_manager.register_group(
+                    name="moe_ep_group_mc2",
+                    group_num=moe_ep_group_num,
+                    group_size=self.moe_ep_size,
+                    group_stride=moe_ep_group_num,
+                    return_name=True,
+                    allow_physical_reuse=False,
+                    hccl_buffer_size=moe_ep_mc2_buffer_size,
+                    group_type=None,
+                )
 
     def forward(
         self,

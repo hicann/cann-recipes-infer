@@ -4,7 +4,7 @@
 # Tests whether the model handles packed 1D framework input correctly when
 # more than one request per rank lands in a single forward.
 model_config:
-  model_name: "longcat-flash-lite"
+  model_name: "longcat_flash_lite"
   model_path: "/data/models/LongCat-Flash-Lite"
   exe_mode: "ge_graph"
   with_ckpt: true

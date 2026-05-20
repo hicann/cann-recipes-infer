@@ -121,9 +121,11 @@ InferenceConfig
 
 ### 3.2 CommManager
 
-通信组管理器，分两阶段创建：模型计算用的 HCCL 组离线 / 在线都建，调度用的 Gloo 组只在 online 模式下追加。
+通信组管理器，负责维护 HCCL / Gloo 通信域的创建、复用和查询。当前职责分为三类：
 
-**模型计算 HCCL 组**（`CommManager.initialize()`，由 `ModelWorker._build_comm_manager` 在权重加载前调用）：模型中各模块（attention / ffn / moe / embedding / lm_head 等）按 YAML 并行参数申请的 HCCL 组；具体所需的 HCCL 组随模型结构而异。
+**默认 HCCL 组缓存**（`CommManager.__init__()`）：`ExecutionEngine._init_device()` 先完成 `init_process_group(hccl)`；随后 `ModelWorker._build_comm_manager()` 构造 `CommManager`，并将 `default_pg` 按物理签名写入缓存，供 world-size 业务组复用。
+
+**模型计算 HCCL 组**（模型侧 `init_parallel_comm_group()`）：模型根据自身结构和 YAML 并行参数，通过 `CommManager.register_group()` 显式声明所需通信域，例如 attention / ffn / moe / embedding / lm_head / MC2 独立通信域等。`CommManager` 负责根据声明完成通信域的创建、缓存与复用，不再在框架侧统一初始化所有业务 HCCL 组。
 
 **调度用 Gloo 组**（`CommManager.init_cpu_groups()`，仅在 `OnlineInference.__init__` 中追加调用，用于在 DP leader 之间或 DP leader 与 TP worker 之间广播 / 同步 Python 对象，例如请求 dict、phase 标记）：
 
@@ -148,7 +150,7 @@ InferenceConfig
 ```mermaid
 flowchart TB
     A[ModelWorker.init] --> E[加载 HF Config]
-    E --> H[构造 CommManager（moe 模型依赖 hf_config 初始化通信域）]
+    E --> H[构造 CommManager]
     H --> B{with_ckpt?}
     B -->|Yes| C[DefaultModelLoader]
     B -->|No| D[DummyModelLoader]
@@ -514,8 +516,8 @@ evalscope eval \
 
 | 能力 | 使用方式 |
 |------|----------|
-| 通信域创建 | 根据 yaml 配置文件中的e并行参数创建对应 HCCL 通信域 |
+| 通信域管理 | 模型通过 `CommManager.register_group()` 声明所需 HCCL 通信域及建域配置；`CommManager` 统一处理通信域创建与物理复用，维护通信域对象、组内 rank 和 HCCL comm name等信息，并提供强制独立建域能力 |
 | Paged KV cache | `KVCacheManager` 按 `cache_info` 申请块；attention forward 按 `block_table` / `slot_mapping` 索引 |
-| Packed Sequence | 唯一输入布局：`Batch.input_ids` 始终为 `[TotalTokens]` 一维；
+| Packed Sequence | 唯一输入布局：`Batch.input_ids` 始终为 `[TotalTokens]` 一维
 | 图编译 | `ModelConfig.exe_mode ∈ {ge_graph, npugraph_ex}` 开启；`ExecutionEngine.warm_up()` 在 dummy prefill 后调用 `compile_model()`；模型需保证输入 shape 静态 |
 | Profiler | `ModelConfig.enable_profiler=True` 开启；`ProfilerManager` 自动插入 profiling 桩 |

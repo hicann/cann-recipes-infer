@@ -216,9 +216,16 @@ class FFNForCausalLM(PreTrainedModel, GenerationMixin):
             global_rank=global_rank, group_num=world_size // self.moe_ep_size, world_size=world_size,
             group_stride=self.moe_tp_size, group_name="moe_ep_group", return_name=True)
 
+        moe_ep_group_mc2, moe_ep_group_mc2_name = init_comm_group(
+            global_rank=global_rank, group_num=world_size // self.moe_ep_size, world_size=world_size,
+            group_stride=self.moe_tp_size, group_name="moe_ep_group_mc2", return_name=True)
+
         hccl_comm_dict = {
-            "moe_tp_group": moe_tp_group, "moe_ep_group": moe_ep_group,
+            "moe_tp_group": moe_tp_group,
+            "moe_ep_group": moe_ep_group,
             "moe_ep_group_name": moe_ep_group_name,
+            "moe_ep_group_mc2": moe_ep_group_mc2,
+            "moe_ep_group_mc2_name": moe_ep_group_mc2_name,
         }
         return hccl_comm_dict
 

@@ -18,14 +18,6 @@
 import importlib
 
 _specs: dict[str, list[tuple[str, str]]] = {
-    "gpt-oss": [
-        ("models.gpt_oss.models.modeling_gpt_oss", "GptOssForCausalLM"),
-        ("models.gpt_oss.models.configuration_gpt_oss", "GptOssConfig"),
-    ],
-    "qwen3-moe": [
-        ("models.qwen3_moe.models.modeling_qwen3_moe", "Qwen3MoeForCausalLM"),
-        ("models.qwen3_moe.models.configuration_qwen3_moe", "Qwen3MoeConfig"),
-    ],
     "deepseek_r1": [
         ("models.deepseek_r1.models.modeling_deepseek", "DeepseekV3ForCausalLM"),
         ("models.deepseek_r1.models.modeling_deepseek", "DeepseekV3ModelMTP"),
@@ -35,29 +27,37 @@ _specs: dict[str, list[tuple[str, str]]] = {
         ("models.deepseek_r1.models.modeling_deepseek", "DeepseekV3ForCausalLM"),
         ("models.deepseek_r1.models.configuration_deepseek", "DeepseekV3Config"),
     ],
-    "kimi_k2": [
-        ("models.deepseek_r1.models.modeling_deepseek", "DeepseekV3ForCausalLM"),
-        ("models.deepseek_r1.models.configuration_deepseek", "DeepseekV3Config"),
-    ],
-    "qwen3_8b": [
-        ("models.qwen.models.modeling_qwen", "QwenForCausalLM"),
-        ("models.qwen.models.configuration_qwen", "Qwen3Config"),
-    ],
-    "qwen25_7b_instruct": [
-        ("models.qwen.models.modeling_qwen", "QwenForCausalLM"),
-        ("models.qwen.models.configuration_qwen", "Qwen2Config"),
-    ],
-    "gemma-4": [
+    "gemma_4": [
         ("models.gemma4_26b_a4b.models.modeling_gemma4", "Gemma4ForCausalLM"),
         ("models.gemma4_26b_a4b.models.configuration_gemma4", "Gemma4TextConfig"),
+    ],
+    "gpt_oss": [
+        ("models.gpt_oss.models.modeling_gpt_oss", "GptOssForCausalLM"),
+        ("models.gpt_oss.models.configuration_gpt_oss", "GptOssConfig"),
     ],
     "hy3_preview": [
         ("models.hy3_preview.models.modeling_hy_v3", "HYV3ForCausalLM"),
         ("models.hy3_preview.models.configuration_hy_v3", "HYV3Config"),
     ],
-    "longcat-flash-lite": [
+    "kimi_k2": [
+        ("models.deepseek_r1.models.modeling_deepseek", "DeepseekV3ForCausalLM"),
+        ("models.deepseek_r1.models.configuration_deepseek", "DeepseekV3Config"),
+    ],
+    "longcat_flash_lite": [
         ("models.longcat_flash_lite.models.modeling_longcat_flash_lite", "LongcatFlashNgramForCausalLM"),
         ("models.longcat_flash_lite.models.configuration_longcat_flash_lite", "LongcatFlashNgramConfig"),
+    ],
+    "qwen25_7b_instruct": [
+        ("models.qwen.models.modeling_qwen", "QwenForCausalLM"),
+        ("models.qwen.models.configuration_qwen", "Qwen2Config"),
+    ],
+    "qwen3_8b": [
+        ("models.qwen.models.modeling_qwen", "QwenForCausalLM"),
+        ("models.qwen.models.configuration_qwen", "Qwen3Config"),
+    ],
+    "qwen3_moe": [
+        ("models.qwen3_moe.models.modeling_qwen3_moe", "Qwen3MoeForCausalLM"),
+        ("models.qwen3_moe.models.configuration_qwen3_moe", "Qwen3MoeConfig"),
     ],
 }
 

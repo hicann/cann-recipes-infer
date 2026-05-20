@@ -22,6 +22,7 @@ from .inference_config import (
     InferenceConfig,
     ModelConfig,
     ParallelConfig,
+    PlatformVersion,
     SchedulerConfig,
 )
 
@@ -32,5 +33,6 @@ __all__ = [
     "InferenceConfig",
     "ModelConfig",
     "ParallelConfig",
+    "PlatformVersion",
     "SchedulerConfig",
 ]

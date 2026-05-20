@@ -8,7 +8,8 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 
 __all__ = [
-    "update_settings", "init_comm_group", "get_group_name", "get_default_group", "read_yaml",
+    "update_settings", "init_comm_group", "init_comm_group_by_ranks",
+    "get_group_name", "get_default_group", "read_yaml",
     "override", "get_init_attn_mask", "get_decode_mask", "npu_stream_switch", "npu_wait_tensor", "align_up",
     "superkernel_scope", "ceil_div", "process_infer_time", "build_dataset_input",
     "calc_moe_hccl_buffer_size", "get_global_routed_expert_num", "MicroBatchMode",
@@ -26,6 +27,7 @@ from .common_utils import (update_settings, override, get_init_attn_mask, get_de
                           )
 from .hccl_utils import (
     init_comm_group,
+    init_comm_group_by_ranks,
     get_group_name,
     get_default_group,
     calc_moe_hccl_buffer_size,

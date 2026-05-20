@@ -74,8 +74,9 @@ class GptOssRMSNorm(nn.Module):
 
 
 class GptOssExperts(nn.Module):
-    def __init__(self, config, infer_config: InferenceConfig):
+    def __init__(self, config, infer_config: InferenceConfig, comm_manager: CommManager):
         super().__init__()
+        self.comm_manager = comm_manager
         self.tp_size = infer_config.parallel_config.moe_tp_size
         self.intermediate_size = config.intermediate_size
         self.num_experts = config.num_local_experts
@@ -117,12 +118,12 @@ class GptOssExperts(nn.Module):
             [((up + 1) * glu)], [self.down_proj],
             group_list=expert_tokens, group_type=0, split_item=3, bias=[self.down_proj_bias])[0]
         if self.commute_type == "all_reduce":
-            dist.all_reduce(next_states)
+            dist.all_reduce(next_states, group=self.comm_manager.get_group("moe_tp_group"))
         return next_states
 
 
 class GptOssMLP(nn.Module):
-    def __init__(self, config, infer_config: InferenceConfig, prefix=""):
+    def __init__(self, config, infer_config: InferenceConfig, comm_manager: CommManager, prefix=""):
         super().__init__()
         self.num_experts = config.num_local_experts
         self.hidden_dim = config.hidden_size
@@ -135,7 +136,7 @@ class GptOssMLP(nn.Module):
             tp_rank=0,
             prefix=f"{prefix}.router"
         )
-        self.experts = GptOssExperts(config, infer_config)
+        self.experts = GptOssExperts(config, infer_config, comm_manager)
 
     def forward(self, hidden_states):
         router_scores, router_indices, row_idx = self._forward_router(hidden_states)  # (num_experts, seq_len)
@@ -236,9 +237,17 @@ def npu_apply_rotary_pos_emb(q, k, cos, sin, layout):
 class GptOssAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-    def __init__(self, config: GptOssConfig, infer_config: InferenceConfig, layer_idx: int, prefix: str):
+    def __init__(
+        self,
+        config: GptOssConfig,
+        infer_config: InferenceConfig,
+        comm_manager: CommManager,
+        layer_idx: int,
+        prefix: str,
+    ):
         super().__init__()
         self.config = config
+        self.comm_manager = comm_manager
         self.layer_idx = layer_idx
         self.tp_size = infer_config.parallel_config.attn_tp_size
         if self.tp_size > 1:
@@ -259,7 +268,7 @@ class GptOssAttention(nn.Module):
             total_num_kv_heads=config.num_key_value_heads,
             bias=True,
             tp_size=self.tp_size,
-            tp_rank=dist.get_rank() if self.tp_size > 1 else 0,
+            tp_rank=comm_manager.get_rank("attn_tp_group") if self.tp_size > 1 else 0,
             quant_config=None,
             prefix=f"{prefix}.qkv_proj",
             return_bias=False
@@ -268,7 +277,7 @@ class GptOssAttention(nn.Module):
             input_size=config.num_attention_heads * self.head_dim,
             output_size=config.hidden_size,
             tp_size=self.tp_size,
-            tp_rank=dist.get_rank() if self.tp_size > 1 else 0,
+            tp_rank=comm_manager.get_rank("attn_tp_group") if self.tp_size > 1 else 0,
             bias=True,
             input_is_parallel=True,
             prefix=f"{prefix}.o_proj"
@@ -413,7 +422,7 @@ class GptOssAttention(nn.Module):
                 ),
             ], dim=0)
         if self.commute_type == "all_reduce":
-            dist.all_reduce(attn_output)
+            dist.all_reduce(attn_output, group=self.comm_manager.get_group("attn_tp_group"))
         return attn_output, attn_weights
 
     def update_cache(self, slot_mapping, key_states, value_states):
@@ -434,11 +443,18 @@ class GptOssAttention(nn.Module):
 
 
 class GptOssDecoderLayer(nn.Module):
-    def __init__(self, config: GptOssConfig, infer_config: InferenceConfig, layer_idx: int, prefix: str):
+    def __init__(
+        self,
+        config: GptOssConfig,
+        infer_config: InferenceConfig,
+        comm_manager: CommManager,
+        layer_idx: int,
+        prefix: str,
+    ):
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.self_attn = GptOssAttention(config, infer_config, layer_idx, prefix)
-        self.mlp = GptOssMLP(config, infer_config, prefix)
+        self.self_attn = GptOssAttention(config, infer_config, comm_manager, layer_idx, prefix)
+        self.mlp = GptOssMLP(config, infer_config, comm_manager, prefix)
         self.input_layernorm = GptOssRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = GptOssRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.attention_type = config.layer_types[layer_idx]
@@ -469,10 +485,17 @@ class GptOssDecoderLayer(nn.Module):
 
 
 class GptOssModel(nn.Module):
-    def __init__(self, config: GptOssConfig, infer_config: InferenceConfig, prefix: str = ""):
+    def __init__(
+        self,
+        config: GptOssConfig,
+        infer_config: InferenceConfig,
+        comm_manager: CommManager,
+        prefix: str = "",
+    ):
         super().__init__()
         self.config = config
         self.infer_config = infer_config
+        self.comm_manager = comm_manager
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.embed_tokens = nn.Embedding(self.vocab_size, config.hidden_size, self.padding_idx)
@@ -485,7 +508,7 @@ class GptOssModel(nn.Module):
             tp_rank=0,
         )
         self.layers = nn.ModuleList(
-            [GptOssDecoderLayer(config, infer_config, layer_idx, prefix)\
+            [GptOssDecoderLayer(config, infer_config, comm_manager, layer_idx, prefix)\
                 for layer_idx in range(config.num_hidden_layers)])
         self.norm = GptOssRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = GptOssRotaryEmbedding(config=config)
@@ -527,16 +550,43 @@ class GptOssForCausalLM(nn.Module):
         self.config = config
         self.infer_config = infer_config
         self.comm_manager = comm_manager
-        self.model = GptOssModel(config, infer_config, prefix)
         self.vocab_size = config.vocab_size
+        self.world_size = infer_config.parallel_config.world_size
         self.lm_head_tp_size = infer_config.parallel_config.lmhead_tp_size
         self.attn_tp_size = infer_config.parallel_config.attn_tp_size
+        self.moe_tp_size = infer_config.parallel_config.moe_tp_size
+        requires_comm_manager = any(
+            size > 1
+            for size in (self.attn_tp_size, self.moe_tp_size, self.lm_head_tp_size)
+        )
+        if comm_manager is None and requires_comm_manager:
+            raise ValueError("comm_manager is required when GPT-OSS tensor parallelism is enabled.")
+        self.init_parallel_comm_group()
+        self.model = GptOssModel(config, infer_config, comm_manager, prefix)
         self.lm_head = ColumnParallelLinear(
             input_size=config.hidden_size,
             output_size=self.vocab_size,
             bias=False,
             tp_size=self.lm_head_tp_size,
-            tp_rank=dist.get_rank() if self.lm_head_tp_size > 1 else 0
+            tp_rank=comm_manager.get_rank("lmhead_tp_group") if self.lm_head_tp_size > 1 else 0
+        )
+
+    def init_parallel_comm_group(self):
+        self.comm_manager.register_group(
+            name="attn_tp_group",
+            group_num=self.world_size // self.attn_tp_size,
+            group_size=self.attn_tp_size,
+        )
+        if self.moe_tp_size > 1:
+            self.comm_manager.register_group(
+                name="moe_tp_group",
+                group_num=self.world_size // self.moe_tp_size,
+                group_size=self.moe_tp_size,
+            )
+        self.comm_manager.register_group(
+            name="lmhead_tp_group",
+            group_num=self.world_size // self.lm_head_tp_size,
+            group_size=self.lm_head_tp_size,
         )
 
     def forward(
@@ -567,7 +617,7 @@ class GptOssForCausalLM(nn.Module):
 
         if self.lm_head_tp_size > 1:
             new_logits = [logits.clone().detach() for _ in range(self.lm_head_tp_size)]
-            dist.all_gather(new_logits, logits)
+            dist.all_gather(new_logits, logits, group=self.comm_manager.get_group("lmhead_tp_group"))
             logits = torch.concat(new_logits, dim=-1)
 
         return logits.float()
@@ -582,21 +632,23 @@ class GptOssForCausalLM(nn.Module):
             ("qkv_proj", "v_proj", "v"),
         ]
 
-        tp_rank = dist.get_rank() if self.lm_head_tp_size > 1 else 0
-        tp_size = self.lm_head_tp_size
+        attn_tp_rank = self.comm_manager.get_rank("attn_tp_group") if self.attn_tp_size > 1 else 0
+        moe_tp_rank = self.comm_manager.get_rank("moe_tp_group") if self.moe_tp_size > 1 else 0
+        attn_tp_size = self.attn_tp_size
+        moe_tp_size = self.moe_tp_size
 
         # Attention heads per rank
-        heads_per_rank = self.config.num_attention_heads // tp_size
-        head_start = tp_rank * heads_per_rank
+        heads_per_rank = self.config.num_attention_heads // attn_tp_size
+        head_start = attn_tp_rank * heads_per_rank
 
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
 
         intermediate_size = self.config.intermediate_size
-        per_rank_intermediate_size = intermediate_size // tp_size
+        per_rank_intermediate_size = intermediate_size // moe_tp_size
         # Calculate common slicing bounds for current rank
-        tp_rank_start = tp_rank * per_rank_intermediate_size
-        tp_rank_end = min((tp_rank + 1) * per_rank_intermediate_size, intermediate_size)
+        tp_rank_start = moe_tp_rank * per_rank_intermediate_size
+        tp_rank_end = min((moe_tp_rank + 1) * per_rank_intermediate_size, intermediate_size)
 
         for name, weight in weights:
             if name.endswith(".gate_up_proj"):
@@ -630,7 +682,7 @@ class GptOssForCausalLM(nn.Module):
             elif name.endswith(".down_proj_bias"):
                 # Handle MLP down projection bias
                 # only load on rank 0 to avoid duplication during the all-reduce phase.
-                if tp_rank != 0:
+                if moe_tp_rank != 0:
                     weight.zero_()
                 param = params_dict[name]
                 param.copy_(weight)

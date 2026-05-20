@@ -33,7 +33,6 @@ import torch_npu
 
 from executor.core.config import InferenceConfig, CommManager
 from executor.core.kv_cache.cache_info import CacheEntry, LayerCacheInfo, ModelCacheInfo
-from executor.utils import calc_moe_hccl_buffer_size, get_global_routed_expert_num
 from executor.utils.forward_metadata import set_forward_metadata, get_forward_metadata
 from executor.model_loader.default_loader import DefaultModelLoader
 from executor.model_loader.dummy_loader import DummyModelLoader
@@ -158,9 +157,8 @@ class ModelWorker:
         # Validate configuration
         self.infer_config.validate(self.hf_config)
 
-        # Phase 2: comm_manager — moe_ep buffer size needs hf_config, so this
-        # is the natural place to size it.  Secondary workers (MTP) pass the
-        # main worker's comm_manager so we don't recreate process-wide state.
+        # Phase 2: comm_manager. Secondary workers (MTP) pass the main worker's
+        # comm_manager so we don't recreate process-wide state.
         if comm_manager is None:
             comm_manager = self._build_comm_manager()
         self.comm_manager = comm_manager
@@ -169,29 +167,13 @@ class ModelWorker:
         self._load_weights(model_cls)
 
     def _build_comm_manager(self) -> CommManager:
-        """Construct and initialize the process-wide CommManager.
-
-        moe_ep_group_mc2 uses a dedicated HCCL buffer size because decode
-        dispatch/combine_v2 runs on an independent MC2 communication domain.
-        """
+        """Construct and initialize the process-wide CommManager."""
         cfg = self.infer_config.parallel_config
-        moe_ep_mc2_buf = None
-        total_experts = get_global_routed_expert_num(self.hf_config)
-        if cfg.moe_ep_size > 1 and total_experts is not None:
-            runner_settings = {
-                "world_size": cfg.world_size,
-                "data_config": {
-                    "batch_size": self.infer_config.scheduler_config.batch_size,
-                },
-                "model_config": {
-                    "next_n": self.infer_config.model_config.next_n,
-                    "platform_version": self.infer_config.model_config.platform_version,
-                },
-                "parallel_config": {"moe_ep_size": cfg.moe_ep_size},
-            }
-            moe_ep_mc2_buf = calc_moe_hccl_buffer_size(runner_settings, self.hf_config, is_full_mesh_v2=True)
-        comm_manager = CommManager(cfg, moe_ep_mc2_buffer_size=moe_ep_mc2_buf)
-        comm_manager.initialize()
+        platform_version = self.infer_config.model_config.platform_version
+        comm_manager = CommManager(
+            cfg,
+            platform_version=platform_version,
+        )
         return comm_manager
 
     def _load_weights(self, model_cls) -> None:

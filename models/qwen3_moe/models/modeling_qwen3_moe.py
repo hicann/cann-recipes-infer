@@ -37,7 +37,7 @@ from module.linear import (
     VocabParallelEmbedding
     )
 from module.fuse_moe_gmm import FusedMoEGMM
-from executor.utils import init_comm_group, get_default_group
+from executor.utils import calc_moe_hccl_buffer_size
 from executor.utils.forward_metadata import ForwardMetaData, get_forward_metadata
 from executor.core.config import InferenceConfig, CommManager
 from executor.core.kv_cache.cache_info import CacheEntry, LayerCacheInfo, ModelCacheInfo
@@ -820,11 +820,14 @@ class Qwen3MoeForCausalLM(nn.Module):
         self.num_experts = config.num_experts
         self.input_max_len = infer_config.data_config.input_truncated_len
         self.lmhead_tp_size = infer_config.parallel_config.lmhead_tp_size
+        self.embed_tp_size = infer_config.parallel_config.embed_tp_size
         self.moe_ep_size = infer_config.parallel_config.moe_ep_size
+        self.moe_tp_size = infer_config.parallel_config.moe_tp_size
         self.attn_tp_size = infer_config.parallel_config.attn_tp_size
         self.attn_dp_size = infer_config.parallel_config.attn_dp_size
         self.max_position_embeddings = config.max_position_embeddings
 
+        self.init_parallel_comm_group()
         self.model = Qwen3MoeModel(config, infer_config, comm_manager, prefix)
         self.vocab_size_per_rank = config.vocab_size // self.lmhead_tp_size
         self.lm_head = ColumnParallelLinear(
@@ -833,6 +836,53 @@ class Qwen3MoeForCausalLM(nn.Module):
             bias=False,
             tp_size=self.lmhead_tp_size,
             tp_rank=comm_manager.get_rank("lmhead_tp_group")
+            )
+
+    def init_parallel_comm_group(self):
+        self.comm_manager.register_group(
+            name="attn_tp_group",
+            group_num=self.world_size // self.attn_tp_size,
+            group_size=self.attn_tp_size,
+        )
+        self.comm_manager.register_group(
+            name="embed_tp_group",
+            group_num=self.world_size // self.embed_tp_size,
+            group_size=self.embed_tp_size,
+        )
+        self.comm_manager.register_group(
+            name="lmhead_tp_group",
+            group_num=self.world_size // self.lmhead_tp_size,
+            group_size=self.lmhead_tp_size,
+        )
+        if self.moe_tp_size > 1:
+            self.comm_manager.register_group(
+                name="moe_tp_group",
+                group_num=self.world_size // self.moe_tp_size,
+                group_size=self.moe_tp_size,
+            )
+        if self.moe_ep_size > 1:
+            moe_ep_group_num = self.world_size // self.moe_ep_size
+            self.comm_manager.register_group(
+                name="moe_ep_group",
+                group_num=moe_ep_group_num,
+                group_size=self.moe_ep_size,
+                group_stride=moe_ep_group_num,
+                return_name=True,
+            )
+
+        if self.moe_ep_size > 1 and self.moe_tp_size == 1:
+            moe_ep_mc2_buffer_size = calc_moe_hccl_buffer_size(
+                self.infer_config, self.config, is_full_mesh_v2=True
+            )
+            self.comm_manager.register_group(
+                name="moe_ep_group_mc2",
+                group_num=self.world_size // self.moe_ep_size,
+                group_size=self.moe_ep_size,
+                group_stride=self.world_size // self.moe_ep_size,
+                return_name=True,
+                allow_physical_reuse=False,
+                hccl_buffer_size=moe_ep_mc2_buffer_size,
+                group_type=None,
             )
 
     def forward(

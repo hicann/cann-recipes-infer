@@ -1,8 +1,8 @@
-model_name: "gemma-4"
+model_name: "gemma_4"
 world_size: 8  # keep it for backward compatibility.
 
 model_config:
-  model_name: "gemma-4"
+  model_name: "gemma_4"
   model_path: "/data/models/gemma-4-26B-A4B"
   exe_mode: "npugraph_ex"
   with_ckpt: true
