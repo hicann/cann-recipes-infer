@@ -7,20 +7,41 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 
-import torch
-import torch_npu
-import torchair as tng
-import numpy as np
-import custom_ops
 import math
-import torch.nn as nn
+import subprocess
+import unittest
 
+import numpy as np
+import torch
+import torch.nn as nn
+import torch_npu
 import torchair
+import torchair as tng
+
+import custom_ops
 
 from torch_npu.testing.testcase import TestCase, run_tests
 
 DEVICE_ID = 0
 torch_npu.npu.set_device(int(DEVICE_ID))
+
+
+def get_npu_chip_name():
+    try:
+        result = subprocess.run(['npu-smi', 'info'], capture_output=True, text=True, timeout=5)
+        for line in result.stdout.split('\n'):
+            if 'Ascend950' in line or 'Ascend95' in line:
+                return 'Ascend950'
+            if 'Ascend910' in line:
+                return 'Ascend910'
+            if 'Ascend310' in line:
+                return 'Ascend310'
+        return 'Unknown'
+    except Exception:
+        return 'Unknown'
+
+CHIP_NAME = get_npu_chip_name()
+IS_ASCEND950 = CHIP_NAME == 'Ascend950'
 
 
 def cal_relative_diff_np(real_data, expect_data, diff_thd):
@@ -34,9 +55,7 @@ def cal_relative_diff_np(real_data, expect_data, diff_thd):
 
 def data_compare(npu_out, cpu_out, diff_thd=0.0001, pct_thd=0.0005, max_diff_hd=0.0001):
     print(f'======================== Golden BEGIN ========================')
-    print(cpu_out)
     print(f'======================== OutPut BEGIN ========================')
-    print(npu_out)
     real_data = npu_out.flatten()
     data_compe = cpu_out.flatten()
     start = 0
@@ -309,6 +328,233 @@ class TestNpuInplacePartialRotaryMul(TestCase):
         rotary_mode = 1
         partial_slice = [448, 512] 
         inplace_partial_rotary_mul_with_cpu_benchmark_base(b, s, n, d, con_b, con_s, con_n, rotary_mode, partial_slice, self)
+
+    def run_mixed_precision_test(self, x_shape, cos_shape, x_dtype=torch.bfloat16, 
+                                  cos_sin_dtype=torch.float32, partial_slice_start=64, 
+                                  partial_slice_end=128):
+        """通用混合精度测试函数：x是bfloat16/float16，cos/sin是float32"""
+        np.random.seed(0)
+        slice_size = partial_slice_end - partial_slice_start
+        partial_slice = [partial_slice_start, partial_slice_end]
+        
+        b, s, n, d = x_shape
+        
+        x = torch.tensor(np.random.uniform(1, 10, x_shape)).to(x_dtype)
+        cos = torch.tensor(np.random.uniform(-10, 10, cos_shape)).to(cos_sin_dtype)
+        sin = torch.tensor(np.random.uniform(-10, 10, cos_shape)).to(cos_sin_dtype)
+        
+        if partial_slice_end == d:
+            chunks = torch.split(x, [partial_slice_start, slice_size], dim=-1)
+            a1 = chunks[0]
+            a2 = chunks[1]
+            aa = cos * a2.float() + rotate_every_two(a2.float()) * sin
+            cpu_result = torch.cat([a1, aa.to(x_dtype)], -1)
+        else:
+            chunks = torch.split(x, [partial_slice_start, slice_size, d - partial_slice_end], dim=-1)
+            a1 = chunks[0]
+            a2 = chunks[1]
+            a3 = chunks[2]
+            aa = cos * a2.float() + rotate_every_two(a2.float()) * sin
+            cpu_result = torch.cat([a1, aa.to(x_dtype), a3], -1)
+        
+        # NPU操作
+        x_npu = x.to("npu:%s" % DEVICE_ID)
+        cos_npu = cos.to("npu:%s" % DEVICE_ID)
+        sin_npu = sin.to("npu:%s" % DEVICE_ID)
+        
+        torch.ops.custom.inplace_partial_rotary_mul(
+            x_npu,
+            cos_npu,
+            sin_npu,
+            rotary_mode="interleave",
+            partial_slice=partial_slice
+        )
+        
+        # 比对结果
+        x_npu_cpu = x_npu.cpu().float()
+        cpu_result_float = cpu_result.cpu().float()
+        compare_result = data_compare(x_npu_cpu.numpy(), cpu_result_float.numpy())
+        print(f"Mixed precision test x_shape={x_shape}, cos_shape={cos_shape}, x_dtype={x_dtype}: {compare_result}")
+        self.assertTrue(compare_result, 
+            f"Mixed precision compare fail for x_shape={x_shape}, cos_shape={cos_shape}")
+
+    @unittest.skipIf(not IS_ASCEND950, "Mixed precision tests only run on Ascend950")
+    def test_mixed_precision_bf16_fp32_shape1(self):
+        """Case 1: x=[8192, 128, 1, 512], cos=[8192, 1, 1, 64]"""
+        self.run_mixed_precision_test(
+            x_shape=[8192, 128, 1, 512],
+            cos_shape=[8192, 1, 1, 64],
+            x_dtype=torch.bfloat16,
+            cos_sin_dtype=torch.float32,
+            partial_slice_start=64,
+            partial_slice_end=128
+        )
+
+    @unittest.skipIf(not IS_ASCEND950, "Mixed precision tests only run on Ascend950")
+    def test_mixed_precision_bf16_fp32_shape2(self):
+        """Case 2: x=[8192, 1, 1, 512], cos=[8192, 1, 1, 64]"""
+        self.run_mixed_precision_test(
+            x_shape=[8192, 1, 1, 512],
+            cos_shape=[8192, 1, 1, 64],
+            x_dtype=torch.bfloat16,
+            cos_sin_dtype=torch.float32,
+            partial_slice_start=64,
+            partial_slice_end=128
+        )
+
+    @unittest.skipIf(not IS_ASCEND950, "Mixed precision tests only run on Ascend950")
+    def test_mixed_precision_bf16_fp32_shape3(self):
+        """Case 3: x=[8192, 64, 1, 128], cos=[8192, 1, 1, 64]"""
+        self.run_mixed_precision_test(
+            x_shape=[8192, 64, 1, 128],
+            cos_shape=[8192, 1, 1, 64],
+            x_dtype=torch.bfloat16,
+            cos_sin_dtype=torch.float32,
+            partial_slice_start=64,
+            partial_slice_end=128
+        )
+
+    @unittest.skipIf(not IS_ASCEND950, "Mixed precision tests only run on Ascend950")
+    def test_mixed_precision_bf16_fp32_shape4(self):
+        """Case 4: x=[4, 128, 1, 512], cos=[4, 1, 1, 64]"""
+        self.run_mixed_precision_test(
+            x_shape=[4, 128, 1, 512],
+            cos_shape=[4, 1, 1, 64],
+            x_dtype=torch.bfloat16,
+            cos_sin_dtype=torch.float32,
+            partial_slice_start=64,
+            partial_slice_end=128
+        )
+
+    @unittest.skipIf(not IS_ASCEND950, "Mixed precision tests only run on Ascend950")
+    def test_mixed_precision_bf16_fp32_shape5(self):
+        """Case 5: x=[4, 1, 1, 512], cos=[4, 1, 1, 64]"""
+        self.run_mixed_precision_test(
+            x_shape=[4, 1, 1, 512],
+            cos_shape=[4, 1, 1, 64],
+            x_dtype=torch.bfloat16,
+            cos_sin_dtype=torch.float32,
+            partial_slice_start=64,
+            partial_slice_end=128
+        )
+
+    @unittest.skipIf(not IS_ASCEND950, "Mixed precision tests only run on Ascend950")
+    def test_mixed_precision_bf16_fp32_shape6(self):
+        """Case 6: x=[4, 64, 1, 128], cos=[4, 1, 1, 64]"""
+        self.run_mixed_precision_test(
+            x_shape=[4, 64, 1, 128],
+            cos_shape=[4, 1, 1, 64],
+            x_dtype=torch.bfloat16,
+            cos_sin_dtype=torch.float32,
+            partial_slice_start=64,
+            partial_slice_end=128
+        )
+
+    @unittest.skipIf(not IS_ASCEND950, "Mixed precision tests only run on Ascend950")
+    def test_inplace_partial_rotary_mul_mixed_precision_bf16_fp32(self):
+        """Mixed precision test: x is bfloat16, cos/sin are float32"""
+        b = 128
+        s = 64
+        n = 1
+        d = 512
+
+        con_b = 1
+        con_s = 64
+        con_n = 1
+
+        rotary_mode = 1
+        partial_slice = [448, 512]
+        
+        np.random.seed(0)
+        slice_size = partial_slice[1] - partial_slice[0]
+        
+        # x is bfloat16, cos/sin are float32
+        x_dtype = torch.bfloat16
+        cos_sin_dtype = torch.float32
+        
+        x = torch.tensor(np.random.uniform(1, 10, (b, s, n, d))).to(x_dtype)
+        cos = torch.tensor(np.random.uniform(-10, 10, (con_b, con_s, con_n, slice_size))).to(cos_sin_dtype)
+        sin = torch.tensor(np.random.uniform(-10, 10, (con_b, con_s, con_n, slice_size))).to(cos_sin_dtype)
+        
+        chunks2 = torch.split(x, [partial_slice[0], slice_size], dim=-1)
+        a1 = chunks2[0]
+        a2 = chunks2[1]
+        
+        # CPU result: cast x to float32, compute, then cast back to bfloat16
+        aa = cos * a2.float() + rotate_every_two(a2.float()) * sin
+        gpu_result = torch.cat([a1, aa.to(x_dtype)], -1)
+        
+        # NPU operation
+        x_npu = x.to("npu:%s" % DEVICE_ID)
+        cos_npu = cos.to("npu:%s" % DEVICE_ID)
+        sin_npu = sin.to("npu:%s" % DEVICE_ID)
+        
+        torch.ops.custom.inplace_partial_rotary_mul(
+            x_npu,
+            cos_npu,
+            sin_npu,
+            rotary_mode="interleave",
+            partial_slice=partial_slice
+        )
+        
+        x_npu_cpu = x_npu.cpu().float()
+        gpu_result_cpu = gpu_result.cpu().float()
+        compare_result = data_compare(x_npu_cpu.numpy(), gpu_result_cpu.numpy())
+        print(f"Mixed precision BF16-FP32 compare: {compare_result}")
+        self.assertTrue(compare_result, f"yOut precision compare fail for mixed precision bf16-fp32")
+
+    @unittest.skipIf(not IS_ASCEND950, "Mixed precision tests only run on Ascend950")
+    def test_inplace_partial_rotary_mul_mixed_precision_fp16_fp32(self):
+        """Mixed precision test: x is float16, cos/sin are float32"""
+        b = 128
+        s = 64
+        n = 1
+        d = 512
+
+        con_b = 1
+        con_s = 64
+        con_n = 1
+
+        rotary_mode = 1
+        partial_slice = [448, 512]
+        
+        np.random.seed(0)
+        slice_size = partial_slice[1] - partial_slice[0]
+        
+        # x is float16, cos/sin are float32
+        x_dtype = torch.float16
+        cos_sin_dtype = torch.float32
+        
+        x = torch.tensor(np.random.uniform(1, 10, (b, s, n, d))).to(x_dtype)
+        cos = torch.tensor(np.random.uniform(-10, 10, (con_b, con_s, con_n, slice_size))).to(cos_sin_dtype)
+        sin = torch.tensor(np.random.uniform(-10, 10, (con_b, con_s, con_n, slice_size))).to(cos_sin_dtype)
+        
+        chunks2 = torch.split(x, [partial_slice[0], slice_size], dim=-1)
+        a1 = chunks2[0]
+        a2 = chunks2[1]
+        
+        # CPU result: cast x to float32, compute, then cast back to float16
+        aa = cos * a2.float() + rotate_every_two(a2.float()) * sin
+        gpu_result = torch.cat([a1, aa.to(x_dtype)], -1)
+        
+        # NPU operation
+        x_npu = x.to("npu:%s" % DEVICE_ID)
+        cos_npu = cos.to("npu:%s" % DEVICE_ID)
+        sin_npu = sin.to("npu:%s" % DEVICE_ID)
+        
+        torch.ops.custom.inplace_partial_rotary_mul(
+            x_npu,
+            cos_npu,
+            sin_npu,
+            rotary_mode="interleave",
+            partial_slice=partial_slice
+        )
+        
+        x_npu_cpu = x_npu.cpu().float()
+        gpu_result_cpu = gpu_result.cpu().float()
+        compare_result = data_compare(x_npu_cpu.numpy(), gpu_result_cpu.numpy())
+        print(f"Mixed precision FP16-FP32 compare: {compare_result}")
+        self.assertTrue(compare_result, f"yOut precision compare fail for mixed precision fp16-fp32")
 
 def rotate_every_two(x):
     x_even = x[..., ::2]
