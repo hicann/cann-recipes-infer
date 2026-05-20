@@ -28,7 +28,7 @@ Hy3-preview 是腾讯混元团队开发的大规模 MoE 语言模型，总参数
 
 2. 安装 Ascend Extension for PyTorch（torch_npu）。
 
-   Ascend Extension for PyTorch（torch_npu）为支撑 PyTorch 框架运行在 NPU 上的适配插件，本样例支持的 torch_npu 版本为 `v2.8.0.post6`，PyTorch 版本为 `2.8.0`。
+   Ascend Extension for PyTorch（torch_npu）为支撑 PyTorch 框架运行在 NPU 上的适配插件，本样例支持的 torch_npu 版本为 `v2.8.0.post4`，PyTorch 版本为 `2.8.0`。
 
    请从[软件包下载地址](https://gitcode.com/Ascend/pytorch/releases/v26.0.0-pytorch2.8.0)下载 `torch_npu-2.8.0.post4-cp311-cp311-manylinux_2_28_${arch}.whl` 安装包，参考 [torch_npu 安装文档](https://www.hiascend.com/document/detail/zh/Pytorch/710/configandinstg/instg/insg_0004.html) 进行安装。
 
@@ -56,13 +56,13 @@ Hy3-preview 是腾讯混元团队开发的大规模 MoE 语言模型，总参数
 
 本样例使用 BF16 原始权重，无需额外权重转换（YAML 中已配置 `enable_online_split_weight: True`，推理启动时自动完成多卡切分）。
 
-请将 Hy3-preview 原始权重下载至本地路径（下载链接：[modelscope](https://www.modelscope.ai/models/Tencent-Hunyuan/Hy3-preview)   [huggingface](https://huggingface.co/tencent/Hy3-preview)），例如 `/data/models/hy3_preview/`。
+请将 Hy3-preview 原始权重下载至本地路径（下载链接：[modelscope](https://www.modelscope.ai/models/Tencent-Hunyuan/Hy3-preview) 或  [huggingface](https://huggingface.co/tencent/Hy3-preview)），例如 `/data/models/hy3_preview/`。
 
 ## 推理执行
 
 1. 配置推理执行需要加载的权重文件以及 YAML 文件。
 
-   - 修改 YAML 文件中 `model_path` 参数。关于 YAML 文件中的更多配置说明可参见 [YAML 参数描述](./config/README.md)。
+   - 修改 YAML 文件中 `model_path` 参数。关于 YAML 文件中的更多配置说明可参见 [YAML 参数描述](../../docs/common/inference_config_guide.md)。
 
      在 `models/hy3_preview/config` 目录下已提供了较优性能的 YAML 样例供您参考，您可以根据场景选择对应的 YAML 文件：
 
