@@ -85,7 +85,7 @@
 
 ### 获取 docker 镜像
 
-  从[ARM镜像地址](https://cann-ai.obs.cn-north-4.myhuaweicloud.com/cann-quantization/DeepSeek/cann9.0_pt2.8.0_ds_aarch_image_v1.0.tar)中下载 docker 镜像，然后上传到A3服务器上，并通过命令导入镜像 `docker load -i cann9.0_pt2.8.0_ds_aarch_image_v1.0.tar`。
+  从[ARM镜像地址](https://cann-ai.obs.cn-north-4.myhuaweicloud.com/cann-quantization/DeepSeek/cann9.0_pt2.8.0_ds_aarch_image_v1.1.tar)中下载 docker 镜像，然后上传到A3服务器上，并通过命令导入镜像 `docker load -i cann9.0_pt2.8.0_ds_aarch_image_v1.1.tar`。
 
 ### 拉起 docker 容器
 
@@ -114,7 +114,7 @@
       --net=host \
       --shm-size=128g \
       --privileged \
-      cann9.0_pt2.8.0_ds_aarch_image:v1.0 /bin/bash
+      cann9.0_pt2.8.0_ds_aarch_image:v1.1 /bin/bash
   ```
   通过如下命令进入容器：
   ```
