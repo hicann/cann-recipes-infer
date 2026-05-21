@@ -337,9 +337,11 @@ for layer in model_layers:
 | 16   | 16  | 3   | Hybrid MXFP8-MXFP4    | 8192     | 6.71      | 148.96  |
 | 256  | 16  | 3   | Hybrid MXFP8-MXFP4    | 8192     | 9.84      | 1625.31 |
 | 1536 | 16  | 1   | Hybrid MXFP8-MXFP4    | 8192     | 20.33     | 4722.22 |
-| 16   | 16  | 3   | Hybrid MXFP8-MXFP4    | 131072   | 7.80      | 128.15  |
-| 256  | 16  | 3   | Hybrid MXFP8-MXFP4    | 131072   | 12.83     | 1246.89 |
-| 768  | 16  | 1   | Hybrid MXFP8-MXFP4    | 131072   | 21.65     | 2217.09 |
+| 16   | 16  | 3   | Hybrid MXFP8-MXFP4    | 131072   | 6.89      | 145.15  |
+| 256  | 16  | 3   | Hybrid MXFP8-MXFP4    | 131072   | 10.69     | 1496.36 |
+| 768  | 16  | 1   | Hybrid MXFP8-MXFP4    | 131072   | 12.08     | 3968.32 |
+| 16   | 16  | 3   | Hybrid MXFP8-MXFP4    | 1048576  | 8.22      | 121.70  |
+| 64   | 16  | 3   | Hybrid MXFP8-MXFP4    | 1048576  | 9.57      | 418.17  |
 | 256  | 16  | 3   | Hybrid FP8-MXFP4      | 8192     | 11.06     | 1447.00 |
 | 1536 | 16  | 1   | Hybrid FP8-MXFP4      | 8192     | 24.28     | 3953.49 |
 
