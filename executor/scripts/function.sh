@@ -19,11 +19,22 @@ function launch()
 
 function check_launch()
 {
-    if pgrep -f "python.*[ /]infer\.py" > /dev/null; then
-        echo "A Python process executing infer.py was detected to be running, and the script was interrupted and exited."
-        exit 1
+    if command -v pgrep >/dev/null 2>&1; then
+        # pgrep command works
+        if pgrep -f "python.*[ /](infer|server)\.py" > /dev/null 2>&1; then
+            echo "A Python process executing infer.py or server.py was detected to be running, and the script was interrupted and exited."
+            exit 1
+        else
+            echo "No Python process running infer.py or server.py was detected."
+        fi
     else
-        echo "No Python process running infer.py was detected."
+        # fall back to ps when pgrep is unavailable
+        if ps aux | grep -E "python.*[ /](infer|server)\.py" | grep -v grep > /dev/null 2>&1; then
+            echo "A Python process executing infer.py or server.py was detected to be running, and the script was interrupted and exited."
+            exit 1
+        else
+            echo "No Python process running infer.py or server.py was detected."
+        fi
     fi
 }
 
