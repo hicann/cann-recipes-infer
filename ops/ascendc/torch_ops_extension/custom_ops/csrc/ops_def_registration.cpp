@@ -22,7 +22,8 @@ TORCH_LIBRARY(custom, m) {
     m.def("indexer_compress_epilog(Tensor(a!) indexer_compress_cache, Tensor(b!) indexer_compress_scale, Tensor x, "
           "Tensor slot_mapping, *, int quant_mode=1, bool round_scale=True, float scale=1.0) -> ()");
     m.def("inplace_partial_rotary_mul(Tensor(a!) x, Tensor r1, Tensor r2, *, str rotary_mode, int[2] partial_slice) -> ()");
-    
+    m.def("partial_rotary_mul_quant(Tensor x, Tensor r1, Tensor r2, *, str rotary_mode, int[2] partial_slice, "
+        "float scale=1.0) -> Tensor");
     m.def("npu_gather_selection_kv_cache(Tensor(a!) selection_k_rope, Tensor(b!) selection_kv_cache, Tensor(c!) "
         "selection_kv_block_table, Tensor(d!) selection_kv_block_status, Tensor selection_topk_indices, Tensor full_k_rope, "
         "Tensor full_kv_cache, Tensor full_kv_block_table, Tensor full_kv_actual_seq, Tensor full_q_actual_seq, *, "
