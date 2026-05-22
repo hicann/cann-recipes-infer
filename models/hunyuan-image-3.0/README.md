@@ -10,17 +10,22 @@
 
 1. 安装CANN软件包。
 
-   本样例的编译执行依赖CANN开发套件包（cann-toolkit）与CANN二进制算子包（cann-kernels），支持的CANN软件版本为`CANN 9.0.0-beta.1`。
+   本样例的编译执行依赖CANN开发套件包与CANN二进制算子包，支持的CANN软件版本为`CANN 9.0.0-beta.1`。
 
-   请从[软件包下载地址](https://www.hiascend.com/developer/download/community/result?module=cann&cann=9.0.0-beta.1)下载`Ascend-cann-toolkit_9.0.0-beta.1_linux-${arch}.run`与`Atlas-A3-ops_9.0.0-beta.1_linux-${arch}.run`（A3环境）或`Ascend-cann-910b-ops_9.0.0-beta.1-${arch}.run`（A2环境）软件包，并参考[CANN安装文档](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/900beta1/softwareinst/instg/instg_0000.html?Mode=PmIns&InstallType=local&OS=openEuler)进行安装。
+   请从[软件包下载地址](https://www.hiascend.com/developer/download/community/result?module=cann&cann=9.0.0-beta.1)下载`Ascend-cann-toolkit_${version}_linux-${arch}.run`与`Ascend-cann-${soc}-ops_${version}_linux-${arch}.run`软件包，并参考[CANN安装文档](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/900beta1/softwareinst/instg/instg_0000.html?Mode=PmIns&InstallType=local&OS=openEuler)进行安装。
 
+    - `${soc}`表示芯片版本，如910b、A3。
+    - `${version}`表示CANN包版本号，如9.0.0-beta.1。
     - `${arch}`表示CPU架构，如aarch64、x86_64。
+
 
 2. 安装Ascend Extension for PyTorch（torch_npu）。
 
-   Ascend Extension for PyTorch（torch_npu）为支撑PyTorch框架运行在NPU上的适配插件，本样例建议使用的Python版本为`3.11`，PyTorch版本为`2.7.1`，请先使用`pip install torch==2.7.1 --index-url https://download.pytorch.org/whl/cpu`安装CPU版本的torch包。
+   Ascend Extension for PyTorch（torch_npu）为支撑PyTorch框架运行在NPU上的适配插件，本样例支持的Ascend Extension for PyTorch版本为`v7.3.1`，PyTorch版本为`2.7.1`。
 
-   相应的Ascend Extension for PyTorch版本为`v7.3.1-pytorch2.7.1`。可以通过`pip install torch_npu==2.7.1`进行安装，也可以从[软件包下载地址](https://gitcode.com/Ascend/pytorch/releases/v7.3.1-pytorch2.7.1)下载`release v7.3.1-pytorch2.7.1`的whl包进行安装，或者下载其源码，参考[源码编译安装](https://www.hiascend.com/document/detail/zh/Pytorch/730/configandinstg/instg/docs/zh/installation_guide/installation_description.md)。
+   请从[软件包下载地址](https://gitcode.com/Ascend/pytorch/releases/v7.3.1-pytorch2.7.1)下载`torch_npu-2.7.1.post3-cp311-cp311-manylinux_2_28_${arch}.whl`安装包，并参考[torch_npu安装文档](https://www.hiascend.com/document/detail/zh/Pytorch/730/configandinstg/instg/docs/zh/installation_guide/installation_description.md)进行安装。
+
+    - `${arch}`表示CPU架构，如aarch64、x86_64。
 
 3. 下载项目源码并安装依赖。
 

@@ -17,9 +17,10 @@ Hy3-preview 是腾讯混元团队开发的大规模 MoE 语言模型，总参数
 
 ## 环境准备
 
+
 1. 安装 CANN 软件包。
 
-   本样例依赖 CANN 开发套件包（cann-toolkit）与 CANN 二进制算子包（cann-kernels），支持的 CANN 软件版本为 `CANN 9.0.0`。
+   本样例依赖CANN开发套件包与CANN二进制算子包，支持的CANN软件版本为 `CANN 9.0.0`。
 
    请从[软件包下载地址](https://www.hiascend.com/developer/download/community/result?module=cann&cann=9.0.0)下载 `Ascend-cann-toolkit_${version}_linux-${arch}.run` 与 `Ascend-cann-A3-ops_${version}_linux-${arch}.run` 软件包，并参考 [CANN 安装文档](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/900/softwareinst/instg/instg_0000.html?OS=openEuler&InstallType=netyum) 进行安装。
 
@@ -28,9 +29,9 @@ Hy3-preview 是腾讯混元团队开发的大规模 MoE 语言模型，总参数
 
 2. 安装 Ascend Extension for PyTorch（torch_npu）。
 
-   Ascend Extension for PyTorch（torch_npu）为支撑 PyTorch 框架运行在 NPU 上的适配插件，本样例支持的 torch_npu 版本为 `v2.8.0.post4`，PyTorch 版本为 `2.8.0`。
+   Ascend Extension for PyTorch（torch_npu）为支撑 PyTorch 框架运行在 NPU 上的适配插件，本样例支持的 torch_npu 版本为 `v26.0.0`，PyTorch 版本为 `2.8.0`。
 
-   请从[软件包下载地址](https://gitcode.com/Ascend/pytorch/releases/v26.0.0-pytorch2.8.0)下载 `torch_npu-2.8.0.post4-cp311-cp311-manylinux_2_28_${arch}.whl` 安装包，参考 [torch_npu 安装文档](https://www.hiascend.com/document/detail/zh/Pytorch/710/configandinstg/instg/insg_0004.html) 进行安装。
+   请从[软件包下载地址](https://gitcode.com/Ascend/pytorch/releases/v26.0.0-pytorch2.8.0)下载 `torch_npu-2.8.0.post4-cp311-cp311-manylinux_2_28_${arch}.whl` 安装包，并参考 [torch_npu 安装文档](https://www.hiascend.com/document/detail/zh/Pytorch/2600/configandinstg/instg/docs/zh/installation_guide/installation_via_binary_package.md) 进行安装。
 
     - `${arch}` 表示 CPU 架构，如 aarch64、x86_64。
 
@@ -56,7 +57,7 @@ Hy3-preview 是腾讯混元团队开发的大规模 MoE 语言模型，总参数
 
 本样例使用 BF16 原始权重，无需额外权重转换（YAML 中已配置 `enable_online_split_weight: True`，推理启动时自动完成多卡切分）。
 
-请将 Hy3-preview 原始权重下载至本地路径（下载链接：[modelscope](https://www.modelscope.ai/models/Tencent-Hunyuan/Hy3-preview) 或  [huggingface](https://huggingface.co/tencent/Hy3-preview)），例如 `/data/models/hy3_preview/`。
+请将 Hy3-preview 原始权重下载至本地路径（下载链接：[modelscope](https://www.modelscope.ai/models/Tencent-Hunyuan/Hy3-preview) 或 [huggingface](https://huggingface.co/tencent/Hy3-preview)），例如 `/data/models/hy3_preview/`。
 
 ## 推理执行
 
