@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 """Lazy registry mapping model name to (ForCausalLM, [ModelMTP,] Config) classes."""
 
 import importlib
@@ -58,6 +59,10 @@ _specs: dict[str, list[tuple[str, str]]] = {
     "qwen3_moe": [
         ("models.qwen3_moe.models.modeling_qwen3_moe", "Qwen3MoeForCausalLM"),
         ("models.qwen3_moe.models.configuration_qwen3_moe", "Qwen3MoeConfig"),
+    ],
+    "qwen3.5": [
+        ("models.qwen3_5.models.modeling_qwen3_5_moe", "Qwen3_5MoeForCausalLM"),
+        ("models.qwen3_5.models.configuration_qwen3_5_moe", "Qwen3_5MoeTextConfig"),
     ],
 }
 

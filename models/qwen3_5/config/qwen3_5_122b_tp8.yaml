@@ -1,0 +1,40 @@
+model_name: "qwen3.5"
+world_size: 8
+
+model_config:
+  model_name: "qwen3.5"
+  model_path: "/model/to/Qwen3.5-122B-A10B"
+  exe_mode: "ge_graph"        # ["ge_graph", "eager", "acl_graph"]
+  enable_profiler: False  # [False, True]
+  with_ckpt: True
+  enable_cache_compile: False
+  packed_sequence: False
+  perfect_eplb: False
+  platform_version: "A3"
+  custom_params:
+      # enable_mm_all_reduce_base: Whether to fuse TP matmul and all_reduce with npu_mm_all_reduce_base (default: False)
+      # enable_gdn_solve_triangular: Whether to use solve_triangular in Qwen3.5 GatedDeltaNet chunk rule (default: False)
+      # enable_decode_moe_dispatch_combine_v2: Whether to use v2 MoE dispatch/combine in decode (default: False)
+      enable_mm_all_reduce_base: False
+      enable_gdn_solve_triangular: False
+      enable_decode_moe_dispatch_combine_v2: False
+
+data_config:
+  dataset: "default"  # ["default", "LongBench"]
+  input_truncated_len: 2048
+
+parallel_config:
+  world_size: 8
+  attn_tp_size: 8
+  moe_tp_size: 8
+  embed_tp_size: 8
+  lmhead_tp_size: 8
+  dense_tp_size: 1
+  o_proj_tp_size: 1
+  # Derivations (not configurable):
+  # attn_dp_size = world_size // attn_tp_size = 1
+  # moe_ep_size = world_size // moe_tp_size = 1
+
+scheduler_config:
+  max_new_tokens: 128
+  batch_size: 4        # Strict constraint: Batch=1

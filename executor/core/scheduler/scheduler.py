@@ -99,7 +99,7 @@ class Scheduler:
         kwargs = {}
         if input_truncated_len is not None:
             kwargs = dict(
-                truncation=True, 
+                truncation=True,
                 max_length=input_truncated_len,
             )
         encoded = self.tokenizer(
