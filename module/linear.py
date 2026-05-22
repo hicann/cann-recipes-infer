@@ -351,34 +351,23 @@ class VocabParallelEmbedding(nn.Embedding):
         self.tp_rank = tp_rank
         self.input_size = vocab_size
         self.input_size_per_partition = divide(vocab_size, self.tp_size)
-        super().__init__(vocab_size,
+        shard_start_idx = self.tp_rank * self.input_size_per_partition
+        shard_end_idx = shard_start_idx + self.input_size_per_partition
+        local_padding_idx = None
+        if padding_idx is not None and shard_start_idx <= padding_idx < shard_end_idx:
+            local_padding_idx = padding_idx - shard_start_idx
+
+        super().__init__(self.input_size_per_partition,
                          hidden_size,
-                         padding_idx,
+                         local_padding_idx,
                          dtype=params_dtype)
         self.output_size_per_partition = hidden_size
         self.output_size = hidden_size
         self.output_partition_sizes = [hidden_size]
         self.params_dtype = params_dtype
-        self.create_weights(
-            layer=self,
-            input_size_per_partition=self.input_size_per_partition,
-            output_partition_sizes=self.output_partition_sizes,
-            input_size=self.input_size,
-            output_size=self.output_size,
-            params_dtype=self.params_dtype,
-            weight_loader=self.weight_loader)
-
-    def create_weights(self,
-                       input_size_per_partition: int,
-                       output_partition_sizes: list[int], input_size: int,
-                       output_size: int, params_dtype: torch.dtype,
-                       **extra_weight_attrs):
-        self.weight = Parameter(torch.empty(input_size_per_partition,
-                                    sum(output_partition_sizes),
-                                    dtype=params_dtype),
-                                requires_grad=False)
+        self.weight.requires_grad_(False)
         set_weight_attrs(self.weight, {"input_dim": 0, "output_dim": 1})
-        set_weight_attrs(self.weight, extra_weight_attrs)
+        set_weight_attrs(self.weight, {"weight_loader": self.weight_loader})
 
     def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
         input_dim = getattr(param, "input_dim", None)
