@@ -388,12 +388,11 @@ template <typename T0, typename T1>
     uint16_t loopCount = CeilDiv(curColNum, VL_FP32);
     uint32_t curColNumAlign = RoundUp<T1>(curColNum);
     uint32_t dstCurColNumAlign = RoundUp<T0>(curColNum);
-    MaskReg pregLoop = CreateMask<float>();
     __VEC_SCOPE__
     {
         RegTensor<float> xReg;
         RegTensor<hifloat8_t> tmp;
-        MaskReg pregMain = CreateMask<float>();
+        MaskReg pregLoop = CreateMask<float>();
         for (uint16_t i = 0; i < curRowNum; i++) {
             uint32_t sreg = curColNum;
             for (uint16_t j = 0; j < loopCount; j++) {
