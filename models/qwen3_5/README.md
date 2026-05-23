@@ -126,6 +126,14 @@ bash executor/scripts/infer.sh --model qwen3_5 --yaml qwen3_5_35b_ep8.yaml
 
 `models/qwen3_5/benchmark`目录提供了MMLU评测入口。评测前请准备好[MMLU数据](https://people.eecs.berkeley.edu/~hendrycks/data.tar)。
 
+>  注意事项：框架默认开启thinking模式。如需使用本脚本进行精度测试，需要关闭thinking模式。请在`executor/core/scheduler/scheduler.py`的`tokenize_request`方法中，将`apply_chat_template`调用添加`enable_thinking=False`参数：
+>
+> ```python
+> prompt_text = self.tokenizer.apply_chat_template(
+>    prompt, tokenize=False, add_generation_prompt=True, enable_thinking=False
+> )
+> ```
+
 执行评测：
 
 ```bash
