@@ -369,8 +369,6 @@ class DeepseekV3MoE(nn.Module):
                 # match GMM operator requirement (dim0, dim1)->(dim0, dim1//2, 2)
                 gathered_pertoken_scale = reshape_mx_scale(gathered_pertoken_scale)
             gmm_args.update({"pertoken_scale": gathered_pertoken_scale})
-        if self.gmm_quant_mode == "w4a8int4":
-            gmm_args.update({"is_prefill": True})
         hidden_states_ordered_by_experts = self.moe_ffn(**gmm_args)
         # finalize-rerouting
         new_x = torch.index_select(hidden_states_ordered_by_experts, 0, gathered_ids_unsort.float().argsort().int())
@@ -393,9 +391,9 @@ class DeepseekV3MoE(nn.Module):
         if pertoken_scale.dim() > 1:
             pertoken_scale = pertoken_scale.reshape(-1)
             x = x.view(-1, hidden_size)
-        is_prefill = kwargs.get("is_prefill", False)
+
         mm1_mm3 = torch_npu.npu_grouped_matmul(
-            [x], [self.experts.w13_weight], bias=None if is_prefill else [self.experts.w13_bias],
+            [x], [self.experts.w13_weight], bias=[self.experts.w13_bias],
             scale=[self.experts.w13_weight_scale], per_token_scale=[pertoken_scale],
             group_list=expert_tokens, split_item=3,
             output_dtype=final_output_dtype, group_type=0,
@@ -424,7 +422,7 @@ class DeepseekV3MoE(nn.Module):
             )
 
         out_hidden = torch_npu.npu_grouped_matmul(
-            [intermediate_h], [self.experts.w2_weight], bias=None if is_prefill else [self.experts.w2_bias],
+            [intermediate_h], [self.experts.w2_weight], bias=[self.experts.w2_bias],
             scale=[self.experts.w2_weight_scale], per_token_scale=[pertoken_scale],
             group_list=expert_tokens, split_item=3,
             output_dtype=final_output_dtype, group_type=0,
