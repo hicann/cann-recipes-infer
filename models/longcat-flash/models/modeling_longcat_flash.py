@@ -281,7 +281,7 @@ class LongcatFlashTopkRouter(nn.Module):
 
     def forward(self, hidden_states):
         hidden_states = hidden_states.view(-1, self.config.hidden_size)
-        router_logits = self.classifier(hidden_states.type(torch.float32))
+        router_logits = F.linear(hidden_states.type(torch.float32), self.classifier.weight, None)
         topk_weights, topk_indices, _ = torch_npu.npu_moe_gating_top_k(
                 router_logits,
                 k=self.top_k,
