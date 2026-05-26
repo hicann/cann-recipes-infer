@@ -58,7 +58,7 @@ def generate_quant_config(cache_scheme, ignores, w4a8=False, is_fp=False):
     Generate a quantization configuration dictionary based on the specified parameters.
     """
     config_groups = {"group_0": {"targets": ["Linear"]}}
-    if is_fp:
+    if w4a8:
         config_groups.update({"group_1": {"targets": ["MoEGMM"]}})
     quant_config = {"config_groups": config_groups,
                     "format": "float-quantized" if is_fp else "int-quantized",
@@ -69,8 +69,9 @@ def generate_quant_config(cache_scheme, ignores, w4a8=False, is_fp=False):
     quant_config.update(cache_scheme)
     qtype = "float" if is_fp else "int"
     quant_config["config_groups"]["group_0"].update(generate_quant_group(a_num_bits=NUM_BITS_8, w_num_bits=NUM_BITS_8, qtype=qtype))
-    if is_fp:
+    if w4a8:
         quant_config["config_groups"]["group_1"].update(generate_quant_group(a_num_bits=NUM_BITS_8, w_num_bits=NUM_BITS_4 if w4a8 else NUM_BITS_8, qtype=qtype))
+    if is_fp:
         quant_config["weight_block_size"] = [1, 32]
     return quant_config
 

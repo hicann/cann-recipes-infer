@@ -37,6 +37,7 @@ from convert_config import generate_quant_config, generate_ignore_item
 
 NUM_BITS_4 = 4
 NUM_BITS_8 = 8
+DBL_MAX = 1.79769e308
 
 
 def weight_dequant(weight: torch.Tensor, scale: torch.Tensor, block_size: int = 128, is_mx: bool=False) -> torch.Tensor:
@@ -87,6 +88,29 @@ def weight_dequant(weight: torch.Tensor, scale: torch.Tensor, block_size: int = 
     return dequantized_weight
 
 
+def per_channel_searching(x):
+    end_ratio = 1.3
+    start_ratio = 0.7
+    step = 0.01
+    min_val, max_val = x.min(1, keepdim=True)[0], x.max(1, keepdim=True)[0]
+    qmax = 2 ** (NUM_BITS_4 - 1) - 1
+    max_size = int((end_ratio - start_ratio) / step + 1)
+    smallest_loss = torch.zeros_like(min_val) + DBL_MAX
+    tmp_val = torch.zeros_like(max_val)
+    for i in range(max_size):
+        max_candidates = (start_ratio + i * step) * max_val
+        current_scale = max_candidates / qmax
+        qx = x.clamp(-max_candidates, max_candidates).mul(1.0 / current_scale).round().mul(current_scale)
+        current_loss = (x - qx).pow(2).sum(dim=1, keepdim=True)
+        mask = current_loss < smallest_loss
+        smallest_loss = torch.where(mask, current_loss, smallest_loss)
+        tmp_val = torch.where(mask, max_candidates, tmp_val)
+    scales = tmp_val / qmax
+    qx = x.clamp(-tmp_val, tmp_val).mul(1.0 / scales).round()
+    qx = torch.clamp(qx, -qmax, qmax)
+    return qx.cpu(), scales.cpu()
+
+
 def unpack_mxfloat4_to_fp32(packed_tensor):
     e2m1_values = torch.tensor([
         0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
@@ -105,12 +129,67 @@ def unpack_mxfloat4_to_fp32(packed_tensor):
     return fp32_tensor.view(*new_shape)
 
 
+def int4_assistance_bias(weight, weight_scale):
+    """
+    Calculate the int4 weight assistance bias matrix for W4A8 MoEGEMM.
+    """
+    repeat_times = weight.shape[1] // weight_scale.shape[1]
+    expanded_scale = weight_scale.repeat_interleave(repeat_times, dim=1)
+    # 8 is the max value of INT4, for normalizing the quantization range of assistance bias.
+    weight_assistant_matrix = (expanded_scale * weight * 8).sum(dim=1).float()
+    return weight_assistant_matrix
+
+
+def scale_fp32_to_u64(weight_scale):
+    """
+    Convert FP32 scale to UINT64 scale for W4A8 MoEGMM.
+    """
+    k, n = weight_scale.shape
+    scale_np = weight_scale.float().cpu().numpy()
+    scale_uint32 = scale_np.astype(np.float32)
+    scale_uint32.dtype = np.uint32
+    scale_uint64 = np.zeros((k, n * 2), dtype=np.uint32)
+    scale_uint64[..., ::2] = scale_uint32
+    scale_uint64.dtype = np.uint64
+    scale_uint64 = torch.from_numpy(scale_uint64).to(torch.uint64)
+    return scale_uint64
+
+
+def pack_4bit(x: torch.Tensor):
+    """
+    Pack int4 weight for W4A8 MoEGMM. Each two int4 numbers are packed into one byte.
+    """
+    assert x.dtype == torch.int8
+    x = x.T.contiguous()  # pack along output channel dim.
+    shape = x.shape
+    x = x.view(-1, 2)
+    # for example, 5(0b00000101) << 4 -> 0b01010000, -7 (0b11111001) & 0b00001111 -> 0b00001001,
+    # then 0b01010000 | 0b00001001 -> 0b01011001
+    x1 = x[:, 0]
+    x2 = x[:, 1]
+    y_x2 = torch.bitwise_left_shift(x2, 4)
+    y_x1 = x1 & 0b00001111
+    y = torch.bitwise_or(y_x1, y_x2)
+    y = y.view(shape[0], shape[1] // 2)
+    return y.T.contiguous()
+
+
 def int_weight_quant(tensor: torch.Tensor, bits=8, weight_clip_factor=None):
     assert tensor.dim() == 2
+    if weight_clip_factor is not None:
+        cur_min, cur_max = tensor.min(1, keepdim=True)[0], tensor.max(1, keepdim=True)[0]
+        cur_min *= weight_clip_factor[0]
+        cur_max *= weight_clip_factor[1]
+        tensor = torch.clamp(tensor, min=cur_min, max=cur_max)
+    if bits == 4:
+        quantized, scale = per_channel_searching(tensor.npu())
+        quantized = quantized.to(torch.int8)
+        bias = int4_assistance_bias(quantized, scale)
+        quantized = pack_4bit(quantized)
+        scale = scale_fp32_to_u64(scale)
+        return quantized, scale, bias
     qmax = 2 ** (bits - 1) - 1
     abs_max = torch.abs(tensor).max(dim=1, keepdim=True)[0]
-    if weight_clip_factor is not None:
-        abs_max = abs_max * weight_clip_factor
     scale = abs_max / qmax
     assert scale.shape == (tensor.shape[0], 1)
     quantized = torch.round(tensor / scale)
@@ -168,6 +247,18 @@ def copy_py_json(src, target):
                 shutil.copy2(src_path, dst_path)
 
 
+def load_clip_params(num_layers, clip_param_path):
+    weight_clip_params = {}
+    for layer_idx in range(num_layers):
+        expected_file = os.path.join(clip_param_path, f"quant_params_{layer_idx}.pt")
+        if not os.path.exists(expected_file):
+            raise FileNotFoundError(expected_file)
+        else:
+            quant_params = torch.load(expected_file)
+        weight_clip_params.update(quant_params)
+    return weight_clip_params
+
+
 def main(fp8_path, output_path, quant_type, quant_param_path=None):
     """
     Converts FP8 weights to BF16 and saves the converted weights.
@@ -196,7 +287,7 @@ def main(fp8_path, output_path, quant_type, quant_param_path=None):
     torch.set_default_dtype(torch.bfloat16)
     os.makedirs(output_path, exist_ok=True)
     assert quant_type in [
-        "bfloat16", "w8a8-int",  "w8a8-mx", "w4a8-mx"], f"Unsupported quant_type: {quant_type}"
+        "bfloat16", "w8a8-int", "w4a8-int", "w8a8-mx", "w4a8-mx"], f"Unsupported quant_type:{quant_type}"
     model_index_file = os.path.join(fp8_path, "model.safetensors.index.json")
     config_file = os.path.join(fp8_path, 'config.json')
     with open(model_index_file, "r") as f:
@@ -255,6 +346,10 @@ def main(fp8_path, output_path, quant_type, quant_param_path=None):
             loaded_files[file_name] = load_file(file_path, device="cpu")
         return loaded_files[file_name][tensor_name]
 
+    is_clip = False
+    if quant_param_path is not None:
+        weight_clip_params = load_clip_params(num_layers, quant_param_path)
+        is_clip = True
     safetensor_files = list(glob(os.path.join(fp8_path, "*.safetensors")))
     safetensor_files.sort()
     for safetensor_file in tqdm(safetensor_files):
@@ -295,7 +390,19 @@ def main(fp8_path, output_path, quant_type, quant_param_path=None):
                             quant_weight = f32_to_f4_unpacked(quant_weight.float())
                             quant_weight = pack_uint4(quant_weight)
                     else:
-                        quant_weight, scale_inv, bias = int_weight_quant(weight, bits=bit)
+                        if is_clip:
+                            weight_clip_factor = [weight_clip_params.get(f"{new_weight_name}.clip_factor_min")]
+                            weight_clip_factor.append(weight_clip_params.get(f"{new_weight_name}.clip_factor_max"))
+                            weight_clip_factor = None if all(v is None for v in weight_clip_factor) \
+                                else weight_clip_factor
+                        else:
+                            weight_clip_factor = None
+                        quant_weight, scale_inv, bias = int_weight_quant(weight, bits=bit,
+                                                                         weight_clip_factor=weight_clip_factor)
+                        if w4a8 and bias is not None:
+                            bias_name = weight_name.replace(".weight", ".bias")
+                            new_state_dict[bias_name] = bias
+                            new_weight_map[bias_name] = file_name
                     new_scale_name = weight_name.replace('.weight', '.scale')
 
                     new_state_dict[weight_name] = quant_weight
@@ -332,7 +439,7 @@ if __name__ == "__main__":
     parser.add_argument("--input_fp8_hf_path", type=str, required=True)
     parser.add_argument("--output_hf_path", type=str, required=True)
     parser.add_argument("--quant_type", type=str, default="w8a8-int",
-                        choices=["w8a8-int", "bfloat16", "w4a8-mx"])
+                        choices=["w8a8-int", "w4a8-int", "bfloat16", "w4a8-mx"])
     parser.add_argument("--quant_param_path", type=str, default=None)
     args = parser.parse_args()
 
