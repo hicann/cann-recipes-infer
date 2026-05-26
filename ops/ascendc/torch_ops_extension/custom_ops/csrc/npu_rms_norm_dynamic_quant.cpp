@@ -74,8 +74,8 @@ std::tuple<at::Tensor, at::Tensor> npu_rms_norm_dynamic_quant_meta(
                 "x should be FLOAT16, BFLOAT16.");
 
     // construct the output tensors
-    at::Tensor y_out = at::empty_like(x);
     auto options = x.options();
+    at::Tensor y_out = at::empty_like(x, options.dtype(at::kChar));
     c10::SmallVector<int64_t, SIZE> scale_out_shape;
     for (size_t i = 0; i < x.sizes().size() - 1; i++) {
         scale_out_shape.push_back(x.sizes()[i]);
