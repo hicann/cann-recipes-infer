@@ -209,7 +209,7 @@ echo "source $HOME/miniconda3/etc/profile.d/conda.sh" >> ~/.bashrc   # 永久生
 创建并激活 Python 环境：
 
 ```bash
-conda create -n sana python=3.10 -y --override-channels -c conda-forge
+conda create -n sana python=3.10 -y
 conda activate sana
 ```
 
