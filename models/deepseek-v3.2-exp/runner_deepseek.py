@@ -25,9 +25,6 @@ import torch.nn as nn
 from models.modeling_deepseek import DeepseekV3ForCausalLM, DeepseekV3ModelMTP
 from executor.utils import override, get_init_attn_mask
 from executor.model_runner import ModelRunner
-from executor.model_loader.default_loader import DefaultModelLoader
-from executor.model_loader.dummy_loader import DummyModelLoader
-from module.utils import to_transpose_nz
 from module.quantization import QuantizeMethodBase
 from module.quantization.compressed_tensors.compressed_tensors_moe_gmm import (
     CompressedTensorW8A8Int8MoEGMMMethod,
