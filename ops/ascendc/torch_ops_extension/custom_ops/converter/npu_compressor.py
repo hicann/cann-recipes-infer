@@ -18,32 +18,37 @@ from torch.types import Device, Number, _bool, _complex, _device, _dtype, _float
 from torchair._ge_concrete_graph import ge_apis as ge
 from torchair._ge_concrete_graph.fx2ge_converter import declare_supported, register_fx_node_ge_converter
 from torchair.ge._ge_graph import Tensor, TensorSpec, DataType
-from torchair._ge_concrete_graph.supported_declaration import _TypedTensor, F32, F16, F64, I32, I16, I64, I8, U8, BOOL, Support
+from torchair._ge_concrete_graph.supported_declaration import _TypedTensor, F32, F16, BF16, F64, I32, I16, I64, \
+    I8, U8, BOOL, Support
 from torchair._ge_concrete_graph.utils import dtype_promote
 from torchair.ge import attr
 
-# 为自定义算子注册converter，用于torch.compile 场景成图
 
-# 注意： meta_outputs形参名为固定写法，若写错会影响ge节点的输出dtype与shape推导
-@register_fx_node_ge_converter(torch.ops.custom.npu_rms_norm_dynamic_quant.default)
-def convert_npu_rms_norm_dynamic_quant(
-    x: Tensor,
-    gamma: Tensor,
-    *,
-    smooth_scale: Optional[Tensor] = None,
-    beta: Optional[Tensor] = None,
-    epsilon: float = 1e-6,
-    meta_outputs: Any = None):
-
+@register_fx_node_ge_converter(torch.ops.custom.compressor.default)
+def convert_compressor(
+        x,
+        wkv,
+        wgate,
+        state_cache,
+        ape,
+        norm_weight,
+        rope_sin,
+        rope_cos,
+        rope_head_dim,
+        cmp_ratio,
+        *,
+        state_block_table=None,
+        cu_seqlens=None,
+        seqused=None,
+        start_pos=None,
+        coff=1,
+        norm_eps=1e-6,
+        rotary_mode=1,
+        cache_mode=1
+):
+    state_cache_stride_dim0 = int(state_cache.symsize[-2]) * int(state_cache.symsize[-1])
     out = torchair.ge.custom_op(
-        "RmsNormDynamicQuant",
-        inputs={"x": x,
-                "gamma": gamma,
-                "smooth_scale1": smooth_scale,
-                "smooth_scale2": None,
-                "beta": beta,
-                },
-        attrs={"epsilon": attr.Float(epsilon)},
-        outputs=['y1', 'y2', 'scale1', 'scale2']
-    )
-    return [out[0], out[2]]
+        "Compressor", x, wkv, wgate, state_cache, ape, norm_weight, rope_sin, rope_cos,
+        state_block_table, cu_seqlens, seqused, start_pos, rope_head_dim, cmp_ratio, coff, norm_eps,
+        rotary_mode, cache_mode, state_cache_stride_dim0)
+    return (out[0])

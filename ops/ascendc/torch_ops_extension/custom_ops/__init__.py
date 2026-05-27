@@ -15,6 +15,7 @@ __all__ = list(module for _, module, _ in pkgutil.iter_modules([os.path.dirname(
 # 导入so 和 python
 from . import custom_ops_lib
 from .converter import (
+    npu_compressor, npu_inplace_partial_rotary_mul, npu_rms_norm_dynamic_quant,
     npu_moe_gating_top_k, npu_indexer_compress_epilog, npu_kv_compress_epilog,
     npu_moe_init_routing_group_quant, npu_hc_post, npu_hc_pre, npu_swiglu_clip_quant,
     npu_swiglu_group_quant, npu_gather_selection_kv_cache, npu_quant_lightning_indexer,
@@ -23,7 +24,6 @@ from .converter import (
     npu_kv_quant_sparse_attn_sharedkv, npu_kv_quant_sparse_attn_sharedkv_metadata,
     npu_dequant_swiglu_clamp_quant, npu_partial_rotary_mul_quant,
 )
-
 """
 import custom ops as torch_npu ops to support the following usage:
 'torch.ops.custom.npu_selected_flash_attention()'

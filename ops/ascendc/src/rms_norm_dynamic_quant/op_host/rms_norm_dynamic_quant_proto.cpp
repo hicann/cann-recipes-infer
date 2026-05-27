@@ -16,7 +16,13 @@
 #define OPS_RMS_NORM_DYNAMIC_QUANT_PROTO_H_
 
 #include "graph/operator_reg.h"
-
+#include "register/op_impl_registry.h"
+namespace {
+    const int32_t OUTPUT_IDX_Y1 = 0;
+    const int32_t OUTPUT_IDX_Y2 = 1;
+    const int32_t OUTPUT_IDX_SCALE1 = 2;
+    const int32_t OUTPUT_IDX_SCALE2 = 3;
+}
 namespace ge {
 /**
 * @brief Fused Operator of RmsNorm and DynamicQuant.
@@ -77,6 +83,38 @@ REG_OP(RmsNormDynamicQuant)
     .ATTR(output_mask, ListBool, {})
     .ATTR(dst_type, Int, DT_INT8)
     .OP_END_FACTORY_REG(RmsNormDynamicQuant)
+
+graphStatus InferShape4RmsNormDynamicQuant(gert::InferShapeContext *context)
+{
+    const gert::Shape *xShape = context->GetInputShape(0);
+    gert::Shape *y1Shape = context->GetOutputShape(0);
+    gert::Shape *y2Shape = context->GetOutputShape(1);
+    gert::Shape *scale1Shape = context->GetOutputShape(2);
+    gert::Shape *scale2Shape = context->GetOutputShape(3);
+
+    *y1Shape = *xShape;
+    y2Shape->SetDimNum(1);
+    y2Shape->SetDim(0, 1);
+
+    scale1Shape->SetDimNum(xShape->GetDimNum() - 1);
+    for (size_t i = 0; i < xShape->GetDimNum() - 1; ++i) {
+        scale1Shape->SetDim(i, xShape->GetDim(i));
+    }
+    *scale2Shape = *scale1Shape;
+    return ge::GRAPH_SUCCESS;
+}
+
+graphStatus InferDtype4RmsNormDynamicQuant(gert::InferDataTypeContext *context)
+{
+    context->SetOutputDataType(OUTPUT_IDX_Y1, ge::DT_INT8);
+    context->SetOutputDataType(OUTPUT_IDX_Y2, ge::DT_INT8);
+    context->SetOutputDataType(OUTPUT_IDX_SCALE1, ge::DT_FLOAT);
+    context->SetOutputDataType(OUTPUT_IDX_SCALE2, ge::DT_FLOAT);
+    return ge::GRAPH_SUCCESS;
+}
+
+IMPL_OP(RmsNormDynamicQuant).InferShape(InferShape4RmsNormDynamicQuant).InferDataType(InferDtype4RmsNormDynamicQuant);
 } // namespace ge
+
 
 #endif // OPS_RMS_NORM_DYNAMIC_QUANT_PROTO_H_
