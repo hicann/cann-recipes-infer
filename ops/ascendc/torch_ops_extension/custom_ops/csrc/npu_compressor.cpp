@@ -100,10 +100,7 @@ std::tuple<at::Tensor> compressor(const at::Tensor &x, const at::Tensor &wkv, co
     auto state_cache_dim = state_cache.dim();
     TORCH_CHECK(state_cache_dim == DIM_3, "state_cache dim num[", state_cache_dim, "] should be 3");
     auto contiguous_axes_result = is_contiguous_axes(state_cache);
-    if (cache_mode == CONTINUOUS) {
-        TORCH_CHECK(contiguous_axes_result[0] && contiguous_axes_result[1] && contiguous_axes_result[2],
-                    "when cache_mode == ", cache_mode, ", state_cache must be contiguous on all axes");
-    }
+
     int64_t state_cache_stride_dim0 = state_cache.stride(0);
 
     EXEC_NPU_CMD_V1(aclnnCompressor, x, wkv, wgate, state_cache, ape, norm_weight, rope_sin, rope_cos,
