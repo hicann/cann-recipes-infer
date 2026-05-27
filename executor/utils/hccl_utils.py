@@ -250,7 +250,7 @@ def calc_moe_hccl_buffer_size(
     combine_size = (top_k + shared_expert_rank_num) * bs_per_rank * \
                     align_up(2 * hidden_size, WIN_ADDR_ALIGN)
     moe_buffer_size = (dispatch_size + combine_size) * 2 / MB_SIZE  # MB
-    moe_buffer_size = math.ceil(moe_buffer_size) + 1  # add win size
+    moe_buffer_size = math.ceil(moe_buffer_size) + 11  # add win size
 
     # use default value if moe_buffer_size is small than default_hccl_buffersize
     if moe_buffer_size <= default_hccl_buffsize:
