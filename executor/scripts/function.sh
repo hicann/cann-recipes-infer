@@ -124,11 +124,13 @@ function get_rank()
         SERVER_NUM=$(((WORLD_SIZE + $offset) / $chip_num ))
         echo "server_num is: $SERVER_NUM"
 
-        if [ "$SERVER_NUM" -eq 1 ]; then
-            LOCAL_HOST=$(hostname -I|awk -F " " '{print$1}')
-            export IPs=($LOCAL_HOST)
-        else
-            export IPs=(${IPs[@]:0:$SERVER_NUM})
+        if [ "$mode" != "online" ]; then
+            if [ "$SERVER_NUM" -eq 1 ]; then
+                LOCAL_HOST=$(hostname -I|awk -F " " '{print$1}')
+                export IPs=($LOCAL_HOST)
+            else
+                export IPs=(${IPs[@]:0:$SERVER_NUM})
+            fi
         fi
     else
         echo "Cannot find world_size in '$filename'"
@@ -143,7 +145,6 @@ function check_env_vars()
     LOCAL_HOST=`hostname -I|awk -F " " '{print$1}'`       # Obtain current server's IP
     export HCCL_SOCKET_IFNAME=enp                     # Socket prefix, to obtain Host IP for HCCL and HCCL group; modify to enp/eth accordingly
     MA_NUM_HOSTS=${#IPs[@]}                           # Number of servers
-    export MASTER_ADDR=${IPs[0]}                      # IP of the master server
     export MASTER_PORT=6038                           # Port of the master server
     VC_TASK_INDEX=0                                   # Task index of the current server
     # obtain the task index of each server
@@ -156,6 +157,11 @@ function check_env_vars()
             break
         fi
     done
+
+    # MASTER_ADDR = leader of the *local* torch.distributed group. SERVER_NUM is
+    # this instance's node count; flooring VC_TASK_INDEX to a SERVER_NUM boundary
+    # picks the local instance's leader IP from the flat list.
+    export MASTER_ADDR=${IPs[$(( VC_TASK_INDEX / SERVER_NUM * SERVER_NUM ))]}
 
     echo "VC_TASK_INDEX >>>" $VC_TASK_INDEX
     export MA_NUM_GPUS=$chip_num  # Number of devices on each server. Should be the same for each server
