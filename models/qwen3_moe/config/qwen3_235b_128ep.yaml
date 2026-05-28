@@ -5,7 +5,7 @@ model_config:
   enable_profiler: False  # [False, True]
   with_ckpt: True # [False, True]
   enable_cache_compile: False
-  perfect_eplb: False # [False, True]
+  force_eplb: False # [False, True]
 
 data_config:
   dataset: "LongBench"  # ["default", "LongBench"]

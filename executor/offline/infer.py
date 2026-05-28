@@ -120,7 +120,7 @@ def main():
         yaml_dict = yaml.safe_load(f)
     config = InferenceConfig.from_dict(yaml_dict, global_rank=global_rank, local_rank=local_rank)
     if config.model_config.output_path == "":
-        config.model_config.output_path = os.path.dirname(args.yaml_file_path)
+        config.model_config.output_path = os.path.join(os.getenv("WORK_DIR", "."), os.getenv("RES_PATH", ""))
     logger.info("Inference Configuration")
     logger.info(config)
 
