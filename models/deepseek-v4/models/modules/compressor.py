@@ -114,8 +114,8 @@ class Compressor(nn.Module):
             sfa_cmp_cache = cache_data["sfa_cmp_kv"]
             if self.kv_cache_quant_mode == "float8":
                 epilog_out = torch.ops.custom.kv_compress_epilog(
-                    x=kv,
-                    slot_mapping=cmp_slot_mapping,
+                    x=kv if is_prefill else kv.view(-1, self.head_dim),
+                    slot_mapping=cmp_slot_mapping if is_prefill else cmp_slot_mapping.view(-1),
                     kv_compress_cache=sfa_cmp_cache
                 )
             else:
@@ -144,17 +144,16 @@ class Compressor(nn.Module):
             seq_used_q = attn_metadata["seq_used_q"] if is_prefill else None
             start_pos = attn_metadata["start_pos"]
         cos, sin = cos_sin[f"c{self.compress_ratio}a"]
-
+        bsz = x.shape[0]
         cmpr_input_kwargs = {
-            "x": x.view(-1, self.dim),
+            "x": x.view(-1, self.dim) if is_prefill else x,
             "wkv": self.wkv.weight,
             "wgate": self.wgate.weight,
             "ape": self.ape,
             "norm_weight": self.norm.weight,
-            "rope_cos": cos.view(-1, self.rope_head_dim),
-            "rope_sin": sin.view(-1, self.rope_head_dim),
+            "rope_cos": cos.view(-1, self.rope_head_dim) if is_prefill else cos.view(bsz, -1, self.rope_head_dim),
+            "rope_sin": sin.view(-1, self.rope_head_dim) if is_prefill else sin.view(bsz, -1, self.rope_head_dim),
             "state_block_table": attn_metadata["block_table"][f"c{self.compress_ratio}a_cmp_state"],
-            "cu_seqlens": cu_seqlens,
             "seqused": seq_used_q,
             "start_pos": start_pos,
             "rope_head_dim": self.rope_head_dim,
@@ -164,6 +163,8 @@ class Compressor(nn.Module):
             "rotary_mode": 2, # 1: half; 2: interleave
             "cache_mode": 1,  # 1: contiguous buffer; 2: ring buffer
         }
+        if is_prefill:   # tnd format in prefill stage while bsnd format in decode stage
+            cmpr_input_kwargs['cu_seqlens'] = cu_seqlens
         if "index" in self.prefix: # LI
             cmpr_input_kwargs.update({
                 "state_cache": cache_data["li_kv_state"].flatten(-3),
@@ -172,8 +173,8 @@ class Compressor(nn.Module):
             cmpr_input_kwargs.update({
                 "state_cache": cache_data["sfa_kv_state"].flatten(-3),
             })
-
-        kv = torch.ops.custom.compressor(**cmpr_input_kwargs) # (T, self.head_dim)
+        # (T, self.head_dim) in prefill stage, while (B, S, self.head_dim) in decode stage
+        kv = torch.ops.custom.compressor(**cmpr_input_kwargs)
         return kv
 
     def forward(

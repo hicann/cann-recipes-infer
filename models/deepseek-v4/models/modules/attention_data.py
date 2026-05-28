@@ -385,6 +385,7 @@ class AttnMetaData(nn.Module):
             "cu_seq_lens_q": cu_seq_lens_q, # li/sfa/cmpr; shape is batchsize + 1
             "seq_used_q": seq_used_q, # sfa/cmpr, not padded
             "start_pos": position_ids[:, 0].to(torch.int32), # cmpr
+            "seq_len": position_ids.shape[1],
         }
         return qkv_lengths
 
@@ -412,6 +413,43 @@ class AttnMetaData(nn.Module):
         max_len = min(attn_metadata["cu_seq_lens_q"][-1], attn_metadata["cu_seq_lens_q"][-1] // ratio + bsz)
         position_ids_cmp = pad_tensor_tnd(compressed_ids, max_len, self.position_ids_pad_value)
         return compressed_len, position_ids_cmp
+    
+    def generate_compressed_position_ids_bsnd(
+        self,
+        attn_metadata,
+        ratio
+    ):
+        """
+        Padding example with batch_size 3, max_seq_len 3, kv_len [2, 3, 1], pad value 1
+        BNSD padding format: [0, 1, 1, 0, 1, 2, 0, 1, 1]
+        """
+        start_pos = attn_metadata["start_pos"] // ratio
+        bsz = start_pos.shape[0]
+        end_pos = (attn_metadata["start_pos"] + attn_metadata["seq_used_q"]) // ratio
+        compressed_len = end_pos - start_pos
+
+        max_len = (attn_metadata["seq_len"] + ratio - 1) // ratio
+        idx = torch.arange(max_len, dtype=torch.int32, device="npu").expand(bsz, max_len)
+        mask = idx < compressed_len.unsqueeze(1)
+        idx = idx + start_pos.unsqueeze(1)
+        position_ids_cmp = torch.where(mask, idx, self.position_ids_pad_value)
+        return mask, position_ids_cmp
+
+    def get_slot_mapping_from_block_table_bsnd(
+        self,
+        mask,
+        position_ids_cmp,
+        block_table
+    ):
+        bsz, seq_len = position_ids_cmp.shape
+        row_indices = torch.arange(bsz, dtype=torch.int32, device="npu").view(-1, 1)
+        # slot mapping without padding
+        block_idx = position_ids_cmp // self.block_size
+        block_offset = position_ids_cmp % self.block_size
+
+        slot_mapping = block_table[row_indices, block_idx] * self.block_size + block_offset
+        slot_mapping = slot_mapping.view(bsz, seq_len)
+        return torch.where(mask, slot_mapping, self.slot_mapping_pad_value)
 
     def get_cmp_attn_metadata(
         self,
@@ -421,7 +459,9 @@ class AttnMetaData(nn.Module):
         is_prefill
     ):
         # 1. position_ids
-        q_len, position_ids_cmp = self.generate_compressed_position_ids(attn_metadata, ratio)
+        position_ids_func = self.generate_compressed_position_ids if is_prefill \
+            else self.generate_compressed_position_ids_bsnd
+        mask, position_ids_cmp = position_ids_func(attn_metadata, ratio)
         attn_metadata['position_ids_c'].update(
             {str(ratio): position_ids_cmp * ratio}
         )
@@ -432,8 +472,10 @@ class AttnMetaData(nn.Module):
         kv_block_num_per_batch = self.get_block_num_per_batch(self.pa_max_length // ratio)
         kv_block_table = self.calc_full_buffer_block_table(kv_block_num_per_batch, batch_size_per_rank)
         attn_metadata["block_table"][f"c{ratio}a_cmp_kv"] = kv_block_table
-        attn_metadata["slot_mapping"][f"c{ratio}a_cmp_kv"] = \
-            self.get_slot_mapping_from_block_table(q_len, position_ids_cmp, kv_block_table)
+
+        slot_mapping_func = self.get_slot_mapping_from_block_table if is_prefill \
+            else self.get_slot_mapping_from_block_table_bsnd
+        attn_metadata["slot_mapping"][f"c{ratio}a_cmp_kv"] = slot_mapping_func(mask, position_ids_cmp, kv_block_table)
 
         # kv_state and score state
         num_ratio_group = calc_num_ratio_group(self.next_n, overlap)
