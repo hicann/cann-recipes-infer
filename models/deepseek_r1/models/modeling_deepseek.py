@@ -2246,7 +2246,8 @@ class DeepseekV3ModelMTPLayer(DeepseekV3Model):
             is_prefill=is_prefill,
             cur_topk_list=cur_topk_list,
             slot_mapping=slot_mapping,
-            block_table=block_table
+            block_table=block_table,
+            shared_expert_stream=getattr(self, 'shared_expert_stream', None)
         )
 
 
