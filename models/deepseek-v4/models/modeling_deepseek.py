@@ -897,6 +897,8 @@ class Attention(nn.Module):
         last_rank = attn_metadata["cp_metadata"]["last_rank"]
         if last_kv_len >= self.window_size:
             last_win = all_win[last_rank]
+        elif last_rank == 0:
+            last_win = all_win[last_rank]
         else:
             last_win = all_win[last_rank, :, :last_kv_len]
             second_last_win = all_win[last_rank - 1]

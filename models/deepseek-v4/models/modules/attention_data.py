@@ -585,10 +585,11 @@ class AttnMetaData(nn.Module):
                                     - torch.min(torch.arange(cp_segment_num, device="npu").unsqueeze(0) * segment_len, kv_len)
         split_kv_len = split_kv_len.to(torch.int32)
         last_rank_before_zz = ((split_kv_len > 0).sum(dim=1) - 1).item()
+        last_kv_len = split_kv_len[0, last_rank_before_zz].item()
         last_rank_zz, last_rank_flag = self.get_zigzag_idx(last_rank_before_zz, cp_segment_num)
         cp_input_dict.update({
             "split_kv_len": split_kv_len,
-            "last_rank": last_rank_before_zz, # the last segment index with kv_len > 0, should be >= 1,
+            "last_rank": last_rank_before_zz, # the last segment index with kv_len > 0
             "last_rank_flag": last_rank_flag,
             "last_rank_zz": last_rank_zz,
         })
@@ -613,9 +614,11 @@ class AttnMetaData(nn.Module):
                                                         split_position_ids[segment_idx]], dim=-1)
             else:
                 position_ids_with_pre_win = split_position_ids[segment_idx]
-            last_kv_len = split_kv_len[:, last_rank_before_zz]
             if last_kv_len >= self.window_size:
                 position_ids_last_win = split_position_ids[last_rank_before_zz][:, last_kv_len - self.window_size:last_kv_len]
+            elif last_rank_before_zz == 0:
+                # Keep valid tokens at the start of win_kv when the whole valid sequence is in segment 0.
+                position_ids_last_win = split_position_ids[last_rank_before_zz][:, :self.window_size]
             else:
                 position_ids_last_win = split_position_ids[last_rank_before_zz][:, :last_kv_len]
                 position_ids_last_win = torch.cat([split_position_ids[last_rank_before_zz - 1][:, -(self.window_size - last_kv_len):], position_ids_last_win], dim=-1)
@@ -623,7 +626,7 @@ class AttnMetaData(nn.Module):
                 "position_ids_with_pre_win": position_ids_with_pre_win,
                 "position_ids_last_win": position_ids_last_win,
                 "position_ids_cur": split_position_ids[segment_idx],
-                "last_kv_len": split_kv_len[0, last_rank_before_zz].item(),
+                "last_kv_len": last_kv_len,
             })
 
             # Calculate actual_seq_k, actual_seq_q and cu_seq_lens_q for fa and li
