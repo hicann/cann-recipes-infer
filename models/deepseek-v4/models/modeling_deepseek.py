@@ -118,12 +118,13 @@ class DeepseekV3SharedExpert(nn.Module):
         else:
             self.forward = self.forward_normal
 
-    def forward_normal(self, x):
+    def forward_normal(self, x, enable_decode_stream=False, shared_expert_event=None):
         merged_x = self.gate_up_proj(x)
         intermediate_hidden_states = torch_npu.npu_swiglu(merged_x)
+        wait_event(enable_decode_stream, shared_expert_event, 0)
         return self.down_proj(intermediate_hidden_states)
 
-    def forward_w8a8int8(self, x):
+    def forward_w8a8int8(self, x, enable_decode_stream=False, shared_expert_event=None):
         merged_x, pertoken_scale = self.gate_up_proj(x, out_dtype=torch.int32)
         swiglu_limit_args = {}
         if self.swiglu_limit:
@@ -140,9 +141,10 @@ class DeepseekV3SharedExpert(nn.Module):
             activation_scale=pertoken_scale,
             **swiglu_limit_args
         )
+        wait_event(enable_decode_stream, shared_expert_event, 0)
         return self.down_proj(intermediate_hidden_states, pertoken_scale)
 
-    def forward_a8float8(self, x):
+    def forward_a8float8(self, x, enable_decode_stream=False, shared_expert_event=None):
         merged_x = self.gate_up_proj(x)
         intermediate_hidden_states, pergroup_scale , _ = torch.ops.custom.npu_swiglu_group_quant(
             merged_x,
@@ -150,6 +152,7 @@ class DeepseekV3SharedExpert(nn.Module):
             quant_mode=2 if "mx" in self.mm_quant_mode else 1,
             clamp_value=self.swiglu_limit if self.swiglu_limit else 0
             )
+        wait_event(enable_decode_stream, shared_expert_event, 0)
         return self.down_proj(intermediate_hidden_states, pergroup_scale)
 
 
@@ -184,8 +187,10 @@ class DeepseekV3MoE(nn.Module):
         self.top_k = config.num_experts_per_tok
 
         self.npu_events = []
+        self.shared_expert_event = []
         if self.enable_multi_streams:
             self.npu_events = [torch.npu.Event(), torch.npu.Event()]
+            self.shared_expert_event = [torch.npu.Event()]
 
         self.intermediate_size_per_rank = self.intermediate_size // self.moe_tp_size
         self.shared_expert_rank_num = 0 # route and share on same card
@@ -317,11 +322,14 @@ class DeepseekV3MoE(nn.Module):
 
     def forward(self, hidden_states, is_prefill=False, cur_topk_list=None, input_ids=None, shared_expert_stream=None):
         bsz, seq_len, h = hidden_states.shape
-
-        if self.n_shared_experts > 0:
-            hidden_states_share = self.forward_shared_expert(hidden_states, shared_expert_stream)
+        if is_prefill:
+            if self.n_shared_experts > 0:
+                hidden_states_share = self.forward_shared_expert(hidden_states, shared_expert_stream)
+            else:
+                hidden_states_share = None
         else:
-            hidden_states_share = None
+            record_stream(self.enable_multi_streams, hidden_states, shared_expert_stream)
+            record_event(self.enable_multi_streams, self.npu_events, 0)
 
         # compute gating score
         if self.platform_version == "950":
@@ -338,7 +346,7 @@ class DeepseekV3MoE(nn.Module):
             return self.moe_infer_double_routing(
                 hidden_states, topk_idx, topk_weight, hidden_states_share)
         else:
-            return self.moe_infer_dispatch_combine(hidden_states, topk_idx, topk_weight, hidden_states_share)
+            return self.moe_infer_dispatch_combine(hidden_states, topk_idx, topk_weight, shared_expert_stream)
 
     def forward_shared_expert(self, hidden_states, shared_expert_stream=None):
         record_stream(self.enable_multi_streams, hidden_states, shared_expert_stream)
@@ -553,7 +561,7 @@ class DeepseekV3MoE(nn.Module):
 
         return hidden_states.view(batch_size, -1, h)
 
-    def moe_infer_dispatch_combine(self, x, topk_ids, topk_weight, hidden_states_share):
+    def moe_infer_dispatch_combine(self, x, topk_ids, topk_weight, shared_expert_stream):
         """
         tp+ep mix strategy, for decode stage
         """
@@ -587,12 +595,17 @@ class DeepseekV3MoE(nn.Module):
 
         hidden_states_ordered_by_experts = self.moe_ffn(**gmm_args)
 
-        wait_event(self.enable_multi_streams, self.npu_events, 1)
-
+        record_event(self.enable_multi_streams, self.shared_expert_event, 0)
+        with npu_stream_switch(self.enable_multi_streams, shared_expert_stream):
+            wait_event(self.enable_multi_streams, self.npu_events, 0)
+            # shared_expert use multi streams
+            hidden_states_share = self.shared_experts(hidden_states.view(-1, hidden_states.shape[-1]), \
+                enable_decode_stream=self.enable_multi_streams, shared_expert_event=self.shared_expert_event)
+            record_event(self.enable_multi_streams, self.npu_events, 1)
+        
         # moe combine
         combine_args = {
             "expand_x": hidden_states_ordered_by_experts,
-            "shared_expert_x": hidden_states_share,
             "expert_ids": topk_ids,
             "assist_info_for_combine": expand_idx,
             "expert_scales": topk_weight.to(torch.float32), # [n*topk]
@@ -601,7 +614,8 @@ class DeepseekV3MoE(nn.Module):
             **self.combine_kwargs
         }
         hidden_states = torch_npu.npu_moe_distribute_combine_v2(**combine_args)
-
+        wait_event(self.enable_multi_streams, self.npu_events, 1)
+        hidden_states = hidden_states + hidden_states_share
         hidden_states = hidden_states.view(batch_size, sequence_length, self.hidden_dim)
         return hidden_states
 
