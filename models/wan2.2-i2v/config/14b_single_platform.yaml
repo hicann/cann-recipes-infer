@@ -1,0 +1,28 @@
+model_args:
+  ckpt_dir: "/path/to/Wan2.2-I2V-A14B-BF16"
+  image: "examples/i2v_input.JPG"
+  prompt: "Summer beach vacation style, a white cat wearing sunglasses sits on a surfboard."
+  task: "i2v-A14B"
+  size: "640*360"
+  frame_num: 61
+  sample_steps: 40
+  base_seed: 100
+  convert_model_dtype: true
+  cfg_size: 1
+  ulysses_size: 1
+  ring_size: 1
+  tp_size: 1
+
+model_name: "wan2.2-i2v"
+world_size: 1
+master_port: 29600
+entry_script: "generate.py"
+
+env_vars:
+  PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
+  TASK_QUEUE_ENABLE: "2"
+  CPU_AFFINITY_CONF: "1"
+
+dit_cache:
+  method: "NoCache"
+  enable_separate_cfg: true

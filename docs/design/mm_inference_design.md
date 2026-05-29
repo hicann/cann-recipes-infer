@@ -336,6 +336,7 @@ sparse:
 | 模型 | YAML 文件 | 卡数 | 启动器 | Cache | 关键特性 |
 |------|-----------|------|--------|-------|---------|
 | Wan2.2-I2V | `14b_single.yaml` | 1 | torchrun | `dit_cache.method` 切 NoCache / FBCache / TeaCache | 单卡基线，`832*480*61`，`convert_model_dtype` |
+| | `14b_single_platform.yaml` | 1 | torchrun | NoCache | CANNLab一站式开发平台模板，由 `infer_platform.sh` 读取并生成临时本地权重配置 |
 | | `14b_cfg2_ulysses4.yaml` | 8 | torchrun | NoCache（多卡强制） | CFG=2 × Ulysses=4, VAE 并行，`1280*720*81` / `832*480*61`，DiT+T5 FSDP |
 | HunyuanVideo | `single.yaml` | 1 | torchrun | `dit_cache.method` 切 NoCache / FBCache / TeaCache / TaylorSeer | 单卡基线，`720*1280*129`，CPU offload |
 | | `single_fp8.yaml` | 1 | torchrun | NoCache | FP8 FA 激活量化（需 950PR） |
@@ -343,7 +344,7 @@ sparse:
 | | `sp8.yaml` | 8 | torchrun | `dit_cache.method` 切 NoCache / FBCache / TeaCache / TaylorSeer | Ulysses=8, VAE 并行，`720*1280*129` |
 | | `sp8_sparse.yaml` | 8 | torchrun | NoCache（sparse 覆盖） | Ulysses=8 + 块稀疏 Attention（默认 SVG，可切 TopK），`720*1280*129` 规格；`ring-degree` 必须为 1 |
 | SANA-Video | `2b_480p_single.yaml` | 1 | accelerate | — | `mixed_precision=bf16`，`DISABLE_XFORMERS=1`，2B 480p，本地离线 DiT/VAE/Gemma 权重 |
-| | `2b_480p_single_platform.yaml` | 1 | python 直接拉起 | — | 一站式平台模板，由 `infer_platform.sh` 读取并生成临时本地权重配置 |
+| | `2b_480p_single_platform.yaml` | 1 | python 直接拉起 | — | CANNLab一站式开发平台模板，由 `infer_platform.sh` 读取并生成临时本地权重配置 |
 | HunyuanImage-3.0 | `ep8_cfg.yaml` | 16 | torchrun | — | Attn TP8 + MoE EP8 + CFG 并行 + VAE 并行 |
 
 上表列出的 YAML 均为参考配置，用户可复制并修改任意字段以派生新的场景配置。

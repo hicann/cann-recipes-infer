@@ -5,6 +5,7 @@ Wan2.2-I2V inference parameters are maintained in `config/*.yaml`. `infer.sh` us
 Default configs:
 
 - Single-card baseline / DiT cache: `14b_single.yaml`
+- CANNLab one-stop development platform template: `14b_single_platform.yaml`
 - 8-card high-resolution inference: `14b_cfg2_ulysses4.yaml`
 
 ```yaml
@@ -63,4 +64,5 @@ dit_cache:
 Notes:
 
 - `14b_single.yaml` can use DiT cache methods `NoCache`, `FBCache`, and `TeaCache`.
+- `14b_single_platform.yaml` is read by `infer_platform.sh` and patched with the local ModelScope weight path at runtime.
 - Multi-card configs and DiT cache are mutually exclusive. Keep `dit_cache.method: "NoCache"` in multi-card configs.

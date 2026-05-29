@@ -9,6 +9,7 @@ Default configs:
 - Single-card FP8: `single_fp8.yaml`
 - Single-card sparse attention: `single_sparse.yaml`
 - 8-card sparse attention: `sp8_sparse.yaml`
+- One-stop platform config: `single_platform.yaml`
 
 ```yaml
 model_args:
