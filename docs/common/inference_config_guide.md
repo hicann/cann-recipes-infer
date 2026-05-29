@@ -45,7 +45,6 @@
 - `dense_tp_size`: dense层TP并行数（默认 1）。
 - `o_proj_tp_size`: attention output 映射层TP并行数（默认 1）。
 - `cp_size`: context并行度（默认 1）。
-- `kvp_size`: KV sequence并行度（默认 1）。
 
 ### 2.4 SchedulerConfig (调度配置)
 控制请求调度器的策略。

@@ -20,7 +20,6 @@ Model Config
   enable_cache_compile: False # Whether enable cache compile for better performance. Support [False, True]
   enable_superkernel: False   # Whether enable superkernel. Support [False, True]
   enable_prefetch: True       # Whether enable prefetch. support [False, True]
-  decode_only: False          # Whether enable decode-only test for long-sequence scenarios. Support [False, True]
   enable_afd: False           # Whether enable attention-ffn disaggragation. support [False, True]. Note: if True, the first half of the ranks for world_size will serve as FFN, and the second half will serve as attn.
 
 data_config:
@@ -36,5 +35,4 @@ parallel_config:
   dense_tp_size: 8    # Dense MLP TP Number
   embed_tp_size: 1    # Embed TP Number
   lmhead_tp_size: 1   # LMHead TP Number
-  kvp_size: 1         # KVCache KVP Number. When kvp_size > 1, o_proj_tp_size must be equal to kvp_size. Support kvp_size subject to world_size % kvp_size = 0, defaults to 1(disabled).
 ```

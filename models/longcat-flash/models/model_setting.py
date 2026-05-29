@@ -112,6 +112,8 @@ def update_afd_settings(runner_settings):
 
 
 def check_and_update_vars(runner_settings):
+    if "kvp_size" in runner_settings.get("parallel_config", {}):
+        raise ValueError("kvp_size is removed; longcat KVP is temporarily disabled")
     update_afd_settings(runner_settings)
     world_size = runner_settings.get("world_size", 1) - runner_settings.get("ffn_world_size", 0)
     check_vars(world_size, runner_settings)

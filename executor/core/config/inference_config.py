@@ -171,7 +171,6 @@ class ParallelConfig:
         o_proj_tp_size: Tensor parallelism size for output projection (default: 1)
         moe_ep_size: Expert parallelism size for MoE (default: 1)
         cp_size: context parallelism size (default: 1)
-        kvp_size: KV parallelism size (default: 1)
     """
     # Basic info
     world_size: int = 1
@@ -190,7 +189,6 @@ class ParallelConfig:
 
     # Other parallelism
     cp_size: int = 1
-    kvp_size: int = 1
 
     @classmethod
     def from_dict(cls, parallel_config_dict: dict, global_rank: int, local_rank: int) -> "ParallelConfig":
@@ -206,7 +204,6 @@ class ParallelConfig:
             dense_tp_size=parallel_config_dict.get("dense_tp_size", 1),
             o_proj_tp_size=parallel_config_dict.get("o_proj_tp_size", 1),
             cp_size=parallel_config_dict.get("cp_size", 1),
-            kvp_size=parallel_config_dict.get("kvp_size", 1),
         )
         parallel_config._validate()
 
@@ -243,8 +240,6 @@ class ParallelConfig:
                 f"world_size={self.world_size} not divisible by "
                 f"attn_tp_size*cp_size={attn_group_size}"
             )
-        if self.world_size % self.kvp_size != 0:
-            raise ValueError(f"world_size={self.world_size} not divisible by kvp_size={self.kvp_size}")
 
     def validate_model_config(self, hf_config):
         """Validate against model-specific configuration."""

@@ -1616,9 +1616,12 @@ class LongcatFlashForCausalLM(LongcatFlashPreTrainedModel, GenerationMixin):
             moe_ep_group_mc2 = None
             moe_ep_group_mc2_name = None
 
-        kvp_group = init_comm_group(
-            global_rank=global_rank, group_num=world_size // self.kvp_size, world_size=world_size,
-            group_name="kvp_group")
+        if self.kvp_size > 1:
+            kvp_group = init_comm_group(
+                global_rank=global_rank, group_num=world_size // self.kvp_size, world_size=world_size,
+                group_name="kvp_group")
+        else:
+            kvp_group = None
 
         hccl_comm_dict = {
                 "default_pg": get_default_group(),
