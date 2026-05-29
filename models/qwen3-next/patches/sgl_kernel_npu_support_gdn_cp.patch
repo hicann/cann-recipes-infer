@@ -1,0 +1,747 @@
+From f1c6d7bbe6f2021adb4777b0198a94603b21b334 Mon Sep 17 00:00:00 2001
+From: egupova-evgeniya <xxx@xxx>
+Date: Tue, 26 May 2026 17:26:56 +0300
+Subject: [PATCH] Add GDN supporting context parallelism
+
+---
+ .../sgl_kernel_npu/fla/chunk.py               | 125 ++++++-
+ .../sgl_kernel_npu/fla/chunk_delta_h_zeco.py  | 308 ++++++++++++++++++
+ .../sgl_kernel_npu/fla/chunk_o_zeco.py        | 247 ++++++++++++++
+ 3 files changed, 676 insertions(+), 4 deletions(-)
+ create mode 100644 python/sgl_kernel_npu/sgl_kernel_npu/fla/chunk_delta_h_zeco.py
+ create mode 100644 python/sgl_kernel_npu/sgl_kernel_npu/fla/chunk_o_zeco.py
+
+diff --git a/python/sgl_kernel_npu/sgl_kernel_npu/fla/chunk.py b/python/sgl_kernel_npu/sgl_kernel_npu/fla/chunk.py
+index a545b6d..fd6a7ac 100644
+--- a/python/sgl_kernel_npu/sgl_kernel_npu/fla/chunk.py
++++ b/python/sgl_kernel_npu/sgl_kernel_npu/fla/chunk.py
+@@ -6,6 +6,7 @@ from typing import Optional
+ 
+ import torch
+ import torch.nn.functional as F
++import torch.distributed as dist
+ from einops import rearrange
+ from sgl_kernel_npu.fla.chunk_delta_h import (
+     chunk_gated_delta_rule_fwd_h_npu as chunk_gated_delta_rule_fwd_h,
+@@ -14,6 +15,11 @@ from sgl_kernel_npu.fla.chunk_o import chunk_fwd_o_npu as chunk_fwd_o
+ from sgl_kernel_npu.fla.chunk_scaled_dot_kkt import (
+     chunk_scaled_dot_kkt_fwd_npu as chunk_scaled_dot_kkt_fwd,
+ )
++from sgl_kernel_npu.fla.chunk_delta_h_zeco import (
++    chunk_gated_delta_rule_fwd_ab_npu as chunk_gated_delta_rule_fwd_ab,
++    chunk_final_state_zeco_npu as chunk_final_state_zeco,
++    )
++from sgl_kernel_npu.fla.chunk_o_zeco import chunk_fwd_o_zeco_npu as chunk_fwd_o_zeco
+ from sgl_kernel_npu.fla.cumsum import chunk_local_cumsum
+ from sgl_kernel_npu.fla.l2norm import l2norm_fwd
+ from sgl_kernel_npu.fla.solve_tril import solve_tril_npu as solve_tril
+@@ -245,6 +251,110 @@ def chunk_gated_delta_rule_fwd(
+         return g, o, A, final_state, w, h, v_new
+ 
+ 
++def chunk_gated_delta_rule_zeco_fwd(
++    q: torch.Tensor,
++    k: torch.Tensor,
++    v: torch.Tensor,
++    g: torch.Tensor,
++    beta: torch.Tensor,
++    scale: float,
++    initial_state: torch.Tensor,
++    output_final_state: bool,
++    comm_stream: torch.npu.Stream,
++    group,
++    cu_seqlens: Optional[torch.LongTensor] = None,
++):
++    g = chunk_local_cumsum(g, chunk_size=64, cu_seqlens=cu_seqlens)
++    # obtain WY representation. u is actually the new v.
++    A = chunk_scaled_dot_kkt_fwd(
++        k=k, beta=beta, g_cumsum=g, cu_seqlens=cu_seqlens, output_dtype=torch.float32
++    )
++    A = solve_tril(A=A, cu_seqlens=cu_seqlens, output_dtype=k.dtype)
++    w, u = recompute_w_u_fwd(
++        k=k,
++        v=v,
++        beta=beta,
++        A=A,
++        g_cumsum=g,
++        cu_seqlens=cu_seqlens,
++    )
++    if group.is_first_rank:
++        h, v_new, final_state = chunk_gated_delta_rule_fwd_h(
++            k=k,
++            w=w,
++            u=u,
++            g=g,
++            initial_state=initial_state,
++            output_final_state=output_final_state,
++            cu_seqlens=cu_seqlens,
++        )
++        final_state = final_state.to(v.dtype).contiguous()
++        comm_stream.wait_stream(torch.npu.default_stream())
++        with torch.npu.stream(comm_stream):
++            send_handle = dist.isend(final_state, dst=group.next_rank)
++            global_final_state = torch.empty_like(final_state)
++            broadcast_handle = torch.distributed.broadcast(global_final_state,
++                                                           src=group.last_rank,
++                                                           group=group.device_group,
++                                                           async_op=True)
++        o = chunk_fwd_o(
++            q=q,
++            k=k,
++            v=v_new,
++            h=h,
++            g=g,
++            scale=scale,
++            cu_seqlens=cu_seqlens,
++        )
++    else:
++        B, S, H, V, K = *v.shape, k.shape[-1]
++        N = B if cu_seqlens is None else len(cu_seqlens) - 1
++        initial_state = torch.empty((N, H, K, V), dtype=torch.bfloat16, device=v.device)
++        with torch.npu.stream(comm_stream):
++            recv_handle = dist.irecv(initial_state, src=group.prev_rank)
++        a, b = chunk_gated_delta_rule_fwd_ab(
++            k=k,
++            w=w,
++            u=u,
++            g=g,
++            cu_seqlens=cu_seqlens,
++        )
++        recv_handle.wait()
++        torch.npu.default_stream().wait_stream(comm_stream)
++        final_state = chunk_final_state_zeco(a, b, initial_state, cu_seqlens=cu_seqlens)
++        comm_stream.wait_stream(torch.npu.default_stream())
++        with torch.npu.stream(comm_stream):
++            if not group.is_last_rank:
++                send_handle = dist.isend(final_state, dst=group.next_rank)
++                global_final_state = torch.empty_like(final_state)
++            else:
++                global_final_state = final_state
++            broadcast_handle = torch.distributed.broadcast(global_final_state,
++                                                           src=group.last_rank,
++                                                           group=group.device_group,
++                                                           async_op=True)
++        o, h = chunk_fwd_o_zeco(
++            q=q,
++            k=k,
++            v=u,
++            w=w,
++            a=a,
++            b=b,
++            g=g,
++            scale=scale,
++            initial_state=initial_state,
++            cu_seqlens=cu_seqlens,
++        )
++
++    if not group.is_last_rank:
++        send_handle.wait()
++    broadcast_handle.wait()
++    if SUPPRESS_LEVEL < 3:
++        return g, o, A, global_final_state, None, h, None
++    elif SUPPRESS_LEVEL >= 3:
++        return g, o, A, global_final_state, w, h, None
++
++
+ @input_guard
+ @torch.compiler.disable
+ def chunk_gated_delta_rule_npu(
+@@ -259,6 +369,8 @@ def chunk_gated_delta_rule_npu(
+     cu_seqlens: Optional[torch.LongTensor] = None,
+     head_first: bool = False,
+     use_qk_l2norm_in_kernel: bool = False,
++    cp_group = None,
++    comm_stream: torch.npu.Stream = None,
+ ):
+     r"""
+     Args:
+@@ -364,10 +476,15 @@ def chunk_gated_delta_rule_npu(
+     if use_qk_l2norm_in_kernel:
+         q = l2norm_fwd(q)
+         k = l2norm_fwd(k)
+-
+-    _, o, _, final_state, _, h, _ = chunk_gated_delta_rule_fwd(
+-        q, k, v, g, beta, scale, initial_state, output_final_state, cu_seqlens
+-    )
++    if cp_group is None:
++        _, o, _, final_state, _, h, _ = chunk_gated_delta_rule_fwd(
++            q, k, v, g, beta, scale, initial_state, output_final_state, cu_seqlens
++        )
++    else:
++        _, o, _, final_state, _, h, _ = chunk_gated_delta_rule_zeco_fwd(
++            q, k, v, g, beta, scale, initial_state, output_final_state, cu_seqlens=cu_seqlens,
++            group=cp_group, comm_stream=comm_stream
++        )
+     o = o.to(q.dtype)
+     if head_first:
+         o = rearrange(o, "b t h ... -> b h t ...")
+diff --git a/python/sgl_kernel_npu/sgl_kernel_npu/fla/chunk_delta_h_zeco.py b/python/sgl_kernel_npu/sgl_kernel_npu/fla/chunk_delta_h_zeco.py
+new file mode 100644
+index 0000000..1b07ffe
+--- /dev/null
++++ b/python/sgl_kernel_npu/sgl_kernel_npu/fla/chunk_delta_h_zeco.py
+@@ -0,0 +1,308 @@
++# Adapted and Merge from
++#   https://github.com/sglang/python/sglang/srt/layers/attention/fla/chunk_delta_h.py
++# -*- coding: utf-8 -*-
++# Copyright (c) 2023-2025, By Triton_Ascend & sglang_ascend
++
++from typing import Optional, Tuple
++
++import torch
++import triton
++import triton.language as tl
++from sgl_kernel_npu.fla.utils import (
++    exp,
++    prepare_chunk_indices,
++    prepare_chunk_offsets,
++    safe_exp,
++)
++
++
++@triton.heuristics(
++    {
++        "USE_G": lambda args: args["g"] is not None,
++        "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
++    }
++)
++@triton.jit(do_not_specialize=["T"])
++def chunk_gated_delta_rule_fwd_kernel_h_blockdim64_zeco_npu_kernel(
++    k,
++    v,
++    w,
++    g,
++    a,
++    b,
++    a_curr,
++    b_curr,
++    cu_seqlens,
++    chunk_offsets,
++    T,
++    H: tl.constexpr,
++    Hg: tl.constexpr,
++    K: tl.constexpr,
++    V: tl.constexpr,
++    BT: tl.constexpr,
++    BK: tl.constexpr,
++    BV: tl.constexpr,
++    USE_G: tl.constexpr,
++    IS_VARLEN: tl.constexpr,
++):
++    i_nh = tl.program_id(1)
++    i_n, i_h = i_nh // H, i_nh % H
++    T_max = 1 * T
++    if IS_VARLEN:
++        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(
++            cu_seqlens + i_n + 1
++        ).to(tl.int32)
++        T = eos - bos
++        NT = tl.cdiv(T, BT)
++        boh = tl.load(chunk_offsets + i_n).to(tl.int32)
++    else:
++        bos, eos = i_n * T, i_n * T + T
++        NT = tl.cdiv(T, BT)
++        boh = i_n * NT
++
++    k += (bos * Hg + i_h // (H // Hg)) * K
++    w += (bos * H + i_h) * K
++    v += (bos * H + i_h) * V
++    a_curr += i_nh * K * K
++    b_curr += i_nh * K * V
++
++    for i_t in range(NT):
++        i_tg = boh + i_t
++        a_base = a + (i_tg * H + i_h).to(tl.int64) * K * K
++        b_base = b + (i_tg * H + i_h).to(tl.int64) * K * V
++
++        p_k = tl.make_block_ptr(
++            k, (K, T), (1, Hg * K), (0, i_t * BT), (K, BT), (0, 1)
++        )
++        # [K, BT]
++        b_k = tl.load(p_k, boundary_check=(0, 1), padding_option="zero")
++
++        if USE_G:
++            offs_t = i_t * BT + tl.arange(0, BT)
++            mask_t = offs_t < T
++            last_idx = min((i_t + 1) * BT, T) - 1
++            b_g_last = tl.load(g + bos + i_h * T_max + last_idx)
++
++            g_ptr = g + bos + i_h * T_max
++            b_g = tl.load(g_ptr + offs_t, mask=mask_t, other=0.0)
++            b_k = b_k * safe_exp(b_g_last - b_g)[None, :]
++            b_g_last = tl.exp(b_g_last)
++
++        p_w = tl.make_block_ptr(
++            w, (T, K), (H * K, 1), (i_t * BT, 0), (BT, K), (1, 0)
++        )
++        p_a = tl.make_block_ptr(
++            a_base, (K, K), (K, 1), (0, 0), (K, BK), (1, 0)
++        )
++        p_b = tl.make_block_ptr(
++            b_base, (K, V), (V, 1), (0, 0), (K, BV), (1, 0)
++        )
++        p_a_curr = tl.make_block_ptr(
++            a_curr, (K, K), (K, 1), (0, 0), (K, BK), (1, 0)
++        )
++        p_b_curr = tl.make_block_ptr(
++            b_curr, (K, V), (V, 1), (0, 0), (K, BV), (1, 0)
++        )
++        p_v = tl.make_block_ptr(
++            v, (T, V), (H * V, 1), (i_t * BT, 0), (BT, BV), (1, 0)
++        )
++
++        # [BT, K]
++        b_w = tl.load(p_w, boundary_check=(0, 1), padding_option="zero")
++        for _ in range(tl.cdiv(V, BV)):
++            # [BT, BV]
++            b_v = tl.load(p_v, boundary_check=(0, 1), padding_option="zero").to(tl.float32)
++            # [K, BV]
++            b_b_curr = tl.load(p_b_curr, boundary_check=(0, 1), padding_option="zero")
++            # [BT, K] @ [K, BV] - [BT, BV]
++            b_v = tl.dot(b_w, b_b_curr.to(b_w.dtype), -b_v)
++            # [K, BV] - [K, BT] @ [BT, BV]
++            b_b_curr = b_b_curr * b_g_last - tl.dot(b_k, b_v)
++            tl.store(p_b_curr, b_b_curr.to(p_b_curr.dtype.element_ty), boundary_check=(0, 1))
++            tl.store(p_b, b_b_curr.to(p_b.dtype.element_ty), boundary_check=(0, 1))
++            p_b = tl.advance(p_b, [0, BV])
++            p_b_curr = tl.advance(p_b_curr, [0, BV])
++
++        # [K, BT] @ [BT, K]
++        a_loc = tl.dot(b_k.to(b_w.dtype), b_w)
++        for _ in range(tl.cdiv(K, BK)):
++            # [K, BK]
++            b_a_curr = tl.load(p_a_curr, boundary_check=(0, 1), padding_option="zero")
++            # [K, BK] - [K, K] @ [K, BK]
++            b_a_curr = b_a_curr * b_g_last - tl.dot(a_loc.to(b_a_curr.dtype), b_a_curr)
++            tl.store(p_a_curr, b_a_curr.to(p_a_curr.dtype.element_ty), boundary_check=(0, 1))
++            tl.store(p_a, b_a_curr.to(p_a.dtype.element_ty), boundary_check=(0, 1))
++            p_a = tl.advance(p_a, [0, BK])
++            p_a_curr = tl.advance(p_a_curr, [0, BK])
++
++
++def chunk_gated_delta_rule_fwd_ab_npu(
++    k: torch.Tensor,
++    w: torch.Tensor,
++    u: torch.Tensor,
++    g: Optional[torch.Tensor] = None,
++    chunk_size: int = 64,
++    cu_seqlens: Optional[torch.LongTensor] = None,
++) -> Tuple[torch.Tensor, torch.Tensor]:
++    B, T, Hg, K, V = *k.shape, u.shape[-1]
++    H = u.shape[-2]
++    BT = chunk_size
++
++    chunk_indices = (
++        prepare_chunk_indices(cu_seqlens, chunk_size)
++        if cu_seqlens is not None
++        else None
++    )
++    # N: the actual number of sequences in the batch with either equal or variable lengths
++    if cu_seqlens is None:
++        N, NT, chunk_offsets = B, triton.cdiv(T, BT), None
++    else:
++        N, NT, chunk_offsets = (
++            len(cu_seqlens) - 1,
++            len(chunk_indices),
++            prepare_chunk_offsets(cu_seqlens, BT),
++        )
++    assert K == 128, "current kernel does not support head dimension other than 128."
++    a = k.new_empty(B, NT, H, K, K)
++    b = k.new_empty(B, NT, H, K, V)
++    a_curr = torch.eye(K, dtype=a.dtype, device=a.device).repeat(N, H, 1, 1)
++    b_curr = torch.zeros(N, H, K, V, dtype=b.dtype, device=b.device)
++
++    # Pre-transpose tensors outside the kernel to ensure contiguous memory access within the kernel
++    # avoiding scattered (non-contiguous) access that may lead to axis expansion
++    g = g.transpose(1, 2).contiguous()
++
++    def grid(meta):
++        return (1, N * H)
++
++    chunk_gated_delta_rule_fwd_kernel_h_blockdim64_zeco_npu_kernel[grid](
++        k=k,
++        v=u,
++        w=w,
++        a=a,
++        b=b,
++        a_curr=a_curr,
++        b_curr=b_curr,
++        g=g,
++        cu_seqlens=cu_seqlens,
++        chunk_offsets=chunk_offsets,
++        T=T,
++        H=H,
++        Hg=Hg,
++        K=K,
++        V=V,
++        BT=BT,
++        BK=128,
++        BV=128,
++    )
++    return a, b
++
++
++@triton.heuristics(
++    {
++        "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
++    }
++)
++@triton.jit(do_not_specialize=["NT"])
++def chunk_final_state_zeco_kernel(
++    a,
++    b,
++    initial_state,
++    final_state,
++    cu_seqlens,
++    chunk_offsets,
++    NT,
++    H: tl.constexpr,
++    K: tl.constexpr,
++    V: tl.constexpr,
++    BK: tl.constexpr,
++    BV: tl.constexpr,
++    BKK: tl.constexpr,
++    IS_VARLEN: tl.constexpr,
++):
++    i_nh = tl.program_id(1)
++    i_n, i_h = i_nh // H, i_nh % H
++
++    if IS_VARLEN:
++        last_chunk_idx = tl.load(chunk_offsets + i_n + 1).to(tl.int32) - 1
++    else:
++        last_chunk_idx = i_n * NT + NT - 1
++
++    a_base = a + (last_chunk_idx * H + i_h).to(tl.int64) * K * K
++    b_base = b + (last_chunk_idx * H + i_h).to(tl.int64) * K * V
++    h0_base = initial_state + i_nh * K * V
++    ht_base = final_state + i_nh * K * V
++
++    for iv in range(tl.cdiv(V, BV)):
++        v_start = iv * BV
++        for ik_out in range(tl.cdiv(K, BKK)):
++            k_out_start = ik_out * BKK
++            b_ht = tl.zeros([BKK, BV], dtype=tl.float32)
++
++            for ik_in in range(tl.cdiv(K, BK)):
++                k_in_start = ik_in * BK
++                p_a = tl.make_block_ptr(
++                    a_base, (K, K), (K, 1), (k_out_start, k_in_start), (BKK, BK), (1, 0)
++                )
++                b_a = tl.load(p_a, boundary_check=(0, 1), padding_option="zero")
++
++                p_h0 = tl.make_block_ptr(
++                    h0_base, (K, V), (V, 1), (k_in_start, v_start), (BK, BV), (1, 0)
++                )
++                b_h0 = tl.load(p_h0, boundary_check=(0, 1), padding_option="zero")
++
++                b_ht = tl.dot(b_a, b_h0, b_ht)
++
++            p_b = tl.make_block_ptr(
++                b_base, (K, V), (V, 1), (k_out_start, v_start), (BKK, BV), (1, 0)
++            )
++            b_b = tl.load(p_b, boundary_check=(0, 1), padding_option="zero")
++            b_ht += b_b.to(tl.float32)
++
++            p_ht = tl.make_block_ptr(
++                ht_base, (K, V), (V, 1), (k_out_start, v_start), (BKK, BV), (1, 0)
++            )
++            tl.store(p_ht, b_ht.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
++
++
++def chunk_final_state_zeco_npu(
++    a: torch.Tensor,
++    b: torch.Tensor,
++    initial_state: torch.Tensor,
++    cu_seqlens: Optional[torch.LongTensor] = None,
++    chunk_size: int = 64,
++) -> torch.Tensor:
++    B, NT, H, K, _ = a.shape
++    V = b.shape[-1]
++
++    if cu_seqlens is None:
++        N = B
++        chunk_offsets = None
++    else:
++        N = len(cu_seqlens) - 1
++        chunk_offsets = prepare_chunk_offsets(cu_seqlens, chunk_size)
++
++    final_state = torch.empty_like(initial_state)
++
++    def grid(meta):
++        return (1, N * H)
++
++    chunk_final_state_zeco_kernel[grid](
++        a=a,
++        b=b,
++        initial_state=initial_state,
++        final_state=final_state,
++        cu_seqlens=cu_seqlens,
++        chunk_offsets=chunk_offsets,
++        NT=NT,
++        H=H,
++        K=K,
++        V=V,
++        BK=128,
++        BV=128,
++        BKK=64,
++        num_warps=4,
++        num_stages=2,
++    )
++
++    return final_state
+diff --git a/python/sgl_kernel_npu/sgl_kernel_npu/fla/chunk_o_zeco.py b/python/sgl_kernel_npu/sgl_kernel_npu/fla/chunk_o_zeco.py
+new file mode 100644
+index 0000000..ebf1f00
+--- /dev/null
++++ b/python/sgl_kernel_npu/sgl_kernel_npu/fla/chunk_o_zeco.py
+@@ -0,0 +1,247 @@
++# Adapted and Merge from
++#   https://github.com/sglang/python/sglang/srt/layers/attention/fla/chunk_o.py
++# -*- coding: utf-8 -*-
++# Copyright (c) 2023-2025, By Triton_Ascend & sglang_ascend
++
++from typing import Optional
++
++import torch
++import triton
++import triton.language as tl
++from sgl_kernel_npu.fla.utils import (
++    prepare_chunk_indices,
++    prepare_chunk_offsets,
++    safe_exp,
++)
++
++
++@triton.heuristics(
++    {
++        "USE_G": lambda args: args["g"] is not None,
++        "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
++        "USE_INITIAL_STATE": lambda args: args["h0"] is not None,
++    }
++)
++@triton.jit(do_not_specialize=["T"])
++def chunk_fwd_kernel_o_zeco_npu_kernel(
++    q,
++    k,
++    v,
++    w,
++    a,
++    b,
++    h0,
++    h,
++    g,
++    o,
++    cu_seqlens,
++    chunk_offsets,
++    scale,
++    T,
++    H: tl.constexpr,
++    Hg: tl.constexpr,
++    K: tl.constexpr,
++    V: tl.constexpr,
++    BT: tl.constexpr,
++    BK: tl.constexpr,
++    BV: tl.constexpr,
++    BKK: tl.constexpr,
++    USE_G: tl.constexpr,
++    IS_VARLEN: tl.constexpr,
++    USE_INITIAL_STATE: tl.constexpr
++):
++    i_v, i_nh = tl.program_id(0), tl.program_id(1)
++    i_n, i_h = i_nh // H, i_nh % H
++    T_max = T
++
++    if IS_VARLEN:
++        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(
++            cu_seqlens + i_n + 1
++        ).to(tl.int32)
++        T = eos - bos
++        NT = tl.cdiv(T, BT)
++        boh = tl.load(chunk_offsets + i_n).to(tl.int64)
++    else:
++        bos, eos = i_n * T, i_n * T + T
++        NT = tl.cdiv(T, BT)
++        boh = i_n * NT
++
++    # offset calculation
++    q += (bos * Hg + i_h // (H // Hg)) * K
++    k += (bos * Hg + i_h // (H // Hg)) * K
++    w += (bos * H + i_h) * K
++    v += (bos * H + i_h) * V
++    o += (bos * H + i_h) * V
++
++    # [K, BV]
++    b_h_curr = tl.zeros([K, BV], dtype=h.dtype.element_ty)
++    if USE_INITIAL_STATE:
++        h0 += i_nh * K * V
++        p_h0 = tl.make_block_ptr(
++            h0, (K, V), (V, 1), (0, i_v * BV), (K, BV), (1, 0)
++        )
++        b_h_curr = tl.load(p_h0, boundary_check=(0, 1), padding_option="zero")
++    h_base = h + (boh * H + i_h).to(tl.int64) * K * V
++    p_h_ = tl.make_block_ptr(
++            h_base, (K, V), (V, 1), (0, i_v * BV), (K, BV), (1, 0)
++        )
++    tl.store(p_h_, b_h_curr.to(p_h_.dtype.element_ty), boundary_check=(0, 1))
++
++    for i_t in range(NT):
++        i_tg = boh + i_t
++        h_base = h + (i_tg * H + i_h).to(tl.int64) * K * V
++        a_base = a + (i_tg * H + i_h).to(tl.int64) * K * K
++        b_base = b + (i_tg * H + i_h).to(tl.int64) * K * V
++        b_wh = tl.zeros([BT, BV], dtype=tl.float32)
++        b_o = tl.zeros([BT, BV], dtype=tl.float32)
++        b_A = tl.zeros([BT, BT], dtype=tl.float32)
++        for i_k in range(tl.cdiv(K, BK)):
++            p_q = tl.make_block_ptr(
++                q, (T, K), (Hg * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0)
++            )
++            # [BT, BK]
++            b_q = tl.load(p_q, boundary_check=(0, 1), padding_option="zero")
++
++            p_k = tl.make_block_ptr(
++                k, (K, T), (1, Hg * K), (i_k * BK, i_t * BT), (BK, BT), (0, 1)
++            )
++            # [BK, BT]
++            b_k = tl.load(p_k, boundary_check=(0, 1), padding_option="zero")
++
++            p_h = tl.make_block_ptr(
++                h_base, (K, V), (V, 1), (i_k * BK, i_v * BV), (BK, BV), (1, 0)
++            )
++            # [BK, BV]
++            b_h = tl.load(p_h, boundary_check=(0, 1), padding_option="zero")
++
++            p_w = tl.make_block_ptr(
++                w, (T, K), (H * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
++            # [BT, BK]
++            b_w = tl.load(p_w, boundary_check=(0, 1), padding_option="zero")
++
++            # [BT, BK] @ [BK, BV] -> [BT, BV]
++            b_wh = tl.dot(b_w, b_h, b_wh.to(tl.float32))
++            # [BT, BK] @ [BK, BV] -> [BT, BV]
++            b_o = tl.dot(b_q, b_h, b_o.to(tl.float32))
++            # [BT, BK] @ [BK, BT] -> [BT, BT]
++            b_A = tl.dot(b_q, b_k, b_A.to(tl.float32))
++
++            h_next_base = h + ((i_tg + 1) * H + i_h).to(tl.int64) * K * V
++            p_h_next = tl.make_block_ptr(
++                h_next_base, (K, V), (V, 1), (i_k * BK, i_v * BV), (BKK, BV), (1, 0)
++            )
++            p_a = tl.make_block_ptr(
++                a_base, (K, K), (K, 1), (i_k * BK, i_k * BK), (BKK, BK), (1, 0)
++            )
++            p_b = tl.make_block_ptr(
++                b_base, (K, V), (V, 1), (i_k * BK, i_v * BV), (BKK, BV), (1, 0)
++            )
++            for _ in range(tl.cdiv(BK, BKK)):
++                # [BKK, BK]
++                b_a = tl.load(p_a, boundary_check=(0, 1), padding_option="zero")
++                # [BKK, BV]
++                b_b = tl.load(p_b, boundary_check=(0, 1), padding_option="zero")
++                # [BKK, BK] @ [BK, BV] + [BKK, BV]
++                h_new = tl.dot(b_a, b_h.to(b_a.dtype), b_b.to(tl.float32))
++                tl.store(p_h_next, h_new.to(p_h_next.dtype.element_ty), boundary_check=(0, 1))
++
++                p_a = tl.advance(p_a, [BKK, 0])
++                p_b = tl.advance(p_b, [BKK, 0])
++                p_h_next = tl.advance(p_h_next, [BKK, 0])
++
++        if USE_G:
++            offs_t = i_t * BT + tl.arange(0, BT)
++            mask_t = offs_t < T
++            g_ptr = g + bos + i_h * T_max
++            b_g = tl.load(g_ptr + offs_t, mask=mask_t, other=0.0)
++
++            b_o = b_o * tl.exp(b_g)[:, None]
++            b_A = b_A * safe_exp(b_g[:, None] - b_g[None, :])
++
++        o_i = tl.arange(0, BT).to(tl.float32)
++        m_A = o_i[:, None] >= o_i[None, :]
++        b_A = tl.where(m_A, b_A, 0)
++
++        p_v = tl.make_block_ptr(
++            v, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0)
++        )
++        p_o = tl.make_block_ptr(
++            o, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0)
++        )
++        b_v = tl.load(p_v, boundary_check=(0, 1), padding_option="zero")
++        b_v -= b_wh.to(b_v.dtype)
++
++        # to fix mma -> mma layout conversion
++        # already solved by triton v3.2 or higher
++        b_o = b_o * scale + tl.dot(b_A.to(b_v.dtype), b_v) * scale
++
++        tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
++
++
++def chunk_fwd_o_zeco_npu(
++    q: torch.Tensor,
++    k: torch.Tensor,
++    v: torch.Tensor,
++    w: torch.Tensor,
++    a: torch.Tensor,
++    b: torch.Tensor,
++    initial_state: Optional[torch.Tensor] = None,
++    g: Optional[torch.Tensor] = None,  # cumsum of log decay
++    scale: Optional[float] = None,
++    cu_seqlens: Optional[torch.LongTensor] = None,
++    chunk_size: int = 64,
++) -> torch.Tensor:
++    B, T, Hg, K, V = *q.shape, v.shape[-1]
++    H = v.shape[-2]
++
++    BT = chunk_size
++    chunk_indices = (
++        prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
++    )
++    NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
++    if scale is None:
++        scale = k.shape[-1] ** -0.5
++
++    h = k.new_empty(B, NT, H, K, V)
++    o = torch.empty_like(v)
++    if cu_seqlens is None:
++        N, chunk_offsets = B, None
++    else:
++        N, chunk_offsets = (
++            len(cu_seqlens) - 1,
++            prepare_chunk_offsets(cu_seqlens, BT),
++        )
++
++    def grid(meta):
++        return (triton.cdiv(V, meta["BV"]), N * H)
++
++    # Pre-transpose tensors outside the kernel to ensure contiguous memory access within the kernel
++    # avoiding scattered (non-contiguous) access that may lead to axis expansion
++    g = g.transpose(1, 2).contiguous()
++    chunk_fwd_kernel_o_zeco_npu_kernel[grid](
++        q,
++        k,
++        v,
++        w,
++        a,
++        b,
++        initial_state,
++        h,
++        g,
++        o,
++        cu_seqlens,
++        chunk_offsets,
++        scale,
++        T=T,
++        H=H,
++        Hg=Hg,
++        K=K,
++        V=V,
++        BT=BT,
++        BK=128,
++        BV=128,
++        BKK=64,
++        num_warps=4,
++        num_stages=2,
++    )
++    return o, h
+-- 
+2.37.3.windows.1
+

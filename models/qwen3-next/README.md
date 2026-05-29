@@ -92,6 +92,7 @@ npu-smi info 检查Ascend NPU固件和驱动是否正确安装。如果已安装
     - stage3：包含GDN和MTP适配。
     - stage4：包含CP并行。
     - stage5：rmsnormgated、GDN大融合算子适配以及问题修复。
+    - stage6: CP support for GDN.
 
    按顺序加载patches目录下的五个patch组：
 
@@ -112,6 +113,12 @@ npu-smi info 检查Ascend NPU固件和驱动是否正确安装。如果已安装
    # 下载sgl-kernel-npu源码
    git clone https://github.com/sgl-project/sgl-kernel-npu -b 2026.03.01
    ```
+   **加载patch**
+   在sgl_kernel_npu目录下加载sgl_kernel_npu_support_gdn_cp.patch:
+   ```bash
+   git apply ../cann-recipes-infer/models/qwen3-next/patches/sgl_kernel_npu_support_gdn_cp.patch
+   ```
+
    请参考[安装文档](https://github.com/sgl-project/sgl-kernel-npu/blob/main/python/sgl_kernel_npu/README.md)，编译安装sgl-kernel-npu。
 
 6. 安装最新Triton-Ascend
@@ -229,7 +236,7 @@ python3 -m sglang_router.launch_router --decode http://${d0}:30001 --prefill htt
    | MTP(多Token预测)            | 1. `set_env.sh`中增加以下环境变量配置：`export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1` `export SGLANG_ENABLE_SPEC_V2=1`<br/>2. 增加以下服务拉起的配置项`--speculative-algorithm NEXTN --speculative-num-steps 1 --speculative-eagle-topk 1 --speculative-num-draft-tokens 2 \`<br/>3. 确保`set_env.sh`中使能GDN融合算子`export ENABLE_ASCENDC_FUSION_GDN="true" ` |
    | A8W8量化                   | 1. `set_env.sh`中修改deepep环境变量配置，将`export SGLANG_DEEPEP_BF16_DISPATCH=1`替换为`export DEEP_NORMAL_MODE_USE_INT8_QUANT=1`<br/>2. 增加以下服务拉起的配置项`--quantization w8a8_int8`<br/>3. `set_env.sh`中配置A8W8权重路径                                                                                                                              |
    | A8W8C8量化                 | 1. `set_env.sh`中修改deepep环境变量配置，将`export SGLANG_DEEPEP_BF16_DISPATCH=1`替换为`export DEEP_NORMAL_MODE_USE_INT8_QUANT=1`<br/>2. `set_env.sh`中增加以下环境变量配置：`export ASCEND_USE_C8=1`<br/>3. 增加以下服务拉起的配置项`--quantization w8a8_int8`<br/>4. `set_env.sh`中配置A8W8C8权重路径                                                                    |
-   | 序列并行                 | 1. 本样例支持PD分离场景下Prefill节点Gated Attention的CP和TP混合并行与CP的负载均衡，启用方式：在`infer_prefill.sh`中将DP配置`--enable-dp-attention --dp-size 8`替换为`--cp-size 8`<br/>2. `set_env.sh`中增加以下环境变量配置开启CP负载均衡：`export CP_USE_ZIGZAG=1`，负载均衡的优化面向长序列单batch场景。                                                                                             |
+   | 序列并行                 | 1. 本样例支持PD分离场景下Prefill节点Gated Attention的CP和TP混合并行与CP的负载均衡，启用方式：在`infer_prefill.sh`中将DP配置`--enable-dp-attention --dp-size 8`替换为`--cp-size 8`<br/>2. `set_env.sh`中增加以下环境变量配置开启CP负载均衡：`export CP_USE_ZIGZAG=1`，负载均衡的优化面向长序列单batch场景。<br/>3. Add the following environment variable to `set_env.sh` to enable hybrid parallelism of CP and TP in GatedDeltaNet attention: `export ENABLE_CONTEXT_PARALLEL_GDN=1`.                                                                                    |
 
 ### 规格约束说明：
 1. PD分离场景P和D部署策略需相同（SGLang框架暂未支持MHA(Multi-Head Attention)PD不同策略部署）；

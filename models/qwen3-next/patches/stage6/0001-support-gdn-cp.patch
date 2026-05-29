@@ -1,0 +1,417 @@
+From 04983aefbdc751e9faa1026d168de6a122b5bb97 Mon Sep 17 00:00:00 2001
+From: egupova-evgeniya <xxx@xxx>
+Date: Tue, 12 May 2026 17:15:42 +0300
+Subject: [PATCH 1/2] support gdn cp
+
+---
+ python/sglang/srt/configs/qwen3_next.py       |   4 +-
+ .../srt/disaggregation/mooncake/conn.py       |  81 +++++++++-
+ python/sglang/srt/disaggregation/prefill.py   |   1 +
+ .../srt/layers/attention/ascend_backend.py    | 148 ++++++++++++++++--
+ python/sglang/srt/mem_cache/memory_pool.py    |   2 +
+ .../sglang/srt/model_executor/model_runner.py |   1 +
+ python/sglang/srt/models/qwen3_next.py        |   3 +-
+ 7 files changed, 219 insertions(+), 21 deletions(-)
+
+diff --git a/python/sglang/srt/configs/qwen3_next.py b/python/sglang/srt/configs/qwen3_next.py
+index aec13c2c7..53eed2560 100644
+--- a/python/sglang/srt/configs/qwen3_next.py
++++ b/python/sglang/srt/configs/qwen3_next.py
+@@ -21,6 +21,7 @@ from transformers.modeling_rope_utils import rope_config_validation
+ from transformers.utils import logging
+ 
+ from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
++from sglang.srt.utils import get_bool_env_var
+ 
+ logger = logging.get_logger(__name__)
+ 
+@@ -277,7 +278,8 @@ class Qwen3NextConfig(PretrainedConfig):
+     @property
+     def mamba2_cache_params(self) -> Mamba2CacheParams:
+         from sglang.srt.distributed import get_context_model_parallel_world_size
+-        use_full_tp = get_context_model_parallel_world_size() > 1
++        use_full_tp = get_context_model_parallel_world_size() > 1 and \
++                      not get_bool_env_var("ENABLE_CONTEXT_PARALLEL_GDN", "false")
+         if use_full_tp:
+             from sglang.srt.distributed import get_tensor_model_parallel_world_size
+             tp_world_size = get_tensor_model_parallel_world_size()
+diff --git a/python/sglang/srt/disaggregation/mooncake/conn.py b/python/sglang/srt/disaggregation/mooncake/conn.py
+index 8111baa76..434c3da7b 100644
+--- a/python/sglang/srt/disaggregation/mooncake/conn.py
++++ b/python/sglang/srt/disaggregation/mooncake/conn.py
+@@ -33,7 +33,7 @@ from sglang.srt.disaggregation.mooncake.utils import (
+ )
+ from sglang.srt.disaggregation.utils import DisaggregationMode
+ from sglang.srt.server_args import ServerArgs
+-from sglang.srt.utils import format_tcp_address, get_int_env_var, is_valid_ipv6_address
++from sglang.srt.utils import format_tcp_address, get_int_env_var, is_valid_ipv6_address, get_bool_env_var
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -682,6 +682,59 @@ class MooncakeKVManager(CommonKVManager):
+ 
+         return self._transfer_data(req.mooncake_session_id, transfer_blocks)
+ 
++    def send_mamba_state_slice(
++        self,
++        req: TransferInfo,
++        prefill_mamba_index: list[int],
++        dst_state_data_ptrs: list[int],
++        dst_tp_rank: int,
++        dst_attn_tp_size: int,
++    ):
++        """
++        Sends Mamba state slices from this Prefill rank to a target Decode rank,
++        supporting generic M-to-N TP size configurations.
++        """
++        assert len(prefill_mamba_index) == 1, "Mamba should have single state index"
++
++        # Extract configuration
++        local_tp_rank_in_group = self.kv_args.engine_rank % self.attn_tp_size
++        dst_tp_rank_in_group = dst_tp_rank % dst_attn_tp_size
++        num_state_heads = self.kv_args.state_head_num
++
++        # Calculate head distribution
++        src_heads_per_rank = num_state_heads // self.attn_tp_size
++        dst_heads_per_rank = num_state_heads // dst_attn_tp_size
++
++        # Determine slicing parameters based on TP configuration
++        if self.attn_tp_size > dst_attn_tp_size:
++            # Send cache from multiple prefill instances to 1 decode instance
++            src_head_start_offset = 0
++            num_heads_to_send = src_heads_per_rank
++            dst_head_start_offset = local_tp_rank_in_group * src_heads_per_rank
++        else:
++            # Send cache from 1 prefill instance to multiple decode instances
++            src_head_start_offset = (
++                dst_tp_rank_in_group * dst_heads_per_rank
++            ) % src_heads_per_rank
++            num_heads_to_send = dst_heads_per_rank
++            dst_head_start_offset = 0
++
++        transfer_blocks = []
++        src_state_data_ptrs = self.kv_args.state_data_ptrs
++        for i, (src_state_ptr, dst_state_ptr) in enumerate(zip(src_state_data_ptrs, dst_state_data_ptrs)):
++            src_length = self.kv_args.state_item_lens[i]
++            bytes_per_head_slice_to_send = src_length // src_heads_per_rank
++            # Calculate precise byte offset and length for the sub-slice
++            src_head_slice_offset = src_head_start_offset * bytes_per_head_slice_to_send
++            dst_head_slice_offset = dst_head_start_offset * bytes_per_head_slice_to_send
++            dst_length = num_heads_to_send * bytes_per_head_slice_to_send
++            # Calculate final src and dst addresses by applying head-slice offsets
++            src_slice_addr = src_state_ptr + int(prefill_mamba_index[0]) * src_length + src_head_slice_offset
++            dst_slice_addr = dst_state_ptr + int(req.dst_state_indices[0]) * dst_length + dst_head_slice_offset
++            transfer_blocks.append((src_slice_addr, dst_slice_addr, dst_length))
++
++        return self._transfer_data(req.mooncake_session_id, transfer_blocks)
++
+     def sync_status_to_decode_endpoint(
+         self, remote: str, dst_port: int, room: int, status: int, prefill_rank: int
+     ):
+@@ -800,12 +853,26 @@ class MooncakeKVManager(CommonKVManager):
+                                         f"PD Disaggregation does NOT support PD different TP sizes for non-MLA hybrid models yet."
+                                     )
+ 
+-                                self.maybe_send_extra(
+-                                    req,
+-                                    kv_chunk.state_indices,
+-                                    target_rank_registration_info.dst_state_data_ptrs,
+-                                    executor,
+-                                )
++                                if self.attn_tp_size != target_rank_registration_info.dst_attn_tp_size and \
++                                    get_bool_env_var("ENABLE_CONTEXT_PARALLEL_GDN", "false"):
++                                    if not getattr(self.kv_args, "state_type", "none") == "mamba":
++                                        raise RuntimeError(
++                                            "PD Disaggregation does NOT support PD different TP sizes for non-mamba hybrid models yet."
++                                    )
++                                    self.send_mamba_state_slice(
++                                        req,
++                                        kv_chunk.state_indices,
++                                        target_rank_registration_info.dst_state_data_ptrs,
++                                        target_rank_registration_info.dst_tp_rank,
++                                        target_rank_registration_info.dst_attn_tp_size,
++                                    )
++                                else:
++                                    self.maybe_send_extra(
++                                        req,
++                                        kv_chunk.state_indices,
++                                        target_rank_registration_info.dst_state_data_ptrs,
++                                        executor,
++                                    )
+ 
+                             if self.pp_group.is_last_rank:
+                                 # Only the last chunk we need to send the aux data
+diff --git a/python/sglang/srt/disaggregation/prefill.py b/python/sglang/srt/disaggregation/prefill.py
+index ef846df0b..9866512fb 100644
+--- a/python/sglang/srt/disaggregation/prefill.py
++++ b/python/sglang/srt/disaggregation/prefill.py
+@@ -163,6 +163,7 @@ class PrefillBootstrapQueue:
+                 kv_args.state_type = "swa"
+             elif isinstance(self.token_to_kv_pool, HybridLinearKVPool):
+                 kv_args.state_type = "mamba"
++                kv_args.state_head_num = self.token_to_kv_pool.state_head_num
+             elif isinstance(self.token_to_kv_pool, NSATokenToKVPool):
+                 kv_args.state_type = "nsa"
+             else:
+diff --git a/python/sglang/srt/layers/attention/ascend_backend.py b/python/sglang/srt/layers/attention/ascend_backend.py
+index 913303522..8dcc01aa8 100644
+--- a/python/sglang/srt/layers/attention/ascend_backend.py
++++ b/python/sglang/srt/layers/attention/ascend_backend.py
+@@ -16,6 +16,7 @@ from sglang.srt.distributed import (
+     get_context_model_parallel_world_size,
+     context_model_parallel_all_gather,
+     get_tp_group,
++    get_cp_group,
+ )
+ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+ from sglang.srt.layers.attention.fla.fused_gdn_gating import fused_gdn_gating_v3
+@@ -1464,10 +1465,15 @@ class AscendGDNAttnBackend(MambaAttnBackendBase):
+         self.enable_ascendc_fusion_gdn = get_bool_env_var(
+             "ENABLE_ASCENDC_FUSION_GDN", "false"
+         )
++        self.enable_context_parallel_gdn = get_bool_env_var(
++            "ENABLE_CONTEXT_PARALLEL_GDN", "false"
++        ) and get_context_model_parallel_world_size() > 1
+         self.num_accepted_tokens = None
+         self.actual_seq_lengths = None
+         self.ssm_state_indices = None
++        self.cu_seqlens = None
+         self.graph_mode = False
++        self.comm_stream = torch.npu.Stream()
+ 
+     def prepare_gdn_inputs(
+         self,
+@@ -1493,6 +1499,30 @@ class AscendGDNAttnBackend(MambaAttnBackendBase):
+         else:
+             self.ssm_state_indices = cache_indices
+ 
++    def init_cp_metadata(self):
++        """
++        Adjusts `query_start_loc` according to split sizes along the sequence length.
++        Required because forward metadata is generated before input sequence is split
++        when context parallelism is enabled.
++        Assumes that queries are splitted uniformly between devices:
++        Context: [A0, A1, A2, A3, B0, B1, B2]
++        Dev 0: [A0, A1, B0, B1]
++        Dev 1: [A2, A3, B2]
++        """
++        def get_split_sizes(seq_len, sections):
++            base_size = seq_len // sections
++            remainder = seq_len % sections
++            sizes = [base_size + 1] * remainder + [base_size] * (sections - remainder)
++            return sizes
++
++        cu_seqlens = self.forward_metadata.query_start_loc.clone()
++        if self.enable_context_parallel_gdn:
++            cp_size = get_context_model_parallel_world_size()
++            cp_rank = get_context_model_parallel_rank()
++            for i, (s, e) in enumerate(zip(cu_seqlens[:-1], cu_seqlens[1:])):
++                cu_seqlens[i+1] = cu_seqlens[i] + get_split_sizes(seq_len=e-s, sections=cp_size)[cp_rank]
++        self.cu_seqlens = cu_seqlens
++
+     def init_forward_metadata(self, forward_batch: ForwardBatch):
+         if forward_batch.forward_mode.is_draft_extend(True):
+             return
+@@ -1502,6 +1532,7 @@ class AscendGDNAttnBackend(MambaAttnBackendBase):
+             forward_batch.forward_mode,
+             forward_batch.spec_info,
+         )
++        self.init_cp_metadata()
+         self.graph_mode = False
+ 
+     def init_forward_metadata_capture_cuda_graph(
+@@ -1585,6 +1616,44 @@ class AscendGDNAttnBackend(MambaAttnBackendBase):
+         out = out.to(hidden_state.dtype)
+         return out, conv_state_update
+ 
++    def single_batch_overlapped_causal_conv1d_update(
++        self,
++        mixed_qkv: torch.Tensor,
++        weight: torch.Tensor,
++        bias: torch.Tensor,
++        activation: torch.Tensor,
++        conv_states: torch.Tensor,
++        has_initial_state: torch.Tensor,
++        cache_indices: torch.Tensor,
++        query_start_loc: torch.Tensor,
++        cp_group,
++        seq_len,
++    ):
++        """Faster processing of a single batched input"""
++        overlap_size = weight.shape[1] - 1
++        overlap = mixed_qkv.new_zeros((overlap_size, mixed_qkv.shape[1]))
++        overlapped_query_start_loc = query_start_loc.clone()
++        if not cp_group.is_last_rank:
++            send_handle = dist.isend(mixed_qkv[query_start_loc[-1] - overlap_size:query_start_loc[-1]].contiguous(),
++                                     dst=cp_group.next_rank)
++        if not cp_group.is_first_rank:
++            dist.recv(overlap, src=cp_group.prev_rank)
++        mixed_qkv = torch.cat((overlap, mixed_qkv))
++        overlapped_query_start_loc[-1] += overlap_size
++        mixed_qkv = causal_conv1d_fn_npu(
++            mixed_qkv.transpose(0, 1),
++            weight,
++            bias,
++            activation=activation,
++            conv_states=conv_states,
++            has_initial_state=has_initial_state,
++            cache_indices=cache_indices,
++            query_start_loc=overlapped_query_start_loc,
++        ).transpose(0, 1)[overlap_size:seq_len + overlap_size]
++        if not cp_group.is_last_rank:
++            send_handle.wait()
++        return mixed_qkv
++
+     def fused_recurrent_gated_delta_rule_update_npu(
+         self,
+         mix_qkv: torch.Tensor,
+@@ -1768,7 +1837,7 @@ class AscendGDNAttnBackend(MambaAttnBackendBase):
+ 
+         is_target_verify = forward_batch.forward_mode.is_target_verify()
+ 
+-        query_start_loc = self.forward_metadata.query_start_loc
++        query_start_loc = self.cu_seqlens
+         cache_indices = self.forward_metadata.mamba_cache_indices
+ 
+         mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer_id)
+@@ -1821,17 +1890,57 @@ class AscendGDNAttnBackend(MambaAttnBackendBase):
+                 mixed_qkv_processed.transpose(1, 2).contiguous().view(seq_len, -1)
+             )
+         else:
+-            mixed_qkv = causal_conv1d_fn_npu(
+-                mixed_qkv.transpose(0, 1),
+-                conv_weights,
+-                bias,
+-                activation=activation,
+-                conv_states=conv_states,
+-                has_initial_state=has_initial_states,
+-                cache_indices=cache_indices,
+-                query_start_loc=query_start_loc,
+-                seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+-            ).transpose(0, 1)[:seq_len]
++            cp_group = get_cp_group() if self.enable_context_parallel_gdn else None
++            if self.enable_context_parallel_gdn and query_start_loc.numel() == 2:
++                mixed_qkv = self.single_batch_overlapped_causal_conv1d_update(
++                    mixed_qkv,
++                    conv_weights,
++                    bias,
++                    activation=activation,
++                    conv_states=conv_states,
++                    has_initial_state=has_initial_states,
++                    cache_indices=cache_indices,
++                    query_start_loc=query_start_loc,
++                    cp_group=cp_group,
++                    seq_len=seq_len,
++                )
++            else:
++                if self.enable_context_parallel_gdn:
++                    for i in range(query_start_loc.numel() - 1):
++                        if not cp_group.is_first_rank:
++                            dist.recv(conv_states[cache_indices[i]], src=cp_group.prev_rank)
++                            has_initial_states[i] = True
++
++                        if not cp_group.is_last_rank:
++                            overlap_size = conv_states[cache_indices[i]].shape[1]
++                            overlap_start = query_start_loc[i + 1] - overlap_size
++                            dist.send(mixed_qkv[overlap_start:overlap_start + overlap_size].transpose(0, 1).contiguous(),
++                                      dst=cp_group.next_rank)
++
++                mixed_qkv = causal_conv1d_fn_npu(
++                    mixed_qkv.transpose(0, 1),
++                    conv_weights,
++                    bias,
++                    activation=activation,
++                    conv_states=conv_states,
++                    has_initial_state=has_initial_states,
++                    cache_indices=cache_indices,
++                    query_start_loc=query_start_loc,
++                    seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
++                ).transpose(0, 1)[:seq_len]
++
++            if self.enable_context_parallel_gdn:
++                broadcasted_conv_states = conv_states[cache_indices].contiguous()
++                torch.distributed.broadcast(
++                    broadcasted_conv_states,
++                    src=cp_group.last_rank,
++                    group=cp_group.device_group
++                )
++                # Matches cache processing of standard attention when PD-disaggregation is enabled and cp_size > 0.
++                # This breaks chunked prefill and brings communication overhead.
++                # Optimally PD-disaggregation backend should handle the situation when attn_tp_sizes on prefill
++                # and decode don't match, so `swap_kv` can be removed from both standard and linear attentions.
++                conv_state_to_be_cached, conv_state_works = AscendAttnBackend.swap_kv(broadcasted_conv_states)
+ 
+         key_split_dim = key_dim // attn_tp_size
+         value_split_dim = value_dim // attn_tp_size
+@@ -1901,7 +2010,22 @@ class AscendGDNAttnBackend(MambaAttnBackendBase):
+                 cu_seqlens=query_start_loc,
+                 head_first=False,
+                 use_qk_l2norm_in_kernel=True,
++                cp_group=cp_group,
++                comm_stream=self.comm_stream
+             )
++            if self.enable_context_parallel_gdn:
++                # Matches cache processing of standard attention when PD-disaggregation is enabled and cp_size > 0.
++                # This breaks chunked prefill and brings communication overhead.
++                # Optimally PD-disaggregation backend should handle the situation when attn_tp_sizes on prefill
++                # and decode don't match, so `swap_kv` can be removed from both standard and linear attentions.
++                state_to_be_cached, state_works = AscendAttnBackend.swap_kv(last_recurrent_state)
++                for w in conv_state_works:
++                    w.wait()
++                conv_states[cache_indices] = conv_state_to_be_cached
++                for w in state_works:
++                    w.wait()
++                last_recurrent_state = state_to_be_cached
++
+             if self.enable_ascendc_fusion_gdn:
+                 # AscendC GDN fusion operator requires the shape of the recurrent_state to be [b, s, Dv, Dk]
+                 last_recurrent_state = last_recurrent_state.transpose(-1, -2).to(
+diff --git a/python/sglang/srt/mem_cache/memory_pool.py b/python/sglang/srt/mem_cache/memory_pool.py
+index 5349e0e13..3982f0993 100644
+--- a/python/sglang/srt/mem_cache/memory_pool.py
++++ b/python/sglang/srt/mem_cache/memory_pool.py
+@@ -981,6 +981,7 @@ class HybridLinearKVPool(KVCache):
+         page_size: int,
+         head_num: int,
+         head_dim: int,
++        state_head_num: int,
+         full_attention_layer_ids: List[int],
+         enable_kvcache_transpose: bool,
+         device: str,
+@@ -1000,6 +1001,7 @@ class HybridLinearKVPool(KVCache):
+         self.start_layer = 0
+         self.head_num = head_num
+         self.head_dim = head_dim
++        self.state_head_num = state_head_num
+         self.mamba_pool = mamba_pool
+         # TODO MHATransposedTokenToKVPool if enable_kvcache_transpose is True
+         assert not enable_kvcache_transpose
+diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
+index 8e97d8acc..785ecb3be 100644
+--- a/python/sglang/srt/model_executor/model_runner.py
++++ b/python/sglang/srt/model_executor/model_runner.py
+@@ -1936,6 +1936,7 @@ class ModelRunner:
+                         get_attention_tp_size()
+                     ),
+                     head_dim=self.model_config.head_dim,
++                    state_head_num=config.linear_num_value_heads,
+                     # if draft worker, we only need 1 attention layer's kv pool
+                     full_attention_layer_ids=(
+                         [0] if self.is_draft_worker else config.full_attention_layer_ids
+diff --git a/python/sglang/srt/models/qwen3_next.py b/python/sglang/srt/models/qwen3_next.py
+index 1fd165bda..cf27306b6 100644
+--- a/python/sglang/srt/models/qwen3_next.py
++++ b/python/sglang/srt/models/qwen3_next.py
+@@ -516,7 +516,8 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
+         super().__init__()
+         self.config = config
+         server_args_cp = get_context_model_parallel_world_size()
+-        self.use_full_tp = server_args_cp > 1
++        self.use_full_tp = server_args_cp > 1 and \
++                           not get_bool_env_var("ENABLE_CONTEXT_PARALLEL_GDN", "false")
+         self.linear_attn = Qwen3GatedDeltaNet(
+             config, layer_id, quant_config, alt_stream, self.use_full_tp
+         )
+-- 
+2.37.3.windows.1
+
