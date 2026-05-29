@@ -368,14 +368,27 @@ function mm_launch_task()
                  ${MODEL_ARGS} \
                  '2>&1 | tee "${MM_LOG_DIR}/log_$(date +%Y%m%d_%H%M%S).log"'
     else
-        echo "[INFO] Launching with torchrun (nproc_per_node=${WORLD_SIZE}, master_port=${MASTER_PORT})"
-        echo "==================================>"
+        if command -v torchrun >/dev/null 2>&1; then
+            echo "[INFO] Launching with torchrun (nproc_per_node=${WORLD_SIZE}, master_port=${MASTER_PORT})"
+            echo "==================================>"
 
-        eval PYTHONPATH=${RECIPES_ROOT}:\$PYTHONPATH \
-                 torchrun --master_port=${MASTER_PORT} \
-                 --nproc_per_node=${WORLD_SIZE} \
-                 ${ENTRY_SCRIPT_PATH} \
-                 ${MODEL_ARGS} \
-                 '2>&1 | tee "${MM_LOG_DIR}/log_$(date +%Y%m%d_%H%M%S).log"'
+            eval PYTHONPATH=${RECIPES_ROOT}:\$PYTHONPATH \
+                     torchrun --master_port=${MASTER_PORT} \
+                     --nproc_per_node=${WORLD_SIZE} \
+                     ${ENTRY_SCRIPT_PATH} \
+                     ${MODEL_ARGS} \
+                     '2>&1 | tee "${MM_LOG_DIR}/log_$(date +%Y%m%d_%H%M%S).log"'
+        else
+            echo "[INFO] torchrun not found in PATH."
+            echo "[INFO] Launching with python -m torch.distributed.run (nproc_per_node=${WORLD_SIZE}, master_port=${MASTER_PORT})"
+            echo "==================================>"
+
+            eval PYTHONPATH=${RECIPES_ROOT}:\$PYTHONPATH \
+                     python -m torch.distributed.run --master_port=${MASTER_PORT} \
+                     --nproc_per_node=${WORLD_SIZE} \
+                     ${ENTRY_SCRIPT_PATH} \
+                     ${MODEL_ARGS} \
+                     '2>&1 | tee "${MM_LOG_DIR}/log_$(date +%Y%m%d_%H%M%S).log"'
+        fi
     fi
 }
