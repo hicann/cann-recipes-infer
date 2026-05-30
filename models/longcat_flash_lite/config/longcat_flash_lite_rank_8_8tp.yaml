@@ -2,9 +2,7 @@ model_config:
   model_name: "longcat_flash_lite"
   model_path: "/data/models/LongCat-Flash-Lite"
   exe_mode: "ge_graph"
-  with_ckpt: true
-  custom_params:
-    enable_mla_prolog: true   # set false to disable npu_mla_prolog_v3 fused decode
+  with_ckpt: True
 
 parallel_config:
   world_size: 8
@@ -15,6 +13,9 @@ parallel_config:
   lmhead_tp_size: 8
 
 scheduler_config:
-  input_max_len: 1024
   max_new_tokens: 128
   batch_size: 1
+
+data_config:
+  dataset: "default"
+  input_truncated_len: 256        # default_prompt.json is ~256 tokens

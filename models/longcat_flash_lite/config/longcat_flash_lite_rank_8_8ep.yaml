@@ -1,26 +1,20 @@
-# Canonical EP deployment for LongCat-Flash-Lite (A3 + ge_graph).
+# Canonical EP deployment for LongCat-Flash-Lite (A3 default).
 #
 # Parallel topology:
-#   attn_tp = 4, attn_dp = 2 (auto = world / attn_tp): MLA TP=4 with DP=2.
-#   dense_tp = 1: dense MLP DP-replicated, no AllReduce.
-#   moe_tp = 1, moe_ep = 8 (auto = world / moe_tp): MoE expert parallelism.
-#   embed_tp = 1: base embedding DP-replicated (full table per rank).
-#   custom_params.ngram_embed_tp_size = 8: ngram sub-tables sharded across all ranks
-#     (independent of embed_tp; framework not modified, model creates the comm group).
-#   lmhead_tp = 8: LM head TP across all ranks.
+#   attn_tp=4, attn_dp=2: MLA TP=4 with DP=2.
+#   moe_tp=1, moe_ep=8: MoE expert parallelism.
+#   dense_tp=1, embed_tp=1: dense MLP / base embedding DP-replicated.
+#   ngram_embed_tp_size=8: ngram sub-tables sharded across all ranks.
+#   lmhead_tp=8: LM head TP across all ranks.
 #
-# Hardware fallback for A2: the MC2 npu_moe_distribute_dispatch_v2 op caps
-# moe_expert_num <= 24 in unlayered mode (Lite has 32/rank at ep=8). On A2
-# either set exe_mode: eager (drops graph + MLA prolog) or add
-# custom_params.enable_moe_mc2_dispatch: false to keep graph + MLA prolog
-# but route decode through the double_routing AllToAll path.
+# A2 deployment: add ``platform_version: "A2"`` below — MC2 dispatch_v2
+# (caps experts_per_rank ≤ 24) then auto-falls back to double_routing.
 model_config:
   model_name: "longcat_flash_lite"
   model_path: "/data/models/LongCat-Flash-Lite"
   exe_mode: "ge_graph"
-  with_ckpt: true
+  with_ckpt: True
   custom_params:
-    enable_mla_prolog: true
     ngram_embed_tp_size: 8
 
 parallel_config:
@@ -32,6 +26,9 @@ parallel_config:
   lmhead_tp_size: 8
 
 scheduler_config:
-  input_max_len: 1024
   max_new_tokens: 128
   batch_size: 2
+
+data_config:
+  dataset: "default"
+  input_truncated_len: 256        # default_prompt.json is ~256 tokens

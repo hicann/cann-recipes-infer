@@ -1,74 +1,71 @@
 # LongCat-Flash-Lite模型在NPU上推理
 
 ## 概述
-LongCat-Flash-Lite是基于MLA + Sparse MoE + N-gram Embedding架构的稀疏专家混合大语言模型。本样例基于LongCat-Flash-Lite开源代码进行迁移，并完成对应的NPU优化适配，包括 Paged Attention 缓存管理、融合算子替换、GE 图模式加速、专家并行（EP）路径与多 batch 支持。
 
-## Agent 工作流
+基于 MLA + Sparse MoE + N-gram Embedding 架构的稀疏专家混合大语言模型。本样例基于 LongCat-Flash-Lite 开源代码进行迁移，并完成对应的 NPU 优化适配，覆盖 Paged Attention 缓存管理、融合算子替换、图模式加速、专家并行路径与多 batch 支持。
 
-本样例由 NPU 推理优化 Agent Skills（`model-infer-optimize` 整体工作流）自动完成迁移与优化，覆盖并行切分、KVCache 与 Attention、算子融合、图模式适配等全流程。完整技术决策与各阶段实测数据归档在 [agentic/](agentic/) 目录：
-
-- [agentic/optimization_report_tp.md](agentic/optimization_report_tp.md) — TP 路径终态技术报告
-- [agentic/optimization_report_ep.md](agentic/optimization_report_ep.md) — EP 路径终态技术报告
-- [agentic/progress_tp.md](agentic/progress_tp.md) / [agentic/progress_ep.md](agentic/progress_ep.md) — 各阶段过程归档
-
-### 运行前置项
-
-运行任一 yaml 前需按所选配置准备以下内容：
-
-| 项 | 位置 | 说明 |
-|----|------|------|
-| 权重 | HuggingFace `meituan-longcat/LongCat-Flash-Lite` | 下载到本地路径 |
-| 权重路径 | yaml 内 `model_config.model_path` | 改为本地权重路径 |
-| CANN 路径 | `executor/scripts/set_env.sh` 的 `cann_path` | 改为本机 CANN 安装路径 |
-| 多机 IP | `executor/scripts/set_env.sh` 的 `IPs` | 多节点时按顺序填，单节点可忽略 |
-| 可见卡 | 环境变量 `ASCEND_RT_VISIBLE_DEVICES` | 指定与 yaml `parallel_config.world_size` 等量的卡 |
-| Python 依赖 | `requirements.txt` | `pip3 install -r requirements.txt` |
+- HuggingFace: [meituan-longcat/LongCat-Flash-Lite](https://huggingface.co/meituan-longcat/LongCat-Flash-Lite)
+- 架构: MoE LLM（MLA + Sparse MoE + N-gram Embedding）
+- 参数量: 约 69 B（N-gram Embedding ~31 B，MoE ~34 B）
 
 ## 支持的产品型号
+
 <term>Atlas A2 系列产品</term>
 <term>Atlas A3 系列产品</term>
 
+## Agent 优化说明
+
+本样例由 NPU 推理优化 Agent Skills 完成迁移与优化。
+
+- **部署模式**：框架部署，接入 `executor/core/`
+- **优化点参考**：本样例已落地的主要优化点（详细方案见下方 agentic 报告）：
+  - **packed sequence 布局**：MoE、MLA、N-gram Embedding、LM Head 全链路按 token 维拍平的 packed sequence 组织，减少各模块之间的布局转换。
+  - **MLA 压缩 KV + Paged Attention**：通过 Paged Attention 框架统一管理 KV cache，每 token 仅缓存 576 维 latent，相比原 4-KV-head GQA 展开的 1280 维节省 55% 显存；Decode 走 absorb 路径，K/V 不再各自展开为多头形态。
+  - **融合算子替换**：把 RMSNorm、SwiGLU、MoE 路由 / 分发 / GMM 等热点全部换成 torch_npu 融合算子；A3 Decode 额外启用 `npu_mla_prolog_v3`，把 Q/KV 投影、RMSNorm、RoPE 与 cache 写入合并为一次算子调用。
+  - **EP 路径序列并行**：EP 部署下 Prefill 把 attention 输出端的 AllReduce 拆为 ReduceScatter + AllGather，层间张量保持在 TP 维切分，紧随其后的 RMSNorm 与 Dense MLP 算力同步缩减（仅在 `attn_tp > 1 且 attn_dp > 1` 时触发）。
+  - **图模式整图**：GE 图把 Decode 前向完整入图，包括 N-gram Embedding 这种含约 200 个小算子的子模块，消除 host 下发的串行开销；同一份模型代码可切换到 `npugraph_ex` 后端（torch_npu 注册的 torch.compile backend）。
+  - **MoE EP Decode 通信**：Decode 阶段 MoE 的跨卡专家路由由 MC2 通信算子完成，需独占通信域；A2 平台单卡专家数超过算子上限时，框架自动回退到 double routing，无需改 yaml。
+
+agent 各优化阶段过程归档在 [agentic/](agentic/) 目录：
+
+- [agentic/optimization_report_tp.md](agentic/optimization_report_tp.md) — TP 路径优化报告
+- [agentic/optimization_report_ep.md](agentic/optimization_report_ep.md) — EP 路径优化报告
+- [agentic/progress_tp.md](agentic/progress_tp.md) / [agentic/progress_ep.md](agentic/progress_ep.md) — 各优化阶段过程归档
+
 ## 环境准备
 
-1. 安装CANN软件包。
+| 项 | 版本 |
+|----|----|
+| CANN | 9.0.0 |
+| torch_npu | v26.0.0 |
+| PyTorch | 2.8.0 |
+| Python | 3.11 |
 
-   本样例的编译执行依赖CANN开发套件包与CANN二进制算子包，支持的CANN软件版本为`CANN 9.0.0`。
+1. 安装 CANN 软件包：从 [软件包下载地址](https://www.hiascend.com/developer/download/community/result?module=cann&cann=9.0.0) 下载 `Ascend-cann-toolkit_${version}_linux-${arch}.run` 与 `Ascend-cann-${soc}-ops_${version}_linux-${arch}.run`，按 [CANN 安装文档](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/900/softwareinst/instg/instg_0090.html?OS=Ubuntu&InstallType=localpack) 操作。
+   - `${soc}`：芯片版本，如 `910b` / `A3`
+   - `${version}`：CANN 包版本号，如 `9.0.0`
+   - `${arch}`：CPU 架构，如 `aarch64` / `x86_64`
 
-   请从[软件包下载地址](https://www.hiascend.com/developer/download/community/result?module=cann&cann=9.0.0)下载`Ascend-cann-toolkit_${version}_linux-${arch}.run`与`Ascend-cann-${soc}-ops_${version}_linux-${arch}.run`软件包，并参考[CANN安装文档](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/900/softwareinst/instg/instg_0090.html?OS=Ubuntu&InstallType=localpack)进行安装。
+2. 安装 Ascend Extension for PyTorch（torch_npu，配套 `v26.0.0` / PyTorch `2.8.0`）：从 [软件包下载地址](https://gitcode.com/Ascend/pytorch/releases/v26.0.0-pytorch2.8.0) 下载 `torch_npu-2.8.0.post4-cp311-cp311-manylinux_2_28_${arch}.whl`，按 [torch_npu 安装文档](https://www.hiascend.com/document/detail/zh/Pytorch/2600/configandinstg/instg/docs/zh/installation_guide/installation_via_binary_package.md) 操作。
 
-    - `${soc}`表示芯片版本，如910b、A3。
-    - `${version}`表示CANN包版本号，如9.0.0。
-    - `${arch}`表示CPU架构，如aarch64、x86_64。
+3. 下载项目源码并安装依赖：
 
-2. 安装Ascend Extension for PyTorch（torch_npu）。
+   ```bash
+   git clone https://gitcode.com/cann/cann-recipes-infer.git
+   cd cann-recipes-infer
+   pip3 install -r ./models/longcat_flash_lite/requirements.txt
+   ```
 
-   Ascend Extension for PyTorch（torch_npu）为支撑PyTorch框架运行在NPU上的适配插件，本样例支持的Ascend Extension for PyTorch版本为`v26.0.0`，PyTorch版本为`2.8.0`。
-   
-   请从[软件包下载地址](https://gitcode.com/Ascend/pytorch/releases/v26.0.0-pytorch2.8.0)下载`torch_npu-2.8.0.post4-cp311-cp311-manylinux_2_28_${arch}.whl`安装包，并参考[torch_npu安装文档](https://www.hiascend.com/document/detail/zh/Pytorch/2600/configandinstg/instg/docs/zh/installation_guide/installation_via_binary_package.md)进行安装。
+4. 配置 `executor/scripts/set_env.sh`：`cann_path` 改为本机 CANN 安装路径（例如 `/usr/local/Ascend/ascend-toolkit/latest`）；多节点部署时按 rank 顺序填 `IPs`，单节点忽略。
+5. 通过环境变量 `ASCEND_RT_VISIBLE_DEVICES` 指定与 yaml `parallel_config.world_size` 等量的卡。
 
-    - `${arch}`表示CPU架构，如aarch64、x86_64。
-
-3. 下载项目源码并安装依赖的python库。
-    ```bash
-    # 下载项目源码，以master分支为例
-    git clone https://gitcode.com/cann/cann-recipes-infer.git
-
-    # 安装依赖的python库，仅支持python 3.11
-    cd cann-recipes-infer
-    pip3 install -r ./models/longcat_flash_lite/requirements.txt
-    ```
-
-4. 配置样例运行所需环境信息。
-
-   修改`executor/scripts/set_env.sh`中的如下字段:
-   - `IPs`：配置所有节点的IP，按照rank id排序，多个节点的ip通过空格分开。
-   - `cann_path`: CANN软件包安装路径，例如`/usr/local/Ascend/ascend-toolkit/latest`。
+   > 说明：多机部署时 `HCCL_SOCKET_IFNAME` 需按本机网卡前缀（如 `enp` / `eth`）在 `executor/scripts/function.sh` 中配置，可参考[集合通信文档](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/900/maintenref/envvar/envref_07_0001.html)。
 
 ## 权重准备
 
-请从 HuggingFace 下载 LongCat-Flash-Lite 原始权重到本地路径，例如 `/data/models/LongCat-Flash-Lite`：
+从 HuggingFace 下载 LongCat-Flash-Lite 原始权重到本地路径（例如 `/data/models/LongCat-Flash-Lite`），并将 yaml 内 `model_config.model_path` 改为该路径：
 
-- [meituan-longcat/LongCat-Flash-Lite](https://huggingface.co/meituan-longcat/LongCat-Flash-Lite)
+- HuggingFace 仓库：[meituan-longcat/LongCat-Flash-Lite](https://huggingface.co/meituan-longcat/LongCat-Flash-Lite)
 
 下载方式（任选其一）：
 
@@ -81,65 +78,50 @@ huggingface-cli download meituan-longcat/LongCat-Flash-Lite --local-dir /data/mo
 git clone https://huggingface.co/meituan-longcat/LongCat-Flash-Lite /data/models/LongCat-Flash-Lite
 ```
 
-## 数据集
-
-样例默认使用仓内自带的 `dataset/default_prompt.json`（~256 token 的关于 attention 的短句），无需额外下载，适用于短输入场景（input_len≤1024）的 1k yaml。
-
-长输入场景（如 `longcat_flash_lite_rank_8_8tp_4k1k.yaml` 的 4K input）请将 `dataset/default_prompt.json` 的内容替换为约 4K token 的长 prompt 后再运行。也可将 yaml 的 `data_config.dataset` 改为 `"LongBench"` 或 `"InfiniteBench"` 使用公开 benchmark（需自行下载到本地或通过 HF 拉取）。
-
 ## 推理执行
 
-1. 修改YAML文件中`model_path`参数。
+1. 配置 yaml：`model_config.model_path` 改为本地权重路径（必改）；其他参数按需调整，本模型特有的开关位于 `model_config.custom_params`。
 
-   在`models/longcat_flash_lite/config`目录下已提供YAML配置供参考：
-   - `longcat_flash_lite_rank_8_8tp.yaml`：8 卡 TP 推理（ge_graph 模式，BS=1 低延迟）
-   - `longcat_flash_lite_rank_8_8tp_4k1k.yaml`：8 卡 TP，4K 输入 / 1K 输出
-   - `longcat_flash_lite_rank_8_8ep.yaml`：8 卡 EP 推理（ge_graph + MC2，BS=2 平衡）
-   - `longcat_flash_lite_rank_8_8ep_b8.yaml`：8 卡 EP 推理（BS=8 高吞吐）
+   配置文件清单：
+   - `config/longcat_flash_lite_rank_8_8tp.yaml` — 8 卡 TP，低延迟
+   - `config/longcat_flash_lite_rank_8_8ep.yaml` — 8 卡 EP，平衡延迟与吞吐
 
-   将`model_path`设置为权重文件存储路径。
+   > 长序列 / 多 batch 无需单独 yaml：长输入改 `data_config.input_truncated_len` 与 `scheduler_config.max_new_tokens`，多 batch 改 `scheduler_config.batch_size` 即可。
 
-2. 执行推理（`infer.sh` 接受 `$1=mode`、`$2=yaml`，与仓库其他模型一致）。
-    ```bash
-    cd models/longcat_flash_lite
-    bash infer.sh                                              # 默认 8卡TP (longcat_flash_lite_rank_8_8tp.yaml)
-    bash infer.sh offline longcat_flash_lite_rank_8_8tp_4k1k.yaml     # 8卡TP, 4K input + 1K output
-    bash infer.sh offline longcat_flash_lite_rank_8_8ep.yaml          # 8卡EP, BS=2
-    bash infer.sh offline longcat_flash_lite_rank_8_8ep_b8.yaml       # 8卡EP, BS=8 高吞吐
-    ```
+   > 切换图模式：把 yaml 里 `model_config.exe_mode` 从 `"ge_graph"` 改成 `"npugraph_ex"` 即可换到 `npugraph_ex` 后端（torch_npu 提供的 torch.compile backend）；该后端建议同时加 `model_config.enable_static_kernel: true` 以获得最优性能。默认 `ge_graph` 时延更低。
+   >
+   > 编译缓存：yaml 加 `model_config.enable_cache_compile: true` 将图编译产物缓存到 `config/cache_compile/`，重复启动时复用缓存、跳过重新编译。
 
-## 优化点参考
+2. 准备推理 prompt：
+   - **内置 prompt**：使用 `dataset/default_prompt.json`（~256 token 关于 attention 的短句），无需额外准备，适用于 1k yaml。
+   - **长序列**：将 `data_config.input_truncated_len` 调到目标输入长度（如 4096），并把 `dataset/default_prompt.json` 替换为相应长度的 prompt；或将 `data_config.dataset` 改为 `"LongBench"` / `"InfiniteBench"` 使用公开 benchmark（需自行下载到本地或通过 HF 拉取）。
 
-TP 与 EP 路径分别成稿，详见 [optimization_report_tp.md](agentic/optimization_report_tp.md) / [optimization_report_ep.md](agentic/optimization_report_ep.md)，主要优化包括：
-1. Paged Attention 内存管理：block-paged KV cache（block_size=128）；cache 内容形态由 MLA 架构决定（每 token 仅存 `kv_lora_rank + qk_rope_head_dim = 576` 维 latent KV，而非 vanilla MHA 的 ~12288 维）
-2. MLA absorb decode 路径：将 `q_b_proj` 投影吸收到 K 方向，避免 decode 时显式还原大维度 K
-3. 融合算子全量替换：`rms_norm` / `add_rms_norm` / `moe_gating_top_k` / `init_routing_v2` / `grouped_matmul + swiglu`
-4. GE 图模式 Decode 整图，含 NgramEmbedding 入图（消除 ~11 ms host dispatch 开销）
-5. A3 启用 `npu_mla_prolog_v3` 融合（q_b_proj → split → RoPE 与 KV cache 写入合一）
-6. EP MoE 路径（Prefill AllToAll dispatch/combine，Decode MC2 `dispatch_v2/combine_v2`）与多 batch 支持
+   > 若长序列场景出现 OOM，参考 [CLAUDE.md 注意事项](../../CLAUDE.md) 的 OOM 缓解顺序调整 batch_size / kvp_size / 量化模式。
+
+3. 执行统一推理脚本。
+
+   统一入口 `executor/scripts/infer.sh` 通过 `--model` / `--yaml` 指定模型与配置（本样例仅支持离线推理，`--mode` 默认 `offline`）：
+
+   | 参数 | 含义 | 取值示例 |
+   | --- | --- | --- |
+   | `--model` | 模型目录名，对应 `models/` 下的子目录 | `longcat_flash_lite` |
+   | `--yaml` | `config/` 下的 yaml 文件名 | `longcat_flash_lite_rank_8_8tp.yaml` |
+
+   ```bash
+   bash executor/scripts/infer.sh --model longcat_flash_lite --yaml longcat_flash_lite_rank_8_8tp.yaml
+   bash executor/scripts/infer.sh --model longcat_flash_lite --yaml longcat_flash_lite_rank_8_8ep.yaml
+   ```
+
+   如需查看参数说明，可执行 `bash executor/scripts/infer.sh --help`。
 
 ## 性能基线
 
-A3 8卡实测最佳性能（input_len=1024）：
+A3 8 卡实测性能（input_len=1024）。低延迟 / 平衡两行对应 `config/` 下两份 yaml，高吞吐行在 EP yaml 基础上将 `batch_size` 改为 8：
 
-| 配置 | BS | Prefill | Decode/token | 吞吐 |
-|---|---|---|---|---|
-| TP8（低延迟） | 1 | 50.68 ms | 5.94 ms | 167 tok/s |
-| EP8（高吞吐） | 8 | 129.38 ms | 9.54 ms | 838 tok/s |
+| 配置 | 量化模式 | Global Batch Size | Seq Length (in/out) | 卡数 | Prefill (ms) | TPOT (ms) | 吞吐 (tokens/s) |
+|------|---------|-------------------|---------------------|------|--------------|-----------|----------------|
+| `rank_8_8tp.yaml`（TP，低延迟） | BF16 | 1 | 1024/128 | 8×A3 | 47.84 | 5.76 | 174 |
+| `rank_8_8ep.yaml`（EP，平衡） | BF16 | 2 | 1024/128 | 8×A3 | 67 | 8.10 | 247 |
+| `rank_8_8ep.yaml` + `batch_size=8`（EP，高吞吐） | BF16 | 8 | 1024/128 | 8×A3 | 129.38 | 9.54 | 838 |
 
 > 详细性能拆解（含逐阶段贡献、A2 / A3 跨硬件对比）参见 [optimization_report_tp.md](agentic/optimization_report_tp.md)（TP 路径）与 [optimization_report_ep.md](agentic/optimization_report_ep.md)（EP 路径）。
-
-## 模型结构
-
-| 参数 | 值 |
-|------|-----|
-| 架构 | MoE LLM (MLA + Sparse MoE + N-gram Embedding) |
-| hidden_size | 3072 |
-| num_layers | 14 (dual sub-layer) |
-| num_attention_heads | 32 |
-| n_routed_experts | 256 |
-| zero_expert_num | 128 (identity) |
-| moe_topk | 12 |
-| vocab_size | 131072 |
-| dtype | bfloat16 |
-

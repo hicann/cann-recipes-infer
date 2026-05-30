@@ -18,6 +18,7 @@
 # limitations under the License.
 
 import math
+import warnings
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -44,9 +45,6 @@ from .configuration_longcat_flash_lite import LongcatFlashNgramConfig
 
 
 ENABLE_NGRAM_EMBEDDING = True
-
-# PA (Paged Attention) configuration constants
-PA_BLOCK_SIZE = 128
 
 
 def _mark_static(tensor):
@@ -140,10 +138,16 @@ class LongcatFlashMLA(nn.Module):
         self.layer_idx = layer_idx
         self.tp_size = infer_config.parallel_config.attn_tp_size
         self.tp_rank = (dist.get_rank() % self.tp_size) if (self.tp_size > 1 and dist.is_initialized()) else 0
+        self.attn_dp_size = infer_config.parallel_config.attn_dp_size
+        # Prefill replaces AllReduce(O_output) with
+        # ReduceScatter(O_output) + AllGather(next_layer_input).
+        # Decode keeps AllReduce because batch_per_dp_rank may be < attn_tp.
+        self.is_sp = self.tp_size > 1 and self.attn_dp_size > 1
         self.comm_manager = comm_manager
 
         # Use tng.ops for FA calls in ge_graph mode (accepts Tensor for actual_seq_lengths_kv)
         self.enable_gegraph = infer_config.model_config.exe_mode == "ge_graph"
+        self.enable_npugraph_ex = infer_config.model_config.exe_mode == "npugraph_ex"
         self.fa_ops = tng.ops if self.enable_gegraph else torch.ops.npu
 
         self.num_heads = config.num_attention_heads
@@ -157,21 +161,19 @@ class LongcatFlashMLA(nn.Module):
         self.qk_nope_head_dim = config.qk_nope_head_dim
         self.qk_head_dim = config.qk_head_dim
 
-        # Q path: compression is replicated, expansion is TP-split by heads
+        # LongCat-Flash-Lite always uses Q LoRA; the no-q-lora variant is not
+        # supported by this implementation.
         if self.q_lora_rank is None:
-            self.q_proj = ColumnParallelLinear(
-                config.hidden_size, self.num_heads * self.qk_head_dim,
-                bias=False, tp_size=self.tp_size, tp_rank=self.tp_rank,
-                prefix=f"{prefix}.q_proj",
-            )
-        else:
-            self.q_a_proj = nn.Linear(config.hidden_size, config.q_lora_rank, bias=config.attention_bias)
-            self.q_a_layernorm = LongcatFlashRMSNorm(config.q_lora_rank)
-            self.q_b_proj = ColumnParallelLinear(
-                config.q_lora_rank, self.num_heads * self.qk_head_dim,
-                bias=False, tp_size=self.tp_size, tp_rank=self.tp_rank,
-                prefix=f"{prefix}.q_b_proj",
-            )
+            raise ValueError("LongcatFlashMLA requires config.q_lora_rank to be set")
+
+        # Q path: compression is replicated, expansion is TP-split by heads.
+        self.q_a_proj = nn.Linear(config.hidden_size, config.q_lora_rank, bias=config.attention_bias)
+        self.q_a_layernorm = LongcatFlashRMSNorm(config.q_lora_rank)
+        self.q_b_proj = ColumnParallelLinear(
+            config.q_lora_rank, self.num_heads * self.qk_head_dim,
+            bias=False, tp_size=self.tp_size, tp_rank=self.tp_rank,
+            prefix=f"{prefix}.q_b_proj",
+        )
 
         # KV path: compression is replicated (MQA shared), expansion is TP-split by heads
         self.kv_a_proj_with_mqa = nn.Linear(
@@ -199,23 +201,31 @@ class LongcatFlashMLA(nn.Module):
 
         # Scaling (softmax_scale for FA)
         self.softmax_scale = self.qk_head_dim ** (-0.5)
-        if self.config.rope_parameters.get("rope_type", "default") != "default":
-            mscale_all_dim = self.config.rope_parameters.get("mscale_all_dim", 0)
+        rope_type = self.config.rope_parameters.get("rope_type", "default")
+        mscale_all_dim = self.config.rope_parameters.get("mscale_all_dim", 0)
+        if rope_type != "default":
             scaling_factor = self.config.rope_parameters["factor"]
             if mscale_all_dim:
                 mscale = yarn_get_mscale(scaling_factor, mscale_all_dim)
                 self.softmax_scale = self.softmax_scale * mscale * mscale
+        elif mscale_all_dim:
+            # rope_type=default but mscale_all_dim is set → likely a stale YaRN
+            # field that the inference path silently ignores. Warn so a misset
+            # rope_parameters does not produce a wrong softmax_scale (skill F.5).
+            warnings.warn(
+                f"rope_parameters.mscale_all_dim={mscale_all_dim} is set but "
+                f"rope_type=default — mscale is NOT applied to softmax_scale; "
+                "confirm this matches the training-time setup.",
+                RuntimeWarning,
+            )
 
         self.mla_scale_q_lora = (config.hidden_size / self.q_lora_rank) ** 0.5
         self.mla_scale_kv_lora = (config.hidden_size / self.kv_lora_rank) ** 0.5
 
-        # PA configuration
-        self.block_size = PA_BLOCK_SIZE
+        # PA configuration — sourced from scheduler_config so the framework's
+        # allocator and MLA cache views see one consistent value.
+        self.block_size = infer_config.scheduler_config.block_size
 
-        # MLA prolog fused kernel switch. Default ON; set
-        # model_config.custom_params.enable_mla_prolog: false in YAML to opt out.
-        cp = infer_config.model_config.custom_params or {}
-        self.enable_mla_prolog = bool(cp.get("enable_mla_prolog", True))
         # NZ-format weights consumed by torch_npu.npu_mla_prolog_v3.
         # Initialised in process_weights_after_loading (see CausalLM wrapper).
         self.weight_dq_prolog = None        # (He, Hcq) NZ — from q_a_proj.weight^T
@@ -286,9 +296,6 @@ class LongcatFlashMLA(nn.Module):
         them here and (optionally) cast to NZ to match the kernel's expectation
         of ``(He, Hcq)`` and ``(He, Hckv + Dr)``.
         """
-        if not self.enable_mla_prolog or self.q_lora_rank is None:
-            return
-
         # weight_dq: (He, Hcq) — derived from q_a_proj.weight (Hcq, He)
         wdq = self.q_a_proj.weight.data.transpose(0, 1).contiguous()
         # weight_dkv_kr: (He, Hckv + Dr) — derived from kv_a_proj_with_mqa.weight
@@ -309,13 +316,11 @@ class LongcatFlashMLA(nn.Module):
         forward_metadata: ForwardMetaData,
         **kwargs,
     ) -> torch.Tensor:
-        batch_size, seq_length = hidden_states.shape[:2]
-        is_prefill = seq_length > 1
-
-        if is_prefill:
+        # Dispatch by phase flag (not by shape): decode is also packed (T>1) for
+        # multi-batch, so shape alone cannot distinguish prefill from decode.
+        if forward_metadata.is_prefill:
             return self._forward_prefill(hidden_states, position_embeddings, forward_metadata)
-        else:
-            return self._forward_decode(hidden_states, position_embeddings, forward_metadata)
+        return self._forward_decode_prolog(hidden_states, position_embeddings, forward_metadata)
 
     def _forward_prefill(
         self,
@@ -323,35 +328,59 @@ class LongcatFlashMLA(nn.Module):
         position_embeddings: Tuple[torch.Tensor, torch.Tensor],
         forward_metadata: ForwardMetaData,
     ) -> torch.Tensor:
-        """Prefill: do NOT use absorb. Expand KV from cache, use full K/V for FA."""
-        batch_size, seq_length = hidden_states.shape[:2]
-        cos, sin = position_embeddings
+        """Prefill: non-absorb path. K/V are expanded via ``kv_b_proj`` and FA
+        runs in NTD_TND layout over full per-head K/V. Inputs are packed 2D
+        ``(T, H)``; a B=1 wrap is applied locally where a kernel requires 4D.
+        """
+        if self.is_sp:
+            local_t, h_dim = hidden_states.shape
+            full_t = local_t * self.tp_size
+            gathered = torch.empty(
+                full_t, h_dim, dtype=hidden_states.dtype, device=hidden_states.device,
+            )
+            dist.all_gather_into_tensor(
+                gathered, hidden_states,
+                group=self.comm_manager.get_group("attn_tp_group"),
+            )
+            hidden_states = gathered
 
-        # --- Q ---
-        if self.q_lora_rank is not None:
-            q_states = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
-        else:
-            q_states = self.q_proj(hidden_states)
+        padded_q_len = hidden_states.shape[0]
+        cos, sin = position_embeddings  # (B, S, D_rope) from rotary_emb; flatten below
 
-        # (B, S, N, qk_head_dim)
-        q_states = q_states.view(batch_size, seq_length, self.num_heads_per_rank, self.qk_head_dim)
+        # SP path inflates T_local -> T_padded via all_gather, but framework
+        # metadata (slot_mapping / cu_kv) is sized for T_real (sum of seq_lens).
+        # Slice hidden_states / cos / sin back to T_real before FA + cache write;
+        # re-pad just before reduce_scatter so the inverse comm shape matches.
+        prompt_tokens = getattr(forward_metadata, "prompt_tokens", padded_q_len)
+        if self.is_sp and 0 < prompt_tokens < padded_q_len:
+            hidden_states = hidden_states[:prompt_tokens]
+            cos = cos[:prompt_tokens]
+            sin = sin[:prompt_tokens]
+
+        num_tokens = hidden_states.shape[0]
+
+        # --- Q LoRA path (assert in __init__ guarantees q_lora_rank is set) ---
+        q_states = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
+
+        # (T, N, qk_head_dim) — TND form
+        q_states = q_states.view(num_tokens, self.num_heads_per_rank, self.qk_head_dim)
         q_nope, q_pe = torch.split(q_states, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 
         # MLA LoRA scaling on Q
         q_nope = q_nope * self.mla_scale_q_lora
         q_pe = q_pe * self.mla_scale_q_lora
 
-        # Q RoPE: (B, S, N, D) -> (B, N, S, D) for npu_interleave_rope
-        q_pe = q_pe.transpose(1, 2)
-        cos_q = cos.unsqueeze(1)  # (B, 1, S, D)
-        sin_q = sin.unsqueeze(1)
+        # Q RoPE: npu_interleave_rope needs 4D (B, N, T, D). Wrap with B=1.
+        q_pe = q_pe.unsqueeze(0).transpose(1, 2)  # (1, T, N, D_rope) → (1, N, T, D_rope)
+        cos_q = cos.view(1, 1, num_tokens, self.qk_rope_head_dim)
+        sin_q = sin.view(1, 1, num_tokens, self.qk_rope_head_dim)
         q_pe = torch_npu.npu_interleave_rope(q_pe, cos_q, sin_q)
-        q_pe = q_pe.transpose(1, 2)  # back to (B, S, N, D)
+        q_pe = q_pe.transpose(1, 2).squeeze(0)  # back to (T, N, D_rope)
 
         # --- KV ---
         latent_cache = self.kv_a_proj_with_mqa(hidden_states)
-        # (B*S, 1, 1, kv_lora_rank + qk_rope_head_dim) for npu_kv_rmsnorm_rope_cache
-        latent_cache = latent_cache.view(-1, 1, 1, self.kv_lora_rank + self.qk_rope_head_dim)
+        # (T, 1, 1, kv_lora_rank + qk_rope_head_dim) for npu_kv_rmsnorm_rope_cache
+        latent_cache = latent_cache.view(num_tokens, 1, 1, self.kv_lora_rank + self.qk_rope_head_dim)
 
         slot_mapping = forward_metadata.slot_mapping[self.attn_type]
         cos_kv = cos.view(-1, 1, 1, self.qk_rope_head_dim)
@@ -386,10 +415,11 @@ class LongcatFlashMLA(nn.Module):
         # k_rope: (B*S, 1, qk_rope_head_dim) -> (N, B*S, qk_rope_head_dim)
         k_rope = k_rope.view(1, -1, self.qk_rope_head_dim).repeat(self.num_heads_per_rank, 1, 1)
 
-        # FA Prefill: NTD_TND layout (non-absorb, expanded K/V)
-        # Q: (N, T, D) where T = B*S, K/V: (N, T, D) in TND format
-        q_nope_ntd = q_nope.reshape(-1, self.num_heads_per_rank, self.qk_nope_head_dim).permute(1, 0, 2)
-        q_pe_ntd = q_pe.reshape(-1, self.num_heads_per_rank, self.qk_rope_head_dim).permute(1, 0, 2)
+        # FA Prefill: NTD_TND layout (non-absorb, expanded K/V).
+        # q_nope/q_pe are already (T, N, D); transpose to (N, T, D) for the
+        # NTD-side of the layout.
+        q_nope_ntd = q_nope.permute(1, 0, 2).contiguous()
+        q_pe_ntd = q_pe.permute(1, 0, 2).contiguous()
 
         # NTD_TND attention: actual_seq_lengths{,_kv} must be cumulative
         # offsets ([T1, T1+T2, ...]) — they tell FA where each sequence ends
@@ -420,34 +450,35 @@ class LongcatFlashMLA(nn.Module):
             next_tokens=0,
         )
 
-        # FA with NTD_TND returns output in TND layout: (T, N, v_head_dim)
-        # Reshape to (B, S, N*v_head_dim)
-        attn_output = attn_output.reshape(batch_size, seq_length, -1).contiguous()
+        # FA with NTD_TND returns output in TND layout: (T, N, v_head_dim).
+        # Flatten N*v_head_dim → packed 2D (T, N*v_head_dim) for o_proj; the
+        # caller (DecoderLayer) threads packed 2D throughout.
+        attn_output = attn_output.reshape(num_tokens, -1).contiguous()
 
         # --- Output ---
         attn_output = self.o_proj(attn_output)
-        if self.tp_size > 1:
+        if self.is_sp:
+            # Re-pad T_real -> T_padded so reduce_scatter sees the same shape
+            # all_gather produced at entry.
+            if attn_output.shape[0] < padded_q_len:
+                pad = torch.zeros(
+                    padded_q_len - attn_output.shape[0], attn_output.shape[-1],
+                    dtype=attn_output.dtype, device=attn_output.device,
+                )
+                attn_output = torch.cat([attn_output, pad], dim=0)
+            full_t, h_dim = attn_output.shape
+            local_t = full_t // self.tp_size
+            scattered = torch.empty(
+                local_t, h_dim, dtype=attn_output.dtype, device=attn_output.device,
+            )
+            dist.reduce_scatter_tensor(
+                scattered, attn_output,
+                group=self.comm_manager.get_group("attn_tp_group"),
+            )
+            attn_output = scattered
+        elif self.tp_size > 1:
             dist.all_reduce(attn_output, group=self.comm_manager.get_group("attn_tp_group"))
         return attn_output
-
-    def _forward_decode(
-        self,
-        hidden_states: torch.Tensor,
-        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
-        forward_metadata: ForwardMetaData,
-    ) -> torch.Tensor:
-        """Decode dispatch: route between MLA prolog fused path and legacy absorb path."""
-        if (
-            self.enable_mla_prolog
-            and self.q_lora_rank is not None
-            and self.weight_dq_prolog is not None
-        ):
-            return self._forward_decode_prolog(
-                hidden_states, position_embeddings, forward_metadata
-            )
-        return self._forward_decode_legacy(
-            hidden_states, position_embeddings, forward_metadata
-        )
 
     def _forward_decode_prolog(
         self,
@@ -459,27 +490,30 @@ class LongcatFlashMLA(nn.Module):
 
         The fused kernel performs (q_a -> rmsnorm -> q_b -> split + interleaved
         rope -> absorb-via-weight_uk) and (kv_a -> rmsnorm -> rope -> scatter
-        into PA cache) in a single call.  The Q-side LoRA scale and KV-side
-        LoRA scale are folded into the fused output via ``qc_qr_scale`` and
-        ``kc_scale`` so that the cache stays unscaled (matching the prefill
-        write path that does the same).
+        into PA cache) in a single call.
+
+        ``cache_nope`` is stored **unscaled** to match the prefill write path
+        (``npu_kv_rmsnorm_rope_cache``). The kv_lora scale is therefore applied
+        on the ``q_nope`` output below rather than via ``kc_scale``, so cache
+        slots written by prefill and decode share a single scale convention.
         """
-        batch_size, seq_length = hidden_states.shape[:2]  # seq_length == 1
+        # Inputs are packed 2D (T, H); prolog returns TND outputs directly.
+        num_tokens = hidden_states.shape[0]
+        hidden_states_2d = hidden_states
         cos, sin = position_embeddings
 
-        # Kernel expects (B, S, Dr) for the rope tables in (B, S, He) mode.
-        rope_cos = cos.view(batch_size, seq_length, self.qk_rope_head_dim)
-        rope_sin = sin.view(batch_size, seq_length, self.qk_rope_head_dim)
+        # TND-friendly rope tables: (num_tokens, qk_rope_head_dim).
+        rope_cos = cos.view(num_tokens, self.qk_rope_head_dim)
+        rope_sin = sin.view(num_tokens, self.qk_rope_head_dim)
 
         slot_mapping = forward_metadata.slot_mapping[self.attn_type]
-        cache_index = slot_mapping.view(batch_size, seq_length).to(torch.int64)
+        cache_index = slot_mapping.view(-1).to(torch.int64)
 
-        # Fused prolog: Q projection + RMSNorm + RoPE + Q absorb + KV projection
-        # + RMSNorm + RoPE + cache write. ``qc_qr_scale`` is applied to q_nope
-        # and q_pe; ``kc_scale`` is folded into the q_nope -> latent K product
-        # so we don't need to scale the cache afterwards.
+        # qc_qr_scale folds the Q-LoRA scale into q_nope/q_pe. kc_scale=1.0
+        # leaves the cache write unscaled; the kv_lora scale is applied to
+        # q_nope below instead, so prefill and decode cache slots share scale.
         q_nope, q_pe, _, _, _ = torch_npu.npu_mla_prolog_v3(
-            hidden_states,
+            hidden_states_2d,
             self.weight_dq_prolog,
             self.q_b_proj.weight,
             self.kv_b_proj_w_k,
@@ -495,12 +529,13 @@ class LongcatFlashMLA(nn.Module):
             rmsnorm_epsilon_ckv=self.kv_a_layernorm.variance_epsilon,
             cache_mode="PA_NZ",
             qc_qr_scale=float(self.mla_scale_q_lora),
-            kc_scale=float(self.mla_scale_kv_lora),
+            kc_scale=1.0,
         )
-        # q_nope: (B, S, N, kv_lora_rank), q_pe: (B, S, N, qk_rope_head_dim)
+        # Apply the kv_lora scale on q_nope; cache stays unscaled.
+        q_nope = q_nope * self.mla_scale_kv_lora
+        # q_nope: (num_tokens, N, kv_lora_rank), q_pe: (num_tokens, N, qk_rope_head_dim).
 
-        # Reshape KV caches into the BSND_NBSD-friendly NZ view that the FA
-        # kernel expects (matches the legacy decode path).
+        # Cache view as PA_NZ 5D for FA v2 TND_NTD.
         kv_cache_nz_dim = 16  # bf16/fp16 NZ inner dim
         cache_nope_nz = self.cache_nope.view(
             self.cache_nope.shape[0], 1,
@@ -513,150 +548,55 @@ class LongcatFlashMLA(nn.Module):
             self.cache_rope.shape[1], kv_cache_nz_dim,
         )
 
-        actual_seq_lengths_kv = forward_metadata.actual_seq_lengths_kv
-
-        attn_output, _ = self.fa_ops.npu_fused_infer_attention_score(
-            q_nope, cache_nope_nz, cache_nope_nz,
-            query_rope=q_pe, key_rope=cache_rope_nz,
-            num_heads=self.num_heads_per_rank,
-            num_key_value_heads=self.num_key_value_heads,
-            input_layout="BSND_NBSD",
-            block_table=forward_metadata.block_table[self.attn_type],
-            block_size=self.block_size,
-            atten_mask=None, sparse_mode=0,
-            actual_seq_lengths_kv=actual_seq_lengths_kv,
-            scale=self.softmax_scale,
-            antiquant_mode=0, antiquant_scale=None,
-        )
-
-        # attn_output: (B, S, N, kv_lora_rank=512)
-        # absorb output: matmul with kv_b_proj_w_v to recover (B, S, N, v_head_dim)
-        attn_output = attn_output.permute(2, 0, 1, 3).reshape(
-            self.num_heads_per_rank, batch_size * seq_length, self.kv_lora_rank
-        )
-        attn_output = torch.matmul(attn_output, self.kv_b_proj_w_v)  # (N, B*S, v_head_dim)
-        attn_output = attn_output.view(
-            self.num_heads_per_rank, batch_size, seq_length, self.v_head_dim
-        ).permute(1, 2, 0, 3).reshape(batch_size, seq_length, -1).contiguous()
-
-        attn_output = self.o_proj(attn_output)
-        if self.tp_size > 1:
-            dist.all_reduce(attn_output, group=self.comm_manager.get_group("attn_tp_group"))
-        return attn_output
-
-    def _forward_decode_legacy(
-        self,
-        hidden_states: torch.Tensor,
-        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
-        forward_metadata: ForwardMetaData,
-    ) -> torch.Tensor:
-        """Legacy decode: explicit absorb + npu_kv_rmsnorm_rope_cache + FA."""
-        batch_size, seq_length = hidden_states.shape[:2]  # seq_length == 1
-        cos, sin = position_embeddings
-
-        # --- Q ---
-        if self.q_lora_rank is not None:
-            q_states = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
+        # npugraph_ex requires actual_seq_lengths to be a Python list (Dynamo
+        # SymInt[] schema). ge_graph + eager accept Tensor. Framework populates
+        # the _list_ variants only when exe_mode == "npugraph_ex".
+        if self.enable_npugraph_ex:
+            actual_seq_lengths_kv = forward_metadata.actual_seq_lengths_list_kv
+            actual_seq_lengths_q_cu = forward_metadata.actual_seq_lengths_cu_list_q
         else:
-            q_states = self.q_proj(hidden_states)
+            actual_seq_lengths_kv = forward_metadata.actual_seq_lengths_kv
+            actual_seq_lengths_q_cu = forward_metadata.actual_seq_lengths_cu_q
 
-        # (B, 1, N, qk_head_dim)
-        q_states = q_states.view(batch_size, seq_length, self.num_heads_per_rank, self.qk_head_dim)
-        q_nope, q_pe = torch.split(q_states, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-
-        # MLA LoRA scaling on Q
-        q_nope = q_nope * self.mla_scale_q_lora
-        q_pe = q_pe * self.mla_scale_q_lora
-
-        # Q RoPE: (B, 1, N, D) -> (B, N, 1, D) for npu_interleave_rope
-        q_pe = q_pe.transpose(1, 2)
-        cos_q = cos.view(batch_size, 1, -1, self.qk_rope_head_dim)
-        sin_q = sin.view(batch_size, 1, -1, self.qk_rope_head_dim)
-        q_pe = torch_npu.npu_interleave_rope(q_pe, cos_q, sin_q)
-        q_pe = q_pe.transpose(1, 2)  # back to (B, 1, N, D)
-
-        # Absorb: q_nope(B,1,N,128) @ kv_b_proj_w_k(N,128,512) -> q_nope(B,1,N,512)
-        q_nope = q_nope.view(-1, self.num_heads_per_rank, self.qk_nope_head_dim)
-        q_nope = torch.matmul(q_nope.transpose(0, 1), self.kv_b_proj_w_k).transpose(0, 1)
-        q_nope = q_nope.view(batch_size, seq_length, self.num_heads_per_rank, self.kv_lora_rank)
-
-        # --- KV: write to cache ---
-        latent_cache = self.kv_a_proj_with_mqa(hidden_states)
-        latent_cache = latent_cache.view(batch_size, 1, 1, self.kv_lora_rank + self.qk_rope_head_dim)
-
-        slot_mapping = forward_metadata.slot_mapping[self.attn_type]
-        cos_kv = cos.view(-1, 1, 1, self.qk_rope_head_dim)
-        sin_kv = sin.view(-1, 1, 1, self.qk_rope_head_dim)
-
-        # npu_kv_rmsnorm_rope_cache returns (updated_rope_cache, updated_nope_cache, k_rope, k_nope).
-        # In GE graph mode, we MUST use the returned cache tensors (not self.cache_*)
-        # for subsequent reads, because the graph's data-flow edges track the outputs,
-        # not the in-place mutation on the input tensors.
-        updated_rope_cache, updated_nope_cache, _, _ = torch_npu.npu_kv_rmsnorm_rope_cache(
-            latent_cache,
-            self.kv_a_layernorm.weight,
-            cos_kv,
-            sin_kv,
-            slot_mapping.view(-1).to(torch.int64),
-            self.cache_rope,
-            self.cache_nope,
-            epsilon=self.kv_a_layernorm.variance_epsilon,
-            cache_mode="PA_NZ",
-        )
-
-        # Reshape cache for NZ format (for BSND_NBSD layout FA)
-        # Use the returned updated cache, not self.cache_*, for correct data flow in GE graph.
-        kv_cache_nz_dim = 16  # bf16 NZ format
-        cache_nope_nz = updated_nope_cache.view(
-            updated_nope_cache.shape[0], 1,
-            self.kv_lora_rank // kv_cache_nz_dim,
-            self.block_size, kv_cache_nz_dim
-        )
-        cache_rope_nz = updated_rope_cache.view(
-            updated_rope_cache.shape[0], 1,
-            self.qk_rope_head_dim // kv_cache_nz_dim,
-            self.block_size, kv_cache_nz_dim
-        )
-
-        # Apply KV LoRA scaling to cache values for FA (must create scaled copy,
-        # not modify cache in-place). Matches longcat-flash reference behavior.
-        cache_nope_nz = cache_nope_nz * self.mla_scale_kv_lora
-
-        # FA Decode: BSND_NBSD layout, absorb mode
-        # key = value = cache_nope (kv_lora_rank=512)
-        # query_rope/key_rope separated
-        actual_seq_lengths_kv = forward_metadata.actual_seq_lengths_kv
-
-        attn_output, _ = self.fa_ops.npu_fused_infer_attention_score(
+        # FA v2 with input_layout="TND_NTD":
+        # query is TND (T, N, kv_lora) but the OUTPUT layout is NTD
+        # (N, T, kv_lora) — the trailing "_NTD" suffix denotes the output
+        # layout, not the cache layout. V absorb below handles the swap
+        # via npu_transpose_batchmatmul.
+        attn_output, _ = self.fa_ops.npu_fused_infer_attention_score_v2(
             q_nope, cache_nope_nz, cache_nope_nz,
             query_rope=q_pe, key_rope=cache_rope_nz,
-            num_heads=self.num_heads_per_rank,
-            num_key_value_heads=self.num_key_value_heads,
-            input_layout="BSND_NBSD",
+            atten_mask=None,
+            actual_seq_kvlen=actual_seq_lengths_kv,
+            actual_seq_qlen=actual_seq_lengths_q_cu,
             block_table=forward_metadata.block_table[self.attn_type],
+            num_query_heads=self.num_heads_per_rank,
+            num_key_value_heads=self.num_key_value_heads,
+            softmax_scale=self.softmax_scale,
+            input_layout="TND_NTD",
+            sparse_mode=0,
             block_size=self.block_size,
-            atten_mask=None, sparse_mode=0,
-            actual_seq_lengths_kv=actual_seq_lengths_kv,
-            scale=self.softmax_scale,
-            antiquant_mode=0, antiquant_scale=None,
+            query_quant_mode=0, key_quant_mode=0, value_quant_mode=0,
+        )
+        # attn_output: (N, num_tokens, kv_lora_rank) — NTD output layout.
+
+        # V absorb: attn_output (N, T, kv_lora) bmm kv_b_proj_w_v
+        # (N, kv_lora, v_head_dim) → (T, N*v_head_dim) packed 2D for o_proj
+        # (perm_y permutes (N, T) → (T, N) and flattens the last two dims).
+        attn_output = torch_npu.npu_transpose_batchmatmul(
+            attn_output,
+            self.kv_b_proj_w_v,
+            bias=None,
+            scale=None,
+            perm_x1=(0, 1, 2),
+            perm_x2=(0, 1, 2),
+            perm_y=(1, 0, 2),
         )
 
-        # attn_output: (B, S, N, kv_lora_rank=512) in BSND layout
-        # Absorb output: multiply by kv_b_proj_w_v to get v_head_dim
-        # Reshape to (N, B*S, kv_lora_rank) for batched matmul with kv_b_proj_w_v(N, kv_lora_rank, v_head_dim)
-        attn_output = attn_output.permute(2, 0, 1, 3).reshape(
-            self.num_heads_per_rank, batch_size * seq_length, self.kv_lora_rank
-        )
-        attn_output = torch.matmul(attn_output, self.kv_b_proj_w_v)
-        # (N, B*S, v_head_dim) -> (B, S, N*v_head_dim)
-        attn_output = attn_output.view(
-            self.num_heads_per_rank, batch_size, seq_length, self.v_head_dim
-        ).permute(1, 2, 0, 3).reshape(batch_size, seq_length, -1).contiguous()
-
-        # --- Output ---
-        attn_output = self.o_proj(attn_output)
+        attn_output = self.o_proj(attn_output.view(num_tokens, -1))
         if self.tp_size > 1:
             dist.all_reduce(attn_output, group=self.comm_manager.get_group("attn_tp_group"))
+        # Return packed 2D (T, H); DecoderLayer threads packed 2D throughout.
         return attn_output
 
 
@@ -790,18 +730,15 @@ class LongcatFlashMoE(nn.Module):
             # MC2 op kwargs are filled lazily (need group_name from comm_manager).
             self.dispatch_kwargs = None
             self.combine_kwargs = None
-            # MC2 npu_moe_distribute_dispatch_v2/combine_v2 is the fast EP
-            # decode path; it requires A3 + ge_graph mode. A2's unlayered
-            # tiling caps moe_expert_num <= 24 (Lite has 32/rank at ep=8),
-            # so on A2 set model_config.custom_params.enable_moe_mc2_dispatch:
-            # false (or exe_mode: eager) to fall back to the double_routing path.
+            # MC2 npu_moe_distribute_dispatch_v2 / combine_v2 caps
+            # experts_per_rank <= 24 on A2 unlayered tiling; A3 has no such
+            # cap. Default is ON unless the runtime platform is A2 and the
+            # model exceeds the A2 cap. Override via
+            # ``custom_params.enable_moe_mc2_dispatch``.
+            platform = infer_config.model_config.platform_version
             cp = infer_config.model_config.custom_params or {}
-            _mc2_cfg = cp.get("enable_moe_mc2_dispatch", None)
-            if _mc2_cfg is None:
-                # Default ON in ge_graph mode (canonical A3 deployment),
-                # OFF in eager mode (works on every chip, slower).
-                _mc2_cfg = infer_config.model_config.exe_mode == "ge_graph"
-            self.enable_moe_mc2_dispatch = bool(_mc2_cfg)
+            default_mc2 = not (platform == "A2" and self.experts_per_rank > 24)
+            self.enable_moe_mc2_dispatch = bool(cp.get("enable_moe_mc2_dispatch", default_mc2))
 
         # Single FusedMoEGMM constructor that takes both tp and ep knobs;
         # FusedMoEGMM internally routes shard layout based on tp/ep sizes.
@@ -820,6 +757,12 @@ class LongcatFlashMoE(nn.Module):
         )
 
     def forward(self, hidden_states, is_prefill: bool = False):
+        """MoE forward — accepts and returns packed 2D ``(T, H)``.
+
+        The TP / EP-prefill / EP-decode paths all work on flat tokens
+        internally; callers (DecoderLayer) thread packed 2D throughout
+        so the entry / exit shape stays consistent.
+        """
         if self.use_ep:
             # Prefill: always double-routing AllToAll (unconstrained, every chip).
             # Decode: MC2 dispatch_v2/combine_v2 when enabled (A3 graph mode);
@@ -832,8 +775,9 @@ class LongcatFlashMoE(nn.Module):
     # ----- TP path (existing fast path: init_routing_v2 + GMM + finalize_routing) -----
 
     def _forward_tp(self, hidden_states):
-        batch_size, sequence_length, h = hidden_states.shape
-        hidden_states_2d = hidden_states.view(-1, h)
+        # ``hidden_states`` is packed 2D ``(T, H)``; the router does its own
+        # final view, all downstream ops are flat-token native.
+        hidden_states_2d = hidden_states
 
         # Step 1: Gating (fused softmax + bias + topk + scaling)
         topk_weight, topk_idx = self.router(hidden_states)
@@ -885,7 +829,7 @@ class LongcatFlashMoE(nn.Module):
         identity_weight = zero_expert_weight.sum(dim=1, keepdim=True).to(hidden_states.dtype)
         hidden_states = hidden_states + hidden_states_2d * identity_weight
 
-        return hidden_states.view(batch_size, sequence_length, h)
+        return hidden_states
 
     # ----- EP path: prefill (double-routing AllToAll) and decode (MC2 dispatch_v2) -----
 
@@ -901,8 +845,12 @@ class LongcatFlashMoE(nn.Module):
         identity_scale = identity_weights.sum(dim=-1, keepdim=True).to(hidden_states_2d.dtype)
         return hidden_states_2d * identity_scale
 
-    def _set_mc2_kwargs(self):
+    def set_mc2_kwargs(self):
         """Build kwargs for npu_moe_distribute_dispatch_v2 / combine_v2 (decode path).
+
+        Uses the independent ``moe_ep_group_mc2`` comm domain (framework allocates
+        a dedicated HCCL buffer for it) so MC2 dispatch / combine run on a
+        non-shared group, which is required by ``comm_alg=fullmesh_v2``.
 
         ``copy_expert_num`` exposes LongCat's identity (zero) experts to the op,
         which yields ``input * weight`` for IDs in
@@ -910,7 +858,7 @@ class LongcatFlashMoE(nn.Module):
         AllToAll hop.
         """
         global_rank = dist.get_rank()
-        ep_group_name = self.comm_manager.get_group_name("moe_ep_group_mc2")
+        mc2_group_name = self.comm_manager.get_group_name("moe_ep_group_mc2")
         copy_expert_num = self.zero_expert_num
         common = {
             "x_active_mask": None,
@@ -919,17 +867,17 @@ class LongcatFlashMoE(nn.Module):
             "shared_expert_rank_num": 0,
             "moe_expert_num": self.n_routed_experts,
             "global_bs": 0,
-            "group_ep": ep_group_name,
+            "group_ep": mc2_group_name,
             "ep_world_size": self.moe_ep_size,
             "ep_rank_id": global_rank // self.moe_tp_size,
-            "group_tp": ep_group_name,
+            "group_tp": mc2_group_name,
             "tp_world_size": self.moe_tp_size,
             "tp_rank_id": global_rank % self.moe_tp_size,
             "zero_expert_num": 0,
             "copy_expert_num": copy_expert_num,
             "const_expert_num": 0,
         }
-        self.dispatch_kwargs = {**common, "scales": None, "quant_mode": 0}
+        self.dispatch_kwargs = {**common, "scales": None, "quant_mode": 0, "comm_alg": "fullmesh_v2"}
         self.combine_kwargs = dict(common)
 
     def _dispatch_double_routing(self, tokens_per_expert, expanded_x):
@@ -957,8 +905,8 @@ class LongcatFlashMoE(nn.Module):
         return gathered_tokens
 
     def _forward_ep_prefill(self, hidden_states):
-        batch_size, sequence_length, h = hidden_states.shape
-        hidden_states_2d = hidden_states.view(-1, h)
+        # ``hidden_states`` is packed 2D ``(T, H)``.
+        hidden_states_2d = hidden_states
 
         # Gating
         topk_weight, topk_idx = self.router(hidden_states)
@@ -1016,18 +964,18 @@ class LongcatFlashMoE(nn.Module):
         )
 
         result = routed_output + identity_output
-        return result.view(batch_size, sequence_length, h)
+        return result
 
     def _forward_ep_decode(self, hidden_states):
-        batch_size, sequence_length, h = hidden_states.shape
-        hidden_states_2d = hidden_states.view(-1, h)
+        # ``hidden_states`` is packed 2D ``(T, H)``.
+        hidden_states_2d = hidden_states
 
         # Gating
         topk_weight, topk_idx = self.router(hidden_states)
         topk_idx = topk_idx.to(torch.int32)
 
         if self.dispatch_kwargs is None:
-            self._set_mc2_kwargs()
+            self.set_mc2_kwargs()
 
         dispatch_args = {
             "x": hidden_states_2d,
@@ -1055,7 +1003,7 @@ class LongcatFlashMoE(nn.Module):
             **self.combine_kwargs,
         }
         hidden_states_2d = torch_npu.npu_moe_distribute_combine_v2(**combine_args)
-        return hidden_states_2d.view(batch_size, sequence_length, h)
+        return hidden_states_2d
 
 
 # ---------------------------------------------------------------------------
@@ -1249,38 +1197,7 @@ class NgramEmbedding(nn.Module):
         self._vocab_mods_cache = vocab_mods
         return vocab_mods
 
-    def _shift_right_ignore_eos(self, tensor: torch.Tensor, n: int, eos_token_id: int = 2,
-                                 is_prefill: bool = False) -> torch.Tensor:
-        # Vectorized path is required when this runs inside the compiled graph
-        # (decode). For prefill (eager), the cummax-based path is much faster
-        # than the unrolled max-chain on long sequences.
-        if is_prefill:
-            return self._shift_right_ignore_eos_vectorized_eager(tensor, n, eos_token_id)
-        return self._shift_right_ignore_eos_vectorized(tensor, n, eos_token_id)
-
-    def _shift_right_ignore_eos_vectorized_eager(
-        self, tensor: torch.Tensor, n: int, eos_token_id: int
-    ) -> torch.Tensor:
-        """cummax-based variant. Used in eager mode (prefill); avoids the
-        Python-side O(S) maximum chain that the graph-friendly version uses."""
-        batch_size, seq_len = tensor.shape
-        device = tensor.device
-        is_eos = (tensor == eos_token_id)
-        pos = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
-        eos_at_prev = torch.cat(
-            [torch.zeros_like(is_eos[:, :1]), is_eos[:, :-1]], dim=-1
-        )
-        candidates = torch.where(eos_at_prev, pos, torch.full_like(pos, -1))
-        segment_start, _ = candidates.cummax(dim=-1)
-        segment_start = segment_start.clamp_min(0)
-
-        offset = pos - segment_start
-        valid = offset >= n
-        src_idx = (pos - n).clamp_min(0)
-        gathered = tensor.gather(dim=-1, index=src_idx)
-        return torch.where(valid, gathered, torch.zeros_like(tensor))
-
-    def _shift_right_ignore_eos_vectorized(self, tensor: torch.Tensor, n: int, eos_token_id: int) -> torch.Tensor:
+    def _shift_right_ignore_eos_unrolled(self, tensor: torch.Tensor, n: int, eos_token_id: int = 2) -> torch.Tensor:
         """Graph-capturable shift-right with EOS-aware segment boundaries.
 
         Semantics:
@@ -1347,15 +1264,64 @@ class NgramEmbedding(nn.Module):
             dist.all_reduce(embeds, group=self.comm_manager.get_group("embed_tp_group"))
         return embeds
 
-    def forward(self, input_ids: torch.Tensor, is_prefill: bool,
-                base_embeds: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        is_prefill: bool,
+        base_embeds: Optional[torch.Tensor] = None,
+        actual_seq_lengths_cu_q: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Packed-1D entry: ``input_ids`` is ``(T,)`` and ``base_embeds`` is
+        ``(T, H)``. Returns packed 2D ``(T, H)``.
+
+        Dispatches by ``is_prefill``:
+        - decode: each request is one token (T == B). Reshape to ``(B, 1)``
+          and run BSND under graph mode (shift-right needs a fixed-shape
+          unrolled max-chain because GE backend has no ``cummax``).
+        - prefill: cu_q-driven packed shift-right with combined EOS +
+          segment-start reset; ngram_context update via per-segment gather.
+          Stays in packed 1D end-to-end since prefill is eager and request
+          lengths can differ.
+        """
+        if not is_prefill:
+            # Decode: B is static (from ngram_context), reshape to (B, 1).
+            batch_size = self.ngram_context.shape[0]
+            input_ids_bsnd = input_ids.view(batch_size, 1)
+            base_embeds_bsnd = base_embeds.view(batch_size, 1, -1) if base_embeds is not None else None
+            out_bsnd = self._forward_bsnd_decode(input_ids_bsnd, base_embeds=base_embeds_bsnd)
+            return out_bsnd.view(-1, out_bsnd.shape[-1])
+
+        # Prefill: packed 1D end-to-end (variable-length-safe).
+        # Framework's ``actual_seq_lengths_cu_q`` is ``cumsum(seq_lens)``
+        # *without* a leading zero (so single-segment T=256 arrives as
+        # ``[256]``, not ``[0, 256]``). Normalise by prepending zero so the
+        # ``cu_q[1:] - cu_q[:-1]`` segment-length math is well-defined.
+        num_tokens = input_ids.shape[0]
+        device = input_ids.device
+        if actual_seq_lengths_cu_q is not None and actual_seq_lengths_cu_q.numel() > 0:
+            cu_q = actual_seq_lengths_cu_q.to(dtype=torch.long, device=device)
+            if int(cu_q[0].item()) != 0:
+                cu_q = torch.cat(
+                    [torch.zeros(1, dtype=cu_q.dtype, device=device), cu_q]
+                )
+        else:
+            cu_q = torch.tensor([0, num_tokens], dtype=torch.long, device=device)
+        return self._forward_prefill_packed(input_ids, base_embeds, cu_q)
+
+    def _forward_bsnd_decode(
+        self,
+        input_ids: torch.Tensor,
+        base_embeds: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """BSND decode forward — accepts ``(B, 1)`` input_ids. Used by the
+        packed 1D entry; decode-only because shift-right needs a fixed-shape
+        unrolled max-chain (GE graph backend has no ``cummax``).
+        Returns ``(B, 1, H)``.
+        """
         seq_len = input_ids.size(-1)
 
-        # Build context: in decode steps, prepend the cached n-1 prior tokens.
-        if is_prefill:
-            context = input_ids
-        else:
-            context = torch.cat([self.ngram_context[..., -(self.n - 1):], input_ids], dim=-1)
+        # Prepend the cached n-1 prior tokens to form the n-token context window.
+        context = torch.cat([self.ngram_context[..., -(self.n - 1):], input_ids], dim=-1)
 
         # Base embedding (from embed TP or direct lookup)
         if base_embeds is not None:
@@ -1367,9 +1333,8 @@ class NgramEmbedding(nn.Module):
 
         shifted_ids = {}
         for i in range(2, self.n + 1):
-            shifted_ids[i] = self._shift_right_ignore_eos(
+            shifted_ids[i] = self._shift_right_ignore_eos_unrolled(
                 context, i - 1, eos_token_id=self.config.eos_token_id,
-                is_prefill=is_prefill,
             )
 
         for i in range(2, self.n + 1):
@@ -1385,14 +1350,100 @@ class NgramEmbedding(nn.Module):
         x = x / (1 + self.k * (self.n - 1))
 
         # Update ngram context (in-place so torch.compile can capture the mutation)
-        if is_prefill:
-            self.ngram_context.copy_(input_ids[:, -(self.n - 1):])
-        else:
-            self.ngram_context.copy_(
-                torch.cat([self.ngram_context[:, 1:], input_ids], dim=-1)
-            )
+        self.ngram_context.copy_(
+            torch.cat([self.ngram_context[:, 1:], input_ids], dim=-1)
+        )
 
         return x
+
+    def _forward_prefill_packed(
+        self,
+        input_ids: torch.Tensor,
+        base_embeds: torch.Tensor,
+        cu_q: torch.Tensor,
+    ) -> torch.Tensor:
+        """Variable-length prefill — ``input_ids`` is ``(T,)`` 1D and
+        ``base_embeds`` is ``(T, H)`` 2D. ``cu_q`` is ``(B+1,)`` cumulative
+        offsets (with leading 0). Returns ``(T, H)``.
+        """
+        device = input_ids.device
+
+        # context == input_ids in prefill (no prepend).
+        context = input_ids
+
+        x = base_embeds.clone()
+        vocab_mods = self._precompute_vocab_mods()
+
+        # cu_q-aware shift-right: reset at EOS-at-prev AND segment-start.
+        shifted_ids = {}
+        for i in range(2, self.n + 1):
+            shifted_ids[i] = self._shift_right_ignore_eos_packed(
+                context,
+                shift_n=i - 1,
+                eos_token_id=self.config.eos_token_id,
+                cu_q=cu_q,
+            )
+
+        for i in range(2, self.n + 1):
+            for j in range(self.k):
+                index = (i - 2) * self.k + j
+                emb_vocab_dim = int(self.m + index * 2 + 1)
+                ngram_ids = self._get_ngram_ids(context, shifted_ids, vocab_mods[(i, j)], ngram=i)
+                new_ids = ngram_ids % emb_vocab_dim  # (T,) — no -seq_len trim needed (context == input)
+                x_ngram = self._lookup_embedding(self.embedders[index], new_ids, emb_vocab_dim)
+                x_proj = self.post_projs[index](x_ngram)
+                x = x + x_proj
+
+        x = x / (1 + self.k * (self.n - 1))
+
+        # ngram_context update: per-segment last (n-1) tokens via cu_q.
+        n_minus_1 = max(self.n - 1, 1)
+        batch_size = cu_q.shape[0] - 1
+        end_idx = cu_q[1:] - 1                                              # (batch_size,) last packed pos per segment
+        offsets = torch.arange(-n_minus_1 + 1, 1, device=device)            # (n-1,) [-(n-2), ..., 0]
+        gather_idx = end_idx.unsqueeze(1) + offsets.unsqueeze(0)            # (batch_size, n-1)
+        # clamp underflow (segment shorter than n-1) to that segment's start
+        gather_idx = torch.maximum(gather_idx, cu_q[:-1].unsqueeze(1))
+        new_context = input_ids[gather_idx.view(-1)].view(batch_size, n_minus_1)
+        self.ngram_context.copy_(new_context)
+
+        return x
+
+    def _shift_right_ignore_eos_packed(
+        self,
+        input_ids: torch.Tensor,
+        shift_n: int,
+        eos_token_id: int,
+        cu_q: torch.Tensor,
+    ) -> torch.Tensor:
+        """Shift-right by ``shift_n`` over packed 1D with combined reset.
+
+        Reset happens at (a) each segment start derived from ``cu_q`` and
+        (b) right after every EOS within a segment. Runs in prefill (eager) only.
+        """
+        num_tokens = input_ids.shape[0]
+        device = input_ids.device
+
+        is_eos = (input_ids == eos_token_id)                                # (num_tokens,)
+        is_eos_at_prev = torch.cat(
+            [torch.zeros(1, dtype=torch.bool, device=device), is_eos[:-1]]
+        )                                                                   # (num_tokens,)
+
+        is_seg_start = torch.zeros(num_tokens, dtype=torch.bool, device=device)
+        is_seg_start[cu_q[:-1]] = True
+
+        is_reset = is_seg_start | is_eos_at_prev                            # (num_tokens,)
+
+        pos = torch.arange(num_tokens, device=device)
+        candidates = torch.where(is_reset, pos, torch.full_like(pos, -1))
+        segment_start, _ = candidates.cummax(dim=0)
+        segment_start = segment_start.clamp_min(0)
+
+        offset = pos - segment_start
+        shift_mask = offset >= shift_n
+        src_idx = (pos - shift_n).clamp_min(0)
+        gathered = input_ids.gather(0, src_idx)
+        return torch.where(shift_mask, gathered, torch.zeros_like(input_ids))
 
 
 # ---------------------------------------------------------------------------
@@ -1407,9 +1458,6 @@ class LongcatFlashNgramModel(nn.Module):
         self.comm_manager = comm_manager
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
-        # Static per-rank batch size used by the BSND shim in forward() to
-        # reshape framework's packed 1D input back to (B, S).
-        self.batch_size_per_dp_rank = infer_config.scheduler_config.batch_size_per_dp_rank
 
         self.embed_tp_size = infer_config.parallel_config.embed_tp_size
         self.embed_tp_rank = (
@@ -1418,6 +1466,15 @@ class LongcatFlashNgramModel(nn.Module):
             else 0
         )
         self.vocab_size_per_rank = self.vocab_size // self.embed_tp_size
+
+        self.attn_tp_size = infer_config.parallel_config.attn_tp_size
+        self.attn_dp_size = infer_config.parallel_config.attn_dp_size
+        self.attn_tp_rank = (
+            (dist.get_rank() % self.attn_tp_size)
+            if (self.attn_tp_size > 1 and dist.is_initialized())
+            else 0
+        )
+        self.is_sp = self.attn_tp_size > 1 and self.attn_dp_size > 1
 
         self.embed_tokens = VocabParallelEmbedding(
             self.vocab_size,
@@ -1484,22 +1541,31 @@ class LongcatFlashNgramModel(nn.Module):
     ):
         is_prefill = forward_metadata.is_prefill
 
-        # Reshape framework's packed 1D input back to the model's [B, S] BSND
-        # layout. Decode delivers [B] (one token per request); prefill delivers
-        # [T] = [sum of per-request prompt lengths]. Offline batches in this
-        # repo run with equal-length prompts, so view(batch_size, -1) is exact.
-        # Truly variable-length packing (continuous batching) would need TND
-        # attention plumbed end-to-end and is out of scope for this entry.
-        if input_ids.ndim == 1:
-            batch_size = self.batch_size_per_dp_rank
-            if is_prefill:
-                input_ids = input_ids.view(batch_size, -1)
-                position_ids = position_ids.view(batch_size, -1)
-            else:
-                input_ids = input_ids.view(batch_size, 1)
-                position_ids = position_ids.view(batch_size, 1)
+        # ``input_ids`` and ``position_ids`` are framework-packed 1D ``(T,)``;
+        # the model now consumes them as-is throughout. NgramEmbedding picks
+        # the equal-length fast path or the cu_q-driven variable-length slow
+        # path internally.
+        if input_ids.ndim != 1:
+            input_ids = input_ids.view(-1)
+        if position_ids.ndim != 1:
+            position_ids = position_ids.view(-1)
 
-        # Embedding with TP support
+        # SP-pad is applied AFTER embed + ngram_embeddings (both expect T_real
+        # input_ids). qwen3_moe convention: only pad input embed_outputs for the
+        # per-rank scatter; position_ids stays T_real so rotary_emb returns
+        # T_real cos/sin (MLA prefill consumes them after gather + slice-back).
+        sp_prefill = self.is_sp and is_prefill
+        t_real = input_ids.shape[0]
+        if sp_prefill:
+            t_padded = (
+                (t_real + self.attn_tp_size - 1) // self.attn_tp_size
+            ) * self.attn_tp_size
+            pad_len = t_padded - t_real
+        else:
+            pad_len = 0
+
+        # Embedding with TP support — operates element-wise on 1D ids, returns
+        # packed 2D ``(T, H)``.
         if self.embed_tp_size > 1:
             new_input_ids = input_ids - self.embed_tp_rank * self.vocab_size_per_rank
             mask = (new_input_ids >= 0) & (new_input_ids < self.vocab_size_per_rank)
@@ -1510,12 +1576,31 @@ class LongcatFlashNgramModel(nn.Module):
             base_embeds = self.embed_tokens(input_ids)
 
         if self.ngram_embeddings is not None:
-            inputs_embeds = self.ngram_embeddings(input_ids, is_prefill=is_prefill, base_embeds=base_embeds)
+            inputs_embeds = self.ngram_embeddings(
+                input_ids,
+                is_prefill=is_prefill,
+                base_embeds=base_embeds,
+                actual_seq_lengths_cu_q=forward_metadata.actual_seq_lengths_cu_q,
+            )
         else:
             inputs_embeds = base_embeds
 
+        # hidden_states is packed 2D (T, H) end-to-end from here.
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
+
+        if sp_prefill and pad_len > 0:
+            # Pad T_real -> T_padded along T dim so scatter math works.
+            h_pad = torch.zeros(
+                pad_len, hidden_states.shape[-1],
+                dtype=hidden_states.dtype, device=hidden_states.device,
+            )
+            hidden_states = torch.cat([hidden_states, h_pad], dim=0)
+
+        if sp_prefill:
+            tokens_per_rank = hidden_states.shape[0] // self.attn_tp_size
+            start = self.attn_tp_rank * tokens_per_rank
+            hidden_states = hidden_states[start:start + tokens_per_rank].contiguous()
 
         for i, decoder_layer in enumerate(self.layers):
             hidden_states = decoder_layer(
@@ -1524,21 +1609,35 @@ class LongcatFlashNgramModel(nn.Module):
                 forward_metadata=forward_metadata,
             )
 
+        # norm + last-token gather run on packed 2D (T, H).
         hidden_states = self.norm(hidden_states)
-        if hidden_states.size(1) > 1:
-            # Prefill: take the last hidden state per request. Read the
-            # per-request query lengths from forward_metadata (packed-1D
-            # friendly) instead of max(position_ids), which silently breaks
-            # if pad positions are not strictly less than real positions.
-            # Aligned with deepseek_r1's packed lm_head last-token pattern.
-            actual_seq_lens = forward_metadata.actual_seq_lengths_q.to(
+        if forward_metadata.is_prefill:
+            if sp_prefill:
+                t_local, h_dim = hidden_states.shape
+                t_full = t_local * self.attn_tp_size
+                full = torch.empty(
+                    t_full, h_dim,
+                    dtype=hidden_states.dtype, device=hidden_states.device,
+                )
+                dist.all_gather_into_tensor(
+                    full, hidden_states.contiguous(),
+                    group=self.comm_manager.get_group("attn_tp_group"),
+                )
+                hidden_states = full
+
+            # Prefill: select the last hidden state of each segment via
+            # cumulative q-lengths (cu_q[i] is the end offset of segment i,
+            # so cu_q[i]-1 is the last token's index in packed [T] order).
+            cu_q = forward_metadata.actual_seq_lengths_cu_q.to(
                 dtype=torch.long, device=hidden_states.device
             )
-            gather_index = (actual_seq_lens - 1).view(-1, 1, 1).expand(
-                -1, 1, hidden_states.shape[-1]
-            )
-            hidden_states = torch.gather(hidden_states, 1, gather_index)
-        return hidden_states
+            hidden_states = torch.index_select(hidden_states, 0, cu_q - 1)
+        # Decode: every token is already its segment's last; no gather needed.
+
+        # Reshape to (B, 1, H) so the downstream lm_head + framework
+        # `logits[:, -1:, :]` slicing keep working without changes.
+        # (B equals num requests for prefill; equals batch_size for decode.)
+        return hidden_states.view(hidden_states.shape[0], 1, hidden_states.shape[-1])
 
 
 # ---------------------------------------------------------------------------
@@ -1560,6 +1659,15 @@ class LongcatFlashNgramForCausalLM(nn.Module):
         self.infer_config = infer_config
         self.comm_manager = comm_manager
 
+        # Framework EPLB hook reads these directly off the ForCausalLM instance.
+        self.num_experts = config.n_routed_experts
+        self.num_experts_per_tok = config.moe_topk
+
+        # PA block size: single source of truth for get_cache_info and the MLA
+        # sublayers (both must agree with the framework's block allocator).
+        self.block_size = infer_config.scheduler_config.block_size
+
+        # Parallel sizes consumed by init_parallel_comm_group() below.
         self.world_size = infer_config.parallel_config.world_size
         self.attn_tp_size = infer_config.parallel_config.attn_tp_size
         self.dense_tp_size = infer_config.parallel_config.dense_tp_size
@@ -1676,16 +1784,15 @@ class LongcatFlashNgramForCausalLM(nn.Module):
 
 
     def _forward_lm_head(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """LM head with all_gather_into_tensor (graph-safe).
-
-        all_gather_into_tensor concatenates along dim 0. Since lm_head is
-        ColumnParallel (split on vocab dim, i.e. last dim), we gather into
-        (tp*B, S, V/tp) then reshape/permute to (B, S, V).
+        """LM head: (B, 1, H) → (B, 1, V) via all_gather over column-parallel
+        vocab shards. NgramModel.forward emits the BSND wrap (S=1) right
+        after the last-token gather so this path keeps the framework's
+        ``logits[:, -1:, :]`` sampler slicing unchanged.
         """
         logits = self.lm_head(hidden_states)
         if self.lmhead_tp_size > 1:
             tp = self.lmhead_tp_size
-            # Gather: each rank has (B, S, V/tp) -> concatenated as (tp*B, S, V/tp)
+            # each rank: (B, 1, V/tp); gather along dim 0 → (tp*B, 1, V/tp)
             gathered = torch.empty(
                 [logits.shape[0] * tp, *logits.shape[1:]],
                 dtype=logits.dtype, device=logits.device,
@@ -1694,7 +1801,6 @@ class LongcatFlashNgramForCausalLM(nn.Module):
                 gathered, logits,
                 group=self.comm_manager.get_group("lmhead_tp_group"),
             )
-            # Reshape to reconstruct full vocab: (tp, B, S, V/tp) -> (B, S, tp, V/tp) -> (B, S, V)
             bsz = logits.shape[0]
             logits = gathered.view(tp, bsz, *logits.shape[1:]).permute(1, 2, 0, 3).reshape(
                 bsz, logits.shape[1], -1
@@ -1711,16 +1817,16 @@ class LongcatFlashNgramForCausalLM(nn.Module):
             if isinstance(module, LongcatFlashMLA):
                 module.init_absorb_weights()
 
-        # enable_weight_nz is a top-level ModelConfig field (yaml: model_config.enable_weight_nz),
-        # not a custom_params entry — kept aligned with deepseek_r1's direct attribute read.
+        # enable_weight_nz is a top-level ModelConfig field
+        # (yaml: model_config.enable_weight_nz), not a custom_params entry.
         enable_weight_nz = self.infer_config.model_config.enable_weight_nz
         for _, module in self.named_modules():
             quant_method = getattr(module, "quant_method", None)
             if quant_method is not None:
                 quant_method.process_weights_after_loading(module, is_nz=enable_weight_nz)
 
-        # Build prolog NZ-format weights (no-op when enable_mla_prolog is False)
-        # and mark absorb weights as static for graph mode.
+        # Build prolog NZ-format weights and mark absorb weights as static
+        # for graph mode.
         for module in self.modules():
             if isinstance(module, LongcatFlashMLA):
                 module.prepare_prolog_weights(enable_nz=enable_weight_nz)
@@ -1733,6 +1839,22 @@ class LongcatFlashNgramForCausalLM(nn.Module):
                     _mark_static(module.weight_dq_prolog)
                 if module.weight_dkv_kr_prolog is not None:
                     _mark_static(module.weight_dkv_kr_prolog)
+
+        # Eagerly prepare MC2 dispatch_v2/combine_v2 kwargs for every MoE module
+        # that will use them. Doing this here — after HCCL groups are up but
+        # before the first forward — avoids paying the kwargs-build cost inside
+        # the traced decode region (where it would otherwise fire a graph guard
+        # miss on the first decode step).
+        for module in self.modules():
+            if not isinstance(module, LongcatFlashMoE):
+                continue
+            if not getattr(module, "use_ep", False):
+                continue
+            if not getattr(module, "enable_moe_mc2_dispatch", False):
+                continue
+            if module.dispatch_kwargs is not None:
+                continue
+            module.set_mc2_kwargs()
 
         # Resize ngram rolling-window buffer to actual batch_size now that the model
         # is on its target device. Cache tensors themselves are allocated later by
@@ -1754,6 +1876,10 @@ class LongcatFlashNgramForCausalLM(nn.Module):
         ModelCacheInfo, sizes the block pool, and binds the allocated tensors
         back via each entry's `tensor_setter`.
         """
+        # LongCat-Lite has 2 MLA sublayers per LongcatFlashDecoderLayer (dual
+        # MLA, ModuleList of 2). We flatten to 28 cache entries spanning
+        # 14 logical layers × 2 sublayers — the flat layer_idx becomes the
+        # canonical key the framework hashes for PD prefix-cache lookup.
         layer_infos = []
         layer_idx = 0
         for layer in self.model.layers:
@@ -1764,8 +1890,9 @@ class LongcatFlashNgramForCausalLM(nn.Module):
                 layer_idx += 1
         return ModelCacheInfo(
             num_layers=layer_idx,
-            block_size=PA_BLOCK_SIZE,
+            block_size=self.block_size,
             layer_infos=layer_infos,
+            is_mla_backend=True,
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set:

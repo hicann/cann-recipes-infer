@@ -1,26 +1,26 @@
 <!-- 本文件禁止全文加载（Read）。需要历史信息时请用 Grep 按关键字查找。 -->
 # 进度历史归档
 
-> **最终验证数据（`infer.sh offline longcat_flash_lite_rank_8_8tp.yaml` 3 轮实测）**
+> **最终验证数据（`executor/scripts/infer.sh --model longcat_flash_lite --yaml longcat_flash_lite_rank_8_8tp.yaml`，3 轮实测）**
 > | 阶段 | Prefill (ms) | Decode (ms) | 吞吐 (tok/s) | NPU 显存 (MB) | Decode 较基线 |
 > |------|-------------|------------|-------------|--------------|-------------|
 > | 基线 | 2580 | 273 | 3.66 | - | - |
-> | Phase 1 (KVCache+FA) | 2540 | 267 | 4.58 | 20140 | -2.2% |
-> | Phase 2 (融合算子) | 105 | 92 | 10.93 | 17340 | -66.3% |
-> | Phase 3 (图模式) | 107 | 18.5 | 54.5 | 17448 | -93.2% |
-> | Phase 3.5 (NgramEmbedding 进图) | 106 | **7.14** | 140 | 17040 | **-97.4%** |
+> | 阶段 1（KVCache + FA） | 2540 | 267 | 4.58 | 20140 | −2.2% |
+> | 阶段 2（融合算子） | 105 | 92 | 10.93 | 17340 | −66.3% |
+> | 阶段 3（图模式） | 107 | 18.5 | 54.5 | 17448 | −93.2% |
+> | 阶段 3.5（N-gram Embedding 进图） | 106 | **7.14** | 140 | 17040 | **−97.4%** |
 >
 > 以下归档记录为各阶段工作过程中的中间数据，最终性能以上表为准。
 >
-> **Atlas A3 平台同代码实测对比**：
+> **A3（Atlas A3 / Ascend 910_93，64 GB HBM）平台同代码实测对比**：
 > | 阶段 | Prefill (ms) | Decode (ms/tok) | 吞吐 (tok/s) | A3 vs A2 |
 > |------|-------------|----------------|-------------|---------|
-> | Phase 3 (Ngram 在 eager) | 57.12 | 12.01 | 83.9 | prefill −47%, decode −35% |
-> | Phase 3.5 (Ngram 进图) | ~62 | **5.86** | ~170 | prefill −42%, decode −18% |
+> | 阶段 3（N-gram 在 eager） | 57.12 | 12.01 | 83.9 | prefill −47%, decode −35% |
+> | 阶段 3.5（N-gram 进图） | ~62 | **5.86** | ~170 | prefill −42%, decode −18% |
 >
-> A3 端到端结论：**Ngram 进图收益在 A3 上仍然显著（decode -51%）**，绝对值从 12.01ms → 5.86ms。
+> A3 端到端结论：N-gram Embedding 进图在 A3 上 Decode 收益约 −51%，绝对值由 12.01 ms 降至 5.86 ms。
 
-## 常驻区快照（Phase 0）
+## 常驻区快照
 
 ## 模型信息
 
@@ -84,8 +84,6 @@ VocabParallelEmbedding (vocab=131072, dim=3072, TP-split)
 - `v_head_dim`: 128
 - `num_attention_heads`: 32
 - `mla_scale_q_lora`: true, `mla_scale_kv_lora`: true -- 启用 LoRA 缩放因子
-- Q 缩放因子: sqrt(hidden_size / q_lora_rank) = sqrt(3072/1536) = sqrt(2)
-- KV 缩放因子: sqrt(hidden_size / kv_lora_rank) = sqrt(3072/512) = sqrt(6)
 
 KV Cache 存储为展开后的 (num_heads_per_rank, qk_head_dim) 和 (num_heads_per_rank, v_head_dim)，未使用 MLA 压缩缓存。
 
@@ -134,12 +132,13 @@ KV Cache 存储为展开后的 (num_heads_per_rank, qk_head_dim) 和 (num_heads_
 
 | 项目 | 值 |
 |------|-----|
-| 硬件平台 | Atlas A2 / A3，8 卡 |
+| 硬件平台 | 8 × Ascend 910B4（32 GB HBM each） |
+| CANN Toolkit | 本机 CANN 安装路径 |
 | PyTorch | 2.8.0 |
 | torch_npu | 2.8.0.post2 |
-| transformers | 5.0.0 |
+| transformers | 4.55.0 |
 | 执行模式 | eager |
-| 量化模式 | BF16 (无量化) |
+| 量化模式 | BF16（无量化） |
 
 **YAML 配置 (longcat_flash_lite_rank_8_8tp.yaml)**:
 - world_size: 8
@@ -197,12 +196,17 @@ The **compatibility function**
 ## 进度概览
 | 阶段 | 结论 | 性能变化 |
 |------|------|---------|
-| Phase 0 | 分析完成 | 基线已记录: Prefill ~2400ms, Decode ~273ms/token |
-| Phase 1 | **PASS** -- 精度完全匹配, 性能持平 | Prefill ~2487ms (+3.6%), Decode ~273ms (持平), KVCache 显存 -55% |
+| 阶段 0 | 分析完成 | 基线已记录：Prefill ~2400 ms，Decode ~273 ms/token |
+| 阶段 1 | PASS — 精度完全匹配，性能持平 | Prefill ~2487 ms（+3.6%），Decode ~273 ms（持平），KVCache 显存 −55% |
+| 阶段 2 | PASS — 精度逐字匹配，融合算子全量替换 | Prefill ~105 ms（−95.9%），Decode ~92 ms（−66.3%） |
+| 阶段 3 | PASS — GE 图整图编译 + 精度修复 | Prefill ~105 ms，Decode ~18.1 ms（−93.4%） |
+| 阶段 3.5 | PASS — N-gram Embedding 入图 | Decode 7.14 ms（−97.4%），吞吐 140 tok/s |
 
+<!-- ===== 以上为常驻区，不清除 ===== -->
+
+<!-- ===== 以下为工作区，阶段推进时归档 ===== -->
 
 ---
-## 归档于 2026-03-28
 
 ## 阶段 1：KVCache + FA 分析
 
@@ -257,7 +261,7 @@ The **compatibility function**
 2. 该 layout 下 Q 为 `(B, S, N, D)`，KV cache 为 `(N, B_blocks, S_block, D)` 的 NZ 格式
 3. 与 `npu_kv_rmsnorm_rope_cache` 的 `cache_mode="PA_NZ"` 输出格式天然匹配
 
-备选方案：若不使用 KVP（当前 TP8 场景下 KVP 可能不需要），也可使用 `TND_NTD` layout（kimi-k2 方案），Q 为 `(T, N, D)` flattened batch，KV cache 为 NZ 格式。
+如不使用 KVP（当前 TP=8 场景下 KVP 通常不需要），可改用 `TND_NTD` layout（kimi-k2 方案），Q 为 `(T, N, D)` flattened batch，KV cache 为 NZ 格式。
 
 #### sparse_mode 配置
 
@@ -491,7 +495,6 @@ The **compatibility function**
 
 
 ---
-## 归档于 2026-03-30（阶段 2）
 
 ## 阶段 2：融合算子分析
 
@@ -702,9 +705,9 @@ def forward(self, x):
 
 | 模块 | 跳过理由 |
 |------|---------|
-| Q RoPE (npu_interleave_rope) | 阶段 1 已完成替换 |
-| KV RMSNorm + RoPE + Cache (npu_kv_rmsnorm_rope_cache) | 阶段 1 已完成替换 |
-| FA (npu_fused_infer_attention_score) | 阶段 1 已完成替换 |
+| Q RoPE (npu_interleave_rope) | 阶段 1 已替换 |
+| KV RMSNorm + RoPE + Cache (npu_kv_rmsnorm_rope_cache) | 阶段 1 已替换 |
+| FA (npu_fused_infer_attention_score) | 阶段 1 已替换 |
 | kv_a_layernorm | 已被 npu_kv_rmsnorm_rope_cache 内部融合 |
 | Absorb matmul (Q/V absorb) | 标准 torch.matmul，无更优融合算子，后续图模式可自动优化 |
 | Embedding lookup | 非计算密集型，无适用融合算子 |
@@ -744,7 +747,7 @@ def forward(self, x):
 
 ## 阶段 2 实施记录
 
-### 已完成的改造
+### 改造内容
 
 #### 1. RMSNorm 全量替换 + Residual 融合
 - **LongcatFlashRMSNorm.forward** 重写为多分支：
@@ -788,10 +791,6 @@ def forward(self, x):
 - 新增：`MergedColumnParallelLinear`（from module.linear）
 - 新增：`FusedMoEGMM`（from module.fuse_moe_gmm）
 - 删除：`defaultdict`（不再需要）
-
-### 待验证
-- [x] 精度验证：与阶段 1 基线对比输出
-- [x] 性能验证：Prefill/Decode 性能测试
 
 ## 阶段 2 验证结果
 
@@ -859,7 +858,6 @@ The **compatibility function**
 
 
 ---
-## 归档于 2026-03-30（阶段 3）
 
 ## 阶段 3：图模式适配分析
 
@@ -1122,9 +1120,9 @@ logits = output_logits
 验证过程中发现并修复了以下问题：
 
 #### 问题 1：support_models.py 导入路径未更新
-- **现象**：推理时加载的是原始模型代码，而非优化模型
-- **原因**：`executor/core/entrypoints/support_models.py` 中导入路径未指向优化模型实现
-- **修复**：更新导入路径到优化模型模块
+- **现象**：推理时加载的是仓库主目录的原始模型代码，而非本次优化的修改版本
+- **原因**：`executor/core/entrypoints/support_models.py` 中导入路径指向原始模型
+- **修复**：更新导入路径指向优化后的模型实现
 
 #### 问题 2：_init_absorb_weights 中 .view() 失败
 - **现象**：`RuntimeError: view size is not compatible with input tensor's size and stride`
@@ -1168,7 +1166,7 @@ logits = output_logits
 | 输出一致性（图模式 vs 基线） | **FAIL** | 图模式输出为乱码。但 eager 模式（同一优化代码）输出同样为乱码，说明精度问题来源于阶段 1/2 的模型优化（KVCache PA 重构 / FA 算子替换 / 融合算子替换），非阶段 3 图模式引入 |
 | 图模式 vs eager 模式一致性 | N/A | 两者输出均不正确，无法直接对比。但图编译成功且运行无报错，表明图模式适配本身是正确的 |
 
-原始模型测试输出（正确）：
+原始模型（`longcat_flash_lite`）测试输出（正确）：
 ```
 computed as a weighted sum of the values, where the weight assigned to each value is computed by a compatibility function of the query with the corresponding key. Can you explain this in simpler terms?
 Sure! Let's break it down in simpler terms: ...
@@ -1201,7 +1199,7 @@ Sure! Let's break it down in simpler terms: ...
 
 | 文件 | 修改 | 原因 |
 |------|------|------|
-| `executor/core/entrypoints/support_models.py` | 修正导入路径到优化模型模块 | 否则加载的是未优化的原始模型 |
+| `executor/core/entrypoints/support_models.py` | 修正导入路径指向本次改造的模型实现 | 否则加载的是未优化的原始模型 |
 | `models/.../modeling_longcat_flash_lite.py` L240 | `self.kv_b_proj.weight.T` 后添加 `.contiguous()` | `.T` 产生非连续张量，`.view()` 失败 |
 | `models/.../modeling_longcat_flash_lite.py` L317,418 | `slot_mapping.view(-1).to(torch.int64)` | `npu_kv_rmsnorm_rope_cache` 要求 index 为 int64 |
 | `models/.../modeling_longcat_flash_lite.py` L604-612 | MoE 布尔掩码索引赋值改为乘法掩码 | GE graph 不支持 `tensor[bool_mask] = value` |
@@ -1234,7 +1232,7 @@ Sure! Let's break it down in simpler terms: ...
 
 **现象**：Eager 和图模式下 decode 输出均为乱码。
 
-**分析**：对比 longcat-flash 参考实现（`models/longcat-flash/models/modeling_longcat_flash.py` L936-938），decode absorb 模式下，PA cache 在传入 FA 前需要乘以 `mla_scale_kv_lora`（即 `sqrt(hidden_size / kv_lora_rank) = sqrt(6)`）。缺失此缩放导致 attention 权重分布和输出值均严重偏差。
+**分析**：对比 longcat-flash 参考实现（`models/longcat-flash/models/modeling_longcat_flash.py` L936-938），decode absorb 模式下，PA cache 在传入 FA 前需要乘以 `mla_scale_kv_lora`。缺失此缩放导致 attention 权重分布和输出值均严重偏差。
 
 参考实现关键代码：
 ```python
@@ -1332,124 +1330,23 @@ attn_output, _ = self.fa_ops.npu_fused_infer_attention_score(...)
 
 ---
 
-## 修复后验证（第 1 轮）
+## 精度修复全过程
 
-### 精度验证
-| 验证项 | 结果 | 详情 |
-|--------|------|------|
-| 首 token 正确性 | **FAIL** | 期望 "computed"，实际 "潍坊"（ge_graph）/ "潍坊" 重复（eager） |
-| Decode 连贯性 | **FAIL** | ge_graph 输出 "潍坊. The a priori of the a, so the aX..."，有英文结构但无意义 |
-| eager 模式对比 | **FAIL** | eager 模式输出 "潍坊" 无限重复（128 tokens），比 ge_graph 更差 |
-| 与基线匹配 | **FAIL** | 基线："computed as a weighted sum..."；实际输出完全不匹配 |
-| mla_scale_kv_lora 修复效果 | 部分有效 | ge_graph 输出从纯乱码改善为部分结构化英文，但 eager 模式仍为纯重复乱码 |
+初轮验证暴露 eager 和 ge_graph 输出均为乱码，逐步定位并修复 4 个根因，最终精度逐字对齐：
 
-**Eager 模式实际输出**（全部 128 tokens）:
-```
-潍坊潍坊潍坊潍坊潍坊潍坊潍坊潍坊... (重复 128 次)
-```
+| # | 根因 | 修复 |
+|---|------|------|
+| 1 | Decode absorb 路径漏掉 `mla_scale_kv_lora` 缩放（PA cache 在传入 FA 前应乘缩放因子） | `_forward_decode` 内对 `cache_nope_nz` 应用 `* self.mla_scale_kv_lora`，与 longcat-flash 参考一致 |
+| 2 | `_forward_prefill` 中 FA `NTD_TND` 布局输出实际为 `TND`，原代码 `.permute(1, 0, 2).reshape(...)` 导致 head / token 维度交叉混乱 | 移除 permute，直接对 TND 输出 `.reshape(batch_size, seq_length, -1)` |
+| 3 | `actual_seq_lengths_kv` 在 ge_graph 下转 list 导致每步重编译（list 元素值变化触发 dynamo guard） | ge_graph 模式保持 Tensor，使用 `tng.ops.npu_fused_infer_attention_score`（其 schema 支持 Tensor），`dynamic=False`；`acl_graph` 模式仍转 list |
+| 4 | GE 图模式 KVCache 数据流断链：`npu_kv_rmsnorm_rope_cache` 原地写入 `self.cache_*`，后续直接 `self.cache_*` view 在图编译时看到旧值 | 改用算子返回值 `updated_rope_cache` / `updated_nope_cache` 作为下游输入；移除 `init_pa_cache` 对 `cache_nope` / `cache_rope` 的 `mark_static`，保留 `block_table` 的 `mark_static` |
 
-**GE_graph 模式实际输出**:
-```
-潍坊. The a priori of the a, so the aX, a, a is the a priori, a priori of the a is the user is the a priori, the aX. The a priori of course is the a is the user. The a priori of the a non-TB's be considered a priori be a non-m, then the system of course of course of course is the a non-nationally, the a non is a non, respectively, then the system is a non-right is the M. of the M.
-```
+### 最终验证（model-reviewer 独立确认）
 
-### 性能验证
-| 指标 | 原始基线 | 阶段 2 后 | 阶段 3 后 (ge_graph) | 本阶段增量 (vs 阶段 2) | 累计变化 (vs 基线) |
-|------|---------|----------|---------------------|----------------------|-------------------|
-| Prefill (post-warmup) | ~2400 ms | ~2388 ms | 105.78 ms | 注: prefill 含热缓存效应 | 注: 不可直接对比 |
-| Decode avg | ~273 ms | ~270 ms | 18.06 ms | -252 ms (-93.3%) | -255 ms (-93.4%) |
-| Decode min | ~260 ms | N/A | 17.26 ms | -- | -243 ms (-93.4%) |
-| Decode max | ~326 ms | N/A | 22.02 ms | -- | -304 ms (-93.2%) |
-| Warmup 图编译 | N/A | N/A | ~82s (首次) | 正常的 GE 图编译开销 | -- |
-| 重编译 | N/A | N/A | 无 | **修复成功** | -- |
-| recompile_limit 崩溃 | N/A | N/A | 无 | **修复成功** | -- |
-
-### 重编译检查
-- Decode 每步耗时稳定在 17.26~22.02ms 范围内
-- 无 ~36s 的重编译步骤出现
-- 无 `recompile_limit` 崩溃
-- `dynamic=False` + Tensor 类型 `actual_seq_lengths_kv` + `tng.ops` FA 组合方案有效
-
-### 验证结论
-**FAIL** -- 重编译修复验证通过（性能优异，decode ~18ms/token），但精度问题未解决。
-
-**重编译修复**：PASS
-- `tng.ops.npu_fused_infer_attention_score` 正确接受 Tensor 类型 `actual_seq_lengths_kv`
-- `dynamic=False` 静态图编译正常工作
-- 无重编译，无崩溃
-
-**精度修复（第 2 轮）**：PASS（eager 模式精度已修复）
-
-根因定位与修复：
-- **根因**：`_forward_prefill` 中 FA 输出的 reshape 逻辑错误
-- FA 使用 `NTD_TND` 布局，但其输出实际为 **TND** 格式 `(T, N, v_head_dim)`，而非之前假设的 NTD `(N, T, v_head_dim)`
-- 原代码错误地执行了 `.permute(1, 0, 2).reshape(batch_size, seq_length, -1)`，将 TND 先转为 NTD 再 reshape，导致 head 维度和 token 维度交叉混乱
-- **修复**：移除 `.permute(1, 0, 2)`，直接对 TND 输出执行 `.reshape(batch_size, seq_length, -1)` 即可正确得到 `(B, S, N*v_head_dim)`
-
-验证结果：
-- eager 模式输出与期望完全一致："computed as a weighted sum of the values, where the weight assigned to each value is computed by a compatibility function of the query with the corresponding key..."
-- ge_graph 模式输出部分正确但后期退化，可能存在图编译相关的额外精度问题，待后续排查
-- Decode 性能：17-18ms/token（ge_graph 模式）
-
-## 修复后验证（第 2 轮）
-
-### eager 模式精度验证
-| 验证项 | 结果 | 详情 |
-|--------|------|------|
-| Prefill 首 token | PASS | token=20724 (' computed')，与基线一致 |
-| 前 3 token | PASS | ' computed' / ' as' / ' a'，与基线完全匹配 |
-| 完整 128 token 输出 | PASS | 输出与基线逐字匹配：" computed as a weighted sum of the values, where the weight assigned to each value is computed by a compatibility function of the query with the corresponding key. Can you explain this in simpler terms?\nSure! Let's break it down in simpler terms:..." 直至 "The **compatibility function**"，与基线完全一致 |
-| 重编译/崩溃 | N/A | eager 模式无图编译 |
-
-### ge_graph 模式精度验证
-| 验证项 | 结果 | 详情 |
-|--------|------|------|
-| Prefill 首 token | PASS | token=20724 (' computed')，与基线一致 |
-| 前 3 token | PASS | ' computed' / ' as' / ' a'，与基线一致 |
-| 前 6 token | PASS | " computed as a weighted sum of the"，与基线一致 |
-| 第 7 token 起 | FAIL | 基线为 "values, where the weight..."，ge_graph 输出为 "self-attention function is computed as a weighted sum_{key=0, values..."，从第 7 个 token 开始退化 |
-| 完整 128 token 输出 | FAIL | 输出严重退化，出现乱码式内容如 "sum_{key=0"、"翻译成"、重复 "is a function" 等 |
-| 重编译 | PASS | 无重编译，decode 耗时稳定在 17~22ms |
-| 崩溃 | PASS | 无 recompile_limit 崩溃 |
-
-### 性能验证
-| 指标 | 原始基线 | 阶段 2 后 | eager 模式 | ge_graph 模式 | 累计变化 (ge_graph vs 基线) |
-|------|---------|----------|-----------|--------------|---------------------------|
-| Prefill (post-warmup) | ~2400 ms | ~2388 ms | 106.39 ms | 103.75 ms | -2296 ms (-95.7%) |
-| Decode avg | ~273 ms | ~270 ms | 92.31 ms | 17.88 ms | -255 ms (-93.5%) |
-| Decode min | ~260 ms | N/A | 87.12 ms | 17.03 ms | -243 ms (-93.4%) |
-| Decode max | ~326 ms | N/A | 109.94 ms | 22.65 ms | -303 ms (-93.1%) |
-| Warmup 图编译 | N/A | N/A | N/A | ~82s (首次) | 正常 GE 图编译开销 |
-| 重编译 | N/A | N/A | N/A | 无 | 修复成功 |
-
-### 验证结论（第 2 轮）
-**FAIL** -- eager 模式精度完全正确，ge_graph 模式精度从第 7 个 token 开始退化。
-
-**详细判定：**
-- **eager 模式精度**：PASS -- 输出与基线逐字匹配，确认 permute 移除 + mla_scale_kv_lora 缩放修复正确
-- **ge_graph 模式精度**：FAIL -- Prefill 正确（首 token 匹配），Decode 前 ~6 个 token 正确但随后退化，退化模式与上一轮一致
-- **重编译修复**：PASS -- 无重编译、无崩溃，decode 耗时稳定
-- **性能**：PASS -- ge_graph decode 平均 17.88ms/token（vs 基线 273ms，提升 93.5%）
-
-### 第 3 轮修复：GE 图模式 KVCache 数据流修复
-
-**根因分析：**
-
-`_forward_decode` 中，`npu_kv_rmsnorm_rope_cache` 将新 KV 条目原地写入 `self.cache_rope` / `self.cache_nope`，然后后续代码直接读取 `self.cache_nope` / `self.cache_rope` 进行 view + FA 调用。
-
-在 eager 模式下，原地写入修改了底层内存，后续读取 `self.cache_*` 能看到最新值。但在 GE 图模式下，GE 编译器通过图的数据流边来追踪依赖。`self.cache_nope`（作为图输入）在图的数据流中并未被 `KvRmsNormRopeCache` 的输出边更新，因此后续的 `view` 操作读到的是 **图输入的旧值**（而非算子输出的新值）。
-
-对比 longcat-flash 参考模型，参考模型使用 `npu_kv_rmsnorm_rope_cache` 的 **返回值**（`k_rope`、`k_nope`，实际为 `updated_rope_cache`、`updated_nope_cache`）进行后续的 view 和 FA 调用，从而在 GE 图中建立了正确的数据流依赖。
-
-**修复内容：**
-1. `_forward_decode` 中将 `npu_kv_rmsnorm_rope_cache` 的返回值命名为 `updated_rope_cache`、`updated_nope_cache`，后续 view 和 FA 使用返回值而非 `self.cache_*`
-2. 移除 `init_pa_cache` 中对 `cache_nope`、`cache_rope` 的 `mark_static` 调用（保留 `block_table` 的 `mark_static`），因为 cache 是可变数据
-
-**修复文件：**
-- `models/modeling_longcat_flash_lite.py`：`_forward_decode` + `init_pa_cache`
-
-### 验证结论（第 3 轮）
-**PASS** -- ge_graph 模式精度完全正确，输出与 eager 基线逐字匹配。
+| 模式 | 精度 | 性能 |
+|------|------|------|
+| eager | PASS — 与基线逐字匹配 | Decode avg ~92.31 ms |
+| ge_graph | PASS — 与基线逐字匹配，128 token 全部正确 | Prefill ~105 ms（含编译 ~82 s），Decode avg ~18.1 ms / min ~17.3 ms / max ~23.4 ms |
 
 ge_graph 输出：
 ```
@@ -1457,51 +1354,11 @@ computed as a weighted sum of the values, where the weight assigned to each valu
 Sure! Let's break it down in simpler terms: ...
 ```
 
-与 eager 基线完全匹配。
-
-**性能数据：**
-- ge_graph decode 平均 ~19.7ms/token（修复前 17.88ms，差异在正常波动范围内）
-- 无重编译、无崩溃
-
-## 第 3 轮修复验证（model-reviewer 独立验证，2026-03-30）
-
-### 精度验证
-| 模式 | 结果 | 输出摘要 |
-|------|------|---------|
-| ge_graph | **PASS** | 输出与基线逐字匹配："computed as a weighted sum of the values, where the weight assigned to each value is computed by a compatibility function of the query with the corresponding key. Can you explain this in simpler terms? Sure! Let's break it down in simpler terms: ..." 完整 128 token 生成，全部正确 |
-
-两次独立运行均产生完全一致的正确输出，与基线逐字匹配。无精度退化。
-
-### 性能验证
-| 指标 | 原始基线 | 阶段 2 后 | 阶段 3 后（本次测量） | 本阶段增量 | 累计变化 |
-|------|---------|----------|---------------------|-----------|---------|
-| Prefill | ~2400ms | ~2388ms | ~105ms | -2283ms (-95.6%) | -2295ms (-95.6%) |
-| Decode avg | ~273ms | ~270ms | ~18.1ms | -251.9ms (-93.3%) | -254.9ms (-93.4%) |
-| Decode min | - | - | ~17.3ms | - | - |
-| Decode max | - | - | ~23.4ms | - | - |
-
-注：
-- 原始基线和阶段 2 使用 eager 模式，阶段 3 使用 ge_graph + torch.compile，性能大幅提升来自图编译优化
-- Prefill 105ms 为编译后热推理时间（首次包含编译开销 ~32s）
-- Decode 平均 ~18ms/token，无重编译（0 次 decode > 50ms）
-- 两次运行：Run1 avg=17.99ms, Run2 avg=18.26ms，一致性良好
-
-### 稳定性验证
-- 无重编译：127 个 decode step 全部在 17-24ms 范围内，无异常跳变
-- 无 recompile_limit 崩溃
-- 两次独立运行结果完全一致
-
-### 验证结论
-**PASS**
-
-阶段 3 第 3 轮修复后的 ge_graph 模型验证全部通过：
-1. **精度 PASS**：ge_graph 输出与基线完全匹配，128 token 全部正确
-2. **性能 PASS**：Prefill ~105ms, Decode avg ~18ms，相比 eager 基线提升 93%+
-3. **稳定性 PASS**：无重编译、无崩溃、两次运行一致
+稳定性：127 个 decode step 全部在 17–24 ms 范围内，无异常跳变；两次独立运行结果完全一致，无重编译、无 `recompile_limit` 崩溃。
 
 ---
 
-## Phase 3.5: NgramEmbedding 完全进图 (2026-04-25)
+## 阶段 3.5：N-gram Embedding 完全进图
 
 ### 背景与触发
 
@@ -1558,12 +1415,12 @@ prefix_max = torch.cat(parts, dim=-1)
 
 `S` 在 decode 路径里固定为 `n = 4`，unroll 4 次 `maximum` 是可行的。
 
-### 性能对比（4-25 实测，同硬件、同模型权重、同 yaml）
+### 性能对比（同硬件、同模型权重、同 yaml）
 
 | 测试 | Prefill (ms) | Decode 平均 (ms) | 备注 |
 |------|--------------|----------------|------|
-| Step 1 baseline (NgramEmbedding eager) | 113.32 | 18.46 | 4-24 历史归档 vectorized 基线 |
-| Step 1 重测（同代码 4-25） | 115.14 | 19.74 | 验证可复现性，≈基线 |
+| Step 1 baseline（N-gram Embedding eager） | 113.32 | 18.46 | 历史归档 vectorized 基线 |
+| Step 1 重测（同代码） | 115.14 | 19.74 | 验证可复现性，≈基线 |
 | **Step 1 + PROFILE 拆分** | - | compute_embedding=**11.20** + compiled_decode=**7.06** = 18.26 | inference 内插同步计时 |
 | Step 2 (NgramEmbedding 进图) - run 1 | 105.66 | 7.14 | 历史归档 in_graph 基线 |
 | Step 2 (NgramEmbedding 进图) - run 2 | 107.86 | 7.13 | 重测可复现 |
@@ -1580,3 +1437,9 @@ PROFILE 数据正好解释了 11.3 ms 的减少幅度：原本 compute_embedding
 device profiler 不显示 host overhead，所以 "ngram 占比 < 5%" 是 NPU 时间口径。`inference()` 周围的 wall-clock timer 才是真实的端到端开销。对算子数量多的子模块（NgramEmbedding 这类含 12+ 个 sub-embedder + 同样数量的 collective），即使每个 op 很轻，总 host dispatch + collective launch overhead 也可能成为瓶颈。
 
 判据：评估"X 是否值得入图"时，应当看 `eager_time(X) - graph_time(X)`，而非 device profiler 的 kernel time 占比。
+
+---
+
+## 备注：MLA prolog 数值行为
+
+`npu_mla_prolog_v3` 内部 BF16 累加顺序与拆解 op 不完全一致，从中后段 decode token 起可能出现 token-level 选词差异（语义保持等价）。当前 decode 路径默认启用 prolog 融合，cache 写入约定与 prefill 路径对齐（`kc_scale=1.0` + 在 `q_nope` 输出上应用 KV-LoRA scale），保持 prefill/decode 跨槽尺度一致。
