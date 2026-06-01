@@ -66,11 +66,11 @@ custom.compressor(x, wkv, wgate, state_cache, ape, norm_weight, rope_sin, rope_c
 
 -   **ape**（`Tensor`）：必选参数，表示positional biases，对应公式中的$Ape$。不支持非连续，数据格式支持ND，数据类型支持`folat32`。支持输入shape[cmp_ratio,coff* D]。
 
--   **norm\_weight**（`Tensor`）：必选参数，表示计算RmsNorm时的权重系数。数据类型支持`bfloat16`、`float16`。支持输入shape[D,]。
+-   **norm\_weight**（`Tensor`）：必选参数，表示计算RmsNorm时的权重系数。数据类型支持`folat32`。支持输入shape[D,]。
 
--   **rope\_sin**（`Tensor`）：必选参数，表示Rope计算时sin的权重系数。数据类型支持`bfloat16`、`float16`。当x的shape为[B,S,H]时，要求输入shape为[B,ceil(S/cmp_ratio),rope_head_dim]；当x的shape为[T,H]时，要求输入shape为[min(T,T//cmp_ratio+B),rope_head_dim]。
+-   **rope\_sin**（`Tensor`）：必选参数，表示Rope计算时sin的权重系数。数据类型支持`folat32`。当x的shape为[B,S,H]时，要求输入shape为[B,ceil(S/cmp_ratio),rope_head_dim]；当x的shape为[T,H]时，要求输入shape为[min(T,T//cmp_ratio+B),rope_head_dim]。
 
--   **rope\_cos**（`Tensor`）：必选参数，表示Rope计算时cos的权重系数。数据类型支持`bfloat16`、`float16`。当x的shape为[B,S,H]时，要求输入shape为[B,ceil(S/cmp_ratio),rope_head_dim]；当x的shape为[T,H]时，要求输入shape为[min(T,T//cmp_ratio+B),rope_head_dim]。
+-   **rope\_cos**（`Tensor`）：必选参数，表示Rope计算时cos的权重系数。数据类型支持`folat32`。当x的shape为[B,S,H]时，要求输入shape为[B,ceil(S/cmp_ratio),rope_head_dim]；当x的shape为[T,H]时，要求输入shape为[min(T,T//cmp_ratio+B),rope_head_dim]。
 
 -   **rope\_head\_dim**（`int`）：必选参数，表示rope_cos和rope_sin的hidden层最小单元大小。目前仅支持64。
 
@@ -270,9 +270,9 @@ custom.compressor(x, wkv, wgate, state_cache, ape, norm_weight, rope_sin, rope_c
     wkv = torch.tensor(np.random.uniform(-10, 10, (coff * head_dim, hidden_size))).to(data_type).npu()
     wgate = torch.tensor(np.random.uniform(-10, 10, (coff * head_dim, hidden_size))).to(data_type).npu()
     ape = torch.tensor(np.random.uniform(-10, 10, (cmp_ratio, coff * head_dim))).to(torch.float32).npu()
-    norm_weight = torch.tensor(np.random.uniform(-10, 10, (head_dim))).to(data_type).npu()
-    rope_sin = torch.tensor(np.random.uniform(-1, 1, rope_sin_shape)).to(data_type).npu()
-    rope_cos = torch.tensor(np.random.uniform(-1, 1, rope_cos_shape)).to(data_type).npu()
+    norm_weight = torch.tensor(np.random.uniform(-10, 10, (head_dim))).to(torch.float32).npu()
+    rope_sin = torch.tensor(np.random.uniform(-1, 1, rope_sin_shape)).to(torch.float32).npu()
+    rope_cos = torch.tensor(np.random.uniform(-1, 1, rope_cos_shape)).to(torch.float32).npu()
     if cache_mode == 1:  # 连续buffer
         state_cache = torch.zeros((kv_state.shape[0], kv_state.shape[1], 2*kv_state.shape[2]))
         state_cache = state_cache.npu()
@@ -432,9 +432,9 @@ custom.compressor(x, wkv, wgate, state_cache, ape, norm_weight, rope_sin, rope_c
     wkv = torch.tensor(np.random.uniform(-10, 10, (coff * head_dim, hidden_size))).to(data_type).npu()
     wgate = torch.tensor(np.random.uniform(-10, 10, (coff * head_dim, hidden_size))).to(data_type).npu()
     ape = torch.tensor(np.random.uniform(-10, 10, (cmp_ratio, coff * head_dim))).to(torch.float32).npu()
-    norm_weight = torch.tensor(np.random.uniform(-10, 10, (head_dim))).to(data_type).npu()
-    rope_sin = torch.tensor(np.random.uniform(-1, 1, rope_sin_shape)).to(data_type).npu()
-    rope_cos = torch.tensor(np.random.uniform(-1, 1, rope_cos_shape)).to(data_type).npu()
+    norm_weight = torch.tensor(np.random.uniform(-10, 10, (head_dim))).to(torch.float32).npu()
+    rope_sin = torch.tensor(np.random.uniform(-1, 1, rope_sin_shape)).to(torch.float32).npu()
+    rope_cos = torch.tensor(np.random.uniform(-1, 1, rope_cos_shape)).to(torch.float32).npu()
     if cache_mode == 1:  # 连续buffer
         state_cache = torch.zeros((kv_state.shape[0], kv_state.shape[1], 2*kv_state.shape[2]))
         state_cache = state_cache.npu()
