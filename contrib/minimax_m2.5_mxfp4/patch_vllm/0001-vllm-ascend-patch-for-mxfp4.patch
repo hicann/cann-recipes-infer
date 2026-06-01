@@ -1,0 +1,84 @@
+From 270f809d6d815bb0143663676f6143f3eb047179 Mon Sep 17 00:00:00 2001
+From: root <root@liteserver-hps-5c19-00001.novalocal>
+Date: Mon, 23 Mar 2026 07:03:05 +0000
+Subject: [PATCH] Enable Quark quantization resolution on Ascend NPU.
+
+This unblocks MXFP4 startup by allowing Quark in platform capability checks and making quant config lookups robust to missing keys.
+---
+ vllm_ascend/ops/layernorm.py                 |  6 ++++--
+ vllm_ascend/platform.py                      |  2 +-
+ vllm_ascend/quantization/modelslim_config.py | 14 +++++++++-----
+ 3 files changed, 14 insertions(+), 8 deletions(-)
+
+diff --git a/vllm_ascend/ops/layernorm.py b/vllm_ascend/ops/layernorm.py
+index dd676e8f..b12cc0c8 100644
+--- a/vllm_ascend/ops/layernorm.py
++++ b/vllm_ascend/ops/layernorm.py
+@@ -40,8 +40,10 @@ class AscendRMSNorm(RMSNorm):
+         vllm_config = get_current_vllm_config()
+         self.bias = None
+         # quantization with anti_method m4 will generate none-zero norm bias
+-        if vllm_config.quant_config is not None and \
+-                any("norm.bias" in name for name in vllm_config.quant_config.quant_description.keys()):
++        quant_description = getattr(vllm_config.quant_config,
++                                    "quant_description", None)
++        if quant_description is not None and any("norm.bias" in name
++                                                 for name in quant_description.keys()):
+             self.bias = torch.nn.Parameter(torch.zeros(hidden_size),
+                                            requires_grad=False)
+ 
+diff --git a/vllm_ascend/platform.py b/vllm_ascend/platform.py
+index a87c790f..efb3724e 100644
+--- a/vllm_ascend/platform.py
++++ b/vllm_ascend/platform.py
+@@ -101,7 +101,7 @@ class NPUPlatform(Platform):
+     device_control_env_var: str = "ASCEND_RT_VISIBLE_DEVICES"
+     dispatch_key: str = "PrivateUse1"
+ 
+-    supported_quantization: list[str] = [ASCEND_QUANTIZATION_METHOD, COMPRESSED_TENSORS_METHOD]
++    supported_quantization: list[str] = [ASCEND_QUANTIZATION_METHOD, COMPRESSED_TENSORS_METHOD, "quark"]
+ 
+     def is_sleep_mode_available(self) -> bool:
+         return True
+diff --git a/vllm_ascend/quantization/modelslim_config.py b/vllm_ascend/quantization/modelslim_config.py
+index 5464cee7..89954478 100644
+--- a/vllm_ascend/quantization/modelslim_config.py
++++ b/vllm_ascend/quantization/modelslim_config.py
+@@ -357,8 +357,12 @@ class AscendModelSlimConfig(QuantizationConfig):
+     @classmethod
+     def override_quantization_method(cls, hf_quant_cfg,
+                                      user_quant) -> Optional[str]:
+-        if hf_quant_cfg is not None:
+-            quant_method = hf_quant_cfg.get("quant_method", None)
++        if user_quant is not None:
++            return user_quant
++        if isinstance(hf_quant_cfg, dict):
++            quant_method = hf_quant_cfg.get("quant_method")
++            if isinstance(quant_method, str):
++                return quant_method
+             if not quant_method and torch.npu.is_available():
+                 return ASCEND_QUANTIZATION_METHOD
+         return None
+@@ -451,8 +455,8 @@ class AscendModelSlimConfig(QuantizationConfig):
+ 
+             is_skipped = None
+             for shard_prefix in shard_prefixes:
+-                is_shard_skipped = self.quant_description[shard_prefix +
+-                                                          '.weight'] == "FLOAT"
++                is_shard_skipped = self.quant_description.get(
++                    shard_prefix + '.weight', 'FLOAT') == "FLOAT"
+ 
+                 if is_skipped is None:
+                     is_skipped = is_shard_skipped
+@@ -462,7 +466,7 @@ class AscendModelSlimConfig(QuantizationConfig):
+                         "are quantized. All shards of fused layers "
+                         "to have the same precision.")
+         else:
+-            is_skipped = self.quant_description[prefix + '.weight'] == "FLOAT"
++            is_skipped = self.quant_description.get(prefix + '.weight', 'FLOAT') == "FLOAT"
+ 
+         assert is_skipped is not None
+         return is_skipped
+-- 
+2.34.1
+
