@@ -136,6 +136,7 @@ class QwenMLP(nn.Module):
         self.intermediate_size = config.intermediate_size
         self.attn_tp_size = infer_config.parallel_config.attn_tp_size
         self.comm_manager = comm_manager
+        quant_cfg = getattr(config, "quant_config", None)
 
         from transformers.activations import ACT2FN
 
@@ -145,7 +146,7 @@ class QwenMLP(nn.Module):
             bias=False,
             tp_size=self.attn_tp_size,
             tp_rank=comm_manager.get_rank("attn_tp_group"),
-            quant_config=None,
+            quant_config=quant_cfg,
             prefix=f"{prefix}.gate_up_proj",
         )
         self.down_proj = RowParallelLinear(
@@ -155,20 +156,48 @@ class QwenMLP(nn.Module):
             tp_size=self.attn_tp_size,
             tp_rank=comm_manager.get_rank("attn_tp_group"),
             input_is_parallel=True,
+            quant_config=quant_cfg,
             prefix=f"{prefix}.down_proj",
         )
         self.act_fn = ACT2FN[config.hidden_act]
 
+        # W8A8 fused MLP path: gate_up_proj (int32 + pertoken_scale) ->
+        # npu_dequant_swiglu_quant -> down_proj (consumes the quantized
+        # tensor and scale, skipping its own dynamic_quant). Keeps ge_graph
+        # on the fused kernel rather than the unsupported AddRmsNormDynamicQuant.
+        self.mm_quant_mode = quant_cfg.mm_quant_mode if quant_cfg is not None else "w16a16"
+        if self.mm_quant_mode == "w8a8int8":
+            self._compute = self._forward_w8a8int8
+        else:
+            self._compute = self._forward_normal
+
     def forward(self, hidden_states):
+        out = self._compute(hidden_states)
+        if self.attn_tp_size > 1:
+            dist.all_reduce(out, group=self.comm_manager.get_group("attn_tp_group"))
+        return out
+
+    def _forward_normal(self, hidden_states):
         gate_up = self.gate_up_proj(hidden_states)
         intermediate_size_per_rank = gate_up.shape[-1] // 2
         gate = gate_up[..., :intermediate_size_per_rank]
         up = gate_up[..., intermediate_size_per_rank:]
-        hidden_states = self.act_fn(gate) * up
-        hidden_states = self.down_proj(hidden_states)
-        if self.attn_tp_size > 1:
-            dist.all_reduce(hidden_states, group=self.comm_manager.get_group("attn_tp_group"))
-        return hidden_states
+        return self.down_proj(self.act_fn(gate) * up)
+
+    def _forward_w8a8int8(self, hidden_states):
+        merged_x, pertoken_scale = self.gate_up_proj(hidden_states, out_dtype=torch.int32)
+        intermediate, pertoken_scale = torch_npu.npu_dequant_swiglu_quant(
+            merged_x,
+            weight_scale=self.gate_up_proj.weight_scale,
+            quant_scale=self.down_proj.smooth_scales,
+            # quant_mode=1: dynamic quantization (quant_mode=0 is static); produces
+            #               per-token int8 + scale, matching down_proj's int8 input.
+            # activate_left=True: out = swish(x[..., :H]) * x[..., H:]
+            #                     (SwiGLU with swish on the first half, gate on the second).
+            quant_mode=1, activate_left=True,
+            activation_scale=pertoken_scale,
+        )
+        return self.down_proj(intermediate, pertoken_scale)
 
 
 class QwenAttention(nn.Module):
@@ -203,6 +232,7 @@ class QwenAttention(nn.Module):
         self.attn_intermediate_size = self.head_dim * self.num_heads
         self.attn_intermediate_size_per_rank = self.attn_intermediate_size // self.attn_tp_size
         self.comm_manager = comm_manager
+        quant_cfg = getattr(config, "quant_config", None)
 
         # Config-driven: Qwen2 uses bias=True, Qwen3 uses bias=False
         self.merged_qkv_proj = QKVParallelLinear(
@@ -214,7 +244,7 @@ class QwenAttention(nn.Module):
             skip_bias_add=False,
             tp_size=self.attn_tp_size,
             tp_rank=comm_manager.get_rank("attn_tp_group"),
-            quant_config=None,
+            quant_config=quant_cfg,
             prefix=f"{prefix}.merged_qkv_proj",
             return_bias=False,
         )
@@ -232,6 +262,7 @@ class QwenAttention(nn.Module):
             tp_rank=comm_manager.get_rank("attn_tp_group"),
             bias=False,
             input_is_parallel=True,
+            quant_config=quant_cfg,
             prefix=f"{prefix}.o_proj",
         )
         self.scale_fa = 1 / (self.head_dim ** 0.5)
@@ -656,7 +687,23 @@ class QwenForCausalLM(nn.Module):
     def process_weights_after_loading(self):
         is_nz = (self.infer_config.model_config.enable_weight_nz
                  and self.infer_config.model_config.exe_mode != "npugraph_ex")
+        # W8A8 scale dtype: weight_scale -> fp32 (npu_quant_matmul);
+        # smooth_scales -> bf16 (npu_dynamic_quant). down_proj overrides
+        # smooth_scale to fp32 since its smooth_scales is reused as the
+        # quant_scale of npu_dequant_swiglu_quant in the fused MLP path.
+        float_scales_map = ["merged_qkv_proj", "o_proj", "gate_up_proj", "down_proj"]
+        float_smooth_scales_map = ["down_proj"]
         for module_name, module in self.named_modules():
             quant_method = getattr(module, "quant_method", None)
-            if quant_method is not None:
-                quant_method.process_weights_after_loading(module, is_nz=is_nz)
+            if quant_method is None:
+                continue
+            scales_dtype = {}
+            for scale_name in float_scales_map:
+                if scale_name in module_name:
+                    scales_dtype["scale_dtype"] = torch.float
+                    break
+            for smooth_scale_name in float_smooth_scales_map:
+                if smooth_scale_name in module_name:
+                    scales_dtype["smooth_scale_dtype"] = torch.float
+                    break
+            quant_method.process_weights_after_loading(module, is_nz=is_nz, scales_dtype=scales_dtype)

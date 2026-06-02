@@ -1,0 +1,23 @@
+model_config:
+  model_name: "qwen3_8b"
+  model_path: "/data/models/origin/Qwen3-8B-W8A8"   # 量化配置由权重目录 config.json 内嵌的 compressed-tensors 自动加载，yaml 无需显式声明 quant_config
+  exe_mode: "ge_graph"
+  enable_profiler: False
+  with_ckpt: True
+  enable_cache_compile: False
+  enable_static_kernel: False
+
+data_config:
+  dataset: "default"
+  input_truncated_len: 4096
+
+parallel_config:
+  world_size: 1
+  attn_tp_size: 1
+  moe_tp_size: 1
+  embed_tp_size: 1
+  lmhead_tp_size: 1
+
+scheduler_config:
+  max_new_tokens: 256
+  batch_size: 1

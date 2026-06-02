@@ -53,5 +53,20 @@ hidden_states, residual = npu_add_rms_norm(residual, hidden_states, weight, eps)
 ## 使能图模式
 使用静态图可以获得更好的推理性能。通过覆写`executor/model_runner.py`中的`ModelRunner`的`graph_compile`函数，将模型编译为静态图。
 
+## W8A8 INT8 量化
+
+Qwen3-8B 支持 W8A8 INT8 量化，其中权重采用 per-channel 静态量化，激活采用 per-token 动态量化。量化范围覆盖 Attention 的 `merged_qkv_proj` / `o_proj` 与 MLP 的 `gate_up_proj` / `down_proj`，共 4 个 Linear 层。
+
+启用量化后，MLP 计算切换至专用的融合算子路径：`gate_up_proj` 输出 int32 张量与 per-token scale，并作为 [torch_npu.npu_dequant_swiglu_quant](https://www.hiascend.com/document/detail/zh/Pytorch/710/apiref/torchnpuCustomsapi/context/torch_npu-npu_dequant_swiglu_quant.md) 的输入，由该算子一次性完成反量化、SwiGLU 激活与再量化操作；输出的 int8 张量与对应 scale 由 `down_proj` 直接接收并执行后续矩阵乘运算。该实现可使 ge_graph 静态图模式下命中现有融合算子实现，避免因 `AddRmsNormDynamicQuant` 等组合算子尚未提供而触发的回退路径。
+
+量化后的模型权重以 compressed-tensors 格式加载。量化相关代码逻辑由 `mm_quant_mode` 字段控制：仅当字段值为 `w8a8int8` 时启用 W8A8 量化路径，否则保持原 BF16 推理路径不变。
+
+## 集合通信使能AIV展开
+利用Device的Vector Core计算单元来加速通信操作的执行，可参考[HCCL_OP_EXPANSION_MODE环境变量](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/83RC1alpha002/maintenref/envvar/envref_07_0096.html)：
+
+```shell
+export HCCL_OP_EXPANSION_MODE=AIV
+```
+
 ## 附录
 [环境部署以及样例执行](../../../models/qwen/README.md)

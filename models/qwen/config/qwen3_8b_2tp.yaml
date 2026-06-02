@@ -14,7 +14,7 @@ data_config:
 parallel_config:
   world_size: 2
   attn_tp_size: 2
-  moe_tp_size: 2
+  moe_tp_size: 1    # Dense model has no MoE layer; fixed to 1 to avoid confusion with attn_tp_size
   embed_tp_size: 1
   lmhead_tp_size: 2
 
