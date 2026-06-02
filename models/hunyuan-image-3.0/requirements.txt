@@ -1,4 +1,4 @@
-
+torch==2.7.1
 # Core dependencies
 einops>=0.8.0
 numpy==1.26.4

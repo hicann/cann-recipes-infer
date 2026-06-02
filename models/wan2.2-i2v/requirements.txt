@@ -1,3 +1,4 @@
+torch==2.7.1
 torchvision==0.22.1
 opencv-python>=4.9.0.80
 diffusers==0.34.0

@@ -96,7 +96,7 @@ git clone https://huggingface.co/meituan-longcat/LongCat-Flash-Lite /data/models
    - **内置 prompt**：使用 `dataset/default_prompt.json`（~256 token 关于 attention 的短句），无需额外准备，适用于 1k yaml。
    - **长序列**：将 `data_config.input_truncated_len` 调到目标输入长度（如 4096），并把 `dataset/default_prompt.json` 替换为相应长度的 prompt；或将 `data_config.dataset` 改为 `"LongBench"` / `"InfiniteBench"` 使用公开 benchmark（需自行下载到本地或通过 HF 拉取）。
 
-   > 若长序列场景出现 OOM，参考 [CLAUDE.md 注意事项](../../CLAUDE.md) 的 OOM 缓解顺序调整 batch_size / kvp_size / 量化模式。
+   > 若长序列场景出现 OOM，参考 [CLAUDE.md 注意事项](../../AGENTS.md) 的 OOM 缓解顺序调整 batch_size / kvp_size / 量化模式。
 
 3. 执行统一推理脚本。
 
