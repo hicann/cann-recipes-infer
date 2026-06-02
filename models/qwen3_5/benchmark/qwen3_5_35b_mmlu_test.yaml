@@ -1,10 +1,7 @@
-model_name: "qwen3.5"
-world_size: 8
-
 model_config:
   model_name: "qwen3.5"
   model_path: "/model/to/Qwen3.5-35B-A3B"
-  exe_mode: "eager"        # ["ge_graph", "eager", "acl_graph"]
+  exe_mode: "eager"        # ["eager", "ge_graph", "npugraph_ex"]
   enable_profiler: False  # [False, True]
   with_ckpt: True
   enable_cache_compile: False
@@ -20,7 +17,6 @@ model_config:
       enable_decode_moe_dispatch_combine_v2: False
 
 data_config:
-  dataset: "default"  # ["default", "LongBench"]
   input_truncated_len: 2048
 
 parallel_config:
@@ -30,11 +26,10 @@ parallel_config:
   embed_tp_size: 8
   lmhead_tp_size: 8
   dense_tp_size: 1
-  o_proj_tp_size: 1
   # Derivations (not configurable):
   # attn_dp_size = world_size // attn_tp_size = 1
   # moe_ep_size = world_size // moe_tp_size = 1
 
 scheduler_config:
-  max_new_tokens: 4
+  max_new_tokens: 1
   batch_size: 1        # Strict constraint: Batch=1

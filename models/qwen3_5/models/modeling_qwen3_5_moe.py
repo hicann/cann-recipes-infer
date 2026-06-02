@@ -669,7 +669,8 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
 
         self.causal_conv1d_fn = causal_conv1d_fn
         self.causal_conv1d_update = causal_conv1d_update or torch_causal_conv1d_update
-        self.use_npu_chunk_gated_delta_rule = hasattr(torch_npu, "npu_chunk_gated_delta_rule")
+        platform = torch.npu.get_device_name()
+        self.use_npu_chunk_gated_delta_rule = '950' not in platform and hasattr(torch_npu, "npu_chunk_gated_delta_rule")
 
         self.chunk_gated_delta_rule = chunk_gated_delta_rule or torch_chunk_gated_delta_rule
         self.recurrent_gated_delta_rule = fused_recurrent_gated_delta_rule or torch_recurrent_gated_delta_rule

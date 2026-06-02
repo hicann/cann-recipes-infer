@@ -1,10 +1,7 @@
-model_name: "qwen3.5"
-world_size: 8
-
 model_config:
   model_name: "qwen3.5"
   model_path: "/model/to/Qwen3.5-122B-A10B"
-  exe_mode: "ge_graph"        # ["ge_graph", "eager", "acl_graph"]
+  exe_mode: "ge_graph"        # ["eager", "ge_graph", "npugraph_ex"]
   enable_profiler: False  # [False, True]
   with_ckpt: True
   enable_cache_compile: False
@@ -30,7 +27,6 @@ parallel_config:
   embed_tp_size: 8
   lmhead_tp_size: 8
   dense_tp_size: 1
-  o_proj_tp_size: 1
   # Derivations (not configurable):
   # attn_dp_size = world_size // attn_tp_size = 1
   # moe_ep_size = world_size // moe_tp_size = 1

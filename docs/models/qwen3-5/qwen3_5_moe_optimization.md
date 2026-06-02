@@ -78,7 +78,6 @@ core_attn_out, last_recurrent_state = torch_npu.npu_chunk_gated_delta_rule(
 - 块间递推状态更新和输出计算。
 
 算子输出`core_attn_out`和`last_recurrent_state`，前者为当前chunk的attention输出，后者用于后续chunk计算或传递给Decode阶段。该优化主要用于Linear Attention Prefill场景，减少Gated DeltaNet块内递推计算中的小算子数量并提升计算效率。
-注意：该算子为近期合入，为保证精度正确，建议开发者使用以下链接提供的 CANN 包: [CANN 9.1.0](https://ascend.devcloud.huaweicloud.com/artifactory/cann-run-mirror/software/master/)
 
 ### RMSNorm融合算子优化
 

@@ -138,7 +138,6 @@ def load_config(yaml_file_path: str, global_rank: int, local_rank: int) -> Infer
         )
         if any(size > 1 for size in non_attn_tp_sizes) or config.parallel_config.moe_ep_size > 1:
             config.scheduler_config.batch_size_per_dp_rank = config.scheduler_config.batch_size
-    config.scheduler_config.max_new_tokens = 1
     return config
 
 
