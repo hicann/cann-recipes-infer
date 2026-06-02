@@ -33,6 +33,7 @@ from torch.distributed.distributed_c10d import _world
 from functools import lru_cache
 
 import torch_npu
+import custom_ops
 from transformers.modeling_attn_mask_utils import (
     AttentionMaskConverter,
     _prepare_4d_attention_mask,
@@ -79,6 +80,29 @@ def rotate_activation(x: torch.Tensor, matrix: torch.Tensor) -> torch.Tensor:
     init_shape = x.shape
     x = x.view(-1, matrix.shape[0])
     return x.matmul(matrix).view(init_shape).to(torch.bfloat16)
+
+
+def inplace_partial_rotary_mul(
+        tensor,
+        cos, sin,
+        partial_slice,
+        platform_version,
+        origin_shape
+    ):
+    if platform_version == "A3":
+        tensor = tensor.to(torch.float32)
+        torch.ops.custom.inplace_partial_rotary_mul(
+            tensor, cos, sin,
+            rotary_mode="interleave",
+            partial_slice=partial_slice,
+        )
+        return tensor.to(torch.bfloat16).view(origin_shape)
+    torch.ops.custom.inplace_partial_rotary_mul(
+        tensor, cos, sin,
+        rotary_mode="interleave",
+        partial_slice=partial_slice,
+    )
+    return tensor.view(origin_shape)
 
 
 @lru_cache(1)
@@ -186,7 +210,7 @@ class DeepseekV3RotaryEmbedding(nn.Module):
         self._set_cos_sin_cache(
             seq_len=max_position_embeddings,
             device=self.inv_freq.device,
-            dtype=torch.get_default_dtype(),
+            dtype=torch.float32,
         )
 
     def _set_cos_sin_cache(self, seq_len, device, dtype):
@@ -204,16 +228,16 @@ class DeepseekV3RotaryEmbedding(nn.Module):
     def forward(self, x, position_ids, kv_len, max_seq_len=None):
         # x shape is [bs, num_attention_heads, seq_len, head_size]
         if max_seq_len is None:
-            self._set_cos_sin_cache(seq_len=kv_len, device=x.device, dtype=x.dtype)
+            self._set_cos_sin_cache(seq_len=kv_len, device=x.device, dtype=torch.float32)
         elif max_seq_len > self.max_seq_len_cached:
-            self._set_cos_sin_cache(seq_len=max_seq_len, device=x.device, dtype=x.dtype)
+            self._set_cos_sin_cache(seq_len=max_seq_len, device=x.device, dtype=torch.float32)
 
         cos = torch.index_select(self.cos_cached, dim=0, index=position_ids.view(-1)).unsqueeze(1).unsqueeze(1)
         sin = torch.index_select(self.sin_cached, dim=0, index=position_ids.view(-1)).unsqueeze(1).unsqueeze(1)
 
         return (
-            cos.to(dtype=x.dtype),
-            sin.to(dtype=x.dtype),
+            cos,
+            sin,
         )
 
 
@@ -384,19 +408,16 @@ class DeepseekV3YarnRotaryEmbedding(DeepseekV3RotaryEmbedding):
 
         freqs = torch.outer(t, inv_freq)
 
-        _mscale = float(
-            yarn_get_mscale(self.scaling_factor, self.mscale)
-            / yarn_get_mscale(self.scaling_factor, self.mscale_all_dim)
-        )
-        # freqs shape[seq_len, dim//2], where each value corresponds a rotary angle. Example with seqlen = 1:
-        # interleave_half = True,  emb: [angle_0, angle_1, ... , angle_31, angle_0, angle_1, ... , angle_31]
-        # interleave_half = False, emb: [angle_0, angle_0, ... , angle_15, angle_15, ... , angle_31, angle_31]
-        emb = torch.cat((freqs, freqs), dim=-1) if self.interleave_half else freqs.repeat_interleave(2, dim=-1)
+        freq_cis = torch.polar(torch.ones_like(freqs), freqs)
+        cos = freq_cis.real
+        sin = freq_cis.imag
+        cos = cos.repeat_interleave(2, dim=-1)
+        sin = sin.repeat_interleave(2, dim=-1)
         self.register_buffer(
-            "cos_cached", (emb.cos() * _mscale).to(dtype), persistent=False
+            "cos_cached", cos.to(dtype), persistent=False
         )
         self.register_buffer(
-            "sin_cached", (emb.sin() * _mscale).to(dtype), persistent=False
+            "sin_cached", sin.to(dtype), persistent=False
         )
 
 

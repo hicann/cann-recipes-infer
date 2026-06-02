@@ -145,14 +145,16 @@ class Compressor(nn.Module):
             start_pos = attn_metadata["start_pos"]
         cos, sin = cos_sin[f"c{self.compress_ratio}a"]
         bsz = x.shape[0]
+        rope_cos = cos.view(-1, self.rope_head_dim) if is_prefill else cos.view(bsz, -1, self.rope_head_dim)
+        rope_sin = sin.view(-1, self.rope_head_dim) if is_prefill else sin.view(bsz, -1, self.rope_head_dim)
         cmpr_input_kwargs = {
             "x": x.view(-1, self.dim) if is_prefill else x,
             "wkv": self.wkv.weight,
             "wgate": self.wgate.weight,
             "ape": self.ape,
             "norm_weight": self.norm.weight,
-            "rope_cos": cos.view(-1, self.rope_head_dim) if is_prefill else cos.view(bsz, -1, self.rope_head_dim),
-            "rope_sin": sin.view(-1, self.rope_head_dim) if is_prefill else sin.view(bsz, -1, self.rope_head_dim),
+            "rope_cos": rope_cos.to(torch.bfloat16),
+            "rope_sin": rope_sin.to(torch.bfloat16),
             "state_block_table": attn_metadata["block_table"][f"c{self.compress_ratio}a_cmp_state"],
             "seqused": seq_used_q,
             "start_pos": start_pos,

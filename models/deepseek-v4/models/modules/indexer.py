@@ -38,7 +38,7 @@ from transformers.cache_utils import Cache
 from executor.utils import get_had_pow2, limit_core_num
 from executor.utils.stream_utils import npu_stream_switch, record_event, wait_event, record_stream
 from module.linear import ReplicatedLinear
-from .common_modules import DeepseekV3RMSNorm, apply_rotary_emb, rotate_activation
+from .common_modules import DeepseekV3RMSNorm, apply_rotary_emb, rotate_activation, inplace_partial_rotary_mul
 from .compressor import Compressor
 
 
@@ -80,7 +80,7 @@ class Indexer(nn.Module):
         self.enable_pypto = self.runner_settings.get("model_config").get("enable_pypto", False)
         self.enable_multi_streams = self.runner_settings.get("model_config").get("enable_multi_streams", False) and \
                                 not self.enable_pypto
-        self.platform_version = self.runner_settings.get("model_config").get("enable_multi_streams", False)
+        self.platform_version = self.runner_settings.get("model_config").get("platform_version", "A3")
         self.enable_limit_core = self.runner_settings.get("model_config").get("enable_limit_core", False)
         aic_total = 24 # enable_limit_core only suppots A3
         aiv_to_aic_ratio = 2 # aiv_num is 2 * aic_num
@@ -146,10 +146,11 @@ class Indexer(nn.Module):
                 q = q.view(qr.shape[0], -1, self.n_heads, self.head_dim)
 
                 # rope
-                torch.ops.custom.inplace_partial_rotary_mul(   # x: (T, 1, N, D); cos(T, 1, 1, D)
+                q = inplace_partial_rotary_mul(   # x: (T, 1, N, D); cos(T, 1, 1, D)
                     q.flatten(0, 1).unsqueeze(2), cos, sin,
-                    rotary_mode="interleave",
                     partial_slice=self.partial_slice,
+                    platform_version=self.platform_version,
+                    origin_shape=q.shape,
                 )
                 q = rotate_activation(q, self.hadamard_matrix)
                 wait_event(cmpr_switch_flag, cmpr_event, cmpr_event_idx) # separate sfa compressor and li qb dynamic quant

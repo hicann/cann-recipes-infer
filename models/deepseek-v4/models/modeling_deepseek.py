@@ -68,7 +68,8 @@ from .configuration_deepseek import DeepseekV3Config
 from .modules import (get_window_topk_idxs, get_compress_topk_idxs,
                       one_hot, yarn_get_mscale,
                       DeepseekV3RMSNorm, _init_rope, DEEPSEEKV3_START_DOCSTRING,
-                      DEEPSEEKV3_INPUTS_DOCSTRING, DeepseekV3PreTrainedModel, apply_rotary_emb
+                      DEEPSEEKV3_INPUTS_DOCSTRING, DeepseekV3PreTrainedModel, apply_rotary_emb,
+                      inplace_partial_rotary_mul
                     )
 from .modules import Indexer, Compressor, AttnMetaData, CacheData
 from .modules.registry import OpKernel
@@ -424,7 +425,7 @@ class DeepseekV3MoE(nn.Module):
                 "glu_bias": 0
             })
         intermediate_h, pertoken_scale = torch_npu.npu_dequant_swiglu_clamp_quant(
-            mm1_mm3, 
+            mm1_mm3,
             quant_scale=self.experts.smooth_scale_2,
             group_index=expert_tokens,
             activate_left=True,
@@ -905,10 +906,11 @@ class Attention(nn.Module):
             last_win = torch.cat([second_last_win[:, -(self.window_size - last_kv_len):], last_win], dim=1)
         last_win_kv = self.wkv(last_win)
         last_win_kv = self.kv_norm(last_win_kv)
-        torch.ops.custom.inplace_partial_rotary_mul(
+        last_win_kv = inplace_partial_rotary_mul(
             last_win_kv.view(-1, 1, 1, self.head_dim), cos, sin,
-            rotary_mode="interleave",
             partial_slice=self.partial_slice,
+            platform_version=self.platform_version,
+            origin_shape=last_win_kv.shape,
         )
         return last_win_kv, x_list
 
@@ -937,10 +939,11 @@ class Attention(nn.Module):
         qr, qr_scale = self.apply_norm_dynamic_quant(qr)
         q = self.wq_b(qr, dynamic_scale=qr_scale).unflatten(-1, (self.num_heads_per_rank, self.head_dim))
         q = self.q_b_norm(q)
-        torch.ops.custom.inplace_partial_rotary_mul(   # x: (T, 1, N, D); cos(T, 1, 1, D)
+        q = inplace_partial_rotary_mul(   # x: (T, 1, N, D); cos(T, 1, 1, D)
             q.flatten(0, 1).unsqueeze(2), cos, sin,
-            rotary_mode="interleave",
             partial_slice=self.partial_slice,
+            platform_version=self.platform_version,
+            origin_shape=q.shape,
         )
 
         if self.cp_size > 1:
@@ -956,10 +959,11 @@ class Attention(nn.Module):
         # win kv & topk_idxs
         kv = self.wkv(x)
         kv = self.kv_norm(kv)
-        torch.ops.custom.inplace_partial_rotary_mul(
+        kv = inplace_partial_rotary_mul(
             kv.view(-1, 1, 1, self.head_dim), cos, sin,
-            rotary_mode="interleave",
             partial_slice=self.partial_slice,
+            platform_version=self.platform_version,
+            origin_shape=kv.shape,
         )
 
         # update temporary full cache
@@ -1021,10 +1025,11 @@ class Attention(nn.Module):
             record_event(enable_multi_streams, self.mla_events, 1)
             with limit_core_num(enable_limit_core, kv_aic_num, kv_aic_num * self.aiv_to_aic_ratio): # parallel to wq_b
                 kv = self.kv_norm(kv)
-                torch.ops.custom.inplace_partial_rotary_mul(
+                kv = inplace_partial_rotary_mul(
                     kv.view(-1, 1, 1, self.head_dim), cos, sin,
-                    rotary_mode="interleave",
                     partial_slice=self.partial_slice,
+                    platform_version=self.platform_version,
+                    origin_shape=kv.shape,
                 )
                 record_stream(enable_multi_streams, kv, cur_stream)
                 record_event(enable_multi_streams, self.mla_events, 2)
@@ -1040,10 +1045,11 @@ class Attention(nn.Module):
             record_event(enable_multi_streams, self.indexer.indexer_events, 0)
         with limit_core_num(enable_limit_core, qb_aic_num, qb_aic_num * self.aiv_to_aic_ratio):
             q = self.q_b_norm(q)
-            torch.ops.custom.inplace_partial_rotary_mul( # x: (T, 1, N, D); cos(T, 1, 1, D)
+            q = inplace_partial_rotary_mul( # x: (T, 1, N, D); cos(T, 1, 1, D)
                 q.flatten(0, 1).unsqueeze(2), cos, sin,
-                rotary_mode="interleave",
                 partial_slice=self.partial_slice,
+                platform_version=self.platform_version,
+                origin_shape=q.shape,
             )
             # update kv cache in default stream can remove tensormove
             wait_event(enable_multi_streams, self.mla_events, 2)
@@ -1228,10 +1234,11 @@ class Attention(nn.Module):
             cos = cos_sin["c1a"][0] if self.compress_ratio == 1 else cos_sin["comp"][0]
             sin = cos_sin["c1a_neg_sin"] if self.compress_ratio == 1 else cos_sin["comp_neg_sin"]
 
-        torch.ops.custom.inplace_partial_rotary_mul(
+        o = inplace_partial_rotary_mul(
             o.flatten(0, 1).unsqueeze(2), cos, sin,
-            rotary_mode="interleave",
             partial_slice=self.partial_slice,
+            platform_version=self.platform_version,
+            origin_shape=o.shape,
         )
 
         o = o.view(bsz * seq_len, self.num_groups_per_rank, -1).to(torch.bfloat16)

@@ -17,13 +17,14 @@ __all__ = ["get_window_topk_idxs", "get_compress_topk_idxs",
            "_prepare_4d_causal_attention_mask", "one_hot",
            "yarn_get_mscale", "DeepseekV3RMSNorm", "_init_rope", "apply_rotary_pos_emb",
            "DEEPSEEKV3_START_DOCSTRING", "DEEPSEEKV3_INPUTS_DOCSTRING", "DeepseekV3PreTrainedModel",
-           "apply_rotary_emb", "rotate_activation",
+           "apply_rotary_emb", "rotate_activation", "inplace_partial_rotary_mul"
            "Compressor", "Indexer", "CacheData", "AttnMetaData"]
 
 from .common_modules import (get_window_topk_idxs, get_compress_topk_idxs,
                         _prepare_4d_causal_attention_mask, one_hot, yarn_get_mscale,
                         DeepseekV3RMSNorm, _init_rope, apply_rotary_pos_emb, DEEPSEEKV3_START_DOCSTRING,
                         DEEPSEEKV3_INPUTS_DOCSTRING, DeepseekV3PreTrainedModel, apply_rotary_emb, rotate_activation,
+                        inplace_partial_rotary_mul
                         )
 from .compressor import Compressor
 from .indexer import Indexer
