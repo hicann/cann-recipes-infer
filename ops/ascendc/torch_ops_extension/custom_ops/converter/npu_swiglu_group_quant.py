@@ -31,16 +31,14 @@ from torchair.ge import attr
 def convert_npu_swiglu_group_quant(
     x: Tensor,
     *,
-    topk_weight: Optional[Tensor] = None,
+    weight: Optional[Tensor] = None,
     group_index: Optional[Tensor] = None,
     dst_type: int = 24,
-    quant_mode: int = 1,
-    group_size: int = 128,
+    quant_mode: int = 0,
+    block_size: int = 0,
     round_scale: bool = False,
-    ue8m0_scale: bool = False,
+    clamp_limit: Optional[float] = None,
     output_origin: bool = False,
-    group_list_type: int = 0,
-    clamp_value: float = 0.0,
     meta_outputs: Any = None):
     dst_type_code = 35
     if dst_type == 23:
@@ -52,21 +50,21 @@ def convert_npu_swiglu_group_quant(
     elif dst_type == 15:
         dst_type_code = 27
 
+    actual_clamp_limit = clamp_limit if clamp_limit is not None else -float("inf")
+
     return torchair.ge.custom_op(
         "SwigluGroupQuant",
         inputs={"x": x,
-                "topk_weight": topk_weight,
+                "weight": weight,
                 "group_index": group_index,
                 },
         attrs={
                "dst_type": attr.Int(dst_type_code),
                "quant_mode": attr.Int(quant_mode),
-               "group_size": attr.Int(group_size),
+               "block_size": attr.Int(block_size),
                "round_scale": attr.Bool(round_scale),
-               "ue8m0_scale": attr.Bool(ue8m0_scale),
                "output_origin": attr.Bool(output_origin),
-               "group_list_type": attr.Int(group_list_type),
-               "clamp_value": attr.Float(clamp_value),
+               "clamp_limit": attr.Float(actual_clamp_limit),
                },
-        outputs=['y', 'scale', 'y_origin']
+        outputs=['y', 'scale_out', 'y_origin']
     )

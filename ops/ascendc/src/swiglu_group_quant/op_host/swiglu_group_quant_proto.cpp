@@ -21,17 +21,17 @@ using namespace ge;
 namespace ops {
 constexpr size_t INPUT_IDX_X = 0;
 constexpr size_t OUTPUT_IDX_Y = 0;
-constexpr size_t OUTPUT_IDX_SCALE = 1;
+constexpr size_t OUTPUT_IDX_SCALE_OUT = 1;
+constexpr size_t OUTPUT_IDX_Y_ORIGIN = 2;
 constexpr int64_t NUM_TWO = 2;
 constexpr size_t ATTR_INDEX_DST_TYPE = 0;
 constexpr size_t ATTR_INDEX_QUANT_MODE = 1;
-constexpr size_t ATTR_INDEX_UE8M0_SCALE = 4;
-constexpr size_t ATTR_INDEX_OUTPUT_ORIGIN = 6;
+constexpr size_t ATTR_INDEX_OUTPUT_ORIGIN = 5;
 constexpr int64_t ACTIVATE_DIM = -1;
 constexpr int64_t PER_BLOCK_FP16 = 128;
 constexpr int64_t PER_MX_FP16 = 32;
-constexpr int64_t MX_QUANT_MODE = 2;
-constexpr int64_t FP8_QUANT_MODE = 3;
+constexpr int64_t BLOCK_QUANT_MODE = 0;
+constexpr int64_t MX_QUANT_MODE = 1;
 constexpr int64_t MX_SCALE_ALIGN_FACTOR = 2;
 
 graphStatus InferShape4SwigluGroupQuant(gert::InferShapeContext* context)
@@ -42,8 +42,10 @@ graphStatus InferShape4SwigluGroupQuant(gert::InferShapeContext* context)
     OPS_LOG_E_IF_NULL(context, xShape, ge::GRAPH_FAILED);
     gert::Shape* yShape = context->GetOutputShape(OUTPUT_IDX_Y);
     OPS_LOG_E_IF_NULL(context, yShape, ge::GRAPH_FAILED);
-    gert::Shape* scaleShape = context->GetOutputShape(OUTPUT_IDX_SCALE);
-    OPS_LOG_E_IF_NULL(context, scaleShape, ge::GRAPH_FAILED);
+    gert::Shape* scaleOutShape = context->GetOutputShape(OUTPUT_IDX_SCALE_OUT);
+    OPS_LOG_E_IF_NULL(context, scaleOutShape, ge::GRAPH_FAILED);
+    gert::Shape* yOriginShape = context->GetOutputShape(OUTPUT_IDX_Y_ORIGIN);
+    OPS_LOG_E_IF_NULL(context, yOriginShape, ge::GRAPH_FAILED);
 
     int64_t xDim = xShape->GetDimNum();
     int64_t splitDim = static_cast<int64_t>(xDim) - 1;
@@ -60,27 +62,27 @@ graphStatus InferShape4SwigluGroupQuant(gert::InferShapeContext* context)
     // infer yShape
     *yShape = *xShape;
     yShape->SetDim(splitDim, xShape->GetDim(splitDim) / NUM_TWO);
+    *yOriginShape = *yShape;
 
     auto attrsPtr = context->GetAttrs();
     OPS_LOG_E_IF_NULL(context, attrsPtr, ge::GRAPH_FAILED);
     auto quantModeAttr = attrsPtr->GetAttrPointer<int>(ATTR_INDEX_QUANT_MODE);
     bool isMxQuant = (quantModeAttr != nullptr && (*quantModeAttr == MX_QUANT_MODE)) ? true : false;
-    bool isFp8Quant = (quantModeAttr != nullptr && (*quantModeAttr == FP8_QUANT_MODE)) ? true : false;
 
-    // 设置Scale的shape
-    scaleShape->SetDimNum(1);
+    // 设置scale_out的shape
+    scaleOutShape->SetDimNum(1);
     for (int i = 0; i < xDim - 1; i++) {
-        scaleShape->AppendDim(xShape->GetDim(i));
+        scaleOutShape->AppendDim(xShape->GetDim(i));
     }
     if (isMxQuant) {
         int64_t tailDim = (xShape->GetDim(splitDim) / 2 + PER_MX_FP16 - 1) / PER_MX_FP16;
         // 额外地，mxFp8需要将最后一维reshape为(-1, 2)
         tailDim = (tailDim + MX_SCALE_ALIGN_FACTOR - 1) / MX_SCALE_ALIGN_FACTOR;
-        scaleShape->AppendDim(tailDim);
-        scaleShape->AppendDim(MX_SCALE_ALIGN_FACTOR);
+        scaleOutShape->AppendDim(tailDim);
+        scaleOutShape->AppendDim(MX_SCALE_ALIGN_FACTOR);
     } else {
         int64_t tailDim = (xShape->GetDim(splitDim) / 2 + PER_BLOCK_FP16 - 1) / PER_BLOCK_FP16;
-        scaleShape->AppendDim(tailDim);
+        scaleOutShape->AppendDim(tailDim);
     }
     OPS_LOG_D(context->GetNodeName(), "End to do InferShape4SwigluGroupQuant");
     return ge::GRAPH_SUCCESS;
@@ -93,19 +95,19 @@ graphStatus InferDtype4SwigluGroupQuant(gert::InferDataTypeContext* context)
     auto dstTypePtr = context->GetAttrs()->GetInt(ATTR_INDEX_DST_TYPE);
     ge::DataType dstType = static_cast<ge::DataType>(*dstTypePtr);
 
-    context->SetOutputDataType(ATTR_INDEX_DST_TYPE, dstType);
+    context->SetOutputDataType(OUTPUT_IDX_Y, dstType);
 
     auto attrsPtr = context->GetAttrs();
     OPS_LOG_E_IF_NULL(context, attrsPtr, ge::GRAPH_FAILED);
     auto quantModeAttr = attrsPtr->GetAttrPointer<int>(ATTR_INDEX_QUANT_MODE);
-    auto ue8m0ScalePtr = attrsPtr->GetAttrPointer<bool>(ATTR_INDEX_UE8M0_SCALE);
     bool isMxQuant = (quantModeAttr != nullptr && (*quantModeAttr == MX_QUANT_MODE)) ? true : false;
-    bool isFp8Quant = (quantModeAttr != nullptr && (*quantModeAttr == FP8_QUANT_MODE)) ? true : false;
-    if ((isFp8Quant && *ue8m0ScalePtr) || isMxQuant) {
-        context->SetOutputDataType(OUTPUT_IDX_SCALE, DT_FLOAT8_E8M0);
+    if (isMxQuant) {
+        context->SetOutputDataType(OUTPUT_IDX_SCALE_OUT, DT_FLOAT8_E8M0);
     } else {
-        context->SetOutputDataType(OUTPUT_IDX_SCALE, DT_FLOAT);
+        context->SetOutputDataType(OUTPUT_IDX_SCALE_OUT, DT_FLOAT);
     }
+    auto xDtype = context->GetInputDataType(INPUT_IDX_X);
+    context->SetOutputDataType(OUTPUT_IDX_Y_ORIGIN, xDtype);
     
     OPS_LOG_D(context->GetNodeName(), "InferDtype4SwigluGroupQuant end");
 

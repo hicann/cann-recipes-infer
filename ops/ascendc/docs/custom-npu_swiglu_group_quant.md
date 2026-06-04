@@ -1,94 +1,178 @@
-# custom-npu_swiglu_group_quant
+# custom.npu_swiglu_group_quant
 
 ## 产品支持情况
 
-| 产品      | 是否支持 |
-|:----------------------------|:-----------:|
-|Ascend 950PR/Ascend 950DT|      √     |
+| 产品 | 是否支持 |
+|:--|:--:|
+| Ascend 950PR/Ascend 950DT | √ |
 
 ## 功能说明
 
-在SwiGlu激活函数后添加量化操作，实现输入x的SwiGluQuant计算。根据quant_mode不同，量化分组大小有所差异：quant_mode=1或3时groupSize固定为128，quant_mode=2时groupSize固定为32。计算过程见计算公式。
+`npu_swiglu_group_quant`在SwiGLU激活函数后执行FP8量化，支持Block FP8量化和MX FP8量化两种模式。输入`x`最后一维按左右两半拆分，左半部分记为`A`，右半部分记为`B`。
 
 ### 计算公式
 
-  $$
-    Y_{tmp} = SwiGLU(x) = Swish(A)*B 
-  $$
+$$
+Y_{tmp}=SwiGLU(x)=Swish(A) * B
+$$
 
-  $$
-    scale=row\_max(abs(Y_{tmp}))/dstTypeScale
-  $$
+如果传入`clamp_limit`，在SwiGLU计算前对`A`和`B`执行如下截断：
 
-  $$
-    Y = Cast(Mul(Y_{tmp}, Scale))
-  $$
-     其中，A表示输入x的前半部分，B表示输入x的后半部分。
+$$
+A=Min(A, clamp\_limit)
+$$
+
+$$
+B=Min(Max(B, -clamp\_limit), clamp\_limit)
+$$
+
+如果传入`weight`，量化前按token乘到`Y_tmp`上：
+
+$$
+Y_{tmp}=Y_{tmp} * weight
+$$
+
+Block FP8量化模式下：
+
+$$
+scale\_out=block\_max(abs(Y_{tmp})) / dstTypeScale
+$$
+
+$$
+Y=Cast(Y_{tmp} / scale\_out)
+$$
+
+MX FP8量化模式下，按每32个通道计算scale，并输出`float8_e8m0`格式scale：
+
+$$
+scale\_out=mx\_scale(abs(Y_{tmp}), round\_scale)
+$$
+
+$$
+Y=Cast(Y_{tmp} / scale\_out)
+$$
 
 ## 函数原型
-```
-custom.npu_swiglu_group_quant(Tensor x, *, Tensor? topk_weight=None, Tensor? group_index=None, ScalarType dst_type, int quant_mode=1, int group_size=128, bool round_scale=False, bool ue8m0_scale=False, bool output_origin=False, int group_list_type=0, float clamp_value=0.0) -> (Tensor, Tensor, Tensor)
+
+```python
+custom.npu_swiglu_group_quant(
+    Tensor x,
+    *,
+    Tensor? weight=None,
+    Tensor? group_index=None,
+    ScalarType dst_type,
+    int quant_mode=0,
+    int block_size=0,
+    bool round_scale=False,
+    float? clamp_limit=None,
+    bool output_origin=False
+) -> (Tensor, Tensor, Tensor)
 ```
 
 ## 参数说明
 
->**说明：**<br> 
+> **说明：**
 >
->- b（batch size）表示输入样本批量大小、s（sequence length）表示输入样本序列长度、d（head dimension）表示注意力头的维度数、T表示bs合轴后的大小、G表示MoE场景下的分组数量。
+> - `T`表示除最后一维外所有维度合轴后的token数。
+> - `D`表示输入`x`最后一维，SwiGlu后输出隐藏维为`H = D / 2`。
+> - `G`表示`group_index`的元素个数。
 
--   **x**（`Tensor`）：必选参数，输入tensor，公式中的输入 x 。不支持非连续，数据格式支持ND，数据类型支持`float16`和`bfloat16`，shape为[ b, s, d ]或[ T, d ]（T为bs合轴后的大小）。
+- **x**（`Tensor`）：必选输入。SwiGLU的输入。不支持非连续，数据格式支持ND，数据类型支持`float16`和`bfloat16`。shape支持`[..., D]`，典型shape为`[b, s, D]`或`[T, D]`。
 
-- <strong>*</strong> ：代表其之前的参数是位置相关的，必须按照顺序输入，属于必选参数；其之后的参数是键值对赋值，与位置无关，属于可选参数（不传入会使用默认值）。
+- **\***：代表其之前的参数是位置相关参数，必须按照顺序输入；其之后的参数是关键字参数。
 
--   **topk_weight**（`Tensor`，可选）：MoE场景下的topk权重tensor，用于对SwiGLU输出进行加权。数据类型支持`float32`，shape为[ T, 1 ]。默认为None，表示不进行加权操作。
+- **weight**（`Tensor`，可选）：可选输入。量化前按token乘到SwiGLU输出上。不支持非连续，数据格式支持ND，数据类型支持`float32`。shape通常为`[T]`或`[T, 1]`，需要与`x`合轴后的token维匹配。
 
--   **group_index**（`Tensor`，可选）：MoE场景下分组索引tensor，用于指定每个group的token个数。数据类型支持`int64`，shape为[G]，其中G表示分组数量。该Tensor的数值总和代表输入x中的有效Token数。默认值为None，表示非MoE场景，此时所有Token都有效。
+- **group_index**（`Tensor`，可选）：可选输入。表示各group中的token数量，当前按count模式使用。不支持非连续，数据格式支持ND，数据类型支持`int64`。shape通常为`[G]`。传入后，算子只保证前`sum(group_index)`个token对应输出有效。
 
--   **dst_type**（`ScalarType`，可选）：量化输出数据类型，支持`torch.float8_e5m2`和`torch.float8_e4m3fn`。默认为`torch.float8_e4m3fn`。
+- **dst_type**（`ScalarType`）：必选属性。量化输出`y`的数据类型，仅支持`torch.float8_e4m3fn`和`torch.float8_e5m2`。
 
--   **quant_mode**（`int`, 可选）：量化模式，取值范围为1、2、3。
-    - 1：PerGroup fp8量化，量化输出scale为float32类型，groupSize固定为128。
-    - 2：MX fp8量化，量化输出scale为float8_e8m0类型，groupSize固定为32。
-    - 3：PerGroup fp8量化增强模式，groupSize固定为128。scale类型由ue8m0_scale参数决定：ue8m0_scale=False时scale为float32类型（与quant_mode=1功能相同），ue8m0_scale=True时scale为float8_e8m0类型。相比quant_mode=1，该模式还支持round_scale、output_origin等额外参数。
+- **quant_mode**（`int`，可选）：量化模式。默认值为`0`。
+  - `0`：Block FP8量化，`scale_out`数据类型为`float32`。
+  - `1`：MX FP8量化，`scale_out`数据类型为`float8_e8m0`。
 
--   **group_size**（`int`, 可选）：量化分组大小。quant_mode=1或3时固定为128；quant_mode=2时固定为32。默认为128。
+- **block_size**（`int`，可选）：量化block大小。默认值为`0`，表示使用当前`quant_mode`对应默认值。
+  - `quant_mode=0`时，仅支持`0`或`128`；`0`按`128`处理。
+  - `quant_mode=1`时，仅支持`0`或`32`；`0`按`32`处理。
 
--   **round_scale**（`bool`, 可选）：是否对scale进行舍入处理。默认为False。仅在quant_mode=3时有效。
+- **round_scale**（`bool`，可选）：是否对scale进行round处理。
+  - `quant_mode=0`时仅支持`False`。
+  - `quant_mode=1`时仅支持`True`。
 
--   **ue8m0_scale**（`bool`, 可选）：是否使用float8_e8m0格式输出scale。默认为False，scale为float32类型；设置为True时，scale为float8_e8m0类型。仅在quant_mode=3时有效。
+- **clamp_limit**（`float`，可选）：SwiGLU计算前对输入进行截断的阈值。不传入时不执行clamp；传入时取值必须大于等于`0.0`，不支持NaN。
 
--   **output_origin**（`bool`, 可选）：是否输出SwiGLU计算后的原始fp16/bf16结果。默认为False。仅在quant_mode=3时有效。
-
--   **group_list_type**（`int`, 可选）：分组列表类型，固定为0，默认为0，表示count模式。在count模式下，group_index的每个元素代表对应分组的元素个数。在quant_mode=1、2、3时均生效。
-
--   **clamp_value**（`float`, 可选）：SwiGLU激活函数的截断值。当clamp_value>0时，对激活值进行截断：A部分只有最大值约束，截断到不超过clamp_value；B部分截断到[-clamp_value, clamp_value]。默认为0.0，表示不进行截断。
-
+- **output_origin**（`bool`，可选）：是否在MX FP8量化模式下写出量化前的SwiGLU结果`y_origin`，默认值为`False`。`quant_mode=0`时该输出不作为有效结果使用。
 
 ## 返回值说明
 
--   **y**（`Tensor`）：输出tensor，量化后的value。不支持非连续，数据格式支持ND，数据类型支持`float8_e4m3fn`和`float8_e5m2`，shape为[ b, s, d/2 ]或[ T, d/2 ]。当使用group_index时，前有效Token数行的数据有效，其余为填充数据。
+- **y**（`Tensor`）：量化后的输出。数据格式支持ND，数据类型与`dst_type`一致，shape为`[..., H]`。
 
--   **scale**（`Tensor`）：输出tensor，量化后的scale。不支持非连续，数据格式支持ND。当quant_mode=1或quant_mode=3且ue8m0_scale=False时，数据类型为`float32`；当quant_mode=2或quant_mode=3且ue8m0_scale=True时，数据类型为`float8_e8m0`。
+- **scale_out**（`Tensor`）：量化scale输出。数据格式支持ND。
+  - `quant_mode=0`时，数据类型为`float32`，shape为`[..., ceil(H / 128)]`。
+  - `quant_mode=1`时，数据类型为`float8_e8m0`，shape为`[..., ceil(ceil(H / 32) / 2), 2]`。
 
--   **yOrigin**（`Tensor`）：输出tensor，SwiGLU计算后的原始结果。仅在quant_mode=3且output_origin=True时有效输出，其他情况下返回空tensor。数据类型与输入x相同（`float16`或`bfloat16`），shape为[ b, s, d/2 ]或[ T, d/2 ]。
+- **y_origin**（`Tensor`）：量化前的SwiGLU结果。数据格式支持ND，数据类型与`x`一致，shape与`y`一致。仅`quant_mode=1`且`output_origin=True`时结果有效；其他场景下该输出会分配但不保证写入有效业务数据。
 
 ## 约束说明
 
--  shape 字段取值范围约束
-    | quant_mode | d（最后一维）约束 |
-    |------------|------------------|
-    | 1 或 3     | 必须是256的倍数   |
-    | 2          | 必须是128的倍数   |
+- 输入`x`约束：
+  - rank必须大于0。
+  - 最后一维`D`必须大于等于`256`，且必须能被`256`整除。
+  - `D`会被均分为`A`和`B`两部分，因此SwiGLU输出最后一维为`H=D/2`。
+  - 数据类型仅支持`float16`和`bfloat16`，格式仅支持ND。
 
-- quant_mode 取值范围为1、2、3。具体说明详见参数说明中的quant_mode字段。
-- round_scale、ue8m0_scale、output_origin参数仅在quant_mode=3时有效。
-- group_list_type固定为0，表示count模式，在quant_mode=1、2、3时均生效。
-- group_index的数值总和必须不超过输入x的第一维大小。
-- 该接口支持推理场景下使用。
-- 该接口支持aclgraph入图。
-- 该接口与PyTorch配合使用时，需要保证CANN相关包与PyTorch相关包的版本匹配。
+- 属性取值约束：
 
-    
+  | 属性 | 支持取值 |
+  |:--|:--|
+  | `dst_type` | `torch.float8_e4m3fn`、`torch.float8_e5m2` |
+  | `quant_mode` | `0`、`1` |
+  | `block_size` | `quant_mode=0`时为`0`或`128`；`quant_mode=1`时为`0`或`32` |
+  | `round_scale` | `quant_mode=0`时必须为`False`；`quant_mode=1`时必须为`True` |
+  | `clamp_limit` | 不传入，或传入大于等于`0.0`的有限/无穷浮点值；不支持NaN |
+
+- 输出dtype约束：
+  - `y`数据类型必须与`dst_type`一致。
+  - `scale_out`在`quant_mode=0`时必须为`float32`，在`quant_mode=1`时必须为`float8_e8m0`。
+  - `y_origin`数据类型必须与`x`一致。
+
+- `group_index`约束：
+  - 仅支持count模式，表示每个group的token数量。
+  - 需要保证`sum(group_index) <= T`，否则可能访问超出`x`有效token范围。
+  - 传入`group_index`后，输出中超过`sum(group_index)`对应token范围的部分不保证为有效业务数据。
+
+- 其他约束：
+  - 该接口支持推理场景下使用。
+  - 该接口支持aclgraph入图。
+  - 该接口与PyTorch配合使用时，需要保证CANN相关包与PyTorch相关包的版本匹配。
+
 ## 调用示例
 
-- 详见 [test_npu_swiglu_group_quant.py](../examples/test_npu_swiglu_group_quant.py)
+```python
+import torch
+import torch_npu
+import custom_ops
+
+x = torch.randn(1, 128, 4096, device="npu", dtype=torch.float16)
+
+# Block FP8 quant
+y, scale, y_origin = torch.ops._ascend_dsv4.npu_swiglu_group_quant(
+    x,
+    dst_type=torch.float8_e5m2,
+    quant_mode=0,
+    block_size=0,
+    round_scale=False,
+)
+
+# MX FP8 quant
+y_mx, scale_mx, y_origin_mx = torch.ops._ascend_dsv4.npu_swiglu_group_quant(
+    x,
+    dst_type=torch.float8_e4m3fn,
+    quant_mode=1,
+    block_size=32,
+    round_scale=True,
+    output_origin=True,
+)
+```
+
+- 详见[test_npu_swiglu_group_quant.py](../examples/test_npu_swiglu_group_quant.py)

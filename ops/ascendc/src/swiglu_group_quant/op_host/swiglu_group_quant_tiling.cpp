@@ -13,6 +13,7 @@
  * \brief
  */
 
+#include <cmath>
 #include <sstream>
 #include "swiglu_group_quant_tiling.h"
 
@@ -39,30 +40,34 @@ int64_t RoundUp(int64_t x, int64_t y) {
 
 constexpr int64_t BLOCK_SIZE = 32;
 constexpr int64_t REPEAT_SIZE = 256;
+constexpr int64_t D_LIMIT = 256;
 constexpr int64_t DOUBLE_BUFFER = 2;
+constexpr int64_t FP8_BYTES = 1;
+constexpr int64_t B16_BYTES = 2;
+constexpr int64_t B32_BYTES = 4;
+constexpr int64_t FP8_ALIGN_NUM = BLOCK_SIZE / FP8_BYTES;
+constexpr int64_t B16_ALIGN_NUM = BLOCK_SIZE / B16_BYTES;
+constexpr int64_t B32_ALIGN_NUM = BLOCK_SIZE / B32_BYTES;
 constexpr int64_t PER_BLOCK_FP16 = 128;
 constexpr int64_t PER_MX_FP16 = 32;
-constexpr int64_t STATIC_QUANT = 1;
-constexpr int64_t MX_QUANT = 2;
-constexpr int64_t FP8_QUANT = 3;
+constexpr int64_t BLOCK_QUANT = 0;
+constexpr int64_t MX_QUANT = 1;
 constexpr size_t ATTR_INDEX_DST_TYPE = 0;
 constexpr size_t ATTR_INDEX_QUANT_MODE = 1;
-constexpr size_t ATTR_INDEX_GROUP_SIZE = 2;
+constexpr size_t ATTR_INDEX_BLOCK_SIZE = 2;
 constexpr size_t ATTR_INDEX_ROUND_SCALE = 3;
-constexpr size_t ATTR_INDEX_UE8M0_SCALE = 4;
+constexpr size_t ATTR_INDEX_CLAMP_LIMIT = 4;
 constexpr size_t ATTR_INDEX_OUTPUT_ORIGIN = 5;
-constexpr size_t ATTR_INDEX_GROUP_LIST_TYPE = 6;
-constexpr size_t ATTR_INDEX_CLAMP_VALUE = 7;
 constexpr size_t INPUT_INDEX_X = 0;
-constexpr size_t INPUT_INDEX_TOPK_WEIGHT = 1;
+constexpr size_t INPUT_INDEX_WEIGHT = 1;
 constexpr size_t INPUT_INDEX_GROUP_INDEX = 2;
+constexpr size_t OUTPUT_INDEX_Y = 0;
+constexpr size_t OUTPUT_INDEX_SCALE_OUT = 1;
+constexpr size_t OUTPUT_INDEX_Y_ORIGIN = 2;
 constexpr size_t CACHE_LINE_SIZE = 128;
-constexpr int64_t GROUP_LIST_TYPE_COUNT = 0;
-constexpr int64_t GROUP_LIST_TYPE_CUMSUM = 1;
-constexpr int64_t GROUP_QUANT_TILING_KEY = 1;
-constexpr int64_t MX_QUANT_TILING_KEY = 2;
-constexpr int64_t FP8_QUANT_TILING_KEY = 31;
-constexpr int64_t FP8_QUANT_YORIGIN_TILING_KEY = 32;
+constexpr int64_t BLOCK_QUANT_TILING_KEY = 1000;
+constexpr int64_t MX_QUANT_TILING_KEY = 2100;
+constexpr int64_t MX_QUANT_YORIGIN_TILING_KEY = 2200;
 
 }
 
@@ -91,40 +96,57 @@ ge::graphStatus SwigluGroupQuantTiling::GetAttr()
     auto* attrs = context_->GetAttrs();
     OPS_LOG_E_IF_NULL(context_, attrs, return ge::GRAPH_FAILED);
 
+    auto dstTypeAttr = attrs->GetAttrPointer<int>(ATTR_INDEX_DST_TYPE);
+    dstType_ = dstTypeAttr == nullptr ? ge::DT_FLOAT8_E4M3FN : static_cast<ge::DataType>(*dstTypeAttr);
+    OPS_ERR_IF((dstType_ != ge::DT_FLOAT8_E4M3FN && dstType_ != ge::DT_FLOAT8_E5M2),
+        OPS_LOG_E(context_->GetNodeName(), "attr dst_type only support FLOAT8_E4M3FN or FLOAT8_E5M2, got %d.",
+                  static_cast<int>(dstType_)),
+        return ge::GRAPH_FAILED);
+
     auto quantModeAttr = attrs->GetAttrPointer<int>(ATTR_INDEX_QUANT_MODE);
-    quantMode_ = quantModeAttr == nullptr ? STATIC_QUANT : *quantModeAttr;
-    if (quantMode_ != STATIC_QUANT && quantMode_ != MX_QUANT && quantMode_ != FP8_QUANT) {
-        return ge::GRAPH_FAILED;
-    }
-    splitFactor_ = quantMode_ == MX_QUANT ? PER_MX_FP16 : PER_BLOCK_FP16;
+    quantMode_ = quantModeAttr == nullptr ? BLOCK_QUANT : *quantModeAttr;
+    OPS_ERR_IF((quantMode_ != BLOCK_QUANT && quantMode_ != MX_QUANT),
+        OPS_LOG_E(context_->GetNodeName(), "attr quant_mode only support 0(block_quant) or 1(mx_quant), got %ld.",
+                  quantMode_),
+        return ge::GRAPH_FAILED);
+
+    auto blockSizeAttr = attrs->GetAttrPointer<int>(ATTR_INDEX_BLOCK_SIZE);
+    int64_t blockSize = blockSizeAttr == nullptr ? 0 : *blockSizeAttr;
+    int64_t expectedBlockSize = quantMode_ == MX_QUANT ? PER_MX_FP16 : PER_BLOCK_FP16;
+    OPS_ERR_IF((blockSize != 0 && blockSize != expectedBlockSize),
+        OPS_LOG_E(context_->GetNodeName(),
+                  "attr block_size should be 0 or %ld when quant_mode is %ld, got %ld.",
+                  expectedBlockSize, quantMode_, blockSize),
+        return ge::GRAPH_FAILED);
+
+    splitFactor_ = expectedBlockSize;
 
     auto roundScaleAttr = attrs->GetAttrPointer<bool>(ATTR_INDEX_ROUND_SCALE);
     if (roundScaleAttr != nullptr) {
         roundScale_ = (*roundScaleAttr) ? 1 : 0;
     }
-
-    auto ue8m0ScaleAttr = attrs->GetAttrPointer<bool>(ATTR_INDEX_UE8M0_SCALE);
-    if (ue8m0ScaleAttr != nullptr) {
-        ue8m0Scale_ = (*ue8m0ScaleAttr) ? 1 : 0;
-    }
+    OPS_ERR_IF((quantMode_ == BLOCK_QUANT && roundScale_ != 0),
+        OPS_LOG_E(context_->GetNodeName(), "attr round_scale should be false when quant_mode is 0."),
+        return ge::GRAPH_FAILED);
+    OPS_ERR_IF((quantMode_ == MX_QUANT && roundScale_ != 1),
+        OPS_LOG_E(context_->GetNodeName(), "attr round_scale should be true when quant_mode is 1."),
+        return ge::GRAPH_FAILED);
 
     auto outputOriginAttr = attrs->GetAttrPointer<bool>(ATTR_INDEX_OUTPUT_ORIGIN);
     if (outputOriginAttr != nullptr) {
         outputOrigin_ = (*outputOriginAttr) ? 1 : 0;
     }
 
-    auto groupListTypeAttr = attrs->GetAttrPointer<int>(ATTR_INDEX_GROUP_LIST_TYPE);
-    if (groupListTypeAttr != nullptr && *groupListTypeAttr != GROUP_LIST_TYPE_COUNT) {
-        OPS_LOG_E(context_, "group_list_type only support 0(count mode) now.");
-        return ge::GRAPH_FAILED;
-    }
-    groupListType_ = groupListTypeAttr == nullptr ? GROUP_LIST_TYPE_COUNT : *groupListTypeAttr;
-
-    auto clampValueAttr = attrs->GetAttrPointer<float>(ATTR_INDEX_CLAMP_VALUE);
-    if (clampValueAttr != nullptr) {
-        if (*clampValueAttr != 0.0) {
-            clampValue_ = *clampValueAttr;
-            hasClampValue_ = 1;
+    auto clampLimitAttr = attrs->GetAttrPointer<float>(ATTR_INDEX_CLAMP_LIMIT);
+    if (clampLimitAttr != nullptr) {
+        // -inf means user did not pass clamp_limit.
+        if (!(std::isinf(*clampLimitAttr) && *clampLimitAttr < 0.0f)) {
+            OPS_ERR_IF(!(*clampLimitAttr >= 0.0f),
+                OPS_LOG_E(context_->GetNodeName(), "attr clamp_limit should be greater than or equal to 0.0, got %f.",
+                          *clampLimitAttr),
+                return ge::GRAPH_FAILED);
+            clampLimit_ = *clampLimitAttr;
+            hasClampLimit_ = 1;
         }
     }
 
@@ -138,23 +160,31 @@ ge::graphStatus SwigluGroupQuantTiling::GetShapeAttrsInfoInner()
     OPS_LOG_E_IF_NULL(context_, shapeX, return ge::GRAPH_FAILED);
 
     auto xStorageShape = shapeX->GetStorageShape();
+    auto xDesc = context_->GetInputDesc(INPUT_INDEX_X);
+    OPS_LOG_E_IF_NULL(context_, xDesc, return ge::GRAPH_FAILED);
+    auto xDtype = xDesc->GetDataType();
+    auto xDimNum = xStorageShape.GetDimNum();
+    OPS_ERR_IF((xDimNum == 0),
+        OPS_LOG_E(context_->GetNodeName(), "input x dim num should be greater than 0."),
+        return ge::GRAPH_FAILED);
     bs_ = 1;
-    for (size_t i = 0; i < xStorageShape.GetDimNum() - 1; i++) {
+    for (size_t i = 0; i < xDimNum - 1; i++) {
         bs_ = bs_ * xStorageShape.GetDim(i);
     }
-    d_ = xStorageShape.GetDim(xStorageShape.GetDimNum() - 1);
-    if (d_ % 2 != 0) {
-        OPS_LOG_E(context_->GetNodeName(), "x last Dim[%ld] is not divisible by 2.", d_);
-        return ge::GRAPH_FAILED;
-    }
+    d_ = xStorageShape.GetDim(xDimNum - 1);
+    OPS_ERR_IF((d_ < D_LIMIT || d_ % D_LIMIT != 0),
+        OPS_LOG_E(context_->GetNodeName(),
+                  "input x last dim should be greater than or equal to %ld and divisible by %ld, got %ld.",
+                  D_LIMIT, D_LIMIT, d_),
+        return ge::GRAPH_FAILED);
 
-    auto topkWeightDesc = context_->GetOptionalInputDesc(INPUT_INDEX_TOPK_WEIGHT);
-    if (topkWeightDesc != nullptr) {
-        auto topkWeightShape = context_->GetOptionalInputShape(INPUT_INDEX_TOPK_WEIGHT);
-        if (topkWeightShape != nullptr) {
-            auto topkWeightStorageShape = topkWeightShape->GetStorageShape();
-            if (topkWeightStorageShape.GetDimNum() != 0) {
-                hasTopkWeight_ = true;
+    auto weightDesc = context_->GetOptionalInputDesc(INPUT_INDEX_WEIGHT);
+    if (weightDesc != nullptr) {
+        auto weightShape = context_->GetOptionalInputShape(INPUT_INDEX_WEIGHT);
+        if (weightShape != nullptr) {
+            auto weightStorageShape = weightShape->GetStorageShape();
+            if (weightStorageShape.GetDimNum() != 0) {
+                hasWeight_ = true;
             }
         }
     }
@@ -171,16 +201,39 @@ ge::graphStatus SwigluGroupQuantTiling::GetShapeAttrsInfoInner()
             hasGroupIndex_ = true;
         }
     }
-    
+
     // Get Attrs
     if (GetAttr() == ge::GRAPH_FAILED) {
         OPS_LOG_E(context_->GetNodeName(), "Get attr failed.");
         return ge::GRAPH_FAILED;
     }
 
-    OPS_ERR_IF((quantMode_ == FP8_QUANT && d_ % 256 != 0),
-                  OPS_LOG_E(context_->GetNodeName(), "x last Dim must be divisible by 256 when quant_mode == %d.", FP8_QUANT),
-                  return ge::GRAPH_FAILED);
+    auto yDesc = context_->GetOutputDesc(OUTPUT_INDEX_Y);
+    OPS_LOG_E_IF_NULL(context_, yDesc, return ge::GRAPH_FAILED);
+    auto yDtype = yDesc->GetDataType();
+    OPS_ERR_IF((yDtype != dstType_),
+        OPS_LOG_E(context_->GetNodeName(), "output y dtype should be same as dst_type, got y dtype %d, dst_type %d.",
+                  static_cast<int>(yDtype), static_cast<int>(dstType_)),
+        return ge::GRAPH_FAILED);
+
+    auto scaleOutDesc = context_->GetOutputDesc(OUTPUT_INDEX_SCALE_OUT);
+    OPS_LOG_E_IF_NULL(context_, scaleOutDesc, return ge::GRAPH_FAILED);
+    auto scaleOutDtype = scaleOutDesc->GetDataType();
+    auto expectedScaleOutDtype = quantMode_ == MX_QUANT ? ge::DT_FLOAT8_E8M0 : ge::DT_FLOAT;
+    OPS_ERR_IF((scaleOutDtype != expectedScaleOutDtype),
+        OPS_LOG_E(context_->GetNodeName(),
+                  "output scale_out dtype should be %d when quant_mode is %ld, got %d.",
+                  static_cast<int>(expectedScaleOutDtype), quantMode_, static_cast<int>(scaleOutDtype)),
+        return ge::GRAPH_FAILED);
+
+    auto yOriginDesc = context_->GetOutputDesc(OUTPUT_INDEX_Y_ORIGIN);
+    OPS_LOG_E_IF_NULL(context_, yOriginDesc, return ge::GRAPH_FAILED);
+    auto yOriginDtype = yOriginDesc->GetDataType();
+    OPS_ERR_IF((yOriginDtype != xDtype),
+        OPS_LOG_E(context_->GetNodeName(),
+                  "output y_origin dtype should be same as input x, got y_origin dtype %d, x dtype %d.",
+                  static_cast<int>(yOriginDtype), static_cast<int>(xDtype)),
+        return ge::GRAPH_FAILED);
 
     splitD_ = d_ / 2;
     scaleCol_ = CeilDiv(splitD_, splitFactor_);
@@ -189,7 +242,7 @@ ge::graphStatus SwigluGroupQuantTiling::GetShapeAttrsInfoInner()
 
 ge::graphStatus SwigluGroupQuantTiling::CalcGroupIndexTiling()
 {
-    if (hasGroupIndex_ && groupListType_ == GROUP_LIST_TYPE_COUNT) {
+    if (hasGroupIndex_) {
         gFactor_ = g_;
         int64_t groupIndexSize = RoundUp(gFactor_, BLOCK_SIZE / sizeof(int64_t)) * DOUBLE_BUFFER * sizeof(int64_t);
         int64_t groupIndexSumSize = BLOCK_SIZE;
@@ -216,7 +269,7 @@ ge::graphStatus SwigluGroupQuantTiling::CalcGroupIndexTiling()
     return ge::GRAPH_SUCCESS;
 }
 
-ge::graphStatus SwigluGroupQuantTiling::CalcMxQuantOpTiling() 
+ge::graphStatus SwigluGroupQuantTiling::CalcMxQuantOpTiling()
 {
     rowOfFormerBlock_ = CeilDiv(bs_, static_cast<int64_t>(coreNum_));
     usedCoreNums_ = std::min(CeilDiv(bs_, rowOfFormerBlock_), static_cast<int64_t>(coreNum_));
@@ -225,182 +278,23 @@ ge::graphStatus SwigluGroupQuantTiling::CalcMxQuantOpTiling()
     int64_t minRowPerCore = 1;
     int64_t rowOnceLoop = std::min(rowOfFormerBlock_, minRowPerCore);
 
-    int64_t x0Size = rowOnceLoop * RoundUp(splitD_, 16) * 2 * DOUBLE_BUFFER;     
-    int64_t x1Size = rowOnceLoop * RoundUp(splitD_, 16) * 2 * DOUBLE_BUFFER;    
-    int64_t swigluSize = rowOnceLoop * RoundUp(splitD_, 16) * 2;   
-    int64_t maxExpSize = rowOnceLoop * RoundUp(scaleCol_, 16) * 2;   
-    int64_t invScaleSize = rowOnceLoop * RoundUp(scaleCol_, 16) * 2; 
-    int64_t ySize = rowOnceLoop * RoundUp(splitD_, 32) * 1 * DOUBLE_BUFFER;    
-    int64_t scaleSize = rowOnceLoop * RoundUp(scaleCol_, 32) * 1 * DOUBLE_BUFFER; 
+    int64_t x0Size = rowOnceLoop * RoundUp(splitD_, B16_ALIGN_NUM) * B16_BYTES * DOUBLE_BUFFER;
+    int64_t x1Size = rowOnceLoop * RoundUp(splitD_, B16_ALIGN_NUM) * B16_BYTES * DOUBLE_BUFFER;
+    int64_t ySize = rowOnceLoop * RoundUp(splitD_, FP8_ALIGN_NUM) * FP8_BYTES * DOUBLE_BUFFER;
+    int64_t scaleSize = RoundUp(rowOnceLoop * scaleCol_, FP8_ALIGN_NUM) * FP8_BYTES * DOUBLE_BUFFER;
+    int64_t yFp32Size = rowOnceLoop * RoundUp(splitD_, B32_ALIGN_NUM) * B32_BYTES;
+    int64_t invScaleSize =
+        rowOnceLoop * RoundUp(CeilDiv(splitD_, B32_ALIGN_NUM), B32_ALIGN_NUM) * B32_BYTES;
 
-    int64_t totalSize = x0Size + x1Size + swigluSize + maxExpSize + invScaleSize + ySize + scaleSize;
+    int64_t totalSize = x0Size + x1Size + ySize + scaleSize + yFp32Size + invScaleSize;
 
-    int64_t topkWeightSize = RoundUp(rowOnceLoop, 8) * 4 * DOUBLE_BUFFER;
-    totalSize = hasTopkWeight_ ? totalSize + topkWeightSize : totalSize;
+    int64_t weightSize = RoundUp(rowOnceLoop, B32_ALIGN_NUM) * B32_BYTES * DOUBLE_BUFFER;
+    totalSize = hasWeight_ ? totalSize + weightSize : totalSize;
 
-    rowFactor_ = rowOnceLoop; 
-    if (totalSize <= ubSize_) {
-        // row和d均可以在ub内全载
-        dLoop_ = 1;
-        dFactor_ = splitD_;
-        tailDFactor_ = dFactor_;
-    } else {
-        dFactor_ = splitD_;
-        int64_t base = 1;
-        while (totalSize < ubSize_) {
-            dFactor_ = base * splitFactor_;
-            scaleCol_ = CeilDiv(dFactor_, splitFactor_);
-            x0Size = rowOnceLoop * RoundUp(dFactor_, 16) * 2 * DOUBLE_BUFFER;     
-            x1Size = rowOnceLoop * RoundUp(dFactor_, 16) * 2 * DOUBLE_BUFFER;    
-            swigluSize = rowOnceLoop * RoundUp(dFactor_, 16) * 2;   
-            maxExpSize = rowOnceLoop * RoundUp(scaleCol_, 16) * 2;   
-            invScaleSize = rowOnceLoop * RoundUp(scaleCol_, 16) * 2; 
-            ySize = rowOnceLoop * RoundUp(dFactor_, 32) * 1 * DOUBLE_BUFFER;    
-            scaleSize = rowOnceLoop * RoundUp(scaleCol_, 32) * 1 * DOUBLE_BUFFER; 
-            totalSize = x0Size + x1Size + swigluSize + maxExpSize + invScaleSize + ySize + scaleSize;
-            if (hasTopkWeight_) {
-                totalSize += topkWeightSize;
-            }
-            base++;
-        }
-        dFactor_ = (base - 1) * splitFactor_;
-        scaleCol_ = CeilDiv(dFactor_, splitFactor_);
-        dLoop_ = CeilDiv(splitD_, dFactor_);
-        tailDFactor_ = splitD_ % dFactor_ == 0 ? dFactor_ : splitD_ % dFactor_;
-    }
-
-    // d全载,尝试搬入更多的bs
-    if (dFactor_ == splitD_) {
-        while (rowFactor_ <= rowOfFormerBlock_) {
-            x0Size = rowFactor_ * RoundUp(dFactor_, 16) * 2 * DOUBLE_BUFFER;     
-            x1Size = rowFactor_ * RoundUp(dFactor_, 16) * 2 * DOUBLE_BUFFER;    
-            swigluSize = rowFactor_ * RoundUp(dFactor_, 16) * 2;   
-            maxExpSize = rowFactor_ * RoundUp(scaleCol_, 16) * 2;   
-            invScaleSize = rowFactor_ * RoundUp(scaleCol_, 16) * 2; 
-            ySize = rowFactor_ * RoundUp(dFactor_, 32) * 1 * DOUBLE_BUFFER;    
-            scaleSize = rowFactor_ * RoundUp(scaleCol_, 32) * 1 * DOUBLE_BUFFER; 
-            totalSize = x0Size + x1Size + swigluSize + maxExpSize + invScaleSize + ySize + scaleSize;
-            if (hasTopkWeight_) {
-                topkWeightSize = RoundUp(rowFactor_, 8) * 4 * DOUBLE_BUFFER;
-                totalSize += topkWeightSize;
-            }
-            if (totalSize > ubSize_) {
-                rowFactor_ = rowFactor_ - 1;
-                break;
-            }
-            rowFactor_ = rowFactor_ + 1;
-        }
-        rowFactor_ = rowFactor_ > rowOfFormerBlock_ ? rowFactor_ - 1 : rowFactor_;
-    }
-
-    rowLoopOfFormerBlock_ = CeilDiv(rowOfFormerBlock_, rowFactor_);
-    rowLoopOfTailBlock_ = CeilDiv(rowOfTailBlock_, rowFactor_);
-    tailRowFactorOfFormerBlock_ = rowOfFormerBlock_ % rowFactor_ == 0 ? rowFactor_ : rowOfFormerBlock_ % rowFactor_;
-    tailRowFactorOfTailBlock_ = rowOfTailBlock_ % rowFactor_ == 0 ? rowFactor_ : rowOfTailBlock_ % rowFactor_; 
-    SetTilingData(); 
-    return ge::GRAPH_SUCCESS;
-}
-
-ge::graphStatus SwigluGroupQuantTiling::CalcGroupQuantOpTiling() 
-{
-    rowOfFormerBlock_ = CeilDiv(bs_, static_cast<int64_t>(coreNum_));
-    usedCoreNums_ = std::min(CeilDiv(bs_, rowOfFormerBlock_), static_cast<int64_t>(coreNum_));
-    rowOfTailBlock_ = bs_ - (usedCoreNums_ - 1) * rowOfFormerBlock_;
-
-    int64_t minRowPerCore = 1;
-    int64_t rowOnceLoop = std::min(rowOfFormerBlock_, minRowPerCore);
-
-    int64_t x0Size = rowOnceLoop * RoundUp(splitD_, 16) * 2 * DOUBLE_BUFFER;     
-    int64_t x1Size = rowOnceLoop * RoundUp(splitD_, 16) * 2 * DOUBLE_BUFFER;    
-    int64_t ySize = rowOnceLoop * RoundUp(splitD_, 32) * 1 * DOUBLE_BUFFER;    
-    int64_t scaleSize = RoundUp(rowOnceLoop * scaleCol_, 8) * 4 * DOUBLE_BUFFER; 
-
-    int64_t totalSize = x0Size + x1Size + ySize + scaleSize;
-
-    int64_t topkWeightSize = RoundUp(rowOnceLoop, 8) * 4 * DOUBLE_BUFFER;
-    totalSize = hasTopkWeight_ ? totalSize + topkWeightSize : totalSize;
-
-    rowFactor_ = rowOnceLoop; 
-    if (totalSize <= ubSize_) {
-        // row和d均可以在ub内全载
-        dLoop_ = 1;
-        dFactor_ = splitD_;
-        tailDFactor_ = dFactor_;
-    } else {
-        dFactor_ = splitD_;
-        int64_t base = 1;
-        while (totalSize < ubSize_) {
-            dFactor_ = base * splitFactor_;
-            scaleCol_ = CeilDiv(dFactor_, splitFactor_);
-            x0Size = rowOnceLoop * RoundUp(dFactor_, 16) * 2 * DOUBLE_BUFFER;     
-            x1Size = rowOnceLoop * RoundUp(dFactor_, 16) * 2 * DOUBLE_BUFFER;    
-            ySize = rowOnceLoop * RoundUp(dFactor_, 32) * 1 * DOUBLE_BUFFER;    
-            scaleSize = RoundUp(rowOnceLoop * scaleCol_, 8) * 4 * DOUBLE_BUFFER; 
-            totalSize = x0Size + x1Size + ySize + scaleSize;
-            if (hasTopkWeight_) {
-                totalSize += topkWeightSize;
-            }
-            base++;
-        }
-        dFactor_ = (base - 1) * splitFactor_;
-        scaleCol_ = CeilDiv(dFactor_, splitFactor_);
-        dLoop_ = CeilDiv(splitD_, dFactor_);
-        tailDFactor_ = splitD_ % dFactor_ == 0 ? dFactor_ : splitD_ % dFactor_;
-    }
-
-    // d全载,尝试搬入更多的bs
-    if (dFactor_ == splitD_) {
-        while (rowFactor_ <= rowOfFormerBlock_) {
-            x0Size = rowFactor_ * RoundUp(dFactor_, 16) * 2 * DOUBLE_BUFFER;     
-            x1Size = rowFactor_ * RoundUp(dFactor_, 16) * 2 * DOUBLE_BUFFER;    
-            ySize = rowFactor_ * RoundUp(dFactor_, 32) * 1 * DOUBLE_BUFFER;    
-            scaleSize = RoundUp(rowFactor_ * scaleCol_, 8) * 4 * DOUBLE_BUFFER; 
-            totalSize = x0Size + x1Size + ySize + scaleSize;
-            if (hasTopkWeight_) {
-                topkWeightSize = RoundUp(rowFactor_, 8) * 4 * DOUBLE_BUFFER;
-                totalSize += topkWeightSize;
-            }
-            if (totalSize > ubSize_) {
-                rowFactor_ = rowFactor_ - 1;
-                break;
-            }
-            rowFactor_ = rowFactor_ + 1;
-        }
-        rowFactor_ = rowFactor_ > rowOfFormerBlock_ ? rowFactor_ - 1 : rowFactor_;
-    }
-
-    rowLoopOfFormerBlock_ = CeilDiv(rowOfFormerBlock_, rowFactor_);
-    rowLoopOfTailBlock_ = CeilDiv(rowOfTailBlock_, rowFactor_);
-    tailRowFactorOfFormerBlock_ = rowOfFormerBlock_ % rowFactor_ == 0 ? rowFactor_ : rowOfFormerBlock_ % rowFactor_;
-    tailRowFactorOfTailBlock_ = rowOfTailBlock_ % rowFactor_ == 0 ? rowFactor_ : rowOfTailBlock_ % rowFactor_;  
-    SetTilingData();
-    return ge::GRAPH_SUCCESS;
-}
-
-ge::graphStatus SwigluGroupQuantTiling::CalcFp8QuantOpTiling() 
-{
-    rowOfFormerBlock_ = CeilDiv(bs_, static_cast<int64_t>(coreNum_));
-    usedCoreNums_ = std::min(CeilDiv(bs_, rowOfFormerBlock_), static_cast<int64_t>(coreNum_));
-    rowOfTailBlock_ = bs_ - (usedCoreNums_ - 1) * rowOfFormerBlock_;
-
-    int64_t minRowPerCore = 1;
-    int64_t rowOnceLoop = std::min(rowOfFormerBlock_, minRowPerCore);
-
-    int64_t x0Size = rowOnceLoop * RoundUp(splitD_, 16) * 2 * DOUBLE_BUFFER;     
-    int64_t x1Size = rowOnceLoop * RoundUp(splitD_, 16) * 2 * DOUBLE_BUFFER;    
-    int64_t ySize = rowOnceLoop * RoundUp(splitD_, 32) * 1 * DOUBLE_BUFFER;    
-    int64_t scaleSize = ue8m0Scale_ ? RoundUp(rowOnceLoop * scaleCol_, 32) * 1 * DOUBLE_BUFFER : RoundUp(rowOnceLoop * scaleCol_, 8) * 4 * DOUBLE_BUFFER;
-
-    int64_t totalSize = x0Size + x1Size + ySize + scaleSize;
-
-    int64_t topkWeightSize = RoundUp(rowOnceLoop, 8) * 4 * DOUBLE_BUFFER;
-    totalSize = hasTopkWeight_ ? totalSize + topkWeightSize : totalSize;
-
-    int64_t yOriginSize = rowOnceLoop * RoundUp(splitD_, 16) * 2 * DOUBLE_BUFFER;
+    int64_t yOriginSize = rowOnceLoop * RoundUp(splitD_, B16_ALIGN_NUM) * B16_BYTES * DOUBLE_BUFFER;
     totalSize = outputOrigin_ ? totalSize + yOriginSize : totalSize;
-    
 
-    rowFactor_ = rowOnceLoop; 
+    rowFactor_ = rowOnceLoop;
     if (totalSize <= ubSize_) {
         // row和d均可以在ub内全载
         dLoop_ = 1;
@@ -412,16 +306,19 @@ ge::graphStatus SwigluGroupQuantTiling::CalcFp8QuantOpTiling()
         while (totalSize < ubSize_) {
             dFactor_ = base * splitFactor_;
             scaleCol_ = CeilDiv(dFactor_, splitFactor_);
-            x0Size = rowOnceLoop * RoundUp(dFactor_, 16) * 2 * DOUBLE_BUFFER;     
-            x1Size = rowOnceLoop * RoundUp(dFactor_, 16) * 2 * DOUBLE_BUFFER;    
-            ySize = rowOnceLoop * RoundUp(dFactor_, 32) * 1 * DOUBLE_BUFFER;    
-            scaleSize = RoundUp(rowOnceLoop * scaleCol_, 8) * 4 * DOUBLE_BUFFER; 
-            totalSize = x0Size + x1Size + ySize + scaleSize;
-            if (hasTopkWeight_) {
-                totalSize += topkWeightSize;
+            x0Size = rowOnceLoop * RoundUp(dFactor_, B16_ALIGN_NUM) * B16_BYTES * DOUBLE_BUFFER;
+            x1Size = rowOnceLoop * RoundUp(dFactor_, B16_ALIGN_NUM) * B16_BYTES * DOUBLE_BUFFER;
+            ySize = rowOnceLoop * RoundUp(dFactor_, FP8_ALIGN_NUM) * FP8_BYTES * DOUBLE_BUFFER;
+            scaleSize = RoundUp(rowOnceLoop * scaleCol_, FP8_ALIGN_NUM) * FP8_BYTES * DOUBLE_BUFFER;
+            yFp32Size = rowOnceLoop * RoundUp(dFactor_, B32_ALIGN_NUM) * B32_BYTES;
+            invScaleSize =
+                rowOnceLoop * RoundUp(CeilDiv(dFactor_, B32_ALIGN_NUM), B32_ALIGN_NUM) * B32_BYTES;
+            totalSize = x0Size + x1Size + ySize + scaleSize + yFp32Size + invScaleSize;
+            if (hasWeight_) {
+                totalSize += weightSize;
             }
             if (outputOrigin_) {
-                yOriginSize = rowOnceLoop * RoundUp(dFactor_, 16) * 2 * DOUBLE_BUFFER;
+                yOriginSize = rowOnceLoop * RoundUp(dFactor_, B16_ALIGN_NUM) * B16_BYTES * DOUBLE_BUFFER;
                 totalSize += yOriginSize;
             }
             base++;
@@ -435,17 +332,20 @@ ge::graphStatus SwigluGroupQuantTiling::CalcFp8QuantOpTiling()
     // d全载,尝试搬入更多的bs
     if (dFactor_ == splitD_) {
         while (rowFactor_ <= rowOfFormerBlock_) {
-            x0Size = rowFactor_ * RoundUp(dFactor_, 16) * 2 * DOUBLE_BUFFER;     
-            x1Size = rowFactor_ * RoundUp(dFactor_, 16) * 2 * DOUBLE_BUFFER;    
-            ySize = rowFactor_ * RoundUp(dFactor_, 32) * 1 * DOUBLE_BUFFER;    
-            scaleSize = RoundUp(rowFactor_ * scaleCol_, 8) * 4 * DOUBLE_BUFFER; 
-            totalSize = x0Size + x1Size + ySize + scaleSize;
-            if (hasTopkWeight_) {
-                topkWeightSize = RoundUp(rowFactor_, 8) * 4 * DOUBLE_BUFFER;
-                totalSize += topkWeightSize;
+            x0Size = rowFactor_ * RoundUp(dFactor_, B16_ALIGN_NUM) * B16_BYTES * DOUBLE_BUFFER;
+            x1Size = rowFactor_ * RoundUp(dFactor_, B16_ALIGN_NUM) * B16_BYTES * DOUBLE_BUFFER;
+            ySize = rowFactor_ * RoundUp(dFactor_, FP8_ALIGN_NUM) * FP8_BYTES * DOUBLE_BUFFER;
+            scaleSize = RoundUp(rowFactor_ * scaleCol_, FP8_ALIGN_NUM) * FP8_BYTES * DOUBLE_BUFFER;
+            yFp32Size = rowFactor_ * RoundUp(dFactor_, B32_ALIGN_NUM) * B32_BYTES;
+            invScaleSize =
+                rowFactor_ * RoundUp(CeilDiv(dFactor_, B32_ALIGN_NUM), B32_ALIGN_NUM) * B32_BYTES;
+            totalSize = x0Size + x1Size + ySize + scaleSize + yFp32Size + invScaleSize;
+            if (hasWeight_) {
+                weightSize = RoundUp(rowFactor_, B32_ALIGN_NUM) * B32_BYTES * DOUBLE_BUFFER;
+                totalSize += weightSize;
             }
             if (outputOrigin_) {
-                yOriginSize = rowFactor_ * RoundUp(dFactor_, 16) * 2 * DOUBLE_BUFFER;
+                yOriginSize = rowFactor_ * RoundUp(dFactor_, B16_ALIGN_NUM) * B16_BYTES * DOUBLE_BUFFER;
                 totalSize += yOriginSize;
             }
             if (totalSize > ubSize_) {
@@ -460,12 +360,88 @@ ge::graphStatus SwigluGroupQuantTiling::CalcFp8QuantOpTiling()
     rowLoopOfFormerBlock_ = CeilDiv(rowOfFormerBlock_, rowFactor_);
     rowLoopOfTailBlock_ = CeilDiv(rowOfTailBlock_, rowFactor_);
     tailRowFactorOfFormerBlock_ = rowOfFormerBlock_ % rowFactor_ == 0 ? rowFactor_ : rowOfFormerBlock_ % rowFactor_;
-    tailRowFactorOfTailBlock_ = rowOfTailBlock_ % rowFactor_ == 0 ? rowFactor_ : rowOfTailBlock_ % rowFactor_;  
+    tailRowFactorOfTailBlock_ = rowOfTailBlock_ % rowFactor_ == 0 ? rowFactor_ : rowOfTailBlock_ % rowFactor_;
     SetTilingData();
     return ge::GRAPH_SUCCESS;
 }
 
-void SwigluGroupQuantTiling::SetTilingData() 
+ge::graphStatus SwigluGroupQuantTiling::CalcBlockQuantOpTiling()
+{
+    rowOfFormerBlock_ = CeilDiv(bs_, static_cast<int64_t>(coreNum_));
+    usedCoreNums_ = std::min(CeilDiv(bs_, rowOfFormerBlock_), static_cast<int64_t>(coreNum_));
+    rowOfTailBlock_ = bs_ - (usedCoreNums_ - 1) * rowOfFormerBlock_;
+
+    int64_t minRowPerCore = 1;
+    int64_t rowOnceLoop = std::min(rowOfFormerBlock_, minRowPerCore);
+
+    int64_t x0Size = rowOnceLoop * RoundUp(splitD_, B16_ALIGN_NUM) * B16_BYTES * DOUBLE_BUFFER;
+    int64_t x1Size = rowOnceLoop * RoundUp(splitD_, B16_ALIGN_NUM) * B16_BYTES * DOUBLE_BUFFER;
+    int64_t ySize = rowOnceLoop * RoundUp(splitD_, FP8_ALIGN_NUM) * FP8_BYTES * DOUBLE_BUFFER;
+    int64_t scaleSize = RoundUp(rowOnceLoop * scaleCol_, B32_ALIGN_NUM) * B32_BYTES * DOUBLE_BUFFER;
+
+    int64_t totalSize = x0Size + x1Size + ySize + scaleSize;
+
+    int64_t weightSize = RoundUp(rowOnceLoop, B32_ALIGN_NUM) * B32_BYTES * DOUBLE_BUFFER;
+    totalSize = hasWeight_ ? totalSize + weightSize : totalSize;
+
+    rowFactor_ = rowOnceLoop;
+    if (totalSize <= ubSize_) {
+        // row和d均可以在ub内全载
+        dLoop_ = 1;
+        dFactor_ = splitD_;
+        tailDFactor_ = dFactor_;
+    } else {
+        dFactor_ = splitD_;
+        int64_t base = 1;
+        while (totalSize < ubSize_) {
+            dFactor_ = base * splitFactor_;
+            scaleCol_ = CeilDiv(dFactor_, splitFactor_);
+            x0Size = rowOnceLoop * RoundUp(dFactor_, B16_ALIGN_NUM) * B16_BYTES * DOUBLE_BUFFER;
+            x1Size = rowOnceLoop * RoundUp(dFactor_, B16_ALIGN_NUM) * B16_BYTES * DOUBLE_BUFFER;
+            ySize = rowOnceLoop * RoundUp(dFactor_, FP8_ALIGN_NUM) * FP8_BYTES * DOUBLE_BUFFER;
+            scaleSize = RoundUp(rowOnceLoop * scaleCol_, B32_ALIGN_NUM) * B32_BYTES * DOUBLE_BUFFER;
+            totalSize = x0Size + x1Size + ySize + scaleSize;
+            if (hasWeight_) {
+                totalSize += weightSize;
+            }
+            base++;
+        }
+        dFactor_ = (base - 1) * splitFactor_;
+        scaleCol_ = CeilDiv(dFactor_, splitFactor_);
+        dLoop_ = CeilDiv(splitD_, dFactor_);
+        tailDFactor_ = splitD_ % dFactor_ == 0 ? dFactor_ : splitD_ % dFactor_;
+    }
+
+    // d全载,尝试搬入更多的bs
+    if (dFactor_ == splitD_) {
+        while (rowFactor_ <= rowOfFormerBlock_) {
+            x0Size = rowFactor_ * RoundUp(dFactor_, B16_ALIGN_NUM) * B16_BYTES * DOUBLE_BUFFER;
+            x1Size = rowFactor_ * RoundUp(dFactor_, B16_ALIGN_NUM) * B16_BYTES * DOUBLE_BUFFER;
+            ySize = rowFactor_ * RoundUp(dFactor_, FP8_ALIGN_NUM) * FP8_BYTES * DOUBLE_BUFFER;
+            scaleSize = RoundUp(rowFactor_ * scaleCol_, B32_ALIGN_NUM) * B32_BYTES * DOUBLE_BUFFER;
+            totalSize = x0Size + x1Size + ySize + scaleSize;
+            if (hasWeight_) {
+                weightSize = RoundUp(rowFactor_, B32_ALIGN_NUM) * B32_BYTES * DOUBLE_BUFFER;
+                totalSize += weightSize;
+            }
+            if (totalSize > ubSize_) {
+                rowFactor_ = rowFactor_ - 1;
+                break;
+            }
+            rowFactor_ = rowFactor_ + 1;
+        }
+        rowFactor_ = rowFactor_ > rowOfFormerBlock_ ? rowFactor_ - 1 : rowFactor_;
+    }
+
+    rowLoopOfFormerBlock_ = CeilDiv(rowOfFormerBlock_, rowFactor_);
+    rowLoopOfTailBlock_ = CeilDiv(rowOfTailBlock_, rowFactor_);
+    tailRowFactorOfFormerBlock_ = rowOfFormerBlock_ % rowFactor_ == 0 ? rowFactor_ : rowOfFormerBlock_ % rowFactor_;
+    tailRowFactorOfTailBlock_ = rowOfTailBlock_ % rowFactor_ == 0 ? rowFactor_ : rowOfTailBlock_ % rowFactor_;
+    SetTilingData();
+    return ge::GRAPH_SUCCESS;
+}
+
+void SwigluGroupQuantTiling::SetTilingData()
 {
     tilingData_.set_bs(bs_);
     tilingData_.set_d(d_);
@@ -482,18 +458,16 @@ void SwigluGroupQuantTiling::SetTilingData()
     tilingData_.set_dFactor(dFactor_);
     tilingData_.set_tailDFactor(tailDFactor_);
     tilingData_.set_roundScale(roundScale_);
-    tilingData_.set_ue8m0Scale(ue8m0Scale_);
     tilingData_.set_outputOrigin(outputOrigin_);
-    tilingData_.set_clampValue(clampValue_);
+    tilingData_.set_clampLimit(clampLimit_);
     tilingData_.set_g(g_);
     tilingData_.set_ubSize(ubSize_);
     tilingData_.set_gLoop(gLoop_);
     tilingData_.set_gFactor(gFactor_);
     tilingData_.set_tailGFactor(tailGFactor_);
-    tilingData_.set_groupListType(groupListType_);
     tilingData_.set_coreNum(coreNum_);
-    tilingData_.set_hasClampValue(hasClampValue_);
-} 
+    tilingData_.set_hasClampLimit(hasClampLimit_);
+}
 
 ge::graphStatus SwigluGroupQuantTiling::CalcOpTiling() {
     ge::graphStatus status;
@@ -501,12 +475,10 @@ ge::graphStatus SwigluGroupQuantTiling::CalcOpTiling() {
     if (status == ge::GRAPH_FAILED) {
         return status;
     }
-    if (quantMode_ == STATIC_QUANT) {
-        status = CalcGroupQuantOpTiling();
+    if (quantMode_ == BLOCK_QUANT) {
+        status = CalcBlockQuantOpTiling();
     } else if (quantMode_ == MX_QUANT) {
         status = CalcMxQuantOpTiling();
-    } else {
-        status = CalcFp8QuantOpTiling();
     }
     return status;
 }
@@ -533,15 +505,13 @@ ge::graphStatus SwigluGroupQuantTiling::DoOpTiling()
         return ge::GRAPH_FAILED;
     }
     int64_t tilingKey = quantMode_;
-    if (quantMode_ == STATIC_QUANT) {
-        tilingKey = GROUP_QUANT_TILING_KEY;
+    if (quantMode_ == BLOCK_QUANT) {
+        tilingKey = BLOCK_QUANT_TILING_KEY;
     } else if (quantMode_ == MX_QUANT) {
-        tilingKey = MX_QUANT_TILING_KEY;
-    } else if (quantMode_ == FP8_QUANT) {
         if (outputOrigin_) {
-            tilingKey = FP8_QUANT_YORIGIN_TILING_KEY;
+            tilingKey = MX_QUANT_YORIGIN_TILING_KEY;
         } else {
-            tilingKey = FP8_QUANT_TILING_KEY;
+            tilingKey = MX_QUANT_TILING_KEY;
         }
     }
     context_->SetTilingKey(tilingKey);
@@ -586,5 +556,4 @@ ge::graphStatus TilingForSwigluGroupQuant(gert::TilingContext *context)
 IMPL_OP_OPTILING(SwigluGroupQuant)
     .Tiling(TilingForSwigluGroupQuant)
     .TilingParse<SwigluGroupQuantCompileInfo>(TilingPrepareForSwigluGroupQuant);
-
 }  // namespace optiling

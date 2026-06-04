@@ -17,7 +17,9 @@
 // step1, 为新增自定义算子添加定义
 TORCH_LIBRARY(custom, m) {
     m.def("npu_swiglu_clip_quant(Tensor x, Tensor group_index, Tensor group_alpha, *, bool activate_left=False, int quant_mode=1, int clamp_mode=1) -> (Tensor, Tensor)");
-    m.def("npu_swiglu_group_quant(Tensor x, *, Tensor? topk_weight=None, Tensor? group_index=None, ScalarType dst_type, int quant_mode=1, int group_size=128, bool round_scale=False, bool ue8m0_scale=False, bool output_origin=False, int group_list_type=0, float clamp_value=0.0) -> (Tensor, Tensor, Tensor)");
+    m.def("npu_swiglu_group_quant(Tensor x, *, Tensor? weight=None, Tensor? group_index=None, "
+        "ScalarType dst_type, int quant_mode=0, int block_size=0, bool round_scale=False, "
+        "float? clamp_limit=None, bool output_origin=False) -> (Tensor, Tensor, Tensor)");
     m.def("npu_hc_post(Tensor x, Tensor residual, Tensor post, Tensor comb) -> Tensor");
     m.def("indexer_compress_epilog(Tensor(a!) indexer_compress_cache, Tensor(b!) indexer_compress_scale, Tensor x, "
           "Tensor slot_mapping, *, int quant_mode=1, bool round_scale=True, float scale=1.0) -> ()");
