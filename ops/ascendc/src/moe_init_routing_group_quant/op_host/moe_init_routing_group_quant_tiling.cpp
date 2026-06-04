@@ -164,6 +164,7 @@ private:
     // 各阶段TilingData计算函数
     void Tiling4GatherOutCompute();
     void Tiling4GatherOutMxQuant();
+    void Tiling4GatherOutMxfp8Quant();
     void Tiling4GatherOutFp8GroupQuant();
     void Tiling4SortOutCompute();
     void Tiling4VMSMiddleCompute();
@@ -172,6 +173,7 @@ private:
     void Tiling4VBSOneCoreCompute(MoeV3Arch35VBSComputeTilingData *vbsTiling);
     void Tiling4VBSMultiCoreCompute(MoeV3Arch35VBSComputeTilingData *vbsTiling);
     int64_t CalcMaxRowIdxPerLoopMxQuant(int64_t perLoopCols);
+    int64_t CalcMaxRowIdxPerLoopMxfp8Quant(int64_t perLoopCols);
 
     // LogTilingData
     void LogBaseTilingData();
@@ -368,7 +370,7 @@ ge::graphStatus MoeInitRoutingV3Arch35Tiling::DoOpTiling()
     Tiling4SortOutCompute();
     Tiling4ExpertTokensCountCompute();
     if (quantMode_ == QUANT_MODE_MXFP8_E5M2 || quantMode_ == QUANT_MODE_MXFP8_E4M3FN) {
-        Tiling4GatherOutMxQuant();
+        Tiling4GatherOutMxfp8Quant();
     } else if (quantMode_ == QUANT_MODE_GROUP_FP8_E5M2 || quantMode_ == QUANT_MODE_GROUP_FP8_E4M3) {
         Tiling4GatherOutFp8GroupQuant();
     } else {
@@ -708,6 +710,12 @@ ge::graphStatus MoeInitRoutingV3Arch35Tiling::CheckSetInputs()
     tilingDataPtr_->k = k_;
     tilingDataPtr_->cols = cols_;
 
+    if (quantMode_ == QUANT_MODE_MXFP8_E5M2 || quantMode_ == QUANT_MODE_MXFP8_E4M3FN) {
+        OPS_ERR_IF(
+            (cols_ % 128) != 0,
+            OPS_LOG_E(context_, "cols_ %% 128 should equal to 0, cols_:%d", cols_),
+            return ge::GRAPH_FAILED);
+    }
     if (activeNum_ != ACTIVE_NUM_MIN_VALUE) {
         //! 出于历史调用的兼容性，保留校验activeNum=n*k，但实际上不使用该属性
         OPS_ERR_IF(
@@ -1186,6 +1194,21 @@ int64_t MoeInitRoutingV3Arch35Tiling::CalcMaxRowIdxPerLoopMxQuant(int64_t perLoo
     return (availUbSize_ - (xInSize + scaleSize + xOutSize)) / static_cast<int64_t>(sizeof(int32_t));
 }
 
+int64_t MoeInitRoutingV3Arch35Tiling::CalcMaxRowIdxPerLoopMxfp8Quant(int64_t perLoopCols)
+{
+    OPS_LOG_D(context_, "Entered MoeInitRoutingV3Arch35Tiling::CalcMaxRowIdxPerLoopMxfp8Quant(...)");
+
+    // 输入x[cols]所占大小：cols*sizeof(dtypeX)+cols*sizeof(Byte)
+    int64_t xInSize = AlignBytes(perLoopCols, sizeof(float)) + AlignBytes(perLoopCols, sizeof(int8_t));
+    // 输出scale[cols]所占大小：scaleCols*sizeof(dtypeX)*2+scaleCols*sizeof(Byte)
+    int64_t scaleSize = 2 * AlignBytes(perLoopCols / quantBlockSize_, sizeof(float)) +
+                 AlignBytes(perLoopCols / quantBlockSize_, sizeof(int8_t));
+    // 输出xOut[cols]所占大小：
+    int64_t xOutSize = Align(perLoopCols / 4, sizeof(int8_t)) * 4;
+    // 返回的是(availUbSize-每行输入x、输出scale、输出xOut所占的大小)/sizeof(int32)，应该是留给sortedRowIdx元素的数目
+    return (availUbSize_ - (xInSize + scaleSize + xOutSize)) / static_cast<int64_t>(sizeof(int32_t));
+}
+
 void MoeInitRoutingV3Arch35Tiling::Tiling4GatherOutMxQuant()
 {
     OPS_LOG_D(context_, "Entered MoeInitRoutingV3Arch35Tiling::Tiling4GatherOutMxQuant()");
@@ -1204,6 +1227,59 @@ void MoeInitRoutingV3Arch35Tiling::Tiling4GatherOutMxQuant()
     while (perLoopMaxIndicesElements <= 0) {
         perLoopCols = CeilAlign(CeilDiv(perLoopCols, NUM_TWO), quantBlockSize_);
         perLoopMaxIndicesElements = CalcMaxRowIdxPerLoopMxQuant(perLoopCols);
+    }
+    int64_t colsLoops = CeilDiv(tilingDataPtr_->cols, perLoopCols);
+    int64_t lastLoopCols = tilingDataPtr_->cols - (colsLoops - 1) * perLoopCols;
+    gatherOutTiling->needCoreNum = needCoreNum; // 没用这个，kernel根据读取到的expertTotalCount重新计算tiling相关值
+    gatherOutTiling->perCoreIndicesElements =
+        perCoreIndicesElements; // 没用这个，kernel根据读取到的expertTotalCount重新计算tiling相关值
+    gatherOutTiling->lastCoreIndicesElements =
+        lastCoreIndicesElements; // 没用这个，kernel根据读取到的expertTotalCount重新计算tiling相关值
+    gatherOutTiling->colsLoops = colsLoops;
+    gatherOutTiling->perLoopCols = perLoopCols;
+    gatherOutTiling->lastLoopCols = lastLoopCols;
+
+    int64_t perCorePerLoopIndicesElements = std::min(perLoopMaxIndicesElements, perCoreIndicesElements);
+    int64_t perCoreIndicesLoops = CeilDiv(perCoreIndicesElements, perCorePerLoopIndicesElements);
+    int64_t perCoreLastLoopIndicesElements =
+        perCoreIndicesElements - (perCoreIndicesLoops - 1) * perCorePerLoopIndicesElements;
+    gatherOutTiling->perCoreIndicesLoops =
+        perCoreIndicesLoops; // 没用这个，kernel根据读取到的expertTotalCount重新计算tiling相关值
+    gatherOutTiling->perCorePerLoopIndicesElements = perCorePerLoopIndicesElements;
+    gatherOutTiling->perCoreLastLoopIndicesElements =
+        perCoreLastLoopIndicesElements; // 没用这个，kernel根据读取到的expertTotalCount重新计算tiling相关值
+
+    int64_t lastCorePerLoopIndicesElements = std::min(perLoopMaxIndicesElements, lastCoreIndicesElements);
+    int64_t lastCoreIndicesLoops = CeilDiv(lastCoreIndicesElements, lastCorePerLoopIndicesElements);
+    int64_t lastCoreLastLoopIndicesElements =
+        lastCoreIndicesElements - (lastCoreIndicesLoops - 1) * lastCorePerLoopIndicesElements;
+    gatherOutTiling->lastCoreIndicesLoops =
+        lastCoreIndicesLoops; // 没用这个，kernel根据读取到的expertTotalCount重新计算tiling相关值
+    gatherOutTiling->lastCorePerLoopIndicesElements = lastCorePerLoopIndicesElements;
+    gatherOutTiling->lastCoreLastLoopIndicesElements =
+        lastCoreLastLoopIndicesElements; // 没用这个，kernel根据读取到的expertTotalCount重新计算tiling相关值
+
+    LogGatherOutTilingData();
+}
+
+void MoeInitRoutingV3Arch35Tiling::Tiling4GatherOutMxfp8Quant()
+{
+    OPS_LOG_D(context_, "Entered MoeInitRoutingV3Arch35Tiling::Tiling4GatherOutMxfp8Quant()");
+
+    auto *gatherOutTiling = &(tilingDataPtr_->gatherOutComputeParamsOp);
+    int64_t perCoreIndicesElements = CeilDiv(totalLength_, aivCoreNum_);
+    if (perCoreIndicesElements <= 0) {
+        gatherOutTiling->needCoreNum = 0;
+        return;
+    }
+    int64_t needCoreNum = CeilDiv(totalLength_, perCoreIndicesElements);
+    int64_t lastCoreIndicesElements = totalLength_ - (needCoreNum - 1) * perCoreIndicesElements;
+
+    int64_t perLoopCols = CeilAlign(tilingDataPtr_->cols, quantBlockSize_);
+    int64_t perLoopMaxIndicesElements = CalcMaxRowIdxPerLoopMxfp8Quant(perLoopCols);
+    while (perLoopMaxIndicesElements <= 0) {
+        perLoopCols = CeilAlign(CeilDiv(perLoopCols, NUM_TWO), quantBlockSize_);
+        perLoopMaxIndicesElements = CalcMaxRowIdxPerLoopMxfp8Quant(perLoopCols);
     }
     int64_t colsLoops = CeilDiv(tilingDataPtr_->cols, perLoopCols);
     int64_t lastLoopCols = tilingDataPtr_->cols - (colsLoops - 1) * perLoopCols;

@@ -28,47 +28,6 @@ using namespace AscendC::MicroAPI;
 constexpr float POS_INFINITY = INFINITY;
 constexpr float NEG_INFINITY = -INFINITY;
 
-__aicore__ inline int32_t CeilDiv(int32_t a, int b)
-{
-    if (b == 0) {
-        return a;
-    }
-    return (a + b - 1) / b;
-}
-
-__aicore__ inline int32_t CeilAlign(int32_t a, int b)
-{
-    return CeilDiv(a, b) * b;
-}
-
-template <typename T>
-__aicore__ inline int32_t RoundUp(int32_t num)
-{
-    int32_t elemNum = UB_BLOCK_SIZE / sizeof(T);
-    return CeilAlign(num, elemNum);
-}
-
-constexpr AscendC::MicroAPI::CastTrait castTraitB162B32Even = {
-    AscendC::MicroAPI::RegLayout::ZERO,
-    AscendC::MicroAPI::SatMode::UNKNOWN,
-    AscendC::MicroAPI::MaskMergeMode::ZEROING,
-    AscendC::RoundMode::UNKNOWN,
-};
-
-constexpr AscendC::MicroAPI::CastTrait castTraitB322B16Even = {
-    AscendC::MicroAPI::RegLayout::ZERO,
-    AscendC::MicroAPI::SatMode::NO_SAT,
-    AscendC::MicroAPI::MaskMergeMode::ZEROING,
-    AscendC::RoundMode::CAST_RINT,
-};
-
-constexpr static AscendC::MicroAPI::CastTrait castTraitF32toFp8Even = {
-    AscendC::MicroAPI::RegLayout::ZERO,
-    AscendC::MicroAPI::SatMode::NO_SAT,
-    AscendC::MicroAPI::MaskMergeMode::ZEROING,
-    AscendC::RoundMode::CAST_RINT,
-};
-
 template <typename T, typename U>
 class MoeGatherOutFp8GroupQuant {
 public:
@@ -323,48 +282,6 @@ __aicore__ inline void MoeGatherOutFp8GroupQuant<T, U>::CopyOut(int64_t dstIdx, 
 
     xQuantOutQueue_.FreeTensor(outLocal);
     scaleOutQueue_.FreeTensor(scaleLocal);
-}
-
-template <typename T>
-__aicore__ inline void LoadInputData(RegTensor<float>& dst, __local_mem__ T* src, MaskReg pregLoop, uint32_t srcOffset)
-{
-    if constexpr (IsSameType<T, float>::value) {
-        DataCopy(dst, src + srcOffset);
-    } else if constexpr (IsSameType<T, half>::value || IsSameType<T, bfloat16_t>::value) {
-        RegTensor<T> tmp;
-        DataCopy<T, AscendC::MicroAPI::LoadDist::DIST_UNPACK_B16>(tmp, src + srcOffset);
-        Cast<float, T, castTraitB162B32Even>(dst, tmp, pregLoop);
-    }
-}
-
-template <typename T>
-__aicore__ inline void StoreOutputData(__local_mem__ T* dst, RegTensor<float>& src, MaskReg pregLoop, uint32_t dstOffset)
-{
-    if constexpr (IsSameType<T, float>::value) {
-        DataCopy(dst + dstOffset, src, pregLoop);
-    } else if constexpr (IsSameType<T, half>::value || IsSameType<T, bfloat16_t>::value) {
-        RegTensor<T> tmp;
-        Cast<T, float, castTraitB322B16Even>(tmp, src, pregLoop);
-        DataCopy<T, AscendC::MicroAPI::StoreDist::DIST_PACK_B32>(dst + dstOffset, tmp, pregLoop);
-    } else if constexpr (IsSameType<T, fp8_e4m3fn_t>::value || IsSameType<T, fp8_e5m2_t>::value) {
-        RegTensor<T> tmp;
-        Cast<T, float, castTraitF32toFp8Even>(tmp, src, pregLoop);
-        DataCopy<T, AscendC::MicroAPI::StoreDist::DIST_PACK4_B32>(dst + dstOffset, tmp, pregLoop);
-    }
-}
-
-template <typename T>
-__aicore__ inline void StoreOuputDataUnalign(RegTensor<float>& src, __local_mem__ T*& dst, UnalignReg& uDst, MaskReg pregLoop, uint32_t postUpdateStride)
-{
- 	 if constexpr (IsSameType<T, float>::value) {
- 	     DataCopyUnAlign(dst, src, uDst, postUpdateStride);
- 	 } else if constexpr (IsSameType<T, half>::value || IsSameType<T, bfloat16_t>::value) {
- 	     RegTensor<T> tmp;
- 	     RegTensor<T> tmpPack;
- 	     Cast<T, float, castTraitB322B16Even>(tmp, src, pregLoop);
- 	     Pack((RegTensor<uint16_t>&)tmpPack, (RegTensor<uint32_t>&)tmp);
- 	     DataCopyUnAlign(dst, tmpPack, uDst, postUpdateStride);
- 	 }
 }
 
 template <typename T, typename U>
