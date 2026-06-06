@@ -109,8 +109,7 @@ class CacheData(nn.Module):
     def init_cache_c4a(self, cache_dict):
         compress_ratio = 4
         cmp_block_num = self.get_block_num(self.pa_max_length // compress_ratio)
-        num_ratio_group = calc_num_ratio_group(next_n=self.next_n, overlap=1)
-        state_block_num = self.get_block_num(num_ratio_group * compress_ratio)
+        state_block_num = 2 * self.batch_size_per_rank + self.pre_pad_num_block  # 2: 2 blocks required if overlap
         cache_dict = self.update_win_cache(cache_dict)
         cache_dict.update({
             "sfa_cmp_kv": self.create_cache(cmp_block_num, self.cache_dim, self.cmp_kv_dtype),
@@ -285,6 +284,7 @@ class AttnMetaData(nn.Module):
 
     def calc_state_block_table(
             self,
+            ratio,
             block_num_per_batch,
             batch_size_per_rank,
             attn_metadata,
@@ -292,8 +292,7 @@ class AttnMetaData(nn.Module):
     ):
         actual_seq_len = attn_metadata['start_pos'] + attn_metadata['seq_used_q']
         block_table_len = math.ceil(self.pa_max_length / self.block_size)
-
-        actual_block_start_pos = (attn_metadata['start_pos'] // self.block_size).view(batch_size_per_rank, 1).repeat(1, block_table_len)
+        compressed_len = ratio * 2 if ratio == 4 else ratio  # 2: when ratio is 4 require overlap
         actual_block_end_pos = ((actual_seq_len - 1) // self.block_size).view(batch_size_per_rank, 1).repeat(1, block_table_len)
         block_pos_ids = torch.arange(block_table_len, dtype=torch.int32, device="npu").repeat(batch_size_per_rank, 1)
         block_table_offset = torch.arange(batch_size_per_rank * block_num_per_batch, dtype=torch.int32, device="npu").\
@@ -303,22 +302,22 @@ class AttnMetaData(nn.Module):
 
         block_table = torch.zeros((batch_size_per_rank, block_table_len), dtype=torch.int32, device="npu")
         if is_prefill:
-            block_table = torch.where(
-                block_pos_ids == actual_block_end_pos,
-                block_table_offset,
-                block_table
-            )
+            actual_block_start_pos = ((actual_seq_len - compressed_len - 1) // self.block_size).\
+                view(batch_size_per_rank, 1).repeat(1, block_table_len)
         else:
-            block_table = torch.where(
-                block_pos_ids >= actual_block_start_pos,
-                block_table_offset,
-                block_table
-            )
-            block_table = torch.where(
-                block_pos_ids <= actual_block_end_pos,
-                block_table,
-                0
-            )
+            actual_compressed_start_pos = attn_metadata['start_pos'] // compressed_len * compressed_len
+            actual_block_start_pos = (actual_compressed_start_pos // self.block_size).view(batch_size_per_rank, 1).\
+                repeat(1, block_table_len)
+        block_table = torch.where(
+            block_pos_ids >= actual_block_start_pos,
+            block_table_offset,
+            block_table
+        )
+        block_table = torch.where(
+            block_pos_ids <= actual_block_end_pos,
+            block_table,
+            0
+        )
         return block_table
 
     def init_win_kv_block_table_and_slot_mapping(
@@ -479,9 +478,13 @@ class AttnMetaData(nn.Module):
 
         # kv_state and score state
         num_ratio_group = calc_num_ratio_group(self.next_n, overlap)
-        state_block_num_per_batch = self.get_block_num_per_batch(num_ratio_group * ratio)
+        state_block_num_per_batch = 2 if overlap > 0 else self.get_block_num_per_batch(num_ratio_group * ratio)
         attn_metadata["block_table"][f"c{ratio}a_cmp_state"] = \
-            self.calc_state_block_table(state_block_num_per_batch, batch_size_per_rank, attn_metadata, is_prefill)
+            self.calc_state_block_table(ratio,
+                                        state_block_num_per_batch,
+                                        batch_size_per_rank,
+                                        attn_metadata,
+                                        is_prefill)
 
     def get_attn_metadata(
         self,
