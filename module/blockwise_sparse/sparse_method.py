@@ -1208,7 +1208,7 @@ class HunyuanVideoTopKAdapter(TopKPredictor):
         sabi_tensor = sabi_tensor.to(device=q1.device, dtype=torch.uint16).contiguous()
         actseqlen = [cu_seqlens_q[1]] * b
         actseqlenkv = [cu_seqlens_kv[1]] * b
-        attn1 = torch_bsa.blitz_sparse_attention(
+        attn1, _ = torch_bsa.blitz_sparse_attention(
             q1,
             k1,
             v1,
@@ -1221,6 +1221,8 @@ class HunyuanVideoTopKAdapter(TopKPredictor):
             scale_value=scale,
             atten_mask=None,
             sparse_mode=0,
+            softmax_lse_flag=False,
+            block_shape=[self.block_size_q, self.block_size_k],
         )
         attn1 = self.move_sink_frame_back(attn1, self.sink_frame_len)
         if sink_dense_q_len > 0:
@@ -1444,7 +1446,7 @@ class HunyuanVideoSVGAdapter(SVGPredictor):
 
             sabi_tensor = sabi_tensor.contiguous()
             sabi_tensor = sabi_tensor.to(q.device).to(torch.uint16)
-            attn1 = torch_bsa.blitz_sparse_attention(
+            attn1, _ = torch_bsa.blitz_sparse_attention(
                 q1, k1, v1,
                 sabi=sabi_tensor,
                 actual_seq_lengths=actseqlen,
@@ -1455,6 +1457,8 @@ class HunyuanVideoSVGAdapter(SVGPredictor):
                 scale_value=scale,
                 atten_mask=None,
                 sparse_mode=0,
+                softmax_lse_flag=False,
+                block_shape=[self.block_size_q, self.block_size_k],
             )
             for h in range(n):
                 if pattern[h] == False:

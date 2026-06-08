@@ -542,7 +542,10 @@ def _sync_scalar_for_sp(self, value: float) -> float:
 
  bash build.sh --make_clean --experimental -j96 --pkg --soc=ascend910_93 --ops=blitz_sparse_attention #（--soc，A2：ascend910b，A3：ascend910_93）
  ./build/cann-ops-transformer-custom_linux-"$(uname -i)".run
- cd experimental/attention/blitz_sparse_attention/torch_interface && bash build.sh custom
+ (cd experimental/attention/blitz_sparse_attention/torch_interface && bash build.sh custom)
+
+ # short test: kernel & python api (remove 'test_joint.py' to run full test suite)
+(cd experimental/attention/blitz_sparse_attention/benchmark && pytest test_joint.py)
  ```
 
 #### TopK
