@@ -1,0 +1,43 @@
+# Step-3.7-Flash text MoE backbone — 16-rank (8-card x 2-die) npugraph_ex (aclgraph) Decode.
+# Strategy A: Attn DP16 (attn_tp=1) + MoE EP16 (moe_tp=1) + Embed/LMHead TP16.
+# Decode runs via aclgraph capture & replay (npugraph_ex backend); Prefill stays
+# eager. dense_tp=1 keeps the decode graph free of the dense_tp AllReduce. RoPE
+# uses the 3D npu_rotary_mul path (TND).
+#
+# Decode MoE EP runs MC2 (npu_moe_distribute_*_v2) with the op default comm_alg
+# (mc2_comm_alg defaults to "" in modeling).
+#
+# NOTE: requires the remote torch_npu dev-build static_kernel.py indentation fix
+# to be in place (npugraph_ex import prerequisite; site-packages, not in repo).
+#
+# Rollback: eager decode (step3p7_flash_rank16_attndp16_ep16.yaml).
+
+model_config:
+  model_name: "step3p7_flash"
+  model_path: "/data/model/Step-3.7-Flash"
+  exe_mode: "npugraph_ex"   # Decode -> aclgraph capture&replay; Prefill stays eager
+  with_ckpt: True
+  enable_profiler: False
+  enable_weight_nz: True
+  force_eplb: False
+  enable_cache_compile: False
+  custom_params:
+    moe_chunk_max_len: 65536
+
+data_config:
+  dataset: "default"
+  input_truncated_len: 4096
+
+parallel_config:
+  world_size: 16
+  attn_tp_size: 1                   # attn_dp_size = 16
+  dense_tp_size: 1                  # dense FFN TP1 (no dense AllReduce in graph)
+  moe_tp_size: 1                    # moe_ep_size = 16 (288/16 = 18 experts/rank)
+  embed_tp_size: 16
+  lmhead_tp_size: 16
+
+scheduler_config:
+  block_size: 128
+  max_new_tokens: 256
+  max_prefill_tokens: 4096
+  batch_size: 16                    # global, divisible by ep_size(16)

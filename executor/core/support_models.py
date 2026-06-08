@@ -60,6 +60,10 @@ _specs: dict[str, list[tuple[str, str]]] = {
         ("models.qwen3_moe.models.modeling_qwen3_moe", "Qwen3MoeForCausalLM"),
         ("models.qwen3_moe.models.configuration_qwen3_moe", "Qwen3MoeConfig"),
     ],
+    "step3p7_flash": [
+        ("models.step3p7_flash.models.modeling_step3p7", "Step3p5ForCausalLM"),
+        ("models.step3p7_flash.models.configuration_step3p7", "Step3p7TextConfig"),
+    ],
     "qwen3.5": [
         ("models.qwen3_5.models.modeling_qwen3_5_moe", "Qwen3_5MoeForCausalLM"),
         ("models.qwen3_5.models.configuration_qwen3_5_moe", "Qwen3_5MoeTextConfig"),

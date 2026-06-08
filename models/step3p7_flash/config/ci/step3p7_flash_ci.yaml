@@ -1,0 +1,36 @@
+# Step-3.7-Flash CI / smoke config — reduced layers, dummy weights.
+# Used to validate framework wiring (import / construct / forward shapes)
+# WITHOUT the full (~394 GB) checkpoint. with_ckpt=False -> DummyModelLoader.
+# num_hidden_layers is overridden via custom_params so the model builds quickly.
+# Still requires 16 dies because MoE EP16 + MC2 decode needs ep_world_size>=16.
+
+model_config:
+  model_name: "step3p7_flash"
+  model_path: "/data/model/Step-3.7-Flash"
+  exe_mode: "eager"
+  with_ckpt: False                  # dummy weights — no checkpoint needed
+  enable_profiler: False
+  enable_weight_nz: False
+  force_eplb: False
+  enable_cache_compile: False
+  custom_params:
+    num_hidden_layers: 8            # reduced backbone for fast smoke construct
+    moe_chunk_max_len: 4096
+
+data_config:
+  dataset: "default"
+  input_truncated_len: 256
+
+parallel_config:
+  world_size: 16
+  attn_tp_size: 1
+  dense_tp_size: 8
+  moe_tp_size: 1
+  embed_tp_size: 16
+  lmhead_tp_size: 16
+
+scheduler_config:
+  block_size: 128
+  max_new_tokens: 8
+  max_prefill_tokens: 256
+  batch_size: 16

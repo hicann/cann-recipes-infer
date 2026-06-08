@@ -1,0 +1,20 @@
+# Target environment: CANN 9.0.0 / torch 2.8.0 / torch_npu 2.8.0 / transformers 5.0.0.
+torch==2.8.0
+transformers==5.0.0
+datasets==3.6.0
+numpy==1.26.4
+protobuf==6.31.0
+decorator==5.2.1
+scipy==1.15.3
+attrs==25.3.0
+psutil==7.0.0
+compressed-tensors==0.6.0
+accelerate==1.0.1
+einops==0.8.0
+
+# --- Vision (image+text) only ---------------------------------------
+# Needed by the vision preprocessing path (models/processing_step3p7.py:
+# torchvision transforms + PIL). NOT required for the text-only backbone.
+# torchvision must match your installed torch (e.g. 0.23.0 for torch 2.8.0).
+torchvision==0.23.0
+Pillow>=10.0

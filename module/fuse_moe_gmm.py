@@ -63,11 +63,28 @@ class UnquantizedFusedMoEGMMMethod(QuantizeMethodBase):
             x: torch.Tensor,
             expert_tokens: torch.Tensor,
             group_list_type: int,
+            swiglu_limit: Optional[float] = None,
             **kwargs,
     ) -> torch.Tensor:
         mm1_mm3 = torch_npu.npu_grouped_matmul([x], [layer.w13_weight],
             group_list=expert_tokens, group_type=0, group_list_type=group_list_type, split_item=3)[0]
-        mm1_mm3 = torch_npu.npu_swiglu(mm1_mm3)
+        if swiglu_limit is None:
+            # Default fast path (unchanged): fused standard SwiGLU
+            # silu(gate) * up, with w13 merged as [gate_half | up_half].
+            mm1_mm3 = torch_npu.npu_swiglu(mm1_mm3)
+        else:
+            # Clamped SwiGLU (Step-3.7-Flash routed experts L43/44). npu_swiglu
+            # has no clamp/limit input, so unfuse: split w13 output into the
+            # first-half (gate) and second-half (up) blocks (FusedMoEGMM merges
+            # gate+up as two contiguous halves, NOT the gpt_oss interleave),
+            # apply standard silu (alpha=1) then clamp AFTER silu, up clamped to
+            # [-limit, limit], up has NO +1. Matches the original HF reference
+            # Step3p7MoEMLP.get_expert_output.
+            gate, up = mm1_mm3.chunk(2, dim=-1)
+            gate = torch.nn.functional.silu(gate)
+            gate = gate.clamp(min=None, max=swiglu_limit)
+            up = up.clamp(min=-swiglu_limit, max=swiglu_limit)
+            mm1_mm3 = gate * up
         out = torch_npu.npu_grouped_matmul(
             [mm1_mm3], [layer.w2_weight],
             group_list=expert_tokens, group_type=0, group_list_type=group_list_type, split_item=3)[0]

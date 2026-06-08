@@ -1,0 +1,40 @@
+# Step-3.7-Flash text MoE backbone — 16-rank (8-card x 2-die) EAGER base config (candidate A).
+# Strategy A (high throughput): Attn DP16 (attn_tp=1) + MoE EP16 (moe_tp=1)
+#   + Dense FFN TP8 + Embed/LMHead TP16. BF16.
+# Decode MoE EP runs MC2 (npu_moe_distribute_*_v2) with the op default comm_alg
+# (mc2_comm_alg defaults to "" in modeling). dense_tp=8 for eager; the graph-mode
+# configs use dense_tp=1 to keep the decode graph free of the dense_tp AllReduce.
+#
+# NOTE: requires 16 dies (Atlas A3, 8 cards x 2 die). Single card (64 GB) cannot
+# hold the ~394 GB BF16 backbone. Weights are loaded from the original (unsharded)
+# checkpoint; online split happens via each parallel layer's weight_loader.
+
+model_config:
+  model_name: "step3p7_flash"
+  model_path: "/data/model/Step-3.7-Flash"
+  exe_mode: "eager"                 # ["eager", "npugraph_ex"]
+  with_ckpt: True                   # [False, True]
+  enable_profiler: False
+  enable_weight_nz: True
+  force_eplb: False
+  enable_cache_compile: False
+  custom_params:
+    moe_chunk_max_len: 65536
+
+data_config:
+  dataset: "default"                # ["default", "LongBench"]
+  input_truncated_len: 4096
+
+parallel_config:
+  world_size: 16
+  attn_tp_size: 1                   # attn_dp_size = 16
+  dense_tp_size: 8                  # dense FFN (layers 0-2) TP8
+  moe_tp_size: 1                    # moe_ep_size = 16 (288/16 = 18 experts/rank)
+  embed_tp_size: 16
+  lmhead_tp_size: 16
+
+scheduler_config:
+  block_size: 128
+  max_new_tokens: 256
+  max_prefill_tokens: 4096
+  batch_size: 16                    # global, divisible by ep_size(16)
