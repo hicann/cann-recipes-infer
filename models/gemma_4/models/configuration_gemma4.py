@@ -59,15 +59,10 @@ class Gemma4TextConfig(PretrainedConfig):
         num_global_key_value_heads=None,
         global_head_dim=512,
         attention_k_eq_v=False,
-        num_kv_shared_layers=0,
         enable_moe_block=False,
         num_experts=None,
         top_k_experts=None,
         moe_intermediate_size=None,
-        hidden_size_per_layer_input=0,
-        vocab_size_per_layer_input=262144,
-        use_double_wide_mlp=False,
-        use_bidirectional_attention=None,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -90,15 +85,10 @@ class Gemma4TextConfig(PretrainedConfig):
         self.num_global_key_value_heads = num_global_key_value_heads
         self.global_head_dim = global_head_dim
         self.attention_k_eq_v = attention_k_eq_v
-        self.num_kv_shared_layers = num_kv_shared_layers
         self.enable_moe_block = enable_moe_block
         self.num_experts = num_experts
         self.top_k_experts = top_k_experts
         self.moe_intermediate_size = moe_intermediate_size
-        self.hidden_size_per_layer_input = hidden_size_per_layer_input
-        self.vocab_size_per_layer_input = vocab_size_per_layer_input
-        self.use_double_wide_mlp = use_double_wide_mlp
-        self.use_bidirectional_attention = use_bidirectional_attention
 
         # Build rope_parameters with defaults if not provided
         if rope_parameters is None:

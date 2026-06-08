@@ -21,14 +21,12 @@
 Covers only the Language MoE Decoder path. Vision/Audio towers are skipped.
 """
 
-import math
-import os
 import logging
-from typing import List, Optional, Tuple, Iterable
+from dataclasses import dataclass
+from typing import Optional, Tuple, Iterable
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.distributed as dist
 import torch_npu
 
@@ -42,10 +40,10 @@ from module.linear import (
 from module.fuse_moe_gmm import FusedMoEGMM
 from module.quantization import QuantizeMethodBase
 from executor.core.config import InferenceConfig, CommManager
+from executor.core.kv_cache.cache_info import CacheEntry, LayerCacheInfo, ModelCacheInfo
 from executor.utils import calc_moe_hccl_buffer_size
 from executor.utils.forward_metadata import ForwardMetaData, get_forward_metadata
 from executor.model_loader.weight_utils import default_weight_loader
-from .configuration_gemma4 import Gemma4TextConfig
 
 logger = logging.getLogger(__name__)
 
@@ -61,13 +59,13 @@ class Gemma4RMSNorm(nn.Module):
         self.with_scale = with_scale
         if self.with_scale:
             self.weight = nn.Parameter(torch.ones(dim))
+        else:
+            # with_scale=False：gamma 恒为 1。预分配 ones buffer 避免每次 forward 新建临时
+            # 张量；persistent=False 不进 state_dict，dtype/device 随 module 与 input 对齐。
+            self.register_buffer("weight", torch.ones(dim), persistent=False)
 
     def forward(self, hidden_states):
-        result = torch_npu.npu_rms_norm(
-            hidden_states, self.weight if self.with_scale else torch.ones(
-                hidden_states.shape[-1], device=hidden_states.device, dtype=hidden_states.dtype
-            ), self.eps
-        )[0]
+        result = torch_npu.npu_rms_norm(hidden_states, self.weight, self.eps)[0]
         return result
 
     def forward_add(self, x1, x2):
@@ -87,43 +85,31 @@ class Gemma4RMSNorm(nn.Module):
 # ---------------------------------------------------------------------------
 
 class Gemma4RotaryEmbedding(nn.Module):
-    """Dual-mode RoPE for sliding_attention and full_attention layers.
-
-    - sliding_attention: head_dim=256, theta=10000, full rotation
-    - full_attention: global_head_dim=512, theta=1000000, partial_rotary_factor=0.25
-      => rotary_dim = 512 * 0.25 = 128 (only first 128 dims get RoPE)
-
-    cos/sin are precomputed at init time up to max_position_embeddings to avoid
-    .item() calls in forward, which would break graph mode.
-    """
+    """Dual RoPE: sliding (full head_dim) and full (partial_rotary_factor)."""
 
     def __init__(self, config, device=None, max_position_embeddings=4096):
         super().__init__()
         self.config = config
         self.max_position_embeddings = max_position_embeddings
 
-        # sliding_attention RoPE
         sliding_params = config.rope_parameters["sliding_attention"]
         sliding_theta = sliding_params["rope_theta"]
-        sliding_dim = config.head_dim  # 256
+        sliding_dim = config.head_dim
         inv_freq_sliding = 1.0 / (
             sliding_theta ** (torch.arange(0, sliding_dim, 2, dtype=torch.float32, device=device) / sliding_dim)
         )
 
-        # full_attention RoPE (partial rotary)
         full_params = config.rope_parameters["full_attention"]
         full_theta = full_params["rope_theta"]
         partial_rotary_factor = full_params.get("partial_rotary_factor", 0.25)
-        full_dim = config.global_head_dim  # 512
-        rotary_dim = int(full_dim * partial_rotary_factor)  # 128
+        full_dim = config.global_head_dim
+        rotary_dim = int(full_dim * partial_rotary_factor)
         self.rotary_dim_full = rotary_dim
         inv_freq_full = 1.0 / (
             full_theta ** (torch.arange(0, rotary_dim, 2, dtype=torch.float32, device=device) / rotary_dim)
         )
 
-        # Precompute cos/sin up to max_position_embeddings for graph mode compatibility.
-        # This eliminates .item() calls in forward. Values computed on CPU at init;
-        # register_buffer ensures they move to NPU with the model.
+        # Precompute cos/sin to avoid .item() in graph mode.
         cos_sliding, sin_sliding = self._compute_cos_sin(
             max_position_embeddings, inv_freq_sliding, device, torch.bfloat16
         )
@@ -144,55 +130,16 @@ class Gemma4RotaryEmbedding(nn.Module):
         sin = (emb.sin() * scaling).to(dtype)
         return cos, sin
 
-    def forward(self, hidden_states, seq_len, kv_len, max_seq_len=None, layer_type="sliding_attention"):
-        """
-        Returns (cos, sin) shaped for BSH layout with npu_apply_rotary_pos_emb.
-
-        For Prefill (seq_len > 1):  cos/sin shape = [1, S, 1, D_rope]
-        For Decode (seq_len == 1):  cos/sin shape = [B, 1, 1, D_rope]  indexed by kv_len
-        """
-        batch_size = hidden_states.shape[0]
-
+    def forward(self, position_ids, layer_type="sliding_attention"):
+        """Returns (cos, sin) shaped [T, 1, D_rope] for TND broadcast over heads."""
         if layer_type == "sliding_attention":
             cos, sin = self.cos_sliding, self.sin_sliding
         else:
             cos, sin = self.cos_full, self.sin_full
 
-        if seq_len == 1:
-            # Decode: index by kv_len per batch (no .item() needed)
-            cos_out = torch.index_select(cos, dim=0, index=kv_len.long()).unsqueeze(1).unsqueeze(1)
-            sin_out = torch.index_select(sin, dim=0, index=kv_len.long()).unsqueeze(1).unsqueeze(1)
-        else:
-            # Prefill: sequential positions
-            cos_out = cos[:seq_len].unsqueeze(0).unsqueeze(2).expand(batch_size, -1, 1, -1)
-            sin_out = sin[:seq_len].unsqueeze(0).unsqueeze(2).expand(batch_size, -1, 1, -1)
-
+        cos_out = cos.index_select(0, position_ids).unsqueeze(1)
+        sin_out = sin.index_select(0, position_ids).unsqueeze(1)
         return cos_out, sin_out
-
-
-def rotate_half(x):
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2:]
-    return torch.cat((-x2, x1), dim=-1)
-
-
-def apply_partial_rotary_pos_emb(q, k, cos, sin, rotary_dim):
-    """Apply RoPE to only the first rotary_dim dimensions of q and k.
-
-    Uses npu_rotary_mul on the rotated slice (fused mul+rotate_half+add) and
-    leaves the trailing pass-through dimensions untouched.
-    """
-    q_rot = q[..., :rotary_dim]
-    q_pass = q[..., rotary_dim:]
-    k_rot = k[..., :rotary_dim]
-    k_pass = k[..., rotary_dim:]
-
-    q_rot = torch_npu.npu_rotary_mul(q_rot, cos, sin, rotary_mode='half')
-    k_rot = torch_npu.npu_rotary_mul(k_rot, cos, sin, rotary_mode='half')
-
-    q = torch.cat([q_rot, q_pass], dim=-1)
-    k = torch.cat([k_rot, k_pass], dim=-1)
-    return q, k
 
 
 # ---------------------------------------------------------------------------
@@ -238,8 +185,7 @@ class Gemma4MLP(nn.Module):
         self.act_fn = ACT2FN[config.hidden_activation]
 
     def forward(self, x):
-        # npu_fast_gelu matches gelu(approximate='tanh') and avoids aclgraph
-        # CPU fallback on aten::gelu
+        # npu_fast_gelu == gelu(approximate='tanh'), graph-safe.
         return self.down_proj(torch_npu.npu_fast_gelu(self.gate_proj(x)) * self.up_proj(x))
 
 
@@ -262,32 +208,23 @@ class Gemma4Router(nn.Module):
         self.per_expert_scale = nn.Parameter(torch.ones(config.num_experts))
 
     def forward(self, hidden_states):
-        """
-        hidden_states: [T, H] (flattened)
-        Returns: topk_idx [T, K], topk_weight [T, K]
-        """
+        """Returns (topk_idx [T, K], topk_weight [T, K])."""
         hidden_states = self.norm(hidden_states)
         hidden_states = hidden_states * self.scale * self.scalar_root_size
         expert_scores = self.proj(hidden_states)
-        # Fused softmax + topk via npu_moe_gating_top_k_softmax
         top_k_weights, top_k_index, _ = torch_npu.npu_moe_gating_top_k_softmax(
             expert_scores, None, k=self.top_k_experts
         )
-        # Post-processing: normalize weights and apply per-expert scaling
         top_k_weights = top_k_weights / top_k_weights.sum(dim=-1, keepdim=True)
         top_k_weights = top_k_weights * self.per_expert_scale[top_k_index]
         return top_k_index, top_k_weights
 
 
 class _GegluMoEMethod(QuantizeMethodBase):
-    """Custom quant method that uses GEGLU (GELU_tanh) instead of SiLU.
+    """MoE expert method using GEGLU (GELU_tanh) instead of SiLU.
 
-    Gemma4 MoE experts use gelu_pytorch_tanh activation, not SiLU.
-    The default UnquantizedFusedMoEGMMMethod hardcodes npu_swiglu.
-
-    GEGLU mode is selected dynamically per-call via the is_prefill parameter:
-    - Prefill (eager) or eager-only mode: npu_geglu (fused, high precision)
-    - Decode in graph mode: manual GEGLU via F.gelu + mul (graph-compatible)
+    Prefill / eager: fused npu_geglu. Graph-mode decode: manual gelu * up
+    (npu_geglu has no graph converter / has broken torch.compile meta).
     """
 
     def __init__(self, base_method, use_manual_geglu=False):
@@ -308,12 +245,8 @@ class _GegluMoEMethod(QuantizeMethodBase):
             group_list_type=group_list_type, split_item=3,
         )[0]
         if is_prefill or not self.use_manual_geglu:
-            # Prefill (always eager) or eager-only mode: use fused npu_geglu
             mm1_mm3, _ = torch_npu.npu_geglu(mm1_mm3, -1, 1)
         else:
-            # Decode in graph mode: manual GEGLU using NPU-native gelu
-            # (F.gelu hits CPU fallback under aclgraph capture; torch_npu.npu_geglu
-            # meta has a signature mismatch under torch.compile)
             gate, up = mm1_mm3.chunk(2, dim=-1)
             mm1_mm3 = torch_npu.npu_fast_gelu(gate) * up
         out = torch_npu.npu_grouped_matmul(
@@ -325,12 +258,7 @@ class _GegluMoEMethod(QuantizeMethodBase):
 
 
 class Gemma4GegluMoEGMM(FusedMoEGMM):
-    """FusedMoEGMM subclass that uses GEGLU activation for Gemma4.
-
-    In graph mode (ge_graph), npu_geglu is not supported so we fall back to
-    manual GEGLU using standard PyTorch ops for Decode. Prefill always uses
-    npu_geglu since it runs in eager mode.
-    """
+    """FusedMoEGMM with GEGLU activation."""
 
     def __init__(self, *args, **kwargs):
         use_manual_geglu = kwargs.pop("use_manual_geglu", False)
@@ -338,7 +266,6 @@ class Gemma4GegluMoEGMM(FusedMoEGMM):
         self.quant_method = _GegluMoEMethod(self.quant_method, use_manual_geglu=use_manual_geglu)
 
     def forward(self, x, expert_tokens, group_list_type=0, is_prefill=False, **kwargs):
-        """Override to pass is_prefill through to the GEGLU method."""
         return self.quant_method.apply(
             layer=self, x=x, expert_tokens=expert_tokens,
             group_list_type=group_list_type, is_prefill=is_prefill, **kwargs,
@@ -366,29 +293,9 @@ class Gemma4SparseMoeBlock(nn.Module):
 
         self.ep_rank = comm_manager.get_rank("moe_ep_group") if self.moe_ep_size > 1 else 0
 
-        # Graph-mode dispatch: both ge_graph and npugraph_ex use local-expert MoE
-        # (fixed shape, no AllToAll). Both also need the manual-GEGLU fallback:
-        # ge_graph because torchair has no converter for npu_geglu, and
-        # npugraph_ex because npu_geglu's torch.compile meta function has a
-        # broken signature. Manual path uses npu_fast_gelu to stay graph-safe.
+        # Graph mode needs manual GEGLU (npu_geglu has no graph converter / broken meta).
         self.exe_mode = infer_config.model_config.exe_mode
         use_manual_geglu = self.exe_mode in ("ge_graph", "npugraph_ex")
-        # MoE EP decode dispatch strategy:
-        #   "mc2": npu_moe_distribute_dispatch_v2 + npu_moe_distribute_combine_v2;
-        #     the standard MC2 path used by qwen3_moe / longcat-flash / deepseek_r1.
-        #     Atlas A2 caps experts_per_rank <= 24 on dispatch_v2; A3 has no such cap.
-        #   "local_experts": every rank runs all experts under a routing mask, then
-        #     AllReduce; required fallback when experts_per_rank > 24 on A2.
-        # Default is "mc2" iff within the A2 cap (also fine on A3). Override via
-        # model_config.custom_params.moe_ep_decode_mode.
-        custom = getattr(infer_config.model_config, "custom_params", {}) or {}
-        default_mode = "mc2" if self.experts_per_rank <= 24 else "local_experts"
-        self._ep_decode_mode = custom.get("moe_ep_decode_mode", default_mode)
-        if self._ep_decode_mode not in ("local_experts", "mc2"):
-            raise ValueError(
-                f"moe_ep_decode_mode must be 'local_experts' or 'mc2', got "
-                f"{self._ep_decode_mode!r}"
-            )
         self.experts = Gemma4GegluMoEGMM(
             num_experts=self.num_experts,
             hidden_size=self.hidden_dim,
@@ -402,16 +309,6 @@ class Gemma4SparseMoeBlock(nn.Module):
             use_manual_geglu=use_manual_geglu,
         )
         self.router = Gemma4Router(config)
-
-        # Pre-compute row_idx for Decode local-expert mode (graph-friendly, fixed shape)
-        row_idx_decode_len = self.batch_size_decode * self.top_k
-        self.row_idx_decode = torch.arange(
-            0, row_idx_decode_len, dtype=torch.int32,
-        ).view(self.top_k, -1).permute(1, 0).contiguous().npu()
-
-        # Local expert range for this EP rank
-        self.local_expert_start = self.ep_rank * self.experts_per_rank
-        self.local_expert_end = self.local_expert_start + self.experts_per_rank
 
     def set_mc2_kwargs(self):
         global_rank = dist.get_rank()
@@ -431,6 +328,7 @@ class Gemma4SparseMoeBlock(nn.Module):
             "shared_expert_num": 0,
             "shared_expert_rank_num": 0,
             "quant_mode": 0,
+            "comm_alg": "fullmesh_v2",
         }
         self.combine_kwargs = {
             "x_active_mask": None,
@@ -449,33 +347,18 @@ class Gemma4SparseMoeBlock(nn.Module):
         }
 
     def forward(self, hidden_states, is_prefill=False, topk_idx=None, topk_weight=None):
-        """
-        hidden_states: [T, H] (already flattened, normed for expert computation)
-        topk_idx, topk_weight: pre-computed routing results (from router on un-normed input)
-        Returns: [T, H]
-        """
         if topk_idx is None or topk_weight is None:
             topk_idx, topk_weight = self.router(hidden_states)
         topk_idx = topk_idx.to(torch.int32)
 
         if self.moe_ep_size <= 1:
-            # Single-rank MoE (no EP)
             return self.moe_infer_tp(hidden_states, topk_idx, topk_weight, is_prefill)
-        elif is_prefill:
-            # EP Prefill: double_routing with AllToAll (always)
+        if is_prefill:
             return self.moe_infer_double_routing(hidden_states, topk_idx, topk_weight, is_prefill=True)
-        elif self._ep_decode_mode == "mc2":
-            # EP Decode + mc2 dispatch_v2 (A2 cap experts_per_rank<=24; A3 no cap)
-            return self.moe_infer_dispatch_combine(hidden_states, topk_idx, topk_weight)
-        elif self.exe_mode in ("ge_graph", "npugraph_ex"):
-            # EP Decode + graph mode: local-expert (graph-friendly, no AllToAll)
-            return self.moe_infer_local_experts(hidden_states, topk_idx, topk_weight)
-        else:
-            # EP Decode + eager: double_routing (exact, same as Prefill)
-            return self.moe_infer_double_routing(hidden_states, topk_idx, topk_weight, is_prefill=False)
+        return self.moe_infer_dispatch_combine(hidden_states, topk_idx, topk_weight)
 
     def moe_infer_tp(self, hidden_states, topk_idx, topk_weight, is_prefill=False):
-        """Non-EP MoE path (TP only or single rank)."""
+        """Single-rank / TP-only MoE."""
         expanded_x, expanded_row_idx, tokens_per_expert, _ = torch_npu.npu_moe_init_routing_v2(
             hidden_states,
             expert_idx=topk_idx,
@@ -506,7 +389,7 @@ class Gemma4SparseMoeBlock(nn.Module):
         return hidden_states
 
     def dispatch_double_routing(self, tokens_per_expert, expanded_x):
-        """AllToAll dispatch for EP double-routing (Prefill)."""
+        """AllToAll dispatch for EP double-routing."""
         moe_ep_group = self.comm_manager.get_group("moe_ep_group")
         tokens_per_expert_group = tokens_per_expert.new_empty(tokens_per_expert.shape[0])
         dist.all_to_all_single(tokens_per_expert_group, tokens_per_expert, group=moe_ep_group)
@@ -522,7 +405,7 @@ class Gemma4SparseMoeBlock(nn.Module):
         return tokens_per_expert_group, gathered_tokens, input_splits, output_splits
 
     def moe_infer_double_routing(self, hidden_states, topk_ids, topk_weight, is_prefill=False):
-        """EP double-routing path (Prefill or eager Decode)."""
+        """EP double-routing (prefill or eager decode)."""
         expanded_x, expanded_row_idx, tokens_per_expert, _ = torch_npu.npu_moe_init_routing_v2(
             hidden_states,
             expert_idx=topk_ids,
@@ -538,11 +421,9 @@ class Gemma4SparseMoeBlock(nn.Module):
         tokens_per_expert_group, gathered_tokens, input_splits, output_splits = \
             self.dispatch_double_routing(tokens_per_expert, expanded_x)
 
-        # Re-route gathered tokens to local experts
         hidden_states_ordered, _, gathered_ids_unsort, tokens_per_local_expert = \
             torch_npu.npu_moe_re_routing(gathered_tokens, tokens_per_expert_group.view(self.moe_ep_size, -1))
 
-        # Expert computation
         hidden_states_ordered = self.experts(
             hidden_states_ordered,
             tokens_per_local_expert,
@@ -550,13 +431,11 @@ class Gemma4SparseMoeBlock(nn.Module):
             is_prefill=is_prefill,
         )
 
-        # Restore order and AllToAll combine
         moe_ep_group = self.comm_manager.get_group("moe_ep_group")
         new_x = torch.index_select(hidden_states_ordered, 0, gathered_ids_unsort.float().argsort().int())
         gathered_back = new_x.new_empty(*expanded_x.shape)
         dist.all_to_all_single(gathered_back, new_x, input_splits, output_splits, group=moe_ep_group)
 
-        # Finalize routing
         hidden_states = torch_npu.npu_moe_finalize_routing(
             gathered_back, skip1=None, skip2=None, bias=None,
             scales=topk_weight.to(gathered_back.dtype),
@@ -566,8 +445,11 @@ class Gemma4SparseMoeBlock(nn.Module):
         return hidden_states
 
     def moe_infer_dispatch_combine(self, hidden_states, topk_ids, topk_weight):
-        """EP Decode: MC2 dispatch_v2 + combine_v2 (A2: experts_per_rank<=24; A3: no cap)."""
-        self.set_mc2_kwargs()
+        """EP decode: MC2 dispatch_v2 + combine_v2."""
+        # kwargs 全为静态标量，已在权重加载后预构建；guard 避免每次 forward 重复构建
+        # （含 dist.get_rank 等 host 调用），并兜底未预构建的路径。
+        if getattr(self, "dispatch_kwargs", None) is None:
+            self.set_mc2_kwargs()
 
         dispatch_args = {
             "x": hidden_states,
@@ -577,10 +459,8 @@ class Gemma4SparseMoeBlock(nn.Module):
         output = torch_npu.npu_moe_distribute_dispatch_v2(**dispatch_args)
         expand_x, dynamic_scale, expand_idx, expert_token_num, ep_recv_counts, tp_recv_counts = output[:6]
 
-        # Expert computation
         hidden_states_ordered = self.experts(expand_x, expert_token_num, group_list_type=1, is_prefill=False)
 
-        # MC2 combine
         combine_args = {
             "expand_x": hidden_states_ordered,
             "expert_ids": topk_ids,
@@ -593,61 +473,24 @@ class Gemma4SparseMoeBlock(nn.Module):
         hidden_states = torch_npu.npu_moe_distribute_combine_v2(**combine_args)
         return hidden_states
 
-    def moe_infer_local_experts(self, hidden_states, topk_ids, topk_weight):
-        """Decode: graph-friendly local-expert mode using npu_moe_init_routing v1.
-
-        Each rank only computes its local experts (experts_per_rank).
-        Tokens routed to remote experts get zero contribution from this rank.
-        All ranks' contributions are summed via all_reduce.
-
-        Gemma-4 has no zero experts (all 128 are routed), so zero expert
-        handling is omitted.
-        """
-        routing_weights = topk_weight.to(hidden_states.dtype)
-        expert_idx = topk_ids.int()
-
-        # Build local routing weights: non-local experts get weight=0
-        not_local = (expert_idx < self.local_expert_start) | (expert_idx >= self.local_expert_end)
-        routing_weights_local = routing_weights.masked_fill(not_local, 0)
-
-        # Remap global expert IDs to local range [0, experts_per_rank)
-        # Non-local experts are mapped to local expert 0 with weight=0
-        local_expert_idx = expert_idx - self.local_expert_start
-        local_expert_idx = torch.where(not_local, 0, local_expert_idx)
-
-        # Route via init_routing v1 (graph-friendly, fixed-capacity expansion)
-        expanded_x, expanded_row_idx, expanded_expert_idx = torch_npu.npu_moe_init_routing(
-            hidden_states,
-            row_idx=self.row_idx_decode,
-            expert_idx=local_expert_idx,
-            active_num=hidden_states.shape[0] * self.top_k,
-        )
-
-        expert_tokens = torch_npu.npu_moe_compute_expert_tokens(
-            expanded_expert_idx, self.experts_per_rank
-        )
-        expert_tokens = expert_tokens.to(torch.int64)
-
-        # Expert computation (local experts only, Decode path -> is_prefill=False)
-        hidden_states_ordered = self.experts(expanded_x, expert_tokens, group_list_type=0, is_prefill=False)
-
-        # Collect back with local routing weights
-        hidden_states = torch_npu.npu_moe_finalize_routing(
-            hidden_states_ordered,
-            skip1=None, skip2=None, bias=None,
-            scales=routing_weights_local.to(hidden_states_ordered.dtype),
-            expanded_src_to_dst_row=expanded_row_idx,
-            export_for_source_row=local_expert_idx,
-        )
-
-        # All-reduce across EP group to sum local expert contributions
-        dist.all_reduce(hidden_states, group=self.comm_manager.get_group("moe_ep_group"))
-        return hidden_states
-
-
 # ---------------------------------------------------------------------------
 # Attention (dual mode: sliding + full)
 # ---------------------------------------------------------------------------
+
+
+@dataclass
+class _AttnInputs:
+    """Per-call FA helper inputs (bundles QKV + PA context + forward metadata)."""
+    query: torch.Tensor
+    key: torch.Tensor
+    value: torch.Tensor
+    is_prefill: bool
+    attention_mask: Optional[torch.Tensor]
+    slot_mapping: dict
+    block_table: dict
+    forward_metadata: ForwardMetaData
+    q_len: int
+
 
 class Gemma4Attention(nn.Module):
     def __init__(
@@ -666,20 +509,18 @@ class Gemma4Attention(nn.Module):
         self.layer_type = config.layer_types[layer_idx]
         self.is_sliding = (self.layer_type == "sliding_attention")
 
-        # Head dimensions differ between sliding and full attention
         if self.is_sliding:
-            self.head_dim = config.head_dim  # 256
-            self.num_kv_heads = config.num_key_value_heads  # 8
+            self.head_dim = config.head_dim
+            self.num_kv_heads = config.num_key_value_heads
         else:
-            self.head_dim = config.global_head_dim  # 512
-            self.num_kv_heads = config.num_global_key_value_heads or config.num_key_value_heads  # 2
+            self.head_dim = config.global_head_dim
+            self.num_kv_heads = config.num_global_key_value_heads or config.num_key_value_heads
 
-        self.num_heads = config.num_attention_heads  # 16
+        self.num_heads = config.num_attention_heads
         self.num_kv_groups = self.num_heads // self.num_kv_heads
         self.use_k_eq_v = config.attention_k_eq_v and not self.is_sliding
         self.sliding_window = config.sliding_window if self.is_sliding else None
 
-        # Projections
         self.q_proj = nn.Linear(config.hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias)
         self.k_proj = nn.Linear(config.hidden_size, self.num_kv_heads * self.head_dim, bias=config.attention_bias)
         if not self.use_k_eq_v:
@@ -688,145 +529,282 @@ class Gemma4Attention(nn.Module):
             self.v_proj = None
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, config.hidden_size, bias=config.attention_bias)
 
-        # QK norms and V norm
         self.q_norm = Gemma4RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = Gemma4RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.v_norm = Gemma4RMSNorm(self.head_dim, eps=config.rms_norm_eps, with_scale=False)
 
-        # Gemma4 uses scaling=1.0 (not 1/sqrt(head_dim)) because QK norms
-        # already normalize the query and key vectors before attention.
+        # QK norm absorbs the 1/sqrt(d) scaling.
         self.scale_fa = 1.0
 
-        # KV cache will be bound by ModelWorker (via self.k_cache / self.v_cache)
+        # Paged KV cache; framework binds the allocated tensor via tensor_setter.
         self.k_cache = torch.Tensor([])
         self.v_cache = torch.Tensor([])
-        self.cache_unit = (self.num_kv_heads * self.head_dim,)
+        self.attn_type = "SlidingWindow" if self.is_sliding else "FullAttention"
+        self.block_size = infer_config.scheduler_config.block_size
+        cache_dtype = torch.bfloat16
+        self.cache_entries = [
+            CacheEntry(
+                cache_name="k_cache",
+                attn_type=self.attn_type,
+                dim=self.head_dim,
+                num_head=self.num_kv_heads,
+                dtype=cache_dtype,
+                needs_block=True,
+                tensor_setter=lambda tensor, layer=self: setattr(layer, "k_cache", tensor),
+                sliding_window=self.sliding_window if self.sliding_window else None,
+            ),
+            CacheEntry(
+                cache_name="v_cache",
+                attn_type=self.attn_type,
+                dim=self.head_dim,
+                num_head=self.num_kv_heads,
+                dtype=cache_dtype,
+                needs_block=True,
+                tensor_setter=lambda tensor, layer=self: setattr(layer, "v_cache", tensor),
+                sliding_window=self.sliding_window if self.sliding_window else None,
+            ),
+        ]
 
         self.batch_size = infer_config.scheduler_config.batch_size
         self.exe_mode = infer_config.model_config.exe_mode
         self.enable_gegraph = (self.exe_mode == "ge_graph")
-        self.fa_ops = torch.ops.npu
+        # FA op dispatch: prefill always torch.ops.npu; decode under ge_graph
+        # uses torchair.ops (tng.ops). See _fa_ops_for().
+        self._torchair_ops = None
         if self.enable_gegraph:
             import torchair as tng
-            self.fa_ops = tng.ops
+            self._torchair_ops = tng.ops
+
+    def _fa_ops_for(self, is_prefill: bool):
+        if (not is_prefill) and self.enable_gegraph and self._torchair_ops is not None:
+            return self._torchair_ops
+        return torch.ops.npu
 
     def forward(
         self,
         hidden_states,
         cos_sin=None,
         forward_metadata: ForwardMetaData = None,
+        slot_mapping=None,
+        block_table=None,
         **kwargs,
     ):
-        kv_len = forward_metadata.kv_len
-        attention_mask = forward_metadata.attention_mask
-        bsz, q_len, _ = hidden_states.size()
+        """Hybrid: sliding -> TND-PA, full -> BNSD-PA. Packed [T, H] in, [T, H] out."""
+        is_prefill = forward_metadata.is_prefill
+        q_len = hidden_states.shape[0]
 
-        # BSND shim: framework keeps kv_len/actual_seq_lengths_kv as packed [B*S]
-        # across decode steps (_pad_batch is no-op when shape >= target). Pull
-        # [B] views for BSND scatter_update / FA — start-slot per seq for prefill,
-        # last-bsz for decode. Decode form correct only for batch_size_per_dp_rank == 1.
-        if kv_len.shape[0] != bsz:
-            if forward_metadata.is_prefill and kv_len.shape[0] == bsz * q_len:
-                kv_len = kv_len[::q_len].contiguous()
-            elif not forward_metadata.is_prefill:
-                kv_len = kv_len[-bsz:].contiguous()
-
-        # FA op variant: ge_graph uses torchair.ops (Tensor OK); eager and
-        # npugraph_ex use torch.ops.npu, where dynamo enforces SymInt[] schema
-        # for actual_seq_lengths_kv — must be a host list, not a Tensor.
-        if self.exe_mode == "npugraph_ex" and forward_metadata.actual_seq_lengths_list_kv is not None:
-            actual_seq_lengths_kv = forward_metadata.actual_seq_lengths_list_kv[-bsz:]
-        else:
-            actual_seq_lengths_kv = forward_metadata.actual_seq_lengths_kv
-            if actual_seq_lengths_kv is not None and actual_seq_lengths_kv.shape[0] != bsz:
-                actual_seq_lengths_kv = actual_seq_lengths_kv[-bsz:].contiguous()
+        if is_prefill:
+            # 变长 prefill 暂不支持：sliding 层 RoPE 的 4D reshape 与 full 层 BNSD reshape
+            # 均按 (batch_size, seq_len) 切分，要求同批次各请求等长，变长会在 reshape 处
+            # 直接崩。此处提前给出可读错误。decode 每请求 1 token 天然等长、且图模式禁
+            # Tensor 驱动断言，故仅在 prefill 检查。
+            seq_q = forward_metadata.actual_seq_lengths_q
+            if seq_q is not None and seq_q.numel() > 1 and not bool((seq_q == seq_q[0]).all()):
+                raise ValueError(
+                    "variable-length prefill is not supported: sliding RoPE 4D view and "
+                    "full BNSD reshape require equal per-request lengths within a batch; "
+                    f"got actual_seq_lengths_q={seq_q.tolist()}"
+                )
 
         query_states = self.q_proj(hidden_states)
         key_states = self.k_proj(hidden_states)
-        if self.v_proj is not None:
-            value_states = self.v_proj(hidden_states)
-        else:
-            # k_eq_v: value = key (before RoPE and after k_norm + v_norm)
-            value_states = key_states.clone()
+        # k_eq_v variant: value shares the key projection.
+        value_states = self.v_proj(hidden_states) if self.v_proj is not None else key_states.clone()
 
-        # Reshape for norm: [B, S, N, D]
-        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim)
-        key_states = key_states.view(bsz, q_len, self.num_kv_heads, self.head_dim)
-        value_states = value_states.view(bsz, q_len, self.num_kv_heads, self.head_dim)
+        query_states = query_states.view(q_len, self.num_heads, self.head_dim)
+        key_states = key_states.view(q_len, self.num_kv_heads, self.head_dim)
+        value_states = value_states.view(q_len, self.num_kv_heads, self.head_dim)
 
-        # Apply QK norms
         query_states = self.q_norm(query_states)
         key_states = self.k_norm(key_states)
         value_states = self.v_norm(value_states)
 
-        # Apply RoPE
+        # Sliding: full head_dim fused rotate-half via npu_rotary_mul.
+        # 3D TND → 4D BSND view (zero-copy) — npu_rotary_mul requires 4D in graph mode.
+        # Full: partial rotary_dim via npu_apply_rotary_pos_emb on 3D TND.
         cos, sin = cos_sin
         if self.is_sliding:
-            # Fused RoPE for sliding attention (head_dim=256, BSND layout)
-            # npu_rotary_mul fuses rotate_half + mul + add into single kernel
-            query_states = torch_npu.npu_rotary_mul(query_states, cos, sin, rotary_mode='half')
-            key_states = torch_npu.npu_rotary_mul(key_states, cos, sin, rotary_mode='half')
+            # npu_rotary_mul 需 4D 输入，按 (batch_size, seq_len) reshape，假设同批次内
+            # 各请求等长（q_len = batch_size × seq_len）。decode 每请求 1 token 恒成立；
+            # 等长 prefill 成立；变长 prefill 暂不支持。
+            batch_size = forward_metadata.actual_seq_lengths_cu_q.shape[0]
+            seq_len = q_len // batch_size
+            q4 = query_states.view(batch_size, seq_len, self.num_heads, self.head_dim)
+            k4 = key_states.view(batch_size, seq_len, self.num_kv_heads, self.head_dim)
+            cos4 = cos.view(batch_size, seq_len, 1, self.head_dim)
+            sin4 = sin.view(batch_size, seq_len, 1, self.head_dim)
+            q4 = torch_npu.npu_rotary_mul(q4, cos4, sin4, rotary_mode='half')
+            k4 = torch_npu.npu_rotary_mul(k4, cos4, sin4, rotary_mode='half')
+            query_states = q4.view(q_len, self.num_heads, self.head_dim)
+            key_states = k4.view(q_len, self.num_kv_heads, self.head_dim)
         else:
-            # Partial rotation for full attention (rotary_dim=128)
-            rotary_dim = cos.shape[-1]  # 128 (64*2)
-            query_states, key_states = apply_partial_rotary_pos_emb(
-                query_states, key_states, cos, sin, rotary_dim
+            rotary_dim = cos.shape[-1]
+            q_rot = query_states[..., :rotary_dim].contiguous()
+            q_pass = query_states[..., rotary_dim:].contiguous()
+            k_rot = key_states[..., :rotary_dim].contiguous()
+            k_pass = key_states[..., rotary_dim:].contiguous()
+            q_rot, k_rot = torch_npu.npu_apply_rotary_pos_emb(
+                q_rot, k_rot, cos, sin, layout="TND",
+            )
+            query_states = torch.cat([q_rot, q_pass], dim=-1)
+            key_states = torch.cat([k_rot, k_pass], dim=-1)
+
+        attention_mask = forward_metadata.attention_mask
+
+        if not (self.k_cache.numel() and self.v_cache.numel()):
+            raise RuntimeError(
+                "k_cache/v_cache not bound. Ensure Gemma4ForCausalLM.get_cache_info() "
+                "is implemented and ModelWorker._init_kvcache has run.",
             )
 
-        # Reshape to BSH for cache and FA
-        query_states = query_states.view(bsz, q_len, -1)  # [B, S, N*D]
-        key_states = key_states.view(bsz, q_len, -1)  # [B, S, Nkv*D]
-        value_states = value_states.view(bsz, q_len, -1)  # [B, S, Nkv*D]
-
-        # KV Cache write (framework pre-allocates self.k_cache/self.v_cache via cache_unit)
-        torch_npu.scatter_update_(self.k_cache, kv_len, key_states, -2)
-        torch_npu.scatter_update_(self.v_cache, kv_len, value_states, -2)
-
-        # FA attention
-        if q_len == 1:
-            past_key_states, past_value_states = self.k_cache, self.v_cache
-            if self.is_sliding:
-                decode_sparse_mode = 4
-                decode_pre_tokens = self.sliding_window
-            else:
-                decode_sparse_mode = 0
-                decode_pre_tokens = torch.iinfo(torch.int32).max
-            attn_output, _ = self.fa_ops.npu_fused_infer_attention_score(
-                query_states, past_key_states, past_value_states,
-                num_heads=self.num_heads,
-                num_key_value_heads=self.num_kv_heads,
-                input_layout="BSH",
-                atten_mask=None,
-                sparse_mode=decode_sparse_mode,
-                pre_tokens=decode_pre_tokens,
-                next_tokens=0,
-                scale=self.scale_fa,
-                actual_seq_lengths_kv=actual_seq_lengths_kv,
-            )
+        attn_inputs = _AttnInputs(
+            query=query_states, key=key_states, value=value_states,
+            is_prefill=is_prefill, attention_mask=attention_mask,
+            slot_mapping=slot_mapping, block_table=block_table,
+            forward_metadata=forward_metadata, q_len=q_len,
+        )
+        if self.is_sliding:
+            attn_output = self._attn_tnd_sliding(attn_inputs)
         else:
-            # Prefill: sliding layers use sparse_mode=4 (band/sliding window causal),
-            # full attention layers use sparse_mode=3 (standard causal)
-            if self.is_sliding:
-                prefill_sparse_mode = 4
-                prefill_pre_tokens = self.sliding_window  # 1024
-            else:
-                prefill_sparse_mode = 3
-                prefill_pre_tokens = torch.iinfo(torch.int32).max
-            attn_output, _ = torch.ops.npu.npu_fused_infer_attention_score(
-                query_states, key_states, value_states,
-                num_heads=self.num_heads,
-                num_key_value_heads=self.num_kv_heads,
-                input_layout="BSH",
-                atten_mask=attention_mask,
-                sparse_mode=prefill_sparse_mode,
-                pre_tokens=prefill_pre_tokens,
-                next_tokens=0,
-                scale=self.scale_fa,
-            )
+            attn_output = self._attn_bnsd_full(attn_inputs)
 
-        attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.head_dim)
+        # attn_output is [T, N*D].
         attn_output = self.o_proj(attn_output)
         return attn_output
+
+    def _attn_tnd_sliding(self, inputs: _AttnInputs):
+        """TND + FA v2 + PA for sliding layers (head_dim=256).
+
+        TND cache uses flat-H view (blocknum, blocksize, H=N*D) — CANN 9.0.0
+        TND non-MLA whitelist includes D=256.
+        """
+        is_prefill = inputs.is_prefill
+        forward_metadata = inputs.forward_metadata
+        sparse_mode = 4
+        pre_tokens = self.sliding_window
+        if self.exe_mode == "npugraph_ex" and not is_prefill:
+            actual_seq_qlen = forward_metadata.actual_seq_lengths_cu_list_q
+            actual_seq_kvlen = forward_metadata.actual_seq_lengths_list_kv
+        else:
+            actual_seq_qlen = forward_metadata.actual_seq_lengths_cu_q
+            actual_seq_kvlen = forward_metadata.actual_seq_lengths_kv
+
+        if is_prefill:
+            attn_output, _ = self._fa_ops_for(is_prefill).npu_fused_infer_attention_score_v2(
+                inputs.query, inputs.key, inputs.value,
+                num_query_heads=self.num_heads,
+                num_key_value_heads=self.num_kv_heads,
+                softmax_scale=self.scale_fa,
+                input_layout="TND",
+                sparse_mode=sparse_mode,
+                pre_tokens=pre_tokens,
+                next_tokens=0,
+                atten_mask=inputs.attention_mask,
+                actual_seq_qlen=actual_seq_qlen,
+                actual_seq_kvlen=actual_seq_qlen,
+            )
+            self._update_cache(inputs.slot_mapping, inputs.key, inputs.value)
+        else:
+            self._update_cache(inputs.slot_mapping, inputs.key, inputs.value)
+            attn_output, _ = self._fa_ops_for(is_prefill).npu_fused_infer_attention_score_v2(
+                inputs.query,
+                self.k_cache.view(*self.k_cache.shape[:2], -1),
+                self.v_cache.view(*self.v_cache.shape[:2], -1),
+                num_query_heads=self.num_heads,
+                num_key_value_heads=self.num_kv_heads,
+                softmax_scale=self.scale_fa,
+                input_layout="TND",
+                sparse_mode=sparse_mode,
+                pre_tokens=pre_tokens,
+                next_tokens=0,
+                atten_mask=inputs.attention_mask,
+                actual_seq_qlen=actual_seq_qlen,
+                actual_seq_kvlen=actual_seq_kvlen,
+                block_table=inputs.block_table[self.attn_type],
+                block_size=self.block_size,
+            )
+        return attn_output.reshape(inputs.q_len, self.num_heads * self.head_dim)
+
+    def _attn_bnsd_full(self, inputs: _AttnInputs):
+        """BNSD + FA v2 + PA for full layers (head_dim=512).
+
+        TND non-MLA rejects D=512; BNSD has no D cap. Q transposes to
+        [B,N,S,D]; KV cache uses non-contig BNBD view [bn, N, bs, D].
+        """
+        is_prefill = inputs.is_prefill
+        forward_metadata = inputs.forward_metadata
+        sparse_mode_prefill = 3
+        pre_tokens = torch.iinfo(torch.int32).max
+        if self.exe_mode == "npugraph_ex" and not is_prefill:
+            per_batch_q = forward_metadata.actual_seq_lengths_list_q
+            per_batch_kv = forward_metadata.actual_seq_lengths_list_kv
+        else:
+            per_batch_q = forward_metadata.actual_seq_lengths_q
+            per_batch_kv = forward_metadata.actual_seq_lengths_kv
+        batch_size = forward_metadata.actual_seq_lengths_cu_q.shape[0]
+
+        # BNSD reshape 同样假设同批次内各请求等长（同 sliding 分支）；变长 batch 暂不支持。
+        seq_len = inputs.q_len // batch_size
+        q_bnsd = inputs.query.view(
+            batch_size, seq_len, self.num_heads, self.head_dim,
+        ).transpose(1, 2).contiguous()
+
+        if is_prefill:
+            k_bnsd = inputs.key.view(
+                batch_size, seq_len, self.num_kv_heads, self.head_dim,
+            ).transpose(1, 2).contiguous()
+            v_bnsd = inputs.value.view(
+                batch_size, seq_len, self.num_kv_heads, self.head_dim,
+            ).transpose(1, 2).contiguous()
+            attn_output, _ = self._fa_ops_for(is_prefill).npu_fused_infer_attention_score_v2(
+                q_bnsd, k_bnsd, v_bnsd,
+                num_query_heads=self.num_heads,
+                num_key_value_heads=self.num_kv_heads,
+                softmax_scale=self.scale_fa,
+                input_layout="BNSD",
+                sparse_mode=sparse_mode_prefill,
+                pre_tokens=pre_tokens,
+                next_tokens=0,
+                atten_mask=inputs.attention_mask,
+                actual_seq_qlen=per_batch_q,
+                actual_seq_kvlen=per_batch_q,
+            )
+            self._update_cache(inputs.slot_mapping, inputs.key, inputs.value)
+        else:
+            self._update_cache(inputs.slot_mapping, inputs.key, inputs.value)
+            k_cache_bnbd = self.k_cache.transpose(1, 2)
+            v_cache_bnbd = self.v_cache.transpose(1, 2)
+            attn_output, _ = self._fa_ops_for(is_prefill).npu_fused_infer_attention_score_v2(
+                q_bnsd, k_cache_bnbd, v_cache_bnbd,
+                num_query_heads=self.num_heads,
+                num_key_value_heads=self.num_kv_heads,
+                softmax_scale=self.scale_fa,
+                input_layout="BNSD",
+                sparse_mode=0,
+                pre_tokens=pre_tokens,
+                next_tokens=0,
+                atten_mask=None,
+                actual_seq_qlen=per_batch_q,
+                actual_seq_kvlen=per_batch_kv,
+                block_table=inputs.block_table[self.attn_type],
+                block_size=self.block_size,
+            )
+
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        return attn_output.reshape(inputs.q_len, self.num_heads * self.head_dim)
+
+    def _update_cache(self, slot_mapping, key_states, value_states):
+        tmp_slot = slot_mapping[self.attn_type].view(-1, 1)
+        torch_npu.npu_scatter_nd_update_(
+            self.k_cache.view(-1, self.num_kv_heads, self.head_dim),
+            tmp_slot,
+            key_states,
+        )
+        torch_npu.npu_scatter_nd_update_(
+            self.v_cache.view(-1, self.num_kv_heads, self.head_dim),
+            tmp_slot,
+            value_states,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -849,7 +827,8 @@ class Gemma4DecoderLayer(nn.Module):
         self.pre_feedforward_layernorm = Gemma4RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
         self.post_feedforward_layernorm = Gemma4RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
 
-        # Layer scalar
+        # Per-layer 真实权重：HF 每层一个 layer_scalar（非 1），由 load_weights 的 buffer
+        # 路径按 name 匹配加载（torch.ones 仅为加载前占位），forward 末尾乘到该层输出上。
         self.register_buffer("layer_scalar", torch.ones(1))
 
         # MoE block (every layer has both dense MLP and MoE)
@@ -865,42 +844,35 @@ class Gemma4DecoderLayer(nn.Module):
         hidden_states,
         cos_sin=None,
         forward_metadata: ForwardMetaData = None,
+        slot_mapping=None,
+        block_table=None,
         **kwargs,
     ):
         is_prefill = forward_metadata.is_prefill
-        # Self-attention
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.self_attn(
             hidden_states,
             cos_sin=cos_sin,
             forward_metadata=forward_metadata,
+            slot_mapping=slot_mapping,
+            block_table=block_table,
         )
         hidden_states = self.post_attention_layernorm(hidden_states)
-        # Fused: (residual + hidden_states) + pre_feedforward_layernorm
         hidden_states, residual = self.pre_feedforward_layernorm.forward_add(residual, hidden_states)
 
-        # Dense MLP
         hidden_states = self.mlp(hidden_states)
 
         if self.enable_moe_block:
-            # Post-norm the dense MLP output
             hidden_states_1 = self.post_feedforward_layernorm_1(hidden_states)
-
-            # MoE path: route on raw residual (matching HF), expert input is normed
-            hidden_states_flat = residual.reshape(-1, residual.shape[-1])
-            # Router operates on un-normed residual (router has its own internal norm)
-            topk_idx, topk_weight = self.moe_block.router(hidden_states_flat)
-            # Expert input is normed with pre_feedforward_layernorm_2
-            hidden_states_2 = self.pre_feedforward_layernorm_2(hidden_states_flat)
+            # Router runs on un-normed residual (has its own internal norm).
+            topk_idx, topk_weight = self.moe_block.router(residual)
+            hidden_states_2 = self.pre_feedforward_layernorm_2(residual)
             hidden_states_2 = self.moe_block(
                 hidden_states_2, is_prefill=is_prefill,
                 topk_idx=topk_idx, topk_weight=topk_weight,
             )
-            hidden_states_2 = hidden_states_2.reshape(residual.shape)
             hidden_states_2 = self.post_feedforward_layernorm_2(hidden_states_2)
-
-            # Fused: (hidden_states_1 + hidden_states_2) + post_feedforward_layernorm
             hidden_states, _ = self.post_feedforward_layernorm.forward_add(hidden_states_1, hidden_states_2)
         else:
             hidden_states = self.post_feedforward_layernorm(hidden_states)
@@ -925,11 +897,9 @@ class Gemma4TextModel(nn.Module):
         self.infer_config = infer_config
         self.comm_manager = comm_manager
 
-        # Parallel settings
         self.embed_tp_size = infer_config.parallel_config.embed_tp_size
         self.rank_id = infer_config.parallel_config.global_rank
 
-        # Embedding
         if self.embed_tp_size > 1:
             embed_tp_rank = comm_manager.get_rank("embed_tp_group") if comm_manager else 0
             self.vocab_size_per_rank = self.vocab_size // self.embed_tp_size
@@ -952,9 +922,6 @@ class Gemma4TextModel(nn.Module):
         ])
         self.norm = Gemma4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-        # Precompute RoPE cos/sin up to max_position_embeddings for graph mode compat.
-        # Must cover prefill (input_truncated_len) + decode (max_new_tokens) — RoPE
-        # has no dynamic resize, out-of-range index_select crashes NPU vector unit.
         max_pos = (
             infer_config.data_config.input_truncated_len
             + infer_config.scheduler_config.max_new_tokens
@@ -969,19 +936,11 @@ class Gemma4TextModel(nn.Module):
         forward_metadata: ForwardMetaData = None,
         **kwargs,
     ):
-        kv_len = forward_metadata.kv_len
-        actual_seq_lengths_kv = forward_metadata.actual_seq_lengths_kv
-        attention_mask = forward_metadata.attention_mask
-        is_prefill = forward_metadata.is_prefill
-        batch_size, seq_length = input_ids.shape
-
-        # Same BSND shim as Gemma4Attention: kv_len is packed [B*S]; reduce to [B]
-        # for RoPE index_select. Idempotent; attention re-applies its own shim.
-        if kv_len.shape[0] != batch_size:
-            if is_prefill and kv_len.shape[0] == batch_size * seq_length:
-                kv_len = kv_len[::seq_length].contiguous()
-            elif not is_prefill:
-                kv_len = kv_len[-batch_size:].contiguous()
+        """Packed 1D input_ids → packed 2D [T, H] through layer stack."""
+        if position_ids is None:
+            raise RuntimeError("Gemma4TextModel requires packed 1D position_ids.")
+        slot_mapping = forward_metadata.slot_mapping
+        block_table = forward_metadata.block_table
 
         if self.embed_tp_size > 1:
             new_input_ids = input_ids - self.rank_id * self.vocab_size_per_rank
@@ -994,13 +953,11 @@ class Gemma4TextModel(nn.Module):
 
         hidden_states = inputs_embeds
 
-        # Compute RoPE cos/sin for each layer type
-        max_pos = None
-        cos_sin_dict = {}
-        for layer_type in self.unique_layer_types:
-            cos_sin_dict[layer_type] = self.rotary_emb(
-                hidden_states, seq_length, kv_len, max_pos, layer_type
-            )
+        # Cache cos/sin per layer_type to avoid duplicate index_select across 30 layers.
+        cos_sin_dict = {
+            layer_type: self.rotary_emb(position_ids, layer_type)
+            for layer_type in self.unique_layer_types
+        }
 
         for i, decoder_layer in enumerate(self.layers):
             layer_type = self.config.layer_types[i] if hasattr(self.config, "layer_types") else "sliding_attention"
@@ -1008,6 +965,8 @@ class Gemma4TextModel(nn.Module):
                 hidden_states,
                 cos_sin=cos_sin_dict.get(layer_type),
                 forward_metadata=forward_metadata,
+                slot_mapping=slot_mapping,
+                block_table=block_table,
             )
 
         hidden_states = self.norm(hidden_states)
@@ -1028,7 +987,6 @@ class Gemma4ForCausalLM(nn.Module):
         self.vocab_size = config.vocab_size
         self.exe_mode = getattr(infer_config.model_config, "exe_mode", "eager")
 
-        # Pull sizes from infer_config
         pc = infer_config.parallel_config
         self.world_size = pc.world_size
         self.attn_tp_size = pc.attn_tp_size
@@ -1044,14 +1002,16 @@ class Gemma4ForCausalLM(nn.Module):
             + infer_config.scheduler_config.max_new_tokens
         )
         self.batch_size = infer_config.scheduler_config.batch_size
+        self.block_size = infer_config.scheduler_config.block_size
 
         self.init_parallel_comm_group()
         self.model = Gemma4TextModel(config, infer_config, comm_manager, prefix=f"{prefix}model" if prefix else "model")
         self.experts_per_rank = (
             config.num_experts // self.moe_ep_size if getattr(config, "num_experts", None) else 0
         )
+        self.num_experts = getattr(config, "num_experts", 0) or 0
+        self.num_experts_per_tok = getattr(config, "num_experts_per_tok", 0) or 0
 
-        # LMHead: ColumnParallelLinear when lmhead_tp > 1 else plain nn.Linear
         if self.lmhead_tp_size > 1:
             self.lm_head = ColumnParallelLinear(
                 input_size=config.hidden_size,
@@ -1094,18 +1054,7 @@ class Gemma4ForCausalLM(nn.Module):
                 group_stride=moe_ep_group_num,
                 return_name=True,
             )
-            experts_per_rank = (
-                self.config.num_experts // self.moe_ep_size
-                if getattr(self.config, "num_experts", None)
-                else 0
-            )
-            custom = getattr(self.infer_config.model_config, "custom_params", {}) or {}
-            default_mode = "mc2" if experts_per_rank <= 24 else "local_experts"
-            if (
-                self.moe_tp_size == 1
-                and experts_per_rank > 0
-                and custom.get("moe_ep_decode_mode", default_mode) == "mc2"
-            ):
+            if self.moe_tp_size == 1 and self.moe_ep_size > 1 and getattr(self.config, "num_experts", 0):
                 moe_ep_mc2_buffer_size = calc_moe_hccl_buffer_size(
                     self.infer_config, self.config, is_full_mesh_v2=True
                 )
@@ -1127,32 +1076,12 @@ class Gemma4ForCausalLM(nn.Module):
         forward_metadata: ForwardMetaData = None,
         **kwargs,
     ):
+        """
+        Packed 1D input_ids → logits [bs, 1, V]. Prefill gathers last token
+        per sequence via cu_q-1; decode is already [bs, H].
+        """
         if forward_metadata is None:
             forward_metadata = get_forward_metadata()
-
-        # BSND shim: framework feeds packed 1D input_ids/position_ids; gemma
-        # internals are BSND. Reshape at this boundary so all downstream sees 2D.
-        # Do NOT mutate forward_metadata.kv_len here — framework's _build_model_inputs
-        # reads it back next step expecting packed shape; attention does its own
-        # local kv_len shim.
-        if input_ids.dim() == 1:
-            bs = self.infer_config.scheduler_config.batch_size_per_dp_rank
-            if forward_metadata.is_prefill:
-                if input_ids.shape[0] % bs != 0:
-                    raise NotImplementedError(
-                        "gemma-4 BSND-shim requires equal-length packed prefill "
-                        f"(got total_tokens={input_ids.shape[0]}, "
-                        f"batch_size_per_dp_rank={bs}). Variable-length packed "
-                        "input requires migrating attention to TND layout."
-                    )
-                seq_length = input_ids.shape[0] // bs
-                input_ids = input_ids.view(bs, seq_length)
-                if position_ids is not None:
-                    position_ids = position_ids.view(bs, seq_length)
-            else:
-                input_ids = input_ids.view(bs, 1)
-                if position_ids is not None:
-                    position_ids = position_ids.view(bs, 1)
 
         hidden_states = self.model(
             input_ids=input_ids,
@@ -1160,57 +1089,71 @@ class Gemma4ForCausalLM(nn.Module):
             forward_metadata=forward_metadata,
         )
 
-        # Only compute logits for last token during prefill
-        if hidden_states.size(1) > 1 and position_ids is not None:
-            gather_index, _ = torch.max(position_ids, dim=-1)
-            gather_index = gather_index.unsqueeze(1).unsqueeze(2).repeat(1, 1, hidden_states.shape[-1])
-            hidden_states = torch.gather(hidden_states, 1, gather_index)
+        if forward_metadata.is_prefill:
+            cu_q = forward_metadata.actual_seq_lengths_cu_q
+            if cu_q is None:
+                raise RuntimeError(
+                    "Prefill path requires forward_metadata.actual_seq_lengths_cu_q.",
+                )
+            hidden_states = torch.index_select(hidden_states, 0, cu_q - 1)
 
         logits = self.lm_head(hidden_states)
 
-        # LMHead AllGather for parallel
+        # AllGather lm_head TP shards on vocab dim.
         if self.lmhead_tp_size > 1:
-            new_logits = [torch.empty_like(logits) for _ in range(self.lmhead_tp_size)]
-            dist.all_gather(new_logits, logits, group=self.comm_manager.get_group("lmhead_tp_group"))
-            logits = torch.cat(new_logits, dim=-1)
+            tp = self.lmhead_tp_size
+            gathered = torch.empty(
+                [logits.shape[0] * tp, logits.shape[-1]],
+                dtype=logits.dtype, device=logits.device,
+            )
+            dist.all_gather_into_tensor(
+                gathered, logits,
+                group=self.comm_manager.get_group("lmhead_tp_group"),
+            )
+            bsz = logits.shape[0]
+            logits = gathered.view(tp, bsz, logits.shape[-1]).permute(1, 0, 2).reshape(bsz, -1)
 
-        # Final logit softcapping
         if self.config.final_logit_softcapping is not None:
             cap = self.config.final_logit_softcapping
             logits = logits / cap
             logits = torch.tanh(logits)
             logits = logits * cap
 
+        # Framework slices logits[:, -1:, :] downstream; keep 3D.
+        logits = logits.view(logits.shape[0], 1, -1)
         logits = logits.float()
         return logits
 
-    # GEGLU mode is now determined dynamically per-call via is_prefill parameter,
-    # so set_geglu_mode() is no longer needed.
-
-    def prefill(self, **kwargs):
-        return self.forward(**kwargs)
-
-    def decode(self, **kwargs):
-        return self.forward(**kwargs)
+    def get_cache_info(self) -> ModelCacheInfo:
+        """
+        Per-layer cache_entries (k_cache + v_cache) grouped by attn_type
+        for the framework PA allocator.
+        """
+        layer_infos = []
+        for layer_idx, layer in enumerate(self.model.layers):
+            layer_infos.append(
+                LayerCacheInfo(
+                    layer_idx=layer_idx,
+                    caches=list(layer.self_attn.cache_entries),
+                )
+            )
+        return ModelCacheInfo(
+            num_layers=len(layer_infos),
+            block_size=self.block_size,
+            layer_infos=layer_infos,
+        )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set:
-        """Load weights from checkpoint, handling the multimodal prefix mapping.
-
-        Checkpoint keys:  model.language_model.layers.X.xxx
-        Our model keys:   model.layers.X.xxx
-
-        Handles:
-        - tie_word_embeddings: lm_head.weight = model.embed_tokens.weight
-        - Expert weights: packed 3D tensors [num_experts, ...] sliced by EP rank
-        - Skipping vision/audio tower weights
-        - Name mapping: ckpt 'layers.X.router.*' -> model 'layers.X.moe_block.router.*'
+        """
+        Load weights, mapping HF multimodal-prefixed keys to the LM-only
+        layout, slicing packed expert tensors by EP rank, and tying lm_head
+        to embed_tokens when applicable.
         """
         params_dict = dict(self.named_parameters())
         buffers_dict = dict(self.named_buffers())
         all_params = {**params_dict, **buffers_dict}
         loaded_params = set()
 
-        # Prefixes to skip (vision/audio tower)
         skip_prefixes = (
             "model.vision_tower",
             "model.audio_tower",
@@ -1219,21 +1162,18 @@ class Gemma4ForCausalLM(nn.Module):
             "model.multimodal_projector",
         )
 
-        # EP rank info for expert slicing
         ep_size = self.moe_ep_size
         experts_per_rank = self.experts_per_rank
         ep_rank = self.comm_manager.get_rank("moe_ep_group") if (ep_size > 1 and self.comm_manager is not None) else 0
 
         for name, loaded_weight in weights:
-            # Skip non-text weights
             if any(name.startswith(p) for p in skip_prefixes):
                 continue
 
-            # Map checkpoint prefix: model.language_model.X -> model.X
             if name.startswith("model.language_model."):
                 name = "model." + name[len("model.language_model."):]
 
-            # Handle tie_word_embeddings: embed_tokens.weight -> both embed and lm_head
+            # tie_word_embeddings: shared with lm_head.
             if name == "model.embed_tokens.weight":
                 for target_name in ["model.embed_tokens.weight",
                                     "model.embed_tokens.embedding.weight",
@@ -1245,12 +1185,8 @@ class Gemma4ForCausalLM(nn.Module):
                         loaded_params.add(target_name)
                 continue
 
-            # Handle packed expert weights: experts.gate_up_proj [128, 1408, 2816]
-            #                               experts.down_proj [128, 2816, 704]
-            # Checkpoint: model.layers.X.experts.gate_up_proj
-            # Model:      model.layers.X.moe_block.experts.w13_weight / w2_weight
+            # Packed expert tensors → EP-rank slice into w13/w2.
             if name.endswith(".experts.gate_up_proj"):
-                # gate_up_proj -> w13_weight (slice by EP rank)
                 target_name = name.replace(".experts.gate_up_proj",
                                            ".moe_block.experts.w13_weight")
                 if target_name in params_dict:
@@ -1263,7 +1199,6 @@ class Gemma4ForCausalLM(nn.Module):
                 continue
 
             if name.endswith(".experts.down_proj"):
-                # down_proj -> w2_weight (slice by EP rank)
                 target_name = name.replace(".experts.down_proj",
                                            ".moe_block.experts.w2_weight")
                 if target_name in params_dict:
@@ -1275,7 +1210,6 @@ class Gemma4ForCausalLM(nn.Module):
                     loaded_params.add(target_name)
                 continue
 
-            # Handle router weights: ckpt 'layers.X.router.*' -> model 'layers.X.moe_block.router.*'
             if ".router." in name and ".moe_block.router." not in name:
                 name = name.replace(".router.", ".moe_block.router.")
 
@@ -1287,20 +1221,16 @@ class Gemma4ForCausalLM(nn.Module):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
             else:
-                # Buffer (e.g. layer_scalar)
                 param.copy_(loaded_weight)
             loaded_params.add(name)
 
         return loaded_params
 
     def process_weights_after_loading(self):
-        """Post-process MoE weights after loading — transpose + NZ/quant formatting.
-
-        Matches the framework's expected flow: ModelWorker calls this after weight
-        load to let each module's quant_method rewrite the stored weight tensor
-        into the layout the grouped-matmul op actually consumes (e.g. transpose
-        K/N dims, pack NZ format). Without this, `npu_grouped_matmul` sees the
-        raw HF layout and fails with K-mismatch.
+        """
+        Apply per-module quant_method weight transforms (NZ pack, K/N
+        transpose) expected by npu_grouped_matmul, and eagerly fill MC2 kwargs
+        on MoE blocks so the first decode step doesn't trigger graph recompile.
         """
         is_nz = self.infer_config.model_config.enable_weight_nz
         for module in self.modules():
@@ -1309,3 +1239,7 @@ class Gemma4ForCausalLM(nn.Module):
                 continue
             if hasattr(quant_method, "process_weights_after_loading"):
                 quant_method.process_weights_after_loading(module, is_nz=is_nz)
+
+        for module in self.modules():
+            if isinstance(module, Gemma4SparseMoeBlock) and module.moe_ep_size > 1:
+                module.set_mc2_kwargs()

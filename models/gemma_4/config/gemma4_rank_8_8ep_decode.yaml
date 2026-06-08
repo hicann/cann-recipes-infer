@@ -1,0 +1,25 @@
+model_config:
+  model_name: "gemma_4"
+  model_path: "/data/models/Gemma-4"
+  exe_mode: "ge_graph"  # [eager, ge_graph, npugraph_ex]
+  with_ckpt: True
+  enable_profiler: False
+  enable_weight_nz: True
+  enable_cache_compile: False
+  enable_static_kernel: False  # [False, True] Only takes effect in npugraph_ex mode.
+
+data_config:
+  dataset: "default"
+  input_truncated_len: 256
+
+parallel_config:
+  world_size: 8
+  attn_tp_size: 1
+  moe_tp_size: 1
+  embed_tp_size: 8
+  lmhead_tp_size: 8
+  dense_tp_size: 1
+
+scheduler_config:
+  max_new_tokens: 32
+  batch_size: 8
