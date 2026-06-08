@@ -1526,6 +1526,52 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
 
         return hidden_states
 
+    def get_cp_input_ids(self, input_ids, attn_metadata):
+        input_ids_split = torch.split(input_ids, attn_metadata["cp_metadata"]["split_list"], dim=1)
+        cp_input_ids = torch.cat(
+            [input_ids_split[i] for i in attn_metadata["cp_metadata"]["zigzag_idx"]], dim=1
+        )
+        return cp_input_ids
+
+    def get_cp_hidden_states(self, hidden_states, attn_metadata):
+        hidden_states_split = torch.split(hidden_states, attn_metadata["cp_metadata"]["split_list"], dim=1)
+        hidden_states_cp = torch.cat(
+            [hidden_states_split[i] for i in attn_metadata["cp_metadata"]["zigzag_idx"]], dim=1
+        )
+        return hidden_states_cp
+
+    def update_cp_cos_sin(self, attn_metadata, hidden_states, kv_len, is_mtp=False):
+        for zigzag_flag in ["prev", "next"]:
+            position_ids_cur = attn_metadata[zigzag_flag]["position_ids_cur"]
+            position_ids_with_pre_win = attn_metadata[zigzag_flag]["position_ids_with_pre_win"]
+            position_ids_last_win = attn_metadata[zigzag_flag]["position_ids_last_win"]
+            cos_sin = {
+                "c1a": self.rotary_emb(hidden_states, position_ids_cur, kv_len, self.max_position_embeddings),
+                "c1a_with_pre_win": self.rotary_emb(hidden_states, position_ids_with_pre_win,
+                                                    kv_len, self.max_position_embeddings),
+                "c1a_last_win": self.rotary_emb(hidden_states, position_ids_last_win,
+                                                kv_len, self.max_position_embeddings),
+            }
+            cos_sin.update({"c1a_neg_sin": -cos_sin["c1a"][1]})
+            if not is_mtp:
+                position_ids_cmp = attn_metadata[zigzag_flag]["position_ids_cmp_for_rope"]
+                cos_sin.update({
+                    "comp": self.compress_rotary_emb(
+                        hidden_states, position_ids_cur, kv_len, self.max_position_embeddings),
+                    "comp_with_pre_win": self.compress_rotary_emb(hidden_states, position_ids_with_pre_win,
+                                                                  kv_len, self.max_position_embeddings),
+                    "comp_last_win": self.compress_rotary_emb(hidden_states, position_ids_last_win,
+                                                              kv_len, self.max_position_embeddings),
+                    "c4a": self.compress_rotary_emb(
+                        hidden_states, position_ids_cmp["4"], kv_len, self.max_position_embeddings),
+                    "c128a": self.compress_rotary_emb(
+                        hidden_states, position_ids_cmp["128"], kv_len, self.max_position_embeddings),
+                })
+                cos_sin.update({"comp_neg_sin": -cos_sin.get("comp")[1]})
+            attn_metadata[zigzag_flag].update({
+                "cos_sin": cos_sin,
+            })
+
     def generate_cos_sin(self, attn_metadata, hidden_states, is_mtp=False):
         # Hash layer: use cos_sin['c1a'] as position_embdding
         # Compress layer: -- Attention & Indexer: use cos_sin['comp'] as position_embdding
@@ -1539,7 +1585,8 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
         if not is_mtp:
             position_ids_c = attn_metadata["position_ids_c"]
             cos_sin.update({
-                "comp": self.compress_rotary_emb(hidden_states, position_ids, kv_len, self.max_position_embeddings),
+                "comp": self.compress_rotary_emb(
+                    hidden_states, position_ids, kv_len, self.max_position_embeddings),
                 "c4a": self.compress_rotary_emb(
                     hidden_states, position_ids_c["4"], kv_len, self.max_position_embeddings),
                 "c128a": self.compress_rotary_emb(
@@ -1559,57 +1606,26 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
     ):
         batch_size, seq_length = input_ids.shape
 
+        if is_prefill and self.cp_size > 1 and self.embed_tp_size == 1:
+            input_ids = self.get_cp_input_ids(input_ids, attn_metadata)
+
         inputs_embeds = self.calc_input_embeddings(input_ids, is_prefill)
         hidden_states = inputs_embeds
+        if is_prefill and self.cp_size > 1 and self.embed_tp_size > 1:
+            # Keep full input_ids for embedding TP, then switch hidden states to attention CP layout.
+            input_ids = self.get_cp_input_ids(input_ids, attn_metadata)
+            hidden_states = self.get_cp_hidden_states(inputs_embeds, attn_metadata)
+            del inputs_embeds
 
-        cos_sin = self.generate_cos_sin(attn_metadata, hidden_states)
-        attn_metadata.update({'cos_sin': cos_sin})
-
-        position_ids = attn_metadata["position_ids"]
         kv_len = attn_metadata["kv_len"]
-        input_ids_cp = input_ids
         if is_prefill and self.cp_size > 1:
-            hidden_states_list = list(
-                torch.split(hidden_states, attn_metadata["cp_metadata"]["split_list"], dim=1))
-            hidden_states = torch.cat(
-                [hidden_states_list[i] for i in attn_metadata["cp_metadata"]["zigzag_idx"]], dim=1
-            )
-
-            input_ids_list = list(
-                torch.split(input_ids, attn_metadata["cp_metadata"]["split_list"], dim=1))
-            input_ids_cp = torch.cat(
-                [input_ids_list[i] for i in attn_metadata["cp_metadata"]["zigzag_idx"]], dim=1
-            )
-
-            for zigzag_flag in ["prev", "next"]:
-                position_ids_cur = attn_metadata[zigzag_flag]["position_ids_cur"]
-                position_ids_with_pre_win = attn_metadata[zigzag_flag]["position_ids_with_pre_win"]
-                position_ids_last_win = attn_metadata[zigzag_flag]["position_ids_last_win"]
-                position_ids_cmp = attn_metadata[zigzag_flag]["position_ids_cmp_for_rope"]
-                cos_sin = {
-                    "c1a": self.rotary_emb(hidden_states, position_ids_cur, kv_len, self.max_position_embeddings),
-                    "comp": self.compress_rotary_emb(hidden_states, position_ids_cur, kv_len, self.max_position_embeddings),
-                    "c1a_with_pre_win": self.rotary_emb(hidden_states, position_ids_with_pre_win,
-                                                        kv_len, self.max_position_embeddings),
-                    "comp_with_pre_win": self.compress_rotary_emb(hidden_states, position_ids_with_pre_win,
-                                                                kv_len, self.max_position_embeddings),
-                    "c1a_last_win": self.rotary_emb(hidden_states, position_ids_last_win,
-                                                        kv_len, self.max_position_embeddings),
-                    "comp_last_win": self.compress_rotary_emb(hidden_states, position_ids_last_win,
-                                                                kv_len, self.max_position_embeddings),
-                    "c4a": self.compress_rotary_emb(
-                        hidden_states, position_ids_cmp["4"], kv_len, self.max_position_embeddings),
-                    "c128a": self.compress_rotary_emb(
-                        hidden_states, position_ids_cmp["128"], kv_len, self.max_position_embeddings),
-                }
-                cos_sin.update({"c1a_neg_sin": -cos_sin["c1a"][1]})
-                cos_sin.update({"comp_neg_sin": -cos_sin["comp"][1]})
-                attn_metadata[zigzag_flag].update({
-                    "cos_sin": cos_sin,
-                })
+            self.update_cp_cos_sin(attn_metadata, hidden_states, kv_len)
+        else:
+            cos_sin = self.generate_cos_sin(attn_metadata, hidden_states)
+            attn_metadata.update({'cos_sin': cos_sin})
 
         if is_prefill and self.attn_tp_size > 1 and self.moe_ep_size > 1:
-            hidden_states = self.prepare_inputs_for_layer(inputs_embeds, input_ids)
+            hidden_states = self.prepare_inputs_for_layer(hidden_states, input_ids)
         residual = None
 
         label = f'decode_layer'
@@ -1630,7 +1646,7 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
                     cache_data=cache_data,
                     is_prefill=is_prefill,
                     cur_topk_list=cur_topk_list,
-                    input_ids=input_ids_cp,
+                    input_ids=input_ids,
                 )
         hidden_states = self.hc_head(hidden_states, self.hc_head_fn, self.hc_head_scale, self.hc_head_base)
         hidden_states = self.norm(hidden_states)
@@ -1910,26 +1926,44 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
             }
         return hccl_comm_dict
 
+    def gather_cp_last_token_hidden(self, outputs, attn_metadata):
+        bs, q_len, hidden_size = outputs.shape
+        cp_metadata = attn_metadata["cp_metadata"]
+        segment_len = q_len // 2
+        last_segment_idx = cp_metadata["last_rank"]
+        if last_segment_idx < 0:
+            raise ValueError("CP prefill requires at least one valid token")
+        last_segment_len = cp_metadata["split_kv_len"][0, last_segment_idx].item()
+
+        local_offset = last_segment_len - 1
+        if cp_metadata["last_rank_flag"] == "next":
+            local_offset += segment_len
+
+        last_hidden = outputs.new_zeros((bs, 1, hidden_size))
+        if self.global_rank == cp_metadata["last_rank_zz"]:
+            last_hidden.copy_(outputs[:, local_offset: local_offset + 1, :])
+        # Only the owner rank writes data; sum broadcasts the selected hidden state across the CP group.
+        dist.all_reduce(last_hidden, group=self.hccl_comm_dict.get("cp_group", None))
+        return last_hidden
+
     def forward_lm_head(self, outputs, kv_len, is_prefill=True, attn_metadata=None):
         bs, q_len, hidden_size = outputs.shape
-        if is_prefill and self.cp_size > 1:
-            outputs_all = outputs.new_empty([bs * q_len * self.cp_size, hidden_size])
-            dist.all_gather_into_tensor(outputs_all, outputs.view(bs * q_len, -1), \
-                                    group=self.hccl_comm_dict.get("cp_group", None))
-            outputs_all = outputs_all.view(-1, bs, q_len // 2,
-                                           hidden_size)[attn_metadata["cp_metadata"]["reverse_index"]]
-            outputs = outputs_all.permute(1, 0, 2, 3).reshape(bs, -1, hidden_size)
         if is_prefill:
+            if self.cp_size > 1:
+                outputs = self.gather_cp_last_token_hidden(outputs, attn_metadata)
+                q_len = 1
+
             # attention: SP + TP，moe：DP + EP
             if self.attn_tp_size > 1 and self.moe_ep_size > 1:
                 new_outputs = torch.zeros_like(outputs).repeat(self.attn_tp_size, 1, 1)
                 dist.all_gather_into_tensor(new_outputs, outputs,
                                             group=self.hccl_comm_dict.get("attn_tp_group", None))
                 outputs = new_outputs
-            gather_index = kv_len - 1
-            gather_index = gather_index.unsqueeze(1).unsqueeze(2).repeat(1, 1, outputs.shape[-1])
-            outputs = torch.gather(outputs, 1, gather_index)
-            q_len = 1 # prefill takes th last token
+            if self.cp_size == 1:
+                gather_index = kv_len - 1
+                gather_index = gather_index.unsqueeze(1).unsqueeze(2).repeat(1, 1, outputs.shape[-1])
+                outputs = torch.gather(outputs, 1, gather_index)
+                q_len = 1 # prefill takes th last token
         else: # combine bs and q_len axes for lm_head
             outputs = outputs.view(bs * q_len, 1, hidden_size)
 
@@ -2386,34 +2420,24 @@ class DeepseekV3ModelMTP(DeepseekV3ForCausalLM):
         self.generate_kernel_metadata(attn_metadata, is_prefill, True)
 
         batch_size, seq_length = input_ids.shape
-        hidden_states = self.model.calc_input_embeddings(input_ids, is_prefill)
+        if is_prefill and self.cp_size > 1 and self.embed_tp_size == 1:
+            input_ids = self.model.get_cp_input_ids(input_ids, attn_metadata)
 
-        cos_sin = self.model.generate_cos_sin(attn_metadata, hidden_states, is_mtp=True)
-        attn_metadata.update({'cos_sin': cos_sin})
+        inputs_embeds = self.model.calc_input_embeddings(input_ids, is_prefill)
+        hidden_states = inputs_embeds
+        if is_prefill and self.cp_size > 1 and self.embed_tp_size > 1:
+            # Preserve embedding TP correctness, then use local attention CP hidden states for MTP.
+            hidden_states = self.model.get_cp_hidden_states(inputs_embeds, attn_metadata)
+            del inputs_embeds
+
+        kv_len = attn_metadata["kv_len"]
+        if is_prefill and self.cp_size > 1:
+            self.model.update_cp_cos_sin(attn_metadata, hidden_states, kv_len, is_mtp=True)
+        else:
+            cos_sin = self.model.generate_cos_sin(attn_metadata, hidden_states, is_mtp=True)
+            attn_metadata.update({'cos_sin': cos_sin})
         residual = None
 
-        if is_prefill and self.cp_size > 1:
-            hidden_states_list = list(
-                torch.split(hidden_states, attn_metadata["cp_metadata"]["split_list"], dim=1))
-            hidden_states = torch.cat(
-                [hidden_states_list[i] for i in attn_metadata["cp_metadata"]["zigzag_idx"]], dim=1
-            )
-
-            for zigzag_flag in ["prev", "next"]:
-                position_ids_cur = attn_metadata[zigzag_flag]["position_ids_cur"]
-                position_ids_with_pre_win = attn_metadata[zigzag_flag]["position_ids_with_pre_win"]
-                position_ids_last_win = attn_metadata[zigzag_flag]["position_ids_last_win"]
-                cos_sin = {
-                    "c1a": self.rotary_emb(hidden_states, position_ids_cur, kv_len, self.max_position_embeddings),
-                    "c1a_with_pre_win": self.rotary_emb(hidden_states, position_ids_with_pre_win,
-                                                        kv_len, self.max_position_embeddings),
-                    "c1a_last_win": self.rotary_emb(hidden_states, position_ids_last_win,
-                                                        kv_len, self.max_position_embeddings),
-                }
-                cos_sin.update({"c1a_neg_sin": -cos_sin["c1a"][1]})
-                attn_metadata[zigzag_flag].update({
-                    "cos_sin": cos_sin,
-                })
 
         hidden_states = self.enorm(hidden_states)
         prev_hidden_states = self.hnorm(prev_hidden_states)
