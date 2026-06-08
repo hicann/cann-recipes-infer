@@ -1,12 +1,12 @@
 model_config:
   model_name: "qwen3.5"
-  model_path: "/model/to/Qwen3.5-122B-A10B"
+  model_path: "/data/models/Qwen3.5-122B-A10B"
   exe_mode: "ge_graph"        # ["eager", "ge_graph", "npugraph_ex"]
   enable_profiler: False  # [False, True]
   with_ckpt: True
   enable_cache_compile: False
   packed_sequence: False
-  perfect_eplb: False
+  force_eplb: False
   platform_version: "A3"
   custom_params:
       # enable_mm_all_reduce_base: Whether to fuse TP matmul and all_reduce with npu_mm_all_reduce_base (default: False)
@@ -26,7 +26,7 @@ parallel_config:
   moe_tp_size: 8
   embed_tp_size: 8
   lmhead_tp_size: 8
-  dense_tp_size: 1
+  shared_tp_size: 1
   # Derivations (not configurable):
   # attn_dp_size = world_size // attn_tp_size = 1
   # moe_ep_size = world_size // moe_tp_size = 1

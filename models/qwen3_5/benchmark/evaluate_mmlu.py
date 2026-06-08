@@ -133,7 +133,7 @@ def load_config(yaml_file_path: str, global_rank: int, local_rank: int) -> Infer
             config.parallel_config.moe_tp_size,
             config.parallel_config.embed_tp_size,
             config.parallel_config.lmhead_tp_size,
-            config.parallel_config.dense_tp_size,
+            config.parallel_config.shared_tp_size,
             config.parallel_config.o_proj_tp_size,
         )
         if any(size > 1 for size in non_attn_tp_sizes) or config.parallel_config.moe_ep_size > 1:

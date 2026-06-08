@@ -51,8 +51,15 @@ Qwen3.5-MoE模型是Qwen3.5系列中的混合专家模型。本样例基于trans
 ## 权重准备
 请根据所使用的模型类型自行下载原始权重到本地路径，例如`/data/models/Qwen3.5-35B-A3B`。
 
-以Qwen3.5-35B-A3B为例，权重下载地址：[Qwen3.5-35B-A3B](https://huggingface.co/Qwen/Qwen3.5-35B-A3B/tree/main)。
+当前950支持FP8和MXFP8量化加速，FP8量化场景需要下载FP8权重，**MXFP8量化场景仅需下载BF16权重，脚本提供在线量化功能**。
 
+权重下载地址如下：
+
+| BF16 | FP8 |
+|---|---|
+| [Qwen3.5-35B-A3B](https://huggingface.co/Qwen/Qwen3.5-35B-A3B) | [Qwen3.5-35B-A3B-FP8](https://huggingface.co/Qwen/Qwen3.5-35B-A3B-FP8) |
+| [Qwen3.5-122B-A10B](https://huggingface.co/Qwen/Qwen3.5-122B-A10B) | [Qwen3.5-122B-A10B-FP8](https://huggingface.co/Qwen/Qwen3.5-122B-A10B-FP8) |
+| [Qwen3.5-397B-A17B](https://huggingface.co/Qwen/Qwen3.5-397B-A17B) | [Qwen3.5-397B-A17B-FP8](https://huggingface.co/Qwen/Qwen3.5-397B-A17B-FP8) |
 
 ## 推理执行
 
@@ -66,7 +73,22 @@ Qwen3.5-MoE模型是Qwen3.5系列中的混合专家模型。本样例基于trans
 - `qwen3_5_122b_tp8.yaml`：Qwen3.5-122B-A10B，TP8配置。
 - `qwen3_5_397b_tp16.yaml`：Qwen3.5-397B-A17B，TP16配置。
 
+类似地，在`models/qwen3_5/config/fp8`目录下提供了FP8量化加速YAML文件，在`models/qwen3_5/config/mxfp8_online`目录下提供了MXFP8量化加速YAML文件。
+
 本文以`models/qwen3_5/config/qwen3_5_35b_ep8.yaml`文件为例，修改其中的`model_path`参数，将其设置为[权重准备](#权重准备)阶段准备好的权重文件存储路径，例如`/data/models/Qwen3.5-35B-A3B`。
+
+除框架统一配置之外，还额外支持以下特性，放置在 YAML 文件 `model_config` 的 `custom_params` 字段下：
+
+| 参数名 | 类型 | 默认值 | 含义 |
+| --- | --- | --- | --- |
+| `quantization` | str | - | 量化类型。FP8权重通常会在`config.json`中携带量化配置；如果权重中没有，可在此设置为`fp8`，并配合`quantization_config`使用。 |
+| `quantization_config` | dict | - | 量化配置。用于补充FP8权重缺失的量化信息，例如`quant_method`、`activation_scheme`、`weight_block_size`等字段。 |
+| `enable_online_mxfp8_quantization` | bool | `false` | 启用在线MXFP8量化。加载BF16/FP16权重后在线转换为MXFP8权重，用于提升推理性能。 |
+| `online_mxfp8_quant_layers` | list[str] | `["linear", "gmm"]` | 指定在线MXFP8量化的层类型，可配置为`linear`、`gmm`。 |
+| `online_mxfp8_ignored_layers` | list[str] | `["lm_head"]` | 指定在线MXFP8量化时跳过的层，默认不量化`lm_head`。 |
+| `enable_mm_all_reduce_base` | bool | `false` | 启用`npu_mm_all_reduce_base`融合TP场景下的MatMul和AllReduce计算。 |
+| `enable_gdn_solve_triangular` | bool | `false` | 在Qwen3.5 GatedDeltaNet chunk rule中使用`solve_triangular`计算。 |
+| `enable_decode_moe_dispatch_combine_v2` | bool | `false` | Decode阶段MoE启用`dispatch_combine_v2`实现。 |
 
 ### 2. 准备输入prompt
 
@@ -89,6 +111,17 @@ Qwen3.5-MoE模型是Qwen3.5系列中的混合专家模型。本样例基于trans
 
 统一入口脚本位于`executor/scripts/infer.sh`，可通过命令行参数指定模型目录和YAML文件。
 
+YAML文件统一放在`models/qwen3_5/config`，具体参数说明可参考[Qwen3.5 YAML参数说明](./config/README.md)
+
+### 4. 执行推理脚本
+
+进入仓库根目录，执行统一推理脚本：
+
+```bash
+cd cann-recipes-infer
+bash executor/scripts/infer.sh --model qwen3_5 --yaml qwen3_5_35b_ep8.yaml
+```
+
 8卡执行示例：
 
 ```bash
@@ -103,13 +136,18 @@ export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
 bash executor/scripts/infer.sh --model qwen3_5 --yaml qwen3_5_397b_tp16.yaml
 ```
 
-### 4. 执行推理脚本
-
-进入仓库根目录，执行统一推理脚本：
+FP8量化加速执行示例：
 
 ```bash
-cd cann-recipes-infer
-bash executor/scripts/infer.sh --model qwen3_5 --yaml qwen3_5_35b_ep8.yaml
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3
+bash executor/scripts/infer.sh --model qwen3_5 --yaml fp8/qwen3_5_35b_fp8_tp4.yaml
+```
+
+MXFP8量化加速执行示例：
+
+```bash
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3
+bash executor/scripts/infer.sh --model qwen3_5 --yaml mxfp8_online/qwen3_5_35b_mxfp8_tp4.yaml
 ```
 
 > 说明：如果是多机环境，需要在每个节点上执行。脚本会根据YAML中的`world_size`和`executor/scripts/set_env.sh`中的IP列表计算各节点rank信息。

@@ -168,6 +168,7 @@ class ParallelConfig:
         embed_tp_size: Tensor parallelism size for embedding (default: 1)
         lmhead_tp_size: Tensor parallelism size for LM head (default: 1)
         dense_tp_size: Tensor parallelism size for dense layers (default: 1)
+        shared_tp_size: Tensor parallelism size for shared expert layers (default: 1)
         o_proj_tp_size: Tensor parallelism size for output projection (default: 1)
         moe_ep_size: Expert parallelism size for MoE (default: 1)
         cp_size: context parallelism size (default: 1)
@@ -185,6 +186,7 @@ class ParallelConfig:
     moe_ep_size: int = 1  # This will be calculated based on world_size and moe_tp_size
     lmhead_tp_size: int = 1
     dense_tp_size: int = 1
+    shared_tp_size: int = 1
     o_proj_tp_size: int = 1
 
     # Other parallelism
@@ -202,6 +204,7 @@ class ParallelConfig:
             embed_tp_size=parallel_config_dict.get("embed_tp_size", 1),
             lmhead_tp_size=parallel_config_dict.get("lmhead_tp_size", 1),
             dense_tp_size=parallel_config_dict.get("dense_tp_size", 1),
+            shared_tp_size=parallel_config_dict.get("shared_tp_size", 1),
             o_proj_tp_size=parallel_config_dict.get("o_proj_tp_size", 1),
             cp_size=parallel_config_dict.get("cp_size", 1),
         )
@@ -230,6 +233,8 @@ class ParallelConfig:
             raise ValueError(f"world_size={self.world_size} not divisible by lmhead_tp_size={self.lmhead_tp_size}")
         if self.world_size % self.dense_tp_size != 0:
             raise ValueError(f"world_size={self.world_size} not divisible by dense_tp_size={self.dense_tp_size}")
+        if self.world_size % self.shared_tp_size != 0:
+            raise ValueError(f"world_size={self.world_size} not divisible by shared_tp_size={self.shared_tp_size}")
         if self.world_size % self.o_proj_tp_size != 0:
             raise ValueError(f"world_size={self.world_size} not divisible by o_proj_tp_size={self.o_proj_tp_size}")
         if self.world_size % self.cp_size != 0:

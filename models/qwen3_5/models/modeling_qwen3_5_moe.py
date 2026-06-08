@@ -16,6 +16,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import itertools
+import json
 import math
 import os
 import logging
@@ -49,15 +50,18 @@ from executor.core.config import InferenceConfig, CommManager
 from executor.model_loader.weight_utils import default_weight_loader
 from executor.utils import align_up
 from executor.utils.forward_metadata import ForwardMetaData
-from module.fuse_moe_gmm import FusedMoEGMM
+from module.fuse_moe_gmm import FusedMoEGMM, UnquantizedFusedMoEGMMMethod
 from module.linear import (
     ColumnParallelLinear,
+    LinearBase,
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
     UnquantizedLinearMethod,
     VocabParallelEmbedding,
 )
+from module.quantization import get_quant_config
+from module.quantization.mxfp8 import BLOCK_K, MxFp8Config, MxFp8LinearMethod, MxFp8MoEGMMMethod
 from module.utils import set_weight_attrs
 
 from .configuration_qwen3_5_moe import Qwen3_5MoeConfig, Qwen3_5MoeTextConfig, Qwen3_5MoeVisionConfig
@@ -104,89 +108,301 @@ def qwen3_5_prefill_mm_all_reduce(
     return torch_npu.npu_mm_all_reduce_base(input_, layer.weight.data, hcom, reduce_op="sum")
 
 
-class Qwen3_5MoeGatedDeltaNetFusedInProj(MergedColumnParallelLinear):
-    def __init__(
-        self,
-        hidden_size: int,
-        total_key_dim: int,
-        total_value_dim: int,
-        total_num_v_heads: int,
-        tp_size: int = 1,
-        tp_rank: int = 0,
-        prefix: str = "",
-    ):
-        self.total_key_dim = total_key_dim
-        self.total_value_dim = total_value_dim
-        self.total_num_v_heads = total_num_v_heads
-        super().__init__(
-            hidden_size,
-            [
-                total_key_dim,
-                total_key_dim,
-                total_value_dim,
-                total_value_dim,
-                total_num_v_heads,
-                total_num_v_heads,
-            ],
-            bias=False,
-            tp_size=tp_size,
-            tp_rank=tp_rank,
-            prefix=prefix,
-        )
-        self._shard_name_to_id = {
-            "q": 0,
-            "k": 1,
-            "v": 2,
-            "z": 3,
-            "b": 4,
-            "a": 5,
-        }
+LINEAR_TARGET_MODULES = (
+    ColumnParallelLinear,
+    MergedColumnParallelLinear,
+    QKVParallelLinear,
+    RowParallelLinear,
+    LinearBase,
+)
+GMM_TARGET_NAMES = {"gmm", "moe", "moegmm", "fused_moe_gmm"}
 
-    def _load_output_shard(
-        self,
-        param: torch.nn.Parameter,
-        loaded_weight: torch.Tensor,
-        loaded_shard_id: int,
-    ) -> None:
-        param_data = param.data
-        output_dim = getattr(param, "output_dim", None)
-        is_per_block_scale = getattr(param, "is_per_block_scale", False)
 
-        if output_dim is not None:
-            if is_per_block_scale:
-                block_size = self.quant_config.weight_block_size[0]
-                shard_offset = math.ceil(sum(self.output_sizes[:loaded_shard_id]) / block_size) // self.tp_size
-                shard_size = math.ceil(self.output_sizes[loaded_shard_id] / block_size) // self.tp_size
-            else:
-                shard_offset = sum(self.output_sizes[:loaded_shard_id]) // self.tp_size
-                shard_size = self.output_sizes[loaded_shard_id] // self.tp_size
+def _normalize_names(values: Iterable[str] | str | None, default: list[str]) -> list[str]:
+    if values is None:
+        return default
+    if isinstance(values, str):
+        return [values.lower()]
+    return [value.lower() for value in values]
 
-            packed_dim = getattr(param, "packed_dim", None)
-            if packed_dim == output_dim:
-                shard_size = shard_size // param.pack_factor
-                shard_offset = shard_offset // param.pack_factor
 
-            use_bitsandbytes_4bit = getattr(param, "use_bitsandbytes_4bit", False)
-            if use_bitsandbytes_4bit:
-                shard_size = loaded_weight.shape[output_dim]
-                shard_offset = loaded_weight.shape[output_dim] * loaded_shard_id
+def _is_ignored(name: str, ignored_layers: Iterable[str]) -> bool:
+    return any(name == ignored or name.startswith(f"{ignored}.") for ignored in ignored_layers)
 
-            param_data = param_data.narrow(output_dim, shard_offset, shard_size)
-            if not use_bitsandbytes_4bit:
-                start_idx = self.tp_rank * shard_size
-                loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
-        else:
-            ignore_warning = getattr(param, "ignore_warning", False)
-            if not ignore_warning:
+
+def _is_mxfp8_quantized_linear(layer: nn.Module) -> bool:
+    weight = getattr(layer, "weight", None)
+    weight_scale = getattr(layer, "weight_scale", None)
+    quant_method = getattr(layer, "quant_method", None)
+    return (
+        weight is not None
+        and weight.dtype == torch.float8_e4m3fn
+        and weight_scale is not None
+        and not isinstance(quant_method, UnquantizedLinearMethod)
+    )
+
+
+def _is_mxfp8_quantized_gmm(layer: nn.Module) -> bool:
+    w13_weight = getattr(layer, "w13_weight", None)
+    w2_weight = getattr(layer, "w2_weight", None)
+    return (
+        w13_weight is not None
+        and w2_weight is not None
+        and w13_weight.dtype == torch.float8_e4m3fn
+        and w2_weight.dtype == torch.float8_e4m3fn
+        and getattr(layer, "w13_weight_scale", None) is not None
+        and getattr(layer, "w2_weight_scale", None) is not None
+    )
+
+
+def _flatten_mxfp8_dynamic_scale(dynamic_scale: torch.Tensor | None) -> torch.Tensor | None:
+    if dynamic_scale is None:
+        return None
+    if dynamic_scale.dim() >= 3 and dynamic_scale.shape[-1] == 2:
+        return dynamic_scale.reshape(-1, dynamic_scale.shape[-2], 2)
+    return dynamic_scale.reshape(-1, dynamic_scale.shape[-1])
+
+
+def _quantize_weight_last_dim(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    original_shape = weight.shape
+    weight_2d = weight.contiguous().view(-1, original_shape[-1])
+    quant_weight, weight_scale = torch_npu.npu_dynamic_mx_quant(
+        weight_2d,
+        dst_type=torch.float8_e4m3fn,
+    )
+    quant_weight = quant_weight.reshape(original_shape).contiguous()
+    weight_scale = weight_scale.reshape(*original_shape[:-1], -1).contiguous()
+    return quant_weight, weight_scale
+
+
+def _quantize_mxfp8_linear_weight(layer: LinearBase) -> None:
+    weight = layer.weight.data
+    if weight.dim() != 2:
+        return
+
+    quant_weight, weight_scale = _quantize_weight_last_dim(weight)
+    layer.weight = torch.nn.Parameter(quant_weight.contiguous(), requires_grad=False)
+    layer.weight_scale = torch.nn.Parameter(weight_scale, requires_grad=False)
+    layer.quant_method = MxFp8LinearMethod()
+
+    if getattr(layer, "bias", None) is not None:
+        layer.bias = torch.nn.Parameter(layer.bias.to(torch.float32).contiguous(), requires_grad=False)
+
+
+def _quantize_mxfp8_gmm_weight(layer: FusedMoEGMM) -> None:
+    w13_quant_weight, w13_weight_scale = _quantize_weight_last_dim(layer.w13_weight.data)
+    w2_quant_weight, w2_weight_scale = _quantize_weight_last_dim(layer.w2_weight.data)
+
+    layer.w13_weight = torch.nn.Parameter(w13_quant_weight, requires_grad=False)
+    layer.w13_weight_scale = torch.nn.Parameter(w13_weight_scale, requires_grad=False)
+    layer.w2_weight = torch.nn.Parameter(w2_quant_weight, requires_grad=False)
+    layer.w2_weight_scale = torch.nn.Parameter(w2_weight_scale, requires_grad=False)
+    quant_config = MxFp8Config(
+        is_checkpoint_mxfp8_serialized=True,
+        activation_scheme="dynamic",
+        weight_block_size=[1, BLOCK_K],
+    )
+    layer.quant_method = MxFp8MoEGMMMethod(quant_config)
+
+
+def _apply_qwen3_5_online_mxfp8_quantization(
+    model: torch.nn.Module,
+    targets: Iterable[str] | str | None = None,
+    ignored_layers: Iterable[str] | None = None,
+) -> int:
+    target_names = _normalize_names(targets, ["linear"])
+    ignored_names = set(ignored_layers or [])
+    convert_linear = "linear" in target_names
+    convert_gmm = any(target_name in GMM_TARGET_NAMES for target_name in target_names)
+
+    converted_linear = 0
+    converted_gmm = 0
+    for name, layer in model.named_modules():
+        if _is_ignored(name, ignored_names):
+            continue
+
+        if convert_gmm and isinstance(layer, FusedMoEGMM):
+            if not isinstance(getattr(layer, "quant_method", None), UnquantizedFusedMoEGMMMethod):
+                continue
+            if layer.w13_weight.dtype == torch.float8_e4m3fn and layer.w2_weight.dtype == torch.float8_e4m3fn:
+                continue
+            if layer.w13_weight.shape[-1] % BLOCK_K != 0 or layer.w2_weight.shape[-1] % BLOCK_K != 0:
                 logger.warning(
-                    "Loading a weight without `output_dim` attribute in "
-                    "Qwen3_5MoeGatedDeltaNetFusedInProj, assume the weight is "
-                    "the same for all partitions."
+                    "Skip online MXFP8 GMM quantization for %s: last dims are %s and %s, not divisible by %s.",
+                    name,
+                    layer.w13_weight.shape[-1],
+                    layer.w2_weight.shape[-1],
+                    BLOCK_K,
                 )
+                continue
+            _quantize_mxfp8_gmm_weight(layer)
+            converted_gmm += 1
+            continue
 
-        if param_data.shape != loaded_weight.shape:
-            raise RuntimeError("param_data.shape != loaded_weight.shape")
-        param_data.copy_(loaded_weight)
+        if not convert_linear or not isinstance(layer, LINEAR_TARGET_MODULES):
+            continue
+        if not isinstance(getattr(layer, "quant_method", None), UnquantizedLinearMethod):
+            continue
+        if layer.weight.dtype == torch.float8_e4m3fn:
+            continue
+        if layer.weight.shape[-1] % BLOCK_K != 0:
+            logger.warning(
+                "Skip online MXFP8 quantization for %s: input dimension %s is not divisible by %s.",
+                name,
+                layer.weight.shape[-1],
+                BLOCK_K,
+            )
+            continue
+
+        _quantize_mxfp8_linear_weight(layer)
+        converted_linear += 1
+
+    logger.info(
+        "Online MXFP8 quantization converted %s linear layers and %s GMM layers.",
+        converted_linear,
+        converted_gmm,
+    )
+    return converted_linear + converted_gmm
+
+
+def _normalize_quantization_method(quantization: str | None) -> str | None:
+    if quantization is None:
+        return None
+    return quantization.lower().replace("compressed_tensors", "compressed-tensors")
+
+
+def _normalize_qwen3_5_quantization_config(quant_config: dict | None) -> dict | None:
+    if not isinstance(quant_config, dict):
+        return quant_config
+
+    normalized = dict(quant_config)
+    ignored_layers = normalized.get("ignored_layers")
+    if ignored_layers is None:
+        ignored_layers = normalized.get("modules_to_not_convert")
+    if ignored_layers is not None:
+        normalized["ignored_layers"] = [
+            layer_name.replace("model.language_model.", "model.", 1)
+            for layer_name in ignored_layers
+        ]
+    return normalized
+
+
+def _load_quantization_config_from_model_path(model_path: str) -> dict | None:
+    config_path = os.path.join(model_path, "config.json")
+    if not os.path.exists(config_path):
+        return None
+    with open(config_path, "r", encoding="utf-8") as config_file:
+        model_config = json.load(config_file)
+    return model_config.get("quantization_config") or model_config.get("compression_config")
+
+
+def _get_qwen3_5_quantization_config(config, infer_config: InferenceConfig) -> dict | None:
+    custom_params = infer_config.model_config.custom_params or {}
+    quant_config = custom_params.get("quantization_config")
+    if quant_config is None:
+        quant_config = getattr(config, "quantization_config", None)
+    if quant_config is None:
+        quant_config = getattr(config, "compression_config", None)
+    if quant_config is None:
+        quant_config = _load_quantization_config_from_model_path(infer_config.model_config.model_path)
+    return _normalize_qwen3_5_quantization_config(quant_config)
+
+
+def _sync_qwen3_5_ignored_layers(config, infer_config: InferenceConfig) -> None:
+    quant_method_config = getattr(config, "quant_config", None)
+    if quant_method_config is None or not hasattr(quant_method_config, "ignored_layers"):
+        return
+
+    quant_config = _get_qwen3_5_quantization_config(config, infer_config)
+    if not quant_config:
+        return
+    ignored_layers = quant_config.get("ignored_layers")
+    if ignored_layers is not None:
+        quant_method_config.ignored_layers = ignored_layers
+
+
+def _register_qwen3_5_packed_modules_mapping(config) -> None:
+    quant_method_config = getattr(config, "quant_config", None)
+    if quant_method_config is None:
+        return
+
+    quant_method_config.packed_modules_mapping.update({
+        "merged_qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+        "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
+        "in_proj_ba": ["in_proj_b", "in_proj_a"],
+    })
+
+
+def _init_qwen3_5_quant_config(config, infer_config: InferenceConfig) -> None:
+    if getattr(config, "quant_config", None) is not None:
+        _sync_qwen3_5_ignored_layers(config, infer_config)
+        _register_qwen3_5_packed_modules_mapping(config)
+        return
+
+    custom_params = infer_config.model_config.custom_params or {}
+    quant_config = _get_qwen3_5_quantization_config(config, infer_config)
+    if quant_config is not None:
+        config.quantization_config = quant_config
+
+    quantization = _normalize_quantization_method(custom_params.get("quantization"))
+    if quantization is None:
+        quant_config = getattr(config, "quantization_config", None)
+        if quant_config is None:
+            quant_config = getattr(config, "compression_config", None)
+        if quant_config:
+            quantization = _normalize_quantization_method(quant_config.get("quant_method", ""))
+
+    if quantization:
+        config.quant_config = get_quant_config(
+            config,
+            quantization,
+            infer_config.model_config.model_path,
+        )
+        _register_qwen3_5_packed_modules_mapping(config)
+
+
+def _map_quant_scale_name(param_name: str, params_dict: dict[str, torch.nn.Parameter]) -> str:
+    candidates = [param_name]
+    if ".weight_scale_inv" in param_name:
+        candidates.extend([
+            param_name.replace(".weight_scale_inv", ".scale"),
+            param_name.replace(".weight_scale_inv", ".weight_scale"),
+        ])
+    if "_weight_scale_inv" in param_name:
+        candidates.extend([
+            param_name.replace("_weight_scale_inv", "_scale"),
+            param_name.replace("_weight_scale_inv", "_weight_scale"),
+        ])
+    for candidate in candidates:
+        if candidate in params_dict:
+            return candidate
+    return candidates[0]
+
+
+def _has_fp8_weight(module: nn.Module) -> bool:
+    fp8_dtype = getattr(torch, "float8_e4m3fn", None)
+    if fp8_dtype is None:
+        return False
+    for attr_name in ("weight", "w13_weight", "w2_weight"):
+        weight = getattr(module, attr_name, None)
+        if weight is not None and weight.dtype == fp8_dtype:
+            return True
+    return False
+
+
+def _has_non_mxfp8_fp8_weight(module: nn.Module) -> bool:
+    return (
+        _has_fp8_weight(module)
+        and not _is_mxfp8_quantized_linear(module)
+        and not _is_mxfp8_quantized_gmm(module)
+    )
+
+
+class Qwen3_5MoeQKVParallelLinear(QKVParallelLinear):
+    def __init__(self, *args, quant_config=None, **kwargs):
+        self.quant_config = quant_config
+        super().__init__(*args, quant_config=quant_config, **kwargs)
 
     def weight_loader(
         self,
@@ -194,32 +410,142 @@ class Qwen3_5MoeGatedDeltaNetFusedInProj(MergedColumnParallelLinear):
         loaded_weight: torch.Tensor,
         loaded_shard_id: Optional[str] = None,
     ) -> None:
+        param_data = param.data
+        output_dim = getattr(param, "output_dim", None)
+
         if loaded_shard_id is None:
             super().weight_loader(param, loaded_weight, loaded_shard_id)
             return
 
-        if loaded_shard_id == "qkv":
-            shard_offsets = [
-                ("q", 0, self.total_key_dim),
-                ("k", self.total_key_dim, self.total_key_dim),
-                ("v", 2 * self.total_key_dim, self.total_value_dim),
-            ]
-            output_dim = getattr(param, "output_dim", None)
-            if output_dim is None:
-                raise RuntimeError("QKV fused loading requires `output_dim` to be set")
+        if output_dim is not None:
+            is_per_block_scale = getattr(param, "is_per_block_scale", False)
+            block_size = self.quant_config.weight_block_size[0] if is_per_block_scale else 1
+            if loaded_shard_id == "q":
+                shard_offset = 0
+                shard_size = self.num_heads * self.head_size
+            elif loaded_shard_id == "k":
+                shard_offset = self.num_heads * self.head_size
+                shard_size = self.num_kv_heads * self.head_size
+            elif loaded_shard_id == "v":
+                shard_offset = (self.num_heads + self.num_kv_heads) * self.head_size
+                shard_size = self.num_kv_heads * self.head_size
+            else:
+                raise RuntimeError(f"Unsupported loaded_shard_id: {loaded_shard_id}")
+
+            if is_per_block_scale:
+                shard_offset = math.ceil(shard_offset / block_size)
+                shard_size = math.ceil(shard_size / block_size)
+
             packed_dim = getattr(param, "packed_dim", None)
-            for shard_name, shard_offset, shard_size in shard_offsets:
-                if packed_dim == output_dim:
-                    shard_size = shard_size // param.pack_factor
-                    shard_offset = shard_offset // param.pack_factor
-                qkv_shard = loaded_weight.narrow(output_dim, shard_offset, shard_size)
-                self._load_output_shard(param, qkv_shard, self._shard_name_to_id[shard_name])
+            if packed_dim == output_dim:
+                shard_size = shard_size // param.pack_factor
+                shard_offset = shard_offset // param.pack_factor
+
+            is_sharded_weight = getattr(param, "is_sharded_weight", False)
+            param_data = param_data.narrow(output_dim, shard_offset, shard_size)
+            shard_id = self.tp_rank if loaded_shard_id == "q" else self.tp_rank // self.num_kv_head_replicas
+            start_idx = shard_id * shard_size
+            if not is_sharded_weight:
+                loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
+        else:
+            ignore_warning = getattr(param, "ignore_warning", False)
+            if not ignore_warning:
+                logger.warning(
+                    "Loading a weight without `output_dim` attribute in "
+                    "Qwen3_5MoeQKVParallelLinear, assume the weight is the same "
+                    "for all partitions."
+                )
+
+        if param_data.shape != loaded_weight.shape:
+            raise RuntimeError("param_data.shape != loaded_weight.shape")
+        param_data.copy_(loaded_weight)
+
+
+class Qwen3_5MoeGatedDeltaNetQKVZProj(MergedColumnParallelLinear):
+    def __init__(
+        self,
+        hidden_size: int,
+        total_key_dim: int,
+        total_value_dim: int,
+        key_dim: int,
+        value_dim: int,
+        tp_size: int = 1,
+        tp_rank: int = 0,
+        quant_config=None,
+        prefix: str = "",
+    ):
+        self.total_key_dim = total_key_dim
+        self.total_value_dim = total_value_dim
+        self.key_dim = key_dim
+        self.value_dim = value_dim
+        self.qkv_output_size = total_key_dim * 2 + total_value_dim
+        super().__init__(
+            hidden_size,
+            [self.qkv_output_size, total_value_dim],
+            bias=False,
+            tp_size=tp_size,
+            tp_rank=tp_rank,
+            quant_config=quant_config,
+            prefix=prefix,
+        )
+
+    def _slice_qkv_packed_tensor(
+        self,
+        loaded_weight: torch.Tensor,
+        output_dim: int,
+        is_scale: bool,
+    ) -> torch.Tensor:
+        if is_scale:
+            block_size = self.quant_config.weight_block_size[0]
+            shard_specs = [
+                (0, math.ceil(self.total_key_dim / block_size), math.ceil(self.key_dim / block_size)),
+                (
+                    math.ceil(self.total_key_dim / block_size),
+                    math.ceil(self.total_key_dim / block_size),
+                    math.ceil(self.key_dim / block_size),
+                ),
+                (
+                    math.ceil(2 * self.total_key_dim / block_size),
+                    math.ceil(self.total_value_dim / block_size),
+                    math.ceil(self.value_dim / block_size),
+                ),
+            ]
+        else:
+            shard_specs = [
+                (0, self.total_key_dim, self.key_dim),
+                (self.total_key_dim, self.total_key_dim, self.key_dim),
+                (2 * self.total_key_dim, self.total_value_dim, self.value_dim),
+            ]
+
+        shards = []
+        for offset, _, local_size in shard_specs:
+            start_idx = offset + self.tp_rank * local_size
+            shards.append(loaded_weight.narrow(output_dim, start_idx, local_size))
+        return torch.cat(shards, dim=output_dim).contiguous()
+
+    def weight_loader(
+        self,
+        param: torch.nn.Parameter,
+        loaded_weight: torch.Tensor,
+        loaded_shard_id: Optional[int] = None,
+    ) -> None:
+        if loaded_shard_id != 0:
+            super().weight_loader(param, loaded_weight, loaded_shard_id)
             return
 
-        shard_id = self._shard_name_to_id.get(loaded_shard_id)
-        if shard_id is None:
-            raise RuntimeError(f"Unsupported loaded_shard_id: {loaded_shard_id}")
-        self._load_output_shard(param, loaded_weight, shard_id)
+        output_dim = getattr(param, "output_dim", None)
+        if output_dim is None:
+            raise RuntimeError("QKV packed loading requires `output_dim` to be set")
+
+        is_per_block_scale = getattr(param, "is_per_block_scale", False)
+        loaded_weight = self._slice_qkv_packed_tensor(loaded_weight, output_dim, is_per_block_scale)
+
+        param_data = param.data
+        shard_size = loaded_weight.shape[output_dim]
+        param_data = param_data.narrow(output_dim, 0, shard_size)
+        if param_data.shape != loaded_weight.shape:
+            raise RuntimeError("param_data.shape != loaded_weight.shape")
+        param_data.copy_(loaded_weight)
 
 
 class SiLUActivation(nn.Module):
@@ -240,6 +566,15 @@ class SiLUAndMul(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         output = torch_npu.npu_swiglu(x)
         return output
+
+    def forward_mx(self, x: Tensor) -> tuple[Tensor, Tensor]:
+        output, scale = torch_npu.npu_swiglu_mx_quant(
+            x,
+            group_index=None,
+            dst_type=torch_npu.float8_e4m3fn,
+            activate_left=True
+        )
+        return output, scale
 
 
 def maybe_autocast(
@@ -664,6 +999,7 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
             tp_size=self.attn_tp_size,
             tp_rank=self.attn_tp_rank,
             input_is_parallel=True,
+            quant_config=getattr(config, "quant_config", None),
             prefix=f"{prefix}.out_proj",
         )
 
@@ -683,14 +1019,25 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
                 "https://github.com/Dao-AILab/causal-conv1d"
             )
 
-        self.in_proj_fused = Qwen3_5MoeGatedDeltaNetFusedInProj(
+        self.in_proj_qkvz = Qwen3_5MoeGatedDeltaNetQKVZProj(
             self.hidden_size,
             self.total_key_dim,
             self.total_value_dim,
-            self.total_num_v_heads,
+            self.key_dim,
+            self.value_dim,
             tp_size=self.attn_tp_size,
             tp_rank=self.attn_tp_rank,
-            prefix=f"{prefix}.in_proj_fused",
+            quant_config=getattr(config, "quant_config", None),
+            prefix=f"{prefix}.in_proj_qkvz",
+        )
+        self.in_proj_ba = MergedColumnParallelLinear(
+            self.hidden_size,
+            [self.total_num_v_heads, self.total_num_v_heads],
+            bias=False,
+            tp_size=self.attn_tp_size,
+            tp_rank=self.attn_tp_rank,
+            quant_config=getattr(config, "quant_config", None),
+            prefix=f"{prefix}.in_proj_ba",
         )
 
         self.tmp = torch.zeros(
@@ -1160,6 +1507,7 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         forward_metadata: ForwardMetaData = None,
+        dynamic_scale: torch.Tensor | None = None,
     ):
         """
         Linear Attention forward with TND input/output.
@@ -1171,8 +1519,10 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
 
         is_prefill = forward_metadata.is_prefill
 
-        # === Step 1: in_proj_fused (directly on TND) ===
-        fused_proj = self.in_proj_fused(hidden_states)
+        # === Step 1: projections directly on TND ===
+        qkvz_proj = self.in_proj_qkvz(hidden_states, dynamic_scale=dynamic_scale)
+        ba_proj = self.in_proj_ba(hidden_states, dynamic_scale=dynamic_scale)
+        fused_proj = torch.cat([qkvz_proj, ba_proj], dim=-1)
 
         if is_prefill and self.use_npu_chunk_gated_delta_rule:
             core_attn_out, z = self._forward_prefill_with_fused_kernel(
@@ -1343,7 +1693,7 @@ class Qwen3_5MoeAttention(nn.Module):
         # block_size will be set in init_cache() to cache_seq_len (not PageAttention's block_size)
         self.enable_gegraph = infer_config.model_config.exe_mode == "ge_graph"
         self.enable_npugraph_ex = infer_config.model_config.exe_mode == "npugraph_ex"
-        self.merged_qkv_proj = QKVParallelLinear(
+        self.merged_qkv_proj = Qwen3_5MoeQKVParallelLinear(
             hidden_size=config.hidden_size,
             head_size=self.head_dim,
             total_num_heads=config.num_attention_heads * 2,
@@ -1352,7 +1702,7 @@ class Qwen3_5MoeAttention(nn.Module):
             skip_bias_add=False,
             tp_size=self.attn_tp_size,
             tp_rank=self.attn_tp_rank,
-            quant_config=None,
+            quant_config=getattr(config, "quant_config", None),
             prefix=f"{prefix}.merged_qkv_proj",
             return_bias=False,
         )
@@ -1363,6 +1713,7 @@ class Qwen3_5MoeAttention(nn.Module):
             tp_size=self.attn_tp_size,
             tp_rank=self.attn_tp_rank,
             input_is_parallel=True,
+            quant_config=getattr(config, "quant_config", None),
             prefix=f"{prefix}.o_proj",
         )
         self.q_norm = Qwen3_5MoeRMSNorm(self.head_dim, eps=config.rms_norm_eps)
@@ -1386,12 +1737,13 @@ class Qwen3_5MoeAttention(nn.Module):
         kv_len: torch.IntTensor = None,
         forward_metadata: ForwardMetaData = None,
         slot_mapping: Optional[torch.Tensor] = None,
+        dynamic_scale: torch.Tensor | None = None,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         # TND format: hidden_states is [total_tokens, hidden_size]
         q_len = hidden_states.size(0)
 
-        qkv_states = self.merged_qkv_proj(hidden_states)
+        qkv_states = self.merged_qkv_proj(hidden_states, dynamic_scale=dynamic_scale)
         query_states, key_states, value_states = torch.split(
             qkv_states,
             [
@@ -1414,8 +1766,8 @@ class Qwen3_5MoeAttention(nn.Module):
         query_shape = (q_len, self.num_heads_per_rank, self.head_dim)
         key_value_shape = (q_len, self.num_key_value_heads_per_rank, self.head_dim)
 
-        query_states = self.q_norm(query_states.view(query_shape))
-        key_states = self.k_norm(key_states.view(key_value_shape))
+        query_states, _, _ = self.q_norm(query_states.view(query_shape))
+        key_states, _, _ = self.k_norm(key_states.view(key_value_shape))
         value_states = value_states.view(key_value_shape)
 
         cos, sin = position_embeddings
@@ -1542,45 +1894,56 @@ class Qwen3_5MoeMLP(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size
         self.intermediate_size = intermediate_size
-        self.dense_tp_size = infer_config.parallel_config.dense_tp_size
+        self.shared_tp_size = infer_config.parallel_config.shared_tp_size
         self.enable_mm_all_reduce_base = infer_config.model_config.custom_params.get("enable_mm_all_reduce_base", False)
         self.comm_manager = comm_manager
         self.gate_up_proj = MergedColumnParallelLinear(
             self.hidden_size,
             [self.intermediate_size] * 2,
             bias=False,
-            tp_size=self.dense_tp_size,
-            tp_rank=comm_manager.get_rank("dense_tp_group") if self.dense_tp_size > 1 else 0,
+            tp_size=self.shared_tp_size,
+            tp_rank=comm_manager.get_rank("shared_tp_group") if self.shared_tp_size > 1 else 0,
+            quant_config=getattr(config, "quant_config", None),
             prefix=f"{prefix}.gate_up_proj",
         )
         self.down_proj = RowParallelLinear(
             self.intermediate_size,
             self.hidden_size,
             bias=False,
-            tp_size=self.dense_tp_size,
-            tp_rank=comm_manager.get_rank("dense_tp_group") if self.dense_tp_size > 1 else 0,
+            tp_size=self.shared_tp_size,
+            tp_rank=comm_manager.get_rank("shared_tp_group") if self.shared_tp_size > 1 else 0,
             input_is_parallel=True,
+            quant_config=getattr(config, "quant_config", None),
             prefix=f"{prefix}.down_proj",
         )
         self.act_fn = SiLUAndMul()
 
-    def forward(self, x, forward_metadata: ForwardMetaData = None):
-        gate_up = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
+    def forward(
+        self,
+        x,
+        forward_metadata: ForwardMetaData = None,
+        dynamic_scale: torch.Tensor | None = None,
+    ):
+        gate_up = self.gate_up_proj(x, dynamic_scale=dynamic_scale)
+        if _is_mxfp8_quantized_linear(self.down_proj):
+            x, swiglu_scale = self.act_fn.forward_mx(gate_up)
+        else:
+            x = self.act_fn(gate_up)
+            swiglu_scale = None
         down_proj = qwen3_5_prefill_mm_all_reduce(
             self.down_proj,
             x,
             self.comm_manager,
-            "dense_tp_group",
+            "shared_tp_group",
             self.enable_mm_all_reduce_base,
             forward_metadata,
         )
         used_mm_all_reduce_base = down_proj is not None
         if down_proj is None:
-            down_proj = self.down_proj(x)
+            down_proj = self.down_proj(x, dynamic_scale=swiglu_scale)
         # down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
-        if self.dense_tp_size > 1 and not used_mm_all_reduce_base:
-            dist.all_reduce(down_proj, group=self.comm_manager.get_group("dense_tp_group"))
+        if self.shared_tp_size > 1 and not used_mm_all_reduce_base:
+            dist.all_reduce(down_proj, group=self.comm_manager.get_group("shared_tp_group"))
         return down_proj
 
 
@@ -1601,7 +1964,7 @@ class Qwen3_5MoeExperts(FusedMoEGMM):
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
             bias=False,
-            quant_config=None,
+            quant_config=getattr(config, "quant_config", None),
             tp_size=self.moe_tp_size,
             tp_rank=self.moe_tp_rank,
             ep_size=self.moe_ep_size,
@@ -1715,8 +2078,14 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
         self,
         hidden_states: torch.Tensor,
         selected_experts: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        expanded_x, expanded_row_idx, tokens_per_expert, _ = torch_npu.npu_moe_init_routing_v2(
+        pertoken_scale: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        use_mxfp8_init_routing = (
+            pertoken_scale is None
+            and hidden_states.dtype != torch.float8_e4m3fn
+            and _is_mxfp8_quantized_gmm(self.experts)
+        )
+        output = torch_npu.npu_moe_init_routing_v2(
             hidden_states,
             expert_idx=selected_experts.to(torch.int32),
             active_num=selected_experts.shape[0] * selected_experts.shape[1],
@@ -1724,9 +2093,23 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
             expert_tokens_num_type=1,
             expert_tokens_num_flag=True,
             active_expert_range=[0, self.num_experts],
-            quant_mode=-1,
+            quant_mode=3 if use_mxfp8_init_routing else -1,
         )
-        return expanded_x, expanded_row_idx, tokens_per_expert
+        expanded_x, expanded_row_idx, tokens_per_expert = output[:3]
+        if use_mxfp8_init_routing:
+            expanded_pertoken_scale = output[3].view(output[3].shape[0], -1, 2)
+        else:
+            expanded_pertoken_scale = self._expand_pertoken_scale(pertoken_scale, expanded_row_idx)
+        return expanded_x, expanded_row_idx, tokens_per_expert, expanded_pertoken_scale
+
+    @staticmethod
+    def _expand_pertoken_scale(
+        pertoken_scale: torch.Tensor | None,
+        expanded_row_idx: torch.Tensor,
+    ) -> torch.Tensor | None:
+        if pertoken_scale is None:
+            return None
+        return torch.index_select(pertoken_scale, 0, expanded_row_idx.to(torch.long))
 
     def _finalize_routing(
         self,
@@ -1749,7 +2132,8 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
         self,
         tokens_per_expert: torch.Tensor,
         expanded_x: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, List[int], List[int]]:
+        expanded_pertoken_scale: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, List[int], List[int]]:
         moe_ep_group = self.comm_manager.get_group("moe_ep_group")
         tokens_per_expert_group = tokens_per_expert.new_empty(tokens_per_expert.shape[0])
         dist.all_to_all_single(tokens_per_expert_group, tokens_per_expert, group=moe_ep_group)
@@ -1761,16 +2145,38 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
         total_tokens = sum(output_splits)
         gathered_tokens = expanded_x.new_empty((total_tokens, expanded_x.shape[1]))
         dist.all_to_all_single(gathered_tokens, expanded_x, output_splits, input_splits, group=moe_ep_group)
-        return tokens_per_expert_group, gathered_tokens, input_splits, output_splits
+        gathered_pertoken_scale = None
+        if expanded_pertoken_scale is not None:
+            gathered_pertoken_scale = expanded_pertoken_scale.new_empty(
+                (total_tokens, *expanded_pertoken_scale.shape[1:])
+            )
+            dist.all_to_all_single(
+                gathered_pertoken_scale,
+                expanded_pertoken_scale,
+                output_splits,
+                input_splits,
+                group=moe_ep_group,
+            )
+        return tokens_per_expert_group, gathered_tokens, gathered_pertoken_scale, input_splits, output_splits
 
     def _run_experts_tp_only(
         self,
         hidden_states: torch.Tensor,
         routing_weights: torch.Tensor,
         selected_experts: torch.Tensor,
+        pertoken_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        expanded_x, expanded_row_idx, tokens_per_expert = self._init_routing(hidden_states, selected_experts)
-        hidden_states_ordered_by_experts = self.experts(expanded_x, tokens_per_expert, group_list_type=1)
+        expanded_x, expanded_row_idx, tokens_per_expert, expanded_pertoken_scale = self._init_routing(
+            hidden_states,
+            selected_experts,
+            pertoken_scale,
+        )
+        hidden_states_ordered_by_experts = self.experts(
+            expanded_x,
+            tokens_per_expert,
+            group_list_type=1,
+            pertoken_scale=expanded_pertoken_scale,
+        )
         expert_output = self._finalize_routing(hidden_states_ordered_by_experts, routing_weights, expanded_row_idx)
         if self.moe_tp_size > 1:
             dist.all_reduce(expert_output, group=self.comm_manager.get_group("moe_tp_group"))
@@ -1781,11 +2187,24 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
         hidden_states: torch.Tensor,
         routing_weights: torch.Tensor,
         selected_experts: torch.Tensor,
+        pertoken_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        expanded_x, expanded_row_idx, tokens_per_expert = self._init_routing(hidden_states, selected_experts)
-        tokens_per_expert_group, gathered_tokens, input_splits, output_splits = self._dispatch_to_ep_group(
+        expanded_x, expanded_row_idx, tokens_per_expert, expanded_pertoken_scale = self._init_routing(
+            hidden_states,
+            selected_experts,
+            pertoken_scale,
+        )
+
+        (
+            tokens_per_expert_group,
+            gathered_tokens,
+            gathered_pertoken_scale,
+            input_splits,
+            output_splits,
+        ) = self._dispatch_to_ep_group(
             tokens_per_expert,
             expanded_x,
+            expanded_pertoken_scale,
         )
 
         hidden_states_ordered_by_experts, _, gathered_ids_unsort, tokens_per_local_expert = (
@@ -1794,10 +2213,18 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
                 tokens_per_expert_group.view(self.moe_ep_size, -1),
             )
         )
+        local_pertoken_scale = None
+        if gathered_pertoken_scale is not None:
+            local_pertoken_scale = torch.index_select(
+                gathered_pertoken_scale,
+                0,
+                gathered_ids_unsort.to(torch.long),
+            )
         hidden_states_ordered_by_experts = self.experts(
             hidden_states_ordered_by_experts,
             tokens_per_local_expert,
             group_list_type=1,
+            pertoken_scale=local_pertoken_scale,
         )
         new_x = torch.index_select(
             hidden_states_ordered_by_experts,
@@ -1888,22 +2315,38 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
         self,
         hidden_states: torch.Tensor,
         forward_metadata: ForwardMetaData = None,
+        dynamic_scale: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # TND format: hidden_states is [total_tokens, hidden_dim]
         hidden_dim = hidden_states.shape[-1]
         hidden_states_reshaped = hidden_states.view(-1, hidden_dim)
-        shared_expert_output = self.shared_expert(hidden_states_reshaped, forward_metadata=forward_metadata)
+        pertoken_scale = _flatten_mxfp8_dynamic_scale(dynamic_scale)
+        shared_expert_output = self.shared_expert(
+            hidden_states_reshaped,
+            forward_metadata=forward_metadata,
+            dynamic_scale=pertoken_scale,
+        )
         _, routing_weights, selected_experts = self.gate(hidden_states_reshaped)
-        if self._can_use_decode_dispatch_combine_v2(forward_metadata):
+        if dynamic_scale is None and self._can_use_decode_dispatch_combine_v2(forward_metadata):
             expert_output = self._run_experts_dispatch_combine_v2(
                 hidden_states_reshaped,
                 routing_weights,
                 selected_experts,
             )
         elif self.moe_ep_size > 1:
-            expert_output = self._run_experts_ep(hidden_states_reshaped, routing_weights, selected_experts)
+            expert_output = self._run_experts_ep(
+                hidden_states_reshaped,
+                routing_weights,
+                selected_experts,
+                pertoken_scale=pertoken_scale,
+            )
         else:
-            expert_output = self._run_experts_tp_only(hidden_states_reshaped, routing_weights, selected_experts)
+            expert_output = self._run_experts_tp_only(
+                hidden_states_reshaped,
+                routing_weights,
+                selected_experts,
+                pertoken_scale=pertoken_scale,
+            )
 
         shared_expert_output = F.sigmoid(self.shared_expert_gate(hidden_states_reshaped)) * shared_expert_output
 
@@ -1912,10 +2355,28 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
         return expert_output
 
 
+def _is_mxfp8_rms_norm_enabled(infer_config: InferenceConfig) -> bool:
+    model_config = infer_config.model_config
+    custom_params = getattr(model_config, "custom_params", {}) or {}
+    online_mxfp8_enabled = custom_params.get(
+        "enable_online_mxfp8_quantization",
+        getattr(model_config, "enable_online_mxfp8_quantization", False),
+    )
+    target_names = _normalize_names(
+        custom_params.get("online_mxfp8_quant_layers", None),
+        ["linear"],
+    )
+    return (
+        getattr(model_config, "quantization", None) == "mxfp8"
+        or (online_mxfp8_enabled and "linear" in target_names)
+    )
+
+
 class Qwen3_5MoeRMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6):
+    def __init__(self, dim: int, eps: float = 1e-6, use_mxfp8_rms_norm: bool = False):
         super().__init__()
         self.eps = eps
+        self.use_mxfp8_rms_norm = use_mxfp8_rms_norm
         self.weight = nn.Parameter(torch.zeros(dim))
 
     @property
@@ -1933,17 +2394,66 @@ class Qwen3_5MoeRMSNorm(nn.Module):
         return output.type_as(x)
 
     def ln_npu(self, x):
+        if self.use_mxfp8_rms_norm:
+            return self.rms_norm_mx(x)
         return torch_npu.npu_rms_norm(x, self.norm_weight, self.eps)[0]
+
+    def rms_norm_mx(self, x, dst_type=292):
+        """
+        dst_type:{  
+            291: torch.float8_e5m2,
+            292: torch.float8_e4m3fn,
+            296: float4_e2m1fn_x2,
+            297: float4_e1m2fn_x2
+        }
+        """
+        x_quant, x_scale, _ = torch_npu.npu_rms_norm_dynamic_mx_quant(
+            x,
+            self.norm_weight,
+            epsilon=self.eps,
+            dst_type=dst_type,
+        )
+        return x_quant, x_scale
+
+    def add_rms_norm_mx(self, residual, x, dst_type=292):
+        """
+        dst_type:{  
+            291: torch.float8_e5m2,
+            292: torch.float8_e4m3fn,
+            296: float4_e2m1fn_x2,
+            297: float4_e1m2fn_x2
+        }
+        """
+        y, x_out, mxscale_out, _ = torch_npu.npu_add_rms_norm_dynamic_mx_quant(
+            residual,
+            x,
+            gamma=self.norm_weight,
+            epsilon=self.eps,
+            dst_type=dst_type,
+        )
+        return y, mxscale_out, x_out
+
+    def add_rms_norm_npu(self, residual, x):
+        y, _, residual = torch_npu.npu_add_rms_norm(residual, x, self.norm_weight, self.eps)
+        return y, residual
 
     def forward(self, x, *args):
         if len(args) == 0:
-            return self.ln_npu(x)
+            if self.use_mxfp8_rms_norm:
+                y, scale = self.ln_npu(x)
+                return y, scale, None
+            return self.ln_npu(x), None, None
         elif len(args) == 1 and args[0] is None:
-            return self.ln_npu(x), x
+            if self.use_mxfp8_rms_norm:
+                y, scale = self.ln_npu(x)
+                return y, scale, x
+            return self.ln_npu(x), None, x
         elif len(args) == 1:
             residual = args[0]
-            y, _, residual = torch_npu.npu_add_rms_norm(residual, x, self.norm_weight, self.eps)
-            return y, residual
+            if self.use_mxfp8_rms_norm:
+                return self.add_rms_norm_mx(residual, x)
+            y, residual = self.add_rms_norm_npu(residual, x)
+            return y, None, residual
         else:
             raise NotImplementedError(
                 f"insupportable Qwen3_5MoeRMSNorm for input_args len as (include hid): {len(args) + 1}"
@@ -1986,8 +2496,16 @@ class Qwen3_5MoeDecoderLayer(nn.Module):
             comm_manager,
             prefix=f"model.layers.{layer_idx}.mlp",
         )
-        self.input_layernorm = Qwen3_5MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = Qwen3_5MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        use_mxfp8_rms_norm = _is_mxfp8_rms_norm_enabled(infer_config)
+        self.input_layernorm = Qwen3_5MoeRMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            use_mxfp8_rms_norm=use_mxfp8_rms_norm,
+        )
+        self.post_attention_layernorm = Qwen3_5MoeRMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+        )
 
     def forward(
         self,
@@ -2001,7 +2519,7 @@ class Qwen3_5MoeDecoderLayer(nn.Module):
         slot_mapping: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        hidden_states, residual = self.input_layernorm(hidden_states, past_residual)
+        hidden_states, hidden_scale, residual = self.input_layernorm(hidden_states, past_residual)
 
         # Token Mixer
         if self.layer_type == "linear_attention":
@@ -2009,6 +2527,7 @@ class Qwen3_5MoeDecoderLayer(nn.Module):
                 hidden_states=hidden_states,
                 attention_mask=attention_mask,
                 forward_metadata=forward_metadata,
+                dynamic_scale=hidden_scale,
             )
         elif self.layer_type == "full_attention":
             # Self Attention
@@ -2018,12 +2537,13 @@ class Qwen3_5MoeDecoderLayer(nn.Module):
                 kv_len=kv_len,
                 position_embeddings=position_embeddings,
                 forward_metadata=forward_metadata,
-                slot_mapping=slot_mapping
+                slot_mapping=slot_mapping,
+                dynamic_scale=hidden_scale,
             )
 
         # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        hidden_states = self.mlp(hidden_states, forward_metadata=forward_metadata)
+        hidden_states, hidden_scale, residual = self.post_attention_layernorm(hidden_states, residual)
+        hidden_states = self.mlp(hidden_states, forward_metadata=forward_metadata, dynamic_scale=hidden_scale)
         # For the MoE layers, we need to unpack
         if isinstance(hidden_states, tuple):
             hidden_states, _ = hidden_states
@@ -2124,9 +2644,6 @@ class Qwen3_5MoeTextModel(nn.Module):
         self.rotary_emb = Qwen3_5MoeTextRotaryEmbedding(config=config)
         self.gradient_checkpointing = False
 
-        # # Initialize weights and apply final processing
-        # self.post_init()
-
     def forward(
         self,
         input_ids: torch.LongTensor | None = None,
@@ -2177,7 +2694,7 @@ class Qwen3_5MoeTextModel(nn.Module):
                 **kwargs,
             )
 
-        hidden_states, _ = self.norm(hidden_states, residual)
+        hidden_states, _, _ = self.norm(hidden_states, residual)
 
         # TND format: get last token for each sequence using index_select
         cu_seq_lens_q = forward_metadata.actual_seq_lengths_cu_q if forward_metadata else None
@@ -2226,6 +2743,7 @@ class Qwen3_5MoeForCausalLM(nn.Module):
     def __init__(self, config, infer_config, comm_manager, prefix: str = ""):
     # def __init__(self, config):
         super().__init__()
+        _init_qwen3_5_quant_config(config, infer_config)
         self.config = config
         self.infer_config = infer_config
         self.comm_manager = comm_manager
@@ -2236,7 +2754,7 @@ class Qwen3_5MoeForCausalLM(nn.Module):
         self.attn_dp_size = infer_config.parallel_config.attn_dp_size
         self.embed_tp_size = infer_config.parallel_config.embed_tp_size
         self.lmhead_tp_size = infer_config.parallel_config.lmhead_tp_size
-        self.dense_tp_size = infer_config.parallel_config.dense_tp_size
+        self.shared_tp_size = infer_config.parallel_config.shared_tp_size
         self.moe_tp_size = infer_config.parallel_config.moe_tp_size
         self.moe_ep_size = infer_config.parallel_config.moe_ep_size
 
@@ -2251,15 +2769,13 @@ class Qwen3_5MoeForCausalLM(nn.Module):
             bias=False,
             tp_size=self.lmhead_tp_size,
             tp_rank=comm_manager.get_rank("lmhead_tp_group") if self.lmhead_tp_size > 1 else 0,
+            quant_config=getattr(config, "quant_config", None),
             prefix="lm_head",
         )
         self.router_aux_loss_coef = config.router_aux_loss_coef
         self.num_experts = config.num_experts
         self.num_experts_per_tok = config.num_experts_per_tok
         self.decode_uses_explicit_metadata = True
-
-        # Initialize weights and apply final processing
-        # self.post_init()
 
     def init_parallel_comm_group(self):
         """Register all communication groups required by the model."""
@@ -2284,12 +2800,12 @@ class Qwen3_5MoeForCausalLM(nn.Module):
             group_size=self.lmhead_tp_size,
         )
 
-        # Dense MLP TP group
-        if self.dense_tp_size > 1:
+        # Shared Expert TP group
+        if self.shared_tp_size > 1:
             self.comm_manager.register_group(
-                name="dense_tp_group",
-                group_num=self.world_size // self.dense_tp_size,
-                group_size=self.dense_tp_size,
+                name="shared_tp_group",
+                group_num=self.world_size // self.shared_tp_size,
+                group_size=self.shared_tp_size,
             )
 
         # MoE TP group
@@ -2389,19 +2905,17 @@ class Qwen3_5MoeForCausalLM(nn.Module):
             self.infer_config.scheduler_config.max_new_tokens
         dtype = self.config.torch_dtype
 
-        # 使用框架配置的 block_size，确保一致性
-        block_size = self.infer_config.scheduler_config.block_size  # 与 engine 保持一致
+        block_size = self.infer_config.scheduler_config.block_size
 
-        # 确保 cache_seq_len 是 block_size 的整数倍
         cache_len = (cache_seq_len + block_size - 1) // block_size  # round up
-        aligned_cache_seq_len = cache_len * block_size  # 对齐后的值
+        aligned_cache_seq_len = cache_len * block_size
 
         # block_table: [batch_size, cache_len]
         block_table = torch.arange(
             0, batch_size * cache_len, dtype=torch.int32, device=device
         ).reshape(batch_size, cache_len)
 
-        # kv_len_offset: [batch_size, 1] - 使用对齐后的 cache_seq_len
+        # kv_len_offset: [batch_size, 1]
         kv_len_offset = torch.arange(
             0, batch_size * aligned_cache_seq_len, aligned_cache_seq_len,
             dtype=torch.int64, device=device
@@ -2451,10 +2965,10 @@ class Qwen3_5MoeForCausalLM(nn.Module):
             ("merged_qkv_proj", "v_proj", "v"),
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
-            ("in_proj_fused", "in_proj_qkv", "qkv"),
-            ("in_proj_fused", "in_proj_z", "z"),
-            ("in_proj_fused", "in_proj_b", "b"),
-            ("in_proj_fused", "in_proj_a", "a"),
+            ("in_proj_qkvz", "in_proj_qkv", 0),
+            ("in_proj_qkvz", "in_proj_z", 1),
+            ("in_proj_ba", "in_proj_b", 0),
+            ("in_proj_ba", "in_proj_a", 1),
         ]
 
         params_dict = dict(self.named_parameters())
@@ -2485,7 +2999,7 @@ class Qwen3_5MoeForCausalLM(nn.Module):
                 ):
                     continue
 
-                name_mapped = norm_name.replace(weight_name, param_name)
+                name_mapped = _map_quant_scale_name(norm_name.replace(weight_name, param_name), params_dict)
                 if name_mapped not in params_dict:
                     continue
 
@@ -2499,7 +3013,7 @@ class Qwen3_5MoeForCausalLM(nn.Module):
                 break
             else:
                 if norm_name.endswith("mlp.experts.gate_up_proj"):
-                    param_name = norm_name.replace("gate_up_proj", "w13_weight")
+                    param_name = _map_quant_scale_name(norm_name.replace("gate_up_proj", "w13_weight"), params_dict)
                     if param_name not in params_dict:
                         logger.warning(f"[SKIP] No match in params_dict: {norm_name} (Original: {name})")
                         continue
@@ -2524,7 +3038,7 @@ class Qwen3_5MoeForCausalLM(nn.Module):
                     continue
 
                 if norm_name.endswith("mlp.experts.down_proj"):
-                    param_name = norm_name.replace("down_proj", "w2_weight")
+                    param_name = _map_quant_scale_name(norm_name.replace("down_proj", "w2_weight"), params_dict)
                     if param_name not in params_dict:
                         logger.warning(f"[SKIP] No match in params_dict: {norm_name} (Original: {name})")
                         continue
@@ -2540,7 +3054,7 @@ class Qwen3_5MoeForCausalLM(nn.Module):
                     loaded_params.add(param_name)
                     continue
 
-                # MoE expert 逻辑 (基于 norm_name)
+                # MoE expert
                 is_expert_weight = False
 
                 for mapping in expert_params_mapping:
@@ -2549,11 +3063,11 @@ class Qwen3_5MoeForCausalLM(nn.Module):
                     if weight_name not in norm_name:
                         continue
 
-                    name_mapped = norm_name.replace(weight_name, param_name)
+                    name_mapped = _map_quant_scale_name(norm_name.replace(weight_name, param_name), params_dict)
 
                     if name_mapped not in params_dict:
                         continue
-                    # 命中 MoE
+
                     param = params_dict[name_mapped]
                     weight_loader = param.weight_loader
 
@@ -2572,7 +3086,7 @@ class Qwen3_5MoeForCausalLM(nn.Module):
                 if is_expert_weight:
                     continue
 
-                # 普通权重逻辑 (基于 norm_name)
+                norm_name = _map_quant_scale_name(norm_name, params_dict)
                 if norm_name not in params_dict:
                     logger.warning(f"[SKIP] No match in params_dict: {norm_name} (Original: {name})")
                     continue
@@ -2586,7 +3100,15 @@ class Qwen3_5MoeForCausalLM(nn.Module):
         return loaded_params
 
     def process_weights_after_loading(self):
-        enable_mm_all_reduce_base = self.infer_config.model_config.custom_params.get("enable_mm_all_reduce_base", False)
+        custom_params = getattr(self.infer_config.model_config, "custom_params", {}) or {}
+        if custom_params.get("enable_online_mxfp8_quantization", False):
+            _apply_qwen3_5_online_mxfp8_quantization(
+                self,
+                targets=custom_params.get("online_mxfp8_quant_layers", ["linear"]),
+                ignored_layers=custom_params.get("online_mxfp8_ignored_layers", []),
+            )
+
+        enable_mm_all_reduce_base = custom_params.get("enable_mm_all_reduce_base", False)
         mm_all_reduce_suffixes = (
             ".linear_attn.out_proj",
             ".self_attn.o_proj",
@@ -2610,9 +3132,13 @@ class Qwen3_5MoeForCausalLM(nn.Module):
                 )
                 quant_method.process_weights_after_loading(
                     module,
-                    is_nz=self.infer_config.model_config.enable_weight_nz and not use_mm_all_reduce_base,
+                    is_nz=(
+                        self.infer_config.model_config.enable_weight_nz
+                        and not use_mm_all_reduce_base
+                        and not _has_non_mxfp8_fp8_weight(module)
+                    ),
+                    scales_dtype={},
                 )
-
     __all__ = [
     "Qwen3_5MoeForCausalLM",
     "Qwen3_5MoeTextModel",
