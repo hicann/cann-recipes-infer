@@ -58,16 +58,24 @@ graphStatus InferShape4SwigluGroupQuant(gert::InferShapeContext* context)
         OPS_LOG_E(context->GetNodeName(), "InferShape4SwigluGroupQuant Split Dim Invalid");
         return GRAPH_FAILED;
     }
-    
-    // infer yShape
-    *yShape = *xShape;
-    yShape->SetDim(splitDim, xShape->GetDim(splitDim) / NUM_TWO);
-    *yOriginShape = *yShape;
-
     auto attrsPtr = context->GetAttrs();
     OPS_LOG_E_IF_NULL(context, attrsPtr, ge::GRAPH_FAILED);
+    
     auto quantModeAttr = attrsPtr->GetAttrPointer<int>(ATTR_INDEX_QUANT_MODE);
     bool isMxQuant = (quantModeAttr != nullptr && (*quantModeAttr == MX_QUANT_MODE)) ? true : false;
+    
+    auto dstTypePtr = attrsPtr->GetInt(ATTR_INDEX_DST_TYPE);
+    ge::DataType dstType = dstTypePtr == nullptr ? ge::DT_FLOAT8_E4M3FN: static_cast<ge::DataType>(*dstTypePtr);
+    bool isMxFp4Quant = (dstType == ge::DT_FLOAT4_E1M2 || dstType == ge::DT_FLOAT4_E2M1) ? true : false;
+    // infer yShape
+    *yShape = *xShape;
+    if (isMxFp4Quant) {
+        // 4bit量化时，两个fp4为Pack到一个byte中，因此尾轴shape需要再原始的基础上除以2
+        yShape->SetDim(splitDim, (xShape->GetDim(splitDim) / NUM_TWO + 1) / NUM_TWO);
+    } else {
+        yShape->SetDim(splitDim, xShape->GetDim(splitDim) / NUM_TWO);
+    }
+    *yOriginShape = *yShape;
 
     // 设置scale_out的shape
     scaleOutShape->SetDimNum(1);

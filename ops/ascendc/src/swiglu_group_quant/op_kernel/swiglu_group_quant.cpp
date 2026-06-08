@@ -15,10 +15,11 @@
 
 #include "swiglu_group_quant_perf.h"
 #include "swiglu_mx_quant_perf.h"
-
+#include "swiglu_mxfp4_quant_perf.h"
 #define BLOCK_QUANT_TILING_KEY 1000
 #define MX_QUANT_TILING_KEY 2100
 #define MX_QUANT_YORIGIN_TILING_KEY 2200
+#define MXFP4_QUANT_TILING_KEY 3000
 using namespace AscendC;
 
 extern "C" __global__ __aicore__ void swiglu_group_quant(GM_ADDR x, GM_ADDR weight, GM_ADDR groupIndex, GM_ADDR y,
@@ -46,6 +47,10 @@ extern "C" __global__ __aicore__ void swiglu_group_quant(GM_ADDR x, GM_ADDR weig
     } else if (TILING_KEY_IS(MX_QUANT_YORIGIN_TILING_KEY)) { // mx_quant with output y_origin
         SwigluGroupQuant::SwigluMxQuantPerf<DTYPE_X, DTYPE_Y, DTYPE_SCALE_OUT, true> op;
         op.Init(x, weight, groupIndex, y, scaleOut, yOrigin, userWs, &tilingData, &pipe);
+        op.Process();
+    } else if (TILING_KEY_IS(MXFP4_QUANT_TILING_KEY)) { // mx_quant fp4 (no y_origin)
+        SwigluGroupQuant::SwigluMxFp4QuantPerf<DTYPE_X, DTYPE_Y, DTYPE_SCALE_OUT> op;
+        op.Init(x, weight, groupIndex, y, scaleOut, userWs, &tilingData, &pipe);
         op.Process();
     }
     AscendC::SetCtrlSpr<FLOAT_OVERFLOW_MODE_CTRL, FLOAT_OVERFLOW_MODE_CTRL>(oriOverflowMode);

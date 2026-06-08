@@ -93,9 +93,11 @@ public:
     ge::graphStatus GetShapeAttrsInfoInner();
     ge::graphStatus CalcOpTiling();
     ge::graphStatus CalcMxQuantOpTiling();
+    ge::graphStatus CalcMxFp4QuantOpTiling();
     ge::graphStatus CalcBlockQuantOpTiling();
     ge::graphStatus CalcGroupIndexTiling();
     void SetTilingData();
+    void SetTilingKey();
 private:
     gert::TilingContext *context_ = nullptr;
     uint64_t tilingKey_ = 0;
@@ -125,6 +127,7 @@ private:
     double clampLimit_ = 0.0;
     int64_t hasClampLimit_ = 0;
     int64_t outputOrigin_ = 0;
+    bool isMxFp4Quant_ = false;
     bool hasWeight_ = false;
     int64_t g_ = 0;
     int64_t gLoop_ = 0;
