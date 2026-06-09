@@ -191,7 +191,7 @@ bash infer.sh
 
 ### 4. 性能分析
 
-如果需要分析 profiling，可以将 `adaptor_patches/hunyuan_image_e_pipeline.py` 中的 `enable_prof = False if idx_round > 1 else False` 改为 `enable_prof = True if idx_round > 1 else False`，并确保 `run_image_gen.py` 中对 `model.generate_image()` 调用 2 次以上，这样在第 2 次及以后便会自动采集 profiling 数据。相关配置可以在 `models/hunyuan-image-3.0/adaptor_patches/hunyuan_image_3_pipeline.py` 中配置，参考 [torch_npu.profiler 接口](https://www.hiascend.com/document/detail/zh/Pytorch/730/apiref/torchnpuCustomsapi/docs/context/torch_npu-profiler_list.md)。
+如果需要分析 profiling，可以将 `adaptor_patches/hunyuan_image_3_pipeline.py` 中的 `enable_prof = False if idx_round > 1 else False` 改为 `enable_prof = True if idx_round > 1 else False`，并确保 `run_image_gen.py` 中对 `model.generate_image()` 调用 2 次以上，这样在第 2 次及以后便会自动采集 profiling 数据。相关配置可以在 `models/hunyuan-image-3.0/adaptor_patches/hunyuan_image_3_pipeline.py` 中配置，参考 [torch_npu.profiler 接口](https://www.hiascend.com/document/detail/zh/Pytorch/730/apiref/torchnpuCustomsapi/docs/context/torch_npu-profiler_list.md)。
 
 ## 优化点参考
 

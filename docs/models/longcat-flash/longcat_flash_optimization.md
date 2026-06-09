@@ -190,7 +190,7 @@ Prefill阶段路由专家采用**Double-Routing**的计算策略完成计算,具
 
 > 以上数据除了核数不同，其他都在相同的配置情况下从整网中采集拆解得到的。
 
-根据以上分析，针对 LongCat-Flash-560B 模型，为了在 Decode 阶段进一步降低 TPOT 耗时，可采用 Attention-FFN Disaggretation(AFD) 技术方案，它将 MoE 模块从整网中剥离出来进行独立部署，也即 Attention 模块 和 MoE 模块单独部署在不同的节点上，中间通过 Send/Recv 算子进行节点间的数据交互，使能 AFD 技术前后的网络结构示意图如下。
+根据以上分析，针对 LongCat-Flash-560B 模型，为了在 Decode 阶段进一步降低 TPOT 耗时，可采用 Attention-FFN Disaggregation(AFD) 技术方案，它将 MoE 模块从整网中剥离出来进行独立部署，也即 Attention 模块 和 MoE 模块单独部署在不同的节点上，中间通过 Send/Recv 算子进行节点间的数据交互，使能 AFD 技术前后的网络结构示意图如下。
 <p align="center">
   <img src="./figures/w_afd.png" width="90%" alt="w_afd">
 </p>
