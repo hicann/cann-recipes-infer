@@ -113,8 +113,6 @@ def main():
             block.forward = extract_q_k_single_block_forward.__get__(block, type(block))
 
     elif args.sparse_method != "no_sparse":
-        if getattr(args, "ring_degree", 1) > 1:
-            raise ValueError("Sparse attention does not support ring_degree > 1 in the current runtime.")
         sparse_predictor_manager.from_config(args.sparse_attention_config, args.sparse_method, sparse_params)
         if (
             getattr(args, "ulysses_degree", 1) > 1

@@ -293,18 +293,26 @@ def parallel_sparse_attention(
 
     sparse_mode = getattr(sparse_predictor_manager, "sparse_attn_mode", None)
     sp_attn = getattr(hybrid_seq_parallel_attn, "__self__", None)
-    attn_prefix = sparse_mode.forward_ulysses_sparse(
-        runtime_attn=sp_attn,
-        block_args={
-            "q_img_local": q_img,
-            "k_img_local": k_img,
-            "v_img_local": v_img,
-            "txt_q": txt_q,
-            "txt_k": txt_k,
-            "txt_v": txt_v,
-        },
-        softmax_scale=q.shape[-1] ** (-0.5),
-    )
+    sparse_block_args = {
+        "q_img_local": q_img,
+        "k_img_local": k_img,
+        "v_img_local": v_img,
+        "txt_q": txt_q,
+        "txt_k": txt_k,
+        "txt_v": txt_v,
+    }
+    if getattr(sp_attn, "ring_world_size", 1) > 1:
+        attn_prefix = sparse_mode.forward_ring_sparse(
+            runtime_attn=sp_attn,
+            block_args=sparse_block_args,
+            softmax_scale=q.shape[-1] ** (-0.5),
+        )
+    else:
+        attn_prefix = sparse_mode.forward_ulysses_sparse(
+            runtime_attn=sp_attn,
+            block_args=sparse_block_args,
+            softmax_scale=q.shape[-1] ** (-0.5),
+        )
 
     attn = attn_prefix
     if int(attn_prefix.shape[1]) < s:

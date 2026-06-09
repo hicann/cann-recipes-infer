@@ -179,6 +179,7 @@ source /usr/local/Ascend/ascend-toolkit/set_env.sh
 | `single_sparse.yaml` | 1 | 单卡 + 块稀疏 Attention（默认 SVG，可切 TopK），`720*1280*129` 规格 |
 | `sp8.yaml` | 8 | 8 卡 Ulysses 序列并行 + VAE 并行，原生规格 `720*1280*129`；`dit_cache.method` 同上可选 |
 | `sp8_sparse.yaml` | 8 | 8 卡 Ulysses + 块稀疏 Attention（默认 SVG，可切 TopK），`720*1280*129` 规格；与 Dit-Cache 互斥（`dit_cache.method: NoCache`） |
+| `sp8_sparse_overlap.yaml` | 8 | 8 卡 Ring + 块稀疏 Attention overlap（默认 TopK，可切 SVG），`720*1280*129` 规格；SVG overlap 暂复用普通 Ring + SVG 路径 |
 
 #### 3. 修改模型权重路径与提示词
 
@@ -253,8 +254,7 @@ dit_cache:
 在启动 YAML 顶层加 `sparse:` 段即可启用（单卡参考 `config/single_sparse.yaml`，多卡参考 `config/sp8_sparse.yaml`），`sparse.method` 可选 `no_sparse / TopK / SVG`；无 `sparse:` 段或 `method: no_sparse` 时稀疏分支关闭。`block_size_Q/K`、`model`、以及 `params.TopK / params.SVG` 各自的策略参数全部内联到同一份 yaml 中，不再依赖独立的 `sparse_config.yaml`。
 
 约束与注意事项：
-- **支持单卡和 Ulysses 多卡**：`hyvideo/sparse/sparse_block.py` 已适配 Ulysses 序列并行的 all-to-all 通信，`sample_video.py` 在 `ulysses_degree > 1` 时会自动调用 `apply_head_reorder_for_load_balance` 做 head 级负载均衡（详见[优化文档](https://gitcode.com/cann/cann-recipes-infer/blob/master/docs/models/hunyuan-video/hunyuan_video_optimization.md) `Ulysses + TopK/SVG 联合优化` 章节）。
-- **不支持 Ring Attention**：`sample_video.py` 在 `ring_degree > 1` 时会直接抛 `ValueError`；多卡 sparse 仅可与 Ulysses 组合（`ring-degree: 1`），不可与 Ring 组合。
+- **支持单卡、Ulysses 多卡和 Ring Attention 多卡**：`hyvideo/sparse/sparse_block.py` 已适配 Ulysses 序列并行的 all-to-all 通信，`sample_video.py` 在 `ulysses_degree > 1` 时会自动调用 `apply_head_reorder_for_load_balance` 做 head 级负载均衡。Ring + TopK 支持普通路径和 overlap 路径；Ring + SVG overlap 暂复用普通 Ring + SVG 路径。详见[优化文档](https://gitcode.com/cann/cann-recipes-infer/blob/master/docs/models/hunyuan-video/hunyuan_video_optimization.md)联合优化章节。
 - **与 Dit-Cache 互斥**：`sample_video.py` 启用 sparse 时会替换**所有** double/single block 的 forward，会覆盖 FBCache / TeaCache / TaylorSeer 设置的 block forward；同时启用时只有 sparse 生效，故 `single_sparse.yaml` / `sp8_sparse.yaml` 都固定 `dit_cache.method: NoCache`。
 - **算子依赖**：基于[blitz_sparse_attention 算子](https://gitcode.com/cann/ops-transformer/blob/master/experimental/attention/blitz_sparse_attention/README.md)实现，运行前需依据参考文档编译算子库。
 - **TopK 前置**：选择 `TopK` 时需先运行 `module/blockwise_sparse/offline_profiling/offline_profiling_hyvideo.py` 生成 sparsity 文件（路径由 yaml 中 `sparse.params.TopK.sparsity_files_path` 指定，规格须与 `video-size / video-length` 一致——单卡默认 `320*480*65`，多卡默认 `720*1280*129`），详见[优化文档](https://gitcode.com/cann/cann-recipes-infer/blob/master/docs/models/hunyuan-video/hunyuan_video_optimization.md) `TopK` 章节。

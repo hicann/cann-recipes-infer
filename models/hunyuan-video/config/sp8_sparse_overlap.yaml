@@ -8,8 +8,8 @@ model_args:
   embedded-cfg-scale: 6.0
   flow-shift: 7.0
   flow-reverse: true                 # [false, true]
-  ulysses-degree: 8                  # Ulysses: 8, Ring: 1
-  ring-degree: 1                     # Ulysses: 1, Ring: 8
+  ulysses-degree: 1
+  ring-degree: 8
   use-cpu-offload: true              # [false, true]
   use-vae-parallel: true             # [false, true]
 
@@ -22,7 +22,7 @@ dit_cache:
   method: "NoCache"                  # [NoCache]
 
 sparse:
-  method: "SVG"                      # [no_sparse, TopK, SVG]
+  method: "TopK"                     # [TopK, SVG]
   block_size_Q: 128
   block_size_K: 512
   model: "HunyuanVideo"
@@ -30,7 +30,8 @@ sparse:
     TopK:
       sparse_time_step: "10-49"      # "start-end"
       sparsity_files_path: "./sparsity/720x1280x129/v3"
-      CAC_threshold: 0.9
+      CAC_threshold: 0.66
+      ring_sparse_overlap: true
     SVG:
       sparse_time_step: "14-49"      # "start-end"
       sparsity: 0.8

@@ -300,7 +300,7 @@ Dit-Cache 与序列并行正交。HunyuanVideo 的 `sp8.yaml` 和 `single.yaml` 
 
 ### 5.5 HunyuanVideo 块稀疏 Attention
 
-HunyuanVideo 额外支持基于 `module/blockwise_sparse/` 的块稀疏 Attention 优化（`torch_bsa` 算子）。**支持单卡和 Ulysses 多卡**（`hyvideo/sparse/sparse_block.py` 已内置 Ulysses all-to-all 分支，`sample_video.py` 在 `ulysses_degree > 1` 时会调用 `apply_head_reorder_for_load_balance` 做 head 级负载均衡），**不支持 Ring Attention**（`ring_degree > 1` 时 `sample_video.py` 直接抛 `ValueError`）。启用后会**覆盖**所有 Dit-Cache 的 block forward。配置内联在启动 YAML 顶层的 `sparse` 段（与 `dit_cache` 并列）：
+HunyuanVideo 额外支持基于 `module/blockwise_sparse/` 的块稀疏 Attention 优化（`torch_bsa` 算子）。支持单卡、Ulysses 多卡和 Ring Attention 多卡。Ulysses 路径内置 all-to-all 通信，并在 `ulysses_degree > 1` 时调用 `apply_head_reorder_for_load_balance` 做 head 级负载均衡；Ring + TopK 额外支持 overlap 路径。启用后会**覆盖**所有 Dit-Cache 的 block forward。配置内联在启动 YAML 顶层的 `sparse` 段（与 `dit_cache` 并列）：
 
 ```yaml
 sparse:
@@ -324,12 +324,12 @@ sparse:
 
 关键约束：
 
-- **支持 Ulysses，不支持 Ring**：`hyvideo/sparse/sparse_block.py` 的 sparse forward 已包含 Ulysses all-to-all 通信路径；但 `sample_video.py` 在 `ring_degree > 1` 时硬性抛 `ValueError`，多卡 sparse 仅可走 Ulysses（设 `ring-degree: 1`）。
+- **支持 Ulysses 和 Ring**：Ulysses sparse forward 包含 all-to-all 通信路径；Ring sparse forward 支持 TopK/SVG，Ring + TopK 额外支持 overlap 路径。Ring + SVG overlap 暂复用普通 Ring + SVG 路径。
 - **与 Dit-Cache 互斥**：`sample_video.py` 顺序是先 cache_manager 初始化并替换 block forward，再在 sparse 启用时把**所有** double/single block forward 替换为 sparse 版——sparse 会静默覆盖 FBCache / TeaCache / TaylorSeer 的 block forward。因此 sparse 与 cache 不应同时启用；预置的 `single_sparse.yaml` / `sp8_sparse.yaml` 都固定 `dit_cache.method: NoCache`。
 - **TopK 前置**：`TopK` 策略需要先跑一次 `module/blockwise_sparse/offline_profiling/offline_profiling_hyvideo.py` 生成 sparsity 文件（路径由 `sparse.params.TopK.sparsity_files_path` 指定，规格须与 `video-size / video-length` 一致——单卡默认 `320*480*65`，多卡默认 `720*1280*129`）；`SVG` 策略无需离线 profiling。
 - **算子依赖**：运行前需依据 `blitz_sparse_attention` 算子文档编译对应算子库，详见 HunyuanVideo README。
 
-参考 YAML：`config/single_sparse.yaml`（单卡 + SVG + `320*480*65` 规格）、`config/sp8_sparse.yaml`（8 卡 Ulysses + SVG + `720*1280*129` 规格）。其他预置 YAML 不写 `sparse` 段，稀疏分支默认关闭。
+参考 YAML：`config/single_sparse.yaml`（单卡 + SVG + `320*480*65` 规格）、`config/sp8_sparse.yaml`（8 卡 Ulysses/Ring + SVG/TopK + `720*1280*129` 规格）和 `config/sp8_sparse_overlap.yaml`（8 卡 Ring overlap + SVG/TopK）。其他预置 YAML 不写 `sparse` 段，稀疏分支默认关闭。
 
 ## 6. 各模型 YAML 清单
 
@@ -342,7 +342,8 @@ sparse:
 | | `single_fp8.yaml` | 1 | torchrun | NoCache | FP8 FA 激活量化（需 950PR） |
 | | `single_sparse.yaml` | 1 | torchrun | NoCache（sparse 覆盖） | 块稀疏 Attention（默认 SVG，可切 TopK），`320*480*65` 规格 |
 | | `sp8.yaml` | 8 | torchrun | `dit_cache.method` 切 NoCache / FBCache / TeaCache / TaylorSeer | Ulysses=8, VAE 并行，`720*1280*129` |
-| | `sp8_sparse.yaml` | 8 | torchrun | NoCache（sparse 覆盖） | Ulysses=8 + 块稀疏 Attention（默认 SVG，可切 TopK），`720*1280*129` 规格；`ring-degree` 必须为 1 |
+| | `sp8_sparse.yaml` | 8 | torchrun | NoCache（sparse 覆盖） | Ulysses/Ring + 块稀疏 Attention（默认 SVG，可切 TopK），`720*1280*129` 规格 |
+| | `sp8_sparse_overlap.yaml` | 8 | torchrun | NoCache（sparse 覆盖） | Ring + 块稀疏 Attention overlap（默认 TopK，可切 SVG），`720*1280*129` 规格 |
 | SANA-Video | `2b_480p_single.yaml` | 1 | accelerate | — | `mixed_precision=bf16`，`DISABLE_XFORMERS=1`，2B 480p，本地离线 DiT/VAE/Gemma 权重 |
 | | `2b_480p_single_platform.yaml` | 1 | python 直接拉起 | — | CANNLab一站式开发平台模板，由 `infer_platform.sh` 读取并生成临时本地权重配置 |
 | HunyuanImage-3.0 | `ep8_cfg.yaml` | 16 | torchrun | — | Attn TP8 + MoE EP8 + CFG 并行 + VAE 并行 |

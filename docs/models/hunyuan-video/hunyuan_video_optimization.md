@@ -531,7 +531,9 @@ def _sync_scalar_for_sp(self, value: float) -> float:
 
 ### 块稀疏 Attention
 
-稀疏Attention算法的主要思路，是根据一定稀疏度选取注意力分数最高，对结果影响最大的块，而跳过其余块的计算。基于这一前提，这里实现了两种不同的稀疏算法，其原理都是尽可能选取注意力分数更高的块，接下来将依次介绍两种不同的方法。该优化方法基于[blitz_sparse_attention算子](https://gitcode.com/cann/ops-transformer/blob/master/experimental/attention/blitz_sparse_attention/README.md)实现，运行前需要依据参考文档编译算子。编译算子运行命令如下：
+稀疏Attention算法的主要思路，是根据一定稀疏度选取注意力分数最高、对结果影响最大的块，而跳过其余块的计算。基于这一前提，这里实现了两种不同的稀疏算法，其原理都是尽可能选取注意力分数更高的块，接下来将依次介绍两种不同的方法。
+
+该优化方法基于[blitz_sparse_attention算子](https://gitcode.com/cann/ops-transformer/blob/master/experimental/attention/blitz_sparse_attention/README.md)实现，运行前需要依据参考文档编译算子。若需要叠加 Ulysses/Ring 序列并行，尤其是使用 Ring + TopK + overlap 的 LSE 合并路径，需要使用合入 [ops-transformer PR 5498](https://gitcode.com/cann/ops-transformer/pull/5498) 之后的 `ops-transformer` 主仓编译稀疏算子。编译算子运行命令如下：
 
  ```bash
  git clone https://gitcode.com/cann/ops-transformer.git
@@ -584,7 +586,7 @@ SVG算法的计算过程如下：1.构造得到两种不同的稀疏范式对应
 ![](figures/svg.png)
 图片来源：[svg](https://icml.cc/virtual/2025/poster/43743)
 
-通过在启动 YAML 顶层增加 `sparse:` 段使能 Sparse Attention（无该段或 `method: no_sparse` 即关闭）。`config/single_sparse.yaml` 是单卡 SVG 参考配置（`720*1280*129` 规格），`config/sp8_sparse.yaml` 是 8 卡 Ulysses + SVG 参考配置（`720*1280*129` 规格）。**Sparse Attention 支持单卡和 Ulysses 多卡**（详见下文 `Ulysses + TopK/SVG 联合优化`），但**不支持 Ring Attention**——`sample_video.py` 检测到 `ring_degree > 1` 会直接抛 `ValueError`。启用 sparse 后会覆盖 Dit-Cache 的 block forward，二者互斥，所以 sparse YAML 都固定 `dit_cache.method: NoCache`。`sparse:` 段内联了原独立 `sparse_config.yaml` 的全部字段，结构如下：
+通过在启动 YAML 顶层增加 `sparse:` 段使能 Sparse Attention（无该段或 `method: no_sparse` 即关闭）。`config/single_sparse.yaml` 是单卡参考配置，`config/sp8_sparse.yaml` 是 8 卡稀疏并行参考配置；该配置默认启用 Ulysses，如需使用 Ring Attention，将 `ulysses-degree` 改为 `1`、`ring-degree` 改为 `8` 即可。Ring + TopK + overlap 使用 `config/sp8_sparse_overlap.yaml`。两份多卡配置均可通过 `sparse.method` 在 `TopK` 与 `SVG` 间切换。启用 sparse 后会覆盖 Dit-Cache 的 block forward，二者互斥，所以 sparse YAML 都固定 `dit_cache.method: NoCache`。`sparse:` 段内联了原独立 `sparse_config.yaml` 的全部字段，结构如下：
 ```yaml
 sparse:
   method: "SVG"                      # [no_sparse, TopK, SVG]
@@ -610,23 +612,15 @@ sparse:
 | SVG      | 80%      | 2036.18      | 2167.55      | 1.70×       | 1.65×       |
 
 
-### Ulysses + TopK/SVG 联合优化
+### TopK/SVG + 序列并行联合优化
 
-在 HunyuanVideo 的长序列场景下，块稀疏 Attention 需要与 Ulysses 序列并行协同工作，才能同时发挥“多卡并行”和“减少计算量”两方面收益。围绕 `TopK/SVG + Ulysses`，本方案主要做了以下优化：
+在 HunyuanVideo 的长序列场景下，块稀疏 Attention 可以与 Ulysses 或 Ring Attention 叠加使用，同时获得“多卡并行”和“减少实际 attention 计算量”两方面收益。整体思路是：先保持原序列并行的 query/key/value 分布方式，再在每个 attention 前构造适配当前并行布局的稀疏 metadata，最后调用 `blitz_sparse_attention` 执行块稀疏计算。
 
-1. **Ulysses 稀疏链路适配**  
-   在 attention 前后复用 Ulysses 的通信逻辑，使 `TopK/SVG` 可以在多卡序列并行下稳定构造完整的稀疏 attention 输入，流程图如下。
+Ulysses 路径在 attention 前后复用 all-to-all 通信。通信后每张卡拥有完整序列和部分 head，因此 TopK/SVG 可以在完整序列语义上构造 `sabi/pattern`；同时保留 UAA（Ulysses Anything Attention）能力，支持任意 head 数和更灵活的视频尺寸。针对 TopK，还根据不同 head 的稀疏度和计算量做 head 级负载均衡，减少多卡拖尾。
+
+Ring 路径保留本卡 query 分片，并聚合全局 key/value。Ring + TopK 使用本地 query 和全局 key/value 构造 TopK `sabi`，并对首帧 query 使用完整 key/value 做 dense attention 回填。Ring + TopK + overlap 进一步将 key/value 分成本地分片和其他分片：异步 `all_gather(k/v)` 的同时先计算本地分片的稀疏 attention，通信完成后计算其他分片，并通过 LSE 合并两段输出。Ring + SVG 使用本地 query 采样并同步 spatial/temporal MSE 中间量，统一各卡 pattern，再按本地 query 的全局时空坐标构造 `sabi`；当前 SVG overlap 配置复用普通 Ring + SVG 路径。
+
 ![](figures/ulysses+topk.png)
-2. **UAA（Ulysses Anything Attention）兼容**  
-   支持任意 head 数和任意 HW 配置，解除标准 Ulysses 对 head 整除和固定分辨率的限制，使 `TopK/SVG + Ulysses` 能适配更灵活的模型配置与输入尺寸。
-
-3. **稀疏 metadata 构造优化**  
-   对 `must_keep`、`move_sink`、`sabi/pattern` 等稀疏元数据进行多卡适配，使 `TopK/SVG` 在 Ulysses 并行下仍能保持稳定的稀疏块选择逻辑。
-
-4. **Head 级负载均衡优化**  
-   根据不同 head 的稀疏度和计算量分布，对多卡场景下的 head 分配做重排，减少单卡拖尾，提高多卡并行效率。
-
-
 
 #### Ulysses + TopK/SVG 性能数据
 
@@ -644,3 +638,19 @@ sparse:
 2. 四卡场景下，负载均衡带来的收益较小，仅将异构稀疏耗时从 `576s` 进一步优化到 `564s`，绝对收益约 `12s`，说明此时 head 负载已经相对均衡。  
 3. 八卡场景下，负载均衡收益更明显，可将异构稀疏耗时从 `335s` 降低到 `321s`，绝对收益约 `14s`，相对降幅约 `4.2%`，说明并行度提升后，head 级别的计算不均衡更加突出。  
 4. Ulysses 与 TopK/SVG 结合后，既能利用多卡序列并行提升吞吐，也能通过块稀疏进一步减少 FA 实际计算量；以八卡为例，相较稠密计算可取得 `1.39x` 到 `1.45x` 的整体加速。
+
+#### Ring Attention + TopK/SVG 性能数据
+
+以下数据为四卡 Ring Attention 场景下的 DiT 推理耗时，单位为秒（s）。
+
+| 方案 | `720*1280*209`, CAC `0.9` | `720*1280*209`, CAC `0.66` | `720*1280*129`, CAC `0.9` | `720*1280*129`, CAC `0.66` |
+| ---- | ------------------------: | -------------------------: | ------------------------: | -------------------------: |
+| Ring Attention | 2250 | 2250 | 949 | 949 |
+| Ring + TopK | 1877 | 1385 | 812 | 554 |
+| Ring + TopK + overlap | 1742 | 1327 | 822 | 584 |
+
+从上述数据可以看出：
+
+1. `720*1280*209` 场景下，Ring + TopK 将耗时从 `2250s` 降低到 `1385s`；启用 overlap 后进一步降低到 `1327s`，相较稠密 Ring Attention 加速约 `1.70x`。
+2. `720*1280*129` 场景下，Ring + TopK 在 CAC `0.66` 时将耗时从 `949s` 降低到 `554s`，相较稠密 Ring Attention 加速约 `1.71x`。
+3. overlap 的收益与序列长度和 CAC 配置相关。`720*1280*209` 场景下收益更明显；`720*1280*129` 场景下，通信与计算重叠的收益不足以抵消额外分段计算开销。
