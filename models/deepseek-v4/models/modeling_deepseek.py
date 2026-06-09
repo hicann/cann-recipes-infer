@@ -69,7 +69,7 @@ from .modules import (get_window_topk_idxs, get_compress_topk_idxs,
                       one_hot, yarn_get_mscale,
                       DeepseekV3RMSNorm, _init_rope, DEEPSEEKV3_START_DOCSTRING,
                       DEEPSEEKV3_INPUTS_DOCSTRING, DeepseekV3PreTrainedModel, apply_rotary_emb,
-                      inplace_partial_rotary_mul
+                      inplace_partial_rotary_mul, partial_rotary_mul_quant
                     )
 from .modules import Indexer, Compressor, AttnMetaData, CacheData
 from .modules.registry import OpKernel
@@ -114,6 +114,8 @@ class DeepseekV3SharedExpert(nn.Module):
             )
         if self.mm_quant_mode == "w8a8int8":
             self.forward = self.forward_w8a8int8
+        elif "hifloat8" in self.mm_quant_mode:
+            self.forward = self.forward_a8hifloat8
         elif "float8" in self.mm_quant_mode and "a8" in self.mm_quant_mode:
             self.forward = self.forward_a8float8
         else:
@@ -155,6 +157,17 @@ class DeepseekV3SharedExpert(nn.Module):
             )
         wait_event(enable_decode_stream, shared_expert_event, 0)
         return self.down_proj(intermediate_hidden_states, pergroup_scale)
+
+    def forward_a8hifloat8(self, x, enable_decode_stream=False, shared_expert_event=None):
+        merged_x = self.gate_up_proj(x)
+        if self.swiglu_limit:
+            half = merged_x.size(-1) // 2
+            gate = merged_x[..., :half].clamp(max=self.swiglu_limit)
+            up = merged_x[..., half:].clamp(min=-self.swiglu_limit, max=self.swiglu_limit)
+            merged_x = torch.cat([gate, up], dim=-1)
+        intermediate_hidden_states = torch_npu.npu_swiglu(merged_x)
+        wait_event(enable_decode_stream, shared_expert_event, 0)
+        return self.down_proj(intermediate_hidden_states)
 
 
 class DeepseekV3MoE(nn.Module):
@@ -603,7 +616,7 @@ class DeepseekV3MoE(nn.Module):
             hidden_states_share = self.shared_experts(hidden_states.view(-1, hidden_states.shape[-1]), \
                 enable_decode_stream=self.enable_multi_streams, shared_expert_event=self.shared_expert_event)
             record_event(self.enable_multi_streams, self.npu_events, 1)
-        
+
         # moe combine
         combine_args = {
             "expand_x": hidden_states_ordered_by_experts,
@@ -730,7 +743,8 @@ class Attention(nn.Module):
         else:
             wo_tp_size = self.oproj_tp_size
             wo_tp_rank = dist.get_rank(self.hccl_comm_dict["oproj_tp_group"])
-        quant_config = config.quant_config if self.mm_quant_mode == "w8a8mxfloat8" else None
+        quant_config = config.quant_config if self.mm_quant_mode == "w8a8mxfloat8" \
+            or self.mm_quant_mode == "w8a8hifloat8" else None
         self.wo_a = ColumnParallelLinear(self.n_heads * self.head_dim // self.n_groups,
                                         self.n_groups * self.o_lora_rank,
                                         params_dtype=torch.bfloat16,
@@ -770,11 +784,14 @@ class Attention(nn.Module):
             if config.quant_config is not None else "unquant"
 
         self.sparse_attn_ops = torch.ops.custom.npu_sparse_attn_sharedkv
-        if self.kv_cache_quant_mode == "float8":
+        if self.kv_cache_quant_mode == "float8" or self.kv_cache_quant_mode == "hifloat8":
             self.sparse_attn_ops = torch.ops.custom.npu_kv_quant_sparse_attn_sharedkv
 
         self.cp_size = self.runner_settings.get("parallel_config").get("cp_size", 1)
         self.global_rank = kwargs.get("global_rank")
+
+        if self.mm_quant_mode == "w8a8hifloat8":
+            self.register_buffer("beta", torch.zeros(self.q_lora_rank, dtype=torch.bfloat16))
 
     def apply_norm_dynamic_quant(self, x):
         if self.mm_quant_mode == "w8a8float8":
@@ -785,6 +802,12 @@ class Attention(nn.Module):
                 row_block_size=1,
                 col_block_size=self.config.quant_config.weight_block_size[1])
             return x.view(bsz, seq_len, -1), x_scale.view(bsz, seq_len, -1)
+        elif self.mm_quant_mode == "w8a8hifloat8":
+            bsz, seq_len, _ = x.shape
+            x = torch_npu.npu_rms_norm_quant(x, self.q_norm.weight, \
+                self.beta, self.wq_b.scale, self.wq_b.offset, self.eps, \
+                dst_dtype=torch_npu.hifloat8)
+            return x.view(bsz, seq_len, -1), self.wq_b.scale
         elif self.mm_quant_mode == "w8a8mxfloat8":
             x = self.q_norm(x)
             return torch_npu.npu_dynamic_mx_quant(x, dst_type=torch.float8_e4m3fn)
@@ -1015,6 +1038,7 @@ class Attention(nn.Module):
         record_stream(enable_multi_streams, x, attn_metadata.get('mla_stream', None))
         if self.platform_version != "A3":
             qa = self.wq_a(x)
+
         qr, qr_scale = self.apply_norm_dynamic_quant(qa)
 
         cur_stream = torch.npu.current_stream()
@@ -1110,7 +1134,7 @@ class Attention(nn.Module):
             "metadata": metadata, # get from operator sparse_attn_sharedkv_metadata for fa tiling
             "softmax_scale": self.softmax_scale,
         }
-        if self.kv_cache_quant_mode == "float8":
+        if self.kv_cache_quant_mode == "float8" or self.kv_cache_quant_mode == "hifloat8":
             attn_kwargs["tile_size"] = 64 # quant per tile size
             attn_kwargs["rope_head_dim"] = self.rope_head_dim
             attn_kwargs["kv_quant_mode"] = 1
@@ -1122,7 +1146,7 @@ class Attention(nn.Module):
         win_kv_slot_mapping: torch.Tensor,
         win_cache: torch.Tensor,
     ):
-        if self.kv_cache_quant_mode == "float8":
+        if self.kv_cache_quant_mode == "float8" or self.kv_cache_quant_mode == "hifloat8":
             torch.ops.custom.kv_compress_epilog(
                     x=kv.view(-1, self.head_dim),
                     slot_mapping=win_kv_slot_mapping,
@@ -1234,14 +1258,22 @@ class Attention(nn.Module):
             cos = cos_sin["c1a"][0] if self.compress_ratio == 1 else cos_sin["comp"][0]
             sin = cos_sin["c1a_neg_sin"] if self.compress_ratio == 1 else cos_sin["comp_neg_sin"]
 
-        o = inplace_partial_rotary_mul(
-            o.flatten(0, 1).unsqueeze(2), cos, sin,
-            partial_slice=self.partial_slice,
-            platform_version=self.platform_version,
-            origin_shape=o.shape,
-        )
-
-        o = o.view(bsz * seq_len, self.num_groups_per_rank, -1).to(torch.bfloat16)
+        if self.mm_quant_mode == "w8a8hifloat8":
+            o = partial_rotary_mul_quant(
+                o.flatten(0, 1).unsqueeze(2), cos, sin,
+                partial_slice=self.partial_slice,
+                platform_version=self.platform_version,
+                origin_shape=o.shape,
+            )
+            o = o.view(bsz * seq_len, self.num_groups_per_rank, -1)
+        else:
+            o = inplace_partial_rotary_mul(
+                o.flatten(0, 1).unsqueeze(2), cos, sin,
+                partial_slice=self.partial_slice,
+                platform_version=self.platform_version,
+                origin_shape=o.shape,
+            )
+            o = o.view(bsz * seq_len, self.num_groups_per_rank, -1).to(torch.bfloat16)
         if self.oproj_tp_size > 1:
             # [BS, tp_size, G/tp_size, ND/G] -> [tp_size, BS, G/tp_size, ND/G]
             o = o.view(bsz * seq_len, self.oproj_tp_size, self.num_groups_per_rank // self.oproj_tp_size, -1)
@@ -1256,10 +1288,16 @@ class Attention(nn.Module):
         if self.mm_quant_mode == "w8a8mxfloat8":
             o, o_scale = torch_npu.npu_dynamic_mx_quant(o, dst_type=torch.float8_e4m3fn)
             o = torch_npu.npu_transpose_quant_batchmatmul(o, self.wo_a.weight, dtype=torch.bfloat16,
- 	                                                        x1_scale=o_scale.view(torch.float8_e8m0fnu),
+                                                            x1_scale=o_scale.view(torch.float8_e8m0fnu),
                                                             x2_scale=self.wo_a.weight_scale.view(torch.float8_e8m0fnu),
- 	                                                        group_sizes=(0, 0, 32),perm_x1=(1, 0, 2),perm_x2=(0, 1, 2),
-                                                            perm_y=(1, 0, 2))
+                                                            group_sizes=(0, 0, 32), perm_x1=(1, 0, 2),
+                                                            perm_x2=(0, 1, 2), perm_y=(1, 0, 2))
+        elif self.mm_quant_mode == "w8a8hifloat8":
+            o = torch_npu.npu_transpose_quant_batchmatmul(o, self.wo_a.weight, dtype=torch_npu.hifloat8,
+                                                            x1_scale=self.wo_a.x_scale, x2_scale=self.wo_a.weight_scale,
+                                                            group_sizes=(0, 0, 0), perm_x1=(1, 0, 2), perm_x2=(0, 1, 2),
+                                                            perm_y=(1, 0, 2), batch_split_factor=1,
+                                                            x1_dtype=torch_npu.hifloat8, x2_dtype=torch_npu.hifloat8)
         else:
             if self.n_heads * self.head_dim // self.oproj_tp_size > MATMUL_MAX_AXIS_VALUE and \
                self.platform_version == "A3":
@@ -1774,7 +1812,7 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
         self.block_size = self.runner_settings.get("model_config").get("pa_block_size", 128)
         self.cache_len = self.pa_max_length // self.block_size
         self.sas_metadata_ops = torch.ops.custom.npu_sparse_attn_sharedkv_metadata
-        if self.kv_cache_quant_mode == "float8":
+        if self.kv_cache_quant_mode == "float8" or self.kv_cache_quant_mode == "hifloat8":
             self.sas_metadata_ops = torch.ops.custom.npu_kv_quant_sparse_attn_sharedkv_metadata
         self.enable_prefill_multi_cycle = self.runner_settings.get("model_config").get("prefill_mini_batch_size", 0) > 0
         self.window_size = config.sliding_window
@@ -1811,7 +1849,10 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
         self.config.quant_config.set_quant_mode("li_cache_quant_mode", "unquant")
 
         # if quant to fp8 or mxfp8, set kv cache and li cache to fp8; if quant to int8, set li cache to int8
-        if self.platform_version == "950" and "float" in self.mm_quant_mode:
+        if self.platform_version == "950" and "hifloat" in self.mm_quant_mode:
+            self.config.quant_config.kv_cache_quant_mode = "hifloat8"
+            self.config.quant_config.li_cache_quant_mode = "hifloat8"
+        elif self.platform_version == "950" and "float" in self.mm_quant_mode:
             self.config.quant_config.kv_cache_quant_mode = "float8"
             self.config.quant_config.li_cache_quant_mode = "float8"
         else:
@@ -2016,7 +2057,7 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
 
     def init_cache_dim(self):
         cache_dim = self.config.head_dim
-        if self.kv_cache_quant_mode == "float8":
+        if self.kv_cache_quant_mode == "float8" or self.kv_cache_quant_mode == "hifloat8":
             rope_dim = self.config.qk_rope_head_dim
             nope_dim = self.config.head_dim - rope_dim
             cache_dim = align_up(nope_dim + 2 * rope_dim + nope_dim // 64, 128)
@@ -2037,7 +2078,7 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
             "has_ori_kv": True,
             "has_cmp_kv": False,
         }
-        if self.kv_cache_quant_mode == "float8":
+        if self.kv_cache_quant_mode == "float8" or self.kv_cache_quant_mode == "hifloat8":
             sas_metadata_kwargs.update(
                 {"kv_quant_mode": 1, "tile_size": 64, "rope_head_dim": self.rope_head_dim}
             )
@@ -2087,7 +2128,7 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
                 self.generate_metadata(attn_metadata, c128a_metadata_kwargs, is_prefill, "c128a_metadata")
                 record_event(enable_metadata_multi_streams and self.first_layer_ratio == 128, attn_metadata.get('metadata_event'), 1)
                 self.generate_metadata(attn_metadata, c4a_metadata_kwargs, is_prefill, "c4a_metadata")
-                if self.li_cache_quant_mode in ["int8", "float8"]:
+                if self.li_cache_quant_mode in ["int8", "float8", "hifloat8"]:
                     li_metadata_kwargs = self.generate_li_metadata_kwargs()
                     self.generate_metadata(attn_metadata, li_metadata_kwargs,\
                                             is_prefill, "lightning_indexer_quant", is_li=True)
@@ -2379,6 +2420,10 @@ class DeepseekV3ModelMTP(DeepseekV3ForCausalLM):
         self.vocab_size = config.vocab_size
         self.vocab_size_per_rank = self.vocab_size // self.embed_tp_size
         self.ignore_share_weight = True
+        self.mm_quant_mode = (
+            config.quant_config.mm_quant_mode
+            if config.quant_config is not None
+            else "w16a16")
 
         # reuse embed_tokens, lm_head, rotary_emb from main model
         self.embed_tokens = None

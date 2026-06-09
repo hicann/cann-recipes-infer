@@ -139,6 +139,9 @@ CANNLab一站式开发平台已预置部署运行环境，使用CANNLab一站式
   # 转换为Hybrid MXFP8-MXFP4权重，适用于950PR/DT系列
   python utils/convert_model.py --input_fp8_hf_path /data/models/deepseek_v4  --output_hf_path /data/models/deepseek_v4_hybrid_mxfp8_mxfp4 --quant_type w4a8-mx
 
+  # 转换为Hybrid MXFP8-MXFP4-HiF8权重，适用于950PR/DT系列
+  python utils/convert_model.py --input_fp8_hf_path /data/models/deepseek_v4  --output_hf_path /data/models/deepseek_v4_hybrid_mxfp8_mxfp4_hif8 --quant_type w4a8-mx-hif
+
   ```
 
 ### 修改代码

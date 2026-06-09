@@ -38,7 +38,8 @@ from transformers.cache_utils import Cache
 from executor.utils import get_had_pow2, limit_core_num
 from executor.utils.stream_utils import npu_stream_switch, record_event, wait_event, record_stream
 from module.linear import ReplicatedLinear
-from .common_modules import DeepseekV3RMSNorm, apply_rotary_emb, rotate_activation, inplace_partial_rotary_mul
+from .common_modules import DeepseekV3RMSNorm, apply_rotary_emb, rotate_activation, \
+    inplace_partial_rotary_mul, partial_rotary_mul_quant
 from .compressor import Compressor
 
 
@@ -82,6 +83,11 @@ class Indexer(nn.Module):
                                 not self.enable_pypto
         self.platform_version = self.runner_settings.get("model_config").get("platform_version", "A3")
         self.enable_limit_core = self.runner_settings.get("model_config").get("enable_limit_core", False)
+        self.mm_quant_mode = (
+            config.quant_config.mm_quant_mode
+            if config.quant_config is not None
+            else "w16a16")
+
         aic_total = 24 # enable_limit_core only suppots A3
         aiv_to_aic_ratio = 2 # aiv_num is 2 * aic_num
         self.cmpr_aic_num = 16
@@ -95,6 +101,12 @@ class Indexer(nn.Module):
 
         self.cp_size = self.runner_settings.get("parallel_config").get("cp_size", 1)
         self.global_rank = kwargs.get("global_rank")
+
+        if self.mm_quant_mode == "w8a8hifloat8":
+            self.register_buffer(
+                "q_scale_ones",
+                torch.ones([1, self.n_heads], dtype=torch.float32),
+            )
 
     def forward(
         self,
@@ -146,17 +158,30 @@ class Indexer(nn.Module):
                 q = q.view(qr.shape[0], -1, self.n_heads, self.head_dim)
 
                 # rope
-                q = inplace_partial_rotary_mul(   # x: (T, 1, N, D); cos(T, 1, 1, D)
-                    q.flatten(0, 1).unsqueeze(2), cos, sin,
-                    partial_slice=self.partial_slice,
-                    platform_version=self.platform_version,
-                    origin_shape=q.shape,
-                )
-                q = rotate_activation(q, self.hadamard_matrix)
+                if self.li_cache_quant_mode == "hifloat8":
+                    q = partial_rotary_mul_quant(   # x: (T, 1, N, D); cos(T, 1, 1, D)
+                        q.flatten(0, 1).unsqueeze(2), cos, sin,
+                        partial_slice=self.partial_slice,
+                        platform_version=self.platform_version,
+                        origin_shape=q.shape,
+                    )
+                else:
+                    q = inplace_partial_rotary_mul(   # x: (T, 1, N, D); cos(T, 1, 1, D)
+                        q.flatten(0, 1).unsqueeze(2), cos, sin,
+                        partial_slice=self.partial_slice,
+                        platform_version=self.platform_version,
+                        origin_shape=q.shape,
+                    )
+                # hif8 covers outliers natively, no need for hadamard
+                if self.mm_quant_mode != "w8a8hifloat8":
+                    q = rotate_activation(q, self.hadamard_matrix)
                 wait_event(cmpr_switch_flag, cmpr_event, cmpr_event_idx) # separate sfa compressor and li qb dynamic quant
                 if self.li_cache_quant_mode == "int8":
                     q, q_scale = torch_npu.npu_dynamic_quant(q.flatten(0, 1))  # B,S,N,D -> T,N,D
                     q_scale = q_scale.to(torch.float16)
+                elif self.li_cache_quant_mode == "hifloat8":
+                    q = q.view(-1, self.n_heads, self.head_dim)
+                    q_scale = self.q_scale_ones.expand(q.shape[0], -1)
                 else: # fp8
                     q, q_scale = torch_npu.npu_dynamic_block_quant(q.view(-1, q.shape[-1]), dst_type=cache_data["li_cmp_kv"].dtype)
                     q = q.view(-1, self.n_heads, self.head_dim)
@@ -214,5 +239,10 @@ class Indexer(nn.Module):
             "query_quant_mode": 0,
             "metadata": attn_metadata["kernel_metadata"]["lightning_indexer_quant"]
         }
+        if self.li_cache_quant_mode == "hifloat8":
+            li_input_kwargs.update({
+                "query_dtype": torch_npu.hifloat8,
+                "key_dtype": torch_npu.hifloat8
+            })
         topk_idxs, _ = torch.ops.custom.npu_quant_lightning_indexer(**li_input_kwargs)
         return topk_idxs.view(q.shape[0], -1, self.index_topk)

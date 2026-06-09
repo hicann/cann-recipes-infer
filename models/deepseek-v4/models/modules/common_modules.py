@@ -105,6 +105,25 @@ def inplace_partial_rotary_mul(
     return tensor.view(origin_shape)
 
 
+def partial_rotary_mul_quant(
+        tensor,
+        cos, sin,
+        partial_slice,
+        platform_version,
+        origin_shape
+    ):
+    if cos.dtype != tensor.dtype:
+        cos = cos.to(tensor.dtype)
+        sin = sin.to(tensor.dtype)
+    tensor = torch.ops.custom.partial_rotary_mul_quant(
+        tensor, cos, sin,
+        rotary_mode="interleave",
+        partial_slice=partial_slice,
+        scale=1.0
+    )
+    return tensor.view(origin_shape)
+
+
 @lru_cache(1)
 def get_window_topk_idxs(window_size: int, bsz: int, seqlen: int, start_pos: int):
     def _get_window_topk_idxs():

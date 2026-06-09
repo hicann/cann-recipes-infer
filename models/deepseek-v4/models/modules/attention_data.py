@@ -53,13 +53,15 @@ class CacheData(nn.Module):
 
     def update_cache_param(self):
         cache_dtype_map = {
-            "int8": torch.int8, "float8": torch.float8_e4m3fn, "unquant": torch.bfloat16
+            "int8": torch.int8, "float8": torch.float8_e4m3fn, "unquant": torch.bfloat16, "hifloat8": torch.uint8
         }
         self.cache_dtype = cache_dtype_map[self.kv_cache_quant_mode]
         self.li_cache_dtype = cache_dtype_map[self.li_cache_quant_mode]
         self.cache_dim = self.config.head_dim
 
-        if self.kv_cache_quant_mode == "float8":
+        if "float" in self.kv_cache_quant_mode:
+            if self.kv_cache_quant_mode == "hifloat8":
+                self.cache_dtype = torch.float8_e4m3fn
             rope_dim = self.config.qk_rope_head_dim
             nope_dim = self.config.head_dim - rope_dim
             self.cmp_kv_dtype = self.cache_dtype
@@ -117,7 +119,7 @@ class CacheData(nn.Module):
             "li_cmp_kv": self.create_cache(cmp_block_num, self.config.index_head_dim, self.li_cache_dtype),
             "li_kv_state": self.create_state_cache(state_block_num, compress_ratio, self.config.index_head_dim),
         })
-        if self.li_cache_quant_mode in ["int8", "float8"]:
+        if self.li_cache_quant_mode in ["int8", "float8", "hifloat8"]:
             dtype = torch.float16 if self.li_cache_quant_mode == "int8" else torch.float32
             cache_dict.update({
                 "li_key_dequant_scale": self.create_cache(cmp_block_num, 1, dtype)

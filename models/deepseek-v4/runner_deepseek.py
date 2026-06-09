@@ -122,6 +122,10 @@ class DeepSeekRunner(ModelRunner):
                     scale_data = reshape_mx_scale(module.weight_scale.data)
                     module.weight_scale.data = scale_data.view(-1, config.o_lora_rank, *scale_data.shape[1:]) \
                                                        .transpose(1, 2).contiguous()
+                elif config.quant_config.mm_quant_mode == "w8a8hifloat8":
+                    scale_data = torch_npu.npu_trans_quant_param(module.weight_scale.data.to(torch.float32).npu())
+                    module.weight_scale.data = scale_data.view(-1, config.o_lora_rank, *scale_data.shape[1:]) \
+                                                       .transpose(1, 2)[0, 0].contiguous()
                 continue
             quant_method = getattr(module, "quant_method", None)
             scales_dtype = {}

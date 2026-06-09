@@ -25,6 +25,7 @@ from argparse import ArgumentParser
 from glob import glob
 import numpy as np
 import torch
+import torch_npu
 from safetensors.torch import load_file, save_file
 from tqdm import tqdm
 
@@ -259,6 +260,15 @@ def load_clip_params(num_layers, clip_param_path):
     return weight_clip_params
 
 
+def hif8_weight_quant(tensor: torch.Tensor, bits=8, weight_clip_factor=None):
+    tensor_npu = tensor.npu()
+    quantized_tensor, scale = torch_npu.npu_dynamic_quant(tensor_npu, dst_type=torch_npu.hifloat8)
+    quantized_tensor = quantized_tensor.cpu()
+    scale = scale.cpu()
+    scale = scale.unsqueeze(-1)
+    return quantized_tensor, scale
+
+
 def main(fp8_path, output_path, quant_type, quant_param_path=None):
     """
     Converts FP8 weights to BF16 and saves the converted weights.
@@ -287,7 +297,7 @@ def main(fp8_path, output_path, quant_type, quant_param_path=None):
     torch.set_default_dtype(torch.bfloat16)
     os.makedirs(output_path, exist_ok=True)
     assert quant_type in [
-        "bfloat16", "w8a8-int", "w4a8-int", "w8a8-mx", "w4a8-mx"], f"Unsupported quant_type:{quant_type}"
+        "bfloat16", "w8a8-int", "w4a8-int", "w8a8-mx", "w4a8-mx", "w4a8-mx-hif"], f"Unsupported quant_type:{quant_type}"
     model_index_file = os.path.join(fp8_path, "model.safetensors.index.json")
     config_file = os.path.join(fp8_path, 'config.json')
     with open(model_index_file, "r") as f:
@@ -301,9 +311,11 @@ def main(fp8_path, output_path, quant_type, quant_param_path=None):
     num_experts = config['n_routed_experts']
     compress_ratios = config['compress_ratios']
 
+    quant_parts = quant_type.split('-')
     w4a8 = quant_type.startswith("w4a8")
     w8a8 = quant_type.startswith("w8a8")
-    mx = quant_type.endswith('mx')
+    mx = "mx" in quant_parts
+    hif = quant_type.endswith('hif')
 
     if w8a8 or w4a8:
         cache_scheme = {"kv_cache_scheme": {"num_bits": NUM_BITS_8, "type": "float"} if mx else None,
@@ -311,7 +323,7 @@ def main(fp8_path, output_path, quant_type, quant_param_path=None):
                             "type": "float" if mx else "int",
                             "num_bits": NUM_BITS_8,
                         }}
-        if mx and w8a8:
+        if mx and w8a8 and not hif:
             config['quantization_config']["quant_method"] = "mxfp8"
             config['quantization_config'].pop("weight_block_size")
             config['quantization_config'].update(cache_scheme)
@@ -385,10 +397,13 @@ def main(fp8_path, output_path, quant_type, quant_param_path=None):
                 if new_weight_name in list(quant_layers.keys()):
                     bit = quant_layers[new_weight_name]
                     if mx:
-                        quant_weight, scale_inv = quantize_mx(weight, bit, real_quant=True)
-                        if bit == NUM_BITS_4:
-                            quant_weight = f32_to_f4_unpacked(quant_weight.float())
-                            quant_weight = pack_uint4(quant_weight)
+                        if hif and bit != NUM_BITS_4:
+                            quant_weight, scale_inv = hif8_weight_quant(weight, bit)
+                        else:
+                            quant_weight, scale_inv = quantize_mx(weight, bit, real_quant=True)
+                            if bit == NUM_BITS_4:
+                                quant_weight = f32_to_f4_unpacked(quant_weight.float())
+                                quant_weight = pack_uint4(quant_weight)
                     else:
                         if is_clip:
                             weight_clip_factor = [weight_clip_params.get(f"{new_weight_name}.clip_factor_min")]

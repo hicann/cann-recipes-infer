@@ -62,6 +62,11 @@ class Compressor(nn.Module):
         self.use_fused_kernel_compressor = runner_settings.get("kernel_config", {}).get("compressor", "native") == "ascendc"
         self.platform_version = runner_settings.get("model_config").get("platform_version", "A3")
         self.block_size = runner_settings.get("model_config").get("pa_block_size", 128)
+        self.mm_quant_mode = (
+            config.quant_config.mm_quant_mode
+            if config.quant_config is not None
+            else "w16a16")
+
         # wkv and wgate in checkpoint is stored in bf16, stored in fp32 for convenient
         self.wkv = ReplicatedLinear(self.dim,
                                     coff * self.head_dim,
@@ -101,6 +106,15 @@ class Compressor(nn.Module):
                     indexer_compress_cache=li_cmp_cache,
                     indexer_compress_scale=scale_cache
                 )
+            elif self.li_cache_quant_mode == "hifloat8":
+                torch.ops.custom.indexer_compress_epilog(
+                    x=kv,
+                    slot_mapping=cmp_slot_mapping,
+                    indexer_compress_cache=li_cmp_cache,
+                    indexer_compress_scale=scale_cache,
+                    quant_mode=1,
+                    round_scale=True
+                )
             else:
                 kv, k_scale = torch_npu.npu_dynamic_quant(kv)
                 k_scale = k_scale.to(torch.float16)
@@ -112,7 +126,7 @@ class Compressor(nn.Module):
                                                 kv.view(-1, li_cmp_cache.shape[-1]))
         else: # SFA compress
             sfa_cmp_cache = cache_data["sfa_cmp_kv"]
-            if self.kv_cache_quant_mode == "float8":
+            if self.kv_cache_quant_mode == "float8" or self.kv_cache_quant_mode == "hifloat8":
                 epilog_out = torch.ops.custom.kv_compress_epilog(
                     x=kv if is_prefill else kv.view(-1, self.head_dim),
                     slot_mapping=cmp_slot_mapping if is_prefill else cmp_slot_mapping.view(-1),
@@ -219,8 +233,8 @@ class Compressor(nn.Module):
         else:
             kv = self.compressor_prolog(x, cache_data, attn_metadata, is_prefill)
 
-        # hardmard
-        if self.rotate:
+        # hardmard (hif8 covers outliers natively, no need for hadamard)
+        if self.rotate and self.mm_quant_mode != "w8a8hifloat8":
             kv = rotate_activation(kv, self.hadamard_matrix)
 
         # epilog
