@@ -96,10 +96,45 @@ std::tuple<at::Tensor> compressor(const at::Tensor &x, const at::Tensor &wkv, co
 
     std::tuple<at::Tensor> output = construct_compressor_output_tensor(x, norm_weight, rope_sin, cmp_ratio, coff);
     at::Tensor cmp_kv = std::get<0>(output);
-
+    
+    TORCH_CHECK(state_cache.defined(), "Check state_cache != nullptr failed");
     auto state_cache_dim = state_cache.dim();
     TORCH_CHECK(state_cache_dim == DIM_3, "state_cache dim num[", state_cache_dim, "] should be 3");
+
+    TORCH_CHECK(wkv.defined(), "Check wkv != nullptr failed");
+    auto wkv_size = wkv.numel();
+    TORCH_CHECK(wkv_size != VALUE_0, "wkv should not be empty tensor");
+
+    TORCH_CHECK(wgate.defined(), "Check wgate != nullptr failed");
+    auto wgate_size = wgate.numel();
+    TORCH_CHECK(wgate_size != VALUE_0, "wgate should not be empty tensor");
+
+    auto state_cache_size = state_cache.sizes();
+    TORCH_CHECK(state_cache_size[DIM_1] != VALUE_0 && state_cache_size[DIM_2] != VALUE_0,
+        "state_cache should not be empty tensor except B equal to 0");
+    
+    TORCH_CHECK(ape.defined(), "Check ape != nullptr failed");
+    auto ape_size = ape.numel();
+    TORCH_CHECK(ape_size != VALUE_0, "ape should not be empty tensor");
+
+    auto norm_weight_size = norm_weight.numel();
+    TORCH_CHECK(norm_weight_size != VALUE_0, "norm_weight should not be empty tensor");
+
+    auto rope_sin_size = rope_sin.sizes();
+    TORCH_CHECK(rope_sin_size[rope_sin_dim-1] != VALUE_0,
+        "rope_sin should not be empty tensor except B or S equal to 0");
+
+    TORCH_CHECK(rope_cos.defined(), "Check rope_cos != nullptr failed");
+    auto rope_cos_size = rope_cos.sizes();
+    auto rope_cos_dim = rope_cos.dim();
+    TORCH_CHECK(rope_cos_dim == x_dim, "rope_cos dim num[", rope_cos_dim, "] should be equal to x dim num[", x_dim,
+                "]");
+    TORCH_CHECK(rope_cos_size[rope_cos_dim-1] != VALUE_0,
+        "rope_cos should not be empty tensor except B or S equal to 0");
+
     auto contiguous_axes_result = is_contiguous_axes(state_cache);
+    TORCH_CHECK(contiguous_axes_result[DIM_1] && contiguous_axes_result[DIM_2], "when cache_mode == ", cache_mode,
+        ", state_cache must be contiguous on all axes except axis 0");
 
     int64_t state_cache_stride_dim0 = state_cache.stride(0);
 
