@@ -32,6 +32,12 @@
     #include "rotate_interleaved_split_s_pad.h"
     #include "rotate_interleaved_split_bs_pad.h"
     #include "rotate_interleaved_split_bsn_pad.h"
+    #include "rotate_interleaved_split_s_mixed.h"
+    #include "rotate_interleaved_split_bs_mixed.h"
+    #include "rotate_interleaved_split_bsn_mixed.h"
+    #include "rotate_interleaved_split_s_pad_mixed.h"
+    #include "rotate_interleaved_split_bs_pad_mixed.h"
+    #include "rotate_interleaved_split_bsn_pad_mixed.h"
     using namespace AscendC;
     using namespace RotateInterleavedN;
 #endif
@@ -243,6 +249,14 @@ extern "C" __global__ __aicore__ void inplace_partial_rotary_mul(GM_ADDR x, GM_A
             InterleavedSplitS<float> interleavedSplitS;
             interleavedSplitS.Init(x, cos, sin, y, tilingData1, &pipe);
             interleavedSplitS.Process();
+        } else if (TILING_KEY_IS(2030)) {
+            InterleavedSplitSMixed<bfloat16_t> interleavedSplitSMixed;
+            interleavedSplitSMixed.Init(x, cos, sin, y, tilingData1, &pipe);
+            interleavedSplitSMixed.Process();
+        } else if (TILING_KEY_IS(2040)) {
+            InterleavedSplitSMixed<half> interleavedSplitSMixed;
+            interleavedSplitSMixed.Init(x, cos, sin, y, tilingData1, &pipe);
+            interleavedSplitSMixed.Process();
         } else if (TILING_KEY_IS(2100)) {
             InterleavedSplitBS<half> interleavedSplitBS;
             interleavedSplitBS.Init(x, cos, sin, y, tilingData1, &pipe);
@@ -255,6 +269,14 @@ extern "C" __global__ __aicore__ void inplace_partial_rotary_mul(GM_ADDR x, GM_A
             InterleavedSplitBS<float> interleavedSplitBS;
             interleavedSplitBS.Init(x, cos, sin, y, tilingData1, &pipe);
             interleavedSplitBS.Process();
+        } else if (TILING_KEY_IS(2130)) {
+            InterleavedSplitBSMixed<bfloat16_t> interleavedSplitBSMixed;
+            interleavedSplitBSMixed.Init(x, cos, sin, y, tilingData1, &pipe);
+            interleavedSplitBSMixed.Process();
+        } else if (TILING_KEY_IS(2140)) {
+            InterleavedSplitBSMixed<half> interleavedSplitBSMixed;
+            interleavedSplitBSMixed.Init(x, cos, sin, y, tilingData1, &pipe);
+            interleavedSplitBSMixed.Process();
         } else if (TILING_KEY_IS(2200)) {
             InterleavedSplitBSN<half> interleavedSplitBSN;
             interleavedSplitBSN.Init(x, cos, sin, y, tilingData1, &pipe);
@@ -267,6 +289,14 @@ extern "C" __global__ __aicore__ void inplace_partial_rotary_mul(GM_ADDR x, GM_A
             InterleavedSplitBSN<float> interleavedSplitBSN;
             interleavedSplitBSN.Init(x, cos, sin, y, tilingData1, &pipe);
             interleavedSplitBSN.Process();
+        } else if (TILING_KEY_IS(2230)) {
+            InterleavedSplitBSNMixed<bfloat16_t> interleavedSplitBSNMixed;
+            interleavedSplitBSNMixed.Init(x, cos, sin, y, tilingData1, &pipe);
+            interleavedSplitBSNMixed.Process();
+        } else if (TILING_KEY_IS(2240)) {
+            InterleavedSplitBSNMixed<half> interleavedSplitBSNMixed;
+            interleavedSplitBSNMixed.Init(x, cos, sin, y, tilingData1, &pipe);
+            interleavedSplitBSNMixed.Process();
         } else if (TILING_KEY_IS(2001)) {
             InterleavedSplitSPad<half> interleavedSplitSPad;
             interleavedSplitSPad.Init(x, cos, sin, y, tilingData1, &pipe);
@@ -279,6 +309,14 @@ extern "C" __global__ __aicore__ void inplace_partial_rotary_mul(GM_ADDR x, GM_A
             InterleavedSplitSPad<float> interleavedSplitSPad;
             interleavedSplitSPad.Init(x, cos, sin, y, tilingData1, &pipe);
             interleavedSplitSPad.Process();
+        } else if (TILING_KEY_IS(2031)) {
+            InterleavedSplitSPadMixed<bfloat16_t> interleavedSplitSPadMixed;
+            interleavedSplitSPadMixed.Init(x, cos, sin, y, tilingData1, &pipe);
+            interleavedSplitSPadMixed.Process();
+        } else if (TILING_KEY_IS(2041)) {
+            InterleavedSplitSPadMixed<half> interleavedSplitSPadMixed;
+            interleavedSplitSPadMixed.Init(x, cos, sin, y, tilingData1, &pipe);
+            interleavedSplitSPadMixed.Process();
         } else if (TILING_KEY_IS(2101)) {
             InterleavedSplitBSPad<half> interleavedSplitBSPad;
             interleavedSplitBSPad.Init(x, cos, sin, y, tilingData1, &pipe);
@@ -291,6 +329,14 @@ extern "C" __global__ __aicore__ void inplace_partial_rotary_mul(GM_ADDR x, GM_A
             InterleavedSplitBSPad<float> interleavedSplitBSPad;
             interleavedSplitBSPad.Init(x, cos, sin, y, tilingData1, &pipe);
             interleavedSplitBSPad.Process();
+        } else if (TILING_KEY_IS(2131)) {
+            InterleavedSplitBSPadMixed<bfloat16_t> interleavedSplitBSPadMixed;
+            interleavedSplitBSPadMixed.Init(x, cos, sin, y, tilingData1, &pipe);
+            interleavedSplitBSPadMixed.Process();
+        } else if (TILING_KEY_IS(2141)) {
+            InterleavedSplitBSPadMixed<half> interleavedSplitBSPadMixed;
+            interleavedSplitBSPadMixed.Init(x, cos, sin, y, tilingData1, &pipe);
+            interleavedSplitBSPadMixed.Process();
         } else if (TILING_KEY_IS(2201)) {
             InterleavedSplitBSNPad<half> interleavedSplitBSNPad;
             interleavedSplitBSNPad.Init(x, cos, sin, y, tilingData1, &pipe);
@@ -303,7 +349,14 @@ extern "C" __global__ __aicore__ void inplace_partial_rotary_mul(GM_ADDR x, GM_A
             InterleavedSplitBSNPad<float> interleavedSplitBSNPad;
             interleavedSplitBSNPad.Init(x, cos, sin, y, tilingData1, &pipe);
             interleavedSplitBSNPad.Process();
+        } else if (TILING_KEY_IS(2231)) {
+            InterleavedSplitBSNPadMixed<bfloat16_t> interleavedSplitBSNPadMixed;
+            interleavedSplitBSNPadMixed.Init(x, cos, sin, y, tilingData1, &pipe);
+            interleavedSplitBSNPadMixed.Process();
+        } else if (TILING_KEY_IS(2241)) {
+            InterleavedSplitBSNPadMixed<half> interleavedSplitBSNPadMixed;
+            interleavedSplitBSNPadMixed.Init(x, cos, sin, y, tilingData1, &pipe);
+            interleavedSplitBSNPadMixed.Process();
         }
     #endif
 }
-

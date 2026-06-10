@@ -23,17 +23,19 @@ namespace ge {
  * @par Inputs:
  * @li x: A 4D tensor which rotary position embedding is applied, format supports ND, and data type must be float16,
  * float or bfloat16.
- * @li cos: A 4D tensor which is "cos" in rotary position embedding, format supports ND, data type must be the same as
- * "x", and shape must be the same as "sin".
- * @li sin: A 4D tensor which is "sin" in rotary position embedding, format supports ND, data type must be the same as
- * "x", and shape must be the same as "cos".
+ * @li cos: A 4D tensor which is "cos" in rotary position embedding, format supports ND. Same precision supports
+ * the same data type as "x"; mixed precision supports x/y float16 or bfloat16 with cos/sin float32. Shape must be
+ * the same as "sin".
+ * @li sin: A 4D tensor which is "sin" in rotary position embedding, format supports ND. Same precision supports
+ * the same data type as "x"; mixed precision supports x/y float16 or bfloat16 with cos/sin float32. Shape must be
+ * the same as "cos".
  * @par Outputs:
  * y: A 4D tensor which is the result of rotary position embedding, format supports ND, data type must be the same as
  * "x", and shape must be the same as "x".
  * @par Attributes:
  * mode: An optional attribute of type int, specifying the mode of rotary position embedding, must be 0-"half",
  * 1-"interleave", 2-"quarter" or 3-"interleave-half". Defaults to 0. Atlas A2 Training Series Product/ Atlas 800I A2
- * Inference Product and Atlas A3 Training Series Product only support 0-"half" and 1-"interleave".
+ * Inference Product and Atlas A3 Training Series Product only support 1-"interleave" in the membase path.
  * @attention Constraints:
  * Let (B, S, N, D) represents the shape of the 4-D input "x". Under this representation, the shape constraints of each
  * parameter can be described as follows:

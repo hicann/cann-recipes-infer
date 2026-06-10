@@ -32,8 +32,10 @@ def get_npu_chip_name():
         for line in result.stdout.split('\n'):
             if 'Ascend950' in line or 'Ascend95' in line:
                 return 'Ascend950'
-            if 'Ascend910' in line:
-                return 'Ascend910'
+            if 'Ascend910_93' in line:
+                return 'Ascend910_93'
+            if '910B' in line:
+                return 'Ascend910B'
             if 'Ascend310' in line:
                 return 'Ascend310'
         return 'Unknown'
@@ -42,6 +44,10 @@ def get_npu_chip_name():
 
 CHIP_NAME = get_npu_chip_name()
 IS_ASCEND950 = CHIP_NAME == 'Ascend950'
+IS_ASCEND910B = CHIP_NAME == 'Ascend910B'
+IS_ASCEND910_93 = CHIP_NAME == 'Ascend910_93'
+IS_MEMBASE_MIXED_SUPPORTED = IS_ASCEND910B or IS_ASCEND910_93
+IS_MIXED_SUPPORTED = IS_ASCEND950 or IS_MEMBASE_MIXED_SUPPORTED
 
 
 def cal_relative_diff_np(real_data, expect_data, diff_thd):
@@ -243,6 +249,7 @@ class TestNpuInplacePartialRotaryMul(TestCase):
         rotary_mode = 1
         partial_slice = [448, 512]
         inplace_partial_rotary_mul_with_cpu_benchmark_graph(b, s, n, d, con_b, con_s, con_n, rotary_mode, partial_slice, self)
+    
     def test_inplace_partial_rotary_mul_with_cpu_benchmark_ab(self):
         """测试函数，包含CPU标杆验证"""
         # 设置测试参数（与原始测试相同）
@@ -258,6 +265,7 @@ class TestNpuInplacePartialRotaryMul(TestCase):
         rotary_mode = 1
         partial_slice = [448, 512]
         inplace_partial_rotary_mul_with_cpu_benchmark_base(b, s, n, d, con_b, con_s, con_n, rotary_mode, partial_slice, self)
+    
     def test_inplace_partial_rotary_mul_with_cpu_benchmark_b(self):
         """测试函数，包含CPU标杆验证"""
         b = 1
@@ -272,6 +280,8 @@ class TestNpuInplacePartialRotaryMul(TestCase):
         rotary_mode = 1
         partial_slice = [448, 512]
         inplace_partial_rotary_mul_with_cpu_benchmark_base(b, s, n, d, con_b, con_s, con_n, rotary_mode, partial_slice, self)
+    
+    @unittest.skipIf(not IS_ASCEND950, "This test only runs on Ascend950, because of shape")
     def test_inplace_partial_rotary_mul_with_cpu_benchmark_a(self):
         """测试函数，包含CPU标杆验证"""
         b = 128
@@ -286,6 +296,8 @@ class TestNpuInplacePartialRotaryMul(TestCase):
         rotary_mode = 1
         partial_slice = [448, 512]
         inplace_partial_rotary_mul_with_cpu_benchmark_base(b, s, n, d, con_b, con_s, con_n, rotary_mode, partial_slice, self)
+    
+    @unittest.skipIf(not IS_ASCEND950, "This test only runs on Ascend950, because of shape")
     def test_inplace_partial_rotary_mul_with_cpu_benchmark_aba(self):
         """测试函数，包含CPU标杆验证"""
         b = 128
@@ -300,6 +312,8 @@ class TestNpuInplacePartialRotaryMul(TestCase):
         rotary_mode = 1
         partial_slice = [484, 512]
         inplace_partial_rotary_mul_with_cpu_benchmark_base(b, s, n, d, con_b, con_s, con_n, rotary_mode, partial_slice, self)
+    
+    @unittest.skipIf(not IS_ASCEND950, "This test only runs on Ascend950, because of shape")
     def test_inplace_partial_rotary_mul_with_cpu_benchmark_ba(self):
         """测试函数，包含CPU标杆验证"""
         b = 128
@@ -314,6 +328,8 @@ class TestNpuInplacePartialRotaryMul(TestCase):
         rotary_mode = 1
         partial_slice = [484, 512]
         inplace_partial_rotary_mul_with_cpu_benchmark_base(b, s, n, d, con_b, con_s, con_n, rotary_mode, partial_slice, self)
+    
+    @unittest.skipIf(not IS_ASCEND950, "This test only runs on Ascend950, because of shape")
     def test_inplace_partial_rotary_mul_with_cpu_benchmark_bab(self):
         """测试函数，包含CPU标杆验证"""
         b = 128
@@ -378,7 +394,7 @@ class TestNpuInplacePartialRotaryMul(TestCase):
         self.assertTrue(compare_result, 
             f"Mixed precision compare fail for x_shape={x_shape}, cos_shape={cos_shape}")
 
-    @unittest.skipIf(not IS_ASCEND950, "Mixed precision tests only run on Ascend950")
+    @unittest.skipIf(not IS_MIXED_SUPPORTED, "Mixed precision tests only run on Ascend950, Ascend910B or Ascend910_93")
     def test_mixed_precision_bf16_fp32_shape1(self):
         """Case 1: x=[8192, 128, 1, 512], cos=[8192, 1, 1, 64]"""
         self.run_mixed_precision_test(
@@ -390,7 +406,7 @@ class TestNpuInplacePartialRotaryMul(TestCase):
             partial_slice_end=128
         )
 
-    @unittest.skipIf(not IS_ASCEND950, "Mixed precision tests only run on Ascend950")
+    @unittest.skipIf(not IS_MIXED_SUPPORTED, "Mixed precision tests only run on Ascend950, Ascend910B or Ascend910_93")
     def test_mixed_precision_bf16_fp32_shape2(self):
         """Case 2: x=[8192, 1, 1, 512], cos=[8192, 1, 1, 64]"""
         self.run_mixed_precision_test(
@@ -402,7 +418,7 @@ class TestNpuInplacePartialRotaryMul(TestCase):
             partial_slice_end=128
         )
 
-    @unittest.skipIf(not IS_ASCEND950, "Mixed precision tests only run on Ascend950")
+    @unittest.skipIf(not IS_MIXED_SUPPORTED, "Mixed precision tests only run on Ascend950, Ascend910B or Ascend910_93")
     def test_mixed_precision_bf16_fp32_shape3(self):
         """Case 3: x=[8192, 64, 1, 128], cos=[8192, 1, 1, 64]"""
         self.run_mixed_precision_test(
@@ -414,7 +430,7 @@ class TestNpuInplacePartialRotaryMul(TestCase):
             partial_slice_end=128
         )
 
-    @unittest.skipIf(not IS_ASCEND950, "Mixed precision tests only run on Ascend950")
+    @unittest.skipIf(not IS_MIXED_SUPPORTED, "Mixed precision tests only run on Ascend950, Ascend910B or Ascend910_93")
     def test_mixed_precision_bf16_fp32_shape4(self):
         """Case 4: x=[4, 128, 1, 512], cos=[4, 1, 1, 64]"""
         self.run_mixed_precision_test(
@@ -426,7 +442,7 @@ class TestNpuInplacePartialRotaryMul(TestCase):
             partial_slice_end=128
         )
 
-    @unittest.skipIf(not IS_ASCEND950, "Mixed precision tests only run on Ascend950")
+    @unittest.skipIf(not IS_MIXED_SUPPORTED, "Mixed precision tests only run on Ascend950, Ascend910B or Ascend910_93")
     def test_mixed_precision_bf16_fp32_shape5(self):
         """Case 5: x=[4, 1, 1, 512], cos=[4, 1, 1, 64]"""
         self.run_mixed_precision_test(
@@ -438,7 +454,7 @@ class TestNpuInplacePartialRotaryMul(TestCase):
             partial_slice_end=128
         )
 
-    @unittest.skipIf(not IS_ASCEND950, "Mixed precision tests only run on Ascend950")
+    @unittest.skipIf(not IS_MIXED_SUPPORTED, "Mixed precision tests only run on Ascend950, Ascend910B or Ascend910_93")
     def test_mixed_precision_bf16_fp32_shape6(self):
         """Case 6: x=[4, 64, 1, 128], cos=[4, 1, 1, 64]"""
         self.run_mixed_precision_test(
@@ -448,6 +464,42 @@ class TestNpuInplacePartialRotaryMul(TestCase):
             cos_sin_dtype=torch.float32,
             partial_slice_start=64,
             partial_slice_end=128
+        )
+
+    @unittest.skipIf(not IS_MEMBASE_MIXED_SUPPORTED,
+        "Membase mixed precision tests only run on Ascend910B or Ascend910_93")
+    def test_membase_mixed_precision_fp16_fp32_aligned(self):
+        self.run_mixed_precision_test(
+            x_shape=[128, 64, 1, 512],
+            cos_shape=[128, 1, 1, 64],
+            x_dtype=torch.float16,
+            cos_sin_dtype=torch.float32,
+            partial_slice_start=448,
+            partial_slice_end=512
+        )
+
+    @unittest.skipIf(not IS_MEMBASE_MIXED_SUPPORTED,
+        "Membase mixed precision tests only run on Ascend910B or Ascend910_93")
+    def test_membase_mixed_precision_bf16_fp32_pad(self):
+        self.run_mixed_precision_test(
+            x_shape=[128, 64, 1, 512],
+            cos_shape=[128, 1, 1, 28],
+            x_dtype=torch.bfloat16,
+            cos_sin_dtype=torch.float32,
+            partial_slice_start=484,
+            partial_slice_end=512
+        )
+
+    @unittest.skipIf(not IS_MEMBASE_MIXED_SUPPORTED,
+        "Membase mixed precision tests only run on Ascend910B or Ascend910_93")
+    def test_membase_mixed_precision_bf16_fp32_middle_slice(self):
+        self.run_mixed_precision_test(
+            x_shape=[4, 64, 1, 128],
+            cos_shape=[4, 1, 1, 64],
+            x_dtype=torch.bfloat16,
+            cos_sin_dtype=torch.float32,
+            partial_slice_start=32,
+            partial_slice_end=96
         )
 
     @unittest.skipIf(not IS_ASCEND950, "Mixed precision tests only run on Ascend950")

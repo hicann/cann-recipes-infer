@@ -46,7 +46,7 @@ custom.inplace_partial_rotary_mul(Tensor(a!) x, Tensor r1, Tensor r2, *, str rot
 ## 约束说明
 - d轴必须小于等1024，且关于2对齐。
 - slice_size必须关于2对齐，且如果低于64会有性能影响。
-- x、r1、r2的dtype必须一致。
+- r1、r2的dtype必须一致，x和r1 r2支持混合精度。
 - 该接口支持推理场景下使用。
 - 该接口支持aclgraph入图。
 - 该接口与PyTorch配合使用时，需要保证CANN相关包与PyTorch相关包的版本匹配。
