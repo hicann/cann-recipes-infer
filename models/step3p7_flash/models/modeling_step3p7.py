@@ -613,12 +613,14 @@ class Step3p7Attention(nn.Module):
                 cache_name="k_cache", attn_type=self.attn_type, dim=self.head_dim,
                 num_head=self.num_kv_heads_per_rank, dtype=cache_dtype,
                 needs_block=True,
+                block_size=infer_config.scheduler_config.block_size,
                 tensor_setter=lambda tensor, layer=self: setattr(layer, "k_cache", tensor),
                 sliding_window=self.sliding_window),
             CacheEntry(
                 cache_name="v_cache", attn_type=self.attn_type, dim=self.head_dim,
                 num_head=self.num_kv_heads_per_rank, dtype=cache_dtype,
                 needs_block=True,
+                block_size=infer_config.scheduler_config.block_size,
                 tensor_setter=lambda tensor, layer=self: setattr(layer, "v_cache", tensor),
                 sliding_window=self.sliding_window),
         ]
@@ -1052,7 +1054,6 @@ class Step3p5ForCausalLM(nn.Module):
                 layer_idx=layer_idx, caches=list(layer.self_attn.cache_entries)))
         return ModelCacheInfo(
             num_layers=len(layer_infos),
-            block_size=self.infer_config.scheduler_config.block_size,
             layer_infos=layer_infos)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:

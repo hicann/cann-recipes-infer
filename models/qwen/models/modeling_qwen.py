@@ -276,6 +276,7 @@ class QwenAttention(nn.Module):
                 dim=self.head_dim,
                 num_head=self.num_key_value_heads_per_rank,
                 dtype=cache_dtype,
+                block_size=self.block_size,
                 needs_block=True,
                 tensor_setter=lambda tensor, layer=self: setattr(layer, "k_cache", tensor),
             ),
@@ -285,6 +286,7 @@ class QwenAttention(nn.Module):
                 dim=self.head_dim,
                 num_head=self.num_key_value_heads_per_rank,
                 dtype=cache_dtype,
+                block_size=self.block_size,
                 needs_block=True,
                 tensor_setter=lambda tensor, layer=self: setattr(layer, "v_cache", tensor),
             ),
@@ -637,7 +639,6 @@ class QwenForCausalLM(nn.Module):
 
         return ModelCacheInfo(
             num_layers=len(layer_infos),
-            block_size=self.infer_config.scheduler_config.block_size,
             layer_infos=layer_infos,
         )
 

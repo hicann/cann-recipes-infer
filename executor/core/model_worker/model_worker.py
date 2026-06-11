@@ -354,10 +354,6 @@ class ModelWorker:
                 (i + self.global_rank) % num_experts for i in range(step_prefill)]
             cur_topk_list = torch.tensor(cur_topk_list_prefill, dtype=torch.int).view(tokens_per_rank_prefill, -1).npu()
         else:
-            # The input are distributed according to attention parallelism (attn_dp_size),
-            # but when computing topk_list in force_eplb mode, the token count should follow MoE
-            # parallelism (moe_ep_size). Thus, the token count should be recacculated.
-            total_tokens = total_tokens * self.attn_dp_size // self.moe_ep_size
             # Decode phase: allocation depends on MoE tensor parallelism
             if self.moe_tp_size > 1:
                 # MoE TP mode: contiguous expert ranges per EP rank

@@ -41,7 +41,7 @@ class BootstrapState:
     attn_tp_size: int = field(init=False)
     attn_cp_size: int = field(init=False)
     attn_dp_size: int = field(init=False)
-    block_size: int = field(init=False, default=1)
+    block_sizes: list[int] = field(default_factory=list)
     kv_cache_dtype: str = field(init=False, default="bfloat16")
     rank_table: Dict[Tuple[int, int, int], Dict[str, int | str]] = field(
         default_factory=dict
@@ -91,7 +91,12 @@ def init_bootstrap(app: FastAPI, yaml_dict: dict) -> BootstrapState:
             port = int(payload["rank_port"])
         except (KeyError, TypeError, ValueError) as exc:
             raise HTTPException(status_code=400, detail="Missing rank registration fields") from exc
-        state.block_size = int(payload.get("block_size", state.block_size))
+        block_sizes = payload.get("block_sizes")
+        if block_sizes is not None:
+            try:
+                state.block_sizes = [int(block_size) for block_size in block_sizes]
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(status_code=400, detail="Invalid block_sizes") from exc
         state.kv_cache_dtype = str(payload.get("kv_cache_dtype", state.kv_cache_dtype))
         async with state.lock:
             state.rank_table[(dp, cp, tp)] = {"rank_ip": ip, "rank_port": port}
@@ -111,7 +116,7 @@ def init_bootstrap(app: FastAPI, yaml_dict: dict) -> BootstrapState:
                 "attn_tp_size": state.attn_tp_size,
                 "attn_cp_size": state.attn_cp_size,
                 "dp_size": state.attn_dp_size,
-                "block_size": state.block_size,
+                "block_sizes": list(state.block_sizes),
                 "kv_cache_dtype": state.kv_cache_dtype,
                 "ranks": {
                     f"{dp},{cp},{tp}": endpoint

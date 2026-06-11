@@ -144,7 +144,7 @@ class AscendKVSender:
         side when done.
 
         Args:
-            src_block_ids: Prefill-side block ids keyed by attn_type
+            src_block_ids: Prefill-side block ids keyed by manager_key
                 (from ``kv_cache_manager.get_block_ids(request_id)``).
             metadata: Dict with request_id, output_bootstrap_room, output_id, kv_len.
         """
@@ -221,6 +221,7 @@ class AscendKVReceiver:
             "metadata_slot_size": pool.slot_size,
             "dst_block_ids": register_info.dst_block_ids,
             "dst_kv_ptrs": register_info.dst_kv_ptrs,
+            "dst_kv_block_sizes": register_info.dst_kv_block_sizes,
             "dst_kv_item_lens": register_info.dst_kv_item_lens,
             "dst_tp_rank": register_info.dst_tp_rank,
             "prefill_dp_rank": self.prefill_dp_rank,

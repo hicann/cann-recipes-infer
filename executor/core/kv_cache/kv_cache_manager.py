@@ -32,7 +32,8 @@ class KVCacheManager:
     ):
         self.max_model_len = max_model_len
         self.single_type_managers = tuple(single_type_managers)
-        self.num_attn_types = len(self.single_type_managers)
+        self.num_attn_types = len({manager.attn_type for manager in self.single_type_managers})
+        self.num_managers = len(self.single_type_managers)
         self.cache_info = cache_info
         self.is_mla_backend = self.cache_info.is_mla_backend
 
@@ -42,6 +43,7 @@ class KVCacheManager:
         computed_tokens: int,
         num_new_tokens: int,
         lookahead_tokens: int = 0,
+        reserved_tokens: int = 0,
     ) -> bool:
         """Coordinate slot allocation across all KV cache types."""
         if num_new_tokens < 0:
@@ -58,13 +60,14 @@ class KVCacheManager:
                 request_id=request_id,
                 total_computed_tokens=total_computed_tokens,
             )
-            block_num_to_allocate = manager.get_num_blocks_to_allocate(
+            need_block_num, status = manager.pre_allocate_blocks(
                 request_id=request_id,
                 num_tokens=num_tokens_need_slot,
+                reserved_tokens=reserved_tokens,
             )
-            if block_num_to_allocate > manager.get_num_free_blocks():
+            if not status:
                 return False
-            block_num_to_allocate_per_manager.append(block_num_to_allocate)
+            block_num_to_allocate_per_manager.append(need_block_num)
 
         for manager, block_num_to_allocate in zip(
             self.single_type_managers,
@@ -80,7 +83,21 @@ class KVCacheManager:
     def get_block_ids(self, request_id: int) -> Dict:
         """Return all blocks associated with a request."""
         return {
-            manager.attn_type: manager.get_blocks(request_id)
+            manager.manager_key: manager.get_blocks(request_id)
+            for manager in self.single_type_managers
+        }
+
+    def get_block_sizes(self) -> Dict[str, int]:
+        """Return block size keyed by manager key."""
+        return {
+            manager.manager_key: manager.block_size
+            for manager in self.single_type_managers
+        }
+
+    def get_block_table_max_lens(self, max_model_len: int) -> Dict[str, int]:
+        """Return block-table width keyed by manager key."""
+        return {
+            manager.manager_key: (max_model_len + manager.block_size - 1) // manager.block_size
             for manager in self.single_type_managers
         }
 
@@ -97,14 +114,14 @@ class KVCacheManager:
         if not self.single_type_managers:
             return "0/0"
         return ",".join(
-            f"{m.attn_type}:{m.block_pool.num_blocks - m.get_num_free_blocks()}"
+            f"{m.manager_key}:{m.block_pool.num_blocks - m.get_num_free_blocks()}"
             f"/{m.block_pool.num_blocks}"
             for m in self.single_type_managers
         )
 
     def get_contiguous_buf_infos(
         self,
-    ) -> Tuple[List[int], List[int], List[int], List[str]]:
+    ) -> Tuple[List[int], List[int], List[int], List[str], List[int]]:
         """Flatten all block-managed physical cache tensors for PD KV transfer.
 
         prefill and decode each call this independently and the returned
@@ -125,15 +142,15 @@ class KVCacheManager:
             data_ptrs: data_ptr() of each physical cache tensor
             data_lens: total bytes of each cache tensor
             item_lens: bytes per block (block_size × num_head × dim × element_size)
-            attn_types: attn_type of each entry (PD side uses this to look up
-                the correct per-attn_type block id list)
+            attn_types: manager_key of each entry (PD side uses this to look up
+                the correct per-manager block id list)
         """
 
         data_ptrs: List[int] = []
         data_lens: List[int] = []
         item_lens: List[int] = []
         attn_types: List[str] = []
-        block_size = self.cache_info.block_size
+        block_sizes: List[int] = []
         # Keeps a stable, deterministic iteration order without re-sorting per call.
         sorted_layer_infos = sorted(self.cache_info.layer_infos, key=lambda li: li.layer_idx)
 
@@ -147,11 +164,13 @@ class KVCacheManager:
                         f"has no tensor — allocate_cache_tensors must run first."
                     )
                 t = cache.tensor
+                block_size = cache.block_size
                 data_ptrs.append(t.data_ptr())
                 data_lens.append(t.numel() * t.element_size())
                 item_lens.append(
-                    block_size * cache.num_head * cache.dim * t.element_size()
+                    block_size * cache.num_head * cache.cache_dim_numel() * t.element_size()
                 )
-                attn_types.append(cache.attn_type)
+                attn_types.append(cache.group_key)
+                block_sizes.append(block_size)
 
-        return data_ptrs, data_lens, item_lens, attn_types
+        return data_ptrs, data_lens, item_lens, attn_types, block_sizes

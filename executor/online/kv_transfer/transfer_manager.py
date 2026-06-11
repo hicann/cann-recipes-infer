@@ -130,13 +130,13 @@ class KVTransferManager:
         self.attn_tp_rank = attn_tp_rank
         self.attn_cp_size = attn_cp_size
         self.attn_cp_rank = attn_cp_rank
-        self.block_size = 0  # set by register_memory()
         self.kv_cache_dtype = kv_cache_dtype
         self.kv_data_ptrs: list[int] = []
         self.kv_data_lens: list[int] = []
         self.kv_item_lens: list[int] = []
-        # attn_type per flat entry in kv_data_ptrs; PD side uses it to pick the
-        # correct per-attn_type block id list when building transfer tuples.
+        self.kv_block_sizes: list[int] = []
+        # manager_key per flat entry in kv_data_ptrs; PD side uses it to pick the
+        # correct per-manager block id list when building transfer tuples.
         self.kv_entry_attn_types: list[str] = []
         self.kv_head_num: int | None = None
         self.total_kv_head_num: int | None = None
@@ -452,6 +452,7 @@ class KVTransferManager:
                     continue
                 dst_kv_ptrs = target.get("dst_kv_ptrs", [])
                 dst_kv_item_lens = target.get("dst_kv_item_lens", [])
+                dst_kv_block_sizes = target.get("dst_kv_block_sizes", self.kv_block_sizes)
                 dst_attn_tp_size = target.get("dst_attn_tp_size", self.attn_tp_size)
                 src_block_ids = task.src_block_ids
                 dst_block_ids = target.get("dst_block_ids", {})
@@ -462,7 +463,7 @@ class KVTransferManager:
                 else:
                     src_addrs, dst_addrs, byte_lens = self.build_tp_slice_blocks(
                         src_block_ids, dst_block_ids, dst_kv_ptrs, dst_kv_item_lens,
-                        dst_attn_tp_size, target.get("dst_tp_rank", 0),
+                        dst_kv_block_sizes, dst_attn_tp_size, target.get("dst_tp_rank", 0),
                     )
                 logger.debug(
                     "RDMA transfer: room=%s rank=%d blocks=%d session=%.8s",
@@ -694,10 +695,10 @@ class KVTransferManager:
         return True
 
     def validate_prefill_info(self, info: PrefillServerInfo) -> None:
-        if info.block_size is not None and self.block_size not in (0, None):
-            if info.block_size != self.block_size:
+        if info.block_sizes is not None and self.kv_block_sizes:
+            if list(info.block_sizes) != self.kv_block_sizes:
                 raise ValueError(
-                    f"Mismatched block_size: decode={self.block_size}, prefill={info.block_size}"
+                    f"Mismatched block_sizes: decode={self.kv_block_sizes}, prefill={info.block_sizes}"
                 )
         if info.kv_cache_dtype is not None and self.kv_cache_dtype is not None:
             if info.kv_cache_dtype != self.kv_cache_dtype:
@@ -820,7 +821,7 @@ class KVTransferManager:
             "attn_dp_rank": self.attn_dp_rank,
             "rank_ip": self.local_ip,
             "rank_port": self.rank_port,
-            "block_size": self.block_size,
+            "block_sizes": list(self.kv_block_sizes),
             "kv_cache_dtype": self.kv_cache_dtype,
         }
         max_attempts = 10
@@ -848,6 +849,7 @@ class KVTransferManager:
         return KVArgsRegisterInfo(
             dst_kv_ptrs=list(self.kv_data_ptrs),
             dst_kv_item_lens=list(self.kv_item_lens),
+            dst_kv_block_sizes=list(self.kv_block_sizes),
             metadata_buffer_index=metadata_buffer_index,
             dst_block_ids={k: list(v) for k, v in dst_block_ids.items()},
             dst_tp_rank=self.attn_tp_rank,
@@ -863,16 +865,15 @@ class KVTransferManager:
         (ptrs, data_lens, item_lens, attn_types); ModelWorker is not
         involved — the pool is the source of truth.
         """
-        ptrs, lengths, item_lens, attn_types = (
+        ptrs, lengths, item_lens, attn_types, block_sizes = (
             kv_cache_manager.get_contiguous_buf_infos()
         )
-        # Source of truth: the same block_size that allocate_cache_tensors used.
-        self.block_size = kv_cache_manager.cache_info.block_size
         if ptrs:
             self.kv_data_ptrs = ptrs
             self.kv_data_lens = lengths
             self.kv_item_lens = item_lens
             self.kv_entry_attn_types = attn_types
+            self.kv_block_sizes = block_sizes
             self.transfer_engine.batch_register(ptrs, lengths)
         self._register_to_bootstrap()
         if self.metadata_pool is not None and self.metadata_pool.base_ptr:
@@ -889,6 +890,7 @@ class KVTransferManager:
         layout = {
             "dst_kv_ptrs": list(self.kv_data_ptrs),
             "dst_kv_item_lens": list(self.kv_item_lens),
+            "dst_kv_block_sizes": list(self.kv_block_sizes),
         }
         if self.kv_data_lens:
             layout["kv_data_lens"] = list(self.kv_data_lens)
@@ -970,6 +972,7 @@ class KVTransferManager:
         dst_block_ids_by_type: dict[str, list[int]],
         dst_kv_ptrs: list[int],
         dst_kv_item_lens: list[int],
+        dst_kv_block_sizes: list[int],
         dst_attn_tp_size: int,
         dst_tp_rank: int,
     ) -> tuple[list[int], list[int], list[int]]:
@@ -986,14 +989,24 @@ class KVTransferManager:
                 f"KV entry count mismatch: src={len(self.kv_data_ptrs)}, "
                 f"dst={len(dst_kv_ptrs)}"
             )
+        if len(self.kv_block_sizes) != len(dst_kv_block_sizes):
+            raise ValueError(
+                f"KV block_size entry count mismatch: src={len(self.kv_block_sizes)}, "
+                f"dst={len(dst_kv_block_sizes)}"
+            )
         src_addrs: list[int] = []
         dst_addrs: list[int] = []
         byte_lens: list[int] = []
-        block_size = self.block_size
-        for src_ptr, dst_ptr, src_item_len, dst_item_len, attn_type in zip(
+        for src_ptr, dst_ptr, src_item_len, dst_item_len, attn_type, src_block_size, dst_block_size in zip(
             self.kv_data_ptrs, dst_kv_ptrs, self.kv_item_lens, dst_kv_item_lens,
-            self.kv_entry_attn_types,
+            self.kv_entry_attn_types, self.kv_block_sizes, dst_kv_block_sizes,
         ):
+            if src_block_size != dst_block_size:
+                raise ValueError(
+                    f"kv block_size mismatch for manager_key={attn_type}: "
+                    f"src={src_block_size}, dst={dst_block_size}"
+                )
+            block_size = src_block_size
             s_bpt = src_item_len // block_size
             d_bpt = dst_item_len // block_size
             src_off, dst_off, length = self._compute_slice_offsets(

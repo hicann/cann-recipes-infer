@@ -269,15 +269,15 @@ class Batch:
     ) -> Dict[int, List[int]]:
         """Split batch outputs by index and update each request in-place."""
         next_tokens_by_request: Dict[int, List[int]] = {}
-        computed_lens = get_forward_metadata().kv_len
+        total_lens = get_forward_metadata().kv_len
 
         if next_tokens is not None and next_tokens.shape[0] != len(self.requests):
             raise ValueError(
                 f"next_tokens batch size {next_tokens.shape[0]} does not match request count {len(self.requests)}"
             )
-        if computed_lens is not None and computed_lens.shape[0] != len(self.requests):
+        if total_lens is not None and total_lens.shape[0] != len(self.requests):
             raise ValueError(
-                f"kv_len batch size {computed_lens.shape[0]} does not match request count {len(self.requests)}"
+                f"kv_len batch size {total_lens.shape[0]} does not match request count {len(self.requests)}"
             )
 
         for i, request in enumerate(self.requests):
@@ -287,6 +287,13 @@ class Batch:
                 accepted_num = self.mtp_infos.accepted_num[i] if self.mtp_infos.accepted_num is not None else None
                 spec_tokens = self.mtp_infos.spec_tokens[i] if self.mtp_infos.spec_tokens is not None else None
                 request.update_mtp_info(accepted_num, spec_tokens)
+                # Since the main model and draft model share forward_metadata, and total_lens includes MTP inference
+                # length when MTP is enabled, after iteration completes, subtract the MTP added length (next_n - 1)
+                # and inference length (next_n) to get the current request's computed_lens.
+                next_n = spec_tokens.shape[-1]
+                computed_lens = total_lens - next_n - (next_n - 1)
+            else:
+                computed_lens = total_lens
 
             if next_tokens is not None:
                 if accepted_num is not None:

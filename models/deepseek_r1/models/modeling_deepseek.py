@@ -948,6 +948,7 @@ class DeepseekV3Attention(nn.Module):
                 dim=self.config.kv_lora_rank,
                 num_head=1,
                 dtype=dtype_nope,
+                block_size=self.block_size,
                 needs_block=True,
                 tensor_setter=lambda tensor, layer=self: setattr(layer, "nope_cache", tensor),
             ),
@@ -957,6 +958,7 @@ class DeepseekV3Attention(nn.Module):
                 dim=self.config.qk_rope_head_dim,
                 num_head=1,
                 dtype=dtype_rope,
+                block_size=self.block_size,
                 needs_block=True,
                 tensor_setter=lambda tensor, layer=self: setattr(layer, "rope_cache", tensor),
             ),
@@ -2542,7 +2544,6 @@ class DeepseekV3ForCausalLM(nn.Module):
 
         return ModelCacheInfo(
             num_layers=len(layer_infos),
-            block_size=self.block_size,
             layer_infos=layer_infos,
             is_mla_backend=True,
         )

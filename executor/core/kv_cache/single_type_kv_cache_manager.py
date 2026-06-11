@@ -39,28 +39,49 @@ class SingleTypeKVCacheManager:
         attn_type: str,
         block_num: int,
         block_size: int,
+        manager_key: Optional[str] = None,
         max_model_len: Optional[int] = None,
         **kwargs,
     ):
         self.attn_type = attn_type
+        self.manager_key = manager_key if manager_key is not None else attn_type
         self.block_pool = BlockPool(num_blocks=block_num, block_size=block_size)
         self.block_size = block_size
         self.max_model_len = max_model_len
         self._null_block = self.block_pool.get_null_block()
         self.req_to_blocks: Dict[int, List[int]] = {}
 
-    def get_num_blocks_to_allocate(
+    def pre_allocate_blocks(
         self,
         request_id: int,
         num_tokens: int,
-    ) -> int:
-        """Return how many new blocks are required for the request."""
+        reserved_tokens: int = 0,
+    ) -> tuple:
+        """Return required blocks and whether the current pool can satisfy it."""
         if num_tokens < 0:
             raise ValueError("num_tokens must be non-negative")
 
+        # Admission control inputs on online mode: each request already in the pipeline
+        # (running + transfer-queue) reserves num_reserved_decode_tokens of
+        # future decode growth.  We only admit a new request if its
+        # input + reservation fits in the leftover budget.  Without this gate
+        # high-QPS bursts greedily fill KV cache, then no running req can grow
+        # to its next token → deadlock.
         required_block_num = ceil(num_tokens / self.block_size)
         existing_block_num = len(self.req_to_blocks.get(request_id, []))
-        return max(0, required_block_num - existing_block_num)
+        need_block_num = max(0, required_block_num - existing_block_num)
+
+        reserved_block_per_request = (reserved_tokens + self.block_size - 1) // self.block_size
+        reserved_block = reserved_block_per_request * len(self.req_to_blocks)
+        free_block_num = self.get_num_free_blocks()
+        status = need_block_num <= free_block_num - reserved_block
+        if not status:
+            logger.warning(
+                "preallocate skip request_id=%s: admission rejected "
+                "(req=%d blocks, free=%d, reserved_for_pipeline=%d)",
+                request_id, need_block_num, free_block_num, reserved_block,
+            )
+        return need_block_num, status
 
     def allocate_new_blocks(
         self,
@@ -144,6 +165,7 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         block_num: int,
         block_size: int,
         sliding_window: int,
+        manager_key: Optional[str] = None,
         max_model_len: Optional[int] = None,
         **kwargs,
     ):
@@ -151,6 +173,7 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
             attn_type=attn_type,
             block_num=block_num,
             block_size=block_size,
+            manager_key=manager_key,
             max_model_len=max_model_len,
         )
         self.sliding_window = sliding_window
@@ -165,12 +188,13 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         valid_block_num = last_block_idx - first_valid_block_idx + 1
         return total_block_num, first_valid_block_idx, valid_block_num
 
-    def get_num_blocks_to_allocate(
+    def pre_allocate_blocks(
         self,
         request_id: int,
         num_tokens: int,
-    ) -> int:
-        """Return how many new blocks are required for the request."""
+        reserved_tokens: int = 0,
+    ) -> tuple:
+        """Return required blocks and whether the current pool can satisfy it."""
         if num_tokens < 0:
             raise ValueError("num_tokens must be non-negative")
 
@@ -178,11 +202,12 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         existing_block_num = len(self.req_to_blocks.get(request_id, []))
         if existing_block_num > 0:
             # decode
-            return max(0, required_block_num - existing_block_num)
+            need_block_num = max(0, required_block_num - existing_block_num)
+            return need_block_num, need_block_num <= self.get_num_free_blocks()
 
         # prefill returns real physical block count only.
-        _, _, required_block_num = self._get_logical_block_layout(num_tokens)
-        return required_block_num
+        _, _, need_block_num = self._get_logical_block_layout(num_tokens)
+        return need_block_num, need_block_num <= self.get_num_free_blocks()
 
     def allocate_new_blocks(
         self,
@@ -241,24 +266,33 @@ def create_single_type_managers(
     """Create grouped single-type cache managers from cache metadata."""
     grouped_caches: Dict[str, List] = {}
 
-    # Group all cache entries that require block management by attn_type so
-    # they can share one manager instance with the same allocation policy.
+    # Group cache entries by manager key. Caches with the same attn_type can
+    # still need independent block tables and slot mappings.
     for layer_info in cache_info.layer_infos:
         for cache in layer_info.caches:
             if not cache.needs_block:
                 continue
-            if cache.attn_type not in block_num_by_type:
+            group_key = cache.group_key
+            if group_key not in block_num_by_type:
                 raise ValueError(
-                    f"Unknown attn_type '{cache.attn_type}' found in layer {layer_info.layer_idx}. "
+                    f"Unknown manager_key '{group_key}' found in layer {layer_info.layer_idx}, "
+                    f"cache {cache.cache_name}, attn_type={cache.attn_type}. "
                     f"Supported cache types are: {list(block_num_by_type.keys())}"
                 )
-            grouped_caches.setdefault(cache.attn_type, []).append(cache)
+            grouped_caches.setdefault(group_key, []).append(cache)
 
     single_type_managers: List[SingleTypeKVCacheManager] = []
     manager_infos = []
-    # Build one manager per attn_type using shared base kwargs plus any
+    # Build one manager per manager_key using shared base kwargs plus any
     # attn-type-specific validated kwargs derived from the grouped entries.
-    for attn_type, group_entries in grouped_caches.items():
+    for group_key, group_entries in grouped_caches.items():
+        attn_types = {cache.attn_type for cache in group_entries}
+        if len(attn_types) != 1:
+            raise ValueError(
+                f"Caches grouped into group_key={group_key} must share one attn_type, "
+                f"but got {sorted(attn_types)}."
+            )
+        attn_type = next(iter(attn_types))
         manager_class = ATTN_TYPE_MANAGER_MAP.get(attn_type)
         if manager_class is None:
             raise ValueError(
@@ -266,9 +300,17 @@ def create_single_type_managers(
                 f"Please add a SingleTypeKVCacheManager class corresponding to {attn_type}."
             )
 
+        block_sizes = {cache.block_size for cache in group_entries}
+        if len(block_sizes) != 1:
+            raise ValueError(
+                "Caches grouped into one SingleTypeKVCacheManager must share the same block_size. "
+                f"group_key={group_key}, attn_type={attn_type}, block_sizes={sorted(block_sizes)}."
+            )
+
         manager_kwargs = {
-            "block_num": block_num_by_type[attn_type],
-            "block_size": cache_info.block_size,
+            "block_num": block_num_by_type[group_key],
+            "block_size": next(iter(block_sizes)),
+            "manager_key": group_key,
             "max_model_len": max_model_len,
         }
         # Call the class's static method to validate and build type-specific kwargs.
@@ -277,11 +319,12 @@ def create_single_type_managers(
         # Instantiate the registered manager for this attention type.
         manager = manager_class(attn_type=attn_type, **manager_kwargs)
         single_type_managers.append(manager)
-        manager_infos.append((attn_type, manager_class.__name__, manager_kwargs))
+        manager_infos.append((group_key, attn_type, manager_class.__name__, manager_kwargs))
 
-    for attn_type, manager_name, manager_kwargs in manager_infos:
+    for manager_key, attn_type, manager_name, manager_kwargs in manager_infos:
         logger.info(
-            "[KVCacheManager] attn_type=%s -> manager=%s, manager_kwargs=%s",
+            "[KVCacheManager] manager_key=%s, attn_type=%s -> manager=%s, manager_kwargs=%s",
+            manager_key,
             attn_type,
             manager_name,
             manager_kwargs,

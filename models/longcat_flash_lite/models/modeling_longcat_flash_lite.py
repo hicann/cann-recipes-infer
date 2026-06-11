@@ -248,6 +248,7 @@ class LongcatFlashMLA(nn.Module):
                 dim=self.kv_lora_rank,
                 num_head=1,
                 dtype=cache_dtype,
+                block_size=self.block_size,
                 needs_block=True,
                 tensor_setter=lambda t, layer=self: setattr(layer, "cache_nope", t),
             ),
@@ -257,6 +258,7 @@ class LongcatFlashMLA(nn.Module):
                 dim=self.qk_rope_head_dim,
                 num_head=1,
                 dtype=cache_dtype,
+                block_size=self.block_size,
                 needs_block=True,
                 tensor_setter=lambda t, layer=self: setattr(layer, "cache_rope", t),
             ),
@@ -1890,7 +1892,6 @@ class LongcatFlashNgramForCausalLM(nn.Module):
                 layer_idx += 1
         return ModelCacheInfo(
             num_layers=layer_idx,
-            block_size=self.block_size,
             layer_infos=layer_infos,
             is_mla_backend=True,
         )

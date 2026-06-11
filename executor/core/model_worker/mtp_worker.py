@@ -70,6 +70,7 @@ class MTPWorker:
         # Model Components
         self.device = device
         self.mtp_model_worker = ModelWorker(self.infer_config, self.device)
+        self.kvcache_manager = None
 
     def share_weights_from_main_model(self, main_model):
         """Share reusable weights from the main model to the MTP model when missing."""
@@ -130,11 +131,7 @@ class MTPWorker:
             # input_ids is [B] 1D, unsqueeze to [B, 1] for concat with spec_tokens [B, next_n]
             input_ids = torch.cat([input_ids.unsqueeze(1), spec_tokens], dim=1)
             input_ids = input_ids[:, -q_len:].reshape(-1).clone()
-            # Rewind kv_len to the accepted prefix before the next main-model verification step.
-            # The draft and main models share forward_metadata, and draft inference
-            # increments kv_len by (self.next_n - 1), so we subtract it here and add
-            # 1 back to align with the current main-model verification step.
-            kv_len = kv_len - (self.next_n - 1) + 1
+            kv_len = kv_len + self.next_n + 1
         indices = torch.arange(q_len - 1, -1, -1, device=self.mtp_model_worker.device)
         position_ids = (kv_len.unsqueeze(1) - indices).clamp(min=0).reshape(-1)
 
@@ -250,8 +247,12 @@ class MTPWorker:
                              actual_seq_lengths_list_kv=actual_seq_lengths_list_kv)
         indices = torch.arange(q_len - 1, -1, -1, device=self.mtp_model_worker.device)
         position_ids = (kv_len.unsqueeze(1) - indices).reshape(-1)
-        slot_mapping = prepare_slot_mapping(position_ids, actual_seq_lengths_cu_q,
-                                             forward_metadata.block_table, self.block_size)
+        slot_mapping = prepare_slot_mapping(
+            position_ids,
+            actual_seq_lengths_cu_q,
+            self.kvcache_manager,
+            forward_metadata.block_table,
+        )
         set_forward_metadata(slot_mapping=slot_mapping)
         input_ids_2d = input_ids.view(batch_size, q_len)
         cur_tokens = MTPWorker._pad_seq_len_to_size(input_ids_2d, q_len + 1)

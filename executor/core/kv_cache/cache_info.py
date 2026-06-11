@@ -31,9 +31,24 @@ class CacheEntry:
     num_head: int
     dtype: torch.dtype
     needs_block: bool
+    block_size: Optional[int] = None
+    manager_key: Optional[str] = None
     tensor_setter: Optional[Callable[[torch.Tensor], None]] = None
     sliding_window: Optional[int] = None
     tensor: Optional[torch.Tensor] = None
+
+    @property
+    def group_key(self) -> str:
+        """Manager grouping key for cache allocation and metadata tables."""
+        return self.manager_key if self.manager_key is not None else self.attn_type
+
+    def cache_dim_numel(self) -> int:
+        """Return flattened element count for a cache entry's trailing dim."""
+        dims = self.dim if isinstance(self.dim, list) else [self.dim]
+        numel = 1
+        for cur_dim in dims:
+            numel *= cur_dim
+        return numel
 
 
 @dataclass
@@ -49,7 +64,6 @@ class ModelCacheInfo:
     """Whole-model cache metadata."""
 
     num_layers: int
-    block_size: int
     layer_infos: List[LayerCacheInfo]
     # True for MLA backends (latent KV replicated across TP ranks). Set
     # explicitly by the model's get_cache_info(); PD transfer uses it to
@@ -60,10 +74,6 @@ class ModelCacheInfo:
 
     def merge(self, other: "ModelCacheInfo") -> "ModelCacheInfo":
         """Merge two cache-info objects into one complete model description."""
-        if self.block_size != other.block_size:
-            raise ValueError(
-                f"block_size mismatch: {self.block_size} != {other.block_size}"
-            )
         if self.is_mla_backend != other.is_mla_backend:
             raise ValueError(
                 "is_mla_backend mismatch across merged cache infos: "
@@ -77,7 +87,6 @@ class ModelCacheInfo:
         merged_layer_infos.extend(other.layer_infos)
         return ModelCacheInfo(
             num_layers=len(merged_layer_infos),
-            block_size=self.block_size,
             layer_infos=merged_layer_infos,
             is_mla_backend=self.is_mla_backend,
         )

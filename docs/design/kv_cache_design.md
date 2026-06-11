@@ -84,8 +84,10 @@ graph TD
 - `allocate_slots(request_id, computed_tokens, num_new_tokens, lookahead_tokens=0)`
 - `get_block_ids(request_id)`
 - `free(request_id)`
-- `format_usage() -> str`：返回**逐 attention type** 的 `used/total` 汇总字符串，例如 `"full:12/100,sliding:8/100"`；由 `Scheduler._log_step` 调用，用于在每步状态日志中暴露各 type 的 KV 压力。
-- `get_contiguous_buf_infos() -> (data_ptrs, data_lens, item_lens, attn_types)`：把 paged-attention 管理的所有物理 cache tensor 扁平化导出，供 PD KV 传输使用——按 `layer_idx` 升序、再按层内 `cache` 原始定义序遍历，仅导出 `needs_block=True` 的 cache。返回四个等长 list：`data_ptrs`（每个 tensor 的 `data_ptr()`）、`data_lens`（每个 tensor 总字节数）、`item_lens`（每块字节数 = `block_size × num_head × dim × element_size`）、`attn_types`（每项的 attention type，用于在对端按 type 查 block id）。Prefill 与 Decode 各自独立调用，返回顺序由模型配置决定，两端必然对齐。
+- `get_block_sizes() -> Dict[str, int]`：返回每个 manager key 对应的 `block_size`。
+- `get_block_table_max_lens(max_model_len) -> Dict[str, int]`：返回每个 manager key 对应的 block table 最大宽度。
+- `format_usage() -> str`：返回**逐 manager key** 的 `used/total` 汇总字符串，例如 `"FullAttention:16:12/100,SlidingWindow:32:8/100"`；由 `Scheduler._log_step` 调用，用于在每步状态日志中暴露各 cache 分组的 KV 压力。
+- `get_contiguous_buf_infos() -> (data_ptrs, data_lens, item_lens, attn_types, block_sizes)`：把 paged-attention 管理的所有物理 cache tensor 扁平化导出，供 PD KV 传输使用——按 `layer_idx` 升序、再按层内 `cache` 原始定义序遍历，仅导出 `needs_block=True` 的 cache。返回五个等长 list：`data_ptrs`（每个 tensor 的 `data_ptr()`）、`data_lens`（每个 tensor 总字节数）、`item_lens`（每块字节数 = `block_size × num_head × dim × element_size`）、`attn_types`（每项的 manager key，用于在对端按 manager key 查 block id）、`block_sizes`（每项 cache 实际使用的 block size）。Prefill 与 Decode 各自独立调用，返回顺序由模型配置决定，两端必然对齐。
 
 其中 `allocate_slots` 的关键点是”两阶段处理”（具体实现可见：[块分配核心流程](#3-块分配核心流程allocate_slots)）：
 
@@ -98,15 +100,16 @@ graph TD
 
 #### 2.3 第二层：SingleTypeKVCacheManager
 
-`SingleTypeKVCacheManager` 抽象”某一种 attention type 的 block 管理策略”。
+`SingleTypeKVCacheManager` 抽象”某一个 cache 管理分组的 block 管理策略”。该分组由 `manager_key` 标识，分组内所有 `CacheEntry` 必须共享同一个 `attn_type` 和同一个 `block_size`。
 
 **定义位置**：[single_type_kv_cache_manager.py](../../executor/core/kv_cache/single_type_kv_cache_manager.py)
 
 其内部成员包括：
 
 - `attn_type`：当前 manager 所属的 attention 类型。
+- `manager_key`：当前 manager 的唯一分组 key，用于 `block_table`、`slot_mapping`、block id 查询和 block 数规划。默认等于 `attn_type`，也可以由模型通过 `CacheEntry.manager_key` 显式指定。
 - `block_pool`：该类型对应的物理 block 池。
-- `block_size`：每个 block 容纳的 token 数。
+- `block_size`：该 manager 下每个 block 容纳的 token 数，来自分组内 `CacheEntry.block_size`。
 - `max_model_len`：模型总长度上限。
 - `_null_block`：空洞占位 block，用于逻辑对齐。之所以需要单独设置 `null_block`，是因为相关算子要求 block table 中必须存在合法的 block 索引；因此实现上会额外申请一个 block 作为占位，但该 block 不承载真实的 cache 数据读写。
 - `req_to_blocks`：`request_id -> block_id 列表` 的映射字典，记录每个请求使用的block ids。
@@ -301,13 +304,13 @@ sequenceDiagram
 **定义位置**：[cache_info.py](../../executor/core/kv_cache/cache_info.py)
 
 - `CacheEntry`
-  描述单个 cache 条目，包括 `cache_name`、`attn_type`、`dim`、`num_head`、`dtype`、`tensor_setter` 和 `needs_block`；Sliding Window 场景下还包含 `sliding_window`。
+  描述单个 cache 条目，包括 `cache_name`、`attn_type`、`dim`、`num_head`、`dtype`、`tensor_setter`、`needs_block` 和 `block_size`；Sliding Window 场景下还包含 `sliding_window`。如需把同一 `attn_type` 的 cache 拆到不同 manager，可设置 `manager_key`。
 - `LayerCacheInfo`
   按 layer 聚合多个 `CacheEntry`。
 - `ModelCacheInfo`
-  汇总全模型 cache 信息，包括 `num_layers`、`block_size` 和所有层的 `LayerCacheInfo`。
+  汇总全模型 cache 信息，包括 `num_layers`、所有层的 `LayerCacheInfo` 以及 `is_mla_backend`。`ModelCacheInfo` 不再保存模型级 `block_size`，block size 由每个 `CacheEntry` 自己声明。
 
-`CacheEntry.attn_type` 决定 cache 条目映射到哪一类 `SingleTypeKVCacheManager`。分组维度是 `attn_type` ，因此本框架支持单层同时包含多个 cache 条目，也支持单层同时包含**多种 cache 类型**。
+`CacheEntry.attn_type` 决定 cache 条目使用哪一类 `SingleTypeKVCacheManager` 子类，`CacheEntry.group_key` 决定它归入哪个 manager 实例。`group_key` 的取值规则为：若显式设置 `manager_key`，使用 `manager_key`；否则使用 `attn_type`。因此框架支持单层同时包含多个 cache 条目，也支持单层同时包含**多种 cache 类型**，还支持同一 `attn_type` 下按不同 `block_size` 拆分多个 manager。
 
 `ModelCacheInfo` 在模型侧构建。执行链路为：`ModelWorker._get_cache_info()` 调用模型对象的 `get_cache_info()`，由具体模型实现返回自身的 cache 元数据。
 
@@ -318,7 +321,7 @@ sequenceDiagram
 2. `rope_cache`
    `attn_type="FullAttention"`，`dim=self.config.qk_rope_head_dim`，`num_head=1`。
 
-二者虽然是不同的 cache 条目，但 `attn_type` 相同，因此会被归入同一个 manager 统一管理。其层级关系如下：
+二者虽然是不同的 cache 条目，但如果 `group_key` 相同，就会被归入同一个 manager 统一管理；如果需要使用不同 `block_size`，则应设置不同 `manager_key`，让它们分别对应不同 manager。其层级关系如下：
 
 ```mermaid
 graph TD
@@ -346,7 +349,7 @@ graph TD
 - `validate_cache_info()`
   校验 cache 元数据合法性。
 - `calculate_block_num()`
-  计算各 attention type 的 block 数量。
+  计算各 manager key 的 block 数量。
 - `allocate_cache_tensors()`
   根据 block 规划结果分配底层 cache tensor。
 - `prepare_block_tables()`
@@ -355,12 +358,12 @@ graph TD
   根据 `position_ids` 和 `block_table` 生成 `slot_mapping`。
 
 ##### 4.2.1 详解 calculate_block_num()
-`calculate_block_num()` 会计算要给每种 `attn_type` 对应的 `SingleTypeKVCacheManager` 分配多少 block 数量。
-它会先按 `attn_type` 将 cache 分成两类，再分别计算 `block_num`：
+`calculate_block_num()` 会计算要给每个 manager key 对应的 `SingleTypeKVCacheManager` 分配多少 block 数量。
+它会先按 cache 的 `attn_type` 区分固定 block 与非固定 block 类型，再按 `cache.group_key` 汇总 `block_size` 和每块字节数，最终返回 `Dict[manager_key, block_num]`：
 
 **1. 固定 block 数的 `attn_type`**
    这类 `attn_type` 需要的 cache 数据不随着请求总长度线性增长，例如 `SlidingWindow` 只需要窗口长度的 cache，因此只给其分配固定大小的 block。代码中通过 `FIXED_BLOCK_ATTN_TYPES` 对这类 `attn_type` 进行标识。
-   当前典型例子是 `SlidingWindow`。对其 `block_num` 的计算思路是先为单个请求估算“窗口内最多需要保留多少真实 block”，再乘以最大并发数 `batch_size_per_dp_rank`。具体计算为：
+   当前典型例子是 `SlidingWindow`。对其 `block_num` 的计算思路是按 `manager_key` 先为单个请求估算“窗口内最多需要保留多少真实 block”，再乘以最大并发数 `batch_size_per_dp_rank`。具体计算为：
    ```text
    fixed_block_num =
        max_concurrency *
@@ -373,11 +376,11 @@ graph TD
 
 **2. 非固定 block 数的 `attn_type`**
    这类 `attn_type` 需要的 cache 数据随着请求总长度线性增长，例如 `FullAttention`，MLA、MHA、GQA等全注意力都属于`FullAttention`。
-   在计算这类 `attn_type` 的所需 block 数时：
+   在计算这类 cache 的所需 block 数时：
    - 在离线推理模式下可以直接根据固定的最大长度计算：
       ```text
-      block_num_per_request = ceil(offline_max_len / block_size)
-      total_block_num = block_num_per_request * max_concurrency + 1
+      block_num_by_type[manager_key] =
+          ceil(offline_max_len / cache.block_size) * max_concurrency + 1
       ```
       这里额外的 `+1` 同样用于 `null_block` 占位。
 
@@ -387,23 +390,23 @@ graph TD
       available_memory = available_kv_memory * kv_cache_mem_ratio - fixed_block_memory_bytes
 
       max_tokens = floor(available_memory / per_token_bytes)
-      non_fixed_block_num = floor(max_tokens / block_size)
 
-      for attn_type in paged_attn_types:
-         block_num_by_type[attn_type] = non_fixed_block_num + 1
+      for manager_key in paged_manager_keys:
+         block_num_by_type[manager_key] = floor(max_tokens / block_size_by_key[manager_key])
       ```
-      其中额外的 `+1` 用于预留 `null_block`。
+      其中每个 manager 的第一个 block 会作为 `null_block` 占位，不参与真实 cache 存储。不同 manager 可使用不同 `block_size`，因此同一个 `max_tokens` 会折算出不同的 block 数。
 
 整体上，`calculate_block_num()` 的顺序是：先为固定 block 类 cache 预留内存，再用剩余内存估算非固定 block 类 cache 的 block 数；这样可以避免 SWA 这类必须预留的 cache 挤占后续计算时出现不确定性。
+分组内一致性由代码显式校验：共享同一个 manager key 的 cache 必须共享同一个 `block_size`；如果同一 attention type 下需要不同 `block_size`，必须使用不同 `manager_key`。
 
 ##### 4.2.2 构建 block_table 与 slot_mapping
 
-`prepare_block_tables()` 和 `prepare_slot_mapping()` 的输出均为字典结构，键为 `attn_type`，值为对应的`block_tables / slot_mapping` 张量，即：
+`prepare_block_tables()` 和 `prepare_slot_mapping()` 的输出均为字典结构，键为 `manager_key`，值为对应的 `block_tables / slot_mapping` 张量，即：
 
-- `block_tables[attn_type] = block_table_tensor`
-- `slot_mapping[attn_type] = slot_mapping_tensor`
+- `block_tables[manager_key] = block_table_tensor`
+- `slot_mapping[manager_key] = slot_mapping_tensor`
 
-这种形式与多 attention type 的设计一致，推理运行时可以按 `attn_type` 取出对应的 `block_table` 和 `slot_mapping`。
+这种形式与多 cache 分组的设计一致，推理运行时可以按 `manager_key` 取出对应的 `block_table` 和 `slot_mapping`。`prepare_slot_mapping()` 会使用当前 manager 的 `block_size` 计算 `block_indices = position_ids // block_size` 和 `position_offsets = position_ids % block_size`，因此不同 manager 的 slot mapping 可以自然对应不同 block 粒度。
 
 ---
 
@@ -462,6 +465,8 @@ self.rope_cache = torch.Tensor([])
 | `num_head` | cache 包含的 head 数量（注意考虑 TP 切分后的实际 head 数） |
 | `dtype` | cache tensor 数据类型，如 `torch.bfloat16`、`torch.int8` |
 | `needs_block` | 是否参与 block 分配，通常为 `True` |
+| `block_size` | 当前 cache 使用的 block size，`needs_block=True` 时必须为正整数 |
+| `manager_key` | 可选。同一 `attn_type` 需要不同 `block_size` 时必须显式设置不同 key |
 | `tensor_setter` | 回调函数，用于将分配的 cache tensor 注册到 attention 类 |
 | `sliding_window` | 仅 `SlidingWindow` 类型需要，设置窗口大小 |
 
@@ -475,6 +480,7 @@ self.cache_entries = [
         num_head=1,
         dtype=dtype_nope,
         needs_block=True,
+        block_size=self.block_size,
         tensor_setter=lambda tensor, layer=self: setattr(layer, "nope_cache", tensor),
     ),
     CacheEntry(
@@ -484,6 +490,7 @@ self.cache_entries = [
         num_head=1,
         dtype=dtype_rope,
         needs_block=True,
+        block_size=self.block_size,
         tensor_setter=lambda tensor, layer=self: setattr(layer, "rope_cache", tensor),
     ),
 ]
@@ -516,12 +523,12 @@ def get_cache_info(
 
     return ModelCacheInfo(
         num_layers=len(layer_infos),
-        block_size=self.block_size,
         layer_infos=layer_infos,
+        is_mla_backend=self.is_mla_backend,
     )
 ```
 
-**注意**：确保模型类持有 `block_size`，在模型类 `__init__()` 中保存 `block_size`，供 `get_cache_info()` 使用：
+**注意**：`block_size` 需要写入每个 `CacheEntry`。模型类可以继续从配置中保存默认 block size，也可以为不同 cache 保存不同 block size，供创建 `CacheEntry` 时使用：
 
 ```python
 self.block_size = infer_config.scheduler_config.block_size
@@ -563,7 +570,7 @@ ATTN_TYPE_MANAGER_MAP: Dict[str, Type[SingleTypeKVCacheManager]] = {
 
 仅在新增 Manager 且现有 block 计算逻辑不满足需求时执行。
 
-`calculate_block_num()`会在 cache 管理初始化对每个 `attn_type` 分配 block 内存块，如果新增了 Manager，需要检查或新增分配逻辑。
+`calculate_block_num()` 会在 cache 管理初始化对每个 `manager_key` 分配 block 内存块，如果新增了 Manager，需要检查或新增分配逻辑。
 
 ##### 5.4.1 判断是否属于固定 block 类型
 
@@ -593,14 +600,14 @@ else:
 
 **位置**：[cache_utils.py](../../executor/core/kv_cache/cache_utils.py)
 
-若新增非固定 block 类型，检查现有的 block 计算逻辑是否满足新 Manager 需求。
+若新增非固定 block 类型，检查现有的 block 计算逻辑是否满足新 Manager 需求。尤其需要确认同一 `manager_key` 下所有 cache 的 `block_size` 一致，并正确统计该 manager 的每块字节数。
 
 
 #### 5.5 扩展 `allocate_cache_tensors()`，为新的 attn_type 分配内存【可选】
 
 **位置**：[cache_utils.py](../../executor/core/kv_cache/cache_utils.py)
 
-cache tensor 的物理布局默认匹配框架分配形状：`[block_num, block_size, num_head, dim]`。如果新增 `attn_type` 不满足默认分配的 shape，则可以在 `allocate_cache_tensors()` 中新增分支，按照该 `attn_type` 的需求 shape 分配物理 tensor。
+cache tensor 的物理布局默认匹配框架分配形状：`[block_num_by_type[cache.group_key], cache.block_size, num_head, dim]`。如果新增 `attn_type` 不满足默认分配的 shape，则可以在 `allocate_cache_tensors()` 中新增分支，按照该 `attn_type` 的需求 shape 分配物理 tensor。
 
 ```python
 elif cache.attn_type in ["NewAttentionType"]:
@@ -615,7 +622,7 @@ elif cache.attn_type in ["NewAttentionType"]:
 
 ##### 5.6.1 从 `forward_metadata` 获取 block 信息
 
-`block_table` 和 `slot_mapping` 存储在 `forward_metadata` 中，均为 `Dict[str, torch.Tensor]` 结构：
+`block_table` 和 `slot_mapping` 存储在 `forward_metadata` 中，均为 `Dict[str, torch.Tensor]` 结构，key 为 `manager_key`：
 
 **生成位置**：
 - [cache_utils.py](../../executor/core/kv_cache/cache_utils.py)：`prepare_block_tables()`
@@ -623,22 +630,22 @@ elif cache.attn_type in ["NewAttentionType"]:
 
 **数据结构**：
 ```python
-block_tables = forward_metadata.block_table  # Dict[attn_type, Tensor]
-slot_mapping = forward_metadata.slot_mapping  # Dict[attn_type, Tensor]
+block_tables = forward_metadata.block_table  # Dict[manager_key, Tensor]
+slot_mapping = forward_metadata.slot_mapping  # Dict[manager_key, Tensor]
 ```
 
-##### 5.6.2 按 `attn_type` 取出对应 tensor
+##### 5.6.2 按 `manager_key` 取出对应 tensor
 
-在 attention forward 中，使用 `self.attn_type` 作为 key：
+在 attention forward 中，使用 cache 对应的 `manager_key` 作为 key。如果该 attention type 下只有一种 block size 且没有显式设置 `manager_key`，则 key 可以继续等于 `self.attn_type`：
 
 ```python
-block_table = forward_metadata.block_table[self.attn_type]
-slot_mapping = forward_metadata.slot_mapping[self.attn_type]
+block_table = forward_metadata.block_table[self.manager_key]
+slot_mapping = forward_metadata.slot_mapping[self.manager_key]
 ```
 
 **注意事项**：
-- 同一层多个 cache（如 `k_cache` 和 `v_cache`）共享相同的 `attn_type`，使用同一份 `block_table` 和 `slot_mapping`
-- 若一层包含多种 `attn_type` 的 cache，需分别取出对应的 tensor
+- 同一层多个 cache（如 `k_cache` 和 `v_cache`）如果共享相同 `manager_key`，使用同一份 `block_table` 和 `slot_mapping`
+- 若一层包含多种 `attn_type`，或同一 `attn_type` 下包含多种 `block_size`，需分别按对应 `manager_key` 取出 tensor
 
 #### 5.7 验证完整链路【必选】
 
@@ -650,7 +657,7 @@ slot_mapping = forward_metadata.slot_mapping[self.attn_type]
 |-----|---------|---------|
 | 1 | `ModelWorker.get_cache_info()` → [model_worker.py](../../executor/core/model_worker/model_worker.py) | 模型正确返回 `ModelCacheInfo` |
 | 2 | `validate_cache_info()` → [cache_utils.py](../../executor/core/kv_cache/cache_utils.py) | cache 元数据合法 |
-| 3 | `calculate_block_num()` → [cache_utils.py](../../executor/core/kv_cache/cache_utils.py) | 各类型 block 数正确计算 |
+| 3 | `calculate_block_num()` → [cache_utils.py](../../executor/core/kv_cache/cache_utils.py) | 各 manager key 的 block 数正确计算 |
 | 4 | `allocate_cache_tensors()` → [cache_utils.py](../../executor/core/kv_cache/cache_utils.py) | cache tensor 正确分配 |
 | 5 | `create_single_type_managers()` → [single_type_kv_cache_manager.py](../../executor/core/kv_cache/single_type_kv_cache_manager.py) | Manager 正确创建 |
 | 6 | `KVCacheManager(...)` → [kv_cache_manager.py](../../executor/core/kv_cache/kv_cache_manager.py) | 顶层 Manager 初始化完成 |
@@ -662,7 +669,7 @@ slot_mapping = forward_metadata.slot_mapping[self.attn_type]
 | 1 | `KVCacheManager.allocate_slots()` → [kv_cache_manager.py](../../executor/core/kv_cache/kv_cache_manager.py) | 能成功分配 block |
 | 2 | `prepare_block_tables()` → [cache_utils.py](../../executor/core/kv_cache/cache_utils.py) | `block_table` 正确生成 |
 | 3 | `prepare_slot_mapping()` → [cache_utils.py](../../executor/core/kv_cache/cache_utils.py) | `slot_mapping` 正确生成 |
-| 4 | 模型前向 | 能正确消费对应 `attn_type` 的 block 信息 |
+| 4 | 模型前向 | 能正确消费对应 `manager_key` 的 block 信息 |
 
 **关键调用点**：
 - Prefill 阶段：[scheduler.py](../../executor/core/scheduler/scheduler.py) 的 `_schedule_prefill_batch()` 调用 `allocate_slots`
@@ -728,7 +735,7 @@ else:
     slot_mapping = None
 ```
 
-最终写入 `ForwardMetaData` 的 `block_table` 和 `slot_mapping` 均为 `None`。模型 forward 不能再依赖 `forward_metadata.block_table[self.attn_type]` 或 `forward_metadata.slot_mapping[self.attn_type]` 来定位 Cache，而需要自行根据长度信息和内部索引更新 Cache。
+最终写入 `ForwardMetaData` 的 `block_table` 和 `slot_mapping` 均为 `None`。模型 forward 不能再依赖 `forward_metadata.block_table[self.manager_key]` 或 `forward_metadata.slot_mapping[self.manager_key]` 来定位 Cache，而需要自行根据长度信息和内部索引更新 Cache。
 
 在 prefill 阶段，框架会额外向模型 forward 入参中传入 `request_offset`：
 

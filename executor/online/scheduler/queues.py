@@ -214,24 +214,6 @@ class DecodePreallocQueue:
         failed: list[DecodeRequest] = []
         remaining: list[DecodeRequest] = []
 
-        # Admission control inputs: each request already in the pipeline
-        # (running + transfer-queue) reserves num_reserved_decode_tokens of
-        # future decode growth.  We only admit a new request if its
-        # input + reservation fits in the leftover budget.  Without this gate
-        # high-QPS bursts greedily fill KV cache, then no running req can grow
-        # to its next token → deadlock.
-        block_size = self.kv_transfer_manager.block_size
-        reserved_blocks_per_req = (
-            self.num_reserved_decode_tokens + block_size - 1
-        ) // block_size
-        in_flight = len(self.running_requests) + len(self.transfer_queue.waiting)
-        reserved_for_pipeline = reserved_blocks_per_req * in_flight
-        free_blocks = min(
-            (m.get_num_free_blocks() for m in self.kv_cache_manager.single_type_managers),
-            default=0,
-        )
-        admittable_blocks = free_blocks - reserved_for_pipeline
-
         for decode_req in self.queue:
             room = decode_req.req.bootstrap_room
             if decode_req.req.is_finished:
@@ -267,29 +249,16 @@ class DecodePreallocQueue:
             # Matches _schedule_decode_batch(num_new_tokens=1+next_n, lookahead=max(next_n-1,0)).
             # Extra blocks beyond what prefill transfers are harmless — prefill
             # only writes src_block_ids count blocks (zip stops at the shorter).
-            required_tokens = num_tokens + self.num_reserved_decode_tokens
-            required_blocks = (required_tokens + block_size - 1) // block_size
-            if required_blocks > admittable_blocks:
-                logger.debug(
-                    "preallocate skip room=%s: admission rejected "
-                    "(req=%d blocks, free=%d, reserved_for_pipeline=%d)",
-                    room, required_blocks, free_blocks, reserved_for_pipeline,
-                )
-                remaining.append(decode_req)
-                continue
             if not self.kv_cache_manager.allocate_slots(
                 request_id=decode_req.req.request_id,
                 computed_tokens=num_tokens,
                 num_new_tokens=1 + next_n,
                 lookahead_tokens=max(next_n - 1, 0),
+                reserved_tokens=self.num_reserved_decode_tokens
             ):
                 logger.debug("preallocate skip room=%s: KV cache slot allocation failed", room)
                 remaining.append(decode_req)
                 continue
-            # Account for this admission so the next iteration's budget
-            # reflects both the real input allocation and the future-decode
-            # reservation we just promised this request.
-            admittable_blocks -= required_blocks
 
             decode_req.metadata_buffer_index = self.metadata_pool.alloc()
             decode_req.req.metadata_buffer_index = decode_req.metadata_buffer_index

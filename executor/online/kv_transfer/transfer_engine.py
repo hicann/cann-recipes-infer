@@ -72,7 +72,7 @@ class PrefillServerInfo:
     attn_tp_size: int
     attn_cp_size: int
     dp_size: int
-    block_size: Optional[int] = None
+    block_sizes: Optional[list[int]] = None
     kv_cache_dtype: Optional[str] = None
     ranks: dict[str, dict[str, int | str]] = field(default_factory=dict)
 
@@ -106,6 +106,7 @@ class PrefillRankInfo:
 class KVArgsRegisterInfo:
     dst_kv_ptrs: list[int]
     dst_kv_item_lens: list[int]
+    dst_kv_block_sizes: list[int]
     metadata_buffer_index: int
     dst_block_ids: dict[str, list[int]]
     dst_tp_rank: int = 0
@@ -123,7 +124,7 @@ class _KVTransferTask:
     """
     bootstrap_room: int
     bootstrap_infos: list
-    src_block_ids: dict  # attn_type -> list[block_id] (prefill's own blocks)
+    src_block_ids: dict  # manager_key -> list[block_id] (prefill's own blocks)
     metadata: dict
     sender: object  # AscendKVSender — needed for prefill_unique_rank
 

@@ -1,6 +1,6 @@
 # MTP Model 模型适配指南
 
-## 概述
+## 1. 概述
 
 MTP (Multi-Token Prediction) 流程已接入框架中。相关实现文件和文档如下：
 

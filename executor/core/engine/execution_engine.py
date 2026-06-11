@@ -179,6 +179,8 @@ class ExecutionEngine:
             single_type_managers=single_type_managers,
             cache_info=cache_info,
         )
+        if self.mtp_worker is not None:
+            self.mtp_worker.kvcache_manager = self.kvcache_manager
 
     @property
     def model(self):
@@ -266,9 +268,15 @@ class ExecutionEngine:
         if self.kvcache_manager:
             # Get blcok_table and slot_mapping
             batch_size = actual_seq_lengths_cu_q.shape[0]
+            block_table_max_lens = self.kvcache_manager.get_block_table_max_lens(self.max_total_len)
             block_tables = prepare_block_tables(batch.requests if batch else None, self.kvcache_manager,
-                                                self.block_table_max_len, device=self.device, batch_size=batch_size)
-            slot_mapping = prepare_slot_mapping(position_ids, actual_seq_lengths_cu_q, block_tables, self.block_size)
+                                                block_table_max_lens, device=self.device, batch_size=batch_size)
+            slot_mapping = prepare_slot_mapping(
+                position_ids,
+                actual_seq_lengths_cu_q,
+                self.kvcache_manager,
+                block_tables,
+            )
         else:
             block_tables = None
             slot_mapping = None
