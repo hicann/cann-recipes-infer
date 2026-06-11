@@ -66,7 +66,7 @@ Qwen3-MoE模型是2025年开源的大语言模型，包括Qwen3-235B-A22B与Qwen
 
    - 使用长序列prompt（默认）。
 
-     本样例默认使用LongBench数据集作为长序列prompt，YAML配置文件中`dataset`参数已设置为`"LongBench"`。若您的机器无法联网，需要从[huggingface](http://huggingface.co/datasets/zai-org/LongBench/tree/main)手动下载数据集至`dataset/LongBench`目录下，`LongBench`文件夹需手工创建，目录中包含`LongBench.py`和`data`目录，并需要在`LongBench.py`中修改数据集加载路径；若您的机器可正常联网，样例执行过程中会自动在线读取LongBench数据集，您无需手工下载。
+     本样例默认使用LongBench数据集作为长序列prompt，YAML配置文件中`dataset`参数已设置为`"LongBench"`。若您的机器无法联网，需要从[huggingface](https://huggingface.co/datasets/zai-org/LongBench/tree/main)手动下载数据集至`dataset/LongBench`目录下，`LongBench`文件夹需手工创建，目录中包含`LongBench.py`和`data`目录，并需要在`LongBench.py`中修改数据集加载路径；若您的机器可正常联网，样例执行过程中会自动在线读取LongBench数据集，您无需手工下载。
      > 说明：在使用LongBench数据集或其他自定义数据集时，默认执行文本摘要任务，可在`cann-recipes-infer/executor/utils/data_utils.py`的`build_dataset_input`函数里修改默认的system prompt。
 
    - 使用内置prompt。
