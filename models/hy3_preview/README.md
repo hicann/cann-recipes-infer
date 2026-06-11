@@ -108,7 +108,7 @@ Hy3-preview 是腾讯混元团队开发的大规模 MoE 语言模型，总参数
 
 ## Benchmark
 
-基于 Atlas A3 8卡，使用 `hy3_rank16_4tp_16ep_gegraph_bf16.yaml` 配置，BF16 精度。
+基于 Atlas A3 8卡，使用 `hy3_preview_rank16_4tp_16ep_gegraph_bf16.yaml` 配置，BF16 精度。
 
 | 指标 | 数值 | 测试条件 |
 |------|------|---------|
