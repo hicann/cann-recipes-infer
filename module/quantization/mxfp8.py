@@ -278,13 +278,14 @@ class MxFp8MoEGMMMethod(QuantizeMethodBase):
             tuning_config=[0]
         )[0]
 
-        swiglu_limit = kwargs.get("swiglu_limit", 0.0)
+        swiglu_limit = kwargs.get("swiglu_limit", None)
         enable_custom_ops = kwargs.get("enable_custom_ops", False)
         if enable_custom_ops:
             intermediate_h, pertoken_scale , _ = torch.ops.custom.npu_swiglu_group_quant(mm1_mm3,
                                                                                         dst_type=torch.float8_e4m3fn,
-                                                                                        quant_mode=2,
-                                                                                        clamp_value=swiglu_limit,
+                                                                                        round_scale=True,
+                                                                                        quant_mode=1,
+                                                                                        clamp_limit=swiglu_limit,
                                                                                         group_index=expert_tokens)
         else:
             mm1_mm3 = torch_npu.npu_swiglu(mm1_mm3)

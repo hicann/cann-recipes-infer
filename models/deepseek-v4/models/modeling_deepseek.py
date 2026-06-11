@@ -152,8 +152,9 @@ class DeepseekV3SharedExpert(nn.Module):
         intermediate_hidden_states, pergroup_scale , _ = torch.ops.custom.npu_swiglu_group_quant(
             merged_x,
             dst_type=torch.float8_e4m3fn,
-            quant_mode=2 if "mx" in self.mm_quant_mode else 1,
-            clamp_value=self.swiglu_limit if self.swiglu_limit else 0
+            round_scale=True if "mx" in self.mm_quant_mode else False,
+            quant_mode=1 if "mx" in self.mm_quant_mode else 0,
+            clamp_limit=self.swiglu_limit, 
             )
         wait_event(enable_decode_stream, shared_expert_event, 0)
         return self.down_proj(intermediate_hidden_states, pergroup_scale)
