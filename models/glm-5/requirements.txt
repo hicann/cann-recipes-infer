@@ -13,3 +13,4 @@ blobfile==3.0.0
 tiktoken==0.9.0
 hypothesis==6.140.2
 einops==0.8.1
+torchao==0.15.0

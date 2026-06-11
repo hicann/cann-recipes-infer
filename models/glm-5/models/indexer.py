@@ -28,12 +28,12 @@ from torch import nn
 import torch.distributed as dist
 
 import torch_npu
-import torchair as tng
 
-from executor.utils import npu_stream_switch, get_had_pow2
+from executor.utils import get_had_pow2
+from executor.utils.stream_utils import (
+    create_event, wait_tensor, npu_stream_switch,
+    record_event, record_stream, wait_event)
 from module.linear import ReplicatedLinear
-
-indexer_npu_events = [tng.ops.npu_create_tagged_event(tag=f"indexer_evt_{i}") for i in range(4)]
 
 
 class LayerNorm(nn.Module):
@@ -62,8 +62,12 @@ class GlmMoeDsaIndexer(nn.Module):
         self.cp_size = self.runner_settings.get("parallel_config").get("cp_size", 1)
 
         self.enable_multi_streams = runner_settings.get("model_config").get("enable_multi_streams", False)
-        self.enable_gegraph = runner_settings.get("exe_mode", "ge_graph") == "ge_graph"
-        self.enable_aclgraph = runner_settings.get("exe_mode", "ge_graph") == "acl_graph"
+        self.exe_mode = runner_settings.get("exe_mode", "ge_graph")
+        self.enable_gegraph = self.exe_mode == "ge_graph"
+        self.enable_npugraph_ex = self.exe_mode == "npugraph_ex"
+        self.indexer_stream = kwargs.get("indexer_stream", None)
+        self.weights_stream = kwargs.get("weights_stream", None)
+        self.indexer_events = tuple(create_event(self.exe_mode, self.enable_multi_streams) for _ in range(4))
         self.pa_block_size = self.runner_settings.get("model_config").get("pa_block_size", 128)
 
         self.dim: int = config.hidden_size
@@ -73,6 +77,7 @@ class GlmMoeDsaIndexer(nn.Module):
         self.rope_head_dim: int = config.qk_rope_head_dim
         self.index_topk: int = config.index_topk
         self.q_lora_rank: int = config.q_lora_rank
+        self.config = config
 
         self.li_cache_quant_mode = config.quant_config.li_cache_quant_mode \
             if config.quant_config is not None else "unquant"
@@ -90,7 +95,7 @@ class GlmMoeDsaIndexer(nn.Module):
         self.weights_proj = ReplicatedLinear(self.dim,
                                     self.n_heads,
                                     bias=False,
-                                    quant_config=config.quant_config,
+                                    quant_config=None,
                                     prefix=f"{prefix}.weights_proj")
         self.k_norm = LayerNorm(self.head_dim)
         self.softmax_scale = self.head_dim ** -0.5
@@ -140,6 +145,17 @@ class GlmMoeDsaIndexer(nn.Module):
         }
         return self.prefill_decode_ascendc(**input_args)
 
+    def apply_hadamard_quant(self, x, use_float16_scale=False):
+        bsz, seqlen, n_heads, _ = x.size()
+        x = self.apply_hadamard(x)
+        x = x.view(-1, self.head_dim)
+        if self.li_cache_quant_mode == "int8":
+            x, dequant_scale = torch_npu.npu_dynamic_quant(x)
+        elif "float8" in self.li_cache_quant_mode:
+            x, dequant_scale = torch_npu.npu_dynamic_block_quant(x, dst_type=torch.float8_e4m3fn)
+        dequant_scale = dequant_scale.type(torch.float16) if use_float16_scale else dequant_scale
+        return x.view(bsz, seqlen, n_heads, -1), dequant_scale.view(bsz, seqlen, n_heads, -1)
+
     def prefill_decode_ascendc(
         self,
         x: torch.Tensor,
@@ -168,26 +184,19 @@ class GlmMoeDsaIndexer(nn.Module):
         sin = sin.view(-1, 1, 1, self.rope_head_dim)
         enable_multi_streams = self.enable_multi_streams and not is_prefill
 
-        if enable_multi_streams and self.enable_aclgraph:
-            tng.ops.npu_record_tagged_stream(qr, "22")
-            tng.ops.npu_record_tagged_stream(query_states[0], "22")
-            tng.ops.npu_record_tagged_stream(cos, "22")
-            tng.ops.npu_record_tagged_stream(sin, "22")
-            tng.ops.npu_tagged_event_record(indexer_npu_events[0])
-        with npu_stream_switch(enable_multi_streams, "22"):
+        record_stream(enable_multi_streams, qr, self.indexer_stream, exe_mode=self.exe_mode)
+        record_stream(enable_multi_streams, cos, self.indexer_stream, exe_mode=self.exe_mode)
+        record_stream(enable_multi_streams, sin, self.indexer_stream, exe_mode=self.exe_mode)
+        record_event(enable_multi_streams, self.indexer_events, 0, exe_mode=self.exe_mode)
+        with npu_stream_switch(enable_multi_streams, self.indexer_stream, exe_mode=self.exe_mode):
             # prolog for kv use multi streams
-            if enable_multi_streams:
-                if self.enable_aclgraph:
-                    tng.ops.npu_tagged_event_wait(indexer_npu_events[0])
-                else:
-                    tng.scope.npu_wait_tensor(qr, query_states[0])
-            # q process in new stream
+            wait_event(enable_multi_streams, self.indexer_events, 0, exe_mode=self.exe_mode)
+            wait_tensor(enable_multi_streams, qr, query_states[0], exe_mode=self.exe_mode)
             q_b = self.wq_b(qr, c8_input_dict.get("pertoken_scale", None)) # [b,s,1536] @ [1536,64*128] = [b,s,64*128]
 
-            if enable_multi_streams and self.enable_aclgraph:
-                tng.ops.npu_record_tagged_stream(q_b, "33")
-                tng.ops.npu_record_tagged_stream(x, "33")
-                tng.ops.npu_tagged_event_record(indexer_npu_events[1])
+            record_stream(enable_multi_streams, q_b, self.weights_stream, exe_mode=self.exe_mode)
+            record_stream(enable_multi_streams, x, self.weights_stream, exe_mode=self.exe_mode)
+            record_event(enable_multi_streams, self.indexer_events, 1, exe_mode=self.exe_mode)
 
             q = q_b.view(bsz, seqlen, self.n_heads, self.head_dim)  # [b,s,64,128]
             q_pe, q_nope = torch.split(q, [self.rope_head_dim, \
@@ -197,17 +206,12 @@ class GlmMoeDsaIndexer(nn.Module):
             # [b,s,n,d]
             q_pe = torch_npu.npu_interleave_rope(q_pe, cos, sin).view(bsz, -1, self.n_heads, self.rope_head_dim)
             q = torch.cat([q_pe, q_nope], dim=-1)
-            if enable_multi_streams and self.enable_aclgraph:
-                tng.ops.npu_tagged_event_record(indexer_npu_events[2])
-        with npu_stream_switch(enable_multi_streams, "33"):
-            if enable_multi_streams:
-                if self.enable_aclgraph:
-                    tng.ops.npu_tagged_event_wait(indexer_npu_events[1])
-                else:
-                    tng.scope.npu_wait_tensor(x, q_b)
+            record_event(enable_multi_streams, self.indexer_events, 2, exe_mode=self.exe_mode)
+        with npu_stream_switch(enable_multi_streams, self.weights_stream, exe_mode=self.exe_mode):
+            wait_event(enable_multi_streams, self.indexer_events, 1, exe_mode=self.exe_mode)
+            wait_tensor(enable_multi_streams, x, q_b, exe_mode=self.exe_mode)
             weights = self.weights_proj(x.view(-1, self.dim))
-            if enable_multi_streams and self.enable_aclgraph:
-                tng.ops.npu_tagged_event_record(indexer_npu_events[3])
+            record_event(enable_multi_streams, self.indexer_events, 3, exe_mode=self.exe_mode)
 
         k_proj = self.wk(x)  # [b,s,7168] @ [7168,128] = [b,s,128]
         k = self.k_norm(k_proj)
@@ -219,19 +223,16 @@ class GlmMoeDsaIndexer(nn.Module):
         key_dequant_scale = None
         indexer_input = {}
 
-        if enable_multi_streams and self.enable_aclgraph:
-            tng.ops.npu_tagged_event_wait(indexer_npu_events[2])
-        if self.li_cache_quant_mode == "int8":
-            with npu_stream_switch(enable_multi_streams, "22"):
+        wait_event(enable_multi_streams, self.indexer_events, 2, exe_mode=self.exe_mode)
+        if self.li_cache_quant_mode != "unquant":
+            use_float16_scale = True if self.li_cache_quant_mode == "int8" else False
+            with npu_stream_switch(enable_multi_streams, self.indexer_stream, exe_mode=self.exe_mode):
                 # q quant
-                q = self.apply_hadamard(q)
-                q, query_dequant_scale = torch_npu.npu_dynamic_quant(q)
-                query_dequant_scale = query_dequant_scale.type(torch.float16)
+                q, query_dequant_scale = self.apply_hadamard_quant(q, use_float16_scale=use_float16_scale)
             # k quant
-            k = self.apply_hadamard(k)
-            k, key_dequant_scale = torch_npu.npu_dynamic_quant(k)
-            key_dequant_scale = key_dequant_scale.type(torch.float16)
+            k, key_dequant_scale = self.apply_hadamard_quant(k, use_float16_scale=use_float16_scale)
 
+        if self.li_cache_quant_mode != "unquant":
             if self.cp_size > 1 and is_prefill:
                 k_scale_all = key_dequant_scale.new_empty([bsz * seqlen * self.cp_size, key_dequant_scale.shape[-1]])
                 dist.all_gather_into_tensor(k_scale_all, key_dequant_scale.view(bsz * seqlen, -1), \
@@ -280,7 +281,8 @@ class GlmMoeDsaIndexer(nn.Module):
             else:
                 torch_npu.npu_scatter_nd_update_(past_key_states.view(-1, self.head_dim),
                                                 slot_mapping.view(-1, 1),
-                                                k.view(-1, k.shape[-1]))
+                                                k.view(-1, k.shape[-1])
+                                                )
 
         indexer_func = self.li_fusion
         indexer_input.update({"actual_seq_lengths_query": actual_seq_lengths_q,
@@ -290,8 +292,7 @@ class GlmMoeDsaIndexer(nn.Module):
                             "k_proj": k_proj,
                             "is_prefill": is_prefill,
                             })
-        if enable_multi_streams and self.enable_aclgraph:
-            tng.ops.npu_tagged_event_wait(indexer_npu_events[3])
+        wait_event(enable_multi_streams, self.indexer_events, 3, exe_mode=self.exe_mode)
         if self.cp_size > 1 and is_prefill:
             # [B, S, N, D] -> [T, N, D]
             x = x.flatten(0, 1).unsqueeze(0)
@@ -307,7 +308,7 @@ class GlmMoeDsaIndexer(nn.Module):
                 })
             indexer_input.update({"actual_seq_lengths_kv": prefill_extra_input_dict["kv_len_prev"],
                                     "actual_seq_lengths_query": prefill_extra_input_dict["actual_seq_q"]})
-            if self.li_cache_quant_mode == "int8":
+            if self.li_cache_quant_mode != "unquant":
                 indexer_input.update({"query_dequant_scale": c8_input_dict["query_dequant_scale_prev"]})
             topk_indices_prev = indexer_func(**indexer_input)
             indexer_input.update({
@@ -315,7 +316,7 @@ class GlmMoeDsaIndexer(nn.Module):
                 "weights": weights_next,
                 })
             indexer_input.update({"actual_seq_lengths_kv": prefill_extra_input_dict["kv_len_next"]})
-            if self.li_cache_quant_mode == "int8":
+            if self.li_cache_quant_mode != "unquant":
                 indexer_input.update({"query_dequant_scale": c8_input_dict["query_dequant_scale_next"]})
             topk_indices_next = indexer_func(**indexer_input)
             return (topk_indices_prev, topk_indices_next)
@@ -349,7 +350,7 @@ class GlmMoeDsaIndexer(nn.Module):
             "weights": weights,
             "layout_query": layout_query,
         }
-        if self.li_cache_quant_mode == "int8":
+        if self.li_cache_quant_mode != "unquant":
             key_dequant_scale = kwargs.get("key_dequant_scale", None)
             query_dequant_scale = kwargs.get("query_dequant_scale", None)
             li_input_kwargs.update({
@@ -357,7 +358,7 @@ class GlmMoeDsaIndexer(nn.Module):
                 "key_quant_mode": 0,
                 "query_dequant_scale": query_dequant_scale,
                 "query_quant_mode": 0,
-                "weights": weights.type(torch.float16),
+                "weights": weights.type(torch.float16) if self.li_cache_quant_mode == "int8" else weights,
             })
             return torch_npu.npu_quant_lightning_indexer(**li_input_kwargs)
         else:

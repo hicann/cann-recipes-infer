@@ -11,7 +11,7 @@
 
 操作系统：Linux ARM
 
-镜像版本：cann8.5_pt2.8.0_glm_aarch_image_v0.1.tar
+镜像版本：cann9.1_pt2.8.0_glm_aarch_image_v0.1.tar
 
 驱动版本：Ascend HDK 25.2.0
 > npu-smi info 检查Ascend NPU固件和驱动是否正确安装。如果已安装，通过命令`npu-smi info`确认版本是否为 25.2.0。如果未安装或者版本不是 25.2.0，请先下载[固件和驱动包](https://www.hiascend.com/hardware/firmware-drivers/community?product=7&model=33&cann=All&driver=Ascend+HDK+25.2.0)，然后根据[指导](https://hiascend.com/document/redirect/CannCommunityInstSoftware)自行安装。
@@ -40,7 +40,7 @@
   - 下载[GLM-5原始FP8权重](https://huggingface.co/zai-org/GLM-5-FP8)，并上传到Atlas A3各节点某个固定的路径下，比如`/data/models/GLM-5-FP8`。
 
 ### 获取 docker 镜像
-  从[ARM镜像地址](https://cann-ai.obs.cn-north-4.myhuaweicloud.com/cann-quantization/GLM/cann8.5_pt2.8.0_glm_aarch_image_v0.1.tar)中下载 docker 镜像，然后上传到A3服务器的每个节点上，并通过命令导入镜像 `docker load -i cann8.5_pt2.8.0_glm_aarch_image_v0.1.tar`。
+  从[ARM镜像地址](https://cann-ai.obs.cn-north-4.myhuaweicloud.com/cann-quantization/GLM/cann9.1_pt2.8.0_glm_aarch_image_v0.1.tar)中下载 docker 镜像，然后上传到A3服务器的每个节点上，并通过命令导入镜像 `docker load -i cann9.1_pt2.8.0_glm_aarch_image_v0.1.tar`。
 
 ### 拉起 docker 容器
 
@@ -69,7 +69,7 @@
       --net=host \
       --shm-size=128g \
       --privileged \
-      cann8.5_pt2.8.0_glm_aarch_image:v0.1 /bin/bash
+      cann9.1_pt2.8.0_glm_aarch_image:v0.1 /bin/bash
   ```
   在各个节点上通过如下命令进入容器：
   ```

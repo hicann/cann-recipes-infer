@@ -59,6 +59,7 @@ class GlmRunner(ModelRunner):
         self.batch_size_per_rank = runner_settings.get("data_config").get("batch_size_per_rank", 1)
         self.cp_size = self.runner_settings.get("parallel_config").get("cp_size", 1)
         self.use_dataset = runner_settings.get("data_config").get("dataset", "default") != "default"
+        self.platform_version = self.runner_settings.get("model_config").get("platform_version", "A3")
         self.prefill_cycles = 0
         self.query_id_list = []
         self.max_new_tokens = runner_settings.get("data_config").get("max_new_tokens", 32)
@@ -114,10 +115,28 @@ class GlmRunner(ModelRunner):
                 if smooth_scale_name in module_name:
                     scales_dtype['smooth_scale_dtype'] = torch.float
                     break
+            enable_weight_nz = self.enable_weight_nz
+            if self.platform_version == "950":
+                if any(
+                    attn_proj_name in module_name
+                    for attn_proj_name in ["q_a_proj", "q_b_proj", "kv_a_proj_with_mqa"]
+                ):
+                    enable_weight_nz = True
 
             if isinstance(quant_method, QuantizeMethodBase):
                 quant_method.process_weights_after_loading(
-                    module, is_nz=self.enable_weight_nz, scales_dtype=scales_dtype)
+                    module, is_nz=enable_weight_nz, scales_dtype=scales_dtype)
+
+            if self.platform_version == "950" and self.model.config.quant_config.mm_quant_mode == "w8a8mxfloat8":
+                if any(
+                    attn_proj_name in module_name
+                    for attn_proj_name in ["q_a_proj", "q_b_proj", "kv_a_proj_with_mqa"]
+                ):
+                    module.weight_scale = nn.Parameter(
+                        module.weight_scale.transpose(0, 1).flatten(1).view(dtype=torch.float8_e8m0fnu), 
+                        requires_grad=False
+                    )
+
             # Dynamic quant for input_avtivation of first grouped matmul requies complete smooth scale.
             # When applying expert parallel, each device only reserves smooth scales of mapping experts.
             # Need to do all gather to obtain complete smooth scale.
@@ -134,24 +153,24 @@ class GlmRunner(ModelRunner):
     @override
     def graph_compile(self):
         if not self.enable_cache_compile:
-            import torchair as tng
-            tng.patch_for_hcom()
-            from torchair.configs.compiler_config import CompilerConfig
+            torch._dynamo.config.inline_inbuilt_nn_modules = False
+            if self.execute_mode == "npugraph_ex":
+                compile_options = {
+                    "frozen_parameter": True,
+                    "static_kernel_compile": self.enable_static_kernel,
+                }
+                self.model.decode = torch.compile(self.model.decode, dynamic=False, fullgraph=True, 
+                                                backend="npugraph_ex", options=compile_options)
+            else:
+                import torchair as tng
+                from torchair.configs.compiler_config import CompilerConfig
 
-            compiler_config = CompilerConfig()
-            if self.execute_mode == "acl_graph":
-                compiler_config.mode = "reduce-overhead"
-                # TODO there is perfomance issue when setting clone_input=True, will be fixed in 2026 Q1.
-                # Need to remove the config once torch_npu released at that time.
-                if hasattr(compiler_config.debug.aclgraph, "clone_input"):
-                    compiler_config.debug.aclgraph.clone_input = False
-                if self.enable_static_kernel:
-                    compiler_config.experimental_config.aclgraph._aclnn_static_shape_kernel = True
-            compiler_config.experimental_config.frozen_parameter = True
-            compiler_config.experimental_config.tiling_schedule_optimize = True
-            compiler_config.experimental_config.topology_sorting_strategy = "StableRDFS"
-            npu_backend = tng.get_npu_backend(compiler_config=compiler_config)
-            self.model.decode = torch.compile(self.model.decode, dynamic=False, fullgraph=True, backend=npu_backend)
+                compiler_config = CompilerConfig()
+                compiler_config.experimental_config.frozen_parameter = True
+                compiler_config.experimental_config.tiling_schedule_optimize = True
+                compiler_config.experimental_config.topology_sorting_strategy = "StableRDFS"
+                npu_backend = tng.get_npu_backend(compiler_config=compiler_config)
+                self.model.decode = torch.compile(self.model.decode, dynamic=False, fullgraph=True, backend=npu_backend)
 
     @override
     def init_splited_kv_b_weight(self):

@@ -88,7 +88,7 @@ class MxFp8Config(QuantizationConfig):
         quant_method = cls.get_from_keys(config, ["quant_method"])
         is_checkpoint_mxfp8_serialized = ("mxfp8" in quant_method)
         activation_scheme = cls.get_from_keys(config, ["activation_scheme"])
-        ignored_layers = cls.get_from_keys_or(config, ["ignored_layers"], None)
+        ignored_layers = cls.get_from_keys_or(config, ["ignored_layers", "modules_to_not_convert"], None)
         quant_config_instance = cls(
             is_checkpoint_mxfp8_serialized=is_checkpoint_mxfp8_serialized,
             activation_scheme=activation_scheme,

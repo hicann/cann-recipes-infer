@@ -1,10 +1,10 @@
 model_name: "GLM-5"
 model_path: "/data/models/GLM-5-W8A8"
 exe_mode: "ge_graph"          # ["ge_graph", "eager", "npugraph_ex"], mode of decode
-world_size: 64                # world_size = 2 * chip_num in A3
+world_size: 16               # world_size = 2 * chip_num in A3
 
 model_config:
-  next_n: 3
+  next_n: 0
   pa_block_size: 128
   enable_weight_nz: True
   with_ckpt: True                   # [False, True]
@@ -17,15 +17,15 @@ model_config:
 
 data_config:
   dataset: InfiniteBench
-  input_max_len: 65536
+  input_max_len: 8192
   max_new_tokens: 256
-  batch_size: 64
+  batch_size: 16
 
 parallel_config:
-  cp_size: 64                 # only active at prefill stage
-  oproj_tp_size: 1
+  cp_size: 16                 # only active at prefill stage
+  oproj_tp_size: 8
   attn_tp_size: 1
-  dense_tp_size: 1
+  dense_tp_size: 4
   moe_tp_size: 1
   embed_tp_size: 16
   lmhead_tp_size: 16

@@ -26,6 +26,11 @@ import numpy as np
 import torch
 from safetensors.torch import load_file, save_file
 from tqdm import tqdm
+from mx_quantize import quantize_mx, pack_uint4, unpack_uint4, f4_unpacked_to_f32, f32_to_f4_unpacked
+
+
+NUM_BITS_4 = 4
+NUM_BITS_8 = 8
 
 
 def get_had_pow2(n, norm=True):
@@ -44,7 +49,8 @@ def get_had_pow2(n, norm=True):
     return had
 
 
-def weight_dequant(weight: torch.Tensor, scale: torch.Tensor, block_size: int = 128) -> torch.Tensor:
+def weight_dequant(weight: torch.Tensor, scale: torch.Tensor, 
+                   block_size: int = 128, is_mx: bool = False) -> torch.Tensor:
     """
     Dequantizes the given weight tensor using the provided scale tensor, efficiently handling cases where
     `weight` is not a multiple of `block_size` by broadcasting `scale`.
@@ -63,20 +69,22 @@ def weight_dequant(weight: torch.Tensor, scale: torch.Tensor, block_size: int = 
 
     # Get the original dimensions of weight
     M, N = weight.shape
-
-    # Compute the effective block dimensions for scale
-    scale_m, scale_n = scale.shape
-    assert scale_m == (
-        M + block_size - 1) // block_size, "Mismatch in scale rows and weight rows."
-    assert scale_n == (
-        N + block_size - 1) // block_size, "Mismatch in scale columns and weight columns."
-
-    # Convert weight to float32 for calculations
     weight = weight.to(torch.float32)
+    scale = scale.to(torch.float32)
 
-    # Expand scale to match the weight tensor's shape
-    scale_expanded = scale.repeat_interleave(
-        block_size, dim=0).repeat_interleave(block_size, dim=1)
+    if is_mx:
+        scale_expanded = scale.repeat_interleave(block_size, dim=1)
+    else:
+        # Compute the effective block dimensions for scale
+        scale_m, scale_n = scale.shape
+        assert scale_m == (
+            M + block_size - 1) // block_size, "Mismatch in scale rows and weight rows."
+        assert scale_n == (
+            N + block_size - 1) // block_size, "Mismatch in scale columns and weight columns."
+
+        # Expand scale to match the weight tensor's shape
+        scale_expanded = scale.repeat_interleave(
+            block_size, dim=0).repeat_interleave(block_size, dim=1)
 
     # Trim scale_expanded to match weight's shape if necessary
     scale_expanded = scale_expanded[:M, :N]
@@ -88,6 +96,24 @@ def weight_dequant(weight: torch.Tensor, scale: torch.Tensor, block_size: int = 
     dequantized_weight = dequantized_weight.to(torch.get_default_dtype())
 
     return dequantized_weight
+
+
+def unpack_mxfloat4_to_fp32(packed_tensor):
+    e2m1_values = torch.tensor([
+        0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+        -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0
+    ], dtype=torch.float32, device=packed_tensor.device)
+
+    low_4bits = packed_tensor & 0x0F
+    high_4bits = (packed_tensor // 16) & 0x0F
+
+    unpacked = torch.stack([low_4bits, high_4bits], dim=-1)
+
+    fp32_tensor = e2m1_values[unpacked.long()]
+    new_shape = list(packed_tensor.shape)
+    new_shape[-1] = new_shape[-1] * 2
+
+    return fp32_tensor.view(*new_shape)
 
 
 def scale_fp32_to_u64(weight_scale):
@@ -134,7 +160,7 @@ def int_weight_quant(tensor: torch.Tensor, bits=8, weight_clip_factor=None):
     assert scale.shape == (tensor.shape[0], 1)
     quantized = torch.round(tensor / scale)
     quantized = torch.clamp(quantized, -qmax, qmax)
-    if bits == 4:
+    if bits == 4:   # not mxquant
         # pack 4bit for W4A8 MoEGMM
         quantized = quantized.to(torch.int8)
         bias = int4_assistance_bias(quantized, scale)
@@ -165,17 +191,19 @@ def is_match_layer_name(weight_name, layer_names):
     return is_match_weight_name
 
 
-def generate_ignore_item(num_layers, num_hidden_layers, first_k_dense_replace):
+def generate_ignore_item(num_layers, num_hidden_layers, first_k_dense_replace, is_mx=False):
     """
     Generate a list of layer names to be ignored during quantization.
     """
     ignore = []
     for i in range(0, num_layers):
-        ignore.append(f'model.layers.{i}.self_attn.indexer.wk')
+        if not is_mx:
+            ignore.append(f'model.layers.{i}.self_attn.indexer.wk')
         ignore.append(f'model.layers.{i}.self_attn.indexer.weights_proj')
+        if not is_mx:
+            ignore.append(f'model.layers.{i}.self_attn.kv_a_proj_with_mqa')
+            ignore.append(f'model.layers.{i}.self_attn.q_a_proj')
         ignore.append(f'model.layers.{i}.self_attn.kv_b_proj')
-        ignore.append(f'model.layers.{i}.self_attn.kv_a_proj_with_mqa')
-        ignore.append(f'model.layers.{i}.self_attn.q_a_proj')
         if i >= first_k_dense_replace:
             ignore.append(f'model.layers.{i}.mlp.gate')
         if i >= num_hidden_layers:
@@ -193,51 +221,55 @@ def generate_w4a8_quant(num_layers, first_k_dense_replace):
     return quant_w4a8_layers
 
 
-def generate_quant_group(a_num_bits=8, w_num_bits=8, targets=None, activation_use_clip=False):
+def generate_quant_group(a_num_bits=8, w_num_bits=8, targets=None, activation_use_clip=False, qtype="float"):
     quant_group = {"input_activations": {"actorder": None, "block_structure": None, "dynamic": True,
                                          "group_size": None, "num_bits": a_num_bits,
                                          "observer": "memoryless", "observer_kwargs": {},
-                                         "strategy": "token", "symmetric": True, "type": "int"},
+                                         "strategy": "token", "symmetric": True, "type": qtype},
                    "activation_use_clip": activation_use_clip,
                    "output_activations": None,
                    "targets": targets,
                    "weights": {"actorder": None, "block_structure": None, "dynamic": False,
                                "group_size": None, "num_bits": w_num_bits,
                                "observer": "minmax", "observer_kwargs": {},
-                               "strategy": "channel", "symmetric": True, "type": "int"}}
+                               "strategy": "channel", "symmetric": True, "type": qtype}}
     return quant_group
 
 
-def generate_quant_config(c8, ignores, w4a8=False, clip=False):
+def generate_quant_config(c8, ignores, w4a8=False, clip=False, is_mx=False):
     """
     Generate a quantization configuration dictionary based on the specified parameters.
     """
-    kv_cache_scheme = {"num_bits": 8,
-                       "type": 'int',
+    kv_cache_scheme = {"num_bits": NUM_BITS_8,
+                       "type": 'float' if is_mx else "int",
                        "strategy": 'group',
                        "group_size": 128,
                        "dynamic": 'true',
-                       "symmetric": 'true'} if c8 else None
+                       "symmetric": 'true'} if c8 or is_mx else None
     config_groups = {"group_0": {}}
     if w4a8:
         config_groups.update({"group_1": {}})
     quant_config = {"config_groups": config_groups,
-                    "format": "int-quantized",
+                    "format": "float-quantized" if is_mx else "int-quantized",
                     "global_compression_ratio": 1,
                     "ignore": ignores,
                     "kv_cache_scheme": kv_cache_scheme,
                     "li_cache_scheme": {
-                        "type": "int",
-                        "num_bits": 8,
+                        "type": 'float' if is_mx else "int",
+                        "num_bits": NUM_BITS_8,
                     },
-                    "quant_method": "compressed-tensors",
+                    "quant_method": "mxfp8" if is_mx and not w4a8 else "compressed-tensors",
                     "quantization_status": "compressed"}
-    targets = ["Linear"]
+    if is_mx:
+        quant_config["activation_scheme"] = "dynamic"
+    qtype = "float" if is_mx else "int"
     quant_config["config_groups"]["group_0"] = generate_quant_group(
-        a_num_bits=8, w_num_bits=8, targets=targets)
+        a_num_bits=NUM_BITS_8, w_num_bits=NUM_BITS_8, targets=["Linear"], qtype=qtype)
     if w4a8:
         quant_config["config_groups"]["group_1"] = generate_quant_group(
-            a_num_bits=8, w_num_bits=4, targets=["MoEGMM"], activation_use_clip=clip)
+            a_num_bits=NUM_BITS_8, w_num_bits=NUM_BITS_4, targets=["MoEGMM"], activation_use_clip=clip, qtype=qtype)
+    if is_mx:
+        quant_config["weight_block_size"] = [1, 32]
     return quant_config
 
 
@@ -312,6 +344,34 @@ def load_clip_params(num_hidden_layers, num_nextn_predict_layers, clip_param_pat
     return kv_clip_params, act_clip_params, weight_clip_params
 
 
+def generate_quant_layers(num_layers, num_experts, first_k_dense_replace=0, w4a8=False, is_mx=False):
+    quant_layers = {}
+    moe_bit = NUM_BITS_4 if w4a8 else NUM_BITS_8
+    se_bit = NUM_BITS_8
+    attn_bit = NUM_BITS_8
+    mlp_linears = ["gate_proj", "down_proj", "up_proj"]
+    for i in range(num_layers):
+        if i >= first_k_dense_replace:
+            for j in range(num_experts):
+                for n in mlp_linears:
+                    quant_layers[f"model.layers.{i}.mlp.experts.{j}.{n}"] = moe_bit
+            for n in mlp_linears:
+                quant_layers[f"model.layers.{i}.mlp.shared_experts.{n}"] = se_bit
+        else:
+            for n in mlp_linears:
+                quant_layers[f"model.layers.{i}.mlp.{n}"] = se_bit
+        if is_mx:
+            quant_layers[f"model.layers.{i}.self_attn.q_a_proj"] = attn_bit
+            quant_layers[f"model.layers.{i}.self_attn.kv_a_proj_with_mqa"] = attn_bit
+        quant_layers[f"model.layers.{i}.self_attn.o_proj"] = attn_bit
+        quant_layers[f"model.layers.{i}.self_attn.q_b_proj"] = attn_bit
+        quant_layers[f"model.layers.{i}.self_attn.indexer.wq_b"] = attn_bit
+        if is_mx:
+            quant_layers[f"model.layers.{i}.self_attn.indexer.wk"] = attn_bit
+
+    return quant_layers
+
+
 def main(fp8_path, output_path, quant_type, clip=False, quant_param_path=None):
     """
     Converts FP8 weights to BF16 and saves the converted weights.
@@ -340,15 +400,13 @@ def main(fp8_path, output_path, quant_type, clip=False, quant_param_path=None):
     torch.set_default_dtype(torch.bfloat16)
     os.makedirs(output_path, exist_ok=True)
     assert quant_type in [
-        "bfloat16", "w8a8c16", "w8a8c8", "w4a8c16", "w4a8c8"], f"Unsupported quant_type: {quant_type}"
+        "bfloat16", "w8a8c16", "w8a8c8", "w4a8c16", "w4a8c8", "w8a8-mx"], f"Unsupported quant_type: {quant_type}"
     model_index_file = os.path.join(fp8_path, "model.safetensors.index.json")
     config_file = os.path.join(fp8_path, 'config.json')
     with open(model_index_file, "r") as f:
         model_index = json.load(f)
     with open(config_file, "r") as f:
         config = json.load(f)
-    if 'quantization_config' in config:
-        config.pop('quantization_config')
 
     weight_map = model_index["weight_map"]
     new_weight_map = {}
@@ -356,21 +414,24 @@ def main(fp8_path, output_path, quant_type, clip=False, quant_param_path=None):
     num_nextn_predict_layers = config['num_nextn_predict_layers']
     first_k_dense_replace = config['first_k_dense_replace']
     num_layers = num_hidden_layers + num_nextn_predict_layers
+    num_experts = config['n_routed_experts']
     quant_ignore_layers = []
     quant_w4a8_layers = []
     c8 = quant_type.endswith('c8')
     w4a8 = quant_type.startswith("w4a8")
     w8a8 = quant_type.startswith("w8a8")
+    is_mx = quant_type.endswith('mx')
     if w8a8 or w4a8:
         quant_ignore_layers = generate_ignore_item(
-            num_layers, num_hidden_layers, first_k_dense_replace)
+            num_layers, num_hidden_layers, first_k_dense_replace, is_mx=is_mx)
         quantization_config = generate_quant_config(
-            c8, quant_ignore_layers, w4a8=w4a8, clip=clip)
+            c8, quant_ignore_layers, w4a8=w4a8, clip=clip, is_mx=is_mx)
         config['quantization_config'] = quantization_config
 
-    if w4a8:
-        quant_w4a8_layers = generate_w4a8_quant(
-            num_layers, first_k_dense_replace)
+    quant_layers = generate_quant_layers(num_layers, num_experts,
+        first_k_dense_replace=first_k_dense_replace, 
+        w4a8=w4a8, is_mx=is_mx
+    )
 
     # Cache for loaded safetensor files
     loaded_files = {}
@@ -418,53 +479,47 @@ def main(fp8_path, output_path, quant_type, clip=False, quant_param_path=None):
                 try:
                     # Get scale_inv from the correct file
                     scale_inv = get_tensor(scale_inv_name)
-                    bf16_weight = weight_dequant(weight, scale_inv)
-                    if w8a8 or w4a8:
-                        is_ignore_layer = is_match_layer_name(
-                            weight_name, quant_ignore_layers)
-                        if is_ignore_layer:
-                            print(f'Ignore quantization {weight_name}')
-                        if not is_ignore_layer:
-                            if clip:
-                                weight_clip_name = weight_name.replace(
-                                    "weight", "w_alpha")
-                                weight_clip_factor = weight_clip_params.get(
-                                    weight_clip_name, None)
-                            else:
-                                weight_clip_factor = None
-                            bits = 8
-                            if is_match_layer_name(weight_name, quant_w4a8_layers):
-                                bits = 4
-                            int_weight, scale_inv, bias = int_weight_quant(
-                                bf16_weight, bits=bits, weight_clip_factor=weight_clip_factor)
-                            new_scale_name = scale_inv_name.replace(
-                                '_scale_inv', '_scale')
-
-                            new_state_dict[weight_name] = int_weight
-                            new_state_dict[new_scale_name] = scale_inv
-
-                            new_weight_map[weight_name] = file_name
-                            new_weight_map[new_scale_name] = file_name
-
-                            if w4a8 and bias is not None:
-                                bias_name = weight_name.replace(
-                                    '.weight', '.bias')
-                                new_state_dict[bias_name] = bias
-                                new_weight_map[bias_name] = file_name
-                        else:
-                            new_state_dict[weight_name] = bf16_weight
-                            new_weight_map[weight_name] = file_name
+                    if weight.dtype == torch.int8:
+                        weight = unpack_mxfloat4_to_fp32(weight.view(torch.uint8))
+                        weight = weight_dequant(weight, scale_inv, block_size=32, is_mx=True)
                     else:
-                        new_state_dict[weight_name] = bf16_weight
-                        new_weight_map[weight_name] = file_name
+                        weight = weight_dequant(weight, scale_inv)
                 except KeyError:
                     print(
                         f"Warning: Missing scale_inv tensor for {weight_name}, skipping conversion")
-                    new_state_dict[weight_name] = weight
-                    new_weight_map[weight_name] = file_name
+                new_state_dict[weight_name] = weight
+                new_weight_map[weight_name] = file_name
             else:
                 new_state_dict[weight_name] = weight
                 new_weight_map[weight_name] = file_name
+            
+            if w4a8 or w8a8:
+                new_weight_name = weight_name.rsplit(".", 1)[0]
+                if new_weight_name in list(quant_layers.keys()):
+                    if clip:
+                        weight_clip_name = weight_name.replace(
+                            "weight", "w_alpha")
+                        weight_clip_factor = weight_clip_params.get(
+                            weight_clip_name, None)
+                    else:
+                        weight_clip_factor = None
+
+                    bit = quant_layers[new_weight_name]
+                    if is_mx:
+                        quant_weight, scale_inv = quantize_mx(weight, bit, real_quant=True)
+                        if bit == NUM_BITS_4:
+                            quant_weight = f32_to_f4_unpacked(quant_weight.float())
+                            quant_weight = pack_uint4(quant_weight)
+                    else:
+                        quant_weight, scale_inv, bias = \
+                            int_weight_quant(weight, bits=bit, weight_clip_factor=weight_clip_factor)
+                    new_scale_name = weight_name.replace('.weight', '.weight_scale')
+
+                    new_state_dict[weight_name] = quant_weight
+                    new_state_dict[new_scale_name] = scale_inv
+
+                    new_weight_map[weight_name] = file_name
+                    new_weight_map[new_scale_name] = file_name
 
         new_safetensor_file = os.path.join(output_path, file_name)
         save_file(new_state_dict, new_safetensor_file,
@@ -524,7 +579,7 @@ if __name__ == "__main__":
     parser.add_argument("--input_fp8_hf_path", type=str, required=True)
     parser.add_argument("--output_hf_path", type=str, required=True)
     parser.add_argument("--quant_type", type=str, default="bfloat16",
-                        choices=["bfloat16", "w8a8c16", "w8a8c8", "w4a8c16", "w4a8c8"])
+                        choices=["bfloat16", "w8a8c16", "w8a8c8", "w4a8c16", "w4a8c8", "w8a8-mx"])
     parser.add_argument("--clip", action='store_true')
     parser.add_argument("--quant_param_path", type=str, default=None)
     args = parser.parse_args()

@@ -35,11 +35,14 @@ from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import logging
 
 from executor.utils import (
-    override, get_init_attn_mask, align_up, calc_moe_hccl_buffer_size,
-    init_comm_group, get_default_group, get_decode_mask)
+    override, weight_dequant, calc_moe_hccl_buffer_size,
+    init_comm_group, get_default_group)
 
 from executor.model_loader.weight_utils import default_weight_loader
-from executor.utils import npu_stream_switch, superkernel_scope
+from executor.utils import superkernel_scope
+from executor.utils.stream_utils import (
+    create_event, create_stream, npu_stream_switch,
+    record_event, record_stream, wait_event)
 from module.linear import (
     ColumnParallelLinear,
     ReplicatedLinear,
@@ -48,18 +51,67 @@ from module.linear import (
     VocabParallelEmbedding
     )
 from module.fuse_moe_gmm import FusedMoEGMM
+from module.quantization.mxfp8 import reshape_mx_scale
 from .configuration_glm import GlmMoeDsaConfig
 from .modules import one_hot, DeepseekV3RMSNorm, apply_rotary_pos_emb, _init_rope
 from .indexer import GlmMoeDsaIndexer
 from .offload_cache import OffloadCache
 
 logger = logging.get_logger(__name__)
-moe_npu_events = [tng.ops.npu_create_tagged_event(tag=f"moe_evt_{i}") for i in range(2)]
 
 
-class GlmMoeDsaMLP(nn.Module):
+class GlmFFN(nn.Module):
     def __init__(self, config, runner_settings, prefix, **kwargs):
         super().__init__()
+        self.runner_settings = runner_settings
+        self.platform_version = self.runner_settings.get("model_config").get("platform_version", "A3")
+        self.mm_quant_mode = (
+            config.quant_config.mm_quant_mode
+            if config.quant_config is not None
+            else "w16a16")
+        self.ffn_mode = {
+            "w8a8int8": self.forward_w8a8int8,
+            "w8a8mxfloat8": self.forward_w8a8mxfloat8,
+            "w8a8float8": self.forward_w8a8float8,
+        }
+        self.ffn_forward = self.ffn_mode[self.mm_quant_mode] if "w8a8" in self.mm_quant_mode else self.forward_normal
+
+    def forward_normal(self, x):
+        merged_x = self.gate_up_proj(x)
+        intermediate_hidden_states = torch_npu.npu_swiglu(merged_x)
+        return self.down_proj(intermediate_hidden_states)
+
+    def forward_w8a8int8(self, x):
+        merged_x, pertoken_scale = self.gate_up_proj(x, out_dtype=torch.int32)
+        intermediate_hidden_states, pertoken_scale = torch_npu.npu_dequant_swiglu_quant(
+            merged_x, weight_scale=self.gate_up_proj.weight_scale,
+            quant_scale=self.down_proj.smooth_scales,
+            quant_mode=1, activate_left=True,
+            activation_scale=pertoken_scale
+        )
+        return self.down_proj(intermediate_hidden_states, pertoken_scale)
+
+    def forward_w8a8float8(self, x):
+        merged_x = self.gate_up_proj(x)
+        intermediate_hidden_states = torch_npu.npu_swiglu(merged_x)
+        intermediate_hidden_states, pertoken_scale = torch_npu.npu_dynamic_block_quant(
+            intermediate_hidden_states, dst_type=torch.float8_e4m3fn)
+        return self.down_proj(intermediate_hidden_states, pertoken_scale)
+
+    def forward_w8a8mxfloat8(self, x):
+        merged_x = self.gate_up_proj(x)
+        intermediate_hidden_states, pertoken_scale = torch_npu.npu_swiglu_mx_quant(
+                merged_x,
+                group_index=None,
+                dst_type=torch_npu.float8_e4m3fn,
+                activate_left=True
+            )
+        return self.down_proj(intermediate_hidden_states, pertoken_scale)
+
+
+class GlmMoeDsaMLP(GlmFFN):
+    def __init__(self, config, runner_settings, prefix, **kwargs):
+        super().__init__(config, runner_settings, prefix, **kwargs)
         self.runner_settings = runner_settings
         self.mm_quant_mode = (
             config.quant_config.mm_quant_mode
@@ -89,7 +141,7 @@ class GlmMoeDsaMLP(nn.Module):
             quant_config=config.quant_config,
             prefix=f"{prefix}.down_proj")
 
-    def forward(self, x, is_prefill=False):
+    def forward(self, x):
         # input_DP + attention_TP + moe_EP
         if self.dense_tp_size > 1 and self.moe_ep_size > 1:
             bsz, q_len, _ = x.size()
@@ -98,10 +150,7 @@ class GlmMoeDsaMLP(nn.Module):
             dist.all_gather_into_tensor(x_output, x, group=self.hccl_comm_dict.get("dense_tp_group", None))
             x = x_output
 
-        if self.mm_quant_mode == "w8a8int8":
-            down_proj = self.forward_w8a8int8(x)
-        else:
-            down_proj = self.forward_normal(x)
+        down_proj = self.ffn_forward(x)
 
         if self.dense_tp_size > 1 and self.moe_ep_size > 1:
             mlp_res = down_proj.new_empty(bsz, q_len, down_proj.shape[-1])
@@ -112,32 +161,16 @@ class GlmMoeDsaMLP(nn.Module):
 
         return down_proj
 
-    def forward_normal(self, x):
-        merged_x = self.gate_up_proj(x)
-        intermediate_hidden_states = torch_npu.npu_swiglu(merged_x)
-        return self.down_proj(intermediate_hidden_states)
 
-    def forward_w8a8int8(self, x):
-        merged_x, pertoken_scale = self.gate_up_proj(x, out_dtype=torch.int32)
-        intermediate_hidden_states, pertoken_scale = torch_npu.npu_dequant_swiglu_quant(
-            merged_x, weight_scale=self.gate_up_proj.weight_scale,
-            quant_scale=self.down_proj.smooth_scales,
-            quant_mode=1, activate_left=True,
-            activation_scale=pertoken_scale
-        )
-        return self.down_proj(intermediate_hidden_states, pertoken_scale)
-
-
-class GlmMoeDsaSharedExpert(nn.Module):
+class GlmMoeDsaSharedExpert(GlmFFN):
     def __init__(self, config, runner_settings, is_moe_layer=False, prefix="", **kwargs):
-        super().__init__()
+        super().__init__(config, runner_settings, prefix, **kwargs)
         self.runner_settings = runner_settings
         self.mm_quant_mode = (
             config.quant_config.mm_quant_mode
             if config.quant_config is not None
             else "w16a16")
         self.moe_tp_size = self.runner_settings.get("parallel_config").get("moe_tp_size", 1)
-        self.moe_ep_size = self.runner_settings.get("parallel_config").get("moe_ep_size", 1)
         self.config = config
         self.hidden_size = config.hidden_size
         self.is_moe_layer = is_moe_layer
@@ -158,29 +191,10 @@ class GlmMoeDsaSharedExpert(nn.Module):
             tp_rank=dist.get_rank(self.hccl_comm_dict["moe_tp_group"]) if self.moe_tp_size > 1 else 0,
             quant_config=config.quant_config,
             prefix=f"{prefix}.down_proj")
-        if self.mm_quant_mode == "w8a8int8":
-            self.down_proj_forward = self.forward_w8a8int8
-        else:
-            self.down_proj_forward = self.forward_normal
 
     def forward(self, x):
-        down_proj = self.down_proj_forward(x)
+        down_proj = self.ffn_forward(x)
         return down_proj
-
-    def forward_normal(self, x):
-        merged_x = self.gate_up_proj(x)
-        intermediate_hidden_states = torch_npu.npu_swiglu(merged_x)
-        return self.down_proj(intermediate_hidden_states)
-
-    def forward_w8a8int8(self, x):
-        merged_x, pertoken_scale = self.gate_up_proj(x, out_dtype=torch.int32)
-        intermediate_hidden_states, pertoken_scale = torch_npu.npu_dequant_swiglu_quant(
-            merged_x, weight_scale=self.gate_up_proj.weight_scale,
-            quant_scale=self.down_proj.smooth_scales,
-            quant_mode=1, activate_left=True,
-            activation_scale=pertoken_scale
-        )
-        return self.down_proj(intermediate_hidden_states, pertoken_scale)
 
 
 class GlmMoeDsaMoE(nn.Module):
@@ -201,10 +215,13 @@ class GlmMoeDsaMoE(nn.Module):
         self.intermediate_size = config.moe_intermediate_size
         self.moe_tp_size = self.runner_settings.get("parallel_config").get("moe_tp_size", 1)
         self.moe_ep_size = self.runner_settings.get("parallel_config").get("moe_ep_size", 1)
+        self.platform_version = self.runner_settings.get("model_config").get("platform_version", "A3")
         self.exe_mode = self.runner_settings.get("exe_mode", "eager")
         self.enable_multi_streams = runner_settings.get("model_config").get("enable_multi_streams", False)
-        self.enable_aclgraph = runner_settings.get("exe_mode", "ge_graph") == "acl_graph"
+        self.enable_npugraph_ex = runner_settings.get("exe_mode", "ge_graph") == "npugraph_ex"
         self.perfect_eplb = self.runner_settings.get("model_config").get("perfect_eplb", False)
+        self.shared_expert_stream = kwargs.get("shared_expert_stream", None)
+        self.npu_events = tuple(create_event(self.exe_mode, self.enable_multi_streams) for i in range(2))
         self.num_experts_per_tok = config.num_experts_per_tok
         # total experts num
         self.num_experts = config.n_routed_experts
@@ -234,9 +251,16 @@ class GlmMoeDsaMoE(nn.Module):
         if config.n_shared_experts is not None:
             self.shared_experts = GlmMoeDsaSharedExpert(config, self.runner_settings,
                                         is_moe_layer=True, prefix=f"{prefix}.shared_experts", **kwargs)
+        self.gmm_int_quant = "a8" in self.gmm_quant_mode and "float" not in self.gmm_quant_mode
 
         self.dispatch_kwargs = None
         self.combine_kwargs = None
+        self.dispatch_quant_mode = {
+            "w16a16": 0,
+            "w8a8int8": 2,
+            "w8a8float8": 3,
+            "w8a8mxfloat8": 4,
+        }
 
     def _init_gate(self, prefix):
         self.top_k = self.config.num_experts_per_tok
@@ -271,8 +295,8 @@ class GlmMoeDsaMoE(nn.Module):
         hidden_states = hidden_states.view(-1, h)
         logits = self.gate(hidden_states)
 
-        # use fused kernel, currently only support 256 or 384 experts
-        if self.topk_method == "noaux_tc" and self.n_routed_experts in [256, 384]:
+        # use fused kernel
+        if self.topk_method == "noaux_tc":
             topk_weight, topk_idx, _ = torch_npu.npu_moe_gating_top_k(
                 logits,
                 k=self.top_k,
@@ -364,22 +388,28 @@ class GlmMoeDsaMoE(nn.Module):
     def set_mc2_kwargs(self):
         global_rank = dist.get_rank()
         mc2_group_name = self.hccl_comm_dict.get("moe_ep_group_mc2_name", None)
+        if self.gmm_quant_mode not in self.dispatch_quant_mode:
+            quant_mode = self.dispatch_quant_mode["w16a16"]
+        else:
+            quant_mode = self.dispatch_quant_mode[self.gmm_quant_mode]
+        enable_smooth_scale = quant_mode == self.dispatch_quant_mode["w8a8int8"]
         self.dispatch_kwargs = {
                 "x_active_mask": None,
                 "expert_shard_type": 0,
                 "shared_expert_rank_num": self.shared_expert_rank_num,
                 "moe_expert_num": self.n_routed_experts,
                 "global_bs": 0,
-                "scales": self.experts.smooth_scale_1 if "a8" in self.gmm_quant_mode else None,
-                "quant_mode": 2 if "a8" in self.gmm_quant_mode else 0,
+                "scales": self.experts.smooth_scale_1 if enable_smooth_scale else None,
+                "quant_mode": quant_mode,
                 "group_ep": mc2_group_name,
                 "ep_world_size": self.moe_ep_size,
                 "ep_rank_id": global_rank // self.moe_tp_size,
                 "group_tp": mc2_group_name,
                 "tp_world_size": self.moe_tp_size,
                 "tp_rank_id": global_rank % self.moe_tp_size,
-                "comm_alg": "fullmesh_v2",
             }
+        if quant_mode in (self.dispatch_quant_mode["w8a8float8"], self.dispatch_quant_mode["w8a8mxfloat8"]):
+            self.dispatch_kwargs['y_dtype'] = torch.float8_e4m3fn
         self.combine_kwargs = {
                 "x_active_mask": None,
                 "expert_shard_type": 0,
@@ -393,8 +423,14 @@ class GlmMoeDsaMoE(nn.Module):
                 "tp_world_size": self.moe_tp_size,
                 "tp_rank_id": global_rank % self.moe_tp_size
             }
+        if self.platform_version != "950":
+            self.dispatch_kwargs["comm_alg"] = "fullmesh_v2"
 
     def forward(self, hidden_states, is_prefill=False, cur_topk_list=None):
+        if self.n_shared_experts > 0:
+            hidden_states_share = self.forward_shared_expert(hidden_states, self.shared_expert_stream)
+        else:
+            hidden_states_share = None
         topk_idx, topk_weight, _ = self._forward_gate(hidden_states.float())
         if self.perfect_eplb:
             topk_idx = cur_topk_list
@@ -402,23 +438,6 @@ class GlmMoeDsaMoE(nn.Module):
         # we convert 2d to 3d, and then 3d back to 2d to adapte fusion pass rule
         hidden_states_3d = hidden_states.unsqueeze(1)
         hidden_states = hidden_states_3d.squeeze(1)
-
-        if self.n_shared_experts > 0:
-            enable_multi_streams = self.enable_multi_streams and not is_prefill
-            use_aclgraph_event = enable_multi_streams and self.enable_aclgraph
-            if use_aclgraph_event:
-                tng.ops.npu_record_tagged_stream(hidden_states, "11")
-                tng.ops.npu_tagged_event_record(moe_npu_events[0])
-            with npu_stream_switch(enable_multi_streams, "11"):
-                if use_aclgraph_event:
-                    tng.ops.npu_tagged_event_wait(moe_npu_events[0])
-                # shared_expert use multi streams
-                hidden_states_share = self.shared_experts(hidden_states.view(-1, hidden_states.shape[-1]))
-                if use_aclgraph_event:
-                    tng.ops.npu_tagged_event_record(moe_npu_events[1])
-        else:
-            use_aclgraph_event = False
-            hidden_states_share = None
 
         if self.moe_tp_size > 1:
             # MOE TP
@@ -430,34 +449,14 @@ class GlmMoeDsaMoE(nn.Module):
             else:
                 return self.moe_infer_dispatch_combine(hidden_states, topk_idx, topk_weight, hidden_states_share)
 
-    def forward_gate_init_routing(self, hidden_states, cur_topk_list=None):
-        # gate
-        topk_idx, topk_weight, _ = self._forward_gate(hidden_states)
-        if self.perfect_eplb:
-            topk_idx = cur_topk_list
-        topk_idx = topk_idx.to(torch.int32)
-
-        # init_routing
-        _, _, h = hidden_states.shape
-        hidden_states = hidden_states.view(-1, h)
-        expanded_x, expanded_row_idx, tokens_per_expert, pertoken_scale = torch_npu.npu_moe_init_routing_v2(
-            hidden_states,
-            expert_idx=topk_idx,
-            active_num=topk_idx.shape[0] * topk_idx.shape[1],
-            scale=self.experts.smooth_scale_1 if "a8" in self.gmm_quant_mode else None,
-            expert_num=self.num_experts,
-            expert_tokens_num_type=1,  # 0: cumsum mode(not supported now); 1: count mode
-            expert_tokens_num_flag=True, active_expert_range=[0, self.num_experts],
-            quant_mode=1 if "a8" in self.gmm_quant_mode else -1
-            # -1: non-quant; 1: dynamic quant; 0: static quant(not supported now)
-        )
-        return expanded_x, expanded_row_idx, tokens_per_expert, pertoken_scale, topk_weight
-
-    def forward_shared_expert(self, hidden_states, is_prefill):
-        if self.n_shared_experts > 0:
+    def forward_shared_expert(self, hidden_states, shared_expert_stream=None):
+        record_stream(self.enable_multi_streams, hidden_states, self.shared_expert_stream, exe_mode=self.exe_mode)
+        record_event(self.enable_multi_streams, self.npu_events, 0, exe_mode=self.exe_mode)
+        with npu_stream_switch(self.enable_multi_streams, shared_expert_stream, exe_mode=self.exe_mode):
+            wait_event(self.enable_multi_streams, self.npu_events, 0, exe_mode=self.exe_mode)
+            # shared_expert use multi streams
             hidden_states_share = self.shared_experts(hidden_states.view(-1, hidden_states.shape[-1]))
-        else:
-            hidden_states_share = None
+            record_event(self.enable_multi_streams, self.npu_events, 1, exe_mode=self.exe_mode)
         return hidden_states_share
 
     def forward_expert(self, gathered_tokens, tokens_per_expert_group, gathered_pertoken_scale):
@@ -474,6 +473,11 @@ class GlmMoeDsaMoE(nn.Module):
         }
 
         if "a8" in self.gmm_quant_mode:
+            if "a8mxfloat" in self.gmm_quant_mode:
+                # match GMM operator requirement (dim0, dim1)->(dim0, dim1//2, 2)
+                gathered_pertoken_scale = reshape_mx_scale(gathered_pertoken_scale)
+            if "a8float" in self.gmm_quant_mode:
+                gathered_pertoken_scale = None
             gmm_args.update({"pertoken_scale": gathered_pertoken_scale})
         hidden_states_ordered_by_experts = self.experts(**gmm_args)
         # finalize-rerouting
@@ -531,10 +535,8 @@ class GlmMoeDsaMoE(nn.Module):
                 "pertoken_scale": pertoken_scale
             })
         hidden_states_ordered_by_experts = self.experts(expanded_x, tokens_per_expert, **moe_args)
-        enable_multi_streams = self.enable_multi_streams and not is_prefill
-        use_aclgraph_event = enable_multi_streams and self.enable_aclgraph
-        if use_aclgraph_event:
-            tng.ops.npu_tagged_event_wait(moe_npu_events[1])
+        enable_multi_streams = self.enable_multi_streams
+        wait_event(enable_multi_streams and hidden_states_share is not None, self.npu_events, 1, exe_mode=self.exe_mode)
         hidden_states = torch_npu.npu_moe_finalize_routing(
             hidden_states_ordered_by_experts,
             skip1=hidden_states_share.view(-1, h), skip2=None,
@@ -564,11 +566,19 @@ class GlmMoeDsaMoE(nn.Module):
         gathered_tokens = expanded_x.new_empty(all_tokens.item(), expanded_x.shape[1])
         dist.all_to_all_single(gathered_tokens, expanded_x, output_splits, input_splits, group=moe_ep_group)
 
-        gathered_pertoken_scale = None if pertoken_scale is None else\
-                            pertoken_scale.new_empty(gathered_tokens.shape[0])
-        if "a8" in self.gmm_quant_mode:
+        gathered_pertoken_scale = None
+        if pertoken_scale is not None:
+            # for w8a8float8, use bf16 routing now
+            if "a8mxfloat" in self.gmm_quant_mode:
+                pertoken_scale = pertoken_scale.view(torch.int8)
+                gathered_pertoken_scale = pertoken_scale.new_empty(gathered_tokens.shape[0], pertoken_scale.shape[1])
+            elif self.gmm_quant_mode == "w8a8int8":
+                gathered_pertoken_scale = pertoken_scale.new_empty(gathered_tokens.shape[0])
+        if "a16" not in self.gmm_quant_mode and "a8float" not in self.gmm_quant_mode:   # bf16 routing when fp8 mode now
             dist.all_to_all_single(gathered_pertoken_scale, \
                                    pertoken_scale, output_splits, input_splits, group=moe_ep_group)
+        if "a8mxfloat" in self.gmm_quant_mode:
+            gathered_pertoken_scale = gathered_pertoken_scale.view(torch.float8_e8m0fnu)
         return tokens_per_expert_group, gathered_tokens, gathered_pertoken_scale, input_splits, output_splits
 
     def moe_infer_double_routing(self, x, topk_ids, topk_weight, hidden_states_share):
@@ -578,16 +588,28 @@ class GlmMoeDsaMoE(nn.Module):
         batch_size, sequence_length, h = x.shape
         x = x.view(-1, h)
 
+        # -1: non-quant; 1: dynamic quant; 0: static quant
+        # 2: mxfp8 for dst_dtype e5m2; 3: mxfp8 for dst_dtype e4m3;
+        # 4: fp8 for dst_dtype e5m2; 5: fp8 for dst_dtype e4m3
+        # init_routing do not support fp8 now
+        routing_args = {}
+        if "a8mxfloat" in self.gmm_quant_mode:
+            routing_args["quant_mode"] = 3
+        elif "a8int" in self.gmm_quant_mode:
+            routing_args["quant_mode"] = 1
+        else:
+            routing_args["quant_mode"] = -1 # bf16 routing, quant in MoeGmm if necessary
+
+        enable_smooth_scale = "w8a8" in self.gmm_quant_mode and "float8" not in self.gmm_quant_mode
         expanded_x, expanded_row_idx, tokens_per_expert, pertoken_scale = torch_npu.npu_moe_init_routing_v2(
             x,
             expert_idx=topk_ids,
             active_num=topk_ids.shape[0] * topk_ids.shape[1],
-            scale=self.experts.smooth_scale_1 if "a8" in self.gmm_quant_mode else None,
+            scale=self.experts.smooth_scale_1 if enable_smooth_scale else None,
             expert_num=self.num_experts,
             expert_tokens_num_type=1,  # 0: cumsum mode(not supported now); 1: count mode
             expert_tokens_num_flag=True, active_expert_range=[0, self.num_experts],
-            quant_mode=1 if "a8" in self.gmm_quant_mode else -1
-            # -1: non-quant; 1: dynamic quant; 0: static quant(not supported now)
+            **routing_args
         )
 
         tokens_per_expert_group, gathered_tokens, gathered_pertoken_scale, input_splits, output_splits =\
@@ -596,7 +618,8 @@ class GlmMoeDsaMoE(nn.Module):
         new_x = self.forward_expert(gathered_tokens, tokens_per_expert_group, gathered_pertoken_scale)
 
         gathered_tokens = self.forward_combine_double_routing(new_x, expanded_x, input_splits, output_splits)
-
+        wait_event(self.enable_multi_streams and hidden_states_share is not None,
+                   self.npu_events, 1, exe_mode=self.exe_mode)
         # finalize-routing
         hidden_states = torch_npu.npu_moe_finalize_routing(
             gathered_tokens, skip1=hidden_states_share, skip2=None, bias=None,
@@ -632,14 +655,15 @@ class GlmMoeDsaMoE(nn.Module):
         }
 
         if "a8" in self.gmm_quant_mode:
+            if "mxfloat" in self.gmm_quant_mode:
+                dynamic_scale = reshape_mx_scale(dynamic_scale)
             gmm_args.update({"pertoken_scale": dynamic_scale})
 
         hidden_states_ordered_by_experts = self.experts(**gmm_args)
 
         # is_prefill is always false in this branch
-        use_aclgraph_event = self.enable_multi_streams and self.enable_aclgraph
-        if use_aclgraph_event:
-            tng.ops.npu_tagged_event_wait(moe_npu_events[1])
+        wait_event(self.enable_multi_streams and hidden_states_share is not None,
+                   self.npu_events, 1, exe_mode=self.exe_mode)
 
         # moe combine
         combine_args = {
@@ -742,7 +766,7 @@ class GlmMoeDsaAttention(nn.Module):
             self.kv_lora_rank,
             self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
             bias=False,
-            quant_config=config.quant_config,
+            quant_config=None,     # anti-quantize in load_weights for fp8
             tp_size=self.attn_tp_size,
             tp_rank=dist.get_rank(self.hccl_comm_dict["attn_tp_group"]) if self.attn_tp_size > 1 else 0,
             prefix=f"{prefix}.kv_b_proj")
@@ -816,7 +840,7 @@ class GlmMoeDsaAttention(nn.Module):
         self.li_cache_quant_mode = config.quant_config.li_cache_quant_mode \
             if config.quant_config is not None else "unquant"
 
-        if self.kv_cache_quant_mode == "int8":
+        if self.kv_cache_quant_mode != "unquant":
             self.ckv_a_alpha = torch.nn.Parameter(torch.ones(1, dtype=torch.float), requires_grad=False)
             # empty tensor input for kr_cache
             # Its shape can be specified arbitrarily, but one of its dimensions must be 0
@@ -825,7 +849,13 @@ class GlmMoeDsaAttention(nn.Module):
         self.enable_offload = self.runner_settings.get("model_config").get("enable_offload", False)
         self.index_topk = self.config.index_topk
         self.last_dim = self.kv_lora_rank + self.qk_rope_head_dim * 2 + 4 * 4 \
-            if self.kv_cache_quant_mode == "int8" else self.kv_lora_rank
+            if self.kv_cache_quant_mode != "unquant" else self.kv_lora_rank
+        self.mlaprolog_quant_mode = {
+            "w16a16": 0,
+            "w8a8int8": 1,
+            "w8a8float8": 4,
+            "w8a8mxfloat8": 3,
+        }
 
     def mla_epilog(
         self,
@@ -1028,6 +1058,18 @@ class GlmMoeDsaAttention(nn.Module):
 
         output = self.mla_epilog(attn_output, absorb=True)
         return output
+    
+    def apply_dynamic_quant(self, x):
+        if self.mm_quant_mode == "w8a8float8":
+            bsz, seq_len, _ = x.shape
+            x, x_scale = torch_npu.npu_dynamic_block_quant(x.view(-1, x.size(-1)),
+                dst_type=torch.float8_e4m3fn,
+                row_block_size=1,
+                col_block_size=self.config.quant_config.weight_block_size[1])
+            x, x_scale = x.view(bsz, seq_len, -1), x_scale.view(bsz, seq_len, -1)
+        elif self.mm_quant_mode == "w8a8mxfloat8":
+            x, x_scale = torch_npu.npu_dynamic_mx_quant(x, dst_type=torch.float8_e4m3fn)
+        return x, x_scale
 
     def mlaprolog_prefill(
         self,
@@ -1057,21 +1099,31 @@ class GlmMoeDsaAttention(nn.Module):
 
         cos = cos.view(-1, 1, 1, self.qk_rope_head_dim)
         sin = sin.view(-1, 1, 1, self.qk_rope_head_dim)
+        
+        scale_name = 'scale' if self.mm_quant_mode == 'w8a8float8' else 'weight_scale'
+        dequant_scale_w_uq_qr = getattr(self.q_b_proj, scale_name, None)
+        dequant_scale_w_dq = getattr(self.q_a_proj, scale_name, None)
+        dequant_scale_w_dkv_kr = getattr(self.kv_a_proj_with_mqa, scale_name, None)
 
-        dequant_scale_w_uq_qr = self.q_b_proj.weight_scale.view(1, -1) if \
-                                self.config.quant_config is not None else None
-        # when weight_quant_mode = 0, no quant applied, when 1 only qb quantization is enabled
-        weight_quant_mode = 1 if self.config.quant_config is not None else 0
+        # 0: no quant applied; 1: only qb quantization is enabled
+        # 3: mxfp8 quantization for weightDq, weightUqQr, and weightDkvKr;
+        # 4: fp8 quantization for weightDq, weightUqQr, and weightDkvKr;
+        weight_quant_mode = self.mlaprolog_quant_mode.get(self.mm_quant_mode, 0)
+        if weight_quant_mode == 1:
+            dequant_scale_w_uq_qr = self.q_b_proj.weight_scale.view(1, -1)
+
         mla_prolog_input_args = {
             "weight_dq": self.q_a_proj.weight,
             "weight_uq_qr": self.q_b_proj.weight,
-            "weight_uk": self.kv_b_proj_w_k,
+            "weight_uk": self.kv_b_proj_w_k,     # bf16
             "weight_dkv_kr": self.kv_a_proj_with_mqa.weight,
             "rmsnorm_gamma_cq": self.q_a_layernorm.weight,
             "rmsnorm_gamma_ckv": self.kv_a_layernorm.weight,
             "kv_cache": nope_cache,
             "kr_cache": rope_cache,
             "dequant_scale_w_uq_qr": dequant_scale_w_uq_qr,
+            "dequant_scale_w_dq": dequant_scale_w_dq,
+            "dequant_scale_w_dkv_kr": dequant_scale_w_dkv_kr,
             "rmsnorm_epsilon_cq": self.q_a_layernorm.variance_epsilon,
             "rmsnorm_epsilon_ckv": self.kv_a_layernorm.variance_epsilon,
             "query_norm_flag": True,
@@ -1102,10 +1154,20 @@ class GlmMoeDsaAttention(nn.Module):
             "cache_mode": cache_mode
         })
 
+        if weight_quant_mode in (3, 4):
+            hidden_states, dequant_scale_x = self.apply_dynamic_quant(hidden_states)
+            dequant_scale_x = dequant_scale_x.flatten(-2)
+            if self.cp_size > 1: # (B, S, H) format for hidden_states, but (B*S, H/32) for scale
+                dequant_scale_x = dequant_scale_x.view(-1, dequant_scale_x.shape[-1])
+            mla_prolog_input_args.update({
+                "token_x": hidden_states,
+                "dequant_scale_x": dequant_scale_x.view(dtype=torch.float8_e8m0fnu)
+            })
+
         # When kv_cache_c8 is enabled, nope_cache, rope_cache, and scales
         # are concatenated and passed via the k_nope input.
         # In this case, an empty tensor must be passed for the k_rope input.
-        if self.kv_cache_quant_mode == "int8":
+        if self.kv_cache_quant_mode != "unquant":
             mla_prolog_input_args.update({
                 "kr_cache": self.fake_kr_cache,
                 "kv_cache_quant_mode": 3,
@@ -1113,14 +1175,15 @@ class GlmMoeDsaAttention(nn.Module):
                 "ckvkr_repo_mode": 1,
                 "quant_scale_repo_mode": 1,
                 "tile_size": 128,
-                "k_nope_clip_alpha": self.ckv_a_alpha
             })
+        if self.kv_cache_quant_mode != "unquant" and "mxfloat" not in self.mm_quant_mode:
+            mla_prolog_input_args.update({"k_nope_clip_alpha": self.ckv_a_alpha})
 
         q_nope, q_pe, dequant_scale_q_nope, qr, dequant_q_norm = torch_npu.npu_mla_prolog_v3(
             **mla_prolog_input_args
         )
 
-        if self.kv_cache_quant_mode == "int8":
+        if self.kv_cache_quant_mode != "unquant":
             latent_cache = nope_cache.view(-1, nope_cache.shape[-1])
         else:
             latent_cache = torch.cat([
@@ -1145,7 +1208,7 @@ class GlmMoeDsaAttention(nn.Module):
                 rope_cache = past_key_value[self.layer_idx][1]
 
             indices = prefill_extra_input_dict["kv_scatter_update_indices"]
-            if self.kv_cache_quant_mode == "int8":
+            if self.kv_cache_quant_mode != "unquant":
                 # The current implementation updates page attention to contiguous memory.
                 torch_npu.scatter_update_(nope_cache.view(bsnd_bsz, -1, nope_cache.shape[-1]),
                                         indices,
@@ -1164,7 +1227,9 @@ class GlmMoeDsaAttention(nn.Module):
                                       k_pe.view(bsnd_bsz, -1, self.qk_rope_head_dim),
                                       axis=1)
 
-        if weight_quant_mode == 1:
+        if weight_quant_mode in (1, 3, 4):
+            if weight_quant_mode == 3:
+                dequant_q_norm = dequant_q_norm.view(*dequant_q_norm.shape[:-1], -1, 2)
             c8_input_dict.update({'pertoken_scale': dequant_q_norm})
 
         return q_nope, q_pe, qr, nope_cache, rope_cache
@@ -1184,10 +1249,18 @@ class GlmMoeDsaAttention(nn.Module):
         cos = cos.view(-1, 1, 1, self.qk_rope_head_dim)
         sin = sin.view(-1, 1, 1, self.qk_rope_head_dim)
         hidden_states = hidden_states.view(bsz * q_len, -1)
-        dequant_scale_w_uq_qr = self.q_b_proj.weight_scale.view(1, -1) if \
-                                self.config.quant_config is not None else None
-        # when weight_quant_mode = 0, no quant applied, when 1 only qb quantization is enabled
-        weight_quant_mode = 1 if self.config.quant_config is not None else 0
+
+        scale_name = 'scale' if self.mm_quant_mode == 'w8a8float8' else 'weight_scale'
+        dequant_scale_w_uq_qr = getattr(self.q_b_proj, scale_name, None)
+        dequant_scale_w_dq = getattr(self.q_a_proj, scale_name, None)
+        dequant_scale_w_dkv_kr = getattr(self.kv_a_proj_with_mqa, scale_name, None)
+
+        # 0: no quant applied; 1: only qb quantization is enabled
+        # 3: mxfp8 quantization for weightDq, weightUqQr, and weightDkvKr;
+        # 4: fp8 quantization for weightDq, weightUqQr, and weightDkvKr;
+        weight_quant_mode = self.mlaprolog_quant_mode.get(self.mm_quant_mode, 0)
+        if weight_quant_mode == 1:
+            dequant_scale_w_uq_qr = self.q_b_proj.weight_scale.view(1, -1)
 
         mla_prolog_input_args = {
             "token_x": hidden_states,
@@ -1203,14 +1276,22 @@ class GlmMoeDsaAttention(nn.Module):
             "kr_cache": rope_cache,
             "cache_index": slot_mapping.view(-1),
             "dequant_scale_w_uq_qr": dequant_scale_w_uq_qr,
+            "dequant_scale_w_dq": dequant_scale_w_dq,
+            "dequant_scale_w_dkv_kr": dequant_scale_w_dkv_kr,
             "rmsnorm_epsilon_cq": self.q_a_layernorm.variance_epsilon,
             "rmsnorm_epsilon_ckv": self.kv_a_layernorm.variance_epsilon,
             "cache_mode": "PA_BSND",
             "query_norm_flag": True,
             "weight_quant_mode": weight_quant_mode
         }
+        if weight_quant_mode in (3, 4):
+            hidden_states, dequant_scale_x = self.apply_dynamic_quant(hidden_states)
+            mla_prolog_input_args.update({
+                "token_x": hidden_states,
+                "dequant_scale_x": dequant_scale_x.flatten(1).view(dtype=torch.float8_e8m0fnu)
+            })
 
-        if self.kv_cache_quant_mode == "int8":
+        if self.kv_cache_quant_mode != "unquant":
             mla_prolog_input_args.update({
                 "kr_cache": self.fake_kr_cache,
                 "kv_cache_quant_mode": 3,
@@ -1218,13 +1299,17 @@ class GlmMoeDsaAttention(nn.Module):
                 "ckvkr_repo_mode": 1,
                 "quant_scale_repo_mode": 1,
                 "tile_size": 128,
-                "k_nope_clip_alpha": self.ckv_a_alpha
             })
+        if self.kv_cache_quant_mode != "unquant" and "mxfloat" not in self.mm_quant_mode:
+            mla_prolog_input_args.update({"k_nope_clip_alpha": self.ckv_a_alpha})
 
         q_nope, q_pe, dequant_scale_q_nope, qr, dequant_q_norm = torch_npu.npu_mla_prolog_v3(
             **mla_prolog_input_args
         )
-        if weight_quant_mode == 1:
+
+        if weight_quant_mode in (1, 3, 4):
+            if weight_quant_mode == 3:
+                dequant_q_norm = dequant_q_norm.view(*dequant_q_norm.shape[:-1], -1, 2)
             c8_input_dict.update({'pertoken_scale': dequant_q_norm})
         return q_nope, q_pe, qr, nope_cache, rope_cache
 
@@ -1245,7 +1330,7 @@ class GlmMoeDsaAttention(nn.Module):
         offload_cache: Optional[OffloadCache] = None,
         **kwargs,
     ):
-        bsz, seq, _ = hidden_states.shape
+        bsz, seq, _ = hidden_states.shape   # (1, T, H) in prefill
 
         c8_input_dict = {}
         if not is_prefill:
@@ -1270,7 +1355,7 @@ class GlmMoeDsaAttention(nn.Module):
                     nope_cache_dst = past_key_value[self.layer_idx][0].view(bsz, -1, 1, self.last_dim)
                     nope_cache_src = nope_cache.view(bsz, -1, 1, self.last_dim)
                     nope_cache_dst.copy_(nope_cache_src, non_blocking=True)
-                    if not self.kv_cache_quant_mode == "int8":
+                    if self.kv_cache_quant_mode == "unquant":
                         rope_cache_dst = past_key_value[self.layer_idx][1].view(bsz, -1, 1, self.qk_rope_head_dim)
                         rope_cache_src = rope_cache.view(bsz, -1, 1, self.qk_rope_head_dim)
                         rope_cache_dst.copy_(rope_cache_src, non_blocking=True)
@@ -1317,7 +1402,7 @@ class GlmMoeDsaAttention(nn.Module):
             selection_k_rope = offload_cache.selected_key_values[self.layer_idx][1]
             selection_kv_cache = offload_cache.selected_key_values[self.layer_idx][0]
             full_kv_cache = k_nope.squeeze(2)
-            full_k_rope = k_pe.squeeze(2) if not self.kv_cache_quant_mode == "int8" else offload_cache.empty_rope
+            full_k_rope = k_pe.squeeze(2) if self.kv_cache_quant_mode == "unquant" else offload_cache.empty_rope
 
             selection_kv_block_table = offload_cache.selection_kv_block_table[self.layer_idx]
             selection_kv_block_status = offload_cache.selection_kv_block_status[self.layer_idx]
@@ -1351,7 +1436,7 @@ class GlmMoeDsaAttention(nn.Module):
                 "key": selection_kv_cache.unsqueeze(2),
                 "value": selection_kv_cache.unsqueeze(2),
             })
-            if not self.kv_cache_quant_mode == "int8":
+            if self.kv_cache_quant_mode == "unquant":
                 k_pe = selection_k_rope.unsqueeze(2)
 
         else:
@@ -1370,7 +1455,7 @@ class GlmMoeDsaAttention(nn.Module):
                 "sparse_mode": 3,
             }
 
-        if self.kv_cache_quant_mode == "int8":
+        if self.kv_cache_quant_mode != "unquant":
             q = torch.cat([q_nope, q_pe], dim=-1).contiguous()
             slc_fa_input_kwargs.update({
                 "query": q,
@@ -1753,6 +1838,7 @@ class GlmMoeDsaForCausalLM(GlmMoeDsaPreTrainedModel):
         self.config = config
         self.runner_settings = runner_settings
         self.input_max_len = self.runner_settings.get("data_config").get("input_max_len", 32)
+        self.platform_version = self.runner_settings.get("model_config").get("platform_version", "A3")
         self.get_parallel_settings()
         self.experts_per_rank = config.n_routed_experts // self.moe_ep_size
         self.top_k = config.num_experts_per_tok
@@ -1761,16 +1847,21 @@ class GlmMoeDsaForCausalLM(GlmMoeDsaPreTrainedModel):
         self.next_n = self.runner_settings.get("model_config").get("next_n", 0)
         self.is_mtp = is_mtp
         self.enable_cache_compile = self.runner_settings.get("model_config").get("enable_cache_compile", False)
+        self.mm_quant_mode = (
+            config.quant_config.mm_quant_mode
+            if config.quant_config is not None
+            else "w16a16")
         self.update_kv_quant_settings()
         self.kv_cache_quant_mode = config.quant_config.kv_cache_quant_mode \
             if config.quant_config is not None else "unquant"
 
         self.li_cache_quant_mode = config.quant_config.li_cache_quant_mode \
             if config.quant_config is not None else "unquant"
+        self.update_cache_param()
 
         self.enable_static_kernel = self.runner_settings.get("model_config").get("enable_static_kernel", False)
-        self.enable_aclgraph = runner_settings.get("exe_mode", "ge_graph") == "acl_graph"
-
+        self.enable_npugraph_ex = runner_settings.get("exe_mode", "ge_graph") == "npugraph_ex"
+        self.exe_mode = runner_settings.get("exe_mode", "ge_graph")
         self.local_rank = int(os.getenv("LOCAL_RANK", "0"))
         self.rank_offset = int(os.getenv("RANK_OFFSET", "0"))
         self.global_rank = self.local_rank + self.rank_offset
@@ -1784,6 +1875,12 @@ class GlmMoeDsaForCausalLM(GlmMoeDsaPreTrainedModel):
             if dist.get_world_size() > 1:
                 self.hccl_comm_dict = self.init_parallel_comm_group()
                 kwargs.update({"hccl_comm_dict": self.hccl_comm_dict})
+
+        kwargs.update({
+            "shared_expert_stream": create_stream("11", self.exe_mode),
+            "indexer_stream": create_stream("22", self.exe_mode),
+            "weights_stream": create_stream("33", self.exe_mode),
+        })
         self.batch_size_per_rank = self.runner_settings.get("data_config").get("batch_size_per_rank", 1)
         self.pa_max_length = self.runner_settings.get("model_config").get("pa_max_length", 2048)
         self.block_size = self.runner_settings.get("model_config").get("pa_block_size", 128)
@@ -1853,11 +1950,6 @@ class GlmMoeDsaForCausalLM(GlmMoeDsaPreTrainedModel):
     def get_decoder(self):
         return self.model
 
-    def update_kv_quant_settings(self):
-        # set li_cache_quant_mode to quant_config
-        if self.config.quant_config:
-            self.config.quant_config.set_quant_mode("li_cache_quant_mode", "int8")
-
     def get_parallel_settings(self):
         self.embed_tp_size = self.runner_settings.get("parallel_config").get("embed_tp_size", 1)
         self.attn_dp_size = self.runner_settings.get("parallel_config").get("attn_dp_size", 1)
@@ -1872,23 +1964,29 @@ class GlmMoeDsaForCausalLM(GlmMoeDsaPreTrainedModel):
         self.dense_tp_size = self.runner_settings.get("parallel_config").get("dense_tp_size", 1)
 
     def get_cached_graph(self):
-        tng.patch_for_hcom()
-        tng_config = tng.CompilerConfig()
-        tng_config.experimental_config.frozen_parameter = True
-        tng_config.experimental_config.tiling_schedule_optimize = True
-        tng_config.experimental_config.topology_sorting_strategy = "StableRDFS"
         case_name = "compile_cache/" + os.getenv("CASE_NAME")
         cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), case_name)
         cache_model = self.main_decode
         if self.is_mtp:
             cache_model = self.main_decode_mtp
-        if self.enable_aclgraph:
-            tng_config.mode = "reduce-overhead"
-            if self.enable_static_kernel:
-                tng_config.experimental_config.aclgraph._aclnn_static_shape_kernel = True
 
-        cached_decode = tng.inference.cache_compile(cache_model, cache_dir=cache_dir, config=tng_config,
-                                                    dynamic=False, fullgraph=True, ge_cache=not self.enable_aclgraph)
+        torch._dynamo.config.inline_inbuilt_nn_modules = False
+        if self.enable_npugraph_ex:
+            compile_options = {
+                "frozen_parameter": True,
+                "static_kernel_compile": self.enable_static_kernel,
+            }
+            cached_decode = torch.npu.npugraph_ex.inference.cache_compile(cache_model, cache_dir=cache_dir,
+                                                                          dynamic=False, options=compile_options)
+        else:
+            tng_config = tng.CompilerConfig()
+            tng_config.experimental_config.frozen_parameter = True
+            tng_config.experimental_config.tiling_schedule_optimize = True
+            tng_config.experimental_config.topology_sorting_strategy = "StableRDFS"
+
+            cached_decode = tng.inference.cache_compile(cache_model, cache_dir=cache_dir, config=tng_config,
+                                                        dynamic=False, fullgraph=True, ge_cache=True)
+
         return cached_decode
 
     def init_parallel_comm_group(self):
@@ -1931,17 +2029,19 @@ class GlmMoeDsaForCausalLM(GlmMoeDsaPreTrainedModel):
                 global_rank=global_rank, group_num=self.moe_dp_size, world_size=world_size,
                 group_stride=1, group_name="moe_tp_group")
 
-        hccl_buffer_size = calc_moe_hccl_buffer_size(self.runner_settings, self.config)
-        moe_ep_group, moe_ep_group_name = init_comm_group(
+        group_type = None if self.platform_version != "950" else 0 # 950 use default group for prefill moe
+        moe_ep_group = init_comm_group(
             global_rank=global_rank, group_num=self.moe_tp_size, world_size=world_size,
-            group_stride=self.moe_tp_size, group_name="moe_ep_group", return_name=True,
-            hccl_buffer_size=hccl_buffer_size)
+            group_stride=self.moe_tp_size, group_name="moe_ep_group", group_type=group_type)
 
-        hccl_buffer_size_mc2 = calc_moe_hccl_buffer_size(self.runner_settings, self.config, is_full_mesh_v2=True)
+        # used for fullmesh v2
+        group_type = None if self.platform_version != "950" else 3 # 950 use aiv group for mc2
+        is_full_mesh_v2 = self.platform_version != "950"
+        hccl_buffer_size = calc_moe_hccl_buffer_size(self.runner_settings, self.config, is_full_mesh_v2=is_full_mesh_v2)
         moe_ep_group_mc2, moe_ep_group_mc2_name = init_comm_group(
             global_rank=global_rank, group_num=self.moe_tp_size, world_size=world_size,
             group_stride=self.moe_tp_size, group_name="moe_ep_group_mc2", return_name=True,
-            hccl_buffer_size=hccl_buffer_size_mc2)
+            hccl_buffer_size=hccl_buffer_size, group_type=group_type)
 
         cp_group = init_comm_group(
             global_rank=global_rank, group_num=world_size // self.cp_size, world_size=world_size,
@@ -1951,7 +2051,6 @@ class GlmMoeDsaForCausalLM(GlmMoeDsaPreTrainedModel):
                 "default_pg": get_default_group(),
                 "attn_tp_group": attn_tp_group, "embed_tp_group": embed_tp_group,
                 "moe_tp_group": moe_tp_group, "moe_ep_group": moe_ep_group,
-                "moe_ep_group_name": moe_ep_group_name,
                 "moe_ep_group_mc2": moe_ep_group_mc2,
                 "moe_ep_group_mc2_name": moe_ep_group_mc2_name,
                 "lmhead_tp_group": lmhead_tp_group,
@@ -2055,7 +2154,7 @@ class GlmMoeDsaForCausalLM(GlmMoeDsaPreTrainedModel):
             prefill_extra_input_dict.update({"kv_len_next": kv_len_next, "actual_seq_q": kv_len.cumsum(dim=-1)})
 
             cache_last_dim = self.config.kv_lora_rank + self.config.qk_rope_head_dim * 2 + 16 \
-                if self.kv_cache_quant_mode == "int8" else self.config.kv_lora_rank
+                if self.kv_cache_quant_mode != "unquant" else self.config.kv_lora_rank
             cp_tmp_kv_cache_nope_shape = (
                             batch_size,
                             seq_len // self.cp_size,
@@ -2069,10 +2168,16 @@ class GlmMoeDsaForCausalLM(GlmMoeDsaPreTrainedModel):
                             1,
                             self.config.qk_rope_head_dim
                         )  # B,S,N,D
-            dtype = torch.int8 if self.kv_cache_quant_mode == "int8" else self.config.torch_dtype
+            dtype = None
+            if self.kv_cache_quant_mode == "int8":
+                dtype = torch.int8
+            elif self.kv_cache_quant_mode == "float8":
+                dtype = torch.float8_e4m3fn
+            else:
+                dtype = self.config.torch_dtype
             cp_tmp_kv_cache_nope = torch.zeros(cp_tmp_kv_cache_nope_shape, dtype=dtype, device=input_ids.device)
             prefill_extra_input_dict.update({"cp_tmp_kv_cache_nope": cp_tmp_kv_cache_nope})
-            if not self.kv_cache_quant_mode == "int8":
+            if self.kv_cache_quant_mode == "unquant":
                 cp_tmp_kv_cache_rope = torch.zeros(cp_tmp_kv_cache_rope_shape, dtype=dtype, device=input_ids.device)
             else:
                 cp_tmp_kv_cache_rope = None
@@ -2169,54 +2274,53 @@ class GlmMoeDsaForCausalLM(GlmMoeDsaPreTrainedModel):
             logits = self.main_decode(**kwargs)
         return logits
 
+    def update_cache_param(self):
+        cache_dtype_map = {
+            "int8": torch.int8, "float8": torch.float8_e4m3fn, "unquant": torch.bfloat16
+        }
+        self.cache_dtype = cache_dtype_map.get(self.kv_cache_quant_mode, torch.bfloat16)
+        self.li_cache_dtype = cache_dtype_map.get(self.li_cache_quant_mode, torch.bfloat16)
+        self.rope_dim = self.config.qk_rope_head_dim
+        self.nope_dim = self.config.kv_lora_rank
+
+        if self.kv_cache_quant_mode != "unquant":
+            # When the kvcache INT8 quantization is enabled
+            # nope_cache, rope_cache, and nope_scale need to be concatenated for SFA/MLAprolog kernel in INT8 dtype.
+            # kv_lora_rank(INT8) + qk_rope_head_dim(BF16) * 2(->INT8) + kv_scale(FP32) * 4(->INT8)
+            self.cache_dim = self.nope_dim + self.rope_dim * 2 + 4 * 4
+
+    def create_cache(self, dim, dtype):
+        cache_shape = (
+            self.kv_cache_num_block,
+            self.block_size,
+            1,
+            dim,
+        )
+        return torch.zeros(cache_shape, dtype=dtype, device="npu")
+
     def init_cache(
         self,
         device,
-        num_hidden_layers=61,
+        num_hidden_layers=78,
     ):
-        cache_seq_len = self.max_position_embeddings
-        dtype = torch.int8 if self.kv_cache_quant_mode == "int8" else self.config.torch_dtype
-
-        # When the kvcache INT8 quantization is enabled
-        # nope_cache, rope_cache, and nope_scale need to be concatenated for SFA/MLAprolog kernel in INT8 dtype.
-        # kv_lora_rank(INT8) + qk_rope_head_dim(BF16) * 2(->INT8) + kv_scale(FP32) * 4(->INT8)
-        cache_last_dim = self.config.kv_lora_rank + self.config.qk_rope_head_dim * 2 + 4 * 4 \
-            if self.kv_cache_quant_mode == "int8" else self.config.kv_lora_rank
         past_key_values = ()
-        cache_nope_shape = (
-                        self.kv_cache_num_block,
-                        self.block_size,
-                        1,
-                        cache_last_dim
-                    )
-
-        cache_rope_shape = (
-                        self.kv_cache_num_block,
-                        self.block_size,
-                        1,
-                        self.config.qk_rope_head_dim
-                    )
-
         for _ in range(num_hidden_layers):
-            cache_nope = torch.zeros(cache_nope_shape, dtype=dtype, device=device)
-            if self.kv_cache_quant_mode == "int8":
-                past_key_values += ((cache_nope, None),)
-            else:
-                cache_rope = torch.zeros(cache_rope_shape, dtype=dtype, device=device)
+            if self.kv_cache_quant_mode == "unquant":
+                cache_nope = self.create_cache(self.nope_dim, self.cache_dtype)
+                cache_rope = self.create_cache(self.rope_dim, self.cache_dtype)
                 past_key_values += ((cache_nope, cache_rope),)
+            else:
+                past_key_values += ((self.create_cache(self.cache_dim, self.cache_dtype), None),)
 
         return past_key_values
 
     def init_cache_for_indexer(
         self,
         device,
-        num_hidden_layers=61,
+        num_hidden_layers=78,
     ):
-        cache_seq_len = self.max_position_embeddings
-        dtype = torch.int8 if self.li_cache_quant_mode == "int8" else self.config.torch_dtype
-
         past_key_values = ()
-        past_key_scales = () if self.li_cache_quant_mode == "int8" else None
+        past_key_scales = () if self.li_cache_quant_mode != "unquant" else None
         cache_key_shape = (
                         self.kv_cache_num_block,
                         self.block_size,
@@ -2230,10 +2334,11 @@ class GlmMoeDsaForCausalLM(GlmMoeDsaPreTrainedModel):
                     )
 
         for _ in range(num_hidden_layers):
-            key_cache = torch.zeros(cache_key_shape, dtype=dtype, device=device)
+            key_cache = torch.zeros(cache_key_shape, dtype=self.li_cache_dtype, device=device)
             past_key_values += ((key_cache, ),)
-            if self.li_cache_quant_mode == "int8":
-                key_scales_cache = torch.zeros(cache_key_scales_shape, dtype=torch.float16, device=device)
+            if self.li_cache_quant_mode != "unquant":
+                scale_dtype = torch.float16 if self.li_cache_quant_mode == "int8" else torch.float32
+                key_scales_cache = torch.zeros(cache_key_scales_shape, dtype=scale_dtype, device=device)
                 past_key_scales += ((key_scales_cache, ),)
 
         return past_key_values, past_key_scales
@@ -2318,6 +2423,19 @@ class GlmMoeDsaForCausalLM(GlmMoeDsaPreTrainedModel):
         actual_seq_lengths_kv = actual_seq_lengths_kv.to(torch.int32)
         return actual_seq_lengths_kv
 
+    def update_kv_quant_settings(self):
+        if self.config.quant_config is None:
+            return
+        # set li_cache_quant_mode to quant_config
+        self.config.quant_config.set_quant_mode("li_cache_quant_mode", "unquant")
+
+        # if quant to fp8 or mxfp8, set kv cache and li cache to fp8; if quant to int8, set li cache to int8
+        if self.platform_version == "950" and "float" in self.mm_quant_mode:
+            self.config.quant_config.kv_cache_quant_mode = "float8"
+            self.config.quant_config.li_cache_quant_mode = "float8"
+        elif self.config.quant_config:
+            self.config.quant_config.li_cache_quant_mode = "int8"
+
     def prepare_inputs_for_generation(
         self,
         input_ids,
@@ -2388,6 +2506,7 @@ class GlmMoeDsaForCausalLM(GlmMoeDsaPreTrainedModel):
             num_experts=self.config.n_routed_experts)
 
         params_dict = dict(self.named_parameters())
+        dequant_cache = {}
         loaded_params: Set[str] = set()
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
@@ -2427,6 +2546,9 @@ class GlmMoeDsaForCausalLM(GlmMoeDsaPreTrainedModel):
                 if name.endswith(".bias") and name not in params_dict:
                     continue
 
+                if self.mm_quant_mode == "w8a8float8":
+                    name = name.replace(".weight_scale_inv", ".scale")
+
                 if name not in params_dict:
                     continue
                 param = params_dict[name]
@@ -2439,6 +2561,8 @@ class GlmMoeDsaForCausalLM(GlmMoeDsaPreTrainedModel):
                     if weight_name not in name:
                         continue
                     name = name.replace(weight_name, param_name)
+                    if self.mm_quant_mode == "w8a8float8":
+                        name = name.replace(".weight_scale_inv", ".scale")
 
                     if name not in params_dict:
                         continue
@@ -2454,8 +2578,21 @@ class GlmMoeDsaForCausalLM(GlmMoeDsaPreTrainedModel):
                     if name.endswith(".bias") and name not in params_dict:
                         continue
 
-                    if name not in params_dict:
-                        continue
+                    if self.mm_quant_mode == "w8a8float8":
+                        name = name.replace(".weight_scale_inv", ".scale")
+
+                    if "kv_b_proj" in name and self.mm_quant_mode == "w8a8float8":
+                        base_name, attr = name.rsplit(".", 1)
+                        if base_name not in dequant_cache:
+                            dequant_cache[base_name] = {}
+                        dequant_cache[base_name][attr] = loaded_weight
+                        if "weight" in dequant_cache[base_name] and "scale" in dequant_cache[base_name]:
+                            data = dequant_cache.pop(base_name)
+                            q_weight = data["weight"]
+                            scale = data["scale"]
+                            loaded_weight = weight_dequant(q_weight, scale)
+                            name = f"{base_name}.weight"
+
                     if name not in params_dict:
                         continue
                     param = params_dict[name]
@@ -2575,6 +2712,7 @@ class GlmMoeDsaModelMTP(GlmMoeDsaForCausalLM):
 
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
+        dequant_cache = {}
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
@@ -2624,6 +2762,8 @@ class GlmMoeDsaModelMTP(GlmMoeDsaForCausalLM):
                 name = name.replace(weight_name, param_name)
                 if name.endswith(".bias") and name not in params_dict:
                     continue
+                if self.mm_quant_mode == "w8a8float8":
+                    name = name.replace(".weight_scale_inv", ".scale")
 
                 if name not in params_dict:
                     continue
@@ -2637,6 +2777,8 @@ class GlmMoeDsaModelMTP(GlmMoeDsaForCausalLM):
                     if weight_name not in name:
                         continue
                     name = name.replace(weight_name, param_name)
+                    if self.mm_quant_mode == "w8a8float8":
+                        name = name.replace(".weight_scale_inv", ".scale")
 
                     if name not in params_dict:
                         continue
@@ -2651,6 +2793,19 @@ class GlmMoeDsaModelMTP(GlmMoeDsaForCausalLM):
                 else:
                     if name.endswith(".bias") and name not in params_dict:
                         continue
+                    if self.mm_quant_mode == "w8a8float8":
+                        name = name.replace(".weight_scale_inv", ".scale")
+                    if "kv_b_proj" in name and self.mm_quant_mode == "w8a8float8":
+                        base_name, attr = name.rsplit(".", 1)
+                        if base_name not in dequant_cache:
+                            dequant_cache[base_name] = {}
+                        dequant_cache[base_name][attr] = loaded_weight
+                        if "weight" in dequant_cache[base_name] and "scale" in dequant_cache[base_name]:
+                            data = dequant_cache.pop(base_name)
+                            q_weight = data["weight"]
+                            scale = data["scale"]
+                            loaded_weight = weight_dequant(q_weight, scale)
+                            name = f"{base_name}.weight"
 
                     if name not in params_dict:
                         continue

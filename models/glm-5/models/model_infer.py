@@ -81,7 +81,7 @@ class Infer(nn.Module):
             if is_prefill:
                 logits, prev_hidden_states = model_runner.model.prefill(**model_inputs)
             else:
-                if self.exe_mode == "acl_graph" and self.enable_skip_guard and not warm_up:
+                if self.exe_mode == "npugraph_ex" and self.enable_skip_guard and not warm_up:
                     with torch.compiler.set_stance(skip_guard_eval_unsafe=True):
                         logits, prev_hidden_states = model_runner.model.decode(**model_inputs)
                 else:
@@ -486,7 +486,7 @@ class Infer(nn.Module):
                     ),
                 )
             input_dict_single_cycle['past_key_scales_indexer'] = ()
-            if self.li_cache_quant_mode == "int8":
+            if self.li_cache_quant_mode != "unquant":
                 for past_key_scale in input_dict['past_key_scales_indexer']:
                     input_dict_single_cycle['past_key_scales_indexer'] += (
                         (
@@ -506,7 +506,7 @@ class Infer(nn.Module):
             input_dict_single_cycle['past_key_values_indexer'] = \
                 tuple([(self.tmp_indexer_kv[0][0].narrow(0, j * batch_len, batch_len), )]
                     * self.main_model.model.config.num_hidden_layers)
-            if self.li_cache_quant_mode == "int8":
+            if self.li_cache_quant_mode != "unquant":
                 input_dict_single_cycle['past_key_scales_indexer'] = \
                     tuple([(self.tmp_indexer_ks[0][0].narrow(0, j * batch_len, batch_len), )]
                         * self.main_model.model.config.num_hidden_layers)

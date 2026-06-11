@@ -128,7 +128,7 @@ def check_model_settings(world_size, runner_settings):
     next_n = runner_settings.get("model_config").get("next_n", 0)
     prefill_mini_batch_size = runner_settings.get("model_config").get("prefill_mini_batch_size", 0)
 
-    if exe_mode not in ["ge_graph", "eager", "acl_graph"]:
+    if exe_mode not in ["ge_graph", "eager", "npugraph_ex"]:
         raise ValueError(f"{exe_mode=} does not supported!")
 
     dynamo_feat = (enable_cache_compile or enable_multi_streams or enable_superkernel)
@@ -190,6 +190,10 @@ def update_vars(world_size, runner_settings):
     pa_block_size = runner_settings.get("model_config").get("pa_block_size", 128)
     pa_max_length = align_up(max_position_embeddings, pa_block_size)
     runner_settings = update_settings(runner_settings, "model_config", "pa_max_length", pa_max_length)
+    platform_version = runner_settings.get("model_config").get("platform_version", "A3")
+    enable_weight_nz = not platform_version == "950"
+    runner_settings = update_settings(runner_settings, "model_config", "enable_weight_nz",
+                                      enable_weight_nz)
     return runner_settings
 
 

@@ -4,7 +4,7 @@ The configuration instructions in the YAML file can be found below.
 Basic Config
   model_name: "GLM-5"                   # The model name. String type
   model_path: "/data/models/GLM-5-W8A8" # The model path. String type
-  exe_mode: "ge_graph"                              # The execution mode. Only support ["ge_graph", "eager", "acl_graph"]
+  exe_mode: "ge_graph"                              # The execution mode. Only support ["ge_graph", "eager", "npugraph_ex"]
   world_size: 128                                   # The world size. Int type
 
 Model Config
