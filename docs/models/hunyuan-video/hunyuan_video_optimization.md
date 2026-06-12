@@ -531,9 +531,9 @@ def _sync_scalar_for_sp(self, value: float) -> float:
 
 ### 块稀疏 Attention
 
-稀疏Attention算法的主要思路，是根据一定稀疏度选取注意力分数最高、对结果影响最大的块，而跳过其余块的计算。基于这一前提，这里实现了两种不同的稀疏算法，其原理都是尽可能选取注意力分数更高的块，接下来将依次介绍两种不同的方法。
 
-该优化方法基于[blitz_sparse_attention算子](https://gitcode.com/cann/ops-transformer/blob/master/experimental/attention/blitz_sparse_attention/README.md)实现，运行前需要依据参考文档编译算子。若需要叠加 Ulysses/Ring 序列并行，尤其是使用 Ring + TopK + overlap 的 LSE 合并路径，需要使用合入 [ops-transformer PR 5498](https://gitcode.com/cann/ops-transformer/pull/5498) 之后的 `ops-transformer` 主仓编译稀疏算子。编译算子运行命令如下：
+
+该优化方法基于[blitz_sparse_attention算子](https://gitcode.com/cann/ops-transformer/blob/master/experimental/attention/blitz_sparse_attention/README.md)实现，运行前需要依据参考文档编译算子（若更新CANN包需要重新编译）。若需要叠加 Ulysses/Ring 序列并行，尤其是使用 Ring + TopK + overlap 的 LSE 合并路径，需要使用合入 [ops-transformer PR 5498](https://gitcode.com/cann/ops-transformer/pull/5498) 之后的 `ops-transformer` 主仓编译稀疏算子。编译算子运行命令如下：
 
  ```bash
  git clone https://gitcode.com/cann/ops-transformer.git

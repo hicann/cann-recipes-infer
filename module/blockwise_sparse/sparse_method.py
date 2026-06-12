@@ -1318,28 +1318,29 @@ class SVGPredictor(BaseSparsePredictor):
         mask_name = ["spatial", "temporal"]
         num_sampled_rows = 64
 
-        _, _, seq_len, dim = query.size()
+        _, h, seq_len, dim = query.size()
+
         num_sampled_rows = min(num_sampled_rows, seq_len)
         sampled_row_high = min(seq_len, self.sample_mse_max_row)
         sampled_rows = torch.randint(low=0, high=sampled_row_high, size=(num_sampled_rows,), device=query.device)
         sampled_q = query[:, :, sampled_rows, :]
-        sampled_qk_scores = torch.matmul(sampled_q, key.transpose(-2, -1)) / (dim**0.5)
-
-        sampled_attn_weights = F.softmax(sampled_qk_scores, dim=-1)
-        sampled_golden_hidden_states = torch.matmul(sampled_attn_weights, value)  # (1, seq_len, dim)
+        sampled_golden_hidden_states = torch_npu.npu_fusion_attention(
+            sampled_q, key, value, head_num=h, input_layout="BNSD", scale=(1 / dim ** 0.5),
+        )[0]
 
         sampled_mses = {}
 
         # Only have Tri-diagonal and Striped
         for mask_idx, attn_mask in enumerate(self.attention_masks):
             sampled_attention_mask = attn_mask[sampled_rows, :-context_length]
-            sampled_attention_scores = sampled_qk_scores.masked_fill(sampled_attention_mask == 0, float("-inf"))
-            sampled_attn_weights = F.softmax(sampled_attention_scores, dim=-1)
-            sampled_hidden_states = torch.matmul(sampled_attn_weights, value)
+            sampled_hidden_states = torch_npu.npu_fusion_attention(
+                sampled_q, key, value, head_num=h, input_layout="BNSD", scale=(1 / dim ** 0.5),
+                atten_mask=~sampled_attention_mask
+            )[0]
             mse = torch.mean((sampled_hidden_states - sampled_golden_hidden_states) ** 2, dim=(2, 3))
             
             sampled_mses[mask_name[mask_idx]] = mse
-        del sampled_attention_mask, sampled_attention_scores, sampled_attn_weights, sampled_hidden_states
+        del sampled_attention_mask, sampled_hidden_states
         return sampled_mses
 
 
@@ -1354,7 +1355,7 @@ class SVGPredictor(BaseSparsePredictor):
 
         context_length = s - num_frame * frame_size
 
-        attention_mask = torch.zeros((s, s), device="cpu")
+        attention_mask = torch.zeros((s, s), dtype=torch.bool, device="cpu")
 
         num_block_q = math.ceil(s / block_size_q)
         num_block_k = math.ceil(s / block_size_k)
@@ -1364,26 +1365,17 @@ class SVGPredictor(BaseSparsePredictor):
         )
         block_thres = frame_size * width_frame
         num_block = math.ceil(num_frame * frame_size / block_size)
-        block_mask = torch.full((num_block_q, num_block_k), True).to(device)
+        
+        idx = torch.arange(num_block, device="cpu")
+        band = (idx[:, None] - idx[None, :]).abs() < int(block_thres // block_size)
+        block_mask = (~band).repeat_interleave(q_num_per_block, dim=0) \
+                            .repeat_interleave(k_num_per_block, dim=1)
+        
+        pixel_attn_mask = (~block_mask).repeat_interleave(self.block_size_q, dim=0) \
+                                        .repeat_interleave(self.block_size_k, dim=1)
+        pixel_attn_mask = pixel_attn_mask[:num_frame * frame_size, :num_frame * frame_size]
       
         if mask_name == "spatial":
-            for i in range(num_block):
-                for j in range(num_block):
-                    if abs(i - j) < block_thres // block_size:
-                        row_start = i * block_size
-                        row_end = (i + 1) * block_size
-                        col_start = j * block_size
-                        col_end = (j + 1) * block_size
-
-                        pixel_attn_mask[row_start: row_end, col_start: col_end] = 1
-
-                        block_row_start = i * q_num_per_block
-                        block_row_end = (i + 1) * q_num_per_block
-                        block_col_start = j * k_num_per_block
-                        block_col_end = (j + 1) * k_num_per_block
-
-                        block_mask[block_row_start: block_row_end, block_col_start: block_col_end] = False
-
             attention_mask[:-context_length, :-context_length] = pixel_attn_mask
 
             attention_mask[-context_length:, :] = 1
@@ -1394,16 +1386,6 @@ class SVGPredictor(BaseSparsePredictor):
             block_mask[-context_blocks_q:, :] = False
             block_mask[:, -context_blocks_k:] = False
         else:
-            for i in range(num_block):
-                for j in range(num_block):
-                    if abs(i - j) < block_thres // block_size:
-                        row_start = i * block_size
-                        row_end = (i + 1) * block_size
-                        col_start = j * block_size
-                        col_end = (j + 1) * block_size
-
-                        pixel_attn_mask[row_start: row_end, col_start: col_end] = 1
-
             pixel_attn_mask = (
                 pixel_attn_mask.reshape(frame_size, num_frame, frame_size, num_frame)
                 .permute(1, 0, 3, 2)
