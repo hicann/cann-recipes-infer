@@ -48,7 +48,7 @@ from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
 from executor.core.config import InferenceConfig, CommManager
 from executor.model_loader.weight_utils import default_weight_loader
-from executor.utils import align_up
+from executor.utils import calc_moe_hccl_buffer_size
 from executor.utils.forward_metadata import ForwardMetaData
 from module.fuse_moe_gmm import FusedMoEGMM, UnquantizedFusedMoEGMMMethod
 from module.linear import (
@@ -79,6 +79,7 @@ global_last_recurrent_state = None
 global_core_attn_out = None
 global_mask = None
 global_mask_diagonal = None
+_QWEN3_5_IS_950_PLATFORM: bool | None = None
 
 
 def qwen3_5_prefill_mm_all_reduce(
@@ -161,6 +162,12 @@ def _flatten_mxfp8_dynamic_scale(dynamic_scale: torch.Tensor | None) -> torch.Te
     if dynamic_scale.dim() >= 3 and dynamic_scale.shape[-1] == 2:
         return dynamic_scale.reshape(-1, dynamic_scale.shape[-2], 2)
     return dynamic_scale.reshape(-1, dynamic_scale.shape[-1])
+
+
+def _reshape_mxfp8_scale_for_gmm(scale: torch.Tensor | None) -> torch.Tensor | None:
+    if scale is None or (scale.dim() >= 3 and scale.shape[-1] == 2):
+        return scale
+    return scale.view(*scale.shape[:-1], scale.shape[-1] // 2, 2)
 
 
 def _quantize_weight_last_dim(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -271,6 +278,59 @@ def _normalize_quantization_method(quantization: str | None) -> str | None:
     return quantization.lower().replace("compressed_tensors", "compressed-tensors")
 
 
+def _is_qwen3_5_950_platform() -> bool:
+    global _QWEN3_5_IS_950_PLATFORM
+    if _QWEN3_5_IS_950_PLATFORM is not None:
+        return _QWEN3_5_IS_950_PLATFORM
+
+    try:
+        device_name = torch.npu.get_device_name()
+    except (AttributeError, RuntimeError) as exc:
+        logger.warning("Failed to get NPU device name, treat as non-950 platform: %s", exc)
+        _QWEN3_5_IS_950_PLATFORM = False
+        return _QWEN3_5_IS_950_PLATFORM
+
+    _QWEN3_5_IS_950_PLATFORM = "950" in device_name
+    if not _QWEN3_5_IS_950_PLATFORM:
+        logger.debug("Qwen3.5 detected non-950 NPU device name: %s", device_name)
+    return _QWEN3_5_IS_950_PLATFORM
+
+
+def _validate_qwen3_5_quantization_support(config, infer_config: InferenceConfig) -> None:
+    model_config = infer_config.model_config
+    custom_params = model_config.custom_params or {}
+
+    is_950_platform = _is_qwen3_5_950_platform()
+    exe_mode = model_config.exe_mode
+
+    quantization = None
+    quant_config = _get_qwen3_5_quantization_config(config, infer_config)
+    if isinstance(quant_config, dict):
+        quantization = _normalize_quantization_method(quant_config.get("quant_method"))
+
+    if custom_params.get("enable_online_mxfp8_quantization", False):
+        quantization = "mxfp8"
+
+    if not is_950_platform and quantization in {"fp8", "mxfp8"}:
+        raise ValueError(
+            f"Qwen3.5 {quantization} is only supported on Atlas 950."
+        )
+
+    if is_950_platform and quantization == "mxfp8" and exe_mode == "ge_graph":
+        raise ValueError(
+            f"Qwen3.5 mxfp8 is not supported with {exe_mode=} on Atlas 950."
+        )
+
+
+def _configure_qwen3_5_npugraph(infer_config: InferenceConfig) -> None:
+    is_950_platform = _is_qwen3_5_950_platform()
+    exe_mode = infer_config.model_config.exe_mode
+
+    if not is_950_platform and exe_mode == "npugraph_ex":
+        torch.npu.config.allow_internal_format = False
+        torch.npu.set_compile_mode(jit_compile=False)
+
+
 def _normalize_qwen3_5_quantization_config(quant_config: dict | None) -> dict | None:
     if not isinstance(quant_config, dict):
         return quant_config
@@ -340,18 +400,13 @@ def _init_qwen3_5_quant_config(config, infer_config: InferenceConfig) -> None:
         _register_qwen3_5_packed_modules_mapping(config)
         return
 
-    custom_params = infer_config.model_config.custom_params or {}
     quant_config = _get_qwen3_5_quantization_config(config, infer_config)
     if quant_config is not None:
         config.quantization_config = quant_config
 
-    quantization = _normalize_quantization_method(custom_params.get("quantization"))
-    if quantization is None:
-        quant_config = getattr(config, "quantization_config", None)
-        if quant_config is None:
-            quant_config = getattr(config, "compression_config", None)
-        if quant_config:
-            quantization = _normalize_quantization_method(quant_config.get("quant_method", ""))
+    quantization = None
+    if isinstance(quant_config, dict):
+        quantization = _normalize_quantization_method(quant_config.get("quant_method"))
 
     if quantization:
         config.quant_config = get_quant_config(
@@ -1005,8 +1060,10 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
 
         self.causal_conv1d_fn = causal_conv1d_fn
         self.causal_conv1d_update = causal_conv1d_update or torch_causal_conv1d_update
-        platform = torch.npu.get_device_name()
-        self.use_npu_chunk_gated_delta_rule = '950' not in platform and hasattr(torch_npu, "npu_chunk_gated_delta_rule")
+        self.is_950_platform = _is_qwen3_5_950_platform()
+        self.use_npu_chunk_gated_delta_rule = (
+            not self.is_950_platform and hasattr(torch_npu, "npu_chunk_gated_delta_rule")
+        )
 
         self.chunk_gated_delta_rule = chunk_gated_delta_rule or torch_chunk_gated_delta_rule
         self.recurrent_gated_delta_rule = fused_recurrent_gated_delta_rule or torch_recurrent_gated_delta_rule
@@ -1457,9 +1514,9 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
 
         beta = b.sigmoid().view(batch_size, self.num_v_heads)
 
-        g = -self.A_log.float().exp() * ge_safe_softplus(
+        g = ge_safe_softplus(
             a.float() + self.dt_bias
-        )
+        ) * (-self.A_log.float().exp())
         g = g.view(batch_size, self.num_v_heads)
 
         if self.num_v_heads // self.num_k_heads > 1:
@@ -1690,7 +1747,6 @@ class Qwen3_5MoeAttention(nn.Module):
         self.is_causal = True
         self.attn_intermediate_size = self.num_heads * self.head_dim
         self.attn_intermediate_size_per_rank = self.num_heads_per_rank * self.head_dim
-        # block_size will be set in init_cache() to cache_seq_len (not PageAttention's block_size)
         self.enable_gegraph = infer_config.model_config.exe_mode == "ge_graph"
         self.enable_npugraph_ex = infer_config.model_config.exe_mode == "npugraph_ex"
         self.merged_qkv_proj = Qwen3_5MoeQKVParallelLinear(
@@ -1721,14 +1777,6 @@ class Qwen3_5MoeAttention(nn.Module):
 
         self.k_cache = self.v_cache = torch.Tensor([])
         self.cache_unit = self.head_dim * self.num_key_value_heads_per_rank
-        # PageAttention cache: will be initialized in init_cache()
-        # block_size: fixed PA block size (e.g., 128)
-        # block_table: [batch_size, cache_len] mapping request to blocks
-        # kv_len_offset: [batch_size, 1] each request's cache region start
-        # cache_seq_len: max cache length per request
-        self.block_size = None
-        self.block_table = None
-
 
     def forward(
         self,
@@ -1736,14 +1784,43 @@ class Qwen3_5MoeAttention(nn.Module):
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         kv_len: torch.IntTensor = None,
         forward_metadata: ForwardMetaData = None,
-        slot_mapping: Optional[torch.Tensor] = None,
         dynamic_scale: torch.Tensor | None = None,
         **kwargs,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        # TND format: hidden_states is [total_tokens, hidden_size]
-        q_len = hidden_states.size(0)
-
+    ) -> torch.Tensor:
+        total_tokens = hidden_states.size(0)
+        actual_seq_lens = forward_metadata.actual_seq_lengths_q
+        is_prefill = forward_metadata.is_prefill
+        bsz = actual_seq_lens.numel()
         qkv_states = self.merged_qkv_proj(hidden_states, dynamic_scale=dynamic_scale)
+
+        cos, sin = position_embeddings
+        if is_prefill:
+            cu_seq_lens = forward_metadata.actual_seq_lengths_cu_q
+            if cu_seq_lens[0] != 0:
+                cu_seq_lens = F.pad(cu_seq_lens, (1, 0))
+            q_len = actual_seq_lens.max().item()
+
+            token_idx = torch.arange(total_tokens, device=qkv_states.device)
+            batch_idx = torch.bucketize(token_idx, cu_seq_lens[1:], right=True)
+            seq_idx = token_idx - cu_seq_lens[batch_idx]
+            flat_idx = batch_idx * q_len + seq_idx
+
+            def pack_tnd_to_bsh(tensor):
+                tensor = tensor.reshape(total_tokens, -1)
+                packed = tensor.new_zeros(bsz * q_len, tensor.shape[-1])
+                packed.index_copy_(0, flat_idx, tensor)
+                return packed.view(bsz, q_len, -1)
+
+            qkv_states = pack_tnd_to_bsh(qkv_states)
+            cos = pack_tnd_to_bsh(cos)
+            sin = pack_tnd_to_bsh(sin)
+        else:
+            q_len = total_tokens // bsz
+            qkv_states = qkv_states.view(bsz, q_len, -1)
+            cos = cos.view(bsz, q_len, -1)
+            sin = sin.view(bsz, q_len, -1)
+
+        input_shape = (bsz, q_len)
         query_states, key_states, value_states = torch.split(
             qkv_states,
             [
@@ -1754,113 +1831,86 @@ class Qwen3_5MoeAttention(nn.Module):
             dim=-1,
         )
 
-        # Split query and gate
         query_states, gate = torch.chunk(
-            query_states.view(q_len, -1, self.head_dim * 2),
+            query_states.view(*input_shape, -1, self.head_dim * 2),
             2,
             dim=-1
         )
-        gate = gate.reshape(q_len, -1)
+        gate = gate.reshape(*input_shape, -1)
 
-        # TND layout: [T, N, D]
-        query_shape = (q_len, self.num_heads_per_rank, self.head_dim)
-        key_value_shape = (q_len, self.num_key_value_heads_per_rank, self.head_dim)
+        query_states, _, _ = self.q_norm(
+            query_states.view(*input_shape, self.num_heads_per_rank, self.head_dim)
+        )
+        key_states, _, _ = self.k_norm(
+            key_states.view(*input_shape, self.num_key_value_heads_per_rank, self.head_dim)
+        )
+        value_states = value_states.view(*input_shape, self.num_key_value_heads_per_rank, self.head_dim)
 
-        query_states, _, _ = self.q_norm(query_states.view(query_shape))
-        key_states, _, _ = self.k_norm(key_states.view(key_value_shape))
-        value_states = value_states.view(key_value_shape)
+        rotary_dim = cos.shape[-1]
+        q_rot = query_states[..., :rotary_dim]
+        q_pass = query_states[..., rotary_dim:]
+        k_rot = key_states[..., :rotary_dim]
+        k_pass = key_states[..., rotary_dim:]
 
-        cos, sin = position_embeddings
-        rotary_dim = cos.shape[-1]  # 64
+        cos = cos.unsqueeze(2)
+        sin = sin.unsqueeze(2)
+        q_rot = torch_npu.npu_rotary_mul(q_rot, cos, sin, rotary_mode='half')
+        k_rot = torch_npu.npu_rotary_mul(k_rot, cos, sin, rotary_mode='half')
 
-        # Slice rotary and passthrough parts -- TND layout (T, N, D)
-        q_rot = query_states[..., :rotary_dim]   # (T, N, 64)
-        q_pass = query_states[..., rotary_dim:]  # (T, N, 192)
-        k_rot = key_states[..., :rotary_dim]     # (T, N, 64)
-        k_pass = key_states[..., rotary_dim:]    # (T, N, 192)
-
-        q_rot_4d = q_rot.unsqueeze(0)  # (T, N, 64) -> (1, T, N, 64)
-        k_rot_4d = k_rot.unsqueeze(0)  # (T, N, 64) -> (1, T, N, 64)
-        cos_4d = cos.unsqueeze(2)      # (1, T, 64) -> (1, T, 1, 64)
-        sin_4d = sin.unsqueeze(2)      # (1, T, 64) -> (1, T, 1, 64)
-
-        q_rot_4d = torch_npu.npu_rotary_mul(q_rot_4d, cos_4d, sin_4d, rotary_mode='half')
-        k_rot_4d = torch_npu.npu_rotary_mul(k_rot_4d, cos_4d, sin_4d, rotary_mode='half')
-
-        # Remove batch dimension: (1, T, N, 64) -> (T, N, 64)
-        q_rot = q_rot_4d.squeeze(0)
-        k_rot = k_rot_4d.squeeze(0)
-
-        query_states = torch.cat([q_rot, q_pass], dim=-1)
-        key_states = torch.cat([k_rot, k_pass], dim=-1)
+        query_states = torch.cat([q_rot, q_pass], dim=-1).view(bsz, q_len, -1)
+        key_states = torch.cat([k_rot, k_pass], dim=-1).view(bsz, q_len, -1)
+        value_states = value_states.view(bsz, q_len, -1)
 
         k_cache, v_cache = self.k_cache, self.v_cache
         if not k_cache.numel() or not v_cache.numel():
             raise RuntimeError("A BUG: k_cache or v_cache are not initialized properly.")
 
-        is_prefill = forward_metadata.is_prefill
-        batch_size = forward_metadata.actual_seq_lengths_kv.shape[0]
+        active_k_cache = k_cache[:bsz]
+        active_v_cache = v_cache[:bsz]
+        scatter_kv_len = kv_len.new_zeros((bsz,)) if is_prefill else kv_len[:bsz]
+        torch_npu.scatter_update_(active_k_cache, scatter_kv_len, key_states, -2)
+        torch_npu.scatter_update_(active_v_cache, scatter_kv_len, value_states, -2)
 
         if is_prefill:
-            # Prefill: forward_metadata.kv_len already contains slot_mapping
-            # computed by execution_engine: kv_len = batch_idx * cache_seq_len + position
-            slot_mapping = slot_mapping.long()
+            attn_output, _ = torch.ops.npu.npu_fused_infer_attention_score(
+                query_states,
+                key_states,
+                value_states,
+                num_heads=self.num_heads_per_rank,
+                num_key_value_heads=self.num_key_value_heads_per_rank,
+                input_layout="BSH",
+                scale=self.scale_fa,
+                sparse_mode=3,
+                atten_mask=forward_metadata.attention_mask,
+                next_tokens=0,
+                antiquant_mode=0,
+                antiquant_scale=None,
+            )
         else:
-            slot_mapping = kv_len
+            actual_seq_lengths_kv = forward_metadata.actual_seq_lengths_kv
+            if self.enable_npugraph_ex:
+                actual_seq_lengths_kv = forward_metadata.actual_seq_lengths_list_kv
+            fa_ops = torchair.ops if self.enable_gegraph else torch.ops.npu
+            attn_output, _ = fa_ops.npu_fused_infer_attention_score(
+                query_states,
+                active_k_cache,
+                active_v_cache,
+                num_heads=self.num_heads_per_rank,
+                num_key_value_heads=self.num_key_value_heads_per_rank,
+                input_layout="BSH",
+                scale=self.scale_fa,
+                actual_seq_lengths_kv=actual_seq_lengths_kv,
+                atten_mask=None,
+                antiquant_mode=0,
+                antiquant_scale=None,
+            )
 
-        # KV Cache update using npu_scatter_nd_update_
-        # k_cache/v_cache: [kv_cache_num_block, block_size, num_heads, head_dim]
-        # Flatten to [total_slots, num_heads, head_dim] for scatter update
-        slot_mapping_flat = slot_mapping.view(-1)
-
-        torch_npu.npu_scatter_nd_update_(
-            k_cache.view(-1, self.num_key_value_heads_per_rank, self.head_dim),
-            slot_mapping_flat.view(-1, 1),
-            key_states,
-        )
-        torch_npu.npu_scatter_nd_update_(
-            v_cache.view(-1, self.num_key_value_heads_per_rank, self.head_dim),
-            slot_mapping_flat.view(-1, 1),
-            value_states,
-        )
-
-        # block_table: [batch_size, cache_len], slice to actual batch_size
-        block_table = self.block_table[:batch_size] if self.block_table is not None else None
-
-        fa_ops = torch.ops.npu
-        if not is_prefill and self.enable_gegraph:
-            fa_ops = torchair.ops
-
-        if not is_prefill and self.enable_npugraph_ex:
-            actual_seq_kvlen = forward_metadata.actual_seq_lengths_list_kv
-            actual_seq_qlen = forward_metadata.actual_seq_lengths_cu_list_q
-        else:
-            actual_seq_kvlen = forward_metadata.actual_seq_lengths_kv
-            actual_seq_qlen = forward_metadata.actual_seq_lengths_cu_q
-
-        # Use FA v2 with TND layout
-        sparse_mode = 3 if is_prefill else 0
-
-        k_cache_fa = k_cache.view(*k_cache.shape[:2], -1)
-        v_cache_fa = v_cache.view(*v_cache.shape[:2], -1)
-        attn_output, _ = fa_ops.npu_fused_infer_attention_score_v2(
-            query_states,
-            k_cache_fa,
-            v_cache_fa,
-            num_query_heads=self.num_heads_per_rank,
-            num_key_value_heads=self.num_key_value_heads_per_rank,
-            softmax_scale=self.scale_fa,
-            input_layout="TND",
-            sparse_mode=sparse_mode,
-            atten_mask=forward_metadata.attention_mask if is_prefill else None,
-            actual_seq_qlen=actual_seq_qlen,
-            actual_seq_kvlen=actual_seq_kvlen,
-            block_table=block_table,
-            block_size=self.block_size,
-        )
-
-        attn_output = attn_output.reshape(q_len, self.attn_intermediate_size_per_rank)
+        attn_output = attn_output.reshape(bsz, q_len, self.attn_intermediate_size_per_rank)
         attn_output = attn_output * torch.sigmoid(gate)
+        if is_prefill:
+            attn_output = attn_output.view(bsz * q_len, -1)[flat_idx]
+        else:
+            attn_output = attn_output.view(total_tokens, -1)
 
         fused_attn_output = qwen3_5_prefill_mm_all_reduce(
             self.o_proj,
@@ -2056,9 +2106,9 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
         self.moe_ep_rank = (
             comm_manager.get_rank("moe_ep_group") if self.moe_ep_size > 1 else 0
         )
-        self.enable_decode_moe_dispatch_combine_v2 = infer_config.model_config.custom_params.get(
-            "enable_decode_moe_dispatch_combine_v2", False
-        )
+        self.exe_mode = infer_config.model_config.exe_mode
+        self.is_950_platform = _is_qwen3_5_950_platform()
+
         self.experts_per_rank = self.num_experts // self.moe_ep_size
         self.local_expert_start = self.moe_ep_rank * self.experts_per_rank
         self.local_expert_end = self.local_expert_start + self.experts_per_rank
@@ -2147,16 +2197,22 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
         dist.all_to_all_single(gathered_tokens, expanded_x, output_splits, input_splits, group=moe_ep_group)
         gathered_pertoken_scale = None
         if expanded_pertoken_scale is not None:
-            gathered_pertoken_scale = expanded_pertoken_scale.new_empty(
-                (total_tokens, *expanded_pertoken_scale.shape[1:])
+            scale_for_dispatch = expanded_pertoken_scale
+            use_mxfp8_scale_view = scale_for_dispatch.dtype == torch_npu.float8_e8m0fnu
+            if use_mxfp8_scale_view:
+                scale_for_dispatch = scale_for_dispatch.view(torch.int8)
+            gathered_pertoken_scale = scale_for_dispatch.new_empty(
+                (total_tokens, *scale_for_dispatch.shape[1:])
             )
             dist.all_to_all_single(
                 gathered_pertoken_scale,
-                expanded_pertoken_scale,
+                scale_for_dispatch,
                 output_splits,
                 input_splits,
                 group=moe_ep_group,
             )
+            if use_mxfp8_scale_view:
+                gathered_pertoken_scale = gathered_pertoken_scale.view(torch_npu.float8_e8m0fnu)
         return tokens_per_expert_group, gathered_tokens, gathered_pertoken_scale, input_splits, output_splits
 
     def _run_experts_tp_only(
@@ -2194,7 +2250,6 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
             selected_experts,
             pertoken_scale,
         )
-
         (
             tokens_per_expert_group,
             gathered_tokens,
@@ -2207,19 +2262,32 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
             expanded_pertoken_scale,
         )
 
-        hidden_states_ordered_by_experts, _, gathered_ids_unsort, tokens_per_local_expert = (
-            torch_npu.npu_moe_re_routing(
+        scale_for_rerouting = gathered_pertoken_scale
+        use_mxfp8_scale_view = (
+            scale_for_rerouting is not None
+            and scale_for_rerouting.dtype == torch_npu.float8_e8m0fnu
+        )
+        if use_mxfp8_scale_view:
+            scale_for_rerouting = scale_for_rerouting.flatten(1)
+        if scale_for_rerouting is None:
+            rerouting_output = torch_npu.npu_moe_re_routing(
                 gathered_tokens,
                 tokens_per_expert_group.view(self.moe_ep_size, -1),
             )
-        )
-        local_pertoken_scale = None
-        if gathered_pertoken_scale is not None:
-            local_pertoken_scale = torch.index_select(
-                gathered_pertoken_scale,
-                0,
-                gathered_ids_unsort.to(torch.long),
+        else:
+            rerouting_output = torch_npu.npu_moe_re_routing(
+                gathered_tokens,
+                tokens_per_expert_group.view(self.moe_ep_size, -1),
+                per_token_scales=scale_for_rerouting,
             )
+        (
+            hidden_states_ordered_by_experts,
+            local_pertoken_scale,
+            gathered_ids_unsort,
+            tokens_per_local_expert,
+        ) = rerouting_output
+        if use_mxfp8_scale_view:
+            local_pertoken_scale = _reshape_mxfp8_scale_for_gmm(local_pertoken_scale)
         hidden_states_ordered_by_experts = self.experts(
             hidden_states_ordered_by_experts,
             tokens_per_local_expert,
@@ -2241,23 +2309,24 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
             dist.all_reduce(expert_output, group=self.comm_manager.get_group("moe_tp_group"))
         return expert_output
 
-    def _can_use_decode_dispatch_combine_v2(self, forward_metadata: ForwardMetaData | None) -> bool:
-        return (
-            self.enable_decode_moe_dispatch_combine_v2
-            and forward_metadata is not None
-            and not forward_metadata.is_prefill
-            and self.moe_ep_size > 1
-            and self.moe_tp_size == 1
-        )
-
     def _run_experts_dispatch_combine_v2(
         self,
         hidden_states: torch.Tensor,
         routing_weights: torch.Tensor,
         selected_experts: torch.Tensor,
+        pertoken_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        moe_ep_group_name = self.comm_manager.get_group_name("moe_ep_group")
+        global_rank = self.comm_manager.config.global_rank
+        moe_ep_group_name = self.comm_manager.get_group_name("moe_ep_group_mc2")
         topk_ids = selected_experts.to(torch.int32)
+        use_mxfp8 = (
+            pertoken_scale is None
+            and hidden_states.dtype != torch.float8_e4m3fn
+            and _is_mxfp8_quantized_gmm(self.experts)
+        )
+        # quant_mode/comm_quant_mode: 4 means MXFP8 quantized output in float8_e4m3fn;
+        # 0 means no quantization.
+        quant_mode = 4 if use_mxfp8 else 0
         dispatch_args = {
             "x": hidden_states,
             "expert_ids": topk_ids,
@@ -2267,23 +2336,30 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
             "scales": None,
             "group_ep": moe_ep_group_name,
             "ep_world_size": self.moe_ep_size,
-            "ep_rank_id": self.moe_ep_rank,
-            "group_tp": "",
-            "tp_world_size": 0,
-            "tp_rank_id": 0,
+            "ep_rank_id": global_rank // self.moe_tp_size,
+            "group_tp": moe_ep_group_name,
+            "tp_world_size": self.moe_tp_size,
+            "tp_rank_id": global_rank % self.moe_tp_size,
             "expert_shard_type": 0,
             "shared_expert_num": 0,
             "shared_expert_rank_num": 0,
-            "quant_mode": 0,
+            "quant_mode": quant_mode,
         }
+        if use_mxfp8:
+            dispatch_args["y_dtype"] = torch.float8_e4m3fn
+        if not self.is_950_platform:
+            dispatch_args["comm_alg"] = "fullmesh_v2"
         output = torch_npu.npu_moe_distribute_dispatch_v2(**dispatch_args)
-        expand_x, _, assist_info_for_combine, expert_token_num, ep_recv_counts, tp_recv_counts = output[:6]
-        expand_scales = output[6] if len(output) > 6 else None
+        expand_x, expand_scales, assist_info_for_combine, expert_token_num, ep_recv_counts, tp_recv_counts = output[:6]
+
+        if use_mxfp8:
+            expand_scales = _reshape_mxfp8_scale_for_gmm(expand_scales)
 
         hidden_states_ordered_by_experts = self.experts(
             expand_x,
             expert_token_num,
             group_list_type=1,
+            pertoken_scale=expand_scales if use_mxfp8 else None,
         )
 
         combine_args = {
@@ -2298,17 +2374,16 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
             "global_bs": 0,
             "group_ep": moe_ep_group_name,
             "ep_world_size": self.moe_ep_size,
-            "ep_rank_id": self.moe_ep_rank,
-            "group_tp": "",
-            "tp_world_size": 0,
-            "tp_rank_id": 0,
+            "ep_rank_id": global_rank // self.moe_tp_size,
+            "group_tp": moe_ep_group_name,
+            "tp_world_size": self.moe_tp_size,
+            "tp_rank_id": global_rank % self.moe_tp_size,
             "expert_shard_type": 0,
             "shared_expert_num": 0,
             "shared_expert_rank_num": 0,
-            "comm_quant_mode": 0,
+            "comm_quant_mode": quant_mode,
         }
-        if expand_scales is not None:
-            combine_args["expand_scales"] = expand_scales
+
         return torch_npu.npu_moe_distribute_combine_v2(**combine_args)
 
     def forward(
@@ -2327,26 +2402,29 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
             dynamic_scale=pertoken_scale,
         )
         _, routing_weights, selected_experts = self.gate(hidden_states_reshaped)
-        if dynamic_scale is None and self._can_use_decode_dispatch_combine_v2(forward_metadata):
-            expert_output = self._run_experts_dispatch_combine_v2(
-                hidden_states_reshaped,
-                routing_weights,
-                selected_experts,
-            )
-        elif self.moe_ep_size > 1:
-            expert_output = self._run_experts_ep(
-                hidden_states_reshaped,
-                routing_weights,
-                selected_experts,
-                pertoken_scale=pertoken_scale,
-            )
-        else:
+
+        if self.moe_tp_size > 1:
             expert_output = self._run_experts_tp_only(
                 hidden_states_reshaped,
                 routing_weights,
                 selected_experts,
-                pertoken_scale=pertoken_scale,
+                pertoken_scale=pertoken_scale
             )
+        else:
+            if forward_metadata.is_prefill:
+                expert_output = self._run_experts_ep(
+                    hidden_states_reshaped,
+                    routing_weights,
+                    selected_experts,
+                    pertoken_scale=pertoken_scale
+                )
+            else:
+                expert_output = self._run_experts_dispatch_combine_v2(
+                    hidden_states_reshaped,
+                    routing_weights,
+                    selected_experts,
+                    pertoken_scale=pertoken_scale,
+                )
 
         shared_expert_output = F.sigmoid(self.shared_expert_gate(hidden_states_reshaped)) * shared_expert_output
 
@@ -2516,7 +2594,6 @@ class Qwen3_5MoeDecoderLayer(nn.Module):
         position_ids: torch.LongTensor | None = None,
         past_residual: torch.Tensor | None = None,
         forward_metadata: ForwardMetaData = None,
-        slot_mapping: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         hidden_states, hidden_scale, residual = self.input_layernorm(hidden_states, past_residual)
@@ -2537,21 +2614,17 @@ class Qwen3_5MoeDecoderLayer(nn.Module):
                 kv_len=kv_len,
                 position_embeddings=position_embeddings,
                 forward_metadata=forward_metadata,
-                slot_mapping=slot_mapping,
                 dynamic_scale=hidden_scale,
             )
 
         # Fully Connected
-        hidden_states, hidden_scale, residual = self.post_attention_layernorm(hidden_states, residual)
-        hidden_states = self.mlp(hidden_states, forward_metadata=forward_metadata, dynamic_scale=hidden_scale)
+        hidden_states, residual = self.post_attention_layernorm.add_rms_norm_npu(residual, hidden_states)
+        hidden_states = self.mlp(hidden_states, forward_metadata=forward_metadata, dynamic_scale=None)
         # For the MoE layers, we need to unpack
         if isinstance(hidden_states, tuple):
             hidden_states, _ = hidden_states
 
         return residual, hidden_states
-
-
-
 
 
 @dataclass
@@ -2619,21 +2692,6 @@ class Qwen3_5MoeTextModel(nn.Module):
             tp_rank=comm_manager.get_rank("embed_tp_group") if self.embed_tp_size > 1 else 0,
         )
 
-        batch_size_per_rank = self.infer_config.scheduler_config.batch_size_per_dp_rank
-        cache_seq_len = self.infer_config.data_config.input_truncated_len + \
-            self.infer_config.scheduler_config.max_new_tokens
-        self.block_size = self.infer_config.scheduler_config.block_size
-        self.pa_max_length = align_up(cache_seq_len, 128)
-        self.cache_len = self.pa_max_length // self.block_size
-        self.kv_cache_num_block = self.cache_len * batch_size_per_rank
-        self.kv_len_offset = torch.arange(
-            0,
-            batch_size_per_rank * self.pa_max_length,
-            self.pa_max_length,
-            dtype=torch.int64,
-            device="npu",
-        ).view(-1, 1)
-
         self.layers = nn.ModuleList(
             [
                 Qwen3_5MoeDecoderLayer(config, infer_config, comm_manager, layer_idx)
@@ -2674,13 +2732,7 @@ class Qwen3_5MoeTextModel(nn.Module):
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
         residual = None
 
-        seq_len = forward_metadata.actual_seq_lengths_kv
-        is_prefill = forward_metadata.is_prefill
-        slot_mapping = self.get_slot_mapping(seq_len, is_prefill, position_ids.device)
         kv_len = forward_metadata.kv_len
-        if not is_prefill:
-            batch_size = seq_len.shape[0]
-            kv_len = kv_len.long().view(-1) + self.kv_len_offset[:batch_size].view(-1)
 
         for layer_idx, decoder_layer in enumerate(self.layers[: self.config.num_hidden_layers]):
             residual, hidden_states = decoder_layer(
@@ -2690,7 +2742,6 @@ class Qwen3_5MoeTextModel(nn.Module):
                 past_residual=residual,
                 forward_metadata=forward_metadata,
                 kv_len=kv_len,
-                slot_mapping=slot_mapping,
                 **kwargs,
             )
 
@@ -2712,18 +2763,6 @@ class Qwen3_5MoeTextModel(nn.Module):
             last_hidden_state=hidden_states
         )
 
-    def get_slot_mapping(self, kv_len, is_prefill, device):
-        if not is_prefill:
-            return None
-        all_tensors = []
-        for i, seq_len in enumerate(kv_len):
-            new_index = torch.arange(
-                self.pa_max_length * i, seq_len.item() + self.pa_max_length * i,
-                dtype=kv_len.dtype, device=device
-                )
-            all_tensors.append(new_index)
-        return torch.cat(all_tensors)
-
     def _update_linear_attn_mask(self, attention_mask, forward_metadata):
         """
         NOTE: Left-padding is used for linear attention mask.
@@ -2744,6 +2783,8 @@ class Qwen3_5MoeForCausalLM(nn.Module):
     # def __init__(self, config):
         super().__init__()
         _init_qwen3_5_quant_config(config, infer_config)
+        _validate_qwen3_5_quantization_support(config, infer_config)
+        _configure_qwen3_5_npugraph(infer_config)
         self.config = config
         self.infer_config = infer_config
         self.comm_manager = comm_manager
@@ -2757,6 +2798,7 @@ class Qwen3_5MoeForCausalLM(nn.Module):
         self.shared_tp_size = infer_config.parallel_config.shared_tp_size
         self.moe_tp_size = infer_config.parallel_config.moe_tp_size
         self.moe_ep_size = infer_config.parallel_config.moe_ep_size
+        self.is_950_platform = _is_qwen3_5_950_platform()
 
         # Initialize communication groups before creating model components
         self.init_parallel_comm_group()
@@ -2819,16 +2861,21 @@ class Qwen3_5MoeForCausalLM(nn.Module):
         # MoE EP group
         if self.moe_ep_size > 1:
             moe_ep_group_num = self.world_size // self.moe_ep_size
+            moe_ep_group_type = 0 if self.is_950_platform else None
             self.comm_manager.register_group(
                 name="moe_ep_group",
                 group_num=moe_ep_group_num,
                 group_size=self.moe_ep_size,
                 group_stride=moe_ep_group_num,
                 return_name=True,
+                group_type=moe_ep_group_type,
             )
 
         # MoE EP group for MC2 (dispatch/combine fusion)
         if self.moe_ep_size > 1 and self.moe_tp_size == 1:
+            moe_ep_mc2_buffer_size = calc_moe_hccl_buffer_size(
+                self.infer_config, self.config, is_full_mesh_v2=not self.is_950_platform
+            )
             self.comm_manager.register_group(
                 name="moe_ep_group_mc2",
                 group_num=self.world_size // self.moe_ep_size,
@@ -2836,6 +2883,8 @@ class Qwen3_5MoeForCausalLM(nn.Module):
                 group_stride=self.world_size // self.moe_ep_size,
                 return_name=True,
                 allow_physical_reuse=False,
+                hccl_buffer_size=moe_ep_mc2_buffer_size,
+                group_type=3 if self.is_950_platform else None,
             )
 
     def forward(
@@ -2865,64 +2914,11 @@ class Qwen3_5MoeForCausalLM(nn.Module):
         return logits.float()
 
     def init_cache(self, device):
-        """Initialize KV cache using standard PageAttention format (block_size=128)."""
-        # batch_size = self.infer_config.scheduler_config.batch_size_per_dp_rank
-        # cache_seq_len = self.infer_config.data_config.input_truncated_len + \
-        #     self.infer_config.scheduler_config.max_new_tokens
-        # dtype = self.config.torch_dtype
-
-        # # Standard PageAttention: fixed block_size (FA optimized size)
-        # # block_size can be configured, default 128
-        # block_size = self.infer_config.model_config.custom_params.get("pa_block_size", 128)
-
-        # # Each request needs cache_len blocks
-        # cache_len = cache_seq_len // block_size
-        # if cache_seq_len % block_size != 0:
-        #     cache_len += 1  # round up
-
-        # # Total blocks in cache pool
-        # kv_cache_num_block = cache_len * batch_size
-
-        # # block_table: [batch_size, cache_len]
-        # # Each request occupies cache_len consecutive blocks
-        # # request 0: blocks [0, 1, ..., cache_len-1]
-        # # request 1: blocks [cache_len, cache_len+1, ..., 2*cache_len-1]
-        # block_table = torch.arange(
-        #     0, batch_size * cache_len, dtype=torch.int32, device=device
-        # ).reshape(batch_size, cache_len)
-
-        # # kv_len_offset: [batch_size, 1]
-        # # Each request's cache region starts at: batch_idx * cache_seq_len
-        # # Used for decode slot_mapping calculation
-        # kv_len_offset = torch.arange(
-        #     0, batch_size * cache_seq_len, cache_seq_len,
-        #     dtype=torch.int64, device=device
-        # ).view(-1, 1)
-
-
+        """Initialize linear attention states and continuous Full Attention caches."""
         batch_size = self.infer_config.scheduler_config.batch_size_per_dp_rank
         cache_seq_len = self.infer_config.data_config.input_truncated_len + \
             self.infer_config.scheduler_config.max_new_tokens
         dtype = self.config.torch_dtype
-
-        block_size = self.infer_config.scheduler_config.block_size
-
-        cache_len = (cache_seq_len + block_size - 1) // block_size  # round up
-        aligned_cache_seq_len = cache_len * block_size
-
-        # block_table: [batch_size, cache_len]
-        block_table = torch.arange(
-            0, batch_size * cache_len, dtype=torch.int32, device=device
-        ).reshape(batch_size, cache_len)
-
-        # kv_len_offset: [batch_size, 1]
-        kv_len_offset = torch.arange(
-            0, batch_size * aligned_cache_seq_len, aligned_cache_seq_len,
-            dtype=torch.int64, device=device
-        ).view(-1, 1)
-
-        # k_cache/v_cache: [kv_cache_num_block, block_size, num_heads, head_dim]
-        kv_cache_num_block = cache_len * batch_size
 
         for layer_idx, layer in enumerate(self.model.layers[: self.config.num_hidden_layers]):
             if layer.layer_type == "linear_attention":
@@ -2938,24 +2934,14 @@ class Qwen3_5MoeForCausalLM(nn.Module):
                     dtype=dtype, device=device
                 )
             else:
-                # FullAttention cache: PageAttention format
-                # Shape: [kv_cache_num_block, block_size, num_heads, head_dim]
-                num_heads = layer.self_attn.num_key_value_heads_per_rank
-                head_dim = layer.self_attn.head_dim
-
                 layer.self_attn.k_cache = torch.empty(
-                    (kv_cache_num_block, block_size, num_heads, head_dim),
+                    (batch_size, cache_seq_len, layer.self_attn.cache_unit),
                     dtype=dtype, device=device
                 )
                 layer.self_attn.v_cache = torch.empty(
-                    (kv_cache_num_block, block_size, num_heads, head_dim),
+                    (batch_size, cache_seq_len, layer.self_attn.cache_unit),
                     dtype=dtype, device=device
                 )
-
-                # Set block_table, block_size
-                layer.self_attn.block_table = block_table
-                layer.self_attn.block_size = block_size
-
 
     def load_weights(self, weights):
         stacked_params_mapping = [

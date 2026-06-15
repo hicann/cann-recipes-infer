@@ -11,7 +11,6 @@ model_config:
   custom_params:
       enable_mm_all_reduce_base: False
       enable_gdn_solve_triangular: False
-      enable_decode_moe_dispatch_combine_v2: False
       # Online MXFP8 converts loaded BF16/FP16 weights after checkpoint loading.
       # It is intentionally configured here instead of relying on checkpoint config.json.
       enable_online_mxfp8_quantization: True
