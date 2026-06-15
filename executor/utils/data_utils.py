@@ -131,8 +131,12 @@ def build_dataset_input(tokenizer, prompts, input_max_len, max_new_tokens=32, is
             f"First, tell me the title and the author, and then tell the story in {max_new_tokens} words.\n\n "
     if is_chat:
         system_prompt_chat = [{"role": "user", "content": prefix + suffix}]
-        system_prompt_len = \
-            len(tokenizer.apply_chat_template(system_prompt_chat, add_generation_prompt=True, return_dict=False))
+        system_prompt_len = len(tokenizer.apply_chat_template(
+                                system_prompt_chat,
+                                add_generation_prompt=True,
+                                return_dict=False,
+                                tokenize=True
+                            ))
     else:
         system_prompt_len = len(tokenizer(prefix + suffix).input_ids)
     if system_prompt_len > input_max_len:

@@ -384,7 +384,6 @@ class DeepseekV3MoE(nn.Module):
                 "group_tp": mc2_group_name,
                 "tp_world_size": self.moe_tp_size,
                 "tp_rank_id": global_rank % self.moe_tp_size,
-                "comm_alg": "fullmesh_v2",
             }
         self.combine_kwargs = {
                 "x_active_mask": None,
