@@ -2,7 +2,7 @@
 
 DeepSeek团队发布了最新的模型DeepSeek-V4系列模型，包含DeepSeek-V4 Flash和DeepSeek-V4 Pro两种规格。在DeepSeek-V3.2的稀疏Attention（DeepSeek Sparse Attention）的基础上，在不同层间进一步通过KV Cache滑窗 (Window Cache) 和压缩算法 (KV Cache Compress)，减少Attention的计算和访存开销，可以大幅提升长序列的计算效率，降低推理的成本。本实践0 Day支持了DeepSeek-V4的模型推理部署，并适配支持`Atlas-A3 Pod`和`950PR/DT`多代际昇腾芯片，提供长达1M序列的高性能推理能力。
 
-针对新模型结构特点，实践打造了低时延、高吞吐的部署方案，创新设计高性能NPU融合Kernel和多流并行方案，大幅提升推理性能。在量化支持上，本实践在`Atlas-A3 Pod`平台适配了W8A8C16（Int8）量化方案，在`950PR/DT`平台上支持了原生Hybrid FP8-MXFP4混合量化模式，以及硬件亲和的Hybrid MXFP8-MXFP4模式，充分发挥不同硬件的算力优势。本实践同步开源了TileLang和PyPTO实现，为高效算子开发提供可直接参考的样例，仅需几百行代码即可完成复杂融合kernel的开发工作。
+针对新模型结构特点，实践打造了低时延、高吞吐的部署方案，创新设计高性能NPU融合Kernel和多流并行方案，大幅提升推理性能。在量化支持上，本实践在`Atlas-A3 Pod`平台适配了W8A8C16（Int8）量化方案，在`950PR/DT`平台上支持了原生Hybrid FP8-MXFP4混合量化模式，以及硬件亲和的Hybrid MXFP8-MXFP4和Hybrid HiF8-MXFP8-MXFP4模式，充分发挥不同硬件的算力优势。本实践同步开源了TileLang和PyPTO实现，为高效算子开发提供可直接参考的样例，仅需几百行代码即可完成复杂融合kernel的开发工作。
 针对DeepSeek-V4模型的新结构，本次开源提供了一系列高性能融合算子，主要包括：
 
 - 针对多Layer交织的Window/Sparse/Compress Attention，提供了SparseAttnSharedKV (SAS)统一接口支持多种Attention计算。
@@ -247,7 +247,7 @@ W4A8：W4指权重使用静态Per-Channel Int4量化，A8指数据使用动态Pe
 ### Ascend 950PR/DT
 #### Hybrid MXFP8-MXFP4 (推荐DeepSeekV4-Flash/Pro模型使用)
 
-本实践支持了原生Hybrid FP8-MXFP4量化方式，同时也支持了使用MXFP8替换原生FP8格式的Linear模块，在Prefill和Decode高吞吐场景可以进一步提升算力利用率，提高整体性能。Hybrid MXFP8-MXFP4整体量化策略如下：
+本实践支持了原生Hybrid FP8-MXFP4量化方式，同时也支持了使用MXFP8或HiF8替换原生FP8格式的Linear模块，在Prefill和Decode高吞吐场景可以进一步提升算力利用率，提高整体性能。Hybrid MXFP8-MXFP4整体量化策略如下：
 
 <p align="center">
   <img src="./figures/quant_mxfp8.jpg" width="70%" alt="quant_mxfp8">
@@ -268,6 +268,26 @@ W4A8：W4指权重使用静态Per-Channel Int4量化，A8指数据使用动态Pe
 
 MLAProlog KV Cache的量化策略使用了动态存8算16。在超长序列情况下，C8 KV Cache内存优化2倍。LI通过A8C8获取计算收益，降低LI计算时延，同步优化TTFT和TPOT。
 
+#### Hybrid HiF8-MXFP8-MXFP4 (推荐DeepSeekV4-Flash模型使用)
+
+本实践同时也支持 Hybrid HiF8-MXFP8-MXFP4，整体量化策略如下：
+
+<p align="center">
+  <img src="./figures/quant_hif8.jpg" width="70%" alt="quant_hif8">
+</p>
+
+- MLAProlog：`q_a_proj`, `q_b_proj`, `kv_proj`使用HiF8 Per-Tensor量化；KV Cache采用C8伪量化；
+- IndexerProlog：`q_b_proj`, `indexer_q`, Indexer Cache使用HiF8 Per-Tensor量化；`indexer_weight`不量化；
+- LightningIndexer: `batch_matmul`使用HiF8计算；
+- Compressor: Linear不量化；
+- MLAEpilog：`o_a_proj`和`o_b_proj`使用HiF8 Per-Tensor量化；
+- MoE：路由专家的Linear使用W4A8量化，共享专家的Linear使用W8A8量化；
+- LMHead：不量化。
+
+> 注：
+> HiF8：表示采用静态Per-Tensor HiF8量化，Scale格式为FP32；
+> MoE W4A8/W8A8：与Hybrid MXFP8-MXFP4中MoE的量化策略保持一致；
+> KV Cache C8：表示KV Cache使用动态Per-Group-64 FP8量化，Scale格式为E8M0。
 
 
 ## 多流并行优化
@@ -336,7 +356,7 @@ for layer in model_layers:
 
 [profile_data](https://cann-ai.obs.cn-north-4.myhuaweicloud.com/cann-quantization/DeepSeek/profile_data/trace_view_950DT_decode.json)
 
-在`950DT`平台上，本实践使用16卡对模型进行部署，部署策略采用 Attention Data Parallel (DP) 和 MoE Expert Parallel (EP)并行。DeepSeek-V4 Flash 8K序列场景Decode单卡吞吐1821TPS@10ms，对应的Profile数据已在上方链接开源，不同Batch Size和序列长度的性能Benchmark测试如下：
+在`950DT`平台上，本实践使用16卡对模型进行部署，部署策略采用 Attention Data Parallel (DP) 和 MoE Expert Parallel (EP)并行。DeepSeek-V4 Flash 8K序列场景Hybrid MXFP8-MXFP4量化Decode单卡吞吐1821TPS@10ms，对应的Profile数据已在上方链接开源，不同Batch Size和序列长度的性能Benchmark测试如下：
 
 **950DT Deepseek-V4 Flash Benchmark**
 
@@ -350,6 +370,13 @@ for layer in model_layers:
 | 768  | 16  | 1   | Hybrid MXFP8-MXFP4    | 131072   | 10.50     | 4569.64 |
 | 16   | 16  | 3   | Hybrid MXFP8-MXFP4    | 1048576  | 8.04      | 124.36  |
 | 64   | 16  | 3   | Hybrid MXFP8-MXFP4    | 1048576  | 9.46      | 422.88  |
+| 16   | 16  | 3   | Hybrid HiF8-MXFP8-MXFP4    | 8192     | 6.27      | 159.49  |
+| 256  | 16  | 3   | Hybrid HiF8-MXFP8-MXFP4    | 8192     | 8.41      | 1902.50 |
+| 1536 | 16  | 1   | Hybrid HiF8-MXFP8-MXFP4    | 8192     | 15.95     | 6017.70 |
+| 16   | 16  | 3   | Hybrid HiF8-MXFP8-MXFP4    | 131072   | 6.45      | 155.03  |
+| 256  | 16  | 3   | Hybrid HiF8-MXFP8-MXFP4    | 131072   | 9.22      | 1735.36 |
+| 16   | 16  | 3   | Hybrid HiF8-MXFP8-MXFP4    | 1048576  | 7.71      | 129.70  |
+| 64   | 16  | 3   | Hybrid HiF8-MXFP8-MXFP4    | 1048576  | 9.11      | 439.08  |
 | 256  | 16  | 3   | Hybrid FP8-MXFP4      | 8192     | 11.06     | 1447.00 |
 | 1536 | 16  | 1   | Hybrid FP8-MXFP4      | 8192     | 24.28     | 3953.49 |
 
@@ -368,7 +395,7 @@ DeepSeek-V4 Pro Decode不同Batch Size和序列长度的性能Benchmark测试如
 
 > 注：性能数据基于MTP投机与强制EPLB配置采集，MTP3场景下平均3个Draft Token中Accepted Token个数为1.44，MTP1场景下平均1个Draft Token中Accepted Token个数为0.7，用户可按照数据集实际接受率自行折算benchmark性能。
 
-> 注：Hybrid FP8-MXFP4指转换后的权重中部分Matmul FP8量化 + MoE模块MXFP4量化；Hybrid MXFP8-MXFP4指转换后的权重中部分Matmul MXFP8量化 + MoE模块MXFP4量化，详情见[量化策略](#量化策略)。
+> 注：Hybrid FP8-MXFP4指转换后的权重中部分Matmul FP8量化 + MoE模块MXFP4量化；Hybrid MXFP8-MXFP4指转换后的权重中部分Matmul MXFP8量化 + MoE模块MXFP4量化；Hybrid HiF8-MXFP8-MXFP4指转换后的权重中部分Matmul HiF8量化 + MoE模块MXFP4量化，详情见[量化策略](#量化策略)。
 
 #### Atlas-A3 Pod
 
@@ -386,7 +413,5 @@ DeepSeek-V4 Pro Decode不同Batch Size和序列长度的性能Benchmark测试如
 > 注：LI Cache使用Int8量化，KV Cache使用BF16计算。性能数据基于MTP1与强制EPLB配置采集，平均1个Draft Token中Accepted Token个数为0.7，用户可按照数据集实际接受率自行折算benchmark性能。
 
 ## Future Plan
-
-- **量化**：在`950PR/DT`平台，将进一步支持HiFloat8量化方式，丰富量化形态；
 - **SuperKernel**：使能Super Kernel进一步降低算子启动开销与调度间隙，提升计算执行效率；
 - **融合Kernel性能优化**：通过Flash Decode等技术，优化长序列场景下的LI/SAS性能。

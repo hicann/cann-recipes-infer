@@ -114,7 +114,7 @@ CANNLab一站式开发平台已预置部署运行环境，使用CANNLab一站式
 
 ### 转换权重
 
- 原生`Hybrid FP8-MXFP4权重`执行推理时可跳过这一步骤，若需要使用 INT8、Hybrid INT8-INT4 或 Hybrid MXFP8-MXFP4 权重执行推理，需要进入容器并在各个节点上使用`utils/convert_model.py` 脚本完成 Hybrid FP8-MXFP4 到 INT8/Hybrid INT8-INT4 /Hybrid MXFP8-MXFP4 权重转换。
+ 原生`Hybrid FP8-MXFP4权重`执行推理时可跳过这一步骤，若需要使用 INT8、Hybrid INT8-INT4、Hybrid MXFP8-MXFP4 或 Hybrid HiF8-MXFP8-MXFP4 权重执行推理，需要进入容器并在各个节点上使用`utils/convert_model.py` 脚本完成 Hybrid FP8-MXFP4 到 INT8/Hybrid INT8-INT4 /Hybrid MXFP8-MXFP4 /Hybrid HiF8-MXFP8-MXFP4 权重转换。
 
   >入参介绍：`input_fp8_hf_path`：原始权重路径；`output_hf_path`：转换后输出的权重路径；`quant_type`：量化模式；`quant_param_path`：量化参数文件夹路径（仅适用于DeepSeek-V4-Pro的Hybrid INT8-INT4量化）
 
@@ -139,8 +139,8 @@ CANNLab一站式开发平台已预置部署运行环境，使用CANNLab一站式
   # 转换为Hybrid MXFP8-MXFP4权重，适用于950PR/DT系列
   python utils/convert_model.py --input_fp8_hf_path /data/models/deepseek_v4  --output_hf_path /data/models/deepseek_v4_hybrid_mxfp8_mxfp4 --quant_type w4a8-mx
 
-  # 转换为Hybrid MXFP8-MXFP4-HiF8权重，适用于950PR/DT系列
-  python utils/convert_model.py --input_fp8_hf_path /data/models/deepseek_v4  --output_hf_path /data/models/deepseek_v4_hybrid_mxfp8_mxfp4_hif8 --quant_type w4a8-mx-hif
+  # 转换为Hybrid HiF8-MXFP8-MXFP4权重，适用于950PR/DT系列
+  python utils/convert_model.py --input_fp8_hf_path /data/models/deepseek_v4  --output_hf_path /data/models/deepseek_v4_hybrid_hif8_mxfp8_mxfp4 --quant_type w4a8-mx-hif
 
   ```
 
@@ -175,6 +175,7 @@ CANNLab一站式开发平台已预置部署运行环境，使用CANNLab一站式
 | 平台  | 模型型号             |  推荐量化策略  | 最小部署单元（chips）|
 |-------|---------------------|--------------|--------------|
 | 950PR/DT  | DeepSeek-V4 Flash    | Hybrid MXFP8-MXFP4 |4          |
+| 950PR/DT  | DeepSeek-V4 Flash    | Hybrid HiF8-MXFP8-MXFP4 |4          |
 | 950PR/DT  | DeepSeek-V4 Pro      | Hybrid MXFP8-MXFP4 |16         |
 | Atlas A3  | DeepSeek-V4 Flash    | INT8 W8A8 |4          |
 | Atlas A3  | DeepSeek-V4 Pro      | Hybrid INT8-INT4 |32         |
