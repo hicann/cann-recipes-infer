@@ -2813,6 +2813,7 @@ class Qwen3_5MoeForCausalLM(nn.Module):
             name="attn_tp_group",
             group_num=self.world_size // self.attn_tp_size,
             group_size=self.attn_tp_size,
+            return_name=True,
         )
 
         # Embedding TP group
@@ -2820,6 +2821,7 @@ class Qwen3_5MoeForCausalLM(nn.Module):
             name="embed_tp_group",
             group_num=self.world_size // self.embed_tp_size,
             group_size=self.embed_tp_size,
+            return_name=True,
         )
 
         # LM Head TP group
@@ -2827,6 +2829,7 @@ class Qwen3_5MoeForCausalLM(nn.Module):
             name="lmhead_tp_group",
             group_num=self.world_size // self.lmhead_tp_size,
             group_size=self.lmhead_tp_size,
+            return_name=True,
         )
 
         # Shared Expert TP group
@@ -2835,6 +2838,7 @@ class Qwen3_5MoeForCausalLM(nn.Module):
                 name="shared_tp_group",
                 group_num=self.world_size // self.shared_tp_size,
                 group_size=self.shared_tp_size,
+                return_name=True,
             )
 
         # MoE TP group
@@ -2843,6 +2847,7 @@ class Qwen3_5MoeForCausalLM(nn.Module):
                 name="moe_tp_group",
                 group_num=self.world_size // self.moe_tp_size,
                 group_size=self.moe_tp_size,
+                return_name=True,
             )
 
         # MoE EP group
