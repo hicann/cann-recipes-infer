@@ -312,7 +312,7 @@ class ModelWorker:
                 self.model.forward,
                 exe_mode=self.exe_mode,
                 enable_cache_compile=self.enable_cache_compile,
-                cache_dir=os.path.join(self.infer_config.model_config.output_path, "cache_compile"),
+                cache_dir=os.path.join(self.infer_config.model_config.output_path, "compile_cache"),
                 enable_static_kernel=self.enable_static_kernel,
                 enable_superkernel=self.enable_superkernel
             )
