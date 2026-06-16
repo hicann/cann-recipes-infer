@@ -28,6 +28,7 @@
 - `force_eplb`: 是否为 MoE 模型开启强制的专家负载均衡（默认 False）。
 - `enable_profiler`: 是否启用性能分析器（默认 False）。
 - `enable_weight_nz`: 是否启用权重 NZ 格式（默认 True）。
+- `platform_version`：指定运行推理的平台，支持配置为 A3 或 950（默认 A3）。
 - `custom_params`：存放模型特有特性的字典（默认{}）。
 
 ### 2.3 ParallelConfig (并行配置)

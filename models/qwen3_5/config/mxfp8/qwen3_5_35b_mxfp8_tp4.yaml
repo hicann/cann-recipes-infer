@@ -5,7 +5,6 @@ model_config:
   enable_profiler: False # [False, True]
   with_ckpt: True
   enable_cache_compile: False
-  packed_sequence: False
   force_eplb: False
   platform_version: "950"
   custom_params:

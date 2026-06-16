@@ -792,11 +792,6 @@ def ge_safe_softplus(x: torch.Tensor) -> torch.Tensor:
     return torch.relu(x) + torch.log1p(torch.exp(-torch.abs(x)))
 
 
-is_fast_path_available = all(
-    (causal_conv1d_fn, causal_conv1d_update, chunk_gated_delta_rule, fused_recurrent_gated_delta_rule)
-)
-
-
 def torch_causal_conv1d_update(
     hidden_states,
     conv_state,
@@ -1067,14 +1062,6 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
 
         self.chunk_gated_delta_rule = chunk_gated_delta_rule or torch_chunk_gated_delta_rule
         self.recurrent_gated_delta_rule = fused_recurrent_gated_delta_rule or torch_recurrent_gated_delta_rule
-
-        if not is_fast_path_available:
-            logger.info(
-                "WARNING: The fast path is not available because one of the required library is not installed. "
-                "Falling back to torch implementation. To install follow "
-                "https://github.com/fla-org/flash-linear-attention#installation and "
-                "https://github.com/Dao-AILab/causal-conv1d"
-            )
 
         self.in_proj_qkvz = Qwen3_5MoeGatedDeltaNetQKVZProj(
             self.hidden_size,
@@ -2478,7 +2465,7 @@ class Qwen3_5MoeRMSNorm(nn.Module):
 
     def rms_norm_mx(self, x, dst_type=292):
         """
-        dst_type:{  
+        dst_type:{
             291: torch.float8_e5m2,
             292: torch.float8_e4m3fn,
             296: float4_e2m1fn_x2,
@@ -2495,7 +2482,7 @@ class Qwen3_5MoeRMSNorm(nn.Module):
 
     def add_rms_norm_mx(self, residual, x, dst_type=292):
         """
-        dst_type:{  
+        dst_type:{
             291: torch.float8_e5m2,
             292: torch.float8_e4m3fn,
             296: float4_e2m1fn_x2,

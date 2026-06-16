@@ -46,11 +46,17 @@ Qwen3.5-MoE模型是Qwen3.5系列中的混合专家模型。本样例基于trans
 4. 配置样例运行所需环境信息。
 
    修改`executor/scripts/set_env.sh`中的如下字段：
-
    - `IPs`：配置所有节点的IP，按照rank id排序，多个节点的IP通过空格分开，例如：`('xxx.xxx.xxx.xxx' 'xxx.xxx.xxx.xxx')`。
-   - `cann_path`：CANN软件包安装路径，例如`/usr/local/Ascend/ascend-toolkit/latest`。
+   - `cann_path`：CANN软件包安装路径，例如`/usr/local/Ascend/cann-{version}/`。
 
-   `set_env.sh`会自动将当前代码仓根目录加入`PYTHONPATH`。HCCL相关配置，如`HCCL_SOCKET_IFNAME`、`HCCL_OP_EXPANSION_MODE`，可参考[集合通信文档](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/83RC1alpha002/maintenref/envvar/envref_07_0001.html#ZH-CN_TOPIC_0000002449945377__section163522499503)并在`executor/scripts/function.sh`中按实际网卡和集群环境自定义配置。
+   `set_env.sh`会自动将当前代码仓根目录加入`PYTHONPATH`。
+
+   HCCL相关配置，如`HCCL_SOCKET_IFNAME`、`HCCL_OP_EXPANSION_MODE`，`HCCL_DETERMINISTIC`，可参考[集合通信文档](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/910beta1/maintenref/envvar/envref_07_0001.html#ZH-CN_TOPIC_0000002586886161__section171761527165613)并在`executor/scripts/function.sh`中按实际网卡和集群环境自定义配置。
+
+   注意，在A3平台部署此模型的推理时，为确保精度，请通过设置环境变量 HCCL_DETERMINISTIC 为 true 来开启[归约算子的确定性计算](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/910beta1/maintenref/envvar/envref_07_0099.html)：
+   ```bash
+   export HCCL_DETERMINISTIC=true
+   ```
 
 ## 权重准备
 请根据所使用的模型类型下载原始权重到`/data/models`目录，例如`/data/models/Qwen3.5-35B-A3B`。
@@ -120,41 +126,35 @@ YAML文件统一放在`models/qwen3_5/config`，具体参数说明可参考[Qwen
 
 ### 4. 执行推理脚本
 
-进入仓库根目录，执行统一推理脚本：
-
+先进入仓库根目录：
 ```bash
 cd cann-recipes-infer
-bash executor/scripts/infer.sh --model qwen3_5 --yaml qwen3_5_35b_ep8.yaml
 ```
 
-8卡执行示例：
+- 35B模型BF16精度8卡EP执行示例：
+   ```bash
+   export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+   bash executor/scripts/infer.sh --model qwen3_5 --yaml qwen3_5_35b_ep8.yaml
+   ```
 
-```bash
-export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
-bash executor/scripts/infer.sh --model qwen3_5 --yaml qwen3_5_35b_ep8.yaml
-```
+- 397B模型BF16精度16卡TP执行示例：
+   ```bash
+   export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+   bash executor/scripts/infer.sh --model qwen3_5 --yaml qwen3_5_397b_tp16.yaml
+   ```
 
-16卡执行示例：
+- 35B模型FP8量化加速8卡EP执行示例：
+   ```bash
+   # 将 qwen3_5_35b_ep8.yaml 中的 model_path 修改为 FP8 权重路径后执行。
+   export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+   bash executor/scripts/infer.sh --model qwen3_5 --yaml qwen3_5_35b_ep8.yaml
+   ```
 
-```bash
-export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
-bash executor/scripts/infer.sh --model qwen3_5 --yaml qwen3_5_397b_tp16.yaml
-```
-
-FP8量化加速执行示例：
-
-```bash
-# 将 qwen3_5_35b_ep8.yaml 中的 model_path 修改为 FP8 权重路径后执行。
-export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
-bash executor/scripts/infer.sh --model qwen3_5 --yaml qwen3_5_35b_ep8.yaml
-```
-
-MXFP8量化加速执行示例：
-
-```bash
-export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3
-bash executor/scripts/infer.sh --model qwen3_5 --yaml mxfp8/qwen3_5_35b_mxfp8_tp4.yaml
-```
+- 35B模型MXFP8量化加速4卡TP执行示例：
+   ```bash
+   export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3
+   bash executor/scripts/infer.sh --model qwen3_5 --yaml mxfp8/qwen3_5_35b_mxfp8_tp4.yaml
+   ```
 
 > 说明：如果是多机环境，需要在每个节点上执行。脚本会根据YAML中的`world_size`和`executor/scripts/set_env.sh`中的IP列表计算各节点rank信息。
 
