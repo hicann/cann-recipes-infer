@@ -89,7 +89,23 @@ TORCH_LIBRARY(custom, m) {
         "str layout_q='BSND', str layout_kv='PA_ND', bool has_ori_kv=True, bool has_cmp_kv=True, str device='npu:0') -> Tensor");
     m.def("npu_rms_norm_dynamic_quant(Tensor x, Tensor gamma, *, Tensor? smooth_scale=None, Tensor? beta=None, float epsilon=1e-6) -> (Tensor, Tensor)");
     m.def("npu_dequant_swiglu_clamp_quant(Tensor x, *, Tensor? weight_scale=None, Tensor? activation_scale=None, Tensor? bias=None, Tensor? quant_scale=None, Tensor? quant_offset=None, Tensor? group_index=None, bool activate_left=False, int quant_mode=0, int? dst_type=None, int? round_mode=None, int? activate_dim=None, int swiglu_mode=0, float clamp_limit=7.0, float glu_alpha=1.702, float glu_bias=1.0) -> (Tensor, Tensor)");
-    }
+    m.def("npu_quant_sparse_flash_mla(Tensor q, *, Tensor? ori_kv=None, Tensor? cmp_kv=None, Tensor? q_descale=None, "
+                                "Tensor? ori_kv_descale=None,Tensor? cmp_kv_descale=None, "
+                                "Tensor? ori_sparse_indices=None, Tensor? cmp_sparse_indices=None, "
+                                "Tensor? ori_block_table=None, Tensor? cmp_block_table=None, "
+                                "Tensor? cu_seqlens_q=None, Tensor? cu_seqlens_ori_kv=None, "
+                                "Tensor? cu_seqlens_cmp_kv=None, Tensor? seqused_q=None, "
+                                "Tensor? seqused_ori_kv=None, Tensor? seqused_cmp_kv=None, "
+                                "Tensor? cmp_residual_kv=None, "
+                                "Tensor? ori_topk_length=None, Tensor? cmp_topk_length=None, "
+                                "Tensor? sinks=None, Tensor? metadata=None, "
+                                "int qkv_quant_mode=None, "
+                                "float softmax_scale=None, int cmp_ratio=None, "
+                                "int ori_mask_mode=0, int cmp_mask_mode=0, "
+                                "int ori_win_left=-1, int ori_win_right=-1, "
+                                "str layout_q=\"BSND\", str layout_kv=\"BSND\", "
+                                "int topk_value_mode=1, bool return_softmax_lse=False) -> (Tensor, Tensor)");
+}
 // 通过pybind将c++接口和python接口绑定，这里绑定的是接口不是算子
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 }
