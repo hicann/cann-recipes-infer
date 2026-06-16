@@ -82,29 +82,6 @@ def rotate_activation(x: torch.Tensor, matrix: torch.Tensor) -> torch.Tensor:
     return x.matmul(matrix).view(init_shape).to(torch.bfloat16)
 
 
-def inplace_partial_rotary_mul(
-        tensor,
-        cos, sin,
-        partial_slice,
-        platform_version,
-        origin_shape
-    ):
-    if platform_version == "A3":
-        tensor = tensor.to(torch.float32)
-        torch.ops.custom.inplace_partial_rotary_mul(
-            tensor, cos, sin,
-            rotary_mode="interleave",
-            partial_slice=partial_slice,
-        )
-        return tensor.to(torch.bfloat16).view(origin_shape)
-    torch.ops.custom.inplace_partial_rotary_mul(
-        tensor, cos, sin,
-        rotary_mode="interleave",
-        partial_slice=partial_slice,
-    )
-    return tensor.view(origin_shape)
-
-
 def partial_rotary_mul_quant(
         tensor,
         cos, sin,

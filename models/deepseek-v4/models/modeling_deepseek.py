@@ -69,7 +69,7 @@ from .modules import (get_window_topk_idxs, get_compress_topk_idxs,
                       one_hot, yarn_get_mscale,
                       DeepseekV3RMSNorm, _init_rope, DEEPSEEKV3_START_DOCSTRING,
                       DEEPSEEKV3_INPUTS_DOCSTRING, DeepseekV3PreTrainedModel, apply_rotary_emb,
-                      inplace_partial_rotary_mul, partial_rotary_mul_quant
+                      partial_rotary_mul_quant
                     )
 from .modules import Indexer, Compressor, AttnMetaData, CacheData
 from .modules.registry import OpKernel
@@ -930,11 +930,10 @@ class Attention(nn.Module):
             last_win = torch.cat([second_last_win[:, -(self.window_size - last_kv_len):], last_win], dim=1)
         last_win_kv = self.wkv(last_win)
         last_win_kv = self.kv_norm(last_win_kv)
-        last_win_kv = inplace_partial_rotary_mul(
+        torch.ops.custom.inplace_partial_rotary_mul(
             last_win_kv.view(-1, 1, 1, self.head_dim), cos, sin,
+            rotary_mode="interleave",
             partial_slice=self.partial_slice,
-            platform_version=self.platform_version,
-            origin_shape=last_win_kv.shape,
         )
         return last_win_kv, x_list
 
@@ -963,11 +962,10 @@ class Attention(nn.Module):
         qr, qr_scale = self.apply_norm_dynamic_quant(qr)
         q = self.wq_b(qr, dynamic_scale=qr_scale).unflatten(-1, (self.num_heads_per_rank, self.head_dim))
         q = self.q_b_norm(q)
-        q = inplace_partial_rotary_mul(   # x: (T, 1, N, D); cos(T, 1, 1, D)
+        torch.ops.custom.inplace_partial_rotary_mul(
             q.flatten(0, 1).unsqueeze(2), cos, sin,
+            rotary_mode="interleave",
             partial_slice=self.partial_slice,
-            platform_version=self.platform_version,
-            origin_shape=q.shape,
         )
 
         if self.cp_size > 1:
@@ -983,11 +981,10 @@ class Attention(nn.Module):
         # win kv & topk_idxs
         kv = self.wkv(x)
         kv = self.kv_norm(kv)
-        kv = inplace_partial_rotary_mul(
+        torch.ops.custom.inplace_partial_rotary_mul(
             kv.view(-1, 1, 1, self.head_dim), cos, sin,
+            rotary_mode="interleave",
             partial_slice=self.partial_slice,
-            platform_version=self.platform_version,
-            origin_shape=kv.shape,
         )
 
         # update temporary full cache
@@ -1050,11 +1047,10 @@ class Attention(nn.Module):
             record_event(enable_multi_streams, self.mla_events, 1)
             with limit_core_num(enable_limit_core, kv_aic_num, kv_aic_num * self.aiv_to_aic_ratio): # parallel to wq_b
                 kv = self.kv_norm(kv)
-                kv = inplace_partial_rotary_mul(
+                torch.ops.custom.inplace_partial_rotary_mul(
                     kv.view(-1, 1, 1, self.head_dim), cos, sin,
+                    rotary_mode="interleave",
                     partial_slice=self.partial_slice,
-                    platform_version=self.platform_version,
-                    origin_shape=kv.shape,
                 )
                 record_stream(enable_multi_streams, kv, cur_stream)
                 record_event(enable_multi_streams, self.mla_events, 2)
@@ -1070,11 +1066,10 @@ class Attention(nn.Module):
             record_event(enable_multi_streams, self.indexer.indexer_events, 0)
         with limit_core_num(enable_limit_core, qb_aic_num, qb_aic_num * self.aiv_to_aic_ratio):
             q = self.q_b_norm(q)
-            q = inplace_partial_rotary_mul( # x: (T, 1, N, D); cos(T, 1, 1, D)
+            torch.ops.custom.inplace_partial_rotary_mul(
                 q.flatten(0, 1).unsqueeze(2), cos, sin,
+                rotary_mode="interleave",
                 partial_slice=self.partial_slice,
-                platform_version=self.platform_version,
-                origin_shape=q.shape,
             )
             # update kv cache in default stream can remove tensormove
             wait_event(enable_multi_streams, self.mla_events, 2)
@@ -1268,11 +1263,10 @@ class Attention(nn.Module):
             )
             o = o.view(bsz * seq_len, self.num_groups_per_rank, -1)
         else:
-            o = inplace_partial_rotary_mul(
+            torch.ops.custom.inplace_partial_rotary_mul(
                 o.flatten(0, 1).unsqueeze(2), cos, sin,
+                rotary_mode="interleave",
                 partial_slice=self.partial_slice,
-                platform_version=self.platform_version,
-                origin_shape=o.shape,
             )
             o = o.view(bsz * seq_len, self.num_groups_per_rank, -1).to(torch.bfloat16)
         if self.oproj_tp_size > 1:

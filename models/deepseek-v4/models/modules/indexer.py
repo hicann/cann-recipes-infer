@@ -39,7 +39,7 @@ from executor.utils import get_had_pow2, limit_core_num
 from executor.utils.stream_utils import npu_stream_switch, record_event, wait_event, record_stream
 from module.linear import ReplicatedLinear
 from .common_modules import DeepseekV3RMSNorm, apply_rotary_emb, rotate_activation, \
-    inplace_partial_rotary_mul, partial_rotary_mul_quant
+    partial_rotary_mul_quant
 from .compressor import Compressor
 
 
@@ -166,11 +166,10 @@ class Indexer(nn.Module):
                         origin_shape=q.shape,
                     )
                 else:
-                    q = inplace_partial_rotary_mul(   # x: (T, 1, N, D); cos(T, 1, 1, D)
+                    torch.ops.custom.inplace_partial_rotary_mul(
                         q.flatten(0, 1).unsqueeze(2), cos, sin,
+                        rotary_mode="interleave",
                         partial_slice=self.partial_slice,
-                        platform_version=self.platform_version,
-                        origin_shape=q.shape,
                     )
                 # hif8 covers outliers natively, no need for hadamard
                 if self.mm_quant_mode != "w8a8hifloat8":
