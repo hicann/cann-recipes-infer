@@ -244,7 +244,7 @@ dit_cache:
 
 通过单卡 FP8 YAML（`single_fp8.yaml`）直接启用；也可向任意 YAML 的 `model_args` 添加：
 
-- `fa-perblock-fp8: true`：启用 FP8 FA 量化（per-block，Q block=128，KV block=256）；
+- `fa-mxfp8: true`：启用 MXFP8 FA 激活值量化；
 - `mm-mxfp8: true`：启用 MXFP8 A8W8 量化（per-channel 直转）。
 
 量化**支持多卡推理**，**仅支持 950PR**。

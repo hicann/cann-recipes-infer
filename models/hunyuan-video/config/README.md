@@ -29,7 +29,7 @@ model_args:
   ulysses-degree: 8                # Ulysses sequence parallel degree. Multi-card configs use this field.
   ring-degree: 1                   # Ring attention degree. Sparse configs currently require 1.
   use-vae-parallel: true           # Whether to enable VAE parallelism. Options: [false, true].
-  fa-perblock-fp8: true            # Whether to enable FP8 FA activation quantization. Options: [false, true].
+  fa-mxfp8: true                   # Whether to enable MXFP8 FA activation quantization. Options: [false, true].
   mm-mxfp8: true                   # Whether to enable MXFP8 matmul quantization. Options: [false, true].
   dit-weight: "/abs/path/ckpt.pt"  # Optional DiT checkpoint path.
   model: "HYVideo-T/2-cfgdistill"  # DiT architecture. Options: ["HYVideo-T/2", "HYVideo-T/2-cfgdistill"].

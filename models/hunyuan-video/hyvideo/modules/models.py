@@ -504,7 +504,7 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
 
-        self.fa_type = "perblock_fp8" if args.fa_perblock_fp8 else "flash"
+        self.fa_type = "mxfp8" if args.fa_mxfp8 else "flash"
         self.patch_size = patch_size
         self.in_channels = in_channels
         self.out_channels = in_channels if out_channels is None else out_channels

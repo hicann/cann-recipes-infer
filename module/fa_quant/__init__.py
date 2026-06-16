@@ -13,6 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .fa_quant import npu_fp8_attn, npu_group_quant
+from .fa_quant import npu_mxfp8_attn, npu_mxfp8_quant
 
-__all__ = ['npu_fp8_attn', 'npu_group_quant']
+__all__ = ['npu_mxfp8_attn', 'npu_mxfp8_quant']

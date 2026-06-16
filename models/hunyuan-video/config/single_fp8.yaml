@@ -9,7 +9,7 @@ model_args:
   flow-shift: 7.0
   flow-reverse: true                 # [false, true]
   use-cpu-offload: false             # [false, true]
-  fa-perblock-fp8: true              # [false, true]
+  fa-mxfp8: true                     # [false, true]
   mm-mxfp8: true                     # [false, true]
 
 model_name: "hunyuan-video"

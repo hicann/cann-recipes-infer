@@ -1,6 +1,7 @@
 # cann-recipes-infer
 
 ## 🚀Latest News
+- [2026/06] HunyuanVideo模型在昇腾950PR/DT系列上支持mxfp8 a8w8量化和Flash Attention mxfp8激活值量化。
 - [2026/06] DeepSeek-V4模型在昇腾950PR/DT系列上已支持HiF8推理部署。
 - [2026/06] Qwen3.5模型文生文通路在昇腾Atlas A3系列上已完成推理部署。
 - [2026/05] Hy3-preview模型基于模型优化Agent（底座DeepSeek-V4-Pro），在昇腾Atlas A3系列上已完成端到端优化适配，支持推理部署。

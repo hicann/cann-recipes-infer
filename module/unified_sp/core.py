@@ -24,7 +24,7 @@ import torch_npu
 
 from .uaa import _maybe_pad_qkv_head, _gather_size_by_comm, _wait_tensor, \
                 _maybe_unpad_qkv_head, _maybe_pad_o_head, _maybe_unpad_o_head
-from ..fa_quant import npu_group_quant, npu_fp8_attn
+from ..fa_quant import npu_mxfp8_attn
 
 
 @dataclass
@@ -90,7 +90,7 @@ class UnifiedSPAttention:
         ring_group: dist.ProcessGroup,
         use_ring_overlap: bool = True,
         ulysses_anything: bool = False,
-        fa_perblock_fp8: bool = False,
+        fa_mxfp8: bool = False,
     ):
         self.ulysses_pg = ulysses_group
         self.ring_pg = ring_group
@@ -99,10 +99,10 @@ class UnifiedSPAttention:
         self.ulysses_world_size = dist.get_world_size(ulysses_group) if ulysses_group else 1
         self.ring_world_size = dist.get_world_size(ring_group) if ring_group else 1
 
-        if fa_perblock_fp8:
+        if fa_mxfp8:
             if self.ring_world_size > 1:
                 raise ValueError("The quantization method supports only Ulysses Attention sequence parallel now!")
-            self.attention_func = self._npu_fp8_attention
+            self.attention_func = self._npu_mxfp8_attention
         elif self.ring_world_size > 1 and self.use_ring_overlap:
             self.attention_func = self._npu_attention_with_lse
         else:
@@ -680,23 +680,16 @@ class UnifiedSPAttention:
 
 
     @staticmethod
-    def _npu_fp8_attention(
+    def _npu_mxfp8_attention(
         params: AttentionParams,
         dst_type: torch.dtype = torch.float8_e4m3fn
     ) -> torch.Tensor:
         """
-        Compute FP8 quantized attention.
+        Compute MXFP8 quantized attention.
 
-        Delegates to npu_fp8_attn from fa_quant module for the actual computation.
-
-        Args:
-            params: AttentionParams containing q, k, v tensors with shape (b, s, n, d)
-            dst_type: Target quantization dtype (default: torch.float8_e4m3fn)
-
-        Returns:
-            torch.Tensor: Output tensor with shape (b, s, n, d), dtype torch.bfloat16
+        Delegates to npu_mxfp8_attn from fa_quant module for the actual computation.
         """
-        return npu_fp8_attn(
+        return npu_mxfp8_attn(
             params.q, params.k, params.v,
             dst_type=dst_type,
             softmax_scale=params.softmax_scale

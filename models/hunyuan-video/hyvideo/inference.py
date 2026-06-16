@@ -78,7 +78,7 @@ def parallelize_transformer(pipe):
         ring_group=get_sp_group().ring_group,
         use_ring_overlap=True,
         ulysses_anything=transformer.args.ulysses_anything,
-        fa_perblock_fp8=pipe.args.fa_perblock_fp8
+        fa_mxfp8=pipe.args.fa_mxfp8
     )
 
     # Set SP group for cache_manager to enable multi-card cache synchronization 
@@ -256,7 +256,7 @@ class Inference(object):
 
         # =========================== Build main model ===========================
 
-        use_quant = args.use_fp8 or args.mm_mxfp8 or args.fa_perblock_fp8
+        use_quant = args.use_fp8 or args.mm_mxfp8 or args.fa_mxfp8
         device_name = torch.npu.get_device_name()
         not_950 = any(device_prefix in device_name for device_prefix in ["Ascend910B", "Ascend910_93"])
         

@@ -424,9 +424,9 @@ def add_inference_args(parser: argparse.ArgumentParser):
     )
 
     group.add_argument(
-        "--fa-perblock-fp8",
+        "--fa-mxfp8",
         action="store_true",
-        help="Enable per_block fp8 quantization in flash attention to accelerate inference."
+        help="Enable mxfp8 activation quantization in flash attention to accelerate inference."
     )
 
     group.add_argument(
