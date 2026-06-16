@@ -93,6 +93,7 @@ class ModelWorker:
         self.enable_static_kernel = self.infer_config.model_config.enable_static_kernel
         self.use_pretrained_model = self.infer_config.model_config.with_ckpt
         self.enable_cache_compile = self.infer_config.model_config.enable_cache_compile
+        self.enable_superkernel = self.infer_config.model_config.custom_params["enable_superkernel"]
 
         # Model Components
         self.device = device
@@ -313,6 +314,7 @@ class ModelWorker:
                 enable_cache_compile=self.enable_cache_compile,
                 cache_dir=os.path.join(self.infer_config.model_config.output_path, "cache_compile"),
                 enable_static_kernel=self.enable_static_kernel,
+                enable_superkernel=self.enable_superkernel
             )
         else:
             self.model_compiled = None

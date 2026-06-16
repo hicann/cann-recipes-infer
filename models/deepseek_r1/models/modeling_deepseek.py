@@ -2755,8 +2755,6 @@ class DeepseekV3ForCausalLM(nn.Module):
         dynamo_feat = (enable_cache_compile or enable_multi_streams or enable_superkernel)
         if exe_mode == "eager" and dynamo_feat:
             raise ValueError(f"{exe_mode=} does not support cache compile, npugraph_ex, multi_streams or superkernel!")
-        if enable_npugraph_ex and enable_superkernel:
-            raise ValueError(f"npugraph_ex dose not support superkernel!")
         if next_n > 3:
             raise ValueError(f"{next_n=}, currently only support 0, 1, 2, 3")
         try:

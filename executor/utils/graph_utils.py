@@ -32,6 +32,7 @@ def compile_model_forward(
     tiling_schedule_optimize=True,
     topology_sorting_strategy="StableRDFS",
     enable_static_kernel=False,
+    enable_superkernel=False,
 ):
     """
     Compile a model.forward method for graph execution.
@@ -52,13 +53,15 @@ def compile_model_forward(
     import torchair as tng
     import torchair.ge_concrete_graph.ge_converter.experimental.patch_for_hcom_allreduce
     tng.patch_for_hcom()
-    # Compile model forward 
+    # Compile model forward
     torch._dynamo.config.inline_inbuilt_nn_modules = False
     if exe_mode == "npugraph_ex":
         # npugraph_ex uses torch.compile or cache_compile directly with backend options.
         compile_options = {
             "frozen_parameter": True,
             "static_kernel_compile": enable_static_kernel,
+            "super_kernel_optimize": enable_superkernel,
+            "super_kernel_optimize_options": {"dcci_disable_on_kernel": [".*"]}
         }
         if enable_cache_compile:
             compiled = torch.npu.npugraph_ex.inference.cache_compile(model_forward, cache_dir=cache_dir,
