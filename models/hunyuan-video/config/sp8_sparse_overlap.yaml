@@ -30,7 +30,7 @@ sparse:
     TopK:
       sparse_time_step: "10-49"      # "start-end"
       sparsity_files_path: "./sparsity/720x1280x129/v3"
-      CAC_threshold: 0.66
+      CAC_threshold: 0.9
       ring_sparse_overlap: true
     SVG:
       sparse_time_step: "14-49"      # "start-end"

@@ -540,7 +540,7 @@ def _sync_scalar_for_sp(self, value: float) -> float:
 
 
 
-该优化方法基于[blitz_sparse_attention算子](https://gitcode.com/cann/ops-transformer/blob/master/experimental/attention/blitz_sparse_attention/README.md)实现，运行前需要依据参考文档编译算子（若更新CANN包需要重新编译）。若需要叠加 Ulysses/Ring 序列并行，尤其是使用 Ring + TopK + overlap 的 LSE 合并路径，需要使用合入 [ops-transformer PR 5498](https://gitcode.com/cann/ops-transformer/pull/5498) 之后的 `ops-transformer` 主仓编译稀疏算子。编译算子运行命令如下：
+该优化方法基于[blitz_sparse_attention算子](https://gitcode.com/cann/ops-transformer/blob/master/experimental/attention/blitz_sparse_attention/README.md)实现，运行前需要依据参考文档编译算子（若更新CANN包需要重新编译）。若需要使用 Ring + TopK + overlap 的 LSE 合并路径，需要使用最新的 `ops-transformer` 主仓编译稀疏算子。编译算子运行命令如下：
 
  ```bash
  git clone https://gitcode.com/cann/ops-transformer.git
