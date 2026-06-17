@@ -53,7 +53,7 @@ VocabParallelEmbedding (131072 → 3072, TP-split)
 | 端到端吞吐 (tokens/s) | ~3.66 | input_len=1024, output_len=128, batch_size=1 |
 | 显存占用 | — | 未启用 PA，KVCache 占用主导 |
 
-基线 Decode 单步耗时 273 ms 主要由 Python MoE for-loop 与 attention 路径的 manual SDPA 占据，构成后续优化的主战场。
+基线 Decode 单步耗时 273 ms 主要由 Python MoE for-loop 与 attention 路径的 manual SDPA 占据，是后续优化的主要瓶颈。
 
 ### 3.1 精度基线
 
@@ -239,10 +239,3 @@ A3 相对 A2 在同代码下 Decode 单步缩短约 19%、吞吐提升 24%，主
 | 吞吐 (tok/s) | 174 | ~167 |
 
 输入从 1K 增至 4K 时，单步 Decode 仅增约 4%（KV cache 更大带来 PA 加载与 FA 计算开销上升），Prefill 近似线性增长（×4.5，对应输入 ×4）；长输入场景吞吐仍稳定在 165 tok/s 以上。
-
----
-
-## 9. 当前未覆盖项
-
-- **批处理与通信重叠**：`batch_size > 1` 路径、TP AllReduce 与 GEMM 重叠、多流 dispatch 未覆盖。
-- **权重量化**：W8A8 / W4A16 路径未接入。

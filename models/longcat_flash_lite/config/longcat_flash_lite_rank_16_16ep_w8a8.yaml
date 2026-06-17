@@ -1,25 +1,27 @@
 model_config:
   model_name: "longcat_flash_lite"
-  model_path: "/data/models/LongCat-Flash-Lite"
+  model_path: "/data/models/LongCat-Flash-Lite-W8A8-Int8-mlp-moe"
   exe_mode: "ge_graph"              # ["ge_graph", "eager", "npugraph_ex"]
   with_ckpt: True                   # [False, True]
   enable_profiler: False            # [False, True]
-  enable_cache_compile: False       # [False, True]
+  enable_cache_compile: True        # [False, True]
   custom_params:
-    ngram_embed_tp_size: 8          # ngram sub-tables TP size; 0 = follow embed_tp_size
+    ngram_embed_tp_size: 16         # ngram sub-tables TP size; 0 = follow embed_tp_size
+    enable_moe_stream_overlap: True # [False, True]
+    enable_limit_core_num: True     # [False, True]
 
 data_config:
   dataset: "default"                # ["default", "LongBench"]
   input_truncated_len: 256
 
 parallel_config:
-  world_size: 8
+  world_size: 16
   attn_tp_size: 4
   dense_tp_size: 1
   moe_tp_size: 1
   embed_tp_size: 1
-  lmhead_tp_size: 8
+  lmhead_tp_size: 16
 
 scheduler_config:
   max_new_tokens: 128
-  batch_size: 2
+  batch_size: 16

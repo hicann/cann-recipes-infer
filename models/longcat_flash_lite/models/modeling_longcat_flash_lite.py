@@ -36,11 +36,15 @@ from module.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
     RowParallelLinear,
+    UnquantizedLinearMethod,
     VocabParallelEmbedding,
 )
 from module.fuse_moe_gmm import FusedMoEGMM
 from executor.model_loader.weight_utils import default_weight_loader
 from executor.utils import calc_moe_hccl_buffer_size, get_init_attn_mask
+from executor.utils.common_utils import (
+    npu_stream_switch, limit_core_num, npu_wait_tensor,
+)
 from .configuration_longcat_flash_lite import LongcatFlashNgramConfig
 
 
@@ -166,12 +170,20 @@ class LongcatFlashMLA(nn.Module):
         if self.q_lora_rank is None:
             raise ValueError("LongcatFlashMLA requires config.q_lora_rank to be set")
 
+        # MLA parallel projections live under prefixes listed in the
+        # compressed-tensors ``ignore`` set of the W8A8 deploy, so passing
+        # ``quant_config`` here is safe — the framework resolves them to
+        # ``UnquantizedLinearMethod`` and weights stay BF16. This keeps
+        # npu_mla_prolog_v3 (which has no W8A8 args) working.
+        quant_config = getattr(config, "quant_config", None)
+
         # Q path: compression is replicated, expansion is TP-split by heads.
         self.q_a_proj = nn.Linear(config.hidden_size, config.q_lora_rank, bias=config.attention_bias)
         self.q_a_layernorm = LongcatFlashRMSNorm(config.q_lora_rank)
         self.q_b_proj = ColumnParallelLinear(
             config.q_lora_rank, self.num_heads * self.qk_head_dim,
             bias=False, tp_size=self.tp_size, tp_rank=self.tp_rank,
+            quant_config=quant_config,
             prefix=f"{prefix}.q_b_proj",
         )
 
@@ -186,6 +198,7 @@ class LongcatFlashMLA(nn.Module):
             self.kv_lora_rank,
             self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
             bias=False, tp_size=self.tp_size, tp_rank=self.tp_rank,
+            quant_config=quant_config,
             prefix=f"{prefix}.kv_b_proj",
         )
 
@@ -196,6 +209,7 @@ class LongcatFlashMLA(nn.Module):
             bias=config.attention_bias,
             tp_size=self.tp_size, tp_rank=self.tp_rank,
             input_is_parallel=True,
+            quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
         )
 
@@ -361,7 +375,7 @@ class LongcatFlashMLA(nn.Module):
 
         num_tokens = hidden_states.shape[0]
 
-        # --- Q LoRA path (assert in __init__ guarantees q_lora_rank is set) ---
+        # --- Q LoRA path (init raises if q_lora_rank unset) ---
         q_states = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
 
         # (T, N, qk_head_dim) — TND form
@@ -625,25 +639,46 @@ class LongcatFlashMLP(nn.Module):
         self.tp_rank = (dist.get_rank() % self.tp_size) if (self.tp_size > 1 and dist.is_initialized()) else 0
         self.comm_manager = comm_manager
 
+        quant_config = getattr(config, "quant_config", None)
+        self.mm_quant_mode = (
+            quant_config.mm_quant_mode if quant_config is not None else "w16a16"
+        )
+
         self.gate_up_proj = MergedColumnParallelLinear(
             input_size=self.hidden_size,
             output_sizes=[self.intermediate_size] * 2,
             bias=False,
             tp_size=self.tp_size,
             tp_rank=self.tp_rank,
+            quant_config=quant_config,
             prefix=f"{prefix}.gate_up_proj",
         )
         self.down_proj = RowParallelLinear(
             self.intermediate_size, self.hidden_size, bias=False,
             tp_size=self.tp_size, tp_rank=self.tp_rank,
             input_is_parallel=True,
+            quant_config=quant_config,
             prefix=f"{prefix}.down_proj",
         )
 
     def forward(self, x):
-        merged_x = self.gate_up_proj(x)
-        intermediate_hidden_states = torch_npu.npu_swiglu(merged_x)
-        result = self.down_proj(intermediate_hidden_states)
+        if self.mm_quant_mode == "w8a8int8":
+            # W8A8 fast path: gate_up returns int32 + per-token scale, fused
+            # dequant+swiglu+quant produces int8 input for down_proj.
+            merged_x, pertoken_scale = self.gate_up_proj(x, out_dtype=torch.int32)
+            intermediate_hidden_states, pertoken_scale = torch_npu.npu_dequant_swiglu_quant(
+                merged_x,
+                weight_scale=self.gate_up_proj.weight_scale,
+                quant_scale=self.down_proj.smooth_scales,
+                quant_mode=1,
+                activate_left=True,
+                activation_scale=pertoken_scale,
+            )
+            result = self.down_proj(intermediate_hidden_states, pertoken_scale)
+        else:
+            merged_x = self.gate_up_proj(x)
+            intermediate_hidden_states = torch_npu.npu_swiglu(merged_x)
+            result = self.down_proj(intermediate_hidden_states)
         if self.tp_size > 1:
             dist.all_reduce(result, group=self.comm_manager.get_group("dense_tp_group"))
         return result
@@ -742,6 +777,15 @@ class LongcatFlashMoE(nn.Module):
             default_mc2 = not (platform == "A2" and self.experts_per_rank > 24)
             self.enable_moe_mc2_dispatch = bool(cp.get("enable_moe_mc2_dispatch", default_mc2))
 
+        # W8A8 routing flag — when the framework attaches a CompressedTensors
+        # quant_config (gmm_quant_mode == "w8a8int8"), the dispatch/prefill EP
+        # paths run npu_dynamic_quant before the GMM call and forward the
+        # per-token scale into FusedMoEGMM. ``w16a16`` keeps the BF16 path.
+        quant_config = getattr(config, "quant_config", None)
+        self.gmm_quant_mode = (
+            quant_config.gmm_quant_mode if quant_config is not None else "w16a16"
+        )
+
         # Single FusedMoEGMM constructor that takes both tp and ep knobs;
         # FusedMoEGMM internally routes shard layout based on tp/ep sizes.
         # Matches qwen3_moe / longcat-flash convention.
@@ -750,7 +794,7 @@ class LongcatFlashMoE(nn.Module):
             hidden_size=self.hidden_size,
             intermediate_size=config.expert_ffn_hidden_size,
             bias=False,
-            quant_config=None,
+            quant_config=quant_config,
             tp_size=self.moe_tp_size,
             tp_rank=self.tp_rank,
             ep_size=self.moe_ep_size,
@@ -946,12 +990,26 @@ class LongcatFlashMoE(nn.Module):
             per_token_scales=None,
         )
 
-        # GMM on local experts
-        expert_output = self.experts(
-            x=hidden_ordered,
-            expert_tokens=tokens_per_local_expert,
-            group_list_type=1,
-        )
+        # GMM on local experts. W8A8: per-rank dynamic quant after re_routing —
+        # alltoall stays BF16 (prefill double_routing path is untouched); the
+        # only added cost is one npu_dynamic_quant before the GMM. We do not
+        # pass per-expert smooth_scale here because that would require a
+        # gather-by-expert op more invasive than the marginal accuracy gain
+        # warrants for prefill.
+        if "a8" in self.gmm_quant_mode:
+            hidden_ordered_q, hidden_ordered_scale = torch_npu.npu_dynamic_quant(hidden_ordered)
+            expert_output = self.experts(
+                x=hidden_ordered_q,
+                expert_tokens=tokens_per_local_expert,
+                group_list_type=1,
+                pertoken_scale=hidden_ordered_scale,
+            )
+        else:
+            expert_output = self.experts(
+                x=hidden_ordered,
+                expert_tokens=tokens_per_local_expert,
+                group_list_type=1,
+            )
 
         # Unsort back to dispatch order, then AllToAll combine
         new_x = torch.index_select(expert_output, 0, ids_unsort.float().argsort().int())
@@ -987,11 +1045,25 @@ class LongcatFlashMoE(nn.Module):
         output = torch_npu.npu_moe_distribute_dispatch_v2(**dispatch_args)
         expand_x, _, expand_idx, expert_token_num, ep_recv_counts, tp_recv_counts = output[:6]
 
-        expert_output = self.experts(
-            x=expand_x,
-            expert_tokens=expert_token_num,
-            group_list_type=1,
-        )
+        # GMM expert computation. We dispatched in BF16 (quant_mode=0), so do
+        # the W8A8 activation quant per-rank here before the grouped matmul.
+        # dispatch_v2's built-in W8A8 path expects a global per-expert
+        # smooth_scale across all routed experts — we only own a shard, so
+        # we keep alltoall in BF16 and pay one npu_dynamic_quant.
+        if "a8" in self.gmm_quant_mode:
+            expand_x_q, expand_x_scale = torch_npu.npu_dynamic_quant(expand_x)
+            expert_output = self.experts(
+                x=expand_x_q,
+                expert_tokens=expert_token_num,
+                group_list_type=1,
+                pertoken_scale=expand_x_scale,
+            )
+        else:
+            expert_output = self.experts(
+                x=expand_x,
+                expert_tokens=expert_token_num,
+                group_list_type=1,
+            )
 
         # combine_v2 needs ori_x to fold in copy_expert (identity) contributions.
         combine_args = {
@@ -1018,6 +1090,22 @@ class LongcatFlashDecoderLayer(nn.Module):
         super().__init__()
         self.layer_idx = layer_idx
         self.hidden_size = config.hidden_size
+
+        # MoE multi-stream overlap (Plan-A): hide MoE (dispatch+GMM+combine)
+        # behind sub-layer 1 (dense_a + mla[1] + dense_b) on a side stream,
+        # synced at the layer-end three-way add. Decode-only; prefill keeps the
+        # serial path. Off by default — opt-in via custom_params.
+        custom = getattr(infer_config.model_config, "custom_params", {}) or {}
+        self.enable_moe_stream_overlap = bool(custom.get("enable_moe_stream_overlap", False))
+        # opt-out switch for limit_core_num (core split between the MoE side
+        # stream and the main stream's sub-layer 1; required by multi-stream
+        # overlap, default on).
+        self.enable_limit_core_num = bool(custom.get("enable_limit_core_num", True))
+        # Core split between MoE side stream and main stream's sub-layer 1 (non-AFD path).
+        self._moe_aic_num = str(custom.get("moe_aic_num", 8))
+        self._moe_aiv_num = str(custom.get("moe_aiv_num", 16))
+        self._main_aic_num = str(custom.get("main_aic_num", 16))
+        self._main_aiv_num = str(custom.get("main_aiv_num", 32))
 
         self.mlp = LongcatFlashMoE(config, infer_config, comm_manager)
 
@@ -1049,6 +1137,8 @@ class LongcatFlashDecoderLayer(nn.Module):
         # input_layernorm(hidden_states, residual) returns (normed, new_residual)
         # where new_residual = residual + hidden_states (fused add+norm)
         is_prefill = forward_metadata.is_prefill
+        # Decode-only MoE/sub-layer-1 overlap; prefill keeps serial path.
+        moe_overlap = self.enable_moe_stream_overlap and not is_prefill
 
         residual = None  # Will be initialized on first call
 
@@ -1061,22 +1151,28 @@ class LongcatFlashDecoderLayer(nn.Module):
         )
 
         hidden_states, residual = self.post_attention_layernorm[0](hidden_states, residual)
-        shortcut_mlp_output = self.mlp(hidden_states, is_prefill=is_prefill)
-        hidden_states = self.mlps[0](hidden_states)
 
-        # --- sub-layer 1 ---
-        hidden_states, residual = self.input_layernorm[1](hidden_states, residual)
-        hidden_states = self.self_attn[1](
-            hidden_states=hidden_states,
-            position_embeddings=position_embeddings,
-            forward_metadata=forward_metadata,
-        )
+        _limit_core_active = moe_overlap and self.enable_limit_core_num
 
-        hidden_states, residual = self.post_attention_layernorm[1](hidden_states, residual)
-        hidden_states = self.mlps[1](hidden_states)
+        # -- MoE on side stream, sub-layer 1 on main stream (merge at three-way add) --
+        with npu_stream_switch(moe_overlap, "moe"):
+            with limit_core_num(_limit_core_active, self._moe_aic_num, self._moe_aiv_num):
+                hidden_states = npu_wait_tensor(moe_overlap, hidden_states, residual)
+                shortcut_mlp_output = self.mlp(hidden_states, is_prefill=is_prefill)
+
+        # Main stream: sub-layer 1, limit-core split so it overlaps the MoE side stream.
+        with limit_core_num(_limit_core_active, self._main_aic_num, self._main_aiv_num):
+            hidden_states = self.mlps[0](hidden_states)
+            hidden_states, residual = self.input_layernorm[1](hidden_states, residual)
+            hidden_states = self.self_attn[1](
+                hidden_states=hidden_states,
+                position_embeddings=position_embeddings,
+                forward_metadata=forward_metadata,
+            )
+            hidden_states, residual = self.post_attention_layernorm[1](hidden_states, residual)
+            hidden_states = self.mlps[1](hidden_states)
 
         # Three-way add: residual + hidden_states + shortcut_mlp_output
-        # npu_add_rms_norm only supports two inputs, so add shortcut separately
         hidden_states = residual + hidden_states + shortcut_mlp_output
 
         return hidden_states
@@ -1822,9 +1918,34 @@ class LongcatFlashNgramForCausalLM(nn.Module):
         # enable_weight_nz is a top-level ModelConfig field
         # (yaml: model_config.enable_weight_nz), not a custom_params entry.
         enable_weight_nz = self.infer_config.model_config.enable_weight_nz
-        for _, module in self.named_modules():
+        # W8A8 dense MLP needs fp32 scales for npu_dequant_swiglu_quant: cast
+        # weight_scale on gate_up_proj and smooth_scale on down_proj.
+        # FusedMoEGMM is special-cased — its smooth_scales feed
+        # npu_dynamic_quant / dispatch_v2 which expect bf16/fp16, so we must
+        # NOT force them to fp32. Mirrors deepseek-r1 / qwen3-moe convention.
+        float_scale_modules = ("gate_up_proj",)
+        float_smooth_scale_modules = ("down_proj",)
+        for name, module in self.named_modules():
             quant_method = getattr(module, "quant_method", None)
-            if quant_method is not None:
+            if quant_method is None:
+                continue
+            if isinstance(module, FusedMoEGMM):
+                quant_method.process_weights_after_loading(
+                    module, is_transpose=True, is_nz=enable_weight_nz,
+                )
+                continue
+            scales_dtype = {}
+            if any(s in name for s in float_scale_modules):
+                scales_dtype["scale_dtype"] = torch.float
+            if any(s in name for s in float_smooth_scale_modules):
+                scales_dtype["smooth_scale_dtype"] = torch.float
+            try:
+                quant_method.process_weights_after_loading(
+                    module, is_nz=enable_weight_nz, scales_dtype=scales_dtype,
+                )
+            except TypeError:
+                # UnquantizedLinearMethod (and other quant methods that don't
+                # take scales_dtype) — fall back to the no-cast path.
                 quant_method.process_weights_after_loading(module, is_nz=enable_weight_nz)
 
         # Build prolog NZ-format weights and mark absorb weights as static
@@ -1841,6 +1962,20 @@ class LongcatFlashNgramForCausalLM(nn.Module):
                     _mark_static(module.weight_dq_prolog)
                 if module.weight_dkv_kr_prolog is not None:
                     _mark_static(module.weight_dkv_kr_prolog)
+
+        # MLA must stay BF16 (npu_mla_prolog_v3 has no W8A8 inputs); fail at
+        # load time if the W8A8 ignore set misses any MLA projection.
+        for name, module in self.named_modules():
+            if not isinstance(module, LongcatFlashMLA):
+                continue
+            for proj in ("q_b_proj", "kv_b_proj", "o_proj"):
+                qm = getattr(getattr(module, proj), "quant_method", None)
+                if not isinstance(qm, UnquantizedLinearMethod):
+                    raise RuntimeError(
+                        f"{name}.{proj} resolved to {type(qm).__name__}, expected "
+                        f"UnquantizedLinearMethod — check the W8A8 checkpoint's "
+                        f"quantization_config.ignore covers all MLA projections"
+                    )
 
         # Eagerly prepare MC2 dispatch_v2/combine_v2 kwargs for every MoE module
         # that will use them. Doing this here — after HCCL groups are up but
