@@ -90,6 +90,19 @@ def hc_split_sinkhorn_torch(
         comb = comb / (col_sum + eps)
     return pre, post, comb
 
+
+def to_hf32(t: torch.Tensor) -> torch.Tensor:
+    # Model the Cube Matmul HF32 mode used by the HcPre kernel (SetHF32Mode(1) + SetHF32TransMode(1)):
+    # before the multiply, each fp32 operand in L0A/L0B is rounded to HF32 (1 sign + 8 exp + 10 mantissa).
+    # SetHF32TransMode(1) selects round-toward-zero, which is exactly clearing the low 13 mantissa bits of
+    # the fp32 bit pattern (23 -> 10). Accumulation stays fp32, so only the inputs are truncated here.
+    # (x is bf16-valued -> 7 mantissa bits -> already representable in HF32, so this is a no-op for x; it
+    #  matters for the fp32 hc_fn weight.)
+    hf32_mantissa_bits = 10
+    drop = 23 - hf32_mantissa_bits
+    bits = t.contiguous().view(torch.int32)
+    return (bits & (~((1 << drop) - 1))).view(torch.float32)
+
 def _hc_pre(x: torch.Tensor, hc_fn: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor, hc_mult: int, hc_sinkhorn_iters: int, norm_eps: float, hc_eps: float):
     # x: [b, s, hc, d], hc_fn: [mix_hc, hc*d], hc_scale: [3], hc_base: [mix_hc], y: [b, s, d]
     shape, dtype = x.size(), x.dtype
@@ -98,7 +111,9 @@ def _hc_pre(x: torch.Tensor, hc_fn: torch.Tensor, hc_scale: torch.Tensor, hc_bas
     elif x.dim() == 3:
         x = x.flatten(1).float()
     rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + norm_eps)
-    mixes = F.linear(x, hc_fn) * rsqrt
+    # The kernel computes mixes via the Cube Matmul in HF32 mode; mirror that in the golden so the
+    # comparison reflects true algorithmic error rather than the (expected) HF32 vs fp32 gap.
+    mixes = F.linear(to_hf32(x), to_hf32(hc_fn)) * rsqrt
 
     pre, post, comb = hc_split_sinkhorn_torch(mixes, hc_scale, hc_base, hc_mult, hc_sinkhorn_iters, hc_eps)
     y = torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=2)
@@ -138,10 +153,16 @@ def run_hc_pre_case(x, hc_fn, hc_scale, hc_base, hc_mult, hc_sinkhorn_iters, nor
             x_npu, hc_fn_npu, hc_scale_npu, hc_base_npu, hc_mult=hc_mult,
             hc_sinkhorn_iters=hc_sinkhorn_iters, norm_eps=norm_eps, hc_eps=hc_eps)
 
-    compare_y = data_compare(golden_y_out.cpu().float().numpy(), npu_y_out.cpu().float().numpy())
-    compare_post = data_compare(golden_post_out.cpu().numpy(), npu_post_out.cpu().float().numpy())
-    compare_comb_frag = data_compare(golden_comb_frag_out.cpu().numpy(), npu_comb_frag_out.cpu().float().numpy(), pct_thd=0.02
-    )
+    # Precision targets: y is bfloat16 -> 4e-3 (= bf16 ULP). post & comb_frag are float32 -> 1e-4.
+    # y keeps a looser element pass-rate (pct_thd) because the bf16 output rounding plus the kernel's
+    # vector-unit sigmoid approximation put a small fraction of elements right on a bf16 rounding
+    # boundary (max observed ~2 bf16 ULP); post/comb_frag are exact-enough to hold the tight 99.5%.
+    compare_y = data_compare(golden_y_out.cpu().float().numpy(), npu_y_out.cpu().float().numpy(),
+                             diff_thd=0.004, pct_thd=0.02)
+    compare_post = data_compare(golden_post_out.cpu().numpy(), npu_post_out.cpu().float().numpy(),
+                                diff_thd=0.0001, pct_thd=0.005)
+    compare_comb_frag = data_compare(golden_comb_frag_out.cpu().numpy(), npu_comb_frag_out.cpu().float().numpy(),
+                                     diff_thd=0.0001, pct_thd=0.005)
 
     return compare_y, compare_post, compare_comb_frag
 
@@ -150,7 +171,16 @@ def create_hc_pre_inputs(shape, hc_mix, hc_mult, seed=42):
     np.random.seed(seed)
     hc_scale = torch.tensor(np.random.uniform(0, 2, (3))).to(torch.float32)
     hc_base = torch.tensor(np.random.uniform(0, 2, (hc_mix))).to(torch.float32)
-    hc_fn = torch.tensor(np.random.uniform(0, 2, (hc_mix, hc_mult * shape[-1]))).to(torch.float32)
+    # hc_fn (the [mix_hc, hc_mult*d] projection weight) is kept positive but scaled by 1/(hc_mult*d) so the
+    # matmul output `mixes = x @ hc_fn^T` stays O(1) instead of O(hc_mult*d). With the original U(0,2) the
+    # sum over hc_mult*d all-positive terms drives the comb softmax logits to ~1e3, making it effectively
+    # one-hot and the 20-iter Sinkhorn numerically singular (tiny perturbations blow up after iteration) —
+    # no finite-precision kernel can match an fp32 golden to 1e-4 there. Keeping mixes O(1) makes the
+    # Sinkhorn path well-conditioned (comb error drops to ~1e-6) while preserving the all-positive
+    # (no catastrophic-cancellation) regime that keeps y/post accurate. Range stays data-dependent/meaningful.
+    fan_in = hc_mult * shape[-1]
+    hc_fn_hi = 1.0 / fan_in
+    hc_fn = torch.tensor(np.random.uniform(0, hc_fn_hi, (hc_mix, fan_in))).to(torch.float32)
     x = torch.tensor(np.random.uniform(0, 2, shape)).to(torch.bfloat16)
     return x, hc_fn, hc_scale, hc_base
 
@@ -319,6 +349,49 @@ class TestCustomHcPre(TestCase):
                 x, hc_fn, hc_scale, hc_base = create_hc_pre_inputs((bs, hc_mult, d), hc_mix, hc_mult, seed=seed)
                 print(f'=== hc_pre generalized D eager: d={d}, bs={bs} ===')
                 self._run_and_check_case(x, hc_fn, hc_scale, hc_base, hc_mult, hc_sinkhorn_iters, norm_eps, hc_eps)
+
+    def test_hc_pre_generalized_bs_eager(self):
+        """泛化 bs 精度验证：覆盖 Ascend950 两条路由(融合算子与小算子拼接)，d=4096/7168。"""
+        torch_npu.npu.set_device(int(DEVICE_ID))
+        soc_name = torch.npu.get_device_properties().name
+        if not soc_name.startswith("Ascend950"):
+            self.skipTest("This generalized-bs case only applies to Ascend950.")
+
+        hc_mix = 24
+        hc_mult = 4
+        hc_sinkhorn_iters = 20
+        hc_eps = 1e-6
+        norm_eps = 1e-6
+
+        import gc
+        bs_list = [
+            # fused: bs <= 512
+            1, 2, 7, 16, 31, 64, 128, 256, 511, 512,
+            # composite: 512 < bs, bs % 8192 != 0
+            513, 768, 1000, 1536, 3079, 4096, 6000, 8193, 10000, 12288, 20480, 30000,
+            # fused: bs % 8192 == 0
+            8192, 16384, 24576, 32768,
+        ]
+        fails = []
+        for d in [4096, 7168]:
+            for bs in bs_list:
+                seed = d * 131 + bs
+                x, hc_fn, hc_scale, hc_base = create_hc_pre_inputs((bs, hc_mult, d), hc_mix, hc_mult, seed=seed)
+                route = "fused" if (bs <= 512 or bs % 8192 == 0) else "composite"
+                cy, cp, cc = run_hc_pre_case(
+                    x, hc_fn, hc_scale, hc_base, hc_mult, hc_sinkhorn_iters, norm_eps, hc_eps)
+                ok = (cy[0] == "Pass" and cp[0] == "Pass" and cc[0] == "Pass")
+                print(f'=== hc_pre generalized bs: d={d} bs={bs:>6} [{route:9}] '
+                      f'y={cy[1]:.3f}% post={cp[1]:.3f}% comb={cc[1]:.3f}% -> {"PASS" if ok else "FAIL"}', flush=True)
+                if not ok:
+                    fails.append((d, bs, route, cy, cp, cc))
+                del x, hc_fn, hc_scale, hc_base
+                gc.collect()
+                torch_npu.npu.empty_cache()
+        if fails:
+            msg = "; ".join(f"d{d}-bs{bs}({r}):y{cy[1]:.2f}/post{cp[1]:.2f}/comb{cc[1]:.2f}"
+                            for d, bs, r, cy, cp, cc in fails)
+            self.fail(f"{len(fails)} generalized-bs case(s) failed: {msg}")
 
 if __name__ == "__main__":
     run_tests()

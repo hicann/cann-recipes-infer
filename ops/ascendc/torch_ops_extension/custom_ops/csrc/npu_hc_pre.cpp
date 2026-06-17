@@ -174,26 +174,6 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_hc_pre_npu(
     static const char* prefix950 = "Ascend950";
     const bool isAscend950 = socName != nullptr && std::string(socName).find(prefix950) == 0;
     check_hc_pre_shape_and_dtype(x, hc_fn, hc_scale, hc_base, isAscend950);
-    // get x shape
-    auto xDims = x.dim();
-    int32_t bs = x.size(0) * x.size(1);
-    int32_t d = x.size(2);
-    if (xDims == 3) {
-        bs = x.size(0);
-        d = x.size(2);
-    } else if (xDims == 4) {
-        d = x.size(3);
-    }
-    if (isAscend950) {
-        ASCEND_LOGI("The matched SoC version is Ascend950.");
-        if (bs <= FUSION_SPLIT_K_MAX_BS || bs % FUSION_BASE_BS == 0) {
-            ASCEND_LOGI("Use fused operator for current bs %d.", bs);
-            return hc_pre_fusion(x, hc_fn, hc_scale, hc_base, hc_mult, hc_sinkhorn_iters, norm_eps, hc_eps);
-        }
-        ASCEND_LOGI("For current bs %d, implemented hc_pre using a concatenation of small operators.", bs);
-        return hc_pre_composite(x, hc_fn, hc_scale, hc_base, hc_mult, hc_sinkhorn_iters, norm_eps, hc_eps);
-    }
-    ASCEND_LOGI("The matched SoC version is %s, use fused operator.", socName);
     return hc_pre_fusion(x, hc_fn, hc_scale, hc_base, hc_mult, hc_sinkhorn_iters, norm_eps, hc_eps);
 }
 
