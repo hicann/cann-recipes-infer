@@ -4,13 +4,13 @@
 
 ## 性能优化
 ### 通用优化
-DeepSeek-R1结构中的非MoE部分与Llama类似，通用优化点可参考[Llama](https://gitcode.com/Ascend/torchair/tree/master/npu_tuned_model/llm/llama)的改动，如固定KV Cache大小、cos/sin优化、AddRMSNorm融合、全量优化LM Head计算量等。
+DeepSeek-R1结构中的非MoE部分与Llama类似，通用优化点可参考[Llama](https://gitcode.com/Ascend/torchair/tree/7.3.0/npu_tuned_model/llm/llama)的改动，如固定KV Cache大小、cos/sin优化、AddRMSNorm融合、全量优化LM Head计算量等。
 
 ### MLA (Multi-Head Latent Attention)低秩压缩优化
 #### 使能融合算子
 参考[Deepseek论文](https://arxiv.org/pdf/2405.04434)中提及的低秩压缩方法，可以减少KV cache占用的内存，提升推理效率。在实现MLA低秩压缩后，可以通过使能融合kernel实现性能优化，相关实现可以参考`DeepseekV3Attention`类中的 `forward_page_attention_mla_prolog`函数。
 
-- MLA前置计算性能优化：使能[npu_mla_prolog_v2](https://www.hiascend.com/document/detail/zh/Pytorch/710/apiref/torchnpuCustomsapi/context/torch_npu-npu_mla_prolog_v2.md)融合kernel，替换attention计算前的计算，其中包含Q、K、V的线性层计算、旋转位置编码 (ROPE)、RmsNorm计算及KV Cache更新等计算处理；
+- MLA前置计算性能优化：使能[npu_mla_prolog_v3](https://www.hiascend.com/document/detail/zh/Pytorch/2600/apiref/torchnpuCustomsapi/docs/zh/custom_APIs/torch_npu/torch_npu-npu_mla_prolog_v3.md)融合kernel，替换attention计算前的计算，其中包含Q、K、V的线性层计算、旋转位置编码 (ROPE)、RmsNorm计算及KV Cache更新等计算处理；
 - Attention性能优化：使能[npu_fused_infer_attention_score](https://www.hiascend.com/document/detail/zh/Pytorch/710/apiref/torchnpuCustomsapi/context/torch_npu-npu_fused_infer_attention_score.md)融合kernel，实现对MLA计算的加速。
 
 ### MoE模块实现Expert Parallel (EP)及使能融合算子
