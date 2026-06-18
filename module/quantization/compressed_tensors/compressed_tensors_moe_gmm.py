@@ -278,7 +278,7 @@ class CompressedTensorW4A16Int4MoEGMMMethod(QuantizeMethodBase):
         layer.register_parameter("w13_offset", w13_offset)
         set_weight_attrs(w13_offset, extra_weight_attrs)
 
-        w2_offset = torch.nn.Parameter(torch.empty(num_experts,
+        w2_offset = torch.nn.Parameter(torch.zeros(num_experts,
                                                  hidden_size,
                                                  intermediate_size_per_partition // self.group_size,
                                                  dtype=params_dtype),
