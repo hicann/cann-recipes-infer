@@ -41,6 +41,12 @@ TORCH_LIBRARY(custom, m) {
         "Tensor? state_block_table=None, Tensor? cu_seqlens=None, Tensor? seqused=None, Tensor? start_pos=None,"
         "int coff=1, float norm_eps=1e-6, int rotary_mode=1, int cache_mode=1) -> (Tensor)");
 
+    m.def("quant_compressor(Tensor x, Tensor wkv, Tensor wgate, Tensor(a!) state_cache, "
+        "Tensor ape, int quant_mode, int cmp_ratio, *,"
+        "Tensor? x_descale=None, Tensor? wkv_descale=None, Tensor? wgate_descale=None, "
+        "Tensor? state_block_table=None, Tensor? cu_seqlens=None, Tensor? seqused=None, Tensor? start_pos=None,"
+        "int coff=1, int cache_mode=1) -> (Tensor)");
+
     m.def("scatter_nd_update_asc(Tensor(a!) var, Tensor indices, Tensor update) -> ()");
     
     m.def("npu_hc_pre_sinkhorn(Tensor mixes, Tensor rsqrt, Tensor hc_scale, Tensor hc_base, Tensor x, int hc_mult=4, int hc_sinkhorn_iters=20,"
