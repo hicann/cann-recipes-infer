@@ -8,17 +8,6 @@
 
 在 AI 智能体（Agent）上下文中，技能（Skills）是为扩展 Agent 能力而设计的模块化功能单元。每个 Skill 封装了指令、元数据及可选资源，当 Agent（如 OpenCode 等）通过意图识别匹配到相关上下文时，自动调用对应的 Skill。
 
-### 仓库能力概览
-
-cann-recipes-infer 仓库支持的核心优化技术：
-
-- **并行策略**：TP（张量并行）、EP（专家并行）、DP（数据并行）等多种并行组合
-- **优化技术**：多流并行、融合算子、消除冗余算子
-- **加速算法**：FBCache、TeaCache、权重预取、KVP（KV缓存并行）
-- **量化支持**：W8A8、W4A16、W8A8C8 等多种量化模式
-- **执行模式**：`ge_graph`（图执行）和 `eager`（即时执行）
-- **硬件平台**：昇腾 Atlas A2 / A3 系列
-
 ### 核心能力
 
 - **端到端优化编排**：从框架适配、基线建立到并行化改造、KVCache 优化、融合算子替换、图模式适配，按阶段推进
@@ -53,6 +42,7 @@ cann-recipes-infer 仓库支持的核心优化技术：
 | [model-infer-parallel-impl](skills/model-infer-parallel-impl/) | 并行切分实施 | 并行化代码改造、权重转换 |
 | [model-infer-kvcache](skills/model-infer-kvcache/) | KVCache 优化 + FA 替换 | KVCache 管理、Paged Attention、FA 融合算子 |
 | [model-infer-fusion](skills/model-infer-fusion/) | 融合算子分析与替换 | torch_npu 融合算子替换、MoE/Attention 适配 |
+| [model-infer-quantization](skills/model-infer-quantization/) | 量化适配改造 | compressed-tensors 量化方案接入、权重/激活/KVCache 量化适配 |
 | [model-infer-graph-mode](skills/model-infer-graph-mode/) | 图模式适配 | torch.compile、GE 图模式、图中断修复 |
 
 ### 辅助与调试 Skills
@@ -83,7 +73,8 @@ model-infer-optimize（编排入口）
   ├── 阶段 1：model-infer-parallel-analysis + model-infer-parallel-impl（并行策略，多卡部署时）
   ├── 阶段 2：model-infer-kvcache（KVCache 优化 + FA 替换）
   ├── 阶段 3：model-infer-fusion（融合算子替换）
-  ├── 阶段 4：model-infer-graph-mode（图模式适配）
+  ├── 阶段 4：model-infer-quantization（量化适配改造，可选）
+  ├── 阶段 5：model-infer-graph-mode（图模式适配）
   └── 按需触发：model-infer-precision-debug（精度诊断）/ model-infer-runtime-debug（运行时错误）
 ```
 
@@ -118,6 +109,7 @@ model-infer-optimize（编排入口）
     ├── model-infer-parallel-impl/               # 并行切分实施
     ├── model-infer-kvcache/                     # KVCache 优化
     ├── model-infer-fusion/                      # 融合算子优化
+    ├── model-infer-quantization/                # 量化适配改造
     ├── model-infer-graph-mode/                  # 图模式适配
     ├── model-infer-precision-debug/             # NPU 推理精度诊断
     ├── model-infer-runtime-debug/               # NPU 运行时调试
@@ -142,17 +134,19 @@ Skill 中引用的外部文档：
 根据使用的客户端选择对应命令：
 
 ```bash
+bash scripts/init-agent.sh --codex      # Codex 用户
 bash scripts/init-agent.sh --claude     # Claude Code 用户
 bash scripts/init-agent.sh --opencode   # OpenCode 用户
-bash scripts/init-agent.sh              # 两个客户端都要用时（可选）
+bash scripts/init-agent.sh              # 多客户端都要用时（可选）
 ```
 
 脚本作用：
+- 在 `.codex/agents/` 下由 `.agents/agents/*.md` 生成 `*.toml`，Codex 直接读取 `.agents/skills`
 - 在 `.claude/` 下创建 skills/agents/hooks 的 symlink（指向 `.agents/`），并复制 `settings.json`
 - 在 `.opencode/` 下创建 skills/agents 的 symlink
 - 根目录生成 `CLAUDE.md` → `AGENTS.md` 的 symlink
 
-生成物（`.claude/` / `.opencode/` / `CLAUDE.md`）已加入仓库 `.gitignore`，不会被提交。
+生成物（`.codex/` / `.claude/` / `.opencode/` / `CLAUDE.md`）已加入仓库 `.gitignore`，不会被提交。
 
 ### 触发方式
 
@@ -211,7 +205,7 @@ FA 替换后精度对不上，帮我排查
 - 大型外部参考文档（如算子接口、图模式指南等）通过在线链接引用，不包含离线副本
 - references 存放仓库模型实现经验的结构化提炼，而非外部文档的离线副本
 
-详细的架构设计见 `docs/agent/skill-design.md`。
+详细的架构设计见 `docs/agent/model-infer-optimize-design.md`。
 
 ## 免责声明
 

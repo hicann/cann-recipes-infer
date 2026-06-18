@@ -71,7 +71,7 @@ skills:
    - 模型实现代码（modeling_*.py、runner_*.py 等）一律不改，输出诊断表交 implementer
 
 7. **性能对比基准**
-   - 若工作目录下存在 baseline/baseline_metadata.json，性能验证以此为基准对比
+   - 若工作目录下存在 agentic/baseline/baseline_metadata.json，性能验证以此为基准对比
    - 无 baseline_metadata.json 时，在报告中标注「缺少标准基线」，建议主 agent 派发 migrator 补采
 
 ## 通用验证流程
@@ -90,16 +90,18 @@ skills:
 
 1. 使用与基线相同的标准输入运行模型
 2. 对比优化前后的输出结果
-3. 判定标准：
+3. 额外覆盖多 batch 不等长场景（`batch_size_per_dp_rank > 1` + 不同 prompt 长度），验证 packed sequence 路径功能与输出文本精度
+4. 判定标准：
    - 文本生成模型：输出 token 序列一致或语义等价
    - 数值对比：关键 tensor 的相对误差 < 1e-3（BF16）或 < 1e-2（量化模式）
-4. 判定 FAIL 的触发条件（满足任一）：
+5. 判定 FAIL 的触发条件（满足任一）：
    - 输出 token 不一致或数值误差超阈值
+   - 同一 prompt 在 batch 内多副本（greedy decoding）输出不一致
    - 输出包含 NaN / Inf
    - Prefill 和 Decode 阶段精度表现不一致
    - 输出不可读（重复 token、乱码、空文本、全 EOS）
    - 模型被简化（模块跳过、参数减配、结构裁剪等）
-5. 不通过时，将失败详情（症状、误差数据、出错阶段）写入 progress.md
+6. 不通过时，将失败详情（症状、误差数据、出错阶段）写入 progress.md
 
 ### 性能验证
 
@@ -107,7 +109,7 @@ skills:
 
 1. 精度通过后执行性能验证
 2. 执行 `bash infer.sh`，从框架日志获取当前 Prefill/Decode 耗时（或使用 `collect_baseline.py` 生成当前性能数据）
-3. 若工作目录下有 `baseline/baseline_metadata.json`，以此为基准计算性能变化百分比
+3. 若工作目录下有 `agentic/baseline/baseline_metadata.json`，以此为基准计算性能变化百分比
 4. 异常数据按核心原则第 1 条处理
 5. 写入 progress.md 性能验证 section
 

@@ -3,7 +3,7 @@
 
 常驻区与工作区用以下标记分隔：
     <!-- ===== 以上为常驻区，不清除 ===== -->
-    <!-- ===== 以下为工作区，阶段推进时归档清空 ===== -->
+    <!-- ===== 以下为工作区，阶段推进时归档并清空 ===== -->
 """
 
 import logging
@@ -15,7 +15,8 @@ logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger(__name__)
 
 SEPARATOR_END = "<!-- ===== 以上为常驻区，不清除 ===== -->"
-SEPARATOR_START = "<!-- ===== 以下为工作区，阶段推进时归档清空 ===== -->"
+SEPARATOR_START = "<!-- ===== 以下为工作区，阶段推进时归档并清空 ===== -->"
+LEGACY_SEPARATOR_START = "<!-- ===== 以下为工作区，阶段推进时归档清空 ===== -->"
 
 
 def archive_progress(progress_path: str) -> None:
@@ -35,8 +36,10 @@ def archive_progress(progress_path: str) -> None:
     persistent_section = parts[0] + SEPARATOR_END
 
     work_section = parts[1] if len(parts) > 1 else ""
-    if SEPARATOR_START in work_section:
-        work_section = work_section.split(SEPARATOR_START, 1)[1]
+    for separator_start in (SEPARATOR_START, LEGACY_SEPARATOR_START):
+        if separator_start in work_section:
+            work_section = work_section.split(separator_start, 1)[1]
+            break
     work_section = work_section.strip()
 
     if not work_section:

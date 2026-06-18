@@ -6,6 +6,7 @@ skills:
   - model-infer-parallel-analysis
   - model-infer-kvcache
   - model-infer-fusion
+  - model-infer-quantization
   - model-infer-graph-mode
 ---
 

@@ -1,10 +1,12 @@
-# NPU 模型优化 Agent Skills 设计文档
+# NPU 模型基础优化 Agent Skills 设计文档
+
+> 本文档覆盖 `model-infer-optimize` 基础优化工作流；后续工作流引入后另行补充。
 
 ## 1. 项目概述
 
 ### 1.1 项目定位
 
-本项目是 [cann-recipes-infer](https://gitcode.com/cann/cann-recipes-infer) 仓库的 Agent Skills 扩展，基于 CANN 平台能力和仓库已有模型的优化经验，将 NPU 推理优化中的路径知识、阶段依赖和验证流程模块化，支持 Agent 按流程完成端到端推理优化。
+本项目是 [cann-recipes-infer](https://gitcode.com/cann/cann-recipes-infer) 仓库的 Agent Skill 框架，基于 CANN 平台能力和仓库已有模型的优化经验，将 NPU 推理工作中的路径知识、阶段依赖和验证流程模块化，由专业 Agent 协同推进。框架以工作流为单位组织 Skill，**当前已落地「基础优化」工作流**——由 `model-infer-optimize` 编排 migrator → 并行 → KVCache → 融合 → 量化 → 图模式 → 总结的端到端优化；后续将引入更多工作流，复用同一套 Agent Team 与 `progress.md` 状态机制接入。
 
 ### 1.2 核心目标
 
@@ -36,13 +38,13 @@ cann-recipes-infer/
     └── skills/            # Skill 定义（详见 2.3 Skill 分类）
 ```
 
-使用前先在仓库根执行 `bash scripts/init-agent.sh`（可选 `--claude` / `--opencode`），脚本会把 `.agents/` 下的目录通过 symlink 暴露到 `.claude/` 和 `.opencode/` 对应的位置，同时创建根目录 `CLAUDE.md -> AGENTS.md` 软链，这些生成物已在 `.gitignore` 中排除。
+使用前先在仓库根执行 `bash scripts/init-agent.sh`（可选 `--codex` / `--claude` / `--opencode`），脚本会把 `.agents/` 下的目录暴露到对应客户端位置——Codex 生成 `.codex/agents/*.toml`，Claude Code / OpenCode 用 symlink 暴露到 `.claude/` 和 `.opencode/`，同时创建根目录 `CLAUDE.md -> AGENTS.md` 软链，这些生成物已在 `.gitignore` 中排除。
 
 ### 2.2 Skill 调度架构
 
-Skill 体系采用 **Agent Team** 模式——由一个编排 Agent 协调多个专业 Agent 协作完成复杂任务。每个 Agent 加载不同的 Skill，各自专注于特定阶段的优化工作，通过共享状态文件协同推进。具体实现为"主 Agent + SubAgent"的调度方式：
+框架采用 **Agent Team** 模式——由一个编排 Agent 协调多个专业 Agent 协作完成复杂任务。每个 Agent 加载不同的 Skill，各自专注于特定阶段的工作，通过共享状态文件协同推进。该模式是框架层能力，不绑定单一工作流；基础优化工作流以 `model-infer-optimize` 作为编排入口，具体实现为"主 Agent + SubAgent"的调度方式：
 
-- **主 Agent**：加载总入口 Skill，负责全局编排、阶段推进和进度管理
+- **主 Agent**：加载工作流编排 Skill，负责全局编排、阶段推进和进度管理
 - **SubAgent**：由主 Agent 按需启动，加载特定阶段的 Skill 执行具体任务，完成后将结果返回主 Agent
 
 调度流程如下：
@@ -73,12 +75,17 @@ Skill 体系采用 **Agent Team** 模式——由一个编排 Agent 协调多个
   │   ├── implementer ──→ model-infer-fusion（算子替换）
   │   └── reviewer ──→ 精度/性能验证
   │
-  ├── 阶段 4：图模式适配
+  ├── 阶段 4：量化适配改造（如阶段 0 完成量化初评估且用户启用）
+  │   ├── analyzer ──→ model-infer-quantization（量化方案匹配）
+  │   ├── implementer ──→ model-infer-quantization（量化接入）
+  │   └── reviewer ──→ 精度/性能验证
+  │
+  ├── 阶段 5：图模式适配
   │   ├── analyzer ──→ model-infer-graph-mode（方案设计）
   │   ├── implementer ──→ model-infer-graph-mode（适配实施）
   │   └── reviewer ──→ 精度/性能验证
   │
-  └── 阶段 5：优化总结 ──→ 输出优化报告
+  └── 阶段 6：优化总结 ──→ 输出优化报告
 ```
 
 全流程中，model-infer-runtime-debug 可在任意阶段按需触发（aicore timeout、OOM、推理卡住等）。
@@ -93,13 +100,14 @@ Skill 体系采用 **Agent Team** 模式——由一个编排 Agent 协调多个
 
 | 类别 | Skill | 说明 |
 |------|-------|------|
-| 编排 | model-infer-optimize | 总入口，阶段 0-5 编排 |
-| 主流程 | model-infer-migrator | 框架适配与基线建立 |
-| 主流程 | model-infer-parallel-analysis | 并行策略分析 |
-| 主流程 | model-infer-parallel-impl | 并行切分实施 |
-| 主流程 | model-infer-kvcache | KVCache + FA 替换 |
-| 主流程 | model-infer-fusion | 融合算子替换 |
-| 主流程 | model-infer-graph-mode | 图模式适配 |
+| 编排 | model-infer-optimize | 基础优化工作流编排入口，阶段 0-6 |
+| 基础优化工作流 | model-infer-migrator | 框架适配与基线建立 |
+| 基础优化工作流 | model-infer-parallel-analysis | 并行策略分析 |
+| 基础优化工作流 | model-infer-parallel-impl | 并行切分实施 |
+| 基础优化工作流 | model-infer-kvcache | KVCache + FA 替换 |
+| 基础优化工作流 | model-infer-fusion | 融合算子替换 |
+| 基础优化工作流 | model-infer-quantization | 量化适配改造（可选） |
+| 基础优化工作流 | model-infer-graph-mode | 图模式适配 |
 | 调试 | model-infer-precision-debug | 推理精度诊断（当前主要覆盖 KVCache/FA） |
 | 调试 | model-infer-runtime-debug | NPU 运行时错误诊断 |
 | 独立进阶优化 | model-infer-multi-stream | 多流并行 |
@@ -115,8 +123,8 @@ Skill 体系采用 **Agent Team** 模式——由一个编排 Agent 协调多个
 | 角色 | 职责 | 权限 | 挂载 Skills |
 |------|------|------|-----------|
 | 主 Agent | 阶段编排、用户确认、进度管理 | 不直接修改模型代码 | model-infer-optimize |
-| analyzer | 架构分析、方案设计 | 只读代码，只写 progress.md | parallel-analysis、kvcache、fusion、graph-mode |
-| implementer | 代码改造、调试修复 | 读写全部文件 | migrator、parallel-impl、kvcache、fusion、graph-mode、precision-debug、runtime-debug |
+| analyzer | 架构分析、方案设计 | 只读代码，只写 progress.md | parallel-analysis、kvcache、fusion、quantization、graph-mode |
+| implementer | 代码改造、调试修复 | 读写全部文件 | migrator、parallel-impl、kvcache、fusion、quantization、graph-mode、precision-debug、runtime-debug |
 | reviewer | 精度验证、性能对比 | 禁止修改模型代码 | precision-debug、runtime-debug |
 
 三个角色共享核心原则：禁止编造解释，遇到异常数据必须先用工具调查。

@@ -7,6 +7,7 @@ skills:
   - model-infer-parallel-impl
   - model-infer-kvcache
   - model-infer-fusion
+  - model-infer-quantization
   - model-infer-graph-mode
   - model-infer-precision-debug
   - model-infer-runtime-debug
@@ -57,8 +58,11 @@ skills:
    - reviewer FAIL 时会输出诊断表（问题 | 位置 | 诊断）
    - 按诊断表逐项修复，不从头重新排查
 
-6. **完成后更新 progress.md**
-   - 更新"实施记录"、"当前代码状态"section，调试时更新"调试记录"section
+6. **细粒度推进 + 阶段性写入 progress.md**
+   - 拿到任务先拆成可独立验证的子任务，按子任务推进
+   - 每完成一个子任务（或放弃某方向）立即追加到 progress.md 对应 section，不要全做完一把记
+   - 调试时同理：发现 / 修复 / 放弃即时追加，不积累几轮再写
+   - 上下文压缩或异常中断时，已写入的进度才是接力 subagent 的可用基线
 
 ## progress.md 写入格式
 

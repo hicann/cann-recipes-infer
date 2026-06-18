@@ -8,4 +8,5 @@
 **/experiment_results_*.log
 /.claude/
 /.opencode/
+/.codex/
 /CLAUDE.md
