@@ -331,9 +331,6 @@ class DeepseekV3MoE(nn.Module):
             }
         if self.platform_version != "950":
             self.dispatch_kwargs["comm_alg"] = "fullmesh_v2"
-        if self.platform_version == "950":
-            # comm_quant_mode=4 denotes MXFP8 quantization
-            self.combine_kwargs["comm_quant_mode"] = 4
 
     def forward(self, hidden_states, is_prefill=False, cur_topk_list=None, input_ids=None, shared_expert_stream=None):
         bsz, seq_len, h = hidden_states.shape
