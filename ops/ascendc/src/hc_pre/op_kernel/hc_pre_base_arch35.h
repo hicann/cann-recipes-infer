@@ -1000,7 +1000,6 @@ __aicore__ inline void VFProcessCombFragPacked(const LocalTensor<float> &combFra
                 Div(mix0, mix0, csum, preg); Div(mix1, mix1, csum, preg);
                 Div(mix2, mix2, csum, preg); Div(mix3, mix3, csum, preg);
             }
-d
             DataCopyScatter(oBase + 0 * R, mix0, (RegTensor<uint32_t> &)sIdx, preg);
             DataCopyScatter(oBase + 1 * R, mix1, (RegTensor<uint32_t> &)sIdx, preg);
             DataCopyScatter(oBase + 2 * R, mix2, (RegTensor<uint32_t> &)sIdx, preg);
