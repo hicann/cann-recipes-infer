@@ -519,9 +519,9 @@ class AttnMetaData(nn.Module):
         attn_metadata = {"batch_size_per_rank": batch_size}
 
         attn_metadata['shared_expert_stream'] = self.shared_expert_stream
+        attn_metadata['mla_stream'] = self.mla_stream
         if not is_prefill:
             attn_metadata['metadata_stream'] = self.metadata_stream
-            attn_metadata['mla_stream'] = self.mla_stream
             attn_metadata['compressor_stream'] = self.compressor_stream
             attn_metadata['indexer_stream'] = self.indexer_stream
         attn_metadata['kernel_metadata'] = {}

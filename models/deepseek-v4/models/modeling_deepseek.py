@@ -662,9 +662,9 @@ class Attention(nn.Module):
             self.layer_idx = 0 # MTP model only has one layer of cache
             self.is_mtp = True
         self.mla_events = []
-        if self.enable_multi_streams and self.enable_npugraph_ex:
-            # 3 is number of events used for event synchronization
-            self.mla_events = [torch.npu.Event(), torch.npu.Event(), torch.npu.Event()]
+        if self.enable_multi_streams:
+            # 4 is number of events used for event synchronization
+            self.mla_events = [torch.npu.Event(), torch.npu.Event(), torch.npu.Event(), torch.npu.Event()]
 
         self.enable_limit_core = self.runner_settings.get("model_config").get("enable_limit_core", False)
         self.compress_ratio = 1 if self.is_mtp else config.compress_ratios[layer_idx]
@@ -943,29 +943,30 @@ class Attention(nn.Module):
         **kwargs,
     ):
         bsz, seqlen, _ = x.size()
+        enable_multi_streams = self.enable_multi_streams and self.platform_version != "950"
+        x_scale = None
+        move_quant_before = "float8" in self.mm_quant_mode and self.cp_size == 1
+        if self.cp_size == 1:
+            if self.mm_quant_mode == "w8a8float8":
+                x_q, x_scale = torch_npu.npu_dynamic_block_quant(
+                    x.view(-1, x.size(-1)),
+                    dst_type=torch.float8_e4m3fn,
+                    row_block_size=1,
+                    col_block_size=self.config.quant_config.weight_block_size[1],
+                )
+            elif self.mm_quant_mode == "w8a8mxfloat8":
+                x_q, x_scale = torch_npu.npu_dynamic_mx_quant(
+                    x.view(-1, x.size(-1)), dst_type=torch.float8_e4m3fn
+                )
+
+        qr = self.wq_a(x_q if move_quant_before else x, dynamic_scale=x_scale).view(bsz, seqlen, -1)
         if self.cp_size > 1:
             cp_metadata_prev, cp_metadata_next = attn_metadata["prev"], attn_metadata["next"]
             cos_sin_prev, cos_sin_next = cp_metadata_prev["cos_sin"], cp_metadata_next["cos_sin"]
             cos_prev, sin_prev = cos_sin_prev["c1a"] if self.compress_ratio == 1 else cos_sin_prev["comp"]
             cos_next, sin_next = cos_sin_next["c1a"] if self.compress_ratio == 1 else cos_sin_next["comp"]
-            cos = torch.cat([cos_prev, cos_next], dim=0)
-            sin = torch.cat([sin_prev, sin_next], dim=0)
-        else:
-            cos_sin = attn_metadata["cos_sin"]
-            cos, sin = cos_sin["c1a"] if self.compress_ratio == 1 else cos_sin["comp"]
-
-        # q
-        qr = self.wq_a(x)
-        qr, qr_scale = self.apply_norm_dynamic_quant(qr)
-        q = self.wq_b(qr, dynamic_scale=qr_scale).unflatten(-1, (self.num_heads_per_rank, self.head_dim))
-        q = self.q_b_norm(q)
-        torch.ops.custom.inplace_partial_rotary_mul(
-            q.flatten(0, 1).unsqueeze(2), cos, sin,
-            rotary_mode="interleave",
-            partial_slice=self.partial_slice,
-        )
-
-        if self.cp_size > 1:
+            cos_q = torch.cat([cos_prev, cos_next], dim=0)
+            sin_q = torch.cat([sin_prev, sin_next], dim=0)
             last_win_kv, x_with_pre_win = self.get_cp_window(x, attn_metadata)
             cos_prev, sin_prev = cos_sin_prev["c1a_with_pre_win"] if self.compress_ratio == 1 \
                 else cos_sin_prev["comp_with_pre_win"]
@@ -974,12 +975,36 @@ class Attention(nn.Module):
             cos = torch.cat([cos_prev, cos_next], dim=0)
             sin = torch.cat([sin_prev, sin_next], dim=0)
             x = torch.cat(x_with_pre_win, dim=1)
+        else:
+            cos_sin = attn_metadata["cos_sin"]
+            cos, sin = cos_sin["c1a"] if self.compress_ratio == 1 else cos_sin["comp"]
+            cos_q, sin_q = cos, sin
+        record_event(enable_multi_streams, self.mla_events, 0)
+        with npu_stream_switch(enable_multi_streams, attn_metadata.get('mla_stream', None)):
+            wait_event(enable_multi_streams, self.mla_events, 0)
+            # win kv & topk_idxs
+            kv = self.wkv(x_q if move_quant_before else x, dynamic_scale=x_scale)
+            record_event(enable_multi_streams, self.mla_events, 2)
+        qr, qr_scale = self.apply_norm_dynamic_quant(qr)
+        wait_event(enable_multi_streams, self.mla_events, 2)
+        record_event(enable_multi_streams, self.mla_events, 1)
+        q = self.wq_b(qr, dynamic_scale=qr_scale).unflatten(-1, (self.num_heads_per_rank, self.head_dim))
+        cur_stream = torch.npu.current_stream()
+        with npu_stream_switch(enable_multi_streams, attn_metadata.get('mla_stream', None)):
+            wait_event(enable_multi_streams, self.mla_events, 1)
+            kv = self.kv_norm(kv)
+            torch.ops.custom.inplace_partial_rotary_mul(
+                kv.view(-1, 1, 1, self.head_dim), cos, sin,
+                rotary_mode="interleave",
+                partial_slice=self.partial_slice,
+            )
+            record_stream(enable_multi_streams, kv, cur_stream)
+            record_event(enable_multi_streams, self.mla_events, 3)
+        wait_event(enable_multi_streams, self.mla_events, 3)
 
-        # win kv & topk_idxs
-        kv = self.wkv(x)
-        kv = self.kv_norm(kv)
+        q = self.q_b_norm(q)
         torch.ops.custom.inplace_partial_rotary_mul(
-            kv.view(-1, 1, 1, self.head_dim), cos, sin,
+            q.flatten(0, 1).unsqueeze(2), cos_q, sin_q,
             rotary_mode="interleave",
             partial_slice=self.partial_slice,
         )
