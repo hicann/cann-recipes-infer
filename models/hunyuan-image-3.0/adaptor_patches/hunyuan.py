@@ -547,20 +547,20 @@ class HunyuanImage3NpuFIA(HunyuanImage3SDPAAttention):
                 raise ValueError("When gen_image, `first_step` must be provided.")
             if first_step:
                 casual_len = timestep_index + 1
-                text_query_states = q_fa[:, :, :casual_len, :]
-                text_key_states = k_fa[:, :, :casual_len, :]
-                text_value_states = v_fa[:, :, :casual_len, :]
+                text_query_states = q_fa[:, :, :casual_len, :].contiguous()
+                text_key_states = k_fa[:, :, :casual_len, :].contiguous()
+                text_value_states = v_fa[:, :, :casual_len, :].contiguous()
                 text_attn_output = flash_attn_func_npu(
                     text_query_states, text_key_states, text_value_states, attn_mask_npu, fa_scale, causal=True)
-                image_query_states = q_fa[:, :, casual_len:, :]
+                image_query_states = q_fa[:, :, casual_len:, :].contiguous()
                 image_attn_output = flash_attn_func_npu(image_query_states, k_fa, v_fa, attn_mask_npu,
                                                         fa_scale, causal=False)
                 attn_output = torch.cat((text_attn_output, image_attn_output), dim=2)
             else:
                 casual_len = timestep_index + 1
-                timestep_query_states = q_fa[:, :, 0:1, :]
-                timestep_key_states = k_fa[:, :, :casual_len, :]
-                timestep_value_states = v_fa[:, :, :casual_len, :]
+                timestep_query_states = q_fa[:, :, 0:1, :].contiguous()
+                timestep_key_states = k_fa[:, :, :casual_len, :].contiguous()
+                timestep_value_states = v_fa[:, :, :casual_len, :].contiguous()
                 if self.attn_mask_npu_qs_is_1 is None or self.attn_mask_npu_qs_is_1.shape != (bsz, casual_len):
                     self.attn_mask_npu_qs_is_1 = torch.ones([bsz, casual_len],
                                                       dtype=torch.bool,
@@ -568,7 +568,7 @@ class HunyuanImage3NpuFIA(HunyuanImage3SDPAAttention):
                 timestep_attn_output = flash_attn_func_npu(timestep_query_states, timestep_key_states,
                                                            timestep_value_states, self.attn_mask_npu_qs_is_1,
                                                            fa_scale, causal=True)
-                image_query_states = q_fa[:, :, 1:, :]
+                image_query_states = q_fa[:, :, 1:, :].contiguous()
                 image_attn_output = flash_attn_func_npu(image_query_states, k_fa, v_fa, attn_mask_npu,
                                                         fa_scale, causal=False)
                 attn_output = torch.cat((timestep_attn_output, image_attn_output), dim=2)

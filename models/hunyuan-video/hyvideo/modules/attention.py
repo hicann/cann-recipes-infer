@@ -22,6 +22,7 @@
 # limitations under the License.
 import importlib.metadata
 import math
+from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
@@ -44,6 +45,21 @@ MEMORY_LAYOUT = {
         lambda x: x,
     ),
 }
+
+
+@dataclass(frozen=True)
+class AttentionProcessConfig:
+    mode: str
+    pre_attn_layout: object
+    post_attn_layout: object
+    cu_seqlens_q: object = None
+    cu_seqlens_kv: object = None
+
+
+@dataclass(frozen=True)
+class AttentionPaddingInfo:
+    pad_shape: object = None
+    cat_dim: object = None
 
 
 def get_cu_seqlens(text_mask, img_len):
@@ -70,6 +86,45 @@ def get_cu_seqlens(text_mask, img_len):
         cu_seqlens[2 * i + 2] = s2
 
     return cu_seqlens
+
+
+def preprocess_attention(q, k, v, config):
+    q = config.pre_attn_layout(q)
+    k = config.pre_attn_layout(k)
+    v = config.pre_attn_layout(v)
+
+    pad_shape = None
+    cat_dim = None
+    if config.cu_seqlens_q is not None:
+        if config.mode in ("torch", "flash"):
+            q_full_shape = q.shape
+            q = q[:, :, :config.cu_seqlens_q[1], :]
+            k = k[:, :, :config.cu_seqlens_kv[1], :]
+            v = v[:, :, :config.cu_seqlens_kv[1], :]
+            cat_dim = 2
+        else:
+            q_full_shape = q.shape
+            q = q[:, :config.cu_seqlens_q[1], ...]
+            k = k[:, :config.cu_seqlens_kv[1], ...]
+            v = v[:, :config.cu_seqlens_kv[1], ...]
+            cat_dim = 1
+
+        pad_shape = list(q.shape)
+        pad_shape[cat_dim] = q_full_shape[cat_dim] - q.shape[cat_dim]
+
+    if config.mode in ("flash"):
+        q = q.contiguous()
+        k = k.contiguous()
+        v = v.contiguous()
+
+    return q, k, v, AttentionPaddingInfo(pad_shape, cat_dim)
+
+
+def postprocess_attention(x, config, padding):
+    if padding.pad_shape is not None and padding.pad_shape[padding.cat_dim] > 0:
+        attn_pad = x.new_zeros(padding.pad_shape)
+        x = torch.cat([x, attn_pad], dim=padding.cat_dim)
+    return config.post_attn_layout(x)
 
 
 def attention(
@@ -118,84 +173,37 @@ def attention(
         pre_attn_layout, post_attn_layout = MEMORY_LAYOUT["BSND"]
     
     b, s, n, d = q.shape
-    q = pre_attn_layout(q)
-    k = pre_attn_layout(k)
-    v = pre_attn_layout(v)
+
+    process_config = AttentionProcessConfig(
+        mode, pre_attn_layout, post_attn_layout, cu_seqlens_q, cu_seqlens_kv
+    )
+    q, k, v, padding = preprocess_attention(q, k, v, process_config)
 
     if mode == "torch":
         if attn_mask is not None and attn_mask.dtype != torch.bool:
             attn_mask = attn_mask.to(q.dtype)
-        if cu_seqlens_q is None:
-            x = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=attn_mask, dropout_p=drop_rate, is_causal=causal
-            )
-        else:
-            attn1 = F.scaled_dot_product_attention(
-                q[:, :, :cu_seqlens_q[1]],
-                k[:, :, :cu_seqlens_kv[1]],
-                v[:, :, :cu_seqlens_kv[1]],
-                attn_mask=attn_mask,
-                dropout_p=drop_rate,
-                is_causal=causal
-            )
-            attn2 = F.scaled_dot_product_attention(
-                q[:, :, cu_seqlens_q[1]:],
-                k[:, :, cu_seqlens_kv[1]:],
-                v[:, :, cu_seqlens_kv[1]:],
-                attn_mask=None,
-                dropout_p=drop_rate,
-                is_causal=False
-            )
-            x = torch.cat([attn1, attn2], dim=2)
+        x = F.scaled_dot_product_attention(
+            q, k, v, attn_mask=attn_mask, dropout_p=drop_rate, is_causal=causal
+        )
     elif mode == "flash":
         scale = 1.0 / math.sqrt(d)
-        if cu_seqlens_q is None:
-            x = torch_npu.npu_fused_infer_attention_score(
-                q, k, v,
-                num_heads=n,
-                input_layout="BNSD",
-                scale=scale,
-            )[0]
-        else:
-            attn1 = torch_npu.npu_fused_infer_attention_score(
-                q[:, :, :cu_seqlens_q[1], :],
-                k[:, :, :cu_seqlens_kv[1], :],
-                v[:, :, :cu_seqlens_kv[1], :],
-                num_heads=n,
-                input_layout="BNSD",
-                scale=scale,
-            )[0]
-            attn2 = torch_npu.npu_fused_infer_attention_score(
-                q[:, :, cu_seqlens_q[1]:, :],
-                k[:, :, cu_seqlens_kv[1]:, :],
-                v[:, :, cu_seqlens_kv[1]:, :],
-                num_heads=n,
-                input_layout="BNSD",
-                scale=scale,
-            )[0]
-            x = torch.cat([attn1, attn2], dim=2)
+        x = torch_npu.npu_fused_infer_attention_score(
+            q,
+            k,
+            v,
+            num_heads=n,
+            input_layout="BNSD",
+            scale=scale,
+        )[0]
     elif mode == "mxfp8":
         scale = 1.0 / math.sqrt(d)
-        attn1 = npu_mxfp8_attn(
-            q[:, :cu_seqlens_q[1], ...],
-            k[:, :cu_seqlens_kv[1], ...],
-            v[:, :cu_seqlens_kv[1], ...],
+        x = npu_mxfp8_attn(
+            q,
+            k,
+            v,
             dst_type=torch.float8_e4m3fn,
             softmax_scale=scale
         )
-
-        attn2 = torch_npu.npu_fused_infer_attention_score(
-            q[:, cu_seqlens_q[1]:, ...],
-            k[:, cu_seqlens_kv[1]:, ...],
-            v[:, cu_seqlens_kv[1]:, ...],
-            num_heads=n,
-            input_layout="BSND",
-            scale=scale,
-        )[0]
-
-        x = torch.cat([attn1, attn2], dim=1)
-
-
     elif mode == "vanilla":
         scale_factor = 1 / math.sqrt(q.size(-1))
 
@@ -228,7 +236,7 @@ def attention(
     else:
         raise NotImplementedError(f"Unsupported attention mode: {mode}")
 
-    x = post_attn_layout(x)
+    x = postprocess_attention(x, process_config, padding)
     out = x.reshape(b, s, -1)
     return out
 

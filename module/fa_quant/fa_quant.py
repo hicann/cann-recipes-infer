@@ -75,30 +75,35 @@ def npu_mxfp8_attn(q, k, v, dst_type=torch.float8_e4m3fn, softmax_scale=None):
     k_quant, k_scale = npu_mxfp8_quant(k, dst_type=dst_type, output_layout="TND")
     v_quant, v_scale = npu_mxfp8_quant(v, dst_type=dst_type, output_layout="TND", axis=0)
 
-    attn_out = torch_npu.npu_fused_infer_attention_score_v2(
-        q_quant,
-        k_quant,
-        v_quant,
-        actual_seq_qlen=_actual_seq_lens(b, s, q.device),
-        actual_seq_kvlen=_actual_seq_lens(b, kv_s, k.device),
-        dequant_scale_query=q_scale,
-        dequant_scale_key=k_scale,
-        dequant_scale_value=v_scale,
-        num_query_heads=n,
-        num_key_value_heads=k.shape[2],
-        softmax_scale=softmax_scale,
-        input_layout="TND",
-        sparse_mode=0,       # non-sparse
-        query_quant_mode=6,  # per-channel group quant
-        key_quant_mode=6,    # per-channel group quant
-        value_quant_mode=8,  # per-token group quant
-        query_dtype=torch.float8_e4m3fn,
-        key_dtype=torch.float8_e4m3fn,
-        value_dtype=torch.float8_e4m3fn,
-        dequant_scale_query_dtype=torch_npu.float8_e8m0fnu,
-        dequant_scale_key_dtype=torch_npu.float8_e8m0fnu,
-        dequant_scale_value_dtype=torch_npu.float8_e8m0fnu,
-        out_dtype=out_dtype
-    )[0]
+    try:
+        attn_out = torch_npu.npu_fused_infer_attention_score_v2(
+            q_quant,
+            k_quant,
+            v_quant,
+            actual_seq_qlen=_actual_seq_lens(b, s, q.device),
+            actual_seq_kvlen=_actual_seq_lens(b, kv_s, k.device),
+            dequant_scale_query=q_scale,
+            dequant_scale_key=k_scale,
+            dequant_scale_value=v_scale,
+            num_query_heads=n,
+            num_key_value_heads=k.shape[2],
+            softmax_scale=softmax_scale,
+            input_layout="TND",
+            sparse_mode=0,       # non-sparse
+            query_quant_mode=6,  # per-channel group quant
+            key_quant_mode=6,    # per-channel group quant
+            value_quant_mode=8,  # per-token group quant
+            query_dtype=torch.float8_e4m3fn,
+            key_dtype=torch.float8_e4m3fn,
+            value_dtype=torch.float8_e4m3fn,
+            dequant_scale_query_dtype=torch_npu.float8_e8m0fnu,
+            dequant_scale_key_dtype=torch_npu.float8_e8m0fnu,
+            dequant_scale_value_dtype=torch_npu.float8_e8m0fnu,
+            out_dtype=out_dtype
+        )[0]
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "MXFP8 FA quantization is supported only with CANN 9.1.0 or later."
+        ) from exc
 
     return attn_out.view(b, s, n, d)

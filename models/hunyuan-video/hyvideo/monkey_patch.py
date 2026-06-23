@@ -36,9 +36,9 @@ def npu_fia(q, k, v,
     head_num = n
     scale = 1.0 / math.sqrt(d)
     block_out, block_lse = torch_npu.npu_fused_infer_attention_score(
-                                                q.transpose(1, 2), 
-                                                k.transpose(1, 2), 
-                                                v.transpose(1, 2), 
+                                                q.transpose(1, 2).contiguous(), 
+                                                k.transpose(1, 2).contiguous(), 
+                                                v.transpose(1, 2).contiguous(), 
                                                 num_heads=head_num, 
                                                 input_layout="BNSD",  
                                                 scale=scale, 
