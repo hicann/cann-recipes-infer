@@ -367,14 +367,35 @@ class InferenceConfig:
             disagg_config=disagg_config or DisaggConfig(),
         )
 
+        attn_dp_size = infer_config.parallel_config.attn_dp_size
+        if infer_config.model_config.custom_params.get("enable_afd", False):
+            attn_dp_size = infer_config._update_afd_parallel_config()
         infer_config.scheduler_config.batch_size_per_dp_rank = \
-            infer_config.scheduler_config.batch_size // infer_config.parallel_config.attn_dp_size
+            infer_config.scheduler_config.batch_size // attn_dp_size
 
         if infer_config.scheduler_config.max_prefill_tokens == 0:
             infer_config.scheduler_config.max_prefill_tokens = \
                 infer_config.data_config.input_truncated_len * infer_config.scheduler_config.batch_size_per_dp_rank
 
         return infer_config
+
+    def _update_afd_parallel_config(self):
+        parallel_config = self.parallel_config
+        world_size = parallel_config.world_size
+        if world_size % 2 != 0:
+            raise ValueError(f"AFD requires even world_size, got {world_size}.")
+
+        afd_world_size = world_size // 2
+        for name in ("attn_tp_size", "moe_tp_size", "embed_tp_size", "lmhead_tp_size", "dense_tp_size",
+                     "o_proj_tp_size"):
+            size = getattr(parallel_config, name)
+            if afd_world_size % size != 0:
+                raise ValueError(f"AFD effective world_size={afd_world_size} not divisible by {name}={size}.")
+
+        parallel_config.attn_dp_size = afd_world_size // parallel_config.attn_tp_size
+        parallel_config.moe_ep_size = afd_world_size // parallel_config.moe_tp_size
+        parallel_config.embed_dp_size = afd_world_size // parallel_config.embed_tp_size
+        return afd_world_size // parallel_config.attn_tp_size
 
     def validate(self, hf_config=None):
         """Validate all configuration sections."""

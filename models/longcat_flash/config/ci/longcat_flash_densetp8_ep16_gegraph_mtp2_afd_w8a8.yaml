@@ -1,0 +1,35 @@
+model_config:
+  model_name: longcat_flash
+  model_path: /data/models/origin/LongCat-Flash-Chat-W8A8/
+  with_ckpt: True                   # [False, True]
+  exe_mode: "ge_graph"             # ["eager", "npugraph_ex", "ge_graph"]
+  enable_profiler: False            # [False, True]
+  force_eplb: False                 # [False, True]
+  enable_cache_compile: True        # [False, True]
+  next_n: 2
+  custom_params:
+    enable_mla_prolog: True           # [False, True]
+    enable_multi_streams: 1           # [0, 1, 2]
+    enable_prefetch: True             # [False, True]
+    enable_superkernel: True          # [False, True]
+    enable_afd: True                  # [False, True]
+    moe_chunk_max_len: 1024
+
+data_config:
+  input_truncated_len: 4608
+  dataset: LongBench
+
+parallel_config:
+  world_size: 32
+  attn_tp_size: 1
+  dense_tp_size: 8
+  moe_tp_size: 1
+  embed_tp_size: 1
+  lmhead_tp_size: 16
+  o_proj_tp_size: 8
+
+scheduler_config:
+  block_size: 128
+  max_new_tokens: 128
+  max_prefill_tokens: 4608
+  batch_size: 64

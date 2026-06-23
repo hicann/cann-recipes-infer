@@ -61,6 +61,15 @@ def preprocess_prompts_for_scheduler(prompts, tokenizer, scheduler_config, data_
                                scheduler_config.max_new_tokens, is_chat=True)
 
 
+def _get_prompt_dp_rank(config, global_rank):
+    parallel_config = config.parallel_config
+    if config.model_config.custom_params.get("enable_afd", False):
+        ffn_world_size = parallel_config.world_size // 2
+        global_rank = global_rank % ffn_world_size
+
+    return global_rank // parallel_config.attn_tp_size
+
+
 def log_results(results, mtp_stats, infer_time, next_n, model_name):
     """Log inference results and calculate MTP acceptance rate if MTP is enabled.
 
@@ -128,15 +137,16 @@ def main():
     if config.data_config.dataset_path != "":
         dataset_path = config.data_config.dataset_path
 
-    attn_tp_size = config.parallel_config.attn_tp_size
     attn_dp_size = config.parallel_config.attn_dp_size
     batch_size = config.scheduler_config.batch_size
 
     if attn_dp_size > 1:
         if batch_size % attn_dp_size != 0:
-            raise ValueError(f"batch_size ({batch_size}) must be divisible by attn_dp_size ({attn_dp_size})")
+            raise ValueError(
+                f"batch_size ({batch_size}) must be divisible by attn_dp_size ({attn_dp_size})"
+            )
         batch_size_per_rank = batch_size // attn_dp_size
-        global_dp_rank = global_rank // attn_tp_size
+        global_dp_rank = _get_prompt_dp_rank(config, global_rank)
         all_prompts = generate_prompt(config.data_config.dataset, dataset_path)
         all_prompts = all_prompts * (batch_size // len(all_prompts) + 1)
         prompts = all_prompts[
@@ -151,6 +161,8 @@ def main():
         prompts = preprocess_prompts_for_scheduler(
             prompts, llm.engine.tokenizer, config.scheduler_config, config.data_config)
     results, mtp_stats, infer_time = llm.generate(prompts)
+    if llm.engine.is_afd_ffn_rank:
+        return
     log_results(results, mtp_stats, infer_time, llm.engine.next_n, llm.engine.main_worker.model_name)
 
 

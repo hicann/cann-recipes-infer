@@ -31,7 +31,7 @@ from executor.core.model_worker import ModelWorker, MTPWorker
 from executor.core.kv_cache import KVCacheManager, ModelCacheInfo, create_single_type_managers
 from executor.core.kv_cache.cache_utils import allocate_cache_tensors, calculate_block_num, \
     prepare_block_tables, prepare_slot_mapping, validate_cache_info
-from ..forward_data_info import MTPInfo, Batch, StepOutput
+from ..forward_data_info import Batch, StepOutput
 
 torch.npu.config.allow_internal_format = True
 logger = logging.getLogger(__name__)
@@ -72,11 +72,15 @@ class ExecutionEngine:
         self.local_rank = self.infer_config.parallel_config.local_rank
         self.global_rank = self.infer_config.parallel_config.global_rank
         self.world_size = self.infer_config.parallel_config.world_size
+        custom_params = self.infer_config.model_config.custom_params
+        enable_afd = custom_params.get("enable_afd", False)
+        self.is_afd_ffn_rank = enable_afd and self.global_rank < self.world_size // 2
         self._init_device()
 
         # Initialize workers
         self.main_worker = ModelWorker(self.infer_config, self.device)
-        self.mtp_worker = MTPWorker(self.infer_config, self.device) if self.next_n > 0 else None
+        self.mtp_worker = MTPWorker(self.infer_config, self.device) if self.next_n > 0 \
+            and not self.is_afd_ffn_rank else None
 
         # Profiling configuration
         self.enable_profiler = self.infer_config.model_config.enable_profiler
@@ -340,10 +344,11 @@ class ExecutionEngine:
 
         # 1. Get warm-up shape info from config
         prefill_batch_size, decode_batch_size, seq_len = self._get_warmup_shape()
+        warmup_role = "AFD FFN" if self.is_afd_ffn_rank else "Main"
 
         if self.infer_config.disagg_config.disaggregation_mode in ["NONE", "PREFILL"]:
             # 2. Execute ONE prefill step with dummy inputs (packed sequence format)
-            logger.info("Warm-up [Main]: executing model prefill step...")
+            logger.info("Warm-up [%s]: executing model prefill step...", warmup_role)
             dummy_seq_lens = torch.tensor([seq_len] * prefill_batch_size, dtype=torch.long, device=self.device)
             if not hasattr(self.hf_config, "vocab_size") or self.hf_config.vocab_size is None:
                 raise ValueError(
@@ -355,14 +360,17 @@ class ExecutionEngine:
                 0, self.hf_config.vocab_size,
                 (prefill_batch_size * seq_len,), dtype=torch.long, device=self.device,
             )
-            model_inputs = self._build_model_inputs(dummy_input_ids, is_prefill=True, seq_lens=dummy_seq_lens)
+            if self.is_afd_ffn_rank:
+                num_tokens = prefill_batch_size * seq_len
+                model_inputs = self._build_afd_ffn_inputs(num_tokens, is_prefill=True)
+            else:
+                model_inputs = self._build_model_inputs(dummy_input_ids, is_prefill=True, seq_lens=dummy_seq_lens)
             output, _ = self.main_worker.inference(model_inputs, is_prefill=True)
             if self.mtp_worker:
                 logger.info("Warm-up [MTP]: executing model prefill step...")
                 prev_hidden_states = output[1]
                 model_inputs['prev_hidden_states'] = prev_hidden_states
                 output, _ = self.mtp_worker.mtp_model_worker.inference(model_inputs, is_prefill=True, is_mtp=True)
-
 
         if self.infer_config.disagg_config.disaggregation_mode in ["NONE", "DECODE"]:
             dummy_kv_len = torch.full(
@@ -374,12 +382,15 @@ class ExecutionEngine:
             set_forward_metadata(kv_len=dummy_kv_len)
             # 3. Execute ONE decode step with graph compilation
             seq_len = 1 if self.next_n == 0 else self.next_n + 1
-            logger.info("Warm-up [Main]: executing model decode step...")
+            logger.info("Warm-up [%s]: executing model decode step...", warmup_role)
             dummy_input_ids = torch.randint(
                 0, self.hf_config.vocab_size,
                 (decode_batch_size * seq_len,), dtype=torch.long, device=self.device,
             )
-            model_inputs = self._build_model_inputs(dummy_input_ids, is_prefill=False)
+            if self.is_afd_ffn_rank:
+                model_inputs = self._build_afd_ffn_inputs(decode_batch_size * seq_len, is_prefill=False)
+            else:
+                model_inputs = self._build_model_inputs(dummy_input_ids, is_prefill=False)
 
             # Trigger graph compilation if graph mode enabled and not yet compiled
             if self.exe_mode in ["ge_graph", "npugraph_ex"]:
@@ -397,6 +408,13 @@ class ExecutionEngine:
 
         logger.info("Warm-up completed successfully.")
 
+    def _build_afd_ffn_inputs(self, num_tokens: int, is_prefill: bool) -> Dict:
+        return self.main_worker.model.build_afd_inputs(
+            num_tokens,
+            is_prefill,
+            dtype=self.main_worker.dtype,
+            device=self.device,
+        )
 
     def forward_batch(self, batch: Batch) -> Dict[str, Any]:
         """Execute forward pass for a batch of requests.
@@ -413,6 +431,8 @@ class ExecutionEngine:
                 - "logits": [batch_size, seq_len, vocab_size] model outputs
         """
         batch.build_tensors_from_requests()
+        if self.is_afd_ffn_rank:
+            return self._forward_afd_ffn_batch(batch)
 
         self.profiler.set_status(batch.is_prefill)
         inputs_ids = batch.input_ids.to(self.device)
@@ -468,6 +488,48 @@ class ExecutionEngine:
             "inference_time": infer_time_total,
             "inference_time_main": infer_time_main,
             "inference_times_mtp": infer_times_mtp,
+        }
+
+    def _forward_afd_ffn_batch(self, batch: Batch) -> Dict[str, Any]:
+        self.profiler.set_status(batch.is_prefill)
+        decode_q_len = 1 if self.next_n == 0 else self.next_n + 1
+        if batch.is_prefill:
+            input_num_tokens = batch.total_tokens
+        else:
+            # Match the Attention side's padded decode send shape.
+            input_num_tokens = self.infer_config.scheduler_config.batch_size_per_dp_rank * decode_q_len
+
+        model_inputs = self._build_afd_ffn_inputs(
+            input_num_tokens,
+            batch.is_prefill,
+        )
+        _, infer_time_main = self.main_worker.inference(model_inputs, is_prefill=batch.is_prefill)
+
+        actual_batch = len(batch.requests)
+        if batch.is_prefill:
+            set_forward_metadata(kv_len=batch.seq_lens.to(self.device) - 1)
+            next_tokens = torch.zeros((actual_batch, 1), dtype=torch.long, device=self.device)
+        else:
+            kv_len = torch.tensor(
+                [request.computed_len + 1 for request in batch.requests],
+                dtype=torch.long,
+                device=self.device,
+            )
+            set_forward_metadata(kv_len=kv_len)
+            next_tokens = torch.zeros((actual_batch, 1), dtype=torch.long, device=self.device)
+
+        next_tokens_by_request = batch.update_requests_from_batch(
+            batch.is_prefill,
+            next_tokens,
+            infer_time_main,
+        )
+        self.profiler.step()
+        return {
+            "next_tokens": next_tokens_by_request,
+            "logits": None,
+            "inference_time": infer_time_main,
+            "inference_time_main": infer_time_main,
+            "inference_times_mtp": [],
         }
 
     def _sample_tokens(

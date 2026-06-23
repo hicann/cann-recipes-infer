@@ -178,6 +178,7 @@ class LongcatFlashConfig(PretrainedConfig):
         self.qk_nope_head_dim = qk_nope_head_dim
         self.qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
         self.moe_topk = moe_topk
+        self.num_experts_per_tok = moe_topk
         self.norm_topk_prob = norm_topk_prob
         self.mla_scale_q_lora = mla_scale_q_lora
         self.mla_scale_kv_lora = mla_scale_kv_lora

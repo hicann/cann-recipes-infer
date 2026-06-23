@@ -8,23 +8,24 @@
 LongCat-Flash结构中的与Llama类似的部分，可参考通用优化点[Llama](https://gitcode.com/Ascend/torchair/tree/master/npu_tuned_model/llm/llama)的改动，如固定KV Cache大小、cos/sin优化、AddRMSNorm融合等。
 
 ### 使能图模式
-使用静态图可以获得更好的推理性能。`LongcatFlashRunner`通过覆写`executor/model_runner.py`中的`ModelRunner`的`graph_compile`函数，将模型编译为静态图，当前暂不支持acl_graph。
+使用静态图可以获得更好的推理性能。LongCat-Flash使用推理框架的图编译流程，在`executor/core/model_worker.py`的`ModelWorker.compile_model`中触发，并调用`executor/utils/graph_utils.py`中的`compile_model_forward`完成编译。
+
+执行模式通过YAML中`model_config.exe_mode`配置，当前支持`eager`、`ge_graph`和`npugraph_ex`。其中`ge_graph`和`npugraph_ex`会在Decode阶段使用编译后的`model.forward`，Prefill阶段按`eager`模式执行。
 
 #### 使能图编译缓存
-torch.compile是一种即时编译器（Just-In-Time compiler），成图首次编译时间通常较长，在时延敏感的模型推理场景下，使能图编译缓存可以缓存编译后的静态图，有效缩短服务启动后的首次推理时延，从而提高推理性能。可参考`LongcatFlashRunner`中`graph_compile`函数中的使用：
+torch.compile是一种即时编译器（Just-In-Time compiler），成图首次编译时间通常较长，在时延敏感的模型推理场景下，使能图编译缓存可以缓存编译后的静态图，有效缩短服务启动后的首次推理时延，从而提高推理性能。当前编译入口如下：
 
 ```python
-if self.enable_cache_compile:
-    case_name = "compile_cache/" + os.getenv("CASE_NAME")
-    cache_model = self.model.decode
-    if self.is_mtp:
-        case_name += "_spec"
-        cache_model = self.model.mtp_compile_decode
-    cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), case_name)
-    self.model.decode = tng.inference.cache_compile(cache_model, cache_dir=cache_dir,
-                        config=compiler_config, dynamic=False, fullgraph=True, ge_cache=True)
+self.model_compiled = compile_model_forward(
+    self.model.forward,
+    exe_mode=self.exe_mode,
+    enable_cache_compile=self.enable_cache_compile,
+    cache_dir=os.path.join(self.infer_config.model_config.output_path, "cache_compile"),
+    enable_static_kernel=self.enable_static_kernel,
+)
 ```
-主模型缓存默认路径为`./compile_cache/CASE_NAME`，mtp模型缓存默认路径为`./compile_cache/CASE_NAME_spec`。
+
+图编译缓存通过YAML中`model_config.enable_cache_compile`开关使能，缓存目录为`model_config.output_path/cache_compile`。`ge_graph`模式下使用`torchair.inference.cache_compile`，`npugraph_ex`模式下使用`torch.npu.npugraph_ex.inference.cache_compile`；`npugraph_ex`还可通过`model_config.enable_static_kernel`使能静态kernel编译。
 
 ### 多流并行与控核
 大模型推理场景下，对于一些可并行的场景，可以划分多个stream做并行计算，多个stream上的计算形成overlap，从而降低整体计算耗时。多流并行技术的详细介绍，请参考[官方文档](https://www.hiascend.com/document/detail/zh/Pytorch/720/modthirdparty/torchairuseguide/torchair_00026.html)
@@ -38,6 +39,8 @@ if self.enable_cache_compile:
 </div>
 
 我们对并行策略进行了调整，调整后的多流并行和控核方案图如下所示。将第二段attention和FFN专家提前执行，并通过控制多流上的ai core和vector core核数，使得双流的计算时间接近，无明显拖尾，提升性能。其中stage1不做控核，默认占用全部的ai core和vector core核数，stage2里的stream0采用c16v32控核方案，stream1采用c8v16。
+
+当前代码中通过`model_config.custom_params.enable_multi_streams`控制该优化：`0`表示关闭，`1`表示采用上述非对称控核方案，`2`表示stream0和stream1均采用c12v24方案。该优化只在Decode阶段生效，且不支持`exe_mode: eager`。
 
 <div align="center">
     <img src="./figures/multi_stream_limit_core_num.png" width="800" />
@@ -62,7 +65,7 @@ with limit_core_num(True, "16", "32"):
 
 
 ### 权重预取
-该优化提供网络weight预取功能，在算子计算的同时，利用空闲的带宽，提前将一些访存bound算子的权重从HBM搬运到L2 Cache中，提升算子性能。npu_prefetch技术的详细介绍，请参考[官方文档](https://www.hiascend.com/document/detail/zh/Pytorch/730/apiref/torchnpuCustomsapi/docs/context/torch_npu-npu_prefetch.md)。npu_prefetch优化功能可通过`enable_prefetch`开关使能。
+该优化提供网络weight预取功能，在算子计算的同时，利用空闲的带宽，提前将一些访存bound算子的权重从HBM搬运到L2 Cache中，提升算子性能。npu_prefetch技术的详细介绍，请参考[官方文档](https://www.hiascend.com/document/detail/zh/Pytorch/730/apiref/torchnpuCustomsapi/docs/context/torch_npu-npu_prefetch.md)。npu_prefetch优化功能可通过`model_config.custom_params.enable_prefetch`开关使能；当前LongCat-Flash中该开关依赖多流优化，需要同时设置`enable_multi_streams > 0`。
 
 以下图为例，`Matmul`的权重有20 MB，前序的算子`RmsNorm`对内存带宽的需求较小，执行时间为10us，此时可以通过预取技术，将`Matmul`的权重提前写入到L2 Cache中，理想情况下，最大可预取的大小为 `HBM_brandwidth / time_available`，实际可预取大小因网络与前序算子对带宽的占用程度而异。假设此时可预取的大小为10 MB，与`RmsNorm`并行执行，则在`Matmul`算子执行时，只需要再额外读10 MB权重，访存的耗时开销减少明显。
 <div align="center">
@@ -97,7 +100,7 @@ flowchart LR
 
 > 注：各模型的预取情况可能有所不同，可按需调整上述流程。
 
-下图为LongCat-Flash模型的预取位置。我们针对访存bound的算子如QuantBatchMatmul (QBMM)、MLAProlog、Matmul等算子提前预取了对应的权重。其中MLAProlog算子包含了多个矩阵乘计算，搬运bound较大，因此我们提前预取了前置的QBMM的权重，为MLAProlog提供了更大的预取空间，获取较大的性能收益。具体的预取大小及预取位置，可在`models/modeling_longcat_flash.py`中搜索`npu_prefetch`接口查看。
+下图为LongCat-Flash模型的预取位置。我们针对访存bound的算子如QuantBatchMatmul (QBMM)、MLAProlog、Matmul等算子提前预取了对应的权重。其中MLAProlog算子包含了多个矩阵乘计算，搬运bound较大，因此我们提前预取了前置的QBMM的权重，为MLAProlog提供了更大的预取空间，获取较大的性能收益。具体的预取大小及预取位置，可在`models/longcat_flash/models/modeling_longcat_flash.py`和`models/longcat_flash/models/ffn.py`中搜索`npu_prefetch`接口查看。
 
 <div align="center">
     <img src="./figures/prefetch.png" width="800" />
@@ -105,7 +108,7 @@ flowchart LR
 
 
 ### 使能SuperKernel
-SuperKernel优化功能在decode启用`ge_graph`图模式的场景下，根据用户定义的范围对模型的计算图进行优化。SuperKernel技术的详细介绍，请参考[官方文档](https://www.hiascend.com/document/detail/zh/Pytorch/710/modthirdparty/torchairuseguide/torchair_00035.html)。SuperKernel优化功能将通过`enable_superkernel`开关使能，可将部分算子优化在一个SuperKernel scope内，从而实现对任务调度的等待时间和调度开销的优化，提升整体性能。由于我们在不同流上采取了不同的分核策略，按照分核、分流的范围标定各SuperKernel scope的范围即可。下图为针对Longcat-Flash模型标定的SuperKernel范围。
+SuperKernel优化功能在Decode启用`ge_graph`图模式的场景下，根据用户定义的范围对模型的计算图进行优化。SuperKernel技术的详细介绍，请参考[官方文档](https://www.hiascend.com/document/detail/zh/Pytorch/710/modthirdparty/torchairuseguide/torchair_00035.html)。SuperKernel优化功能通过`model_config.custom_params.enable_superkernel`开关使能，可将部分算子优化在一个SuperKernel scope内，从而实现对任务调度的等待时间和调度开销的优化，提升整体性能。当前LongCat-Flash中`enable_superkernel`不支持`eager`和`npugraph_ex`模式。由于我们在不同流上采取了不同的分核策略，按照分核、分流的范围标定各SuperKernel scope的范围即可。下图为针对Longcat-Flash模型标定的SuperKernel范围。
 
 <div align="center">
     <img src="./figures/superkernel.png" width="800" />
@@ -127,7 +130,7 @@ Decode阶段参考[Deepseek论文](https://arxiv.org/pdf/2405.04434)中提及的
 </div>
 
 ### MoE (Mixture of Experts)模块实现Expert Parallel (EP)及使能融合算子
-MoE计算阶段采用EP (Expert Parallelism)切分策略，将路由专家和零计算专家均匀分布到每张卡上。
+MoE计算阶段采用EP (Expert Parallelism)切分策略，将路由专家和零计算专家均匀分布到每张卡上。当前实现位于`models/longcat_flash/models/modeling_longcat_flash.py`的`LongcatFlashMoE`；AFD场景下FFN侧独立模型位于`models/longcat_flash/models/ffn.py`，并在框架中注册为`longcat_flash_ffn`。
 
 #### Router使能融合算子
 使用[torch_npu.npu_moe_gating_top_k](https://www.hiascend.com/document/detail/zh/Pytorch/720/apiref/torchnpuCustomsapi/context/torch_npu-npu_moe_gating_top_k.md)算子，对router计算的结果排序，并选取前top-k个专家。
@@ -144,18 +147,18 @@ Prefill阶段路由专家采用**Double-Routing**的计算策略完成计算,具
 原始`LongCatFlashMLP`实现中，存在`gate_proj`、`up_proj`与`down_proj`三个matmul运算，可通过将`gate_proj`与`up_proj`进行合并计算，得到`gate_up_proj`提升整体计算效率。
 
 #### MLP线性层TP切分
-在MLP的计算中，`gate_up_proj`和`down_proj`需要全量存储到每一个device上，造成device内存压力，本优化将`gate_up_proj`沿N轴切分、`down_proj`沿K轴切分到`dense_tp`域内的不同device上，以完成MLP线性层的TP切分，降低单个device的内存使用，并减少matmul矩阵运算时的权重搬运开销。需要注意的是，MLP阶段采用TP切分，但前后的Attention模块采用的是DP切分，在MLP计算之前和之后需要分别进行AllGather和ReduceScatter，完成DP -> TP -> DP的并行方式转化。虽然有额外的通信开销，但整体仍有较好的性能收益。在当前的优化实践中，Dense FFN专家采用TP8切分。
+在MLP的计算中，`gate_up_proj`和`down_proj`需要全量存储到每一个device上，造成device内存压力，本优化将`gate_up_proj`沿N轴切分、`down_proj`沿K轴切分到`dense_tp`域内的不同device上，以完成MLP线性层的TP切分，降低单个device的内存使用，并减少matmul矩阵运算时的权重搬运开销。需要注意的是，MLP阶段采用TP切分，但前后的Attention模块采用的是DP切分，在MLP计算前后需要分别进行AllGather和ReduceScatter，完成DP -> TP -> DP的并行方式转化。虽然有额外的通信开销，但整体具有较好的性能收益。在当前的优化实践中，Dense FFN专家采用TP8切分。
 
 <div align="center">
     <img src="./figures/dense_tp.png" width="800" />
 </div>
 
 ### 支持Multi-Token Prediction (MTP)
-实现了MTP投机推理，在未达到计算bound的场景下，MTP计算可以实现较好的推理加速效果。可通过`next_n`参数使能MTP。当前支持了MTP1，MTP2。
+实现了MTP投机推理，在未达到计算bound的场景下，MTP计算可以实现较好的推理加速效果。可通过YAML中`model_config.next_n`参数使能MTP。框架会在`next_n > 0`时加载`LongcatFlashModelMTP`并由`executor/core/model_worker/mtp_worker.py`执行投机推理流程。当前支持MTP1和MTP2。
 
 ### Attention-FFN Disaggregation(AFD)优化
 #### 优化出发点
-在非分离场景中，Attention 模块和 MoE 模块部署在同一个卡上，由于 ScMoE 结构的固有特性，为了获取最佳的性能，在 [多流并行与控核](###多流并行与控核) 小节中对 Stage2 设计了多流并行策略，通过分配不同的核数将 Attention 计算流和 MoE 计算流进行了并行流水，达到最佳性能。
+在非分离场景中，Attention 模块和 MoE 模块部署在同一个卡上，由于 ScMoE 结构的固有特性，为了获取最佳的性能，在 [多流并行与控核](#多流并行与控核) 小节中对 Stage2 设计了多流并行策略，通过分配不同的核数将 Attention 计算流和 MoE 计算流进行了并行流水，达到最佳性能。
 
 然而，对 Stage2 通过控核后，由于两条计算流在计算时只能使用部分 Cube 和 Vector 核，算子执行时会受到算力的约束。在 Atlas A3 环境上实测对比发现，在不控核情况下，MLAProlog/FA/MM/TBMM/QBMM算子耗时相比控核时均有所下降，耗时对比如下表格。
 <table style="width:99%; border-collapse:collapse; margin:20px 0;">
@@ -190,7 +193,7 @@ Prefill阶段路由专家采用**Double-Routing**的计算策略完成计算,具
 
 > 以上数据除了核数不同，其他都在相同的配置情况下从整网中采集拆解得到的。
 
-根据以上分析，针对 LongCat-Flash-560B 模型，为了在 Decode 阶段进一步降低 TPOT 耗时，可采用 Attention-FFN Disaggregation(AFD) 技术方案，它将 MoE 模块从整网中剥离出来进行独立部署，也即 Attention 模块 和 MoE 模块单独部署在不同的节点上，中间通过 Send/Recv 算子进行节点间的数据交互，使能 AFD 技术前后的网络结构示意图如下。
+根据以上分析，针对 LongCat-Flash-560B 模型，为了在 Decode 阶段进一步降低 TPOT 耗时，可采用 Attention-FFN Disaggregation(AFD) 技术方案，它将 MoE 模块从整网中剥离出来进行独立部署，也即 Attention 模块 和 MoE 模块单独部署在不同的节点上，中间通过 Send/Recv 算子进行节点间的数据交互。AFD通过`model_config.custom_params.enable_afd`使能，框架会将`world_size`一分为二：低半区rank加载`longcat_flash_ffn`，高半区rank加载`longcat_flash`主模型，二者通过`dist.send`/`dist.recv`完成Attention侧和FFN侧的数据交互。使能 AFD 技术前后的网络结构示意图如下。
 <p align="center">
   <img src="./figures/w_afd.png" width="90%" alt="w_afd">
 </p>
@@ -225,11 +228,11 @@ Attention 和 MoE 独立部署后的示意图如下：
   <img src="./figures/afd_ffn_cmo.png" width="100%" alt="afd_ffn_cmo">
 </p>
 
-> AFD场景下，Attention 侧的权重预取保持和非分离场景时一样，可参看[权重预取](###权重预取)小节。
+> AFD场景下，Attention 侧的权重预取保持和非分离场景时一样，可参看[权重预取](#权重预取)小节。
 
 
 ## Benchmark
-详细的 benchmark 性能数据请参考[longcat-flash模型README](../../../models/longcat-flash/README.md#benchmark)。
+详细的 benchmark 性能数据请参考[longcat-flash模型README](../../../models/longcat_flash/README.md#benchmark)。
 
 ## 附录
-[环境部署以及样例执行](../../../models/longcat-flash/README.md)
+[环境部署以及样例执行](../../../models/longcat_flash/README.md)

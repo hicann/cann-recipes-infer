@@ -30,6 +30,7 @@ from typing import Dict, Optional, Tuple
 
 import torch
 import torch_npu
+import torch.distributed as dist
 
 from executor.core.config import InferenceConfig, CommManager
 from executor.core.kv_cache.cache_info import CacheEntry, LayerCacheInfo, ModelCacheInfo
@@ -93,6 +94,7 @@ class ModelWorker:
         self.enable_static_kernel = self.infer_config.model_config.enable_static_kernel
         self.use_pretrained_model = self.infer_config.model_config.with_ckpt
         self.enable_cache_compile = self.infer_config.model_config.enable_cache_compile
+        self.enable_afd = self.infer_config.model_config.custom_params.get("enable_afd", False)
 
         # Model Components
         self.device = device
@@ -263,6 +265,15 @@ class ModelWorker:
                     f"Unknown quantization method: {self.quantization}. Must "
                     f"be one of {supported_quantization}.")
 
+    def _barrier_before_timing(self) -> None:
+        if self.enable_afd:
+            return
+        if self.infer_config.parallel_config.world_size <= 1:
+            return
+        if not dist.is_available() or not dist.is_initialized():
+            raise RuntimeError("dist.barrier requires an initialized default process group.")
+        dist.barrier()
+
     def inference(self, model_inputs: Dict, is_prefill: bool, is_mtp: bool = False) -> Tuple[torch.Tensor, float]:
         """Execute model inference and log timing information."""
         # Generate expert indices for force EPLB if enabled
@@ -277,6 +288,7 @@ class ModelWorker:
             model_inputs.update({"cur_topk_list": self.prefill_topk_list if is_prefill else self.decode_topk_list})
 
         # Synchronize and start timing
+        self._barrier_before_timing()
         torch.npu.synchronize()
         start_time = time.time()
 

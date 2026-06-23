@@ -68,6 +68,15 @@ _specs: dict[str, list[tuple[str, str]]] = {
         ("models.qwen3_5.models.modeling_qwen3_5_moe", "Qwen3_5MoeForCausalLM"),
         ("models.qwen3_5.models.configuration_qwen3_5_moe", "Qwen3_5MoeTextConfig"),
     ],
+    "longcat_flash": [
+        ("models.longcat_flash.models.modeling_longcat_flash", "LongcatFlashForCausalLM"),
+        ("models.longcat_flash.models.modeling_longcat_flash", "LongcatFlashModelMTP"),
+        ("models.longcat_flash.models.configuration_longcat_flash", "LongcatFlashConfig"),
+    ],
+    "longcat_flash_ffn": [
+        ("models.longcat_flash.models.ffn", "FFNForCausalLM"),
+        ("models.longcat_flash.models.configuration_longcat_flash", "LongcatFlashConfig"),
+    ],
 }
 
 

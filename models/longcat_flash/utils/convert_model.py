@@ -18,13 +18,13 @@
 import math
 import os
 import json
+import shutil
 from argparse import ArgumentParser
 from glob import glob
 from tqdm import tqdm
 
 import torch
 from safetensors.torch import load_file, save_file
-import shutil
 
 
 def int_weight_quant(tensor: torch.Tensor, bits=8, weight_clip_factor=None):

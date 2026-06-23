@@ -72,6 +72,9 @@ class OfflineInference:
     def _load_model(self) -> None:
         """Load model based on configuration."""
         model_name = self.infer_config.model_config.model_name
+        # AFD FFN-only ranks load the FFN variant registered as "<model_name>_ffn".
+        if self.engine.is_afd_ffn_rank:
+            model_name = f"{model_name}_ffn"
 
         model_config_cls = load_model_classes(model_name)
         if len(model_config_cls) == 2:
@@ -105,6 +108,8 @@ class OfflineInference:
         """
         if not prompts:
             return [], None, []
+        if self.engine.is_afd_ffn_rank:
+            return self._generate_afd_ffn(prompts)
 
         # Reset scheduler for new batch
         self.scheduler.reset()
@@ -169,6 +174,7 @@ class OfflineInference:
             valid_output_id_list = self.get_valid_output(request)
             output_text = self.engine.tokenizer.decode(
                 torch.tensor(valid_output_id_list), skip_special_tokens=True)
+
             # Caculate mtp accept rate
             if request.mtp_info:
                 mtp_stats["spec_num_accepted_tokens"].append(request.spec_num_accepted_tokens)
@@ -182,6 +188,46 @@ class OfflineInference:
             ))
 
         return results, mtp_stats, request.infer_time
+
+    def _generate_afd_ffn(self, prompts: List[str]) -> tuple[List[GenerationOutput], Optional[dict], List[float]]:
+        self.scheduler.reset()
+        batch_size = self.scheduler.config.batch_size_per_dp_rank
+        prompts = [
+            [{"role": "user", "content": p}] if isinstance(p, str) else p
+            for p in prompts
+        ]
+        request_ids = []
+        for prompt in prompts:
+            request_ids.append(self.scheduler.add_request(prompt))
+            if len(request_ids) >= batch_size:
+                break
+        if not request_ids:
+            return [], None, []
+        # AFD FFN ranks build dummy inputs to receive hidden states from Attention ranks.
+        # Keep the FFN-side batch shape fixed by padding dummy requests when needed.
+        while len(request_ids) < batch_size:
+            request_ids.append(self.scheduler.add_request(prompts[-1]))
+
+        infer_time = []
+        while self.scheduler.has_work():
+            step_output = self.scheduler.run_step(self.engine)
+            if step_output is None:
+                logger.warning("AFD FFN scheduler has work but no batch was scheduled.")
+                break
+            request = self.scheduler.running_requests.get(request_ids[0])
+            if request is None:
+                request = self.scheduler.finished_requests.get(request_ids[0])
+            if request is not None:
+                infer_time = request.infer_time
+
+        decode_infer_time = infer_time[1:] if infer_time and len(infer_time) > 1 else []
+        avg_decode_time = process_infer_time(decode_infer_time, len(decode_infer_time))
+        logger.info(
+            "%s ffn average inference time cost is %.2f ms",
+            self.engine.main_worker.model_name,
+            avg_decode_time * 1000,
+        )
+        return [], None, infer_time
 
     def get_valid_output(self, request: Request) -> List[int]:
         if request.valid_output_len is not None:
