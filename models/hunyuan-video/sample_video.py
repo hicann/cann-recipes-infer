@@ -88,6 +88,9 @@ def main():
 
     cache_manager.from_config(args.cache_config, cache_params=cache_params)
 
+    if args.sparse_method != "no_sparse" and cache_manager.cache_method.cache_name != "NoCache":
+        raise ValueError("sparse method is incompatible with dit cache")
+
     if cache_manager.cache_method.cache_name == "TaylorSeer":
         for block in hunyuan_video_sampler.pipeline.transformer.double_blocks:
             block.forward = double_block_forward.__get__(block, type(block))
