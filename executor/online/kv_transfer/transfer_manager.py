@@ -130,6 +130,10 @@ class KVTransferManager:
         self.attn_tp_rank = attn_tp_rank
         self.attn_cp_size = attn_cp_size
         self.attn_cp_rank = attn_cp_rank
+        # env=0: transfer full KV from cp_rank=0 only; env=1: transfer from all CP ranks.
+        self.enable_all_cp_ranks_for_transfer = (
+            os.environ.get("ENABLE_ALL_CP_RANKS_FOR_TRANSFER", "0") == "1"
+        )
         self.kv_cache_dtype = kv_cache_dtype
         self.kv_data_ptrs: list[int] = []
         self.kv_data_lens: list[int] = []
@@ -742,11 +746,15 @@ class KVTransferManager:
 
         if self.attn_cp_size == info.attn_cp_size:
             target_cp_ranks = [self.attn_cp_rank]
-        else:
+        elif self.enable_all_cp_ranks_for_transfer:
             target_cp_ranks = list(range(info.attn_cp_size))
             required_prefill_response_num *= max(
                 1, info.attn_cp_size // self.attn_cp_size
             )
+        else:
+            # Current prefill CP transfer policy keeps full KV visible on
+            # cp_rank=0, so decode only needs one CP source rank.
+            target_cp_ranks = [0]
 
         return TargetRankMapping(
             target_tp_rank=target_tp_rank,
@@ -1052,4 +1060,3 @@ class KVTransferManager:
         dst_replication = max(1, (dst_attn_tp_size * d_bpt) // (self.attn_tp_size * s_bpt))
         unique_head_idx = dst_tp_rank // dst_replication
         return (unique_head_idx * d_bpt) % s_bpt, 0, d_bpt
-

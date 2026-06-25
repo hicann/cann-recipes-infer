@@ -16,9 +16,37 @@
 """Cache metadata structures for paged-attention initialization."""
 
 from dataclasses import dataclass
+from enum import Enum
 from typing import Callable, List, Optional, Union
 
 import torch
+
+
+class CacheAllocator(str, Enum):
+    """Physical allocator used for a cache entry."""
+
+    HBM = "hbm"
+    SWAPPED_MEMORY = "swapped_memory"
+
+
+@dataclass
+class MemoryBudgetItem:
+    """Memory item reported by a model for cache/workspace budgeting."""
+
+    name: str
+    bytes: int
+    location: str = "npu"
+
+
+@dataclass
+class OffloadWorkspaceMemoryInfo:
+    """Structured offload workspace memory report."""
+
+    items: List[MemoryBudgetItem]
+
+    @property
+    def npu_bytes(self) -> int:
+        return sum(item.bytes for item in self.items if item.location == "npu")
 
 
 @dataclass
@@ -35,6 +63,7 @@ class CacheEntry:
     manager_key: Optional[str] = None
     tensor_setter: Optional[Callable[[torch.Tensor], None]] = None
     sliding_window: Optional[int] = None
+    allocator: CacheAllocator = CacheAllocator.HBM
     tensor: Optional[torch.Tensor] = None
 
     @property

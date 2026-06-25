@@ -149,20 +149,41 @@ class MTPWorker:
             if batch.seq_lens is None:
                 raise RuntimeError("seq_lens is required for packed MTP prefill.")
 
-            seq_lens = batch.seq_lens.to(device=self.device, dtype=torch.long)
-            packed_input_ids = batch.input_ids.to(self.device).view(-1)
+            position_ids_mtp = model_inputs_main["position_ids"]
+            forward_metadata_mtp = model_inputs_main["forward_metadata"]
+            cp_metadata = getattr(forward_metadata_mtp, "cp_metadata", None)
+            enable_cp = cp_metadata is not None and cp_metadata.enabled
+            if enable_cp:
+                seq_lens = forward_metadata_mtp.actual_seq_lengths_kv.to(device=self.device, dtype=torch.long)
+                packed_input_ids = torch.index_select(
+                    model_inputs_main["input_ids"].to(self.device).view(-1),
+                    0,
+                    cp_metadata.global_valid_indices,
+                )
+            else:
+                seq_lens = batch.seq_lens.to(device=self.device, dtype=torch.long)
+                packed_input_ids = batch.input_ids.to(self.device).view(-1)
+
             packed_hidden_states = prev_hidden_states.to(self.device).view(-1, prev_hidden_states.shape[-1])
             total_tokens = int(seq_lens.sum().item())
-            if packed_hidden_states.shape[0] < total_tokens:
+            expected_hidden_tokens = cp_metadata.local_token_num if enable_cp else total_tokens
+            if packed_hidden_states.shape[0] < expected_hidden_tokens:
                 raise RuntimeError("Packed prev_hidden_states is shorter than seq_lens in MTP prefill.")
+
+            next_tokens = main_next_tokens.to(self.device)
+            if enable_cp and next_tokens.shape[0] != seq_lens.numel():
+                raise RuntimeError("CP MTP prefill requires global next tokens prepared by execution engine.")
 
             cu_seq_lens = seq_lens.cumsum(0)
             input_ids_mtp = packed_input_ids.roll(-1)
-            input_ids_mtp[cu_seq_lens - 1] = main_next_tokens[:, 0].to(self.device)
+            input_ids_mtp[cu_seq_lens - 1] = next_tokens[:, 0]
             input_ids_mtp = input_ids_mtp[:total_tokens]
-            prev_hidden_states = packed_hidden_states[:total_tokens]
-            position_ids_mtp = model_inputs_main["position_ids"]
-            forward_metadata_mtp = model_inputs_main["forward_metadata"]
+            prev_hidden_states = packed_hidden_states[:expected_hidden_tokens]
+            if enable_cp:
+                global_valid_indices = cp_metadata.global_valid_indices
+                input_ids_mtp_padded = input_ids_mtp.new_zeros(cp_metadata.global_padded_token_num)
+                input_ids_mtp_padded.index_copy_(0, global_valid_indices, input_ids_mtp)
+                input_ids_mtp = input_ids_mtp_padded
         else:
             input_ids_mtp = main_next_tokens.reshape(-1).clone()
             position_ids_mtp = model_inputs_main["position_ids"]
@@ -188,6 +209,12 @@ class MTPWorker:
     ) -> Dict:
         """Process MTP model output and update state for the next inference step."""
         forward_metadata = get_forward_metadata()
+        cp_metadata = getattr(forward_metadata, "cp_metadata", None)
+        if mtp_infos.is_prefill and cp_metadata is not None and cp_metadata.enabled:
+            output_indices = cp_metadata.output_request_indices.to(logits.device)
+            # MTP model also returns global CP prefill logits; postprocess only
+            # updates speculative state for rows selected by the current rank.
+            logits = torch.index_select(logits, 0, output_indices)
         next_tokens = torch.argmax(logits, dim=-1)
         batch_size = next_tokens.shape[0]
         q_len = self.next_n + 1
@@ -246,7 +273,7 @@ class MTPWorker:
                              actual_seq_lengths_list_q=actual_seq_lengths_list_q,
                              actual_seq_lengths_list_kv=actual_seq_lengths_list_kv)
         indices = torch.arange(q_len - 1, -1, -1, device=self.mtp_model_worker.device)
-        position_ids = (kv_len.unsqueeze(1) - indices).reshape(-1)
+        position_ids = (kv_len.unsqueeze(1) - indices).clamp(min=0).reshape(-1)
         slot_mapping = prepare_slot_mapping(
             position_ids,
             actual_seq_lengths_cu_q,

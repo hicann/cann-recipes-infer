@@ -58,6 +58,7 @@ class AscendKVSender:
         self.kv_transfer_manager.track_room(self.bootstrap_addr, bootstrap_room)
         self.kv_transfer_manager.update_status(bootstrap_room, KVPoll.Bootstrapping)
         if is_dummy:
+            self.kv_transfer_manager.update_status(bootstrap_room, KVPoll.Success)
             return
         if is_dp_leader and dp_rank is not None and bootstrap_addr:
             self._register_prefill_dp_rank()
@@ -149,7 +150,7 @@ class AscendKVSender:
             metadata: Dict with request_id, output_bootstrap_room, output_id, kv_len.
         """
         if self.is_dummy:
-            # Dummy sender (e.g. non-zero CP rank without ENABLE_ALL_CP_RANKS_FOR_TRANSFER):
+            # Dummy sender (e.g. non-zero CP rank without all-CP-rank transfer):
             # no real data to transfer; mark success immediately.
             self.kv_transfer_manager.update_status(self.bootstrap_room, KVPoll.Success)
             return

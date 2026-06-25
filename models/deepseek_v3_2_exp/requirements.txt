@@ -1,5 +1,5 @@
-torch==2.6.0
-transformers==4.53.3
+torch==2.8.0
+transformers==5.0.0
 datasets==3.6.0
 numpy==1.26.4
 protobuf==6.31.0

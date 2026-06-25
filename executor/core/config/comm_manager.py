@@ -152,10 +152,10 @@ class CommManager:
         """
         cfg = self.config
         global_rank = cfg.global_rank
-        dp_size = cfg.attn_dp_size
         tp_size = cfg.attn_tp_size
         cp_size = cfg.cp_size
         group_size = tp_size * cp_size
+        dp_size = cfg.cp_prefill_dp_size if cp_size > 1 else cfg.attn_dp_size
 
         # dp_leader_group: ranks where global_rank % group_size == 0
         if dp_size > 1:

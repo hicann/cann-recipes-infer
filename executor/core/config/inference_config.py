@@ -180,6 +180,7 @@ class ParallelConfig:
 
     attn_tp_size: int = 1
     attn_dp_size: int = 1  # This will be calculated based on world_size and attn_tp_size
+    cp_prefill_dp_size: int = 1  # This will be calculated based on world_size, attn_tp_size and cp_size
     embed_tp_size: int = 1
     embed_dp_size: int = 1  # This will be calculated based on world_size and embed_tp_size
     moe_tp_size: int = 1
@@ -210,9 +211,11 @@ class ParallelConfig:
         )
         parallel_config._validate()
 
-        parallel_config.attn_dp_size = (
-            parallel_config.world_size
-            // (parallel_config.attn_tp_size * parallel_config.cp_size)
+        parallel_config.attn_dp_size = parallel_config.world_size // parallel_config.attn_tp_size
+        # CP prefill uses all CP ranks to process the same request batch, so the
+        # prefill DP view must include cp_size in the partitioning.
+        parallel_config.cp_prefill_dp_size = (
+            parallel_config.world_size // (parallel_config.attn_tp_size * parallel_config.cp_size)
         )
         parallel_config.moe_ep_size = parallel_config.world_size // parallel_config.moe_tp_size
         parallel_config.embed_dp_size = parallel_config.world_size // parallel_config.embed_tp_size
@@ -239,12 +242,17 @@ class ParallelConfig:
             raise ValueError(f"world_size={self.world_size} not divisible by o_proj_tp_size={self.o_proj_tp_size}")
         if self.world_size % self.cp_size != 0:
             raise ValueError(f"world_size={self.world_size} not divisible by cp_size={self.cp_size}")
-        attn_group_size = self.attn_tp_size * self.cp_size
-        if self.world_size % attn_group_size != 0:
-            raise ValueError(
-                f"world_size={self.world_size} not divisible by "
-                f"attn_tp_size*cp_size={attn_group_size}"
-            )
+        if self.cp_size > 1:
+            if self.cp_size != self.world_size:
+                raise ValueError(
+                    f"Phase1 prefill CP requires cp_size == world_size, "
+                    f"got cp_size={self.cp_size}, world_size={self.world_size}"
+                )
+            if self.attn_tp_size != 1:
+                raise ValueError(
+                    f"Phase1 prefill CP does not support attention TP, "
+                    f"got attn_tp_size={self.attn_tp_size}"
+                )
 
     def validate_model_config(self, hf_config):
         """Validate against model-specific configuration."""
@@ -374,8 +382,14 @@ class InferenceConfig:
             infer_config.scheduler_config.batch_size // attn_dp_size
 
         if infer_config.scheduler_config.max_prefill_tokens == 0:
+            prefill_batch_size = infer_config.scheduler_config.batch_size_per_dp_rank
+            if infer_config.parallel_config.cp_size > 1:
+                prefill_batch_size = (
+                    infer_config.scheduler_config.batch_size
+                    // infer_config.parallel_config.cp_prefill_dp_size
+                )
             infer_config.scheduler_config.max_prefill_tokens = \
-                infer_config.data_config.input_truncated_len * infer_config.scheduler_config.batch_size_per_dp_rank
+                infer_config.data_config.input_truncated_len * prefill_batch_size
 
         return infer_config
 

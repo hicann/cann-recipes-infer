@@ -33,7 +33,7 @@ import torch_npu
 import torch.distributed as dist
 
 from executor.core.config import InferenceConfig, CommManager
-from executor.core.kv_cache.cache_info import CacheEntry, LayerCacheInfo, ModelCacheInfo
+from executor.core.kv_cache.cache_info import CacheEntry, LayerCacheInfo, ModelCacheInfo, OffloadWorkspaceMemoryInfo
 from executor.utils.forward_metadata import set_forward_metadata, get_forward_metadata
 from executor.model_loader.default_loader import DefaultModelLoader
 from executor.model_loader.dummy_loader import DummyModelLoader
@@ -117,6 +117,7 @@ class ModelWorker:
         self.global_rank = self.infer_config.parallel_config.global_rank
         self.attn_tp_size = self.infer_config.parallel_config.attn_tp_size
         self.attn_dp_size = self.infer_config.parallel_config.attn_dp_size
+        self.cp_size = self.infer_config.parallel_config.cp_size
         self.moe_ep_size = self.infer_config.parallel_config.moe_ep_size
         self.moe_tp_size = self.infer_config.parallel_config.moe_tp_size
 
@@ -218,6 +219,17 @@ class ModelWorker:
         else:
             return None
 
+    def get_offload_workspace_memory_info(self) -> Optional[OffloadWorkspaceMemoryInfo]:
+        """Get model-owned offload workspace memory that must be reserved in HBM."""
+        if hasattr(self.model, "get_offload_workspace_memory_info"):
+            return self.model.get_offload_workspace_memory_info()
+        return None
+
+    def init_offload_workspace(self):
+        """Initialize model-owned offload workspace after framework KV cache allocation."""
+        if hasattr(self.model, "init_offload_workspace"):
+            self.model.init_offload_workspace(self.device)
+
     def init_kvcache(self):
         """Initialize pre-allocated KV cache tensors."""
         batch_size = self.infer_config.scheduler_config.batch_size_per_dp_rank
@@ -280,6 +292,10 @@ class ModelWorker:
         if self.force_eplb:
             input_ids = model_inputs["input_ids"]
             total_tokens = input_ids.numel() if input_ids.dim() == 1 else input_ids.shape[0] * input_ids.shape[1]
+            if is_prefill:
+                cp_metadata = getattr(model_inputs.get("forward_metadata"), "cp_metadata", None)
+                if cp_metadata is not None and cp_metadata.enabled:
+                    total_tokens = cp_metadata.local_token_num
             if is_prefill:
                 self.prefill_topk_list = self.gen_force_eplb_topk_idx(is_prefill, total_tokens)
             elif self.decode_topk_list is None:
@@ -368,6 +384,11 @@ class ModelWorker:
                 (i + self.global_rank) % num_experts for i in range(step_prefill)]
             cur_topk_list = torch.tensor(cur_topk_list_prefill, dtype=torch.int).view(tokens_per_rank_prefill, -1).npu()
         else:
+            # In the TP+DP path, the model slices input tokens by TP rank before MoE.
+            # Force EPLB topk is generated before model forward, so use the token count
+            # that each TP rank will actually feed into MoE.
+            if self.attn_tp_size > 1 and self.attn_dp_size > 1:
+                total_tokens = total_tokens // self.attn_tp_size
             # Decode phase: allocation depends on MoE tensor parallelism
             if self.moe_tp_size > 1:
                 # MoE TP mode: contiguous expert ranges per EP rank

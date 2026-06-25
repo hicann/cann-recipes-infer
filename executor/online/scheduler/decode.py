@@ -45,7 +45,7 @@ class DecodeDisaggScheduler(Scheduler):
         self.mode = 'online'
         if getattr(kv_transfer_manager, "attn_cp_size", 1) != 1:
             raise ValueError(
-                f"Decode disaggregation requires cp_size == 1, "
+                f"Decode disaggregation requires decode cp_size == 1, "
                 f"got {kv_transfer_manager.attn_cp_size}"
             )
         self.kv_transfer_manager = kv_transfer_manager

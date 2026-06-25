@@ -111,7 +111,7 @@ class DeepseekV3Config(PretrainedConfig):
     >>> configuration = model.config
     ```"""
 
-    model_type = "deepseek_v3"
+    model_type = "deepseek_v32"
     keys_to_ignore_at_inference = ["past_key_values"]
 
     def __init__(
@@ -196,7 +196,7 @@ class DeepseekV3Config(PretrainedConfig):
         self.attention_dropout = attention_dropout
         self.quantization_config = kwargs.get('quantization_config', {})
         self.quant_config = kwargs.get('quant_config', None)
-        
+
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
@@ -220,7 +220,7 @@ class DeepseekV3IndexConfig(DeepseekV3Config):
 
     ```"""
 
-    model_type = "deepseek_v3"
+    model_type = "deepseek_v32"
     keys_to_ignore_at_inference = ["past_key_values"]
 
     def __init__(

@@ -114,8 +114,11 @@ class OfflineInference:
         # Reset scheduler for new batch
         self.scheduler.reset()
 
-        # Use batch_size_per_dp_rank for distributed inference
-        batch_size = self.scheduler.config.batch_size_per_dp_rank
+        parallel_config = self.infer_config.parallel_config
+        enable_cp = parallel_config.cp_size > 1
+        # CP prefill uses a global compute batch on every CP rank; decode still
+        # returns only this rank's owner requests.
+        batch_size = self.scheduler.config.batch_size if enable_cp else self.scheduler.config.batch_size_per_dp_rank
 
         # Convert str prompts to chat message format for chat template tokenization
         prompts = [
@@ -156,7 +159,14 @@ class OfflineInference:
             "spec_num_forward_ct": [],
             "valid_output_len": []
         }
-        for request_id in request_ids[:original_request_count]:
+        result_request_ids = request_ids[:original_request_count]
+        if enable_cp:
+            current_cp_rank = parallel_config.global_rank % parallel_config.cp_size
+            result_request_ids = [
+                request_id for request_id in result_request_ids
+                if request_id % parallel_config.cp_size == current_cp_rank
+            ]
+        for request_id in result_request_ids:
             request = self.scheduler.get_finished_request(request_id)
             if request is None:
                 logger.warning(
@@ -174,8 +184,7 @@ class OfflineInference:
             valid_output_id_list = self.get_valid_output(request)
             output_text = self.engine.tokenizer.decode(
                 torch.tensor(valid_output_id_list), skip_special_tokens=True)
-
-            # Caculate mtp accept rate
+            # Calculate MTP accept rate
             if request.mtp_info:
                 mtp_stats["spec_num_accepted_tokens"].append(request.spec_num_accepted_tokens)
                 mtp_stats["spec_num_forward_ct"].append(request.spec_num_forward_ct)

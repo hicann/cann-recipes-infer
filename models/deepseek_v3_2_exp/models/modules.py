@@ -159,7 +159,7 @@ class DeepseekV3RotaryEmbedding(nn.Module):
 
         cos = torch.index_select(self.cos_cached, dim=0, index=position_ids.view(-1)).unsqueeze(1).unsqueeze(1)
         sin = torch.index_select(self.sin_cached, dim=0, index=position_ids.view(-1)).unsqueeze(1).unsqueeze(1)
-        
+
         return (
             cos.to(dtype=x.dtype),
             sin.to(dtype=x.dtype),
@@ -198,7 +198,7 @@ class DeepseekV3LinearScalingRotaryEmbedding(DeepseekV3RotaryEmbedding):
 # Copied from transformers.models.llama.modeling_llama.LlamaDynamicNTKScalingRotaryEmbedding with Llama->DeepseekV3
 class DeepseekV3DynamicNTKScalingRotaryEmbedding(DeepseekV3RotaryEmbedding):
     """
-    DeepseekV3RotaryEmbedding extended with Dynamic NTK scaling. 
+    DeepseekV3RotaryEmbedding extended with Dynamic NTK scaling.
     Credits to the Reddit users /u/bloc97 and /u/emozilla
     """
 

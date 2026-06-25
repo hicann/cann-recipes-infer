@@ -90,10 +90,10 @@ class OnlineInference(OfflineInference):
         self.global_rank = pc.global_rank
         self.local_rank = pc.local_rank
         self.world_size = pc.world_size
-        self.dp_size = pc.attn_dp_size
         self.tp_size = pc.attn_tp_size
         self.cp_size = pc.cp_size
         self.group_size = self.tp_size * self.cp_size
+        self.dp_size = pc.cp_prefill_dp_size if self.cp_size > 1 else pc.attn_dp_size
 
         self.dp_rank = self.global_rank // self.group_size
         self.cp_rank = (self.global_rank % self.group_size) // self.tp_size

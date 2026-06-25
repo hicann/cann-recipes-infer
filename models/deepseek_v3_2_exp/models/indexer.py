@@ -22,7 +22,7 @@
 # limitations under the License.
 
 """ PyTorch Index model."""
-from typing import List, Optional, Tuple, Union, Dict
+from typing import Optional, Dict
 
 import torch
 import torch.nn.functional as F
@@ -32,13 +32,18 @@ from torch import nn
 import torch.distributed as dist
 
 import torch_npu
-import torchair as tng
 import custom_ops
 
-from executor.utils import npu_stream_switch, get_had_pow2
+from executor.core.config import InferenceConfig, CommManager
+from executor.utils import npu_stream_switch as npu_stream_switch_gegraph, npu_wait_tensor, get_had_pow2
+from executor.utils.forward_metadata import PrefillCPMetaData
+from executor.utils.stream_utils import (
+    record_event,
+    wait_event,
+    record_stream,
+    npu_stream_switch as npu_stream_switch_npugraph,
+)
 from module.linear import ReplicatedLinear
-
-indexer_npu_events = [tng.ops.npu_create_tagged_event(tag=f"indexer_evt_{i}") for i in range(4)]
 
 
 class LayerNorm(nn.Module):
@@ -54,23 +59,33 @@ class LayerNorm(nn.Module):
 
 
 class Indexer(nn.Module):
-    def __init__(self, config, runner_settings, layer_idx: Optional[int] = None,
+    def __init__(self, config, infer_config: InferenceConfig, comm_manager: CommManager,
+                 layer_idx: Optional[int] = None,
                  prefix: Optional[str] = "", **kwargs):
         super().__init__()
         self.layer_idx = layer_idx
         if layer_idx == config.num_hidden_layers: # mtp model
             self.layer_idx = 0 # mtp model only has one layer of cache
-        self.runner_settings = runner_settings
-        self.hccl_comm_dict = kwargs.get("hccl_comm_dict", None)
+        self.infer_config = infer_config
+        self.comm_manager = comm_manager
+        model_config = self.infer_config.model_config
+        parallel_config = self.infer_config.parallel_config
+        custom_params = model_config.custom_params
 
-        self.attn_tp_size = self.runner_settings.get("parallel_config").get("attn_tp_size", 1)
-        self.cp_size = self.runner_settings.get("parallel_config").get("cp_size", 1)
+        self.attn_tp_size = parallel_config.attn_tp_size
+        self.cp_size = parallel_config.cp_size
 
-        self.enable_multi_streams = runner_settings.get("model_config").get("enable_multi_streams", False)
-        self.enable_gegraph = runner_settings.get("exe_mode", "ge_graph") == "ge_graph"
-        self.enable_aclgraph = runner_settings.get("exe_mode", "ge_graph") == "acl_graph"
-        self.enable_pypto = self.runner_settings.get("model_config").get("enable_pypto", False)
-        self.pa_block_size = self.runner_settings.get("model_config").get("pa_block_size", 128)
+        self.enable_multi_streams = custom_params.get("enable_multi_streams", False)
+        self.enable_gegraph = model_config.exe_mode == "ge_graph"
+        self.enable_npugraph_ex = model_config.exe_mode == "npugraph_ex"
+        self.npu_events = []
+        streams = kwargs.get("npugraph_streams", {})
+        self.prolog_stream = streams.get("indexer_prolog")
+        self.weight_stream = streams.get("indexer_weight")
+        if self.enable_multi_streams and self.enable_npugraph_ex:
+            self.npu_events = [torch.npu.Event() for _ in range(4)]
+        self.enable_pypto = custom_params.get("enable_pypto", False)
+        self.pa_block_size = self.infer_config.scheduler_config.block_size
 
         self.dim: int = config.hidden_size
         self.n_heads: int = config.index_n_heads
@@ -117,13 +132,13 @@ class Indexer(nn.Module):
         cos_sin: torch.Tensor,
         position_ids: torch.Tensor,
         query_states: torch.Tensor,
-        past_key_values_indexer: Optional[List[torch.FloatTensor]],
-        past_key_scales_indexer: Optional[List[torch.FloatTensor]],
         slot_mapping: torch.Tensor,
         block_table: Optional[torch.Tensor] = None,
         actual_seq_lengths_q: Optional[torch.Tensor] = None,
-        prefill_extra_input_dict: Optional[Dict] = None,
+        cp_metadata: Optional[PrefillCPMetaData] = None,
         c8_input_dict: Optional[Dict] = None,
+        indexer_key_cache: Optional[torch.Tensor] = None,
+        indexer_key_scale_cache: Optional[torch.Tensor] = None,
         is_prefill: bool = True,
     ):
         input_args = {
@@ -134,13 +149,13 @@ class Indexer(nn.Module):
             "cos_sin": cos_sin,
             "position_ids": position_ids,
             "query_states": query_states,
-            "past_key_values_indexer": past_key_values_indexer,
-            "past_key_scales_indexer": past_key_scales_indexer,
             "slot_mapping": slot_mapping,
             "block_table": block_table,
             "actual_seq_lengths_q": actual_seq_lengths_q,
-            "prefill_extra_input_dict": prefill_extra_input_dict,
+            "cp_metadata": cp_metadata,
             "c8_input_dict": c8_input_dict,
+            "indexer_key_cache": indexer_key_cache,
+            "indexer_key_scale_cache": indexer_key_scale_cache,
             "is_prefill": is_prefill,
         }
 
@@ -163,23 +178,22 @@ class Indexer(nn.Module):
         cos_sin: torch.Tensor,
         position_ids: torch.Tensor,
         query_states: torch.Tensor,
-        past_key_values_indexer: Optional[List[torch.FloatTensor]],
-        past_key_scales_indexer: Optional[List[torch.FloatTensor]],
         slot_mapping: torch.Tensor,
         block_table: Optional[torch.Tensor] = None,
         actual_seq_lengths_q: Optional[torch.Tensor] = None,
-        prefill_extra_input_dict: Optional[Dict] = None,
+        cp_metadata: Optional[PrefillCPMetaData] = None,
         c8_input_dict: Optional[Dict] = None,
+        indexer_key_cache: Optional[torch.Tensor] = None,
+        indexer_key_scale_cache: Optional[torch.Tensor] = None,
         is_prefill: bool = True,
     ):
-        x = x.view(kv_len.shape[0], -1, self.dim)
-        bsz, seqlen, _ = x.size()
+        token_num = x.shape[0]
         cos, sin = cos_sin
         cos = cos.view(-1, 1, 1, self.rope_head_dim)
         sin = sin.view(-1, 1, 1, self.rope_head_dim)
 
-        past_key_states = past_key_values_indexer[self.layer_idx][0]
-        past_key_scales = past_key_scales_indexer[self.layer_idx][0]
+        key_states = indexer_key_cache
+        key_scales = indexer_key_scale_cache
 
         res = torch.ops.custom_pypto.npu_lightning_indexer_prolog_pto(
             token_x=x.view(-1, self.dim),
@@ -195,8 +209,8 @@ class Indexer(nn.Module):
             sin_idx_rope=sin.squeeze(1).squeeze(1),
             hadamard_q=self.hadamard_matrix,
             hadamard_k=self.hadamard_matrix,
-            idx_k_cache=past_key_states,
-            idx_k_scale_cache=past_key_scales,
+            idx_k_cache=key_states,
+            idx_k_scale_cache=key_scales,
             idx_k_cache_index=slot_mapping.view(-1),
             layernorm_epsilon_k=self.k_norm.eps,
             layout_query="TND",
@@ -208,12 +222,13 @@ class Indexer(nn.Module):
 
         li_ops_input = {}
         indexer_func = self.li_fusion
-        li_ops_input.update({"key_dequant_scale": past_key_scales,
+        key_scales_for_indexer = key_scales.squeeze(2) if key_scales.dim() == 4 else key_scales
+        li_ops_input.update({"key_dequant_scale": key_scales_for_indexer,
                               "query_dequant_scale": query_dequant_scale.view(-1, self.n_heads),
                                 })
         li_ops_input.update({"actual_seq_lengths_query": actual_seq_lengths_q,
                             "actual_seq_lengths_kv": actual_seq_lengths_kv,
-                            "k": past_key_states,
+                            "k": key_states,
                             "block_table": block_table,
                             "is_prefill": is_prefill,
                             })
@@ -229,81 +244,96 @@ class Indexer(nn.Module):
         cos_sin: torch.Tensor,
         position_ids: torch.Tensor,
         query_states: torch.Tensor,
-        past_key_values_indexer: Optional[List[torch.FloatTensor]],
-        past_key_scales_indexer: Optional[List[torch.FloatTensor]],
         slot_mapping: torch.Tensor,
         block_table: Optional[torch.Tensor] = None,
         actual_seq_lengths_q: Optional[torch.Tensor] = None,
-        prefill_extra_input_dict: Optional[Dict] = None,
+        cp_metadata: Optional[PrefillCPMetaData] = None,
         c8_input_dict: Optional[Dict] = None,
+        indexer_key_cache: Optional[torch.Tensor] = None,
+        indexer_key_scale_cache: Optional[torch.Tensor] = None,
         is_prefill: bool = True,
     ):
-        x = x.view(kv_len.shape[0], -1, self.dim)
-        bsz, seqlen, _ = x.size()
-        if self.cp_size > 1 and is_prefill:
-            _, _, cos, sin = cos_sin
-        else:
-            cos, sin = cos_sin
+        token_num = x.shape[0]
+        enable_cp = cp_metadata is not None and getattr(cp_metadata, "enabled", False)
+        cos, sin = cos_sin
         cos = cos.view(-1, 1, 1, self.rope_head_dim)
         sin = sin.view(-1, 1, 1, self.rope_head_dim)
         enable_multi_streams = self.enable_multi_streams and not is_prefill
+        enable_gegraph_and_multistream = enable_multi_streams and self.enable_gegraph
+        enable_npugraph_and_multistream = enable_multi_streams and self.enable_npugraph_ex
 
-        if enable_multi_streams and self.enable_aclgraph:
-            tng.ops.npu_record_tagged_stream(qr, "22")
-            tng.ops.npu_record_tagged_stream(cos, "22")
-            tng.ops.npu_record_tagged_stream(sin, "22")
-            tng.ops.npu_tagged_event_record(indexer_npu_events[0])
-        with npu_stream_switch(enable_multi_streams, "22"):
+        if enable_npugraph_and_multistream:
+            record_stream(True, qr, self.prolog_stream)
+            record_stream(True, cos, self.prolog_stream)
+            record_stream(True, sin, self.prolog_stream)
+            record_event(True, self.npu_events, 0)
+        with (
+            npu_stream_switch_npugraph(True, self.prolog_stream)
+            if enable_npugraph_and_multistream
+            else npu_stream_switch_gegraph(enable_gegraph_and_multistream, "22")
+        ):
             # prolog for kv use multi streams
             if enable_multi_streams:
-                if self.enable_aclgraph:
-                    tng.ops.npu_tagged_event_wait(indexer_npu_events[0])
+                if enable_gegraph_and_multistream:
+                    qr = npu_wait_tensor(True, qr, query_states[0])
+                elif enable_npugraph_and_multistream:
+                    wait_event(True, self.npu_events, 0)
                 else:
-                    tng.scope.npu_wait_tensor(qr, query_states[0])
+                    qr = npu_wait_tensor(True, qr, query_states[0])
             # q process in new stream
             q_b = self.wq_b(qr, c8_input_dict.get("pertoken_scale", None)) # [b,s,1536] @ [1536,64*128] = [b,s,64*128]
 
-            if enable_multi_streams and self.enable_aclgraph:
-                tng.ops.npu_tagged_event_record(indexer_npu_events[1])
+            if enable_npugraph_and_multistream:
+                record_event(True, self.npu_events, 1)
 
-            q = q_b.view(bsz, seqlen, self.n_heads, self.head_dim)  # [b,s,64,128]
+            q = q_b.view(token_num, self.n_heads, self.head_dim)
             q_pe, q_nope = torch.split(q, [self.rope_head_dim, \
-                                        self.head_dim - self.rope_head_dim], dim=-1)  # [b,s,64,64+64]
+                                        self.head_dim - self.rope_head_dim], dim=-1)
 
             q_pe = q_pe.view(-1, self.n_heads, 1, self.rope_head_dim)
-            # [b,s,n,d]
-            q_pe = torch_npu.npu_rotary_mul(q_pe, cos, sin).view(bsz, -1, self.n_heads, self.rope_head_dim)
+            q_pe = torch_npu.npu_rotary_mul(q_pe, cos, sin).view(token_num, self.n_heads, self.rope_head_dim)
             q = torch.cat([q_pe, q_nope], dim=-1)
-            if enable_multi_streams and self.enable_aclgraph:
-                tng.ops.npu_tagged_event_record(indexer_npu_events[2])
+            if enable_npugraph_and_multistream:
+                record_event(True, self.npu_events, 2)
 
-        if enable_multi_streams and self.enable_aclgraph:
-            tng.ops.npu_record_tagged_stream(x, "33")
+        if enable_npugraph_and_multistream:
+            record_stream(True, x, self.weight_stream)
 
-        with npu_stream_switch(enable_multi_streams, "33"):
+        with (
+            npu_stream_switch_npugraph(True, self.weight_stream)
+            if enable_npugraph_and_multistream
+            else npu_stream_switch_gegraph(enable_gegraph_and_multistream, "33")
+        ):
             if enable_multi_streams:
-                if self.enable_aclgraph:
-                    tng.ops.npu_tagged_event_wait(indexer_npu_events[1])
+                if enable_gegraph_and_multistream:
+                    x = npu_wait_tensor(True, x, q_b)
+                elif enable_npugraph_and_multistream:
+                    wait_event(True, self.npu_events, 1)
                 else:
-                    tng.scope.npu_wait_tensor(x, q_b)
+                    x = npu_wait_tensor(True, x, q_b)
             weights = self.weights_proj(x.view(-1, self.dim))
-            if enable_multi_streams and self.enable_aclgraph:
-                tng.ops.npu_tagged_event_record(indexer_npu_events[3])
+            if enable_npugraph_and_multistream:
+                record_event(True, self.npu_events, 3)
 
         k_proj = self.wk(x)  # [b,s,7168] @ [7168,128] = [b,s,128]
         k = self.k_norm(k_proj)
         # [b,s,64+64]
         k_pe, k_nope = torch.split(k, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1)
         k_pe = k_pe.view(-1, 1, 1, self.rope_head_dim)
-        k_pe = torch_npu.npu_rotary_mul(k_pe, cos, sin).view(bsz, -1, 1, self.rope_head_dim) # [b,s,1,d]
-        k = torch.cat([k_pe, k_nope.unsqueeze(2)], dim=-1)  # [b,s,1,128]
+        k_pe = torch_npu.npu_rotary_mul(k_pe, cos, sin).view(token_num, 1, self.rope_head_dim)
+        k = torch.cat([k_pe, k_nope.unsqueeze(1)], dim=-1)
         key_dequant_scale = None
         indexer_input = {}
+        key_states = indexer_key_cache
 
-        if enable_multi_streams and self.enable_aclgraph:
-            tng.ops.npu_tagged_event_wait(indexer_npu_events[2])
+        if enable_npugraph_and_multistream:
+            wait_event(True, self.npu_events, 2)
         if self.kv_cache_quant_mode == "int8":
-            with npu_stream_switch(enable_multi_streams, "22"):
+            with (
+                npu_stream_switch_npugraph(True, self.prolog_stream)
+                if enable_npugraph_and_multistream
+                else npu_stream_switch_gegraph(enable_gegraph_and_multistream, "22")
+            ):
                 # q quant
                 q = self.apply_hadamard(q)
                 q, query_dequant_scale = torch_npu.npu_dynamic_quant(q)
@@ -313,16 +343,24 @@ class Indexer(nn.Module):
             k, key_dequant_scale = torch_npu.npu_dynamic_quant(k)
             key_dequant_scale = key_dequant_scale.type(torch.float16)
 
-            if self.cp_size > 1 and is_prefill:
-                k_scale_all = key_dequant_scale.new_empty([bsz * seqlen * self.cp_size, key_dequant_scale.shape[-1]])
-                dist.all_gather_into_tensor(k_scale_all, key_dequant_scale.view(bsz * seqlen, -1), \
-                                            group=self.hccl_comm_dict.get("cp_group", None))
-                outputs_k_scale_list = list(
-                    torch.split(k_scale_all, prefill_extra_input_dict["reverse_split_list"], dim=0))
-                key_dequant_scale = torch.cat([outputs_k_scale_list[i] \
-                                            for i in prefill_extra_input_dict["cp_reverse_index"]], dim=0)
-                query_dequant_scale_prev, query_dequant_scale_next = torch.split(query_dequant_scale, \
-                query_dequant_scale.size(1) // 2, dim=1)
+            if enable_cp:
+                k_scale_all = key_dequant_scale.new_empty(
+                    [
+                        cp_metadata.local_token_num * cp_metadata.cp_size,
+                        key_dequant_scale.shape[-1],
+                    ]
+                )
+                dist.all_gather_into_tensor(
+                    k_scale_all,
+                    key_dequant_scale.view(token_num, -1),
+                    group=self.comm_manager.get_group("cp_group"),
+                )
+                key_dequant_scale = torch.index_select(k_scale_all, 0, cp_metadata.restore_indices)
+                query_dequant_scale_prev, query_dequant_scale_next = torch.split(
+                    query_dequant_scale,
+                    [cp_metadata.local_prev_token_num, cp_metadata.local_next_token_num],
+                    dim=0,
+                )
                 query_dequant_scale_prev = query_dequant_scale_prev.reshape(-1, self.n_heads)
                 query_dequant_scale_next = query_dequant_scale_next.reshape(-1, self.n_heads)
                 c8_input_dict.update({
@@ -330,72 +368,134 @@ class Indexer(nn.Module):
                                     "query_dequant_scale_next": query_dequant_scale_next,
                                     })
 
-            if past_key_scales_indexer is not None:
-                past_key_scales = past_key_scales_indexer[self.layer_idx][0]
-                if is_prefill:
-                    # scatter_update_ performs better in prefill stage
-                    torch_npu.scatter_update_(past_key_scales.view(kv_len.shape[0], -1, past_key_scales.shape[-1]),
-                                            prefill_extra_input_dict["kv_scatter_update_indices"],
-                                            key_dequant_scale.view(kv_len.shape[0], -1, key_dequant_scale.shape[-1]),
-                                            axis=1)
-                else:
-                    torch_npu.npu_scatter_nd_update_(past_key_scales.view(-1, 1),
-                                                    slot_mapping.view(-1, 1),
-                                                    key_dequant_scale.view(-1, key_dequant_scale.shape[-1]))
-            indexer_input.update({"key_dequant_scale": past_key_scales,
+            key_scales = indexer_key_scale_cache
+            compute_key_scales = key_scales
+            scatter_slot_mapping = (
+                cp_metadata.global_slot_mapping["FullAttention"]
+                if enable_cp else slot_mapping
+            )
+            if enable_cp:
+                compute_block_num = cp_metadata.global_block_table["FullAttention"].numel()
+                _, block_size, num_heads, scale_dim = key_scales.shape
+                compute_key_scales = key_scales.new_zeros(
+                    compute_block_num,
+                    block_size,
+                    num_heads,
+                    scale_dim,
+                )
+            persistent_key_dequant_scale = (
+                torch.index_select(key_dequant_scale, 0, cp_metadata.persistent_valid_indices)
+                if enable_cp else key_dequant_scale
+            )
+            persistent_scale_slot_mapping = (
+                cp_metadata.persistent_slot_mapping["FullAttention"]
+                if enable_cp else scatter_slot_mapping
+            )
+            if persistent_scale_slot_mapping.numel() > 0:
+                torch_npu.npu_scatter_nd_update_(
+                    key_scales.view(-1, 1),
+                    persistent_scale_slot_mapping.view(-1, 1),
+                    persistent_key_dequant_scale.view(-1, key_dequant_scale.shape[-1]),
+                )
+            if enable_cp:
+                torch_npu.npu_scatter_nd_update_(
+                    compute_key_scales.view(-1, 1),
+                    scatter_slot_mapping.view(-1, 1),
+                    key_dequant_scale.view(-1, key_dequant_scale.shape[-1]),
+                )
+            key_scales_for_indexer = (
+                compute_key_scales.squeeze(2) if compute_key_scales.dim() == 4 else compute_key_scales
+            )
+            indexer_input.update({"key_dequant_scale": key_scales_for_indexer,
                                    "query_dequant_scale": query_dequant_scale.view(-1, self.n_heads),
                                 })
-        if self.cp_size > 1 and is_prefill:
-            kv_all = k.new_empty([bsz * seqlen * self.cp_size, k.shape[-1]])
-            dist.all_gather_into_tensor(kv_all, k.view(bsz * seqlen, -1), \
-                                    group=self.hccl_comm_dict.get("cp_group", None))
-            outputs_list = list(torch.split(kv_all, prefill_extra_input_dict["reverse_split_list"], dim=0))
-            k = torch.cat([outputs_list[i] for i in prefill_extra_input_dict["cp_reverse_index"]], dim=0)
-        if past_key_values_indexer is not None:
-            past_key_states = past_key_values_indexer[self.layer_idx][0]
-            if is_prefill:
-                torch_npu.scatter_update_(past_key_states.view(kv_len.shape[0], -1, past_key_states.shape[-1]),
-                                        prefill_extra_input_dict["kv_scatter_update_indices"],
-                                        k.view(kv_len.shape[0], -1, k.shape[-1]),
-                                        axis=1)
-            else:
-                torch_npu.npu_scatter_nd_update_(past_key_states.view(-1, self.head_dim),
-                                                slot_mapping.view(-1, 1),
-                                                k.view(-1, k.shape[-1]))
+        if enable_cp:
+            # CP prefill computes token shards on each rank. Restore the full
+            # token-level KV first, then build two PA cache views below.
+            kv_all = k.new_empty([cp_metadata.local_token_num * cp_metadata.cp_size,
+                                  k.shape[-1]])
+            dist.all_gather_into_tensor(
+                kv_all,
+                k.view(token_num, -1),
+                group=self.comm_manager.get_group("cp_group"),
+            )
+            k = torch.index_select(kv_all, 0, cp_metadata.restore_indices)
+        scatter_slot_mapping = (
+            cp_metadata.global_slot_mapping["FullAttention"]
+            if enable_cp else slot_mapping
+        )
+        if enable_cp:
+            compute_block_num = cp_metadata.global_block_table["FullAttention"].numel()
+            _, block_size, num_heads, head_dim = key_states.shape
+            compute_key_states = key_states.new_zeros(
+                compute_block_num,
+                block_size,
+                num_heads,
+                head_dim,
+            )
+            # Persistent cache keeps only KV owned by this rank for later
+            # decode; ranks without owner requests skip the empty scatter.
+            persistent_k = torch.index_select(k, 0, cp_metadata.persistent_valid_indices)
+            persistent_slot_mapping = cp_metadata.persistent_slot_mapping["FullAttention"]
+            if persistent_slot_mapping.numel() > 0:
+                torch_npu.npu_scatter_nd_update_(
+                    key_states.view(-1, self.head_dim),
+                    persistent_slot_mapping.view(-1, 1),
+                    persistent_k.view(-1, k.shape[-1]),
+                )
+            # Current prefill indexer still needs full-batch KV, so scatter the
+            # restored KV into a temporary compute cache.
+            torch_npu.npu_scatter_nd_update_(
+                compute_key_states.view(-1, self.head_dim),
+                scatter_slot_mapping.view(-1, 1),
+                k.view(-1, k.shape[-1]),
+            )
+            key_states = compute_key_states
+        else:
+            torch_npu.npu_scatter_nd_update_(
+                key_states.view(-1, self.head_dim),
+                slot_mapping.view(-1, 1),
+                k.view(-1, k.shape[-1]),
+            )
         indexer_func = self.li_fusion
         indexer_input.update({"actual_seq_lengths_query": actual_seq_lengths_q,
                             "actual_seq_lengths_kv": actual_seq_lengths_kv,
-                            "k": past_key_states,
+                            "k": key_states,
                             "block_table": block_table,
                             "k_proj": k_proj,
                             "is_prefill": is_prefill,
                             })
 
-        if enable_multi_streams and self.enable_aclgraph:
-            tng.ops.npu_tagged_event_wait(indexer_npu_events[3])
-        if self.cp_size > 1 and is_prefill:
-            # [B, S, N, D] -> [T, N, D]
-            x = x.flatten(0, 1).unsqueeze(0)
-            q = q.flatten(0, 1).unsqueeze(0)
-            weights = weights.view(bsz, -1, weights.shape[-1])
-            weights_prev, weights_next = torch.split(weights, weights.size(1) // 2, dim=1)
+        if enable_npugraph_and_multistream:
+            wait_event(True, self.npu_events, 3)
+        if enable_cp:
+            weights_prev, weights_next = torch.split(
+                weights,
+                [cp_metadata.local_prev_token_num, cp_metadata.local_next_token_num],
+                dim=0,
+            )
             weights_prev = weights_prev.reshape(-1, weights_prev.shape[-1])
             weights_next = weights_next.reshape(-1, weights_next.shape[-1])
-            q_prev, q_next = torch.split(q, q.size(1) // 2, dim=1)
+            q_prev, q_next = torch.split(
+                q,
+                [cp_metadata.local_prev_token_num, cp_metadata.local_next_token_num],
+                dim=0,
+            )
             indexer_input.update({
-                "q": q_prev.view(bsz, -1, self.n_heads, q.shape[-1]),
+                "q": q_prev.view(-1, self.n_heads, q.shape[-1]),
                 "weights": weights_prev,
                 })
-            indexer_input.update({"actual_seq_lengths_kv": prefill_extra_input_dict["kv_len_prev"],
-                                    "actual_seq_lengths_query": prefill_extra_input_dict["actual_seq_q"]})
+            indexer_input.update({"actual_seq_lengths_kv": cp_metadata.kv_len_prev,
+                                    "actual_seq_lengths_query": cp_metadata.actual_seq_q_prev})
             if self.kv_cache_quant_mode == "int8":
                 indexer_input.update({"query_dequant_scale": c8_input_dict["query_dequant_scale_prev"]})
             topk_indices_prev = indexer_func(**indexer_input)
             indexer_input.update({
-                "q": q_next.view(bsz, -1, self.n_heads, q.shape[-1]),
+                "q": q_next.view(-1, self.n_heads, q.shape[-1]),
                 "weights": weights_next,
                 })
-            indexer_input.update({"actual_seq_lengths_kv": prefill_extra_input_dict["kv_len_next"]})
+            indexer_input.update({"actual_seq_lengths_kv": cp_metadata.kv_len_next,
+                                  "actual_seq_lengths_query": cp_metadata.actual_seq_q_next})
             if self.kv_cache_quant_mode == "int8":
                 indexer_input.update({"query_dequant_scale": c8_input_dict["query_dequant_scale_next"]})
             topk_indices_next = indexer_func(**indexer_input)

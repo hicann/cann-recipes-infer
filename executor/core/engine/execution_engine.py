@@ -25,7 +25,7 @@ from transformers import AutoTokenizer
 
 from executor.core.config import InferenceConfig
 from executor.utils import get_default_group
-from executor.utils.forward_metadata import set_forward_metadata, get_forward_metadata
+from executor.utils.forward_metadata import PrefillCPMetaData, set_forward_metadata, get_forward_metadata
 from executor.utils.profiler_context import ProfilerManager
 from executor.core.model_worker import ModelWorker, MTPWorker
 from executor.core.kv_cache import KVCacheManager, ModelCacheInfo, create_single_type_managers
@@ -48,6 +48,7 @@ class ExecutionEngine:
         self.infer_config = infer_config
         self.device = None
         self.tokenizer = None
+        self.eos_token_id = None
         self.hf_config = None
         self.kvcache_manager = None
         self.comm_manager = None
@@ -135,7 +136,7 @@ class ExecutionEngine:
                 self.mtp_worker.share_weights_from_main_model(self.main_worker.model)
             else:
                 model_name = self.infer_config.model_config.model_name
-                raise ValueError(f"next_n > 0 enables speculative inference, but {model_name} dosen't" +
+                raise ValueError(f"next_n > 0 enables speculative inference, but {model_name} doesn't " +
                                  "contain an MTP model and doesn't support speculative inference; set next_n to 0")
 
         # Initialize tokenizer (from main worker)
@@ -146,6 +147,7 @@ class ExecutionEngine:
             truncation_side='right',
             trust_remote_code=True
         )
+        self.eos_token_id = getattr(self.tokenizer, "eos_token_id", None)
 
         # Initialize KV cache
         if cache_info is not None:
@@ -161,11 +163,16 @@ class ExecutionEngine:
 
     def _init_cache_manager(self, cache_info: ModelCacheInfo):
         validate_cache_info(cache_info)
+        # Offload models may still need model-owned HBM workspace, for example
+        # selected KV buffers. Reserve that budget before sizing framework KV
+        # blocks, then initialize the workspace after KV cache tensors exist.
+        offload_workspace_npu_bytes = self._get_offload_workspace_npu_bytes()
         block_num_by_type = calculate_block_num(
             infer_config=self.infer_config,
             cache_info=cache_info,
             offline_max_len=self.max_total_len if not self.is_online else None,
             tp_group=self.comm_manager.get_group("attn_tp_group"),
+            extra_reserved_memory_bytes=offload_workspace_npu_bytes,
         )
         allocate_cache_tensors(
             device=self.device,
@@ -185,6 +192,33 @@ class ExecutionEngine:
         )
         if self.mtp_worker is not None:
             self.mtp_worker.kvcache_manager = self.kvcache_manager
+        self._init_offload_workspace()
+
+    def _get_offload_workspace_npu_bytes(self) -> int:
+        memory_infos = [self.main_worker.get_offload_workspace_memory_info()]
+        if self.mtp_worker is not None:
+            memory_infos.append(self.mtp_worker.mtp_model_worker.get_offload_workspace_memory_info())
+
+        total_npu_bytes = 0
+        for memory_info in memory_infos:
+            if memory_info is None:
+                continue
+            total_npu_bytes += memory_info.npu_bytes
+            for item in memory_info.items:
+                logger.info(
+                    "Offload workspace memory: name=%s location=%s bytes=%s",
+                    item.name,
+                    item.location,
+                    item.bytes,
+                )
+        if total_npu_bytes > 0:
+            logger.info("Reserve offload workspace NPU memory: %s bytes", total_npu_bytes)
+        return total_npu_bytes
+
+    def _init_offload_workspace(self):
+        self.main_worker.init_offload_workspace()
+        if self.mtp_worker is not None:
+            self.mtp_worker.mtp_model_worker.init_offload_workspace()
 
     @property
     def model(self):
@@ -207,6 +241,7 @@ class ExecutionEngine:
         """Build model inputs and set forward metadata."""
         attention_mask = ~torch.tril(torch.ones((2048, 2048), dtype=torch.bool, device=self.device))
         prompt_tokens = int(seq_lens.sum().item()) if is_prefill and seq_lens is not None else 0
+        cp_metadata = None
 
         if is_prefill:
             position_ids = torch.cat(
@@ -270,7 +305,7 @@ class ExecutionEngine:
                 actual_seq_lengths_list_kv = actual_seq_lengths_kv.detach().cpu().numpy().tolist()
                 actual_seq_lengths_list_q = actual_seq_lengths_q.detach().cpu().numpy().tolist()
         if self.kvcache_manager:
-            # Get blcok_table and slot_mapping
+            # Get block_table and slot_mapping
             batch_size = actual_seq_lengths_cu_q.shape[0]
             block_table_max_lens = self.kvcache_manager.get_block_table_max_lens(self.max_total_len)
             block_tables = prepare_block_tables(batch.requests if batch else None, self.kvcache_manager,
@@ -284,6 +319,15 @@ class ExecutionEngine:
         else:
             block_tables = None
             slot_mapping = None
+        if is_prefill and self.infer_config.parallel_config.cp_size > 1:
+            input_ids, position_ids, cp_metadata = self._apply_prefill_cp(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                actual_seq_lengths_kv=actual_seq_lengths_kv,
+                block_table=block_tables,
+                slot_mapping=slot_mapping,
+                batch=batch,
+            )
         set_forward_metadata(
             is_prefill=is_prefill,
             kv_len=kv_len,
@@ -299,6 +343,7 @@ class ExecutionEngine:
             prompt_tokens=prompt_tokens,
             block_table=block_tables,
             slot_mapping=slot_mapping,
+            cp_metadata=cp_metadata,
         )
         model_inputs = {
             "input_ids": input_ids.contiguous(),
@@ -311,6 +356,213 @@ class ExecutionEngine:
             })
         return model_inputs
 
+    def _apply_prefill_cp(
+        self,
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor,
+        actual_seq_lengths_kv: torch.Tensor,
+        block_table: Optional[Dict[str, torch.Tensor]],
+        slot_mapping: Optional[Dict[str, torch.Tensor]],
+        batch: Optional[Batch] = None,
+    ):
+        """Pad packed prefill TND input and slice it in PCP head-tail style."""
+        parallel_config = self.infer_config.parallel_config
+        cp_size = parallel_config.cp_size
+        if self.exe_mode not in ["eager", "ge_graph", "npugraph_ex"]:
+            raise ValueError(f"Prefill CP does not support exe_mode={self.exe_mode}.")
+        if self.world_size != cp_size:
+            raise ValueError(
+                f"Prefill CP currently follows the legacy constraint world_size == cp_size, "
+                f"got world_size={self.world_size}, cp_size={cp_size}."
+            )
+        if parallel_config.attn_tp_size != 1:
+            raise ValueError(
+                f"Phase1 prefill CP does not support attn_tp_size={parallel_config.attn_tp_size}."
+            )
+
+        actual_seq_lengths_kv = actual_seq_lengths_kv.to(self.device)
+        batch_size = actual_seq_lengths_kv.numel()
+        if batch_size == 0:
+            raise ValueError("Prefill CP requires at least one local request per rank in Phase1.")
+
+        cp_segment_num = cp_size * 2
+        cp_rank = self.global_rank % cp_size
+        seq_lens = [int(seq_len) for seq_len in actual_seq_lengths_kv.detach().cpu().tolist()]
+        starts = [0]
+        padded_starts = [0]
+        padded_seq_lens = []
+        padded_input_ids = []
+        padded_position_ids = []
+        for seq_len in seq_lens:
+            starts.append(starts[-1] + seq_len)
+            segment_len = (seq_len + cp_segment_num - 1) // cp_segment_num
+            padded_seq_len = segment_len * cp_segment_num
+            padded_seq_lens.append(padded_seq_len)
+            padded_starts.append(padded_starts[-1] + padded_seq_len)
+        compute_slot_mapping = {} if slot_mapping is not None else None
+        full_block_table_len = max(
+            (padded_seq_len + self.block_size - 1) // self.block_size
+            for padded_seq_len in padded_seq_lens
+        )
+        if slot_mapping is not None:
+            compute_cache_len = full_block_table_len * self.block_size
+            for cache_type in slot_mapping:
+                mapping_list = []
+                for req_idx, padded_seq_len in enumerate(padded_seq_lens):
+                    start = req_idx * compute_cache_len
+                    mapping_list.append(
+                        torch.arange(
+                            start,
+                            start + padded_seq_len,
+                            dtype=slot_mapping[cache_type].dtype,
+                            device=self.device,
+                        )
+                    )
+                compute_slot_mapping[cache_type] = (
+                    torch.cat(mapping_list) if mapping_list else slot_mapping[cache_type].new_empty(0)
+                )
+
+        for seq_len, padded_seq_len, seq_start in zip(seq_lens, padded_seq_lens, starts[:-1]):
+            real_ids = input_ids[seq_start:seq_start + seq_len]
+            pad_len = padded_seq_len - seq_len
+            if pad_len > 0:
+                real_ids = torch.cat([
+                    real_ids,
+                    torch.zeros(pad_len, dtype=input_ids.dtype, device=input_ids.device),
+                ])
+            padded_input_ids.append(real_ids)
+            padded_position_ids.append(
+                torch.arange(padded_seq_len, dtype=position_ids.dtype, device=position_ids.device)
+            )
+
+        input_ids = torch.cat(padded_input_ids) if padded_input_ids else input_ids.new_empty(0)
+        position_ids = torch.cat(padded_position_ids) if padded_position_ids else position_ids.new_empty(0)
+
+        if block_table is not None:
+            block_table_for_compute = {
+                cache_type: torch.arange(
+                    0,
+                    len(seq_lens) * full_block_table_len,
+                    dtype=table.dtype,
+                    device=self.device,
+                ).reshape(len(seq_lens), full_block_table_len)
+                for cache_type, table in block_table.items()
+            }
+        else:
+            block_table_for_compute = None
+
+        prev_lens = []
+        next_lens = []
+        kv_len_prev = []
+        kv_len_next = []
+        global_valid_indices_list = []
+
+        def get_rank_local_indices(rank):
+            # Zigzag CP assigns each rank one head segment and one mirrored
+            # tail segment from every padded request.
+            rank_prev_indices = []
+            rank_next_indices = []
+            for padded_seq_start, padded_seq_len in zip(padded_starts[:-1], padded_seq_lens):
+                segment_len = padded_seq_len // cp_segment_num if padded_seq_len > 0 else 0
+                prev_start = rank * segment_len
+                next_segment = cp_segment_num - rank - 1
+                next_start = next_segment * segment_len
+                rank_prev_indices.extend(
+                    range(padded_seq_start + prev_start, padded_seq_start + prev_start + segment_len)
+                )
+                rank_next_indices.extend(
+                    range(padded_seq_start + next_start, padded_seq_start + next_start + segment_len)
+                )
+            return rank_prev_indices, rank_next_indices
+
+        for seq_len, padded_seq_len, padded_seq_start in zip(seq_lens, padded_seq_lens, padded_starts[:-1]):
+            segment_len = padded_seq_len // cp_segment_num if padded_seq_len > 0 else 0
+
+            prev_lens.append(segment_len)
+            next_lens.append(segment_len)
+
+            kv_len_prev.append((cp_rank + 1) * segment_len)
+            kv_len_next.append((cp_segment_num - cp_rank) * segment_len)
+
+            global_valid_indices_list.extend(range(padded_seq_start, padded_seq_start + seq_len))
+
+        local_owner_valid_indices = []
+        owner_request_indices = []
+        local_owner_valid_padded = []
+        requests = batch.requests if batch is not None else []
+        for req_idx in range(batch_size):
+            request_cp_rank = requests[req_idx].cp_rank if req_idx < len(requests) else req_idx % cp_size
+            if request_cp_rank == cp_rank:
+                owner_request_indices.append(req_idx)
+                local_owner_valid_indices.extend(range(starts[req_idx], starts[req_idx + 1]))
+                local_owner_valid_padded.extend(
+                    range(padded_starts[req_idx], padded_starts[req_idx] + seq_lens[req_idx])
+                )
+        local_owner_request_indices = torch.tensor(owner_request_indices, dtype=torch.long, device=self.device)
+        local_owner_valid_indices = torch.tensor(local_owner_valid_indices, dtype=torch.long, device=self.device)
+        local_owner_valid_padded = torch.tensor(local_owner_valid_padded, dtype=torch.long, device=self.device)
+        if slot_mapping is not None:
+            local_owner_slot_mapping = {
+                cache_type: torch.index_select(mapping, 0, local_owner_valid_indices)
+                for cache_type, mapping in slot_mapping.items()
+            }
+        else:
+            local_owner_slot_mapping = None
+        if self.infer_config.disagg_config.disaggregation_mode == "PREFILL":
+            persistent_valid_indices = torch.tensor(global_valid_indices_list, dtype=torch.long, device=self.device)
+            persistent_slot_mapping = slot_mapping
+            output_request_indices = (
+                torch.arange(batch_size, dtype=torch.long, device=self.device)
+                if cp_rank == 0 else torch.empty(0, dtype=torch.long, device=self.device)
+            )
+        else:
+            persistent_valid_indices = local_owner_valid_padded
+            persistent_slot_mapping = local_owner_slot_mapping
+            output_request_indices = local_owner_request_indices
+
+        local_prev_indices, local_next_indices = get_rank_local_indices(cp_rank)
+
+        all_rank_local_indices = []
+        for rank in range(cp_size):
+            rank_prev_indices, rank_next_indices = get_rank_local_indices(rank)
+            all_rank_local_indices.extend(rank_prev_indices + rank_next_indices)
+
+        local_indices = torch.tensor(
+            local_prev_indices + local_next_indices,
+            dtype=torch.long,
+            device=self.device,
+        )
+        restore_indices = torch.tensor(
+            sorted(range(len(all_rank_local_indices)), key=all_rank_local_indices.__getitem__),
+            dtype=torch.long,
+            device=self.device,
+        )
+        prev_lens_tensor = torch.tensor(prev_lens, dtype=actual_seq_lengths_kv.dtype, device=self.device)
+        next_lens_tensor = torch.tensor(next_lens, dtype=actual_seq_lengths_kv.dtype, device=self.device)
+        kv_len_prev_tensor = torch.tensor(kv_len_prev, dtype=actual_seq_lengths_kv.dtype, device=self.device)
+        kv_len_next_tensor = torch.tensor(kv_len_next, dtype=actual_seq_lengths_kv.dtype, device=self.device)
+        cp_metadata = PrefillCPMetaData(
+            enabled=True,
+            cp_size=cp_size,
+            global_padded_token_num=padded_starts[-1],
+            local_token_num=local_indices.numel(),
+            local_indices=local_indices,
+            restore_indices=restore_indices,
+            global_valid_indices=torch.tensor(global_valid_indices_list, dtype=torch.long, device=self.device),
+            global_slot_mapping=compute_slot_mapping,
+            global_block_table=block_table_for_compute,
+            persistent_valid_indices=persistent_valid_indices,
+            persistent_slot_mapping=persistent_slot_mapping,
+            output_request_indices=output_request_indices,
+            actual_seq_q_prev=prev_lens_tensor.cumsum(dim=0),
+            actual_seq_q_next=next_lens_tensor.cumsum(dim=0),
+            kv_len_prev=kv_len_prev_tensor,
+            kv_len_next=kv_len_next_tensor,
+            local_prev_token_num=sum(prev_lens),
+            local_next_token_num=sum(next_lens),
+        )
+        return input_ids, position_ids, cp_metadata
+
     def _pad_batch(self, tensor: torch.Tensor, pad_value: int = 0) -> torch.Tensor:
         """Pad the batch dimension of a tensor to configured decode batch size."""
         target_batch = self.infer_config.scheduler_config.batch_size_per_dp_rank
@@ -322,6 +574,36 @@ class ExecutionEngine:
             tensor,
             torch.full(pad_shape, pad_value, dtype=tensor.dtype, device=tensor.device),
         ], dim=0)
+
+    def _prepare_mtp_next_tokens(self, next_tokens: torch.Tensor, model_inputs: Dict[str, Any],
+                                 is_prefill: bool) -> torch.Tensor:
+        """Expand owner-local prefill CP samples to the global request order for MTP."""
+        if not is_prefill:
+            return next_tokens
+        forward_metadata = model_inputs.get("forward_metadata")
+        cp_metadata = getattr(forward_metadata, "cp_metadata", None)
+        if cp_metadata is None or not cp_metadata.enabled:
+            return next_tokens
+
+        global_batch_size = forward_metadata.actual_seq_lengths_kv.numel()
+        local_next_tokens = next_tokens.to(self.device).contiguous()
+        output_indices = cp_metadata.output_request_indices.to(self.device)
+        if local_next_tokens.shape[0] != output_indices.numel():
+            raise RuntimeError(
+                "CP MTP next_tokens must match output_request_indices before global restore, "
+                f"got next_tokens={local_next_tokens.shape[0]}, indices={output_indices.numel()}."
+            )
+        mtp_next_tokens = local_next_tokens.new_zeros(
+            (global_batch_size,) + tuple(local_next_tokens.shape[1:])
+        )
+        if output_indices.numel() > 0:
+            mtp_next_tokens.index_copy_(0, output_indices, local_next_tokens)
+        torch.distributed.all_reduce(
+            mtp_next_tokens,
+            op=torch.distributed.ReduceOp.SUM,
+            group=self.comm_manager.get_group("cp_group"),
+        )
+        return mtp_next_tokens
 
     def _get_warmup_shape(self):
         """Calculate warm-up input shapes based on current packed prefill/decode config."""
@@ -455,15 +737,26 @@ class ExecutionEngine:
             logits = output
             prev_hidden_states = None
 
+        selected_logits = logits
+        cp_metadata = None
         if batch.is_prefill:
-            set_forward_metadata(kv_len=batch.seq_lens.to(self.device) - 1)
+            kv_len = batch.seq_lens.to(self.device) - 1
+            cp_metadata = getattr(model_inputs["forward_metadata"], "cp_metadata", None)
+            if cp_metadata is not None and cp_metadata.enabled:
+                output_indices = cp_metadata.output_request_indices.to(self.device)
+                kv_len = torch.index_select(kv_len, 0, output_indices)
+                # The model returns global CP prefill logits; only selected
+                # request rows are consumed by sampling and request updates.
+                selected_logits = torch.index_select(logits, 0, output_indices)
+            set_forward_metadata(kv_len=kv_len)
 
-        next_tokens = self._sample_tokens(batch, logits)
+        next_tokens = self._sample_tokens(batch, selected_logits)
 
         infer_times_mtp: list[float] = []
         if self.mtp_worker:
             accepted_num = self.verify_spec_tokens(batch, next_tokens)
-            infer_times_mtp = self.mtp_worker.inference(batch, next_tokens, accepted_num,
+            mtp_next_tokens = self._prepare_mtp_next_tokens(next_tokens, model_inputs, batch.is_prefill)
+            infer_times_mtp = self.mtp_worker.inference(batch, mtp_next_tokens, accepted_num,
                                                         model_inputs, prev_hidden_states)
 
         self.profiler.step()
@@ -481,10 +774,11 @@ class ExecutionEngine:
             batch.is_prefill,
             next_tokens,
             infer_time_total,
+            eos_token_id=self.eos_token_id,
         )
         return {
             "next_tokens": next_tokens_by_request,
-            "logits": logits,
+            "logits": selected_logits,
             "inference_time": infer_time_total,
             "inference_time_main": infer_time_main,
             "inference_times_mtp": infer_times_mtp,
@@ -545,7 +839,7 @@ class ExecutionEngine:
     def verify_spec_tokens(self, batch, main_next_tokens):
         '''
         Verify spec tokens with main model's output, stop accepting tokens if rejection occurs in a batch.
-        Each batch would process verification seperately.
+        Each batch processes verification separately.
         '''
         if batch.is_prefill:
             return torch.zeros([main_next_tokens.shape[0]], dtype=torch.int64, device=self.device) # shape: (Batch,)

@@ -99,6 +99,9 @@ class Request:
         spec_num_accepted_tokens: Number of accepted speculative tokens for MTP acceptance statistics.
         decode_step_count: Number of decode steps completed (each step generates one or more tokens).
         valid_output_len: Length of valid output tokens when hitting EOS or max_new_tokens.
+        eos_output_len: Output length after the first EOS token. This records
+            EOS inside a multi-token MTP step without making finish decisions.
+        cp_rank: Phase1 CP owner rank that stores persistent KV and runs decode for this request.
     """
     request_id: int
     prompt: "str | List[dict]"
@@ -119,6 +122,7 @@ class Request:
     # Step counter for decode phase
     decode_step_count: int = 0
     valid_output_len: Optional[int] = None
+    eos_output_len: Optional[int] = None
     # PD disaggregation fields (only populated in online PD mode).
     bootstrap_host: str = ""
     bootstrap_port: int = -1
@@ -126,6 +130,7 @@ class Request:
     disagg_prefill_dp_rank: int = -1
     metadata_buffer_index: int = -1
     disagg_kv_sender: Optional[Any] = None
+    cp_rank: int = 0
 
     @property
     def bootstrap_addr(self) -> str:
@@ -266,26 +271,36 @@ class Batch:
         is_prefill: bool,
         next_tokens: Optional[torch.Tensor],
         infer_time: Optional[List],
+        eos_token_id: Optional[int] = None,
     ) -> Dict[int, List[int]]:
         """Split batch outputs by index and update each request in-place."""
         next_tokens_by_request: Dict[int, List[int]] = {}
-        total_lens = get_forward_metadata().kv_len
+        forward_metadata = get_forward_metadata()
+        total_lens = forward_metadata.kv_len
 
-        if next_tokens is not None and next_tokens.shape[0] != len(self.requests):
+        request_indices = list(range(len(self.requests)))
+        cp_metadata = getattr(forward_metadata, "cp_metadata", None)
+        if is_prefill and cp_metadata is not None and cp_metadata.enabled:
+            request_indices = cp_metadata.output_request_indices.detach().cpu().tolist()
+
+        if next_tokens is not None and next_tokens.shape[0] != len(request_indices):
             raise ValueError(
-                f"next_tokens batch size {next_tokens.shape[0]} does not match request count {len(self.requests)}"
+                f"next_tokens batch size {next_tokens.shape[0]} does not match request count {len(request_indices)}"
             )
-        if total_lens is not None and total_lens.shape[0] != len(self.requests):
+        if total_lens is not None and total_lens.shape[0] != len(request_indices):
             raise ValueError(
-                f"kv_len batch size {total_lens.shape[0]} does not match request count {len(self.requests)}"
+                f"kv_len batch size {total_lens.shape[0]} does not match request count {len(request_indices)}"
             )
 
-        for i, request in enumerate(self.requests):
+        for output_idx, request_idx in enumerate(request_indices):
+            request = self.requests[request_idx]
             accepted_num = None
 
             if self.mtp_infos:
-                accepted_num = self.mtp_infos.accepted_num[i] if self.mtp_infos.accepted_num is not None else None
-                spec_tokens = self.mtp_infos.spec_tokens[i] if self.mtp_infos.spec_tokens is not None else None
+                accepted_num = (
+                    self.mtp_infos.accepted_num[output_idx] if self.mtp_infos.accepted_num is not None else None
+                )
+                spec_tokens = self.mtp_infos.spec_tokens[output_idx] if self.mtp_infos.spec_tokens is not None else None
                 request.update_mtp_info(accepted_num, spec_tokens)
                 # Since the main model and draft model share forward_metadata, and total_lens includes MTP inference
                 # length when MTP is enabled, after iteration completes, subtract the MTP added length (next_n - 1)
@@ -297,14 +312,21 @@ class Batch:
 
             if next_tokens is not None:
                 if accepted_num is not None:
-                    request_next_tokens = next_tokens[i, :accepted_num + 1].tolist()
+                    request_next_tokens = next_tokens[output_idx, :accepted_num + 1].tolist()
                 else:
-                    request_next_tokens = next_tokens[i].tolist()
+                    request_next_tokens = next_tokens[output_idx].tolist()
+                old_output_len = len(request.output_id_list)
                 request.output_id_list += request_next_tokens
+                if (
+                    eos_token_id is not None
+                    and request.eos_output_len is None
+                    and eos_token_id in request_next_tokens
+                ):
+                    request.eos_output_len = old_output_len + request_next_tokens.index(eos_token_id) + 1
                 next_tokens_by_request[request.request_id] = request_next_tokens
 
             if computed_lens is not None:
-                request.computed_len = computed_lens[i].item()
+                request.computed_len = computed_lens[output_idx].item()
                 if accepted_num is not None:
                     request.computed_len += accepted_num.item()
 

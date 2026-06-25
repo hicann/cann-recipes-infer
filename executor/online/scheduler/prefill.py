@@ -16,7 +16,6 @@
 from __future__ import annotations
 
 import logging
-import os
 from collections import deque
 
 from executor.core.scheduler import Scheduler
@@ -45,6 +44,7 @@ class PrefillDisaggScheduler(Scheduler):
         )
         self.kv_transfer_manager = kv_transfer_manager
         self.kv_cache_manager = kv_cache_manager
+        self.mode = 'online'
         self.dp_rank = dp_rank
         self.is_dp_leader = is_dp_leader
         # Gloo CPU group for sender.poll_and_all_reduce consensus across TP
@@ -53,7 +53,7 @@ class PrefillDisaggScheduler(Scheduler):
         self.tp_cpu_group = tp_cpu_group
         self._use_dummy_sender = (
             getattr(kv_transfer_manager, "attn_cp_rank", 0) != 0
-            and not os.environ.get("ENABLE_ALL_CP_RANKS_FOR_TRANSFER")
+            and not getattr(kv_transfer_manager, "enable_all_cp_ranks_for_transfer", False)
         )
         self.bootstrap_queue = deque()
         self.inflight_queue = deque()

@@ -20,8 +20,9 @@ from typing import Callable, Dict, List, Sequence, Tuple, Union
 
 import torch
 import torch.distributed as dist
+import torch_npu
 
-from .cache_info import CacheEntry, ModelCacheInfo
+from .cache_info import CacheAllocator, CacheEntry, ModelCacheInfo
 from .kv_cache_manager import KVCacheManager
 from .single_type_kv_cache_manager import ATTN_TYPE_MANAGER_MAP
 
@@ -35,6 +36,16 @@ FIXED_BLOCK_ATTN_TYPES = {"SlidingWindow"}
 def dtype_itemsize(dtype: torch.dtype) -> int:
     """Return item size in bytes for a torch dtype."""
     return torch.empty((), dtype=dtype).element_size()
+
+
+def _normalize_cache_allocator(cache: CacheEntry, layer_idx: int) -> CacheAllocator:
+    try:
+        return CacheAllocator(cache.allocator)
+    except ValueError as exc:
+        raise ValueError(
+            f"cache {cache.cache_name} in layer {layer_idx} has unsupported allocator "
+            f"{cache.allocator}. Supported allocators are: {[item.value for item in CacheAllocator]}"
+        ) from exc
 
 
 def validate_cache_info(cache_info: ModelCacheInfo) -> None:
@@ -76,6 +87,7 @@ def validate_cache_info(cache_info: ModelCacheInfo) -> None:
                     f"cache {cache.cache_name} in layer {layer_info.layer_idx} must have positive dim, "
                     f"but got {cache.dim}"
                 )
+            _normalize_cache_allocator(cache, layer_info.layer_idx)
 
 
 def allocate_cache_tensors(device, cache_info: ModelCacheInfo, block_num_by_type: Dict[str, int]) -> None:
@@ -102,20 +114,28 @@ def allocate_cache_tensors(device, cache_info: ModelCacheInfo, block_num_by_type
                 )
 
             block_num = block_num_by_type[group_key]
+            allocator = CacheAllocator(cache.allocator)
             if cache.attn_type in ["FullAttention", "SlidingWindow"]:
                 block_size = cache.block_size
                 dims = cache.dim if isinstance(cache.dim, list) else [cache.dim]
                 shape = (block_num, block_size, cache.num_head, *dims)
                 numel = block_num * block_size * cache.num_head * cache.cache_dim_numel()
-                # HIXL_ALIGNMENT is in bytes; convert to element count for the padding.
-                elem_size = dtype_itemsize(cache.dtype)
-                slack = (HIXL_ALIGNMENT + elem_size - 1) // elem_size
-                raw = torch.empty(numel + slack, dtype=cache.dtype, device=device)
-                cache_tensor = align_memory(raw, HIXL_ALIGNMENT).narrow(0, 0, numel).view(shape)
-                if cache_tensor.data_ptr() % HIXL_ALIGNMENT != 0:
-                    raise RuntimeError(
-                        f"cache_tensor not aligned to {HIXL_ALIGNMENT} bytes "
-                        f"(ptr={cache_tensor.data_ptr()})"
+                if allocator == CacheAllocator.HBM:
+                    # HIXL_ALIGNMENT is in bytes; convert to element count for the padding.
+                    elem_size = dtype_itemsize(cache.dtype)
+                    slack = (HIXL_ALIGNMENT + elem_size - 1) // elem_size
+                    raw = torch.empty(numel + slack, dtype=cache.dtype, device=device)
+                    cache_tensor = align_memory(raw, HIXL_ALIGNMENT).narrow(0, 0, numel).view(shape)
+                    if cache_tensor.data_ptr() % HIXL_ALIGNMENT != 0:
+                        raise RuntimeError(
+                            f"cache_tensor not aligned to {HIXL_ALIGNMENT} bytes "
+                            f"(ptr={cache_tensor.data_ptr()})"
+                        )
+                elif allocator == CacheAllocator.SWAPPED_MEMORY:
+                    cache_tensor = torch_npu.empty_with_swapped_memory(shape, dtype=cache.dtype, device=device)
+                else:
+                    raise ValueError(
+                        f"Creating cache tensor with allocator='{cache.allocator}' is not supported."
                     )
             else:
                 raise ValueError(
@@ -157,8 +177,10 @@ def calculate_fixed_block_memory_bytes(infer_config, cache_info: ModelCacheInfo)
                 # The additional one block is allocated for the null block.
                 fixed_block_num += 1
 
-                tmp_memory_bytes = fixed_block_num * block_size * cache.num_head \
-                    * cache.cache_dim_numel() * dtype_itemsize(cache.dtype)
+                tmp_memory_bytes = 0
+                if CacheAllocator(cache.allocator) == CacheAllocator.HBM:
+                    tmp_memory_bytes = fixed_block_num * block_size * cache.num_head \
+                        * cache.cache_dim_numel() * dtype_itemsize(cache.dtype)
             else:
                 raise AttributeError(
                         f"If other attention types {cache.attn_type} are added to FIXED_BLOCK_ATTN_TYPES, "
@@ -181,6 +203,7 @@ def calculate_block_num(
     cache_info: ModelCacheInfo,
     offline_max_len=None,
     tp_group=None,
+    extra_reserved_memory_bytes: int = 0,
 ) -> Dict[str, int]:
     """Calculate block count keyed by attention type."""
     block_num_by_type: Dict[str, int] = {}
@@ -199,7 +222,6 @@ def calculate_block_num(
             if cache.attn_type in FIXED_BLOCK_ATTN_TYPES:
                 has_fixed_block_cache = True
                 continue
-
             group_key = cache.group_key
             block_size = cache.block_size
             if group_key in paged_block_sizes_by_key and paged_block_sizes_by_key[group_key] != block_size:
@@ -213,11 +235,12 @@ def calculate_block_num(
                 cache.cache_dim_numel() * cache.num_head * dtype_itemsize(cache.dtype)
             )
             paged_block_sizes_by_key[group_key] = block_size
-            paged_block_bytes_by_key[group_key] = (
-                paged_block_bytes_by_key.get(group_key, 0) + block_size * cache_token_bytes
-            )
-            per_token_bytes += cache_token_bytes
             paged_manager_keys.add(group_key)
+            if CacheAllocator(cache.allocator) == CacheAllocator.HBM:
+                paged_block_bytes_by_key[group_key] = (
+                    paged_block_bytes_by_key.get(group_key, 0) + block_size * cache_token_bytes
+                )
+                per_token_bytes += cache_token_bytes
 
     if has_fixed_block_cache:
         # Reserve memory for fixed-block caches first, so non fixed-block sizing only uses
@@ -244,15 +267,21 @@ def calculate_block_num(
 
         # Validate that current free_memory can support all requested block memory
         paged_attention_memory_bytes = sum(
-            block_num_by_type[manager_key] * paged_block_bytes_by_key[manager_key]
+            block_num_by_type[manager_key] * paged_block_bytes_by_key.get(manager_key, 0)
             for manager_key in paged_manager_keys
         )
-        required_memory_bytes = paged_attention_memory_bytes + fixed_block_memory_bytes
+        required_memory_bytes = (
+            paged_attention_memory_bytes
+            + fixed_block_memory_bytes
+            + extra_reserved_memory_bytes
+        )
         free_memory, total_memory = torch.npu.mem_get_info()
         if required_memory_bytes > free_memory:
             raise MemoryError(
                 f"Insufficient memory for offline mode cache allocation. "
-                f"Please reduce the length of requests or the total batch size."
+                f"required={required_memory_bytes}, free={free_memory}, "
+                f"extra_reserved={extra_reserved_memory_bytes}. "
+                "Please reduce the length of requests or the total batch size."
             )
         return block_num_by_type
 
@@ -262,12 +291,24 @@ def calculate_block_num(
     used_memory = total_memory - free_memory
 
     mem_fraction_static = infer_config.scheduler_config.mem_fraction_static
-    available_memory = total_memory * mem_fraction_static - used_memory - fixed_block_memory_bytes
+    available_memory = (
+        total_memory * mem_fraction_static
+        - used_memory
+        - fixed_block_memory_bytes
+        - extra_reserved_memory_bytes
+    )
     if available_memory <= 0:
         raise MemoryError(
             "No available memory for paged attention after fixed-block cache reservation. "
-            f"used={used_memory}, fixed_block={fixed_block_memory_bytes}, total={total_memory}, "
+            f"used={used_memory}, fixed_block={fixed_block_memory_bytes}, "
+            f"extra_reserved={extra_reserved_memory_bytes}, total={total_memory}, "
             f"mem_fraction_static={mem_fraction_static}, Please boost mem_fraction_static in yaml."
+        )
+
+    if per_token_bytes <= 0:
+        raise MemoryError(
+            "No HBM-backed paged-attention cache entry remains for dynamic block sizing. "
+            "Please use offline mode or keep at least one paged cache entry in HBM."
         )
 
     # Convert the remaining memory budget to token capacity, then to block capacity.
@@ -311,7 +352,8 @@ def calculate_block_num(
         raise MemoryError(
             "Current memory cannot satisfy max input length requirement. "
             f"supported max tokens={supported_tokens}, required max tokens={required_tokens}, "
-            f"fixed_block_memory_gb={fixed_block_memory_bytes / 1024**3:.2f}"
+            f"fixed_block_memory_gb={fixed_block_memory_bytes / 1024**3:.2f}, "
+            f"extra_reserved_memory_gb={extra_reserved_memory_bytes / 1024**3:.2f}"
         )
 
     return block_num_by_type

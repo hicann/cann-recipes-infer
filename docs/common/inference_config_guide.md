@@ -38,6 +38,7 @@
 - `local_rank`: **不支持yaml配置**。节点内 Rank ID，可在脚本中获取环境变量后传入。
 - `attn_tp_size`: Attention 层TP并行数（默认 1）。
 - `attn_dp_size`: **不支持配置**。Attention 层DP并行数，推导方式：`world_size // attn_tp_size`。
+- `cp_prefill_dp_size`: **不支持配置**。CP prefill 阶段内部使用的DP并行数，推导方式：`world_size // (attn_tp_size * cp_size)`。
 - `embed_tp_size`: Embedding 层TP并行数（默认 1）。
 - `embed_dp_size`: **不支持配置**。Embedding 层DP并行数，推导方式：`world_size // embed_tp_size`。
 - `moe_tp_size`: MoE 层TP并行数，只有MoE模型支持（默认 1）。
@@ -45,7 +46,7 @@
 - `lmhead_tp_size`: LM Head 层TP并行数（默认 1）。
 - `dense_tp_size`: dense层TP并行数（默认 1）。
 - `o_proj_tp_size`: attention output 映射层TP并行数（默认 1）。
-- `cp_size`: context并行度（默认 1）。
+- `cp_size`: context并行度（默认 1）。当前仅支持 `cp_size = 1`（不开启 CP）或 `cp_size == world_size`配置。
 - `shared_tp_size`: 共享专家层TP并行数（默认1）。
 
 ### 2.4 SchedulerConfig (调度配置)

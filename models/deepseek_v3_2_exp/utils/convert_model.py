@@ -210,7 +210,7 @@ def generate_quant_group(a_num_bits=8, w_num_bits=8, targets=None, activation_us
 
 def generate_quant_config(c8, ignores, w4a8=False, clip=False):
     """
-    Generate a quantization configuration dictionary based on the specified parameters. 
+    Generate a quantization configuration dictionary based on the specified parameters.
     """
     kv_cache_scheme = {"num_bits": 8,
                        "type": 'int',
@@ -313,13 +313,13 @@ def main(fp8_path, output_path, quant_type, clip=False, quant_param_path=None):
     Converts FP8 weights to BF16 and saves the converted weights.
 
     This function reads FP8 weights from the specified directory, converts them to BF16,
-    and saves the converted weights to another specified directory. It also updates the 
+    and saves the converted weights to another specified directory. It also updates the
     model index file to reflect the changes.
 
     Args:
     fp8_path (str): The path to the directory containing the FP8 weights and model index file.
     output_path (str): The path to the directory where the converted BF16/INT8 weights will be saved.
-    quant_type (str): The type of quantization to apply. Supported values are "bfloat16", 
+    quant_type (str): The type of quantization to apply. Supported values are "bfloat16",
     "w8a8c16", "w8a8c8", "w4a8c16", and "w4a8c8".
     clip (bool, optional): Whether to apply clipping during quantization. Defaults to False.
     quant_param_path (str, optional): The path to the directory containing quantization parameters.

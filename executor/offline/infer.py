@@ -138,9 +138,16 @@ def main():
         dataset_path = config.data_config.dataset_path
 
     attn_dp_size = config.parallel_config.attn_dp_size
+    cp_size = config.parallel_config.cp_size
     batch_size = config.scheduler_config.batch_size
 
-    if attn_dp_size > 1:
+    if cp_size > 1:
+        if batch_size % attn_dp_size != 0:
+            raise ValueError(f"batch_size ({batch_size}) must be divisible by attn_dp_size ({attn_dp_size})")
+        all_prompts = generate_prompt(config.data_config.dataset, dataset_path)
+        all_prompts = all_prompts * (batch_size // len(all_prompts) + 1)
+        prompts = all_prompts[:batch_size]
+    elif attn_dp_size > 1:
         if batch_size % attn_dp_size != 0:
             raise ValueError(
                 f"batch_size ({batch_size}) must be divisible by attn_dp_size ({attn_dp_size})"

@@ -1,0 +1,31 @@
+model_config:
+  model_name: "deepseek_v3_2_exp"
+  model_path: "/data/models/DeepSeek-V3.2-Exp-W4A8C8"
+  exe_mode: "ge_graph"            # ["eager", "npugraph_ex", "ge_graph"], mode of decode
+  next_n: 1
+  with_ckpt: True                 # [False, True]
+  force_eplb: False               # [False, True]
+  enable_weight_nz: True
+  enable_profiler: False          # [False, True]
+  enable_cache_compile: False     # [False, True]
+  custom_params:
+    enable_offload: False         # [False, True]
+    enable_multi_streams: True    # [False, True]
+
+data_config:
+  dataset: InfiniteBench
+  input_truncated_len: 4096
+
+parallel_config:
+  world_size: 16
+  o_proj_tp_size: 8
+  attn_tp_size: 1
+  dense_tp_size: 4
+  moe_tp_size: 1
+  embed_tp_size: 16
+  lmhead_tp_size: 16
+
+scheduler_config:
+  block_size: 128
+  max_new_tokens: 256
+  batch_size: 16

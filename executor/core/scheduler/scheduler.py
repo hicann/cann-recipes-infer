@@ -22,7 +22,6 @@ import torch
 from executor.core.config import SchedulerConfig
 from ..forward_data_info import Request, Batch, StepOutput, MTPInfo, SamplingParams
 from ..engine import ExecutionEngine
-from ..kv_cache import KVCacheManager
 
 logger = logging.getLogger(__name__)
 
@@ -180,7 +179,7 @@ class Scheduler:
             return None
 
         # Process outputs and update request states
-        finished = self._process_batch_output(batch, engine.kvcache_manager)
+        finished = self._process_batch_output(batch, engine)
 
         self._step += 1
         self._log_step(engine, batch, output)
@@ -246,6 +245,8 @@ class Scheduler:
         request_offset = self.prefilled_request_count
         total_prefill_tokens = 0
         max_prefill_tokens = self.config.max_prefill_tokens
+        parallel_config = engine.infer_config.parallel_config
+        enable_offline_cp = self.mode == 'offline' and parallel_config.cp_size > 1
 
         # Strict FIFO: only consider the queue head. If the head request
         # cannot fit in the current prefill batch budget, stop scheduling
@@ -272,13 +273,28 @@ class Scheduler:
                 self._on_request_finished(request)
                 continue
 
-            if engine.kvcache_manager and not engine.kvcache_manager.allocate_slots(
-                    request.request_id, request.computed_len, request.input_ids.shape[-1]):
-                continue
-
             next_total_prefill_tokens = total_prefill_tokens + request.prompt_tokens
             if selected and next_total_prefill_tokens > max_prefill_tokens:
                 break
+
+            if enable_offline_cp:
+                request.cp_rank = (request_offset + len(selected)) % parallel_config.cp_size
+
+            if (
+                engine.kvcache_manager
+                and self._needs_prefill_kv_allocation(engine, request)
+                and not engine.kvcache_manager.allocate_slots(
+                    request.request_id, request.computed_len, request.input_ids.shape[-1]
+                )
+            ):
+                if enable_offline_cp:
+                    raise RuntimeError(
+                        "CP offline prefill requires all CP ranks to schedule the same request batch, "
+                        "but the owner rank failed to allocate KV cache slots. "
+                        f"request_id={request.request_id}, cp_rank={request.cp_rank}, "
+                        f"global_rank={parallel_config.global_rank}"
+                    )
+                continue
 
             selected.append(self.waiting_queue.popleft())
             total_prefill_tokens = next_total_prefill_tokens
@@ -294,6 +310,13 @@ class Scheduler:
         )
 
         return batch
+
+    def _needs_prefill_kv_allocation(self, engine: ExecutionEngine, request: Request) -> bool:
+        parallel_config = engine.infer_config.parallel_config
+        if self.mode != 'offline' or parallel_config.cp_size <= 1:
+            return True
+        current_cp_rank = parallel_config.global_rank % parallel_config.cp_size
+        return request.cp_rank == current_cp_rank
 
     def _prepare_request_prompt(self, request: Request) -> None:
         if request.input_ids.numel() > 0:
@@ -365,18 +388,24 @@ class Scheduler:
     def _process_batch_output(
         self,
         batch: Batch,
-        kv_cache_manager: KVCacheManager,
+        engine: ExecutionEngine,
     ) -> List[int]:
         """Process batch execution output and update request states.
 
         Args:
             batch: The batch that was executed.
-            kv_cache_manager: KV cache manager for freeing request cache blocks.
+            engine: Execution engine that owns KV cache and parallel config.
 
         Returns:
             List of request IDs that finished in this step.
         """
         finished = []
+        parallel_config = engine.infer_config.parallel_config
+        enable_offline_cp = self.mode == 'offline' and batch.is_prefill and parallel_config.cp_size > 1
+        current_cp_rank = (
+            parallel_config.global_rank % parallel_config.cp_size
+            if enable_offline_cp else 0
+        )
 
         for request in batch.requests:
             if batch.is_prefill:
@@ -387,15 +416,16 @@ class Scheduler:
                 # does not later try to decode a PD pending request).
                 request.is_prefill_done = True
                 self.prefilled_request_count += 1
-                self._on_prefill_complete(request)
+                if not enable_offline_cp or request.cp_rank == current_cp_rank:
+                    self._on_prefill_complete(request)
             else:
                 if self._should_finish(request):
                     """Move a decode-completed request to finished_requests and free KV."""
                     request.is_finished = True
                     self.running_requests.pop(request.request_id, None)
                     self.finished_requests[request.request_id] = request
-                    if kv_cache_manager:
-                        kv_cache_manager.free(request.request_id)
+                    if engine.kvcache_manager:
+                        engine.kvcache_manager.free(request.request_id)
                     finished.append(request.request_id)
                     self._on_request_finished(request)
         return finished
@@ -417,25 +447,26 @@ class Scheduler:
         finish = False
         output_len = len(request.output_id_list)
         if not request.sampling_params.ignore_eos:
-            eos_token_id = getattr(self.tokenizer, "eos_token_id", None)
-            if (
-                eos_token_id is not None
-                and request.output_id_list
-                and request.output_id_list[-1] == eos_token_id
-            ):
+            if request.eos_output_len is not None:
                 request.finish_reason = "stop"
+                if self.mode == 'offline':
+                    request.valid_output_len = request.eos_output_len
+                else:
+                    request.output_id_list = request.output_id_list[:request.eos_output_len]
+                    output_len = len(request.output_id_list)
                 finish = True
-        if output_len >= self.config.max_new_tokens:
+        if not finish and output_len >= self.config.max_new_tokens:
             request.finish_reason = "length"
             finish = True
         sp_max = request.sampling_params.max_tokens
-        if sp_max is not None and output_len >= sp_max:
+        if not finish and sp_max is not None and output_len >= sp_max:
             request.finish_reason = "length"
             finish = True
 
         # for offline
         if self.mode == 'offline' and request.finish_reason is not None:
-            request.valid_output_len = output_len
+            if request.valid_output_len is None:
+                request.valid_output_len = output_len
             # offline finish according to compute step
             finish = request.decode_step_count >= self.config.max_new_tokens
 

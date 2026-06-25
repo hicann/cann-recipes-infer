@@ -1,0 +1,34 @@
+model_config:
+  model_name: "deepseek_v3_2_exp"
+  model_path: "/data/models/DeepSeek-V3.2-Exp-W4A8C8"
+  exe_mode: "eager"
+  next_n: 3
+  with_ckpt: True                 # [False, True]
+  force_eplb: False               # [False, True]
+  enable_weight_nz: True
+  enable_profiler: False          # [False, True]
+  enable_cache_compile: False     # [False, True]
+  custom_params:
+    enable_offload: False
+    enable_multi_streams: False   # [False, True]
+
+data_config:
+  input_truncated_len: 8192
+
+parallel_config:
+  cp_size: 16
+  world_size: 16
+  o_proj_tp_size: 8
+  attn_tp_size: 1
+  dense_tp_size: 4
+  moe_tp_size: 1
+  embed_tp_size: 16
+  lmhead_tp_size: 16
+
+
+scheduler_config:
+  block_size: 128
+  max_prefill_tokens: 16384
+  max_new_tokens: 1
+  batch_size: 4
+  mem_fraction_static: 0.91

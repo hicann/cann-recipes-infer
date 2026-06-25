@@ -16,7 +16,14 @@
 """Paged-attention memory cache module."""
 
 from .block_pool import BlockPool
-from .cache_info import CacheEntry, LayerCacheInfo, ModelCacheInfo
+from .cache_info import (
+    CacheAllocator,
+    CacheEntry,
+    LayerCacheInfo,
+    MemoryBudgetItem,
+    ModelCacheInfo,
+    OffloadWorkspaceMemoryInfo,
+)
 from .cache_utils import (
     allocate_cache_tensors,
     calculate_block_num,
@@ -37,11 +44,14 @@ from .single_type_kv_cache_manager import (
 __all__ = [
     "ATTN_TYPE_MANAGER_MAP",
     "BlockPool",
+    "CacheAllocator",
     "CacheEntry",
     "FullAttentionManager",
     "KVCacheManager",
     "LayerCacheInfo",
+    "MemoryBudgetItem",
     "ModelCacheInfo",
+    "OffloadWorkspaceMemoryInfo",
     "allocate_cache_tensors",
     "calculate_block_num",
     "dtype_itemsize",
