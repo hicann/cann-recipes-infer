@@ -196,7 +196,7 @@ class DeepseekV3Config(PretrainedConfig):
         self.attention_dropout = attention_dropout
         self.quantization_config = kwargs.get('quantization_config', {})
         self.quant_config = kwargs.get('quant_config', None)
-        
+
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,

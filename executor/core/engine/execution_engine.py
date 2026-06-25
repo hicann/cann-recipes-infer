@@ -147,6 +147,8 @@ class ExecutionEngine:
             truncation_side='right',
             trust_remote_code=True
         )
+        if getattr(self.hf_config, "eos_token_id", None) is not None:
+            self.tokenizer.eos_token_id = self.hf_config.eos_token_id
         self.eos_token_id = getattr(self.tokenizer, "eos_token_id", None)
 
         # Initialize KV cache

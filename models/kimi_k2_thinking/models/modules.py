@@ -37,13 +37,11 @@ from transformers.modeling_attn_mask_utils import (
     _prepare_4d_attention_mask,
     _prepare_4d_causal_attention_mask,
 )
-from transformers.modeling_utils import PreTrainedModel
 from transformers.pytorch_utils import (
     ALL_LAYERNORM_LAYERS,
     is_torch_greater_or_equal_than_1_13,
 )
 from transformers.utils import (
-    add_start_docstrings,
     logging,
 )
 
@@ -487,23 +485,6 @@ DEEPSEEKV3_START_DOCSTRING = r"""
             load the weights associated with the model, only the configuration. Check out the
             [`~PreTrainedModel.from_pretrained`] method to load the model weights.
 """
-
-
-@add_start_docstrings(
-    "The bare DeepseekV3 Model outputting raw hidden-states without any specific head on top.",
-    DEEPSEEKV3_START_DOCSTRING,
-)
-class DeepseekV3PreTrainedModel(PreTrainedModel):
-    config_class = DeepseekV3Config
-    base_model_prefix = "model"
-    supports_gradient_checkpointing = True
-    _no_split_modules = ["DeepseekV3DecoderLayer"]
-    _skip_keys_device_placement = "past_key_values"
-    _supports_flash_attn_2 = True
-    _supports_cache_class = True
-
-    def _init_weights(self, module):
-        pass
 
 
 DEEPSEEKV3_INPUTS_DOCSTRING = r"""
