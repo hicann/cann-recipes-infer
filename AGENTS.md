@@ -43,10 +43,9 @@ scripts/        # 工具脚本
 
 | 流程 | 类别 | 模型 |
 |---|---|---|
-| **统一流程** | Dense LLM | `gpt_oss` |
-| | MoE LLM | `deepseek_r1`, `qwen3_moe` |
-| **ModelRunner** | LLM (Dense / MoE) | `deepseek-v3.2-exp`, `deepseek-v4` |
-| | 长序列 LLM | `kimi-k2-thinking`, `longcat-flash` |
+| **统一流程** | Dense LLM | `gpt_oss`, `qwen25_7b_instruct`, `qwen3_8b`, `deepseek_v3_2_exp`, `gemma_4` |
+| | MoE LLM | `deepseek_r1`, `kimi_k2_thinking`, `qwen3_moe`, `qwen3.5`, `hy3_preview`, `step3p7_flash`, `longcat_flash`, `longcat_flash_lite` |
+| **ModelRunner** | LLM (Dense / MoE) | `deepseek-v4`, `glm-5`, `pangu-7b` |
 | | 视频生成 | `hunyuan-video`, `wan2.2-i2v`, `sana-video` |
 | | 图像生成 | `hunyuan-image-3.0` |
 | | 推荐 / 其他 | `hstu` |

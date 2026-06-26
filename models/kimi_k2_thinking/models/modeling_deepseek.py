@@ -775,7 +775,7 @@ class DeepseekAttention(nn.Module):
         self.batch_size_per_rank = self.infer_config.scheduler_config.batch_size_per_dp_rank
         self.attn_tp_size = self.infer_config.parallel_config.attn_tp_size
         self.attn_dp_size = self.infer_config.parallel_config.attn_dp_size
-        self.oproj_tp_size = getattr(self.infer_config.parallel_config, "oproj_tp_size", 1)
+        self.o_proj_tp_size = self.infer_config.parallel_config.o_proj_tp_size
         self.cp_size = self.infer_config.parallel_config.cp_size
         self.moe_tp_size = self.infer_config.parallel_config.moe_tp_size
         self.moe_ep_size = self.infer_config.parallel_config.moe_ep_size
@@ -864,7 +864,7 @@ class DeepseekAttention(nn.Module):
         self.kv_b_proj_w_k_data = self.kv_b_proj_w_k_data.permute(1, 2, 0)
         self.kv_b_proj_w_v_data = self.kv_b_proj_w_v_data.transpose(0, 1)
 
-        if self.oproj_tp_size == 1:
+        if self.o_proj_tp_size == 1:
             self.o_proj = RowParallelLinear(self.num_heads * self.v_head_dim,
                                             config.hidden_size,
                                             tp_size=self.attn_tp_size,
@@ -877,9 +877,9 @@ class DeepseekAttention(nn.Module):
         else:
             self.o_proj = RowParallelLinear(self.num_heads * self.v_head_dim,
                                             config.hidden_size,
-                                            tp_size=self.oproj_tp_size,
-                                            tp_rank=self.comm_manager.get_rank("oproj_tp_group")
-                                            if self.oproj_tp_size > 1 else 0,
+                                            tp_size=self.o_proj_tp_size,
+                                            tp_rank=self.comm_manager.get_rank("o_proj_tp_group")
+                                            if self.o_proj_tp_size > 1 else 0,
                                             bias=False,
                                             input_is_parallel=True,
                                             quant_config=config.quant_config,
@@ -944,7 +944,7 @@ class DeepseekAttention(nn.Module):
         attn_output: torch.Tensor = None,
         absorb: bool = False,
         is_prefill: bool = False,
-        prefill_oproj_padded_tokens: Optional[int] = None,
+        prefill_o_proj_padded_tokens: Optional[int] = None,
     ):
         if absorb:
             # input shape [N//attn_tp_size, T(bs*q_len), D]
@@ -954,38 +954,38 @@ class DeepseekAttention(nn.Module):
                 self.kv_b_proj_w_v
             ).transpose(0, 1)
             # Note: Considering the fusion rules of TBMM, attn_output shape requires a 3-dim shape, and
-            # with appropriate tensor stride for the later 'view' operation if oproj_tp_size > 1.
+            # with appropriate tensor stride for the later 'view' operation if o_proj_tp_size > 1.
             # after reshape: [T(bs*q_len), 1, N//attn_tp_size*D]
             attn_output = attn_output.reshape(-1, 1, self.num_heads // self.attn_tp_size * self.v_head_dim)
 
         local_token_num = attn_output.shape[0]
-        if is_prefill and self.oproj_tp_size > 1 and prefill_oproj_padded_tokens is not None:
-            pad_tokens = prefill_oproj_padded_tokens - local_token_num
+        if is_prefill and self.o_proj_tp_size > 1 and prefill_o_proj_padded_tokens is not None:
+            pad_tokens = prefill_o_proj_padded_tokens - local_token_num
             if pad_tokens > 0:
                 pad_shape = (pad_tokens, *attn_output.shape[1:])
                 attn_output = torch.cat([attn_output, attn_output.new_zeros(pad_shape)], dim=0)
 
-        if self.oproj_tp_size > 1:
-            # after view: (bs*q_len, oproj_tp_size, num_heads // oproj_tp_size * v_head_dim)
-            attn_output = attn_output.view(-1, self.oproj_tp_size,
-                                           self.num_heads // self.oproj_tp_size * self.v_head_dim)
-            # after transpose: (oproj_tp_size, bs*q_len, num_heads // oproj_tp_size * v_head_dim)
-            # after view: (oproj_tp_size * bs*q_len * num_heads // oproj_tp_size * v_head_dim)
+        if self.o_proj_tp_size > 1:
+            # after view: (bs*q_len, o_proj_tp_size, num_heads // o_proj_tp_size * v_head_dim)
+            attn_output = attn_output.view(-1, self.o_proj_tp_size,
+                                           self.num_heads // self.o_proj_tp_size * self.v_head_dim)
+            # after transpose: (o_proj_tp_size, bs*q_len, num_heads // o_proj_tp_size * v_head_dim)
+            # after view: (o_proj_tp_size * bs*q_len * num_heads // o_proj_tp_size * v_head_dim)
             attn_output = attn_output.transpose(1, 0).contiguous().view(-1)
             all2all_output = torch.empty_like(attn_output)
-            # after all2all: (oproj_tp_size * bs*q_len * num_heads // oproj_tp_size * v_head_dim)
+            # after all2all: (o_proj_tp_size * bs*q_len * num_heads // o_proj_tp_size * v_head_dim)
             dist.all_to_all_single(all2all_output, attn_output,
-                                   group=self.comm_manager.get_group("oproj_tp_group"))
-            # after view: (oproj_tp_size * bs*q_len, num_heads // oproj_tp_size * v_head_dim)
-            attn_output = all2all_output.view(-1, self.num_heads // self.oproj_tp_size * self.v_head_dim)
+                                   group=self.comm_manager.get_group("o_proj_tp_group"))
+            # after view: (o_proj_tp_size * bs*q_len, num_heads // o_proj_tp_size * v_head_dim)
+            attn_output = all2all_output.view(-1, self.num_heads // self.o_proj_tp_size * self.v_head_dim)
 
         attn_output = self.o_proj(attn_output.reshape(attn_output.shape[0], -1))
 
-        if self.oproj_tp_size > 1:
-            reduce_scatter_output = torch.empty((attn_output.size()[0] // self.oproj_tp_size, attn_output.size()[1]),
+        if self.o_proj_tp_size > 1:
+            reduce_scatter_output = torch.empty((attn_output.size()[0] // self.o_proj_tp_size, attn_output.size()[1]),
                                                 dtype=attn_output.dtype, device=attn_output.device)
             dist.reduce_scatter_tensor(reduce_scatter_output, attn_output,
-                                       group=self.comm_manager.get_group("oproj_tp_group"))
+                                       group=self.comm_manager.get_group("o_proj_tp_group"))
             attn_output = reduce_scatter_output
 
         if is_prefill and attn_output.shape[0] > local_token_num:
@@ -996,15 +996,15 @@ class DeepseekAttention(nn.Module):
 
         return attn_output
 
-    def get_prefill_oproj_padded_tokens(self, hidden_states, is_prefill):
-        if not is_prefill or self.oproj_tp_size <= 1:
+    def get_prefill_o_proj_padded_tokens(self, hidden_states, is_prefill):
+        if not is_prefill or self.o_proj_tp_size <= 1:
             return None
         local_token_num = hidden_states.shape[0]
         max_token_num = torch.tensor([local_token_num], dtype=torch.long, device=hidden_states.device)
         dist.all_reduce(
             max_token_num,
             op=dist.ReduceOp.MAX,
-            group=self.comm_manager.get_group("oproj_tp_group"),
+            group=self.comm_manager.get_group("o_proj_tp_group"),
         )
         return int(max_token_num.item())
 
@@ -1022,7 +1022,7 @@ class DeepseekAttention(nn.Module):
         block_table: Optional[Dict[str, torch.Tensor]] = None,
         cp_metadata: Optional[PrefillCPMetaData] = None,
         attention_mask: Optional[torch.Tensor] = None,
-        prefill_oproj_padded_tokens: Optional[int] = None,
+        prefill_o_proj_padded_tokens: Optional[int] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         slot_mapping = slot_mapping[self.attn_type] if isinstance(slot_mapping, dict) else slot_mapping
@@ -1038,7 +1038,7 @@ class DeepseekAttention(nn.Module):
             "block_table": block_table,
             "cp_metadata": cp_metadata,
             "attention_mask": attention_mask,
-            "prefill_oproj_padded_tokens": prefill_oproj_padded_tokens,
+            "prefill_o_proj_padded_tokens": prefill_o_proj_padded_tokens,
         }
         if is_prefill and cp_metadata is not None and cp_metadata.enabled:
             return self.forward_absorb_cp(**input_kwargs)
@@ -1059,7 +1059,7 @@ class DeepseekAttention(nn.Module):
         block_table: Optional[torch.Tensor] = None,
         cp_metadata: Optional[PrefillCPMetaData] = None,
         attention_mask: Optional[torch.Tensor] = None,
-        prefill_oproj_padded_tokens: Optional[int] = None,
+        prefill_o_proj_padded_tokens: Optional[int] = None,
         **kwargs,
     ):
         query_states = self.prepare_qkv(
@@ -1087,7 +1087,7 @@ class DeepseekAttention(nn.Module):
             attn_output,
             absorb=True,
             is_prefill=is_prefill,
-            prefill_oproj_padded_tokens=prefill_oproj_padded_tokens,
+            prefill_o_proj_padded_tokens=prefill_o_proj_padded_tokens,
         )
 
         return output
@@ -1104,7 +1104,7 @@ class DeepseekAttention(nn.Module):
         block_table: Optional[torch.Tensor] = None,
         cp_metadata: Optional[PrefillCPMetaData] = None,
         attention_mask: Optional[torch.Tensor] = None,
-        prefill_oproj_padded_tokens: Optional[int] = None,
+        prefill_o_proj_padded_tokens: Optional[int] = None,
         **kwargs,
     ):
         # Prefill:[1, B*S, H] Decode:[B, S, H]
@@ -1163,7 +1163,7 @@ class DeepseekAttention(nn.Module):
             attn_output,
             absorb=True,
             is_prefill=is_prefill,
-            prefill_oproj_padded_tokens=prefill_oproj_padded_tokens,
+            prefill_o_proj_padded_tokens=prefill_o_proj_padded_tokens,
         )
 
         return output
@@ -1867,7 +1867,7 @@ class DeepseekV3ForCausalLM(nn.Module):
         self.embed_tp_size = pc.embed_tp_size
         self.attn_dp_size = pc.attn_dp_size
         self.attn_tp_size = pc.attn_tp_size
-        self.oproj_tp_size = getattr(pc, "oproj_tp_size", 1)
+        self.o_proj_tp_size = pc.o_proj_tp_size
         self.cp_size = pc.cp_size
         self.moe_ep_size = pc.moe_ep_size
         self.moe_tp_size = pc.moe_tp_size
@@ -1884,9 +1884,9 @@ class DeepseekV3ForCausalLM(nn.Module):
             group_size=self.attn_tp_size,
         )
         self.comm_manager.register_group(
-            name="oproj_tp_group",
-            group_num=world_size // self.oproj_tp_size,
-            group_size=self.oproj_tp_size,
+            name="o_proj_tp_group",
+            group_num=world_size // self.o_proj_tp_size,
+            group_size=self.o_proj_tp_size,
         )
         self.comm_manager.register_group(
             name="embed_tp_group",

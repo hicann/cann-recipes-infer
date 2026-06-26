@@ -790,7 +790,7 @@ class DeepseekIndexerAttention(nn.Module):
         self.batch_size_per_rank = scheduler_config.batch_size_per_dp_rank
         self.attn_tp_size = parallel_config.attn_tp_size
         self.attn_dp_size = parallel_config.attn_dp_size
-        self.oproj_tp_size = parallel_config.o_proj_tp_size
+        self.o_proj_tp_size = parallel_config.o_proj_tp_size
         self.cp_size = parallel_config.cp_size
         self.moe_tp_size = parallel_config.moe_tp_size
         self.moe_ep_size = parallel_config.moe_ep_size
@@ -884,7 +884,7 @@ class DeepseekIndexerAttention(nn.Module):
         self.kv_b_proj_w_k_data = self.kv_b_proj_w_k_data.permute(1, 2, 0)
         self.kv_b_proj_w_v_data = self.kv_b_proj_w_v_data.transpose(0, 1)
 
-        if self.oproj_tp_size == 1:
+        if self.o_proj_tp_size == 1:
             self.o_proj = RowParallelLinear(self.num_heads * self.v_head_dim,
                                             config.hidden_size,
                                             tp_size=self.attn_tp_size,
@@ -897,9 +897,9 @@ class DeepseekIndexerAttention(nn.Module):
         else:
             self.o_proj = RowParallelLinear(self.num_heads * self.v_head_dim,
                                             config.hidden_size,
-                                            tp_size=self.oproj_tp_size,
-                                            tp_rank=self.comm_manager.get_rank("oproj_tp_group")
-                                            if self.oproj_tp_size > 1 else 0,
+                                            tp_size=self.o_proj_tp_size,
+                                            tp_rank=self.comm_manager.get_rank("o_proj_tp_group")
+                                            if self.o_proj_tp_size > 1 else 0,
                                             bias=False,
                                             input_is_parallel=True,
                                             quant_config=config.quant_config,
@@ -996,7 +996,7 @@ class DeepseekIndexerAttention(nn.Module):
         attn_output: torch.Tensor = None,
         absorb: bool = False,
         is_prefill: bool = False,
-        prefill_oproj_padded_tokens: Optional[int] = None,
+        prefill_o_proj_padded_tokens: Optional[int] = None,
     ):
         if absorb:
             # input shape [N//attn_tp_size, T(bs*q_len), D]
@@ -1006,38 +1006,38 @@ class DeepseekIndexerAttention(nn.Module):
                 self.kv_b_proj_w_v
             ).transpose(0, 1)
             # Note: Considering the fusion rules of TBMM, attn_output shape requires a 3-dim shape, and
-            # with appropriate tensor stride for the later 'view' operation if oproj_tp_size > 1.
+            # with appropriate tensor stride for the later 'view' operation if o_proj_tp_size > 1.
             # after reshape: [T(bs*q_len), 1, N//attn_tp_size*D]
             attn_output = attn_output.reshape(-1, 1, self.num_heads // self.attn_tp_size * self.v_head_dim)
 
         local_token_num = attn_output.shape[0]
-        if is_prefill and self.oproj_tp_size > 1 and prefill_oproj_padded_tokens is not None:
-            pad_tokens = prefill_oproj_padded_tokens - local_token_num
+        if is_prefill and self.o_proj_tp_size > 1 and prefill_o_proj_padded_tokens is not None:
+            pad_tokens = prefill_o_proj_padded_tokens - local_token_num
             if pad_tokens > 0:
                 pad_shape = (pad_tokens, *attn_output.shape[1:])
                 attn_output = torch.cat([attn_output, attn_output.new_zeros(pad_shape)], dim=0)
 
-        if self.oproj_tp_size > 1:
-            # after view: (bs*q_len, oproj_tp_size, num_heads // oproj_tp_size * v_head_dim)
-            attn_output = attn_output.view(-1, self.oproj_tp_size,
-                                           self.num_heads // self.oproj_tp_size * self.v_head_dim)
-            # after transpose: (oproj_tp_size, bs*q_len, num_heads // oproj_tp_size * v_head_dim)
-            # after view: (oproj_tp_size * bs*q_len * num_heads // oproj_tp_size * v_head_dim)
+        if self.o_proj_tp_size > 1:
+            # after view: (bs*q_len, o_proj_tp_size, num_heads // o_proj_tp_size * v_head_dim)
+            attn_output = attn_output.view(-1, self.o_proj_tp_size,
+                                           self.num_heads // self.o_proj_tp_size * self.v_head_dim)
+            # after transpose: (o_proj_tp_size, bs*q_len, num_heads // o_proj_tp_size * v_head_dim)
+            # after view: (o_proj_tp_size * bs*q_len * num_heads // o_proj_tp_size * v_head_dim)
             attn_output = attn_output.transpose(1, 0).contiguous().view(-1)
             all2all_output = torch.empty_like(attn_output)
-            # after all2all: (oproj_tp_size * bs*q_len * num_heads // oproj_tp_size * v_head_dim)
+            # after all2all: (o_proj_tp_size * bs*q_len * num_heads // o_proj_tp_size * v_head_dim)
             dist.all_to_all_single(all2all_output, attn_output,
-                                   group=self.comm_manager.get_group("oproj_tp_group"))
-            # after view: (oproj_tp_size * bs*q_len, num_heads // oproj_tp_size * v_head_dim)
-            attn_output = all2all_output.view(-1, self.num_heads // self.oproj_tp_size * self.v_head_dim)
+                                   group=self.comm_manager.get_group("o_proj_tp_group"))
+            # after view: (o_proj_tp_size * bs*q_len, num_heads // o_proj_tp_size * v_head_dim)
+            attn_output = all2all_output.view(-1, self.num_heads // self.o_proj_tp_size * self.v_head_dim)
 
         attn_output = self.o_proj(attn_output.reshape(attn_output.shape[0], -1))
 
-        if self.oproj_tp_size > 1:
-            reduce_scatter_output = torch.empty((attn_output.size()[0] // self.oproj_tp_size, attn_output.size()[1]),
+        if self.o_proj_tp_size > 1:
+            reduce_scatter_output = torch.empty((attn_output.size()[0] // self.o_proj_tp_size, attn_output.size()[1]),
                                                 dtype=attn_output.dtype, device=attn_output.device)
             dist.reduce_scatter_tensor(reduce_scatter_output, attn_output,
-                                       group=self.comm_manager.get_group("oproj_tp_group"))
+                                       group=self.comm_manager.get_group("o_proj_tp_group"))
             attn_output = reduce_scatter_output
 
         if is_prefill and attn_output.shape[0] > local_token_num:
@@ -1062,7 +1062,7 @@ class DeepseekIndexerAttention(nn.Module):
         block_table: Optional[torch.Tensor] = None,
         cp_metadata: Optional[PrefillCPMetaData] = None,
         offload_cache: Optional[OffloadCache] = None,
-        prefill_oproj_padded_tokens: Optional[int] = None,
+        prefill_o_proj_padded_tokens: Optional[int] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         '''
@@ -1081,7 +1081,7 @@ class DeepseekIndexerAttention(nn.Module):
             "block_table": block_table,
             "offload_cache": offload_cache,
             "cp_metadata": cp_metadata,
-            "prefill_oproj_padded_tokens": prefill_oproj_padded_tokens,
+            "prefill_o_proj_padded_tokens": prefill_o_proj_padded_tokens,
         }
         input_kwargs.update({"actual_seq_lengths_q": actual_seq_lengths_q})
         if is_prefill and cp_metadata is not None and cp_metadata.enabled:
@@ -1101,7 +1101,7 @@ class DeepseekIndexerAttention(nn.Module):
         block_table: Optional[torch.Tensor] = None,
         cp_metadata: Optional[PrefillCPMetaData] = None,
         offload_cache: Optional[OffloadCache] = None,
-        prefill_oproj_padded_tokens: Optional[int] = None,
+        prefill_o_proj_padded_tokens: Optional[int] = None,
         **kwargs,
     ):
         query_states, topk_indices = self.prepare_qkv(
@@ -1131,7 +1131,7 @@ class DeepseekIndexerAttention(nn.Module):
             attn_output,
             absorb=True,
             is_prefill=is_prefill,
-            prefill_oproj_padded_tokens=prefill_oproj_padded_tokens,
+            prefill_o_proj_padded_tokens=prefill_o_proj_padded_tokens,
         )
         return output
 
@@ -1147,7 +1147,7 @@ class DeepseekIndexerAttention(nn.Module):
         block_table: Optional[torch.Tensor] = None,
         cp_metadata: Optional[PrefillCPMetaData] = None,
         offload_cache: Optional[OffloadCache] = None,
-        prefill_oproj_padded_tokens: Optional[int] = None,
+        prefill_o_proj_padded_tokens: Optional[int] = None,
         **kwargs,
     ):
         # Prefill:[1, B*S, H] Decode:[B, S, H]
@@ -1207,7 +1207,7 @@ class DeepseekIndexerAttention(nn.Module):
             attn_output,
             absorb=True,
             is_prefill=is_prefill,
-            prefill_oproj_padded_tokens=prefill_oproj_padded_tokens,
+            prefill_o_proj_padded_tokens=prefill_o_proj_padded_tokens,
         )
         return output
 
@@ -1716,7 +1716,7 @@ class DeepseekV3DecoderLayer(nn.Module):
         block_table: Optional[torch.Tensor] = None,
         cp_metadata: Optional[PrefillCPMetaData] = None,
         offload_cache: Optional[OffloadCache] = None,
-        prefill_oproj_padded_tokens: Optional[int] = None,
+        prefill_o_proj_padded_tokens: Optional[int] = None,
         prefill_dense_padded_tokens: Optional[int] = None,
         **kwargs,
     ) -> Tuple[torch.FloatTensor]:
@@ -1735,7 +1735,7 @@ class DeepseekV3DecoderLayer(nn.Module):
             block_table=block_table,
             cp_metadata=cp_metadata,
             offload_cache=offload_cache,
-            prefill_oproj_padded_tokens=prefill_oproj_padded_tokens,
+            prefill_o_proj_padded_tokens=prefill_o_proj_padded_tokens,
         )
 
         # Fully Connected
@@ -1781,7 +1781,7 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
         self.embed_dp_size = parallel_config.embed_dp_size
         self.attn_tp_size = parallel_config.attn_tp_size
         self.attn_dp_size = parallel_config.attn_dp_size
-        self.oproj_tp_size = parallel_config.o_proj_tp_size
+        self.o_proj_tp_size = parallel_config.o_proj_tp_size
         self.dense_tp_size = parallel_config.dense_tp_size
         self.cp_size = parallel_config.cp_size
         self.moe_ep_size = parallel_config.moe_ep_size
@@ -1913,15 +1913,15 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
         position_ids = torch.index_select(position_ids, 0, local_indices)
         return input_ids, position_ids, None
 
-    def get_prefill_oproj_padded_tokens(self, hidden_states, is_prefill):
-        if not is_prefill or self.oproj_tp_size <= 1:
+    def get_prefill_o_proj_padded_tokens(self, hidden_states, is_prefill):
+        if not is_prefill or self.o_proj_tp_size <= 1:
             return None
         local_token_num = hidden_states.shape[0]
         max_token_num = torch.tensor([local_token_num], dtype=torch.long, device=hidden_states.device)
         dist.all_reduce(
             max_token_num,
             op=dist.ReduceOp.MAX,
-            group=self.comm_manager.get_group("oproj_tp_group"),
+            group=self.comm_manager.get_group("o_proj_tp_group"),
         )
         return int(max_token_num.item())
 
@@ -1970,7 +1970,7 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
 
         if is_prefill and self.attn_tp_size > 1 and self.moe_ep_size > 1:
             hidden_states = self.prepare_inputs_for_layer(inputs_embeds, input_ids)
-        prefill_oproj_padded_tokens = self.get_prefill_oproj_padded_tokens(hidden_states, is_prefill)
+        prefill_o_proj_padded_tokens = self.get_prefill_o_proj_padded_tokens(hidden_states, is_prefill)
         prefill_dense_padded_tokens = self.get_prefill_dense_padded_tokens(hidden_states, is_prefill)
         residual = None
 
@@ -1995,7 +1995,7 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
                     block_table=block_table,
                     cp_metadata=cp_metadata,
                     offload_cache=offload_cache,
-                    prefill_oproj_padded_tokens=prefill_oproj_padded_tokens,
+                    prefill_o_proj_padded_tokens=prefill_o_proj_padded_tokens,
                     prefill_dense_padded_tokens=prefill_dense_padded_tokens,
                 )
 
@@ -2038,13 +2038,13 @@ class DeepseekV3ModelMTPLayer(DeepseekV3Model):
         block_table: Optional[torch.Tensor] = None,
         mtp_layer_idx: Optional[int] = 0,
         offload_cache: Optional[OffloadCache] = None,
-        prefill_oproj_padded_tokens: Optional[int] = None,
+        prefill_o_proj_padded_tokens: Optional[int] = None,
         prefill_dense_padded_tokens: Optional[int] = None,
         cp_metadata: Optional[PrefillCPMetaData] = None,
         **kwargs,
     ) -> torch.Tensor:
-        if prefill_oproj_padded_tokens is None:
-            prefill_oproj_padded_tokens = self.get_prefill_oproj_padded_tokens(hidden_states, is_prefill)
+        if prefill_o_proj_padded_tokens is None:
+            prefill_o_proj_padded_tokens = self.get_prefill_o_proj_padded_tokens(hidden_states, is_prefill)
         if prefill_dense_padded_tokens is None:
             prefill_dense_padded_tokens = self.get_prefill_dense_padded_tokens(hidden_states, is_prefill)
         return self.layers[str(self.mtp_start_layer_idx + mtp_layer_idx)](
@@ -2060,7 +2060,7 @@ class DeepseekV3ModelMTPLayer(DeepseekV3Model):
             slot_mapping=slot_mapping,
             block_table=block_table,
             offload_cache=offload_cache,
-            prefill_oproj_padded_tokens=prefill_oproj_padded_tokens,
+            prefill_o_proj_padded_tokens=prefill_o_proj_padded_tokens,
             prefill_dense_padded_tokens=prefill_dense_padded_tokens,
             cp_metadata=cp_metadata,
         )
@@ -2185,7 +2185,7 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
         self.embed_tp_size = parallel_config.embed_tp_size
         self.attn_dp_size = parallel_config.attn_dp_size
         self.attn_tp_size = parallel_config.attn_tp_size
-        self.oproj_tp_size = parallel_config.o_proj_tp_size
+        self.o_proj_tp_size = parallel_config.o_proj_tp_size
         self.cp_size = parallel_config.cp_size
         self.moe_ep_size = parallel_config.moe_ep_size
         self.moe_tp_size = parallel_config.moe_tp_size
@@ -2258,9 +2258,9 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
             group_size=self.lmhead_tp_size,
         )
         self.comm_manager.register_group(
-            name="oproj_tp_group",
-            group_num=self.world_size // self.oproj_tp_size,
-            group_size=self.oproj_tp_size,
+            name="o_proj_tp_group",
+            group_num=self.world_size // self.o_proj_tp_size,
+            group_size=self.o_proj_tp_size,
         )
         if self.dense_tp_size > 1:
             self.comm_manager.register_group(

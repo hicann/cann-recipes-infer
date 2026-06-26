@@ -11,8 +11,8 @@ model_config:
   enable_weight_nz: True
   custom_params:
     enable_mla_prolog: True
-enable_multi_streams: True
-enable_superkernel: False         # ge_graph only
+    enable_multi_streams: True
+    enable_superkernel: False         # ge_graph only
 
 data_config:
   dataset: "InfiniteBench"
