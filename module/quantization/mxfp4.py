@@ -129,9 +129,11 @@ class W4A8MxFp4MoEGMMMethod(QuantizeMethodBase):
         if pertoken_scale is None:
             x, pertoken_scale = torch_npu.npu_dynamic_mx_quant(x, dst_type=torch.float8_e4m3fn)
         num_tokens = x.shape[0]
+        w13_weight_scale = layer.w13_weight_scale.transpose(1, 2) if self.enable_ge_graph else layer.w13_weight_scale
+        # Do not pre-transpose the weights to prevent the weights from becoming attributes
         mm1_mm3 = torch_npu.npu_grouped_matmul(
             [x], [layer.w13_weight.transpose(1, 2)],
-            antiquant_scale=[layer.w13_weight_scale],
+            antiquant_scale=[w13_weight_scale],
             per_token_scale=[pertoken_scale],
             group_list=expert_tokens, split_item=3,
             output_dtype=torch.bfloat16, group_type=0,
@@ -151,12 +153,16 @@ class W4A8MxFp4MoEGMMMethod(QuantizeMethodBase):
                                                                                         clamp_limit=swiglu_limit,
                                                                                         group_index=expert_tokens)
         else:
-            mm1_mm3 = torch_npu.npu_swiglu(mm1_mm3)
-            intermediate_h, pertoken_scale = torch_npu.npu_dynamic_mx_quant(mm1_mm3, dst_type=torch.float8_e4m3fn)
-
+            intermediate_h, pertoken_scale = torch_npu.npu_swiglu_mx_quant(
+                                                mm1_mm3,
+                                                group_index=expert_tokens,
+                                                dst_type=torch_npu.float8_e4m3fn,
+                                                activate_left=True,
+                                            )
+        w2_weight_scale = layer.w2_weight_scale.transpose(1, 2) if self.enable_ge_graph else layer.w2_weight_scale
         out_hidden = torch_npu.npu_grouped_matmul(
             [intermediate_h], [layer.w2_weight.transpose(1, 2)], bias=None,
-            antiquant_scale=[layer.w2_weight_scale],
+            antiquant_scale=[w2_weight_scale],
             per_token_scale=[pertoken_scale],
             group_list=expert_tokens, split_item=3,
             output_dtype=final_output_dtype, group_type=0,
@@ -178,6 +184,8 @@ class W4A8MxFp4MoEGMMMethod(QuantizeMethodBase):
         w2_weight = layer.w2_weight
         w13_weight_scale = layer.w13_weight_scale
         w2_weight_scale = layer.w2_weight_scale
+        exe_mode = kwargs.get("exe_mode") or "eager"
+        self.enable_ge_graph = exe_mode == "ge_graph"
 
         w13_weight = torch_npu.npu_format_cast(
             w13_weight.data.contiguous(), 29,
@@ -189,9 +197,12 @@ class W4A8MxFp4MoEGMMMethod(QuantizeMethodBase):
             customize_dtype=torch.float8_e4m3fn,
             input_dtype=torch_npu.float4_e2m1fn_x2
         )
-        w13_weight_scale.data = reshape_mx_scale(w13_weight_scale.data).transpose(1, 2)
-        w2_weight_scale.data = reshape_mx_scale(w2_weight_scale.data).transpose(1, 2)
-
+        if self.enable_ge_graph:
+            w13_weight_scale.data = reshape_mx_scale(w13_weight_scale.data)
+            w2_weight_scale.data = reshape_mx_scale(w2_weight_scale.data)
+        else:
+            w13_weight_scale.data = reshape_mx_scale(w13_weight_scale.data).transpose(1, 2)
+            w2_weight_scale.data = reshape_mx_scale(w2_weight_scale.data).transpose(1, 2)
         layer.w13_weight = Parameter(w13_weight, requires_grad=False)
         layer.w2_weight = Parameter(w2_weight, requires_grad=False)
 
@@ -276,7 +287,7 @@ class UpGateW4A4DownW4A8MxFp4MoEGMMMethod(W4A8MxFp4MoEGMMMethod):
         )[0]
 
         swiglu_limit = kwargs.get("swiglu_limit", None)
-        enable_custom_ops = kwargs.get("enable_custom_ops", False)
+        enable_custom_ops = kwargs.get("enable_custom_ops", False) 
         if enable_custom_ops:
             intermediate_h, pertoken_scale , _ = torch.ops.custom.npu_swiglu_group_quant(mm1_mm3,
                                                                                         dst_type=torch.float8_e4m3fn,

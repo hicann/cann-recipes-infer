@@ -5,9 +5,10 @@ Qwen3-MoE模型是2025年开源的大语言模型，包括Qwen3-235B-A22B与Qwen
 
 
 ## 支持的产品型号
-<term>Atlas A3 系列产品</term>
+<term>Atlas A3、950 系列产品</term>  
+在950系列产品中，Qwen3-MoE Prefill支持低时延优化、Decode支持W4A8混精推理。
 
-## 环境准备
+## A3系列产品环境准备
 
 1. 安装CANN软件包。
 
@@ -43,11 +44,65 @@ Qwen3-MoE模型是2025年开源的大语言模型，包括Qwen3-235B-A22B与Qwen
    - `cann_path`: CANN软件包安装路径，例如`/usr/local/Ascend/ascend-toolkit/latest`。
     > 说明：HCCL相关配置，如：`HCCL_SOCKET_IFNAME`、`HCCL_OP_EXPANSION_MODE`，可以参考[集合通信文档](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/900/maintenref/envvar/envref_07_0001.html)并在`executor/scripts/function.sh`中自定义配置。
 
+## 950系列产品环境准备
+1. 安装CANN软件包。
+
+   本样例的编译执行依赖CANN开发套件包与CANN二进制算子包，支持的CANN软件版本为`CANN 9.1.0-beta.1`。
+
+   请从[软件包下载地址](https://www.hiascend.com/developer/download/community/result?module=cann)下载`Ascend-cann-toolkit_${version}_linux-${arch}.run`与`Ascend-cann-A3-ops_${version}_linux-${arch}.run`软件包，并参考[CANN安装文档](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/910beta1/softwareinst/instg/instg_0090.html?OS=openEuler&InstallType=localpack)进行安装。
+
+   - `${version}`表示CANN包版本号，如9.1.0-beta.1。
+   - `${arch}`表示CPU架构，如aarch64、x86_64。
+
+2. 安装Ascend Extension for PyTorch（torch_npu）。
+
+   Ascend Extension for PyTorch（torch_npu）为支撑PyTorch框架运行在NPU上的适配插件，本样例支持的Ascend Extension for PyTorch版本为`v26.0.0`，PyTorch版本为`2.8.0`。
+   
+   请从[软件包下载地址](https://gitcode.com/Ascend/pytorch/releases/v26.0.0-pytorch2.8.0)下载`torch_npu-2.8.0.post4-cp311-cp311-manylinux_2_28_${arch}.whl`安装包，并参考[torch_npu安装文档](https://www.hiascend.com/document/detail/zh/Pytorch/2600/configandinstg/instg/docs/zh/installation_guide/installation_via_binary_package.md)进行安装。
+   
+    - `${arch}`表示CPU架构，如aarch64、x86_64。
+
+3. 下载项目源码并安装依赖的python库。
+    ```bash
+    # 下载项目源码，以master分支为例
+    git clone https://gitcode.com/cann/cann-recipes-infer.git
+
+    # 安装依赖的python库，仅支持python 3.11
+    cd cann-recipes-infer
+    pip3 install -r ./models/qwen3_moe/requirements.txt
+    ```
+
+4. 配置样例运行所需环境信息。
+
+   修改`executor/scripts/set_env.sh`中的如下字段：
+   - `IPs`：配置所有节点的IP，按照rank id排序，多个节点的ip通过空格分开，例如：`('xxx.xxx.xxx.xxx' 'xxx.xxx.xxx.xxx')`。
+   - `cann_path`: CANN软件包安装路径，例如`/usr/local/Ascend/ascend-toolkit/latest`。
+    > 说明：HCCL相关配置，如：`HCCL_SOCKET_IFNAME`、`HCCL_OP_EXPANSION_MODE`，可以参考[集合通信文档](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/900/maintenref/envvar/envref_07_0001.html)并在`executor/scripts/function.sh`中自定义配置。
 ## 权重准备
 
 请根据所使用的模型类型自行下载原始权重到本地路径，例如`/data/models/qwen3_origin_weight/`。
 
 以Qwen3-235B-A22B为例，权重下载地址：[Qwen3-MoE权重](https://huggingface.co/Qwen/Qwen3-235B-A22B/tree/main)。
+
+## 权重转换
+
+本样例在950系列产品上支持Qwen3-MoE模型量化W4A8混精推理，基于`models\qwen3_moe\utils\convert_model.py`可以完成从Bfloat16到W4A8 MXFP8的权重转换。
+
+> 入参介绍：`input_bf16_hf_path`：原始Bfloat16权重路径；`output_hf_path`：转换后输出的权重路径。
+
+如果权重转换的运行环境为NPU，需要先执行：
+
+```bash
+cann_path=/usr/local/Ascend/ascend-toolkit/latest # cann包安装路径
+source ${cann_path}/bin/setenv.bash
+```
+
+权重转换执行示例：
+
+```bash
+# 转换为W4A8权重
+python models/longcat_flash/utils/convert_model.py --input_bf16_hf_path /data/models/Qwen3-235B-A22B --output_hf_path /data/models/Qwen3-235B-A22B-MXFP48
+```
 
 ## 推理执行
 
@@ -123,4 +178,4 @@ Qwen3-MoE模型是2025年开源的大语言模型，包括Qwen3-235B-A22B与Qwen
 
 ## 优化点参考
 
-本样例采用的详细优化点介绍可参见[基于Atlas A3的Qwen3-MoE模型低时延推理性能优化实践](../../docs/models/qwen3-moe/qwen3_moe_optimization.md)。
+本样例采用的详细优化点介绍可参见[基于Atlas A3、950的Qwen3-MoE模型低时延推理性能优化实践](../../docs/models/qwen3-moe/qwen3_moe_optimization.md)。

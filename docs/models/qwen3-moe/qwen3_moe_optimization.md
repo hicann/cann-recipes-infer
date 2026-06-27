@@ -1,6 +1,9 @@
-# 基于Atlas A3训练/推理集群的Qwen3-MoE模型低时延推理性能优化实践
+# 基于Atlas A3、950训练/推理集群的Qwen3-MoE模型低时延推理性能优化实践
 ## 概述
-本文主要介绍Qwen3-MoE模型基于NPU的低时延推理优化策略。基于Atlas A3 训练/推理系列产品，decode采用8卡部署，实现BF16场景下单batch推理时延小于20ms。
+本文主要介绍Qwen3-MoE模型基于NPU的低时延推理优化策略。
+- 基于Atlas A3 训练/推理系列产品，decode采用8卡部署，实现BF16场景下单batch推理时延小于20ms。
+- 基于Atlas 950 PR 训练/推理系列产品，decode采用4卡部署，实现W4A8混精推理4K场景下单batch Prefill时延小于280ms,Decode时延小于24ms。
+
 
 ## 低时延场景Tensor Parallel (TP)优化
 ### Attention TP优化
@@ -69,5 +72,124 @@ if self.enable_cache_compile:
 ```shell
 export HCCL_OP_EXPANSION_MODE=AIV
 ```
+## 高吞吐场景Prefill优化（Attention SP+TP, MoE EP）
+### 概述
+在Prefill推理场景下，模型需要一次性处理完整的输入序列，计算密集度高。为在TTFT时延约束下实现最大吞吐，采用Attention序列并行（SP）+张量并行（TP）与MoE专家并行（EP）的组合策略，结合MXFP8/MXFP4量化与多算子融合，显著降低Prefill阶段的计算与通信开销。
+
+### Attention SP+TP优化
+#### 并行策略选择
+Prefill阶段算子多为计算bound，TP并行在切分后每卡的序列长度缩短，但AllReduce通信量与完整序列成正比。SP并行沿序列维度切分，每卡仅处理`seq_len // attn_tp_size`长度的子序列，通信算子采用AlltoAll，通信数据量更小且可配合低bit量化。
+
+综合考虑通信数据量、数据类型和额外引入算子三个因素，Prefill阶段Attention采用**SP+TP混合并行**：
+- **FA前通信**：使用AllGather将各Rank的子序列聚合成完整序列，配合MXFP8量化减小通信体积；
+- **FA后通信**：使用AlltoAll将o_proj的输出按序列维度重新分发到各Rank，配合MXFP8量化。
+
+#### 切分策略
+输入序列沿token维度按`attn_tp_size`均分，每个Rank处理`seq_len // attn_tp_size`个token。要求输入序列长度能被`attn_tp_size`整除，不足时进行padding对齐。
+
+```
+Rank 0: [token_0, ..., token_{S/P-1}]
+Rank 1: [token_{S/P}, ..., token_{2S/P-1}]
+...
+Rank P-1: [token_{(P-1)S/P}, ..., token_{S-1}]
+```
+
+其中`S`为序列长度，`P`为`attn_tp_size`。
+
+#### 计算分解
+Prefill阶段的Attention计算流程如下：
+
+1. **序列切分与Embedding**：输入`input_ids`按`attn_tp_size`切分，每个Rank仅对自身持有的子序列做Embedding；
+2. **AllGather聚合**：通过`dist.all_gather_into_tensor`将各Rank的`hidden_states`聚合为完整序列，若使能MXFP8量化则同时聚合`hidden_states_scale`；
+3. **merged_qkv_proj**：对聚合后的完整序列执行QKV线性层计算；
+4. **FlashAttention**：使用`npu_fused_infer_attention_score_v2`完成注意力计算；
+5. **o_proj + AlltoAll**：o_proj使用`ReplicatedLinear`（每卡持有完整权重），输出经MXFP8量化后通过AlltoAll按序列维度重新分发，每个Rank仅保留自身负责的子序列部分；
+6. **MoE输入准备**：AlltoAll后的输出shape为`(seq_len // attn_tp_size, hidden_size)`，直接作为MoE层的输入。
+
+![attention_sp_tp_prefill](./figures/attention_sp_tp_prefill.png)
+
+### MoE EP优化
+#### 并行策略选择
+MoE部分支持TP和EP两种并行方式。TP并行会将GMM的K或N轴切得过小，导致计算性能下降。EP并行每个Rank持有部分专家，通过通信完成token与专家的路由匹配，在`ep_rank`数较小时通信开销可控。
+
+EP并行进一步分为AllGather方案和Double Routing（AlltoAll）方案：
+
+| 并行策略 | 通信算子 | 通信数据量 | 适用场景 |
+|---|---|---|---|
+| EP (AllGather) | AllGather + ReduceScatter | (B,S,H) × 2 | `ep_rank`较小、`top_k > ep_rank`时数据量更小 |
+| EP (Double Routing) | AlltoAll + AlltoAll | (BS×top_k/ep_rank, H) × 2 | 大EP场景、`ep > top_k`时数据量更小 |
+
+当前Qwen3-MoE模型`top_k=8`，在`ep_rank=4`时`top_k > ep_rank`，AllGather方案通信数据量更小，为默认优选方案。
+
+#### 计算分解（AllGather方案，W4A8量化）
+当使能W4A8（MXFP4）量化且`attn_tp_size == moe_ep_size`时，MoE EP采用AllGather + ReduceScatter通信模式，具体流程如下：
+
+1. **MXFP8量化**：对输入`hidden_states`执行`npu_dynamic_mx_quant`，得到MXFP8量化数据及scale；
+2. **AllGather**：通过`dist.all_gather_into_tensor`聚合各Rank的量化数据、scale、`topk_ids`和`topk_weight`，得到完整序列的token信息；
+3. **Routing**：使用`npu_moe_init_routing_v2`对聚合后的token进行专家路由，仅筛选属于本Rank的专家范围内的token；
+4. **GMM计算**：通过`npu_grouped_matmul`（封装在`FusedMoEGMM`中）完成多专家并行矩阵乘计算；
+5. **Finalize Routing**：使用`npu_moe_finalize_routing`将专家计算结果按路由信息重新排布并加权求和；
+6. **ReduceScatter**：通过`dist.reduce_scatter_tensor`将各Rank的部分结果归约并分发，每个Rank获得自身负责的子序列输出。
+
+
+#### 计算分解（Double Routing方案）
+当未使能W4A8量化时，MoE EP采用Double Routing（AlltoAll）通信模式，具体流程如下：
+
+1. **Routing**：使用`npu_moe_init_routing_v2`对token进行初始路由和排序；
+2. **Dispatch（AlltoAll）**：通过`dist.all_to_all_single`将token按专家归属分发到对应Rank，同时交换`tokens_per_expert`信息用于确定接收数量；
+3. **Re-routing**：使用`npu_moe_re_routing`对接收到的token进行二次排序；
+4. **GMM计算**：通过`npu_grouped_matmul`完成专家计算；
+5. **Combine（AlltoAll）**：将专家计算结果通过`dist.all_to_all_single`回传到原始Rank；
+6. **Finalize Routing**：使用`npu_moe_finalize_routing`完成最终的结果归约。
+
+### 融合算子优化
+Prefill场景下，为减少量化引入的额外算子开销，将归一化、残差加法与量化操作进行融合：
+
+#### 融合RMSNorm + MX量化
+通过使能`torch_npu.npu_add_rms_norm_dynamic_mx_quant`融合算子，将残差加法、RMSNorm归一化和MXFP8动态量化合并为一次计算，避免中间结果的反复读写：
+
+```python
+hidden_states_mx, residual, hidden_states_scale, _ = \
+    torch_npu.npu_add_rms_norm_dynamic_mx_quant(
+        hidden_states, past_residual,
+        norm_weight, beta=None,
+        epsilon=variance_epsilon,
+        round_mode='rint',
+        dst_type=torch.float8_e4m3fn
+    )
+```
+
+当残差为None时（首层），使用`torch_npu.npu_rms_norm_dynamic_mx_quant`完成RMSNorm + MX量化融合。
+
+#### 融合RMSNorm + Cast
+MoE前的归一化需要同时输出FP32（用于gate计算）和BF16（用于专家计算）两种精度，通过使能`torch_npu.npu_add_rms_norm_cast`融合算子，将残差加法、RMSNorm和数据类型转换合并：
+
+```python
+hidden_states_fp32, hidden_states_bf16, _, residual = \
+    torch_npu.npu_add_rms_norm_cast(
+        hidden_states, residual,
+        norm_weight, epsilon
+    )
+```
+
+### 配置说明
+在YAML配置文件中设置Prefill SP+TP与MoE EP相关参数：
+
+```yaml
+parallel_config:
+  attn_tp_size: 4     # Attention SP/TP并行度，Prefill时同时作为序列并行度
+  moe_tp_size: 1      # MoE TP大小，EP场景下设为1
+  moe_ep_size: 4      # MoE EP大小，需与attn_tp_size相等以启用SP优化路径
+```
+
+参数约束：
+
+| 参数 | 约束条件 | 说明 |
+|---|---|---|
+| `attn_tp_size` | `world_size % attn_tp_size == 0` | Attention并行度 |
+| `moe_ep_size` | `world_size % moe_ep_size == 0` | MoE专家并行度 |
+| `attn_tp_size == moe_ep_size` | 推荐相等 | 启用Prefill SP优化路径（`prefill_opt`） |
+| `seq_len` | 需能被`attn_tp_size`整除 | 不足时自动padding对齐 |
+
 ## 附录
 [环境部署以及样例执行](../../../models/qwen3_moe/README.md)

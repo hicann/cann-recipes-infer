@@ -37,6 +37,7 @@ from module.linear import (
     VocabParallelEmbedding
     )
 from module.fuse_moe_gmm import FusedMoEGMM
+from module.quantization.mxfp4 import W4A8MxFp4MoEGMMMethod 
 from executor.utils import calc_moe_hccl_buffer_size
 from executor.utils.forward_metadata import ForwardMetaData, get_forward_metadata
 from executor.core.config import InferenceConfig, CommManager
@@ -135,6 +136,8 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
         super().__init__()
         self.config = config
+        if getattr(config, "quant_config", None) is None:
+            setattr(config, "quant_config", None)
         self.infer_config = infer_config
         self.hidden_dim = config.hidden_size
         self.batch_size_decode = infer_config.scheduler_config.batch_size
@@ -148,18 +151,24 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         self.max_position_embeddings = config.max_position_embeddings
         self.moe_tp_size = infer_config.parallel_config.moe_tp_size
         self.moe_ep_size = infer_config.parallel_config.moe_ep_size
+        self.attn_tp_size = infer_config.parallel_config.attn_tp_size
         self.moe_intermediate_size = config.moe_intermediate_size
         self.intermediate_size_per_rank = self.moe_intermediate_size // self.moe_tp_size
         self.experts_per_rank = config.num_experts // self.moe_ep_size
         self.force_eplb = infer_config.model_config.force_eplb
         self.ep_size = self.infer_config.parallel_config.moe_ep_size
         self.tp_size = self.infer_config.parallel_config.moe_tp_size
+        self.gmm_quant_mode = (
+            config.quant_config.gmm_quant_mode
+            if config.quant_config is not None
+            else "w16a16"
+        )
         self.experts = FusedMoEGMM(
             num_experts=self.num_experts,
             hidden_size=self.hidden_dim,
             intermediate_size=self.moe_intermediate_size,
             bias=False,
-            quant_config=None,
+            quant_config=config.quant_config,
             tp_size=self.moe_tp_size,
             tp_rank=comm_manager.get_rank("moe_tp_group") if self.tp_size > 1 else 0,
             ep_size=self.moe_ep_size,
@@ -171,6 +180,8 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         self.row_idx_decode = torch.arange(
             0, self.row_idx_decode_len,
             dtype=torch.int32).view(self.top_k, -1).permute(1, 0).contiguous().npu()
+        # Use w4a8 for MOE
+        self.prefill_opt = (self.attn_tp_size == self.moe_ep_size and self.gmm_quant_mode == "w4a8mxfloat4")
 
     def init_gate(self, prefix):
         self.norm_topk_prob = self.config.norm_topk_prob
@@ -179,7 +190,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             self.gating_dim,
             self.num_experts,
             bias=False,
-            quant_config=None,
+            quant_config=self.config.quant_config,
             params_dtype=torch.float32,
             prefix=f"{prefix}.gate"
         )
@@ -235,16 +246,26 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
     def forward(self, hidden_states, cur_topk_list=None, **kwargs):
         is_prefill = get_forward_metadata().is_prefill
-        topk_idx, topk_weight, _, row_idx = self._forward_gate(hidden_states)
+        if self.prefill_opt:
+            hidden_states_fp32, hidden_states_bf16 = hidden_states
+            hidden_states_gate = hidden_states_fp32
+            hidden_states = hidden_states_bf16
+        else:
+            hidden_states_gate = hidden_states
+        topk_idx, topk_weight, _, row_idx = self._forward_gate(hidden_states_gate)
         if self.force_eplb:
             topk_idx = cur_topk_list
         topk_idx = topk_idx.to(torch.int32)
+        
+        
         if self.moe_tp_size > 1:
-            # MoE TP scene
+            # MoE TP scence
             return self.moe_infer_tp(hidden_states, topk_idx, topk_weight)
         else:
             # MoE EP scene
             if is_prefill:
+                if self.prefill_opt:
+                    return self.moe_infer_ag_w4a8mx(hidden_states, topk_idx, topk_weight)
                 return self.moe_infer_double_routing(hidden_states, topk_idx, topk_weight)
             else:
                 return self.moe_infer_dispatch_combine(hidden_states, topk_idx, topk_weight)
@@ -340,7 +361,87 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             export_for_source_row=None, drop_pad_mode=2
         )
         return hidden_states.view(token_count, self.hidden_dim)
+    
+    def moe_infer_ag_w4a8mx(self, hidden_states, topk_ids, topk_weight):
+        bs_qlen, h = hidden_states.shape
+        h_dtype = hidden_states.dtype
+        moe_ep_group = self.comm_manager.get_group("moe_ep_group")
+        ep_rank = dist.get_rank(moe_ep_group)
+        total_tokens = bs_qlen * self.attn_tp_size
+        routing_args = {"quant_mode": -1}
 
+        hidden_states_mx, moe_agout_scale = torch_npu.npu_dynamic_mx_quant(hidden_states, dst_type=torch.float8_e4m3fn)
+        moe_agout = torch.empty(
+            [total_tokens, h], dtype=hidden_states_mx.dtype, device="npu"
+        )
+        dist.all_gather_into_tensor(moe_agout, hidden_states_mx, group=moe_ep_group)
+        x = moe_agout
+        moe_agout_scale_all = torch.empty(
+            [total_tokens, moe_agout_scale.shape[-2], moe_agout_scale.shape[-1]],
+            dtype=moe_agout_scale.dtype, device="npu"
+        )
+        dist.all_gather_into_tensor(moe_agout_scale_all, moe_agout_scale, group=moe_ep_group)
+        x_scale = moe_agout_scale_all
+        topk_ids_ag = torch.empty(
+            [total_tokens, topk_ids.shape[1]], dtype=topk_ids.dtype, device="npu"
+        )
+        dist.all_gather_into_tensor(topk_ids_ag, topk_ids, group=moe_ep_group)
+        topk_ids = topk_ids_ag
+
+        topk_weight_ag = torch.empty(
+            [total_tokens, topk_weight.shape[1]], dtype=topk_weight.dtype, device="npu"
+        )
+        dist.all_gather_into_tensor(topk_weight_ag, topk_weight, group=moe_ep_group)
+        topk_weight = topk_weight_ag
+
+        # --- separate routing for x and x_scale ---
+        active_num = topk_ids.shape[0] * topk_ids.shape[1]
+        routing_kwargs = dict(
+            expert_idx=topk_ids,
+            active_num=active_num,
+            expert_num=self.num_experts,
+            expert_tokens_num_type=1,
+            expert_tokens_num_flag=True,
+            active_expert_range=[
+                ep_rank * self.experts_per_rank,
+                (ep_rank + 1) * self.experts_per_rank,
+            ],
+            **routing_args
+        )
+
+        x_bf16 = x.view(torch.bfloat16)
+        expanded_x_bf16, expanded_row_idx, tokens_per_expert, _ = \
+            torch_npu.npu_moe_init_routing_v2(x_bf16, **routing_kwargs)
+        expanded_x = expanded_x_bf16.view(x.dtype)
+
+        x_scale_bf16 = x_scale.reshape(total_tokens, -1).to(torch.bfloat16)
+        expanded_x_scale_bf16, _, _, _ = \
+            torch_npu.npu_moe_init_routing_v2(x_scale_bf16, **routing_kwargs)
+        pertoken_scale = expanded_x_scale_bf16.to(x_scale.dtype) \
+            .view(-1, *x_scale.shape[1:])
+
+        gmm_args = {
+            "x": expanded_x,
+            "pertoken_scale": pertoken_scale,
+            "expert_tokens": tokens_per_expert,
+            "group_list_type": 1,
+        }
+        hidden_states_ordered = self.experts(**gmm_args)
+        hidden_states = torch_npu.npu_moe_finalize_routing(
+            hidden_states_ordered,
+            skip1=None, skip2=None, bias=None,
+            scales=topk_weight,
+            expanded_src_to_dst_row=expanded_row_idx,
+            export_for_source_row=topk_ids,
+            drop_pad_mode=2,
+        )
+
+        hidden_states_rs = torch.empty([bs_qlen, h], dtype=h_dtype, device="npu")
+        dist.reduce_scatter_tensor(hidden_states_rs, hidden_states, group=moe_ep_group)
+        hidden_states = hidden_states_rs
+        hidden_states = hidden_states.view(bs_qlen, self.hidden_dim)
+        return hidden_states.view(-1, h)
+    
     def moe_infer_dispatch_combine(self, x, topk_ids, topk_weight):
         """
         support ep for decode stage
@@ -395,6 +496,8 @@ class Qwen3MoeAttention(nn.Module):
     ):
         super().__init__()
         self.config = config
+        if getattr(config, "quant_config", None) is None:
+            setattr(config, "quant_config", None)
         self.layer_idx = layer_idx
         self.attn_type = "FullAttention"
         if layer_idx is None:
@@ -403,7 +506,14 @@ class Qwen3MoeAttention(nn.Module):
                 "to errors during the forward call, if caching is used. Please make sure to provide a `layer_idx` "
                 "when creating this class."
             )
-
+        self.mm_quant_mode = (
+            config.quant_config.mm_quant_mode
+            if config.quant_config is not None
+            else "w16a16")
+        self.kv_cache_quant_mode = (
+            config.quant_config.kv_cache_quant_mode
+            if config.quant_config is not None
+            else "unquant")
         self.attn_tp_size = infer_config.parallel_config.attn_tp_size
         self.attn_dp_size = infer_config.parallel_config.attn_dp_size
         self.moe_tp_size = infer_config.parallel_config.moe_tp_size
@@ -433,7 +543,7 @@ class Qwen3MoeAttention(nn.Module):
             skip_bias_add=False,
             tp_size=self.attn_tp_size,
             tp_rank=comm_manager.get_rank("attn_tp_group"),
-            quant_config=None,
+            quant_config=config.quant_config,
             prefix=f"{prefix}.merged_qkv_proj",
             return_bias=False
         )
@@ -441,6 +551,8 @@ class Qwen3MoeAttention(nn.Module):
         self.k_norm = Qwen3MoeRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.batch_size = infer_config.scheduler_config.batch_size
         self.input_len = infer_config.data_config.input_truncated_len
+        # Use w8a8 for attention
+        self.prefill_opt = (self.attn_tp_size == self.moe_ep_size and self.mm_quant_mode == "w8a8mxfloat8")
 
         self.o_proj = RowParallelLinear(self.attn_intermediate_size,
                                         config.hidden_size,
@@ -448,8 +560,17 @@ class Qwen3MoeAttention(nn.Module):
                                         tp_rank=comm_manager.get_rank("attn_tp_group"),
                                         bias=False,
                                         input_is_parallel=True,
+                                        quant_config=config.quant_config,
                                         prefix=f"{prefix}.o_proj")
+        if self.prefill_opt:
+            self.o_proj = ReplicatedLinear(self.attn_intermediate_size, # ReplicatedLinear
+                                            config.hidden_size,
+                                            bias=False,
+                                            quant_config=config.quant_config,
+                                            prefix=f"{prefix}.o_proj")
+        
         self.scale_fa = 1 / (self.head_dim ** 0.5)
+        self.dynamic_mx_block = 64
         self.k_cache = torch.Tensor([])
         self.v_cache = torch.Tensor([])
         self.cache_entries = [
@@ -458,9 +579,9 @@ class Qwen3MoeAttention(nn.Module):
                 attn_type=self.attn_type,
                 dim=self.head_dim,
                 num_head=self.num_key_value_heads_per_rank,
-                dtype=self.config.torch_dtype,
-                block_size=self.block_size,
+                dtype=torch.float8_e4m3fn if self.kv_cache_quant_mode == "float8" else self.config.torch_dtype,
                 needs_block=True,
+                block_size=self.block_size,
                 tensor_setter=lambda tensor, layer=self: setattr(layer, "k_cache", tensor),
             ),
             CacheEntry(
@@ -468,13 +589,102 @@ class Qwen3MoeAttention(nn.Module):
                 attn_type=self.attn_type,
                 dim=self.head_dim,
                 num_head=self.num_key_value_heads_per_rank,
-                dtype=self.config.torch_dtype,
-                block_size=self.block_size,
+                dtype=torch.float8_e4m3fn if self.kv_cache_quant_mode == "float8" else self.config.torch_dtype,
                 needs_block=True,
+                block_size=self.block_size,
                 tensor_setter=lambda tensor, layer=self: setattr(layer, "v_cache", tensor),
             ),
         ]
+        if self.kv_cache_quant_mode != "unquant":
+            self.ks_cache = torch.Tensor([])
+            self.vs_cache = torch.Tensor([])
+            self.cache_entries.append(
+                CacheEntry(
+                cache_name="ks_cache",
+                attn_type=self.attn_type,
+                dim=1,
+                num_head=1,
+                dtype=torch.float32,
+                needs_block=True,
+                block_size=self.block_size,
+                tensor_setter=lambda tensor, layer=self: setattr(layer, "ks_cache", tensor),
+                )
+            )
+            self.cache_entries.append(
+                CacheEntry(
+                cache_name="vs_cache",
+                attn_type=self.attn_type,
+                dim=1,
+                num_head=1,
+                dtype=torch.float32,
+                needs_block=True,
+                block_size=self.block_size,
+                tensor_setter=lambda tensor, layer=self: setattr(layer, "vs_cache", tensor),
+                )
+            )
 
+    def kv_cache_update(
+        self,
+        slot_mapping: Optional[torch.Tensor] = None,
+        key_states: Optional[torch.Tensor] = None,
+        value_states: Optional[torch.Tensor] = None
+    ):
+        k_cache, v_cache = self.k_cache, self.v_cache
+        key_scale, value_scale = None, None
+        if self.kv_cache_quant_mode == "float8":
+            ks_cache, vs_cache = self.ks_cache, self.vs_cache
+        if not k_cache.numel() or not v_cache.numel():
+            raise RuntimeError("A BUG: k_cache or v_cache are not initialized properly.")
+        
+        tmp_slot_mapping = slot_mapping.view(-1)
+        if self.kv_cache_quant_mode == "float8":
+            seq_len, num_heads, head_dim = key_states.shape
+            key_quant, key_scale = torch_npu.npu_dynamic_quant(key_states.view(seq_len, -1), 
+                                                            dst_type=torch.float8_e4m3fn, 
+                                                            quant_mode="pertoken")
+            value_quant, value_scale = torch_npu.npu_dynamic_quant(value_states.view(seq_len, -1), 
+                                                                dst_type=torch.float8_e4m3fn, 
+                                                                quant_mode="pertoken")
+            torch_npu.npu_scatter_nd_update_(
+                k_cache.view(-1, self.num_key_value_heads_per_rank, self.head_dim),
+                tmp_slot_mapping.view(-1, 1),
+                key_quant.view(seq_len, num_heads, head_dim),
+            )
+
+            torch_npu.npu_scatter_nd_update_(
+                v_cache.view(-1, self.num_key_value_heads_per_rank, self.head_dim),
+                tmp_slot_mapping.view(-1, 1),
+                value_quant.view(seq_len, num_heads, head_dim),
+            )
+
+            torch_npu.npu_scatter_nd_update_(
+                ks_cache.view(-1, 1, 1),
+                tmp_slot_mapping.view(-1, 1),
+                key_scale.view(seq_len, 1, 1),
+            )
+
+            torch_npu.npu_scatter_nd_update_(
+                vs_cache.view(-1, 1, 1),
+                tmp_slot_mapping.view(-1, 1),
+                value_scale.view(seq_len, 1, 1),
+            )
+            key_scale, value_scale = ks_cache, vs_cache
+        else:
+            torch_npu.npu_scatter_nd_update_(
+                k_cache.view(-1, self.num_key_value_heads_per_rank, self.head_dim),
+                tmp_slot_mapping.view(-1, 1),
+                key_states,
+            )
+
+            torch_npu.npu_scatter_nd_update_(
+                v_cache.view(-1, self.num_key_value_heads_per_rank, self.head_dim),
+                tmp_slot_mapping.view(-1, 1),
+                value_states,
+            )
+
+        key_states, value_states = k_cache, v_cache
+        return key_states, value_states, key_scale, value_scale
+    
     def exec_qkv(
         self,
         qkv: torch.Tensor,
@@ -489,7 +699,7 @@ class Qwen3MoeAttention(nn.Module):
         attention_mask = forward_metadata.attention_mask
         q_len = qkv.size(0)
         prompt_tokens = forward_metadata.prompt_tokens if forward_metadata else q_len
-
+        
         if is_prefill:
             padded_q_len = q_len
             if prompt_tokens < padded_q_len:
@@ -517,37 +727,38 @@ class Qwen3MoeAttention(nn.Module):
         )
 
         attention_mask = forward_metadata.attention_mask
-
-        k_cache, v_cache = self.k_cache, self.v_cache
-        if not k_cache.numel() or not v_cache.numel():
-            raise RuntimeError("A BUG: k_cache or v_cache are not initialized properly.")
-
         sparse_mode = 3
         fa_ops = torch.ops.npu
         if not forward_metadata.is_prefill and self.enable_gegraph:
             fa_ops = torchair.ops
-
-        tmp_slot_mapping = slot_mapping.view(-1)
-        torch_npu.npu_scatter_nd_update_(
-            k_cache.view(-1, self.num_key_value_heads_per_rank, self.head_dim),
-            tmp_slot_mapping.view(-1, 1),
-            key_states,
-        )
-        torch_npu.npu_scatter_nd_update_(
-            v_cache.view(-1, self.num_key_value_heads_per_rank, self.head_dim),
-            tmp_slot_mapping.view(-1, 1),
-            value_states,
-        )
-
-        key_states, value_states = k_cache, v_cache
         if not is_prefill and self.enable_npugraph_ex:
             actual_seq_kvlen = forward_metadata.actual_seq_lengths_list_kv
             actual_seq_qlen = forward_metadata.actual_seq_lengths_cu_list_q
         else:
-            actual_seq_kvlen = forward_metadata.actual_seq_lengths_kv
+            # Prefill uses cumulative mode
+            actual_seq_kvlen = forward_metadata.actual_seq_lengths_cu_kv if is_prefill  \
+                                else forward_metadata.actual_seq_lengths_kv
             actual_seq_qlen = forward_metadata.actual_seq_lengths_cu_q
 
-        attn_output, _ = fa_ops.npu_fused_infer_attention_score_v2(
+        if is_prefill:
+            attn_output, _ = fa_ops.npu_fused_infer_attention_score_v2(
+                query_states,
+                key_states,
+                value_states,
+                num_query_heads=self.num_heads_per_rank,
+                num_key_value_heads=self.num_key_value_heads_per_rank,
+                softmax_scale=self.scale_fa,
+                input_layout="TND",
+                sparse_mode=sparse_mode,
+                atten_mask=attention_mask,
+                actual_seq_qlen=actual_seq_qlen,
+                actual_seq_kvlen=actual_seq_kvlen,
+            )
+            self.kv_cache_update(slot_mapping, key_states, value_states)
+        else:
+            key_states, value_states, key_scale, value_scale = (
+                self.kv_cache_update(slot_mapping, key_states, value_states))
+            attn_output, _ = fa_ops.npu_fused_infer_attention_score_v2(
             query_states,
             key_states.view(*key_states.shape[:2], -1),
             value_states.view(*value_states.shape[:2], -1),
@@ -555,39 +766,95 @@ class Qwen3MoeAttention(nn.Module):
             num_key_value_heads=self.num_key_value_heads_per_rank,
             softmax_scale=self.scale_fa,
             input_layout="TND",
-            sparse_mode=sparse_mode,
-            atten_mask=attention_mask,
+            sparse_mode=0 if self.kv_cache_quant_mode == "float8" else sparse_mode,
+            atten_mask=None if self.kv_cache_quant_mode == "float8" else attention_mask,
             actual_seq_qlen=actual_seq_qlen,
             actual_seq_kvlen=actual_seq_kvlen,
             block_table=block_table,
             block_size=self.block_size,
+            dequant_scale_key=key_scale.squeeze() if self.kv_cache_quant_mode == "float8" else None,
+            dequant_scale_value=value_scale.squeeze() if self.kv_cache_quant_mode == "float8" else None,
+            key_quant_mode=4 if self.kv_cache_quant_mode == "float8" else 0,
+            value_quant_mode=4 if self.kv_cache_quant_mode == "float8" else 0
         )
-
         attn_output = attn_output.reshape(q_len, self.attn_intermediate_size_per_rank)
-        attn_output = self.o_proj(attn_output)
-        if is_prefill and q_len < padded_q_len:
-            pad_len = padded_q_len - q_len
-            attn_output = torch.cat([
-                attn_output,
-                torch.zeros(
-                    (pad_len, attn_output.size(-1)),
-                    dtype=attn_output.dtype,
-                    device=attn_output.device,
-                ),
-            ], dim=0)
-            q_len = padded_q_len
-        if self.attn_tp_size > 1 and self.attn_dp_size > 1:
-            token_count, h = attn_output.size()
-            new_output = torch.empty([token_count // self.attn_tp_size, h],
-                                     dtype=attn_output.dtype, device="npu")
-            dist.reduce_scatter_tensor(
-                new_output,
-                attn_output.view(token_count, h),
-                group=self.comm_manager.get_group("attn_tp_group"),
-            )
-            attn_output = new_output
-        elif self.attn_tp_size > 1:
-            dist.all_reduce(attn_output, group=self.comm_manager.get_group("attn_tp_group"))
+        if self.prefill_opt:
+            if is_prefill:
+                attn_output, attn_output_scale = torch_npu.npu_dynamic_mx_quant(attn_output, 
+                                                            dst_type=torch.float8_e4m3fn)
+                out_shape_dim_last = attn_output.shape[-1]
+                attn_tp_group = self.comm_manager.get_group("attn_tp_group")
+                tp_size = self.attn_tp_size
+                attn_output_in, attn_output_scale_in = attn_output, attn_output_scale
+                attn_output_dp = torch.empty_like(attn_output)
+                attn_scale_dp = torch.empty_like(attn_output_scale)
+                attn_output, attn_output_scale = attn_output_dp, attn_scale_dp
+                dist.all_to_all_single(attn_output, attn_output_in, group=attn_tp_group)
+                dist.all_to_all_single(attn_output_scale, attn_output_scale_in, group=attn_tp_group)
+                # transpose matmul
+                attn_output = attn_output.view(tp_size, -1, out_shape_dim_last)
+                if out_shape_dim_last % self.dynamic_mx_block != 0:
+                    raise ValueError(
+                        f"out_shape_dim_last {out_shape_dim_last} not divisible by "
+                        f"mx_block_size {self.dynamic_mx_block}"
+                    )
+                attn_output_scale = attn_output_scale.view(tp_size, -1, out_shape_dim_last // self.dynamic_mx_block, 2)
+                attn_output = attn_output.transpose(0, 1).contiguous() \
+                                            .view(-1, tp_size * out_shape_dim_last)
+                attn_output_scale = attn_output_scale.transpose(0, 1).contiguous() \
+                                            .view(-1, tp_size * (out_shape_dim_last // self.dynamic_mx_block), 2)
+                attn_output = self.o_proj(attn_output, dynamic_scale=attn_output_scale)
+                if q_len < padded_q_len:
+                    pad_len = padded_q_len - q_len
+                    attn_output = torch.cat([
+                        attn_output,
+                        torch.zeros(
+                            (pad_len, attn_output.size(-1)),
+                            dtype=attn_output.dtype,
+                            device=attn_output.device,
+                        ),
+                    ], dim=0)
+                    q_len = padded_q_len
+            else:
+                if self.attn_tp_size > 1:
+                    out_shape_dim_last = attn_output.shape[-1]
+                    tp_size = self.attn_tp_size
+                    attn_tp_group = self.comm_manager.get_group("attn_tp_group")
+
+                    gathered = torch.empty(
+                        [q_len * tp_size, out_shape_dim_last],
+                        dtype=attn_output.dtype, device=attn_output.device)
+                    dist.all_gather_into_tensor(gathered, attn_output, group=attn_tp_group)
+
+                    attn_output = gathered.view(tp_size, -1, out_shape_dim_last) \
+                        .transpose(0, 1).contiguous() \
+                        .view(-1, tp_size * out_shape_dim_last)
+                attn_output = self.o_proj(attn_output)
+        else:            
+            attn_output = self.o_proj(attn_output)
+            if is_prefill and q_len < padded_q_len:
+                pad_len = padded_q_len - q_len
+                attn_output = torch.cat([
+                    attn_output,
+                    torch.zeros(
+                        (pad_len, attn_output.size(-1)),
+                        dtype=attn_output.dtype,
+                        device=attn_output.device,
+                    ),
+                ], dim=0)
+                q_len = padded_q_len
+            if self.attn_tp_size > 1 and self.attn_dp_size > 1:
+                token_count, h = attn_output.size()
+                new_output = torch.empty([token_count // self.attn_tp_size, h],
+                                        dtype=attn_output.dtype, device="npu")
+                dist.reduce_scatter_tensor(
+                    new_output,
+                    attn_output.view(token_count, h),
+                    group=self.comm_manager.get_group("attn_tp_group"),
+                )
+                attn_output = new_output
+            elif self.attn_tp_size > 1:
+                dist.all_reduce(attn_output, group=self.comm_manager.get_group("attn_tp_group"))
 
         return attn_output
 
@@ -600,15 +867,35 @@ class Qwen3MoeAttention(nn.Module):
         block_table: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        hidden_states_scale = None
+        if len(hidden_states) == 2:
+            hidden_states, hidden_states_scale = hidden_states
+        else:
+            hidden_states = hidden_states[0]
+
         is_prefill = forward_metadata.is_prefill if forward_metadata else False
         q_len, h = hidden_states.size()
-        if self.attn_tp_size > 1 and self.attn_dp_size > 1:
+        
+        if self.prefill_opt and is_prefill:
+            h_dtype = hidden_states.dtype
+            s_dtype = hidden_states_scale.dtype
+            attn_tp_group = self.comm_manager.get_group("attn_tp_group")
+            new_hidden_states = torch.empty([q_len * self.attn_tp_size, h], dtype=h_dtype, device="npu")
+            new_scale = torch.empty(
+                [self.attn_tp_size * hidden_states_scale.shape[0], h // self.dynamic_mx_block, 2],
+                dtype=s_dtype, device="npu")
+            dist.all_gather_into_tensor(new_hidden_states, hidden_states, group=attn_tp_group)
+            dist.all_gather_into_tensor(new_scale, hidden_states_scale, group=attn_tp_group)
+            hidden_states = new_hidden_states
+            hidden_states_scale = new_scale
+        elif self.attn_tp_size > 1 and self.attn_dp_size > 1:
             h_dtype = hidden_states.dtype
             attn_tp_group = self.comm_manager.get_group("attn_tp_group")
             new_hidden_states = torch.empty([q_len * self.attn_tp_size, h], dtype=h_dtype, device="npu")
             dist.all_gather_into_tensor(new_hidden_states, hidden_states, group=attn_tp_group)
             hidden_states = new_hidden_states
-        qkv = self.merged_qkv_proj(hidden_states)
+        
+        qkv = self.merged_qkv_proj(hidden_states, dynamic_scale=hidden_states_scale)
         output = self.exec_qkv(
             qkv=qkv,
             cos_sin=cos_sin,
@@ -656,6 +943,8 @@ class Qwen3MoeDecoderLayer(nn.Module):
         )
         self.batch_size = infer_config.scheduler_config.batch_size
         self.input_len = infer_config.data_config.input_truncated_len
+        self.gmm_quant_mode = config.quant_config.gmm_quant_mode if config.quant_config is not None else "w16a16"
+        self.prefill_opt = (self.attn_tp_size == self.moe_ep_size and self.gmm_quant_mode == "w4a8mxfloat4")
 
     def forward(
         self,
@@ -667,9 +956,28 @@ class Qwen3MoeDecoderLayer(nn.Module):
         block_table: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Tuple[torch.FloatTensor]:
-
-        hidden_states, residual = self.input_layernorm(hidden_states, past_residual)
-
+        if self.prefill_opt:
+            if past_residual is not None:
+                hidden_states_mx, residual, hidden_states_scale, _ = (
+                    torch_npu.npu_add_rms_norm_dynamic_mx_quant(
+                        hidden_states, past_residual,
+                        self.input_layernorm.weight, beta=None,
+                        epsilon=self.input_layernorm.variance_epsilon,
+                        round_mode='rint',
+                        dst_type=torch.float8_e4m3fn))
+            else:
+                residual = hidden_states
+                hidden_states_mx, hidden_states_scale, _ = (
+                    torch_npu.npu_rms_norm_dynamic_mx_quant(
+                        hidden_states, self.input_layernorm.weight,
+                        beta=None,
+                        epsilon=self.input_layernorm.variance_epsilon,
+                        round_mode='rint',
+                        dst_type=torch.float8_e4m3fn))
+            hidden_states = (hidden_states_mx, hidden_states_scale)
+        else:
+            hidden_states, residual = self.input_layernorm(hidden_states, past_residual)
+            hidden_states = (hidden_states, )
         # Self Attention
         hidden_states = self.self_attn(
             hidden_states=hidden_states,
@@ -681,7 +989,13 @@ class Qwen3MoeDecoderLayer(nn.Module):
         )
 
         # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        if self.prefill_opt:
+            hidden_states_fp32, hidden_states_bf16, _, residual = torch_npu.npu_add_rms_norm_cast(
+                                hidden_states, residual, self.post_attention_layernorm.weight, 
+                                self.post_attention_layernorm.variance_epsilon)
+            hidden_states = (hidden_states_fp32, hidden_states_bf16)
+        else:
+            hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states, **kwargs)
         outputs = (residual, hidden_states)
         return outputs
@@ -705,6 +1019,7 @@ class Qwen3MoeModel(nn.Module):
         self.vocab_size = config.vocab_size
         self.vocab_size_per_rank = self.vocab_size // self.embed_tp_size
         self.comm_manager = comm_manager
+        self.moe_ep_size = infer_config.parallel_config.moe_ep_size
         self.attn_tp_size = infer_config.parallel_config.attn_tp_size
         self.attn_dp_size = infer_config.parallel_config.attn_dp_size
         self.embed_tokens = VocabParallelEmbedding(
@@ -722,6 +1037,8 @@ class Qwen3MoeModel(nn.Module):
         )
         self.norm = Qwen3MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen3MoeRotaryEmbedding(config=config, max_position_embeddings=self.max_position_embeddings)
+        self.gmm_quant_mode = config.quant_config.gmm_quant_mode if config.quant_config is not None else "w16a16"
+        self.prefill_opt = (self.attn_tp_size == self.moe_ep_size and self.gmm_quant_mode == "w4a8mxfloat4")
 
     def forward(
         self,
@@ -733,7 +1050,9 @@ class Qwen3MoeModel(nn.Module):
         is_prefill = forward_metadata.is_prefill if forward_metadata else False
         token_count = input_ids.shape[0]
         position_ids = position_ids.view(-1).long()
-        if self.attn_tp_size > 1 and self.attn_dp_size > 1:
+
+        prefill_sp = self.prefill_opt and is_prefill
+        if self.attn_tp_size > 1 and (self.attn_dp_size > 1 or prefill_sp):
             rank_in_tp_group = self.comm_manager.get_rank("attn_tp_group")
             if is_prefill:
                 prompt_tokens = forward_metadata.prompt_tokens
@@ -787,7 +1106,7 @@ class Qwen3MoeModel(nn.Module):
 
         if is_prefill:
             seq_index = cu_seq_lens_q - 1
-            if self.attn_tp_size > 1 and self.attn_dp_size > 1:
+            if self.attn_tp_size > 1:
                 q_len, hidden_size = hidden_states.size()
                 gathered_hidden_states = torch.empty(
                     [self.attn_tp_size * q_len, hidden_size],
@@ -812,6 +1131,8 @@ class Qwen3MoeModel(nn.Module):
 class Qwen3MoeForCausalLM(nn.Module):
     def __init__(self, config, infer_config: InferenceConfig, comm_manager: CommManager, prefix: str = ""):
         super().__init__()
+        if getattr(config, "quant_config", None) is None:
+            setattr(config, "quant_config", None)
         self.infer_config = infer_config
         self.comm_manager = comm_manager
         self.world_size = infer_config.parallel_config.world_size
@@ -838,6 +1159,11 @@ class Qwen3MoeForCausalLM(nn.Module):
             bias=False,
             tp_size=self.lmhead_tp_size,
             tp_rank=comm_manager.get_rank("lmhead_tp_group")
+            )
+        self.kv_cache_quant_mode = (
+                config.quant_config.kv_cache_quant_mode
+                if config.quant_config is not None
+                else "unquant"
             )
 
     def init_parallel_comm_group(self):
@@ -933,6 +1259,7 @@ class Qwen3MoeForCausalLM(nn.Module):
 
         return ModelCacheInfo(
             num_layers=len(layer_infos),
+            # block_size=self.infer_config.scheduler_config.block_size,
             layer_infos=layer_infos,
         )
 
@@ -1000,7 +1327,7 @@ class Qwen3MoeForCausalLM(nn.Module):
                     # Do not modify `name` since the loop may continue here
                     # Instead, create a new variable
                     name_mapped = name.replace(weight_name, param_name)
-
+  
                     # Skip loading extra parameters for GPTQ/modelopt models.
                     if name_mapped.endswith(".bias") and name_mapped not in params_dict:
                         continue
@@ -1045,9 +1372,16 @@ class Qwen3MoeForCausalLM(nn.Module):
         for module_name, module in self.named_modules():
             quant_method = getattr(module, "quant_method", None)
             if quant_method is not None:
-                quant_method.process_weights_after_loading(
-                    module, is_nz=self.infer_config.model_config.enable_weight_nz
-                )
+                if isinstance(quant_method, W4A8MxFp4MoEGMMMethod):
+                    quant_method.process_weights_after_loading(
+                        module,
+                        is_nz=self.infer_config.model_config.enable_weight_nz,
+                        exe_mode=self.infer_config.model_config.exe_mode,
+                    )
+                else:
+                    quant_method.process_weights_after_loading(
+                        module, is_nz=self.infer_config.model_config.enable_weight_nz
+                    )
                 if "gate" in module_name:
                     # Avoid GE graph performance degradation: make gate tensor contiguous after transpose.
                     module.weight.data = module.weight.data.contiguous()
