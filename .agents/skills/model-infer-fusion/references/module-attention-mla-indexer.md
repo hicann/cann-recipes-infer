@@ -1,6 +1,6 @@
 # Attention 层：MLA + Indexer 稀疏路径
 
-**参考模型**：`models/deepseek-v3.2-exp/`、`models/glm-5/`
+**参考模型**：`models/deepseek-v3.2-exp/`、`models/glm_5/`
 
 **核心特征**：在 MLA Absorb 基础上增加 Indexer（Top-K KV Block 选择），FA 替换为稀疏版本。**Prefill 和 Decode 共用 `forward_absorb` 路径**。
 

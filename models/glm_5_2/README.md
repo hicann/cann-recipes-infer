@@ -1,6 +1,6 @@
 # GLM-5.2 Inference on NPU
 ## 概述
-智谱团队发布了 GLM-5.2，本样例基于 [GLM-5](../glm-5) 样例适配迁移，并在 CANN 平台上完成对应的优化适配，可在华为 Atlas A3 集群上运行起来。
+智谱团队发布了 GLM-5.2，本样例基于 [GLM-5](../glm_5) 样例适配迁移，并在 CANN 平台上完成对应的优化适配，可在华为 Atlas A3 集群上运行起来。
 
 - GLM-5.2 模型结构沿用 GLM-5 / DeepSeek-V3.2-Exp 的 DSA（MLA + Lightning Indexer）+ MoE + MTP，本样例的并行策略方案沿用 DeepSeek-V3.2-Exp。详细方案请参考[NPU DeepSeek-V3.2-Exp推理优化实践](../../docs/models/deepseek-v3.2-exp/deepseek_v3.2_exp_inference_guide.md)。
 - **GLM-5.2 相对 GLM-5 的核心新增是 IndexShare（跨层 top-k 复用）**：按 `config.indexer_types` 每层取 `full`（本层运行 indexer）或 `shared`（复用上一个 full 层的 top-k，不持有 indexer 权重）。

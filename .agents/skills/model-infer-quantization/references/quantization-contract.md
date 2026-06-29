@@ -72,7 +72,7 @@
 9. forward 走 NPU 量化 kernel，例如动态 activation quant + `npu_quant_matmul`，或 MoE `npu_grouped_matmul`。
 
 > **接入形态（改造按框架模式实现）**：量化配置由 `executor/core/model_worker/model_worker.py` 调用 `module/quantization` 的 `get_quant_config` 读取并挂到 `hf_config.quant_config`；post-load 由其 `_process_weights_after_loading()` 触发 modeling 的 `process_weights_after_loading()`（步骤 1-2 / 8 的落点）。**新适配模型一律按此实现，不引入 per-model runner**（如 `qwen` / `longcat_flash_lite` / `deepseek_r1` / `qwen3_moe`）。
-> 注：部分早期模型（`glm-5` / `deepseek-v3.2-exp` / `longcat-flash` / `pangu-7b` / `kimi-k2-thinking` / `deepseek-v4`）用模型目录根的 `runner_*.py` 自己读 config + 调 post-load——读它们代码（含本卡代表路径）时会遇到，属历史实现、非新改造范式；仅当给这些已有模型补量化时才就地动其 runner。
+> 注：部分早期模型（`glm_5` / `deepseek-v3.2-exp` / `longcat-flash` / `pangu-7b` / `kimi-k2-thinking` / `deepseek-v4`）用模型目录根的 `runner_*.py` 自己读 config + 调 post-load——读它们代码（含本卡代表路径）时会遇到，属历史实现、非新改造范式；仅当给这些已有模型补量化时才就地动其 runner。
 
 能否接入的关键不是模型名，而是：结构里的量化对象能否映射到 §4 的 runtime object，产物契约（§1-§3）是否写清，post-load 是否能还原 runtime 需要的 layout。
 

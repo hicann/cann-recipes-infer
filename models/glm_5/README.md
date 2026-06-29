@@ -74,7 +74,7 @@
   在各个节点上通过如下命令进入容器：
   ```
   docker attach cann_recipes_infer
-  cd /home/code/cann-recipes-infer/models/glm-5
+  cd /home/code/cann-recipes-infer/models/glm_5
   ```
 
 ### 转换权重

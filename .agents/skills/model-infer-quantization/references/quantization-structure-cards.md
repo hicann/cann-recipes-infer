@@ -116,7 +116,7 @@ Skill 动作：
 
 #### 经验 B1：W8A8 用量化友好 SwigLU 链替代浮点 SwigLU
 
-代表路径：`models/deepseek-v3.2-exp/models/modeling_deepseek.py`、`models/glm-5/models/modeling_glm.py`、`models/kimi-k2-thinking/models/modeling_deepseek.py`、`models/longcat-flash/models/modeling_longcat_flash.py`、`models/longcat_flash_lite/models/modeling_longcat_flash_lite.py`
+代表路径：`models/deepseek-v3.2-exp/models/modeling_deepseek.py`、`models/glm_5/models/modeling_glm.py`、`models/kimi-k2-thinking/models/modeling_deepseek.py`、`models/longcat-flash/models/modeling_longcat_flash.py`、`models/longcat_flash_lite/models/modeling_longcat_flash_lite.py`
 
 - W8A8 下，`gate_up_proj` 常以 `out_dtype=torch.int32` 输出累加结果和 per-token scale。
 - 原浮点链路 `gate_up -> npu_swiglu -> down_proj` 需要替换为 `npu_dequant_swiglu_quant`，同时消费 `gate_up_proj.weight_scale`、`down_proj.smooth_scales` 和上一段 matmul 的 `pertoken_scale`。
@@ -132,7 +132,7 @@ Skill 动作：
 
 #### 经验 B2：A8 scale 是路由/通信/专家计算的 side channel
 
-代表路径：`models/deepseek_r1/models/modeling_deepseek.py`、`models/deepseek-v3.2-exp/models/modeling_deepseek.py`、`models/glm-5/models/modeling_glm.py`、`models/kimi-k2-thinking/models/modeling_deepseek.py`、`models/longcat-flash/models/modeling_longcat_flash.py`、`models/longcat_flash_lite/models/modeling_longcat_flash_lite.py`
+代表路径：`models/deepseek_r1/models/modeling_deepseek.py`、`models/deepseek-v3.2-exp/models/modeling_deepseek.py`、`models/glm_5/models/modeling_glm.py`、`models/kimi-k2-thinking/models/modeling_deepseek.py`、`models/longcat-flash/models/modeling_longcat_flash.py`、`models/longcat_flash_lite/models/modeling_longcat_flash_lite.py`
 
 - MoE A8 不只是 expert 内部 `FusedMoEGMM` 量化；routing / dispatch / combine 是否携带 activation scale 也是适配核心。
 - EP 路线至少有两条合法实现：一条是在 `npu_moe_init_routing_v2` / `npu_moe_distribute_dispatch_v2` 上显式走 A8 scale side channel；另一条是 dispatch / all-to-all 保持 BF16，在 `npu_moe_re_routing` 或 `dispatch_v2` 之后按 rank 本地 `npu_dynamic_quant`，再把 `pertoken_scale` 传给 experts。
@@ -189,7 +189,7 @@ Skill 动作：
 
 #### 经验 C1：MLA/KVCache C8 的量化边界由 prolog、cache 和 FA 共同定义
 
-代表路径：`models/deepseek_r1/models/modeling_deepseek.py`、`models/deepseek-v3.2-exp/models/modeling_deepseek.py`、`models/glm-5/models/modeling_glm.py`、`models/kimi-k2-thinking/models/modeling_deepseek.py`
+代表路径：`models/deepseek_r1/models/modeling_deepseek.py`、`models/deepseek-v3.2-exp/models/modeling_deepseek.py`、`models/glm_5/models/modeling_glm.py`、`models/kimi-k2-thinking/models/modeling_deepseek.py`
 
 - C8 不是简单把 KV cache dtype 改成 int8。模型侧需要同时处理 `npu_mla_prolog_v3`、cache layout、query scale、cache scale 和后续 attention kernel。
 - DeepSeek-R1 路线会在进入 MLA prolog 前对 hidden states 做动态量化，并通过 `weight_quant_mode=2`、`kv_cache_quant_mode=1`、`query_quant_mode=1` 让 prolog 处理 W8A8C8。
@@ -206,7 +206,7 @@ Skill 动作：
 
 #### 经验 C2：Indexer / LI cache C8 有独立量化闭环
 
-代表路径：`models/deepseek-v3.2-exp/models/indexer.py`、`models/glm-5/models/indexer.py`
+代表路径：`models/deepseek-v3.2-exp/models/indexer.py`、`models/glm_5/models/indexer.py`
 
 - Indexer 侧通常不是普通 attention 量化，而是独立的 LI cache / sparse indexer 量化闭环。
 - q/k 在进入 lightning indexer 前会先做 Hadamard transform，再动态量化，生成 `query_dequant_scale` 和 `key_dequant_scale`。
@@ -225,7 +225,7 @@ Skill 动作：
 
 ## post-load 例外汇总
 
-代表路径：模型 ForCausalLM 的 `process_weights_after_loading` 方法（如 `models/qwen3_moe/models/modeling_qwen3_moe.py`、`models/deepseek_r1/models/modeling_deepseek.py`），post-load 调用点：框架模型在 `executor/core/model_worker/model_worker.py::_process_weights_after_loading` 触发；早期 runner 模型（如 glm-5 / deepseek-v3.2-exp）在其 `runner_*.py` 内调用（见 contract §5）。
+代表路径：模型 ForCausalLM 的 `process_weights_after_loading` 方法（如 `models/qwen3_moe/models/modeling_qwen3_moe.py`、`models/deepseek_r1/models/modeling_deepseek.py`），post-load 调用点：框架模型在 `executor/core/model_worker/model_worker.py::_process_weights_after_loading` 触发；早期 runner 模型（如 glm_5 / deepseek-v3.2-exp）在其 `runner_*.py` 内调用（见 contract §5）。
 
 同一套公共量化方法在不同模型中，post-load 参数不一定相同。常见差异：
 
