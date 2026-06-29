@@ -1,0 +1,732 @@
+diff --git a/kt-kernel/CMakeLists.txt b/kt-kernel/CMakeLists.txt
+index fb5ca3b..885b129 100644
+--- a/kt-kernel/CMakeLists.txt
++++ b/kt-kernel/CMakeLists.txt
+@@ -16,7 +16,16 @@ option(LLAMA_AVX512_FANCY_SIMD "llama: enable AVX512-VL, AVX512-BW, AVX512-DQ, A
+ option(KTRANSFORMERS_USE_CUDA "ktransformers: use CUDA" OFF)
+ option(KTRANSFORMERS_USE_MUSA "ktransformers: use MUSA" OFF)
+ option(KTRANSFORMERS_USE_ROCM "ktransformers: use ROCM" OFF)
++option(KTRANSFORMERS_USE_ASCEND_NPU "ktransformers: use Ascend NPU (CANN)" OFF)
+ option(KTRANSFORMERS_CUDA_STATIC_RUNTIME "ktransformers: statically link CUDA runtime" ON)
++# ARM aarch64 feature toggles. Older Kunpeng (920) and Cortex-A76 = armv8.2-a + dotprod + fp16 only.
++# Newer Kunpeng (930+) / Neoverse-V1+ add SVE/BF16/I8MM. Keep OFF by default to stay
++# compatible with the widest hardware; the Python setup.py auto-detects /proc/cpuinfo.
++option(LLAMA_ARM_DOTPROD "llama: enable ARM NEON SDOT/UDOT (asimddp, armv8.2+)" ON)
++option(LLAMA_ARM_FP16    "llama: enable ARM NEON fp16 vector arithmetic"        ON)
++option(LLAMA_ARM_SVE     "llama: enable ARM SVE (Kunpeng 930+, Neoverse V1+)"   OFF)
++option(LLAMA_ARM_BF16    "llama: enable ARM BF16 matmul"                        OFF)
++option(LLAMA_ARM_I8MM    "llama: enable ARM SMMLA/UMMLA (Neoverse N2/V1+)"      OFF)
+ option(KTRANSFORMERS_CPU_USE_KML "ktransformers: CPU use KML" OFF)
+ option(KTRANSFORMERS_CPU_USE_AMX_AVX512 "ktransformers: CPU use AMX or AVX512" OFF)
+ option(KTRANSFORMERS_CPU_USE_AMX "ktransformers: CPU use AMX" OFF)
+@@ -196,18 +205,26 @@ if(CMAKE_OSX_ARCHITECTURES STREQUAL "arm64" OR CMAKE_GENERATOR_PLATFORM_LWR STRE
+             # Raspberry Pi 3, 4, Zero 2 (32-bit)
+             list(APPEND ARCH_FLAGS -mno-unaligned-access)
+         endif()
+-        # add_compile_definitions(__ARM_NEON)
+-        # list(APPEND ARCH_FLAGS -march=armv8.2-a+fp16+dotprod)
+-        # add_compile_definitions(__ARM_FEATURE_DOTPROD)
+-        # add_compile_definitions(__aarch64__)
+-
+-        # add_compile_definitions(__ARM_NEON)
+-        list(APPEND ARCH_FLAGS -march=armv8.2-a+fp16+dotprod+sve+bf16)
+-        # list(APPEND ARCH_FLAGS -march=armv8-a+dotprod+sha3+sm4+fp16fml+sve+rng+sb+ssbs+i8mm+bf16+flagm+pauth)
+-        # add_compile_definitions(__ARM_FEATURE_DOTPROD)
+-        # add_compile_definitions(__ARM_FEATURE_SVE)
+-        # add_compile_definitions(__ARM_FEATURE_MATMUL_INT8)
+-        # add_compile_definitions(__aarch64__)
++        # ARM extensions are selected dynamically. K920 / Cortex-A76 = armv8.2-a + fp16 + dotprod
++        # (NEON only). K930+ / Neoverse-V1+ add SVE/BF16/I8MM. Toggle via -DLLAMA_ARM_SVE=ON etc.
++        set(_kt_arm_arch "armv8.2-a")
++        if(LLAMA_ARM_FP16)
++            set(_kt_arm_arch "${_kt_arm_arch}+fp16")
++        endif()
++        if(LLAMA_ARM_DOTPROD)
++            set(_kt_arm_arch "${_kt_arm_arch}+dotprod")
++        endif()
++        if(LLAMA_ARM_SVE)
++            set(_kt_arm_arch "${_kt_arm_arch}+sve")
++        endif()
++        if(LLAMA_ARM_BF16)
++            set(_kt_arm_arch "${_kt_arm_arch}+bf16")
++        endif()
++        if(LLAMA_ARM_I8MM)
++            set(_kt_arm_arch "${_kt_arm_arch}+i8mm")
++        endif()
++        list(APPEND ARCH_FLAGS "-march=${_kt_arm_arch}")
++        message(STATUS "ARM target: -march=${_kt_arm_arch}")
+     endif()
+ elseif(CMAKE_OSX_ARCHITECTURES STREQUAL "x86_64" OR CMAKE_GENERATOR_PLATFORM_LWR MATCHES "^(x86_64|i686|amd64|x64|win32)$" OR
+     (NOT CMAKE_OSX_ARCHITECTURES AND NOT CMAKE_GENERATOR_PLATFORM_LWR AND
+@@ -458,6 +475,29 @@ elseif(KTRANSFORMERS_USE_MUSA)
+         message(STATUS "MUSA Toolkit found")
+         add_compile_definitions(KTRANSFORMERS_USE_MUSA=1)
+     endif()
++elseif(KTRANSFORMERS_USE_ASCEND_NPU)
++    message(STATUS "Ascend NPU (CANN) backend selected")
++    add_compile_definitions(KTRANSFORMERS_USE_ASCEND_NPU=1)
++    # Legacy switch name used by cpu_backend/vendors/vendor.h
++    add_compile_definitions(USE_ASCEND_NPU=1)
++    # Locate CANN: $ASCEND_TOOLKIT_HOME -> $CANN_HOME -> /usr/local/Ascend/ascend-toolkit/latest
++    if(DEFINED ENV{ASCEND_TOOLKIT_HOME})
++        set(_kt_cann_root "$ENV{ASCEND_TOOLKIT_HOME}")
++    elseif(DEFINED ENV{CANN_HOME})
++        set(_kt_cann_root "$ENV{CANN_HOME}")
++    else()
++        set(_kt_cann_root "/usr/local/Ascend/ascend-toolkit/latest")
++    endif()
++    message(STATUS "CANN root: ${_kt_cann_root}")
++    find_path(ACL_INCLUDE_DIR acl/acl_rt.h
++        HINTS "${_kt_cann_root}/include"
++        REQUIRED)
++    find_library(ASCEND_CL_LIBRARY NAMES ascendcl
++        HINTS "${_kt_cann_root}/lib64" "${_kt_cann_root}/runtime/lib64"
++        REQUIRED)
++    message(STATUS "Ascend CL include: ${ACL_INCLUDE_DIR}")
++    message(STATUS "Ascend CL library: ${ASCEND_CL_LIBRARY}")
++    include_directories(${ACL_INCLUDE_DIR})
+ elseif(KTRANSFORMERS_CPU_USE_KML)
+     message(STATUS "KML CPU detected")
+ else()
+@@ -642,6 +682,10 @@ if(NOT HOST_IS_X86 AND KTRANSFORMERS_CPU_USE_KML)
+     target_compile_definitions(${PROJECT_NAME} PRIVATE CPU_USE_KML)
+ endif()
+ target_link_libraries(${PROJECT_NAME} PRIVATE llama PkgConfig::HWLOC OpenMP::OpenMP_CXX)
++if(KTRANSFORMERS_USE_ASCEND_NPU AND ASCEND_CL_LIBRARY)
++    target_link_libraries(${PROJECT_NAME} PRIVATE ${ASCEND_CL_LIBRARY})
++    target_include_directories(${PROJECT_NAME} PRIVATE ${ACL_INCLUDE_DIR})
++endif()
+ if(NOT HOST_IS_X86 AND KTRANSFORMERS_CPU_USE_KML)
+     if(KTRANSFORMERS_CPU_DEBUG)
+         # add_executable(convert-test ${CMAKE_CURRENT_SOURCE_DIR}/operators/kml/convert-test.cpp)
+diff --git a/kt-kernel/cpu_backend/ascend_callback_worker.cpp b/kt-kernel/cpu_backend/ascend_callback_worker.cpp
+new file mode 100644
+index 0000000..0b9eb15
+--- /dev/null
++++ b/kt-kernel/cpu_backend/ascend_callback_worker.cpp
+@@ -0,0 +1,155 @@
++#if defined(KTRANSFORMERS_USE_ASCEND_NPU)
++
++#include "ascend_callback_worker.h"
++
++#include <atomic>
++#include <cstdio>
++#include <mutex>
++#include <set>
++#include <thread>
++#include <vector>
++
++namespace kt::ascend {
++
++namespace {
++
++constexpr int kProcessReportTimeoutMs = 100;
++
++std::mutex g_mu;
++std::set<aclrtStream> g_subscribed_streams;
++aclrtContext g_context = nullptr;
++std::thread g_worker;
++std::atomic<bool> g_stop{false};
++std::atomic<bool> g_started{false};
++// Set by the worker thread once it has installed the ACL context and is about to
++// enter the aclrtProcessReport loop. start_worker_locked waits on this before
++// subscribing any stream, so a report can never be dispatched to a thread that
++// has not yet set its context (the latent start race).
++std::atomic<bool> g_worker_ready{false};
++uint64_t g_worker_thread_id = 0;
++
++void worker_main(aclrtContext ctx) {
++  if (ctx != nullptr) {
++    aclError err = aclrtSetCurrentContext(ctx);
++    if (err != ACL_SUCCESS) {
++      std::fprintf(stderr,
++                   "[kt-kernel] ascend_callback_worker: aclrtSetCurrentContext failed (%d)\n",
++                   static_cast<int>(err));
++    }
++  }
++  g_worker_ready.store(true, std::memory_order_release);
++
++  while (!g_stop.load(std::memory_order_acquire)) {
++    (void)aclrtProcessReport(kProcessReportTimeoutMs);
++  }
++
++  // Drain any reports already queued so no pending callback is dropped on exit.
++  (void)aclrtProcessReport(kProcessReportTimeoutMs);
++
++  // Unsubscribe from this (the subscribed) thread while it is still alive.
++  // Doing it after join() in shutdown would target a dead thread id and be a
++  // no-op. shutdown holds g_mu and is blocked in join() here, so g_subscribed_streams
++  // is not being mutated concurrently and can be read without the lock.
++  for (aclrtStream stream : g_subscribed_streams) {
++    (void)aclrtUnSubscribeReport(g_worker_thread_id, stream);
++  }
++}
++
++void start_worker_locked(aclrtContext ctx) {
++  if (g_started.load(std::memory_order_acquire)) {
++    return;
++  }
++  g_context = ctx;
++  g_stop.store(false, std::memory_order_release);
++  g_worker_ready.store(false, std::memory_order_release);
++  g_worker = std::thread([ctx]() { worker_main(ctx); });
++  g_worker_thread_id = static_cast<uint64_t>(g_worker.native_handle());
++  g_started.store(true, std::memory_order_release);
++
++  // Wait until the worker has set its ACL context and is ready to process
++  // reports before subscribing any stream (start readiness barrier).
++  while (!g_worker_ready.load(std::memory_order_acquire)) {
++    std::this_thread::yield();
++  }
++
++  for (aclrtStream stream : g_subscribed_streams) {
++    aclError err = aclrtSubscribeReport(g_worker_thread_id, stream);
++    if (err != ACL_SUCCESS) {
++      std::fprintf(stderr,
++                   "[kt-kernel] ascend_callback_worker: aclrtSubscribeReport failed (%d)\n",
++                   static_cast<int>(err));
++    }
++  }
++}
++
++void subscribe_stream_locked(aclrtStream stream) {
++  if (stream == nullptr) {
++    return;
++  }
++  if (g_subscribed_streams.count(stream) != 0) {
++    return;
++  }
++  g_subscribed_streams.insert(stream);
++  if (g_started.load(std::memory_order_acquire)) {
++    aclError err = aclrtSubscribeReport(g_worker_thread_id, stream);
++    if (err != ACL_SUCCESS) {
++      std::fprintf(stderr,
++                   "[kt-kernel] ascend_callback_worker: aclrtSubscribeReport failed (%d)\n",
++                   static_cast<int>(err));
++    }
++  }
++}
++
++}  // namespace
++
++void ensure_callback_worker(aclrtContext ctx) {
++  std::lock_guard<std::mutex> lock(g_mu);
++  if (g_started.load(std::memory_order_acquire)) {
++    return;
++  }
++  aclrtContext use_ctx = ctx;
++  if (use_ctx == nullptr) {
++    aclError err = aclrtGetCurrentContext(&use_ctx);
++    if (err != ACL_SUCCESS || use_ctx == nullptr) {
++      std::fprintf(stderr,
++                   "[kt-kernel] ascend_callback_worker: no ACL context; call after torch.npu init\n");
++      return;
++    }
++  }
++  start_worker_locked(use_ctx);
++}
++
++void ensure_stream_subscribed(aclrtStream stream) {
++  std::lock_guard<std::mutex> lock(g_mu);
++  if (!g_started.load(std::memory_order_acquire)) {
++    aclrtContext ctx = nullptr;
++    (void)aclrtGetCurrentContext(&ctx);
++    start_worker_locked(ctx);
++  }
++  subscribe_stream_locked(stream);
++}
++
++void shutdown_callback_worker() {
++  std::lock_guard<std::mutex> lock(g_mu);
++  if (!g_started.load(std::memory_order_acquire)) {
++    return;
++  }
++  // The worker drains pending reports and unsubscribes itself before exiting
++  // (see worker_main), so here we only signal stop and join.
++  g_stop.store(true, std::memory_order_release);
++  if (g_worker.joinable()) {
++    g_worker.join();
++  }
++  g_subscribed_streams.clear();
++  g_started.store(false, std::memory_order_release);
++  g_worker_ready.store(false, std::memory_order_release);
++  g_worker_thread_id = 0;
++}
++
++bool callback_worker_running() {
++  return g_started.load(std::memory_order_acquire) && g_worker_ready.load(std::memory_order_acquire);
++}
++
++}  // namespace kt::ascend
++
++#endif  // KTRANSFORMERS_USE_ASCEND_NPU
+diff --git a/kt-kernel/cpu_backend/ascend_callback_worker.h b/kt-kernel/cpu_backend/ascend_callback_worker.h
+new file mode 100644
+index 0000000..765be53
+--- /dev/null
++++ b/kt-kernel/cpu_backend/ascend_callback_worker.h
+@@ -0,0 +1,34 @@
++#pragma once
++
++// Ascend ACL stream callback subscriber for kt-kernel.
++//
++// CANN dispatches aclrtLaunchCallback tasks only on a host thread that has called
++// aclrtSubscribeReport(threadId, stream) and is running aclrtProcessReport() in a
++// loop.  This worker mirrors torch_npu's pattern (see NPUGraph.cpp / Graph.cpp).
++
++#if defined(KTRANSFORMERS_USE_ASCEND_NPU)
++
++#include <acl/acl_rt.h>
++
++#include <cstdint>
++
++namespace kt::ascend {
++
++// Start the global callback worker (idempotent).  Call after ACL/torch.npu init.
++// If ctx is null, uses aclrtGetCurrentContext().
++void ensure_callback_worker(aclrtContext ctx = nullptr);
++
++// Register ``stream`` with the worker so enqueued callbacks are dispatched.
++void ensure_stream_subscribed(aclrtStream stream);
++
++// Optional shutdown (process exit).
++void shutdown_callback_worker();
++
++// True iff the worker thread is started and ready to process reports. Used by
++// the Python side to decide whether the async submit_with_cuda_stream path is
++// safe, or whether it must fall back to synchronous submit/sync.
++bool callback_worker_running();
++
++}  // namespace kt::ascend
++
++#endif  // KTRANSFORMERS_USE_ASCEND_NPU
+diff --git a/kt-kernel/cpu_backend/cpuinfer.h b/kt-kernel/cpu_backend/cpuinfer.h
+index 5c3210a..c5d7a42 100644
+--- a/kt-kernel/cpu_backend/cpuinfer.h
++++ b/kt-kernel/cpu_backend/cpuinfer.h
+@@ -24,6 +24,8 @@
+ #elif KTRANSFORMERS_USE_ROCM
+ #define __HIP_PLATFORM_AMD__
+ #include "vendors/hip.h"
++#elif KTRANSFORMERS_USE_ASCEND_NPU
++#include "vendors/ascend_npu.h"
+ #endif
+ 
+ #include "./vendors/vendor.h"
+@@ -83,7 +85,7 @@ class CPUInfer {
+   }
+ #ifndef KTRANSFORMERS_CPU_ONLY
+   void submit_with_cuda_stream(intptr_t user_cuda_stream, std::pair<intptr_t, intptr_t> params) {
+-#if defined(KTRANSFORMERS_USE_CUDA)
++#if defined(KTRANSFORMERS_USE_CUDA) || defined(KTRANSFORMERS_USE_ASCEND_NPU)
+     void (*func)(void*) = (void (*)(void*))params.first;
+     void* args = (void*)params.second;
+     *((CPUInfer**)args) = this;
+@@ -108,7 +110,7 @@ class CPUInfer {
+   }
+ #ifndef KTRANSFORMERS_CPU_ONLY
+   void sync_with_cuda_stream(intptr_t user_cuda_stream, size_t allow_n_pending = 0) {
+-#if defined(KTRANSFORMERS_USE_CUDA)
++#if defined(KTRANSFORMERS_USE_CUDA) || defined(KTRANSFORMERS_USE_ASCEND_NPU)
+     SyncArgs* args = new SyncArgs{this, allow_n_pending};
+     cudaLaunchHostFunc((cudaStream_t)user_cuda_stream, (cudaHostFn_t)&sync_, (void*)args);
+ #endif
+diff --git a/kt-kernel/cpu_backend/vendors/ascend_npu.h b/kt-kernel/cpu_backend/vendors/ascend_npu.h
+new file mode 100644
+index 0000000..8361de2
+--- /dev/null
++++ b/kt-kernel/cpu_backend/vendors/ascend_npu.h
+@@ -0,0 +1,63 @@
++#pragma once
++
++// ============================================================================
++// Ascend NPU vendor adapter for cpu_backend.
++//
++// Provides CUDA-shaped wrappers around CANN aclrt* runtime APIs so the rest of
++// cpu_backend (cpuinfer.h, ext_bindings.cpp etc.) can keep using cudaStream_t /
++// cudaHostFn_t / cudaLaunchHostFunc names. Mirrors the pattern used by
++// vendors/hip.h and vendors/musa.h.
++//
++// IMPORTANT semantic difference from CUDA:
++//   * aclrtLaunchCallback() inserts a callback into the stream's report queue.
++//     The callback is dispatched by a dedicated host "callback thread" which
++//     must (a) have been registered with aclrtSubscribeReport(threadId, stream)
++//     and (b) be continuously calling aclrtProcessReport(timeout) in a loop.
++//   * If no such subscriber thread exists, queued callbacks NEVER fire and any
++//     code waiting on the callback (e.g. CPUInfer::sync_with_cuda_stream) will
++//     hang forever.
++//   * The submit_with_cuda_stream / sync_with_cuda_stream path therefore
++//     requires the host process to also spin up a callback worker (see
++//     cpu_backend/ascend_callback_worker.cpp). The synchronous CPUInfer::submit()
++//     / sync() path works without it
++//     and is what the initial integration used.
++// ============================================================================
++
++#include <acl/acl_base.h>
++#include <acl/acl_rt.h>
++
++#include <cstdint>
++
++#if defined(KTRANSFORMERS_USE_ASCEND_NPU)
++#include "../ascend_callback_worker.h"
++#endif
++
++// ---- types -----------------------------------------------------------------
++using cudaStream_t = aclrtStream;
++using cudaError_t  = aclError;
++using cudaHostFn_t = aclrtCallback;  // both are void (*)(void *)
++
++// ACL_SUCCESS is `static const int = 0;` in acl_base_rt.h. Re-expose with the
++// CUDA name. Using an inline constexpr avoids ODR issues across TUs.
++inline constexpr cudaError_t cudaSuccess = ACL_SUCCESS;
++
++// ---- callbacks -------------------------------------------------------------
++// CUDA:  cudaLaunchHostFunc(stream, fn, userData)
++// ACL :  aclrtLaunchCallback(fn, userData, blockType, stream)
++//
++// We pick ACL_CALLBACK_NO_BLOCK to match CUDA's fire-and-forget enqueue
++// semantics. (ACL_CALLBACK_BLOCK can block the host if the device queue
++// is full.) See header note above re: the required subscriber thread.
++static inline cudaError_t cudaLaunchHostFunc(cudaStream_t stream, cudaHostFn_t fn, void* userData) {
++#if defined(KTRANSFORMERS_USE_ASCEND_NPU)
++  kt::ascend::ensure_stream_subscribed(stream);
++#endif
++  return aclrtLaunchCallback(fn, userData, ACL_CALLBACK_NO_BLOCK, stream);
++}
++
++// ---- error reporting -------------------------------------------------------
++// CUDA gives a static string per error code; ACL only exposes the *most recent*
++// error message on the current thread. Best-effort emulation.
++static inline const char* cudaGetErrorString(cudaError_t /*err*/) {
++  return "ACL error";
++}
+diff --git a/kt-kernel/cpu_backend/vendors/vendor.h b/kt-kernel/cpu_backend/vendors/vendor.h
+index 8470438..796bcc2 100644
+--- a/kt-kernel/cpu_backend/vendors/vendor.h
++++ b/kt-kernel/cpu_backend/vendors/vendor.h
+@@ -8,6 +8,8 @@
+ #include "hip.h"
+ #elif USE_MUSA
+ #include "musa.h"
++#elif USE_ASCEND_NPU
++#include "ascend_npu.h"
+ #endif
+ 
+ #endif  // CPUINFER_VENDOR_VENDOR_H
+\ No newline at end of file
+diff --git a/kt-kernel/ext_bindings.cpp b/kt-kernel/ext_bindings.cpp
+index f22207f..e77f81a 100644
+--- a/kt-kernel/ext_bindings.cpp
++++ b/kt-kernel/ext_bindings.cpp
+@@ -21,6 +21,9 @@
+ 
+ #include "cpu_backend/cpuinfer.h"
+ #include "cpu_backend/worker_pool.h"
++#if defined(KTRANSFORMERS_USE_ASCEND_NPU)
++#include "cpu_backend/ascend_callback_worker.h"
++#endif
+ #include "operators/common.hpp"
+ 
+ #if defined(USE_MOE_KERNEL)
+@@ -477,6 +480,23 @@ void bind_moe_module(py::module_& moe_module, const char* name) {
+ }
+ 
+ PYBIND11_MODULE(kt_kernel_ext, m) {
++#if defined(KTRANSFORMERS_USE_ASCEND_NPU)
++  m.def(
++      "init_ascend_callback_worker",
++      []() { kt::ascend::ensure_callback_worker(nullptr); },
++      "Start ACL aclrtProcessReport worker for stream callbacks (Ascend NPU).");
++  m.def(
++      "subscribe_ascend_stream",
++      [](intptr_t stream_handle) {
++        kt::ascend::ensure_stream_subscribed(reinterpret_cast<aclrtStream>(stream_handle));
++      },
++      py::arg("stream_handle"),
++      "Subscribe an aclrtStream with the global callback worker.");
++  m.def("shutdown_ascend_callback_worker", &kt::ascend::shutdown_callback_worker,
++        "Stop the ACL callback worker thread.");
++  m.def("is_ascend_callback_worker_running", &kt::ascend::callback_worker_running,
++        "True iff the ACL callback worker is started and ready to process reports.");
++#endif
+   py::class_<WorkerPool>(m, "WorkerPool").def(py::init<int>());
+   py::class_<WorkerPoolConfig>(m, "WorkerPoolConfig")
+       .def(py::init<>())
+diff --git a/kt-kernel/install.sh b/kt-kernel/install.sh
+index 06a7d8c..4503527 100755
+--- a/kt-kernel/install.sh
++++ b/kt-kernel/install.sh
+@@ -146,6 +146,33 @@ install_dependencies() {
+   esac
+ }
+ 
++# Function to detect ARM (aarch64) features from /proc/cpuinfo "Features:" line.
++# Returns: "has_dotprod has_fp16 has_sve has_bf16 has_i8mm" (space-separated 0/1 values).
++detect_arm_features() {
++  local has_dotprod=0 has_fp16=0 has_sve=0 has_bf16=0 has_i8mm=0
++  if [ -f /proc/cpuinfo ]; then
++    local feats
++    feats=$(grep -m1 -E "^Features\s*:" /proc/cpuinfo | tr ' ' '\n')
++    echo "$feats" | grep -qE "^asimddp$" && has_dotprod=1
++    echo "$feats" | grep -qE "^(asimdhp|fphp)$" && has_fp16=1
++    echo "$feats" | grep -qE "^sve$" && has_sve=1
++    echo "$feats" | grep -qE "^bf16$" && has_bf16=1
++    echo "$feats" | grep -qE "^i8mm$" && has_i8mm=1
++  fi
++  echo "$has_dotprod $has_fp16 $has_sve $has_bf16 $has_i8mm"
++}
++
++# Detect Ascend CANN install. Echoes the toolkit root if found, else empty.
++detect_cann_root() {
++  for cand in "${ASCEND_TOOLKIT_HOME:-}" "${CANN_HOME:-}" "/usr/local/Ascend/ascend-toolkit/latest"; do
++    if [ -n "$cand" ] && [ -f "$cand/include/acl/acl_rt.h" ]; then
++      echo "$cand"
++      return 0
++    fi
++  done
++  echo ""
++}
++
+ # Function to detect CPU features
+ # Returns: "has_amx has_avx512f has_avx512_vnni has_avx512_bf16 has_avx512_vbmi" (space-separated 0/1 values)
+ detect_cpu_features() {
+@@ -227,6 +254,59 @@ build_step() {
+   echo "=========================================="
+   echo ""
+ 
++  HOST_ARCH="$(uname -m)"
++  echo "Host arch: $HOST_ARCH"
++
++  if [ "$HOST_ARCH" = "aarch64" ] || [ "$HOST_ARCH" = "arm64" ]; then
++    # ARM (aarch64) auto-detect path: Kunpeng / Neoverse / Apple Silicon.
++    # Returns "dotprod fp16 sve bf16 i8mm"
++    ARM_FEATURES=$(detect_arm_features)
++    HAS_DOTPROD=$(echo "$ARM_FEATURES" | cut -d' ' -f1)
++    HAS_FP16=$(echo "$ARM_FEATURES"   | cut -d' ' -f2)
++    HAS_SVE=$(echo "$ARM_FEATURES"    | cut -d' ' -f3)
++    HAS_BF16=$(echo "$ARM_FEATURES"   | cut -d' ' -f4)
++    HAS_I8MM=$(echo "$ARM_FEATURES"   | cut -d' ' -f5)
++
++    echo "ARM features: DOTPROD=$HAS_DOTPROD FP16=$HAS_FP16 SVE=$HAS_SVE BF16=$HAS_BF16 I8MM=$HAS_I8MM"
++
++    export CPUINFER_CPU_INSTRUCT=NATIVE
++    export CPUINFER_ENABLE_AMX=OFF
++    [ "$HAS_DOTPROD" = "1" ] && export CPUINFER_ARM_DOTPROD=ON || export CPUINFER_ARM_DOTPROD=OFF
++    [ "$HAS_FP16" = "1" ]    && export CPUINFER_ARM_FP16=ON    || export CPUINFER_ARM_FP16=OFF
++    [ "$HAS_SVE" = "1" ]     && export CPUINFER_ARM_SVE=ON     || export CPUINFER_ARM_SVE=OFF
++    [ "$HAS_BF16" = "1" ]    && export CPUINFER_ARM_BF16=ON    || export CPUINFER_ARM_BF16=OFF
++    [ "$HAS_I8MM" = "1" ]    && export CPUINFER_ARM_I8MM=ON    || export CPUINFER_ARM_I8MM=OFF
++
++    # CANN auto-detection. If found, enable Ascend NPU backend; otherwise
++    # build pure CPU and rely on the LLAMA_MOE_TP / llamafile NEON+SDOT path.
++    CANN_ROOT="$(detect_cann_root)"
++    if [ -n "$CANN_ROOT" ]; then
++      echo "✓ CANN detected at: $CANN_ROOT"
++      export ASCEND_TOOLKIT_HOME="$CANN_ROOT"
++      export CPUINFER_USE_ASCEND_NPU=1
++    else
++      echo "ℹ CANN not detected; building CPU-only (no NPU host callback support)"
++      export CPUINFER_USE_ASCEND_NPU=0
++    fi
++
++    # K920 / Cortex-A76 cannot run the SVE micro-kernels in kt-kernel's KML path.
++    # Keep KML / BLIS off unless the user explicitly opts in.
++    : "${CPUINFER_ENABLE_KML:=OFF}"
++    : "${CPUINFER_ENABLE_BLIS:=OFF}"
++    export CPUINFER_ENABLE_KML CPUINFER_ENABLE_BLIS
++
++    echo ""
++    echo "Configuration (aarch64):"
++    echo "  CPUINFER_USE_ASCEND_NPU = $CPUINFER_USE_ASCEND_NPU"
++    echo "  CPUINFER_ARM_SVE        = $CPUINFER_ARM_SVE"
++    echo "  CPUINFER_ARM_BF16       = $CPUINFER_ARM_BF16"
++    echo "  CPUINFER_ARM_I8MM       = $CPUINFER_ARM_I8MM"
++    echo "  CPUINFER_ENABLE_KML     = $CPUINFER_ENABLE_KML  (forced OFF unless SVE present)"
++    echo ""
++    # Skip the x86-only AMX/AVX512 detection below.
++    :
++  else
++
+   # detect_cpu_features returns "has_amx has_avx512f has_avx512_vnni has_avx512_bf16 has_avx512_vbmi"
+   CPU_FEATURES=$(detect_cpu_features)
+   HAS_AMX=$(echo "$CPU_FEATURES" | cut -d' ' -f1)
+@@ -317,6 +397,7 @@ build_step() {
+   echo ""
+   echo "To use manual configuration instead, run: $0 build --manual"
+   echo ""
++  fi  # end aarch64-vs-x86 branch
+   else
+   # Manual mode - validate user configuration (no exports)
+   if [ -z "$CPUINFER_CPU_INSTRUCT" ] || [ -z "$CPUINFER_ENABLE_AMX" ]; then
+diff --git a/kt-kernel/pyproject.toml b/kt-kernel/pyproject.toml
+index f877dda..356978a 100644
+--- a/kt-kernel/pyproject.toml
++++ b/kt-kernel/pyproject.toml
+@@ -20,11 +20,12 @@ classifiers = [
+ ]
+ requires-python = ">=3.11"
+ dependencies = [
+-  # Core dependencies
+-  "torch==2.9.1",
++  # Core: Ascend 环境 torch_npu 2.8.x 固定要求 torch==2.8.0，勿锁到 2.9.x（会触发 libtorch_npu.so undefined symbol）
++  "torch>=2.8.0,<2.9.0",
+   "safetensors>=0.4.0",
+   "numpy>=1.24.0",
+-  "triton>=2.0.0",
++  # Triton 主要为 x86 GPU 路径；aarch64 + NPU 推理通常不需要，且会拉数百 MB 与 torch 强绑定 wheel
++  "triton>=2.0.0; platform_machine == 'x86_64' or platform_machine == 'AMD64'",
+   "gguf>=0.17.0",
+   # CLI dependencies
+   "typer>=0.9.0",
+diff --git a/kt-kernel/requirements.txt b/kt-kernel/requirements.txt
+index d2b31e2..c5f4db9 100644
+--- a/kt-kernel/requirements.txt
++++ b/kt-kernel/requirements.txt
+@@ -2,9 +2,9 @@
+ # These dependencies will be automatically installed when running `pip install .`
+ # You can skip this file if you already have these packages installed
+ 
+-# Core dependencies (minimum versions)
+-torch==2.9.1
++# aarch64 / 通用：与 torch_npu 对齐时用 torch 2.8.x；仅 x86_64 安装 triton
++torch>=2.8.0,<2.9.0
+ safetensors>=0.4.0
+ numpy>=1.24.0
+-triton>=2.0.0
++triton>=2.0.0; platform_machine == "x86_64"
+ gguf>=0.17.0
+diff --git a/kt-kernel/setup.py b/kt-kernel/setup.py
+index a14b0a5..6633e0d 100644
+--- a/kt-kernel/setup.py
++++ b/kt-kernel/setup.py
+@@ -34,10 +34,18 @@ Environment knobs (export before running pip install .):
+   CPUINFER_NATIVE=ON               (override LLAMA_NATIVE)
+ 
+ 
+-GPU backends (if ever added later, keep placeholders):
++GPU/NPU backends (if ever added later, keep placeholders):
+   CPUINFER_USE_CUDA=0/1           -DKTRANSFORMERS_USE_CUDA
+   CPUINFER_USE_ROCM=0/1           -DKTRANSFORMERS_USE_ROCM
+   CPUINFER_USE_MUSA=0/1           -DKTRANSFORMERS_USE_MUSA
++  CPUINFER_USE_ASCEND_NPU=0/1     -DKTRANSFORMERS_USE_ASCEND_NPU (auto-detects $ASCEND_TOOLKIT_HOME)
++
++ARM aarch64 feature toggles (Kunpeng / Neoverse / Apple Silicon):
++  CPUINFER_ARM_DOTPROD=ON/OFF     -DLLAMA_ARM_DOTPROD (default ON on armv8.2+)
++  CPUINFER_ARM_FP16=ON/OFF        -DLLAMA_ARM_FP16    (default ON on armv8.2+)
++  CPUINFER_ARM_SVE=ON/OFF         -DLLAMA_ARM_SVE     (default OFF; K920 lacks SVE)
++  CPUINFER_ARM_BF16=ON/OFF        -DLLAMA_ARM_BF16    (default OFF; K920 lacks BF16)
++  CPUINFER_ARM_I8MM=ON/OFF        -DLLAMA_ARM_I8MM    (default OFF; needs Neoverse N2/V1+)
+ 
+ Usage:
+   pip install .
+@@ -197,6 +205,20 @@ class CMakeBuild(build_ext):
+                         flags.update(m.group(1).lower().split())
+                 info["raw"]["flags"] = flags
+ 
++                # ARM feature summary (Kunpeng / Neoverse / Apple Silicon).
++                # /proc/cpuinfo on Linux/aarch64 lists these in "Features:".
++                if info["vendor"] == "arm" or "aarch64" in info["arch"]:
++                    if "asimddp" in flags:
++                        info["features"].add("ARM_DOTPROD")
++                    if "asimdhp" in flags or "fphp" in flags:
++                        info["features"].add("ARM_FP16")
++                    if "sve" in flags:
++                        info["features"].add("ARM_SVE")
++                    if "bf16" in flags:
++                        info["features"].add("ARM_BF16")
++                    if "i8mm" in flags:
++                        info["features"].add("ARM_I8MM")
++
+                 # feature summary
+                 if any(f in flags or f in low for f in ["avx512f", "avx512bw", "avx512dq", "avx512vl"]):
+                     info["features"].add("AVX512")
+@@ -469,6 +491,20 @@ class CMakeBuild(build_ext):
+                 return True
+             return False
+ 
++        # Auto-detect Ascend CANN toolkit if user did not explicitly set CPUINFER_USE_ASCEND_NPU.
++        # We check $ASCEND_TOOLKIT_HOME, $CANN_HOME, and the default install
++        # prefix /usr/local/Ascend/ascend-toolkit/latest; treat the toolkit as
++        # available iff include/acl/acl_rt.h exists under that root.
++        def detect_cann_toolkit() -> str | None:
++            for env_name in ("ASCEND_TOOLKIT_HOME", "CANN_HOME"):
++                p = os.environ.get(env_name)
++                if p and (Path(p) / "include" / "acl" / "acl_rt.h").exists():
++                    return p
++            default_root = Path("/usr/local/Ascend/ascend-toolkit/latest")
++            if (default_root / "include" / "acl" / "acl_rt.h").exists():
++                return str(default_root)
++            return None
++
+         # Locate nvcc executable (without forcing user to set -DCMAKE_CUDA_COMPILER)
+         def find_nvcc_path() -> str | None:
+             cuda_home = os.environ.get("CUDA_HOME")
+@@ -501,6 +537,22 @@ class CMakeBuild(build_ext):
+             os.environ["CPUINFER_USE_CUDA"] = "1" if auto_cuda else "0"
+             print(f"-- CPUINFER_USE_CUDA not set; auto-detected CUDA toolkit: {'YES' if auto_cuda else 'NO'}")
+ 
++        # Normalize CPUINFER_USE_ASCEND_NPU. We only auto-enable when the host
++        # is aarch64 and no CUDA was detected; on x86 boxes with CUDA we keep
++        # the CUDA path even if a CANN toolkit happens to be installed.
++        npu_env = _env_get_bool("CPUINFER_USE_ASCEND_NPU", None)
++        if npu_env is None:
++            cann_root = detect_cann_toolkit()
++            host_is_arm = (platform.machine().lower() in ("aarch64", "arm64"))
++            cuda_active = os.environ.get("CPUINFER_USE_CUDA") == "1"
++            auto_npu = (cann_root is not None) and host_is_arm and (not cuda_active)
++            os.environ["CPUINFER_USE_ASCEND_NPU"] = "1" if auto_npu else "0"
++            if auto_npu:
++                # Forward toolkit root so CMake's find_path can locate acl/acl_rt.h.
++                os.environ.setdefault("ASCEND_TOOLKIT_HOME", cann_root)
++            print(f"-- CPUINFER_USE_ASCEND_NPU not set; auto-detected CANN toolkit: "
++                  f"{'YES (' + str(cann_root) + ')' if auto_npu else 'NO'}")
++
+         # Base CMake args
+         cmake_args = [
+             f"-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={extdir}/",
+@@ -647,6 +699,45 @@ class CMakeBuild(build_ext):
+             cmake_args.append("-DKTRANSFORMERS_USE_ROCM=ON")
+         if _env_get_bool("CPUINFER_USE_MUSA", False):
+             cmake_args.append("-DKTRANSFORMERS_USE_MUSA=ON")
++        if _env_get_bool("CPUINFER_USE_ASCEND_NPU", False):
++            cmake_args.append("-DKTRANSFORMERS_USE_ASCEND_NPU=ON")
++            print("-- Enabling Ascend NPU backend (-DKTRANSFORMERS_USE_ASCEND_NPU=ON)")
++            cann_root = os.environ.get("ASCEND_TOOLKIT_HOME") or os.environ.get(
++                "CANN_HOME") or detect_cann_toolkit()
++            if cann_root:
++                print(f"-- CANN root: {cann_root}")
++            else:
++                print("-- Warning: ASCEND_TOOLKIT_HOME not set and no default CANN install"
++                      " found; CMake configure will likely fail.")
++            # CPU-only MoE on Kunpeng must NOT enable the KML SVE micro-kernels
++            # (kt-kernel/operators/moe_kernel/mat_kernel/kml_kernel/*.cpp). These
++            # require SVE which K920/Cortex-A76 lacks. Force them off unless the
++            # user explicitly opts in.
++            if not _env_get_bool("CPUINFER_ENABLE_KML", None):
++                os.environ.setdefault("CPUINFER_ENABLE_KML", "OFF")
++            if not _env_get_bool("CPUINFER_ENABLE_BLIS", None):
++                os.environ.setdefault("CPUINFER_ENABLE_BLIS", "OFF")
++
++        # ---- ARM feature toggles (aarch64 only) -------------------------
++        # The CMake side starts from armv8.2-a baseline and appends features
++        # via LLAMA_ARM_{DOTPROD,FP16,SVE,BF16,I8MM}. Auto-detect once and
++        # forward as -D flags so binary distribution still works.
++        if platform.machine().lower() in ("aarch64", "arm64"):
++            arm_feature_map = [
++                ("CPUINFER_ARM_DOTPROD", "LLAMA_ARM_DOTPROD", "ARM_DOTPROD"),
++                ("CPUINFER_ARM_FP16",    "LLAMA_ARM_FP16",    "ARM_FP16"),
++                ("CPUINFER_ARM_SVE",     "LLAMA_ARM_SVE",     "ARM_SVE"),
++                ("CPUINFER_ARM_BF16",    "LLAMA_ARM_BF16",    "ARM_BF16"),
++                ("CPUINFER_ARM_I8MM",    "LLAMA_ARM_I8MM",    "ARM_I8MM"),
++            ]
++            for env_name, cmake_flag, feature in arm_feature_map:
++                if _forward_bool_env(cmake_args, env_name, cmake_flag):
++                    continue
++                if feature in d["features"]:
++                    cmake_args.append(f"-D{cmake_flag}=ON")
++                    print(f"-- aarch64 {feature} detected; -D{cmake_flag}=ON")
++                else:
++                    cmake_args.append(f"-D{cmake_flag}=OFF")
+ 
+         # Respect user extra CMAKE_ARGS (space separated)
+         extra = os.environ.get("CMAKE_ARGS")

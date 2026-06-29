@@ -1,0 +1,912 @@
+diff --git a/python/sglang/srt/environ.py b/python/sglang/srt/environ.py
+index 9f72f3570..52b55e1e4 100644
+--- a/python/sglang/srt/environ.py
++++ b/python/sglang/srt/environ.py
+@@ -207,6 +207,18 @@ class Envs:
+     SGLANG_SIMULATE_ACC_LEN = EnvFloat(-1)
+     SGLANG_SIMULATE_ACC_METHOD = EnvStr("multinomial")
+     SGLANG_TORCH_PROFILER_DIR = EnvStr("/tmp")
++    # NPU: one-shot torch_npu profiler on a specific decode step (scheduler event loop).
++    SGLANG_NPU_PROFILE_ENABLE = EnvBool(False)
++    SGLANG_NPU_PROFILE_DECODE_TOKEN = EnvInt(2)
++    SGLANG_NPU_PROFILE_DIR = EnvStr("./npu_results_dbg")
++    # ProfilerLevel: 0=light, 1=medium, 2=heavy (Level2 + analyse can block scheduler for a long time).
++    SGLANG_NPU_PROFILE_LEVEL = EnvInt(0)
++    # tensorboard_trace_handler(analyse_flag): True runs CANN offline parse in-process and blocks the server.
++    SGLANG_NPU_PROFILE_ANALYSE = EnvBool(False)
++    # KT + NPUGraph host callbacks deadlock/hang with torch_npu.profiler; force eager decode when profiling.
++    SGLANG_NPU_PROFILE_DISABLE_GRAPH = EnvBool(True)
++    # After the profiled decode step, keep NPUGraph disabled (mixing eager+profiler then graph replay can SIGBUS).
++    SGLANG_NPU_PROFILE_KEEP_EAGER_AFTER = EnvBool(True)
+     SGLANG_OTLP_EXPORTER_SCHEDULE_DELAY_MILLIS = EnvInt(500)
+     SGLANG_OTLP_EXPORTER_MAX_EXPORT_BATCH_SIZE = EnvInt(64)
+     SGLANG_NATIVE_MOVE_KV_CACHE = EnvBool(False)
+diff --git a/python/sglang/srt/layers/moe/kt_ep_wrapper.py b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
+index 128853931..7f01eb238 100644
+--- a/python/sglang/srt/layers/moe/kt_ep_wrapper.py
++++ b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
+@@ -7,14 +7,26 @@ for any MoE quantization method. It coordinates parallel execution of GPU expert
+ (using any quantization method) and CPU experts (using AMX/AVX instructions).
+ """
+ 
++import logging
+ from dataclasses import dataclass
+-from typing import TYPE_CHECKING, Optional
++from typing import TYPE_CHECKING, Optional, Set, Tuple
+ 
+ import torch
+ 
+ from sglang.srt.distributed import get_tensor_model_parallel_rank
+ from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
+-from sglang.srt.utils import get_compiler_backend
++from sglang.srt.utils.kt_accel import (
++    kt_current_stream,
++    kt_current_stream_handle,
++    kt_device_synchronize,
++)
++
++from sglang.srt.layers.moe.kt_expert_masks import (
++    ensure_kt_layer_masks,
++    get_layer_gpu_experts_mask,
++    get_layer_logical_to_gpu_index,
++)
++
+ 
+ if TYPE_CHECKING:
+     from sglang.srt.layers.moe import MoeRunnerConfig
+@@ -32,6 +44,72 @@ except ImportError:
+     KTRANSFORMERS_AVAILABLE = False
+ 
+ 
++logger = logging.getLogger(__name__)
++
++# Streams subscribed for ACL aclrtProcessReport (torch_npu graph host callbacks).
++_npu_report_subscribed: Set[int] = set()
++
++
++def _npu_use_graph_host_callback(device: torch.device) -> bool:
++    """True when MoE CPU work must be enqueued via ``_launch_host_func`` (graph capture)."""
++    if device.type != "npu":
++        return False
++    try:
++        if torch.npu.is_current_stream_capturing():
++            return True
++    except Exception:
++        pass
++    try:
++        from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
++
++        return get_is_capture_mode()
++    except Exception:
++        return False
++
++
++def _ensure_npu_subscribe_report(stream) -> None:
++    """Register ``stream`` with torch_npu ACL report thread (idempotent)."""
++    key = int(stream.npu_stream)
++    if key in _npu_report_subscribed:
++        return
++    import torch_npu
++
++    torch_npu.npu._subscribe_report(stream)
++    _npu_report_subscribed.add(key)
++
++
++@torch.no_grad()
++def _kt_npu_graph_host_forward(args) -> None:
++    """Host callback: run CPU MoE on pinned buffers (used during NPUGraph capture)."""
++    wrapper, hidden_states, stream_handle = args
++    wrapper.run_pinned_forward_sync(hidden_states, stream_handle)
++
++
++def resolve_kt_weight_path_for_layer(weight_path_template: str, layer_idx: int) -> str:
++    """Expand ``--kt-weight-path`` for per-layer split GGUFs (e.g. DeepSeek-V4-Flash).
++
++    Supported placeholders:
++
++    - ``{layer_idx}`` — named, recommended (e.g. ``.../dsv4_layer{layer_idx}.gguf``).
++    - A single anonymous ``{}`` — filled with the integer ``layer_idx`` (e.g. handoff
++      ``.../dsv4_layer{}.gguf``).
++
++    If there is no placeholder, the path is returned unchanged (one shared weight path).
++    """
++    if "{layer_idx}" in weight_path_template:
++        return weight_path_template.format(layer_idx=layer_idx)
++    if weight_path_template.count("{}") == 1:
++        # Use replace (not str.format) so a lone ``{}`` is unambiguous. Some
++        # deployment/YAML layers mangle ``{}``; ``{layer_idx}`` is safer (see launch script).
++        return weight_path_template.replace("{}", str(layer_idx), 1)
++    if weight_path_template.count("{}") > 1:
++        logger.warning(
++            "[KT] kt_weight_path contains multiple `{}` placeholders; "
++            "using literal path without per-layer expansion."
++        )
++    return weight_path_template
++
++
+ @dataclass
+ class KTConfig:
+     """Configuration for KTransformers heterogeneous computing CPU part.
+@@ -56,6 +134,8 @@ class KTConfig:
+     max_deferred_experts_per_token: int
+     method: str
+     num_layers: Optional[int] = None
++    gpu_experts_mask: Optional[torch.Tensor] = None
++    logical_to_gpu_index: Optional[torch.Tensor] = None
+ 
+ 
+ def create_kt_config_from_server_args(
+@@ -76,15 +156,20 @@ def create_kt_config_from_server_args(
+     # Try to get num_layers from model config
+     num_layers = None
+     try:
+-        hf_config = server_args.get_hf_config()
++        hf_config = server_args.get_model_config().hf_config
+         num_layers = getattr(hf_config, "num_hidden_layers", None)
+     except Exception:
+         # If we can't get the config, num_layers will be None
+         pass
+ 
++    ensure_kt_layer_masks(server_args)
++    gpu_experts_mask = get_layer_gpu_experts_mask(layer_idx)
++    logical_to_gpu_index = get_layer_logical_to_gpu_index(layer_idx)
++    num_gpu_experts = int(gpu_experts_mask.sum().item())
++
+     return KTConfig(
+         layer_idx=layer_idx,
+-        num_gpu_experts=server_args.kt_num_gpu_experts,
++        num_gpu_experts=num_gpu_experts,
+         cpuinfer_threads=server_args.kt_cpuinfer,
+         threadpool_count=server_args.kt_threadpool_count,
+         weight_path=server_args.kt_weight_path,
+@@ -92,26 +177,38 @@ def create_kt_config_from_server_args(
+         method=server_args.kt_method,
+         max_deferred_experts_per_token=server_args.kt_max_deferred_experts_per_token,
+         num_layers=num_layers,
++        gpu_experts_mask=gpu_experts_mask,
++        logical_to_gpu_index=logical_to_gpu_index,
+     )
+ 
+ 
+-@torch.compile(dynamic=True, backend=get_compiler_backend())
+-def mask_cpu_expert_ids(topk_ids: torch.Tensor, num_gpu_experts: int) -> torch.Tensor:
+-    """Mask CPU expert IDs by setting them to -1.
+-
+-    This function masks expert IDs that should be computed on CPU (IDs >= num_gpu_experts)
+-    so they won't be computed on GPU. The masked IDs are set to -1, which causes the
+-    GPU MoE kernel to skip those experts.
+-
+-    Args:
+-        topk_ids: Tensor of shape [num_tokens, top_k] containing expert IDs
+-        num_gpu_experts: Number of experts that should run on GPU (experts 0 to num_gpu_experts-1)
+-
+-    Returns:
+-        Modified topk_ids tensor with CPU expert IDs masked as -1
++# NOTE: deliberately NOT @torch.compile'd. On NPU ``get_compiler_backend()``
++# returns the torchair backend, which lowers this into a *separate* NPU graph
++# bound to the stream it was traced on. Inside sglang's outer NPU graph capture
++# the model runs on a different stream at replay, so a torchair-compiled inner
++# graph raises ``Unsupport run graph with different stream``. The ops below are
++# trivial on-device indexing/``where`` (masks are pre-moved to device in
++# ``process_weights_after_loading``), so eager execution folds cleanly into the
++# outer graph with negligible cost.
++def mask_cpu_expert_routing(
++    topk_ids: torch.Tensor,
++    topk_weights: torch.Tensor,
++    gpu_experts_mask: torch.Tensor,
++    logical_to_gpu_index: torch.Tensor,
++) -> Tuple[torch.Tensor, torch.Tensor]:
++    """Make ``topk_ids/topk_weights`` safe for NPU grouped matmul.
++
++    GPU slots use ``logical_to_gpu_index[logical_id]`` (supports prefix and
++    frequency placement). CPU experts map to ``(expert 0, weight 0)`` — see
++    docstring in prior revision for why ``-1`` is unsafe on NPU routing kernels.
+     """
+-    topk_ids[topk_ids >= num_gpu_experts] = -1
+-    return topk_ids
++    mask_on_device = gpu_experts_mask.to(topk_ids.device)
++    l2g_on_device = logical_to_gpu_index.to(topk_ids.device)
++    is_gpu = mask_on_device[topk_ids]
++    gpu_slots = l2g_on_device[topk_ids]
++    safe_ids = torch.where(is_gpu, gpu_slots, torch.zeros_like(topk_ids))
++    safe_weights = torch.where(is_gpu, topk_weights, torch.zeros_like(topk_weights))
++    return safe_ids, safe_weights
+ 
+ 
+ class KTEPWrapperMethod(FusedMoEMethodBase):
+@@ -151,6 +248,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+ 
+         self.gpu_method = gpu_method
+         self.kt_config = kt_config
++        self.gpu_experts_mask = kt_config.gpu_experts_mask
++        self.logical_to_gpu_index = kt_config.logical_to_gpu_index
+         self.num_gpu_experts = kt_config.num_gpu_experts
+         self.override_num_local_experts = True
+         self.gpu_method.num_gpu_experts = self.num_gpu_experts
+@@ -216,16 +315,24 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+         # 2. Initialize KT wrapper for CPU experts
+         # CPU experts: num_gpu_experts to num_experts-1
+         if self.tp_rank == 0:
++            resolved_weight_path = resolve_kt_weight_path_for_layer(
++                self.kt_config.weight_path, self.kt_config.layer_idx
++            )
++            gpu_experts_mask = self.gpu_experts_mask
++            if gpu_experts_mask is None:
++                gpu_experts_mask = torch.zeros(num_experts, dtype=torch.bool)
++                gpu_experts_mask[: self.num_gpu_experts] = True
+             self.wrapper = KTMoEWrapper(
+                 layer_idx=self.kt_config.layer_idx,
+                 num_experts=num_experts,
+                 num_experts_per_tok=num_experts_per_tok,
+                 hidden_size=hidden_size,
+                 moe_intermediate_size=intermediate_size_full,
+-                num_gpu_experts=self.num_gpu_experts,
++                gpu_experts_mask=gpu_experts_mask,
+                 cpuinfer_threads=self.kt_config.cpuinfer_threads,
+                 threadpool_count=self.kt_config.threadpool_count,
+-                weight_path=self.kt_config.weight_path,
++                numa_nodes=None,
++                weight_path=resolved_weight_path,
+                 chunked_prefill_size=self.kt_config.chunked_prefill_size,
+                 method=self.kt_config.method,
+                 max_deferred_experts_per_token=layer_max_deferred,
+@@ -243,7 +350,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+ 
+         # 2. Load CPU weights using KT wrapper
+         if self.tp_rank == 0 and self.wrapper is not None:
+-            torch.cuda.synchronize()
++            kt_device_synchronize()
+ 
+             # Get expert location metadata for CPU expert mapping
+             from sglang.srt.eplb.expert_location_dispatch import (
+@@ -257,6 +364,45 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+             )
+             self.wrapper.load_weights(physical_to_logical_map_cpu)
+ 
++        # 3. Pre-move GPU-expert placement masks to the device ONCE, here at a
++        # deterministic pre-capture point. On NPU there is NO eager warmup
++        # forward before graph capture, so the very first forward runs under
++        # capture — a per-forward ``.to(topk_ids.device)`` inside
++        # ``mask_cpu_expert_routing`` would do a synchronous host->device
++        # ``aclrtMemcpy`` that ACL capture mode forbids (error 107030). With the
++        # masks already on-device, ``.to(same_device)`` short-circuits to a
++        # no-op (no memcpy, no sync). Only needed when GPU experts exist; in
++        # all-CPU mode (``num_gpu_experts == 0``) ``apply`` never calls
++        # ``mask_cpu_expert_routing`` and the masks may be None.
++        if self.num_gpu_experts > 0 and self.gpu_experts_mask is not None:
++            device = layer.w13_weight.device
++            if self.gpu_experts_mask.device != device:
++                self.gpu_experts_mask = self.gpu_experts_mask.to(device)
++            if (
++                self.logical_to_gpu_index is not None
++                and self.logical_to_gpu_index.device != device
++            ):
++                self.logical_to_gpu_index = self.logical_to_gpu_index.to(device)
++
++        # 4. Pre-subscribe the ACL report stream before graph capture begins.
++        # The graph host-callback path (``_submit_cpu_npu_graph``) issues
++        # ``torch_npu.npu._subscribe_report`` lazily on first use; since the
++        # first forward IS the capture forward on NPU, that subscription would
++        # otherwise be issued during capture. Pre-warming it here (idempotent,
++        # guarded by the ``_npu_report_subscribed`` set) keeps the capture-time
++        # path free of first-time ACL control calls. Best-effort: failures are
++        # non-fatal (the lazy path still runs).
++        if self.tp_rank == 0 and self.wrapper is not None:
++            try:
++                device = layer.w13_weight.device
++                if device.type == "npu":
++                    _ensure_npu_subscribe_report(kt_current_stream(device))
++            except Exception as exc:  # pragma: no cover - hardening only
++                logger.warning(
++                    "[KT] pre-capture ACL report subscribe failed (non-fatal): %s",
++                    exc,
++                )
++
+     def create_moe_runner(
+         self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"
+     ):
+@@ -299,16 +445,17 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+ 
+         # Submit forward task to CPU (non-blocking)
+         self.wrapper.submit_forward(
+-            x, topk_ids, topk_weights, torch.cuda.current_stream(x.device).cuda_stream
++            x, topk_ids, topk_weights, kt_current_stream_handle(x.device)
+         )
+ 
+-    def sync(self, x: torch.Tensor) -> torch.Tensor:
++    def sync(self, x: torch.Tensor, *, cpu_already_synced: bool = False) -> torch.Tensor:
+         """Synchronize and retrieve CPU expert computation results.
+ 
+         This method waits for the CPU computation to complete and returns the results.
+ 
+         Args:
+             x: Reference tensor for shape and device information
++            cpu_already_synced: If True, only copy pinned CPU output to device (graph host path).
+ 
+         Returns:
+             CPU expert computation results
+@@ -316,9 +463,28 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+         if self.tp_rank != 0 or self.wrapper is None:
+             return torch.zeros_like(x)
+ 
+-        # Wait for CPU computation and retrieve results
+-        return self.wrapper.sync_forward(
+-            x, torch.cuda.current_stream(x.device).cuda_stream
++        if cpu_already_synced:
++            return self.wrapper.copy_forward_output_to_device(x)
++        return self.wrapper.sync_forward(x, kt_current_stream_handle(x.device))
++
++    def _submit_cpu_npu_graph(
++        self,
++        dispatch_output: "StandardDispatchOutput",
++        x: torch.Tensor,
++    ) -> None:
++        """Enqueue CPU MoE via ``_launch_host_func`` so it is captured in NPUGraph."""
++        import torch_npu
++
++        assert self.wrapper is not None
++        topk_weights, topk_ids, _ = dispatch_output.topk_output
++        stream = kt_current_stream(x.device)
++        _ensure_npu_subscribe_report(stream)
++        stream_handle = kt_current_stream_handle(x.device)
++        self.wrapper.copy_inputs_to_cpu_buffers(x, topk_ids, topk_weights)
++        torch_npu.npu._launch_host_func(
++            stream,
++            _kt_npu_graph_host_forward,
++            (self.wrapper, x, stream_handle),
+         )
+ 
+     def apply(
+@@ -345,33 +511,69 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+         x = dispatch_output.hidden_states
+         topk_output = dispatch_output.topk_output
+ 
+-        # Step 1: Submit CPU expert computation (non-blocking)
+-        if self.tp_rank == 0:
++        use_npu_graph = (
++            self.tp_rank == 0
++            and self.wrapper is not None
++            and _npu_use_graph_host_callback(x.device)
++        )
++
++        # Step 1: Submit CPU expert computation (non-blocking, or graph host callback)
++        if use_npu_graph:
++            self._submit_cpu_npu_graph(dispatch_output, x)
++        elif self.tp_rank == 0:
+             self.submit(layer, dispatch_output)
+ 
+-        # Step 2: Prepare GPU computation by masking CPU expert IDs
+-        # CPU expert IDs (>= num_gpu_experts) are set to -1 so GPU kernel skips them
+-        topk_ids = topk_output.topk_ids
+-        masked_topk_ids = mask_cpu_expert_ids(topk_ids, self.num_gpu_experts)
++        # Step 2 & 3: GPU expert computation — only if we actually have GPU experts.
++        #
++        # In all-CPU mode (``--kt-num-gpu-experts 0``) the underlying quant
++        # method created ``layer.w13_weight`` / ``layer.w2_weight`` with shape
++        # ``[0, ...]`` (no GPU expert weights loaded → no HBM cost). Calling
++        # ``self.gpu_method.apply`` would then invoke ``npu_grouped_matmul``
++        # with an empty weight tensor and CANN raises
++        # ``RuntimeError: Invalid inputs: neither x nor weight could be empty``.
++        # This guard is symmetric to the early-return ``torch.zeros_like(x)``
++        # in ``submit/sync`` when ``tp_rank != 0`` / ``wrapper is None``.
++        if self.num_gpu_experts > 0:
++            # CPU rows (id >= num_gpu_experts) are remapped to (expert 0, weight 0)
++            # — see ``mask_cpu_expert_routing`` docstring for why we do not use
++            # ``-1`` here (would crash NPU ``npu_moe_init_routing/compute_expert_tokens``).
++            topk_ids = topk_output.topk_ids
++            topk_weights = topk_output.topk_weights
++            masked_topk_ids, masked_topk_weights = mask_cpu_expert_routing(
++                topk_ids,
++                topk_weights,
++                self.gpu_experts_mask,
++                self.logical_to_gpu_index,
++            )
+ 
+-        # Create modified dispatch output for GPU computation
+-        masked_topk_output = topk_output._replace(topk_ids=masked_topk_ids)
+-        masked_dispatch_output = dispatch_output._replace(
+-            topk_output=masked_topk_output
+-        )
++            masked_topk_output = topk_output._replace(
++                topk_ids=masked_topk_ids,
++                topk_weights=masked_topk_weights,
++            )
++            masked_dispatch_output = dispatch_output._replace(
++                topk_output=masked_topk_output
++            )
+ 
+-        # Step 3: Execute GPU expert computation (any quantization method)
+-        # This runs in parallel with CPU computation
+-        gpu_combine_input = self.gpu_method.apply(layer, masked_dispatch_output)
++            gpu_combine_input = self.gpu_method.apply(layer, masked_dispatch_output)
++            output = gpu_combine_input.hidden_states
++        else:
++            output = torch.zeros_like(x)
+ 
+         # Step 4: Synchronize CPU results and merge with GPU results
+-        output = gpu_combine_input.hidden_states
+         if self.tp_rank == 0:
+-            cpu_output = self.sync(x)
++            cpu_output = self.sync(x, cpu_already_synced=use_npu_graph)
+             output = output + cpu_output
+ 
+         return StandardCombineInput(hidden_states=output)
+ 
++    def map_logical_expert_id_for_gpu_load(self, logical_expert_id: int) -> int:
++        """Map checkpoint logical expert id to NPU weight slot, or -1 if CPU-only."""
++        if self.logical_to_gpu_index is None:
++            if logical_expert_id < self.num_gpu_experts:
++                return logical_expert_id
++            return -1
++        return int(self.logical_to_gpu_index[logical_expert_id].item())
++
+     def __getattr__(self, name: str):
+         """Delegate attribute access to the wrapped GPU method.
+ 
+diff --git a/python/sglang/srt/layers/moe/kt_expert_masks.py b/python/sglang/srt/layers/moe/kt_expert_masks.py
+new file mode 100644
+index 000000000..a1ce7cfb9
+--- /dev/null
++++ b/python/sglang/srt/layers/moe/kt_expert_masks.py
+@@ -0,0 +1,164 @@
++# SPDX-License-Identifier: Apache-2.0
++"""GPU expert placement masks for KT hybrid MoE (prefix / frequency)."""
++
++from __future__ import annotations
++
++import logging
++from typing import TYPE_CHECKING, Optional, Tuple
++
++import torch
++
++if TYPE_CHECKING:
++    from sglang.srt.server_args import ServerArgs
++
++logger = logging.getLogger(__name__)
++
++_LAYER_MASKS: Optional[torch.Tensor] = None
++_LOGICAL_TO_GPU: Optional[torch.Tensor] = None
++
++
++def is_moe_layer(
++    layer_idx: int,
++    first_k_dense_replace: int,
++    moe_layer_freq: int,
++) -> bool:
++    return layer_idx >= first_k_dense_replace and layer_idx % moe_layer_freq == 0
++
++
++def generate_prefix_masks(
++    num_layers: int,
++    num_experts: int,
++    experts_per_moe_layer: int,
++    first_k_dense_replace: int = 0,
++    moe_layer_freq: int = 1,
++) -> torch.Tensor:
++    """Per MoE layer: experts ``0 .. experts_per_moe_layer-1`` on GPU (static default)."""
++    masks = torch.zeros(num_layers, num_experts, dtype=torch.bool, device="cpu")
++    k = min(max(experts_per_moe_layer, 0), num_experts)
++    for layer_idx in range(num_layers):
++        if is_moe_layer(layer_idx, first_k_dense_replace, moe_layer_freq) and k > 0:
++            masks[layer_idx, :k] = True
++    return masks
++
++
++def generate_frequency_masks_per_layer(
++    activation_freq: torch.Tensor,
++    experts_per_moe_layer: int,
++    first_k_dense_replace: int,
++    moe_layer_freq: int,
++) -> torch.Tensor:
++    """Per MoE layer: top-``experts_per_moe_layer`` experts by activation frequency."""
++    num_layers, num_experts = activation_freq.shape
++    k = min(max(experts_per_moe_layer, 0), num_experts)
++    masks = torch.zeros(num_layers, num_experts, dtype=torch.bool, device="cpu")
++    if k == 0:
++        return masks
++    freq_cpu = activation_freq.to(device="cpu", dtype=torch.float32)
++    for layer_idx in range(num_layers):
++        if not is_moe_layer(layer_idx, first_k_dense_replace, moe_layer_freq):
++            continue
++        _, top = torch.topk(freq_cpu[layer_idx], k=k, largest=True, sorted=False)
++        masks[layer_idx, top] = True
++    return masks
++
++
++def build_logical_to_gpu_index(masks: torch.Tensor) -> torch.Tensor:
++    """``[num_layers, num_experts]`` bool -> ``[num_layers, num_experts]`` int64 (-1 = CPU)."""
++    num_layers, num_experts = masks.shape
++    out = torch.full((num_layers, num_experts), -1, dtype=torch.long, device="cpu")
++    for layer_idx in range(num_layers):
++        logical_ids = torch.nonzero(masks[layer_idx], as_tuple=False).view(-1)
++        for slot, logical_id in enumerate(logical_ids.tolist()):
++            out[layer_idx, logical_id] = slot
++    return out
++
++
++def load_activation_freq(path: str) -> torch.Tensor:
++    data = torch.load(path, map_location="cpu", weights_only=True)
++    if isinstance(data, dict):
++        for key in ("activation_freq", "freq", "data"):
++            if key in data:
++                data = data[key]
++                break
++    if not isinstance(data, torch.Tensor):
++        raise TypeError(
++            f"Expected activation_freq tensor in {path}, got {type(data).__name__}"
++        )
++    return data.to(device="cpu", dtype=torch.float32)
++
++
++def get_moe_layout_from_server_args(server_args: "ServerArgs") -> Tuple[int, int, int, int]:
++    hf = server_args.get_model_config().hf_config
++    num_layers = getattr(hf, "num_hidden_layers", None)
++    num_experts = getattr(hf, "n_routed_experts", None)
++    first_k_dense = getattr(hf, "first_k_dense_replace", 0) or 0
++    moe_layer_freq = getattr(hf, "moe_layer_freq", 1) or 1
++    if num_layers is None or num_experts is None:
++        raise ValueError("Cannot infer MoE layout from model config")
++    return num_layers, num_experts, first_k_dense, moe_layer_freq
++
++
++def ensure_kt_layer_masks(server_args: "ServerArgs") -> None:
++    global _LAYER_MASKS, _LOGICAL_TO_GPU
++    if _LAYER_MASKS is not None:
++        return
++    if server_args.kt_weight_path is None:
++        return
++
++    num_layers, num_experts, first_k_dense, moe_freq = get_moe_layout_from_server_args(
++        server_args
++    )
++    experts_per = server_args.kt_num_gpu_experts or 0
++    strategy = getattr(server_args, "kt_expert_placement_strategy", None) or "prefix"
++
++    if strategy == "frequency":
++        freq_path = getattr(server_args, "kt_activation_freq_path", None)
++        if not freq_path:
++            raise ValueError(
++                "--kt-expert-placement-strategy frequency requires "
++                "--kt-activation-freq-path"
++            )
++        freq = load_activation_freq(freq_path)
++        if tuple(freq.shape) != (num_layers, num_experts):
++            raise ValueError(
++                f"activation_freq shape {tuple(freq.shape)} != "
++                f"({num_layers}, {num_experts})"
++            )
++        masks = generate_frequency_masks_per_layer(
++            freq, experts_per, first_k_dense, moe_freq
++        )
++    else:
++        if strategy != "prefix":
++            logger.warning(
++                "[KT] unknown kt_expert_placement_strategy=%r; using prefix",
++                strategy,
++            )
++        masks = generate_prefix_masks(
++            num_layers, num_experts, experts_per, first_k_dense, moe_freq
++        )
++
++    _LAYER_MASKS = masks
++    _LOGICAL_TO_GPU = build_logical_to_gpu_index(masks)
++    n_moe = sum(
++        1 for i in range(num_layers) if is_moe_layer(i, first_k_dense, moe_freq)
++    )
++    logger.info(
++        "[KT] expert placement strategy=%s experts_per_moe_layer=%d "
++        "moe_layers=%d total_gpu_expert_slots=%d",
++        strategy,
++        experts_per,
++        n_moe,
++        int(masks.sum().item()),
++    )
++
++
++def get_layer_gpu_experts_mask(layer_idx: int) -> torch.Tensor:
++    if _LAYER_MASKS is None:
++        raise RuntimeError("KT layer masks not initialized; call ensure_kt_layer_masks")
++    return _LAYER_MASKS[layer_idx]
++
++
++def get_layer_logical_to_gpu_index(layer_idx: int) -> torch.Tensor:
++    if _LOGICAL_TO_GPU is None:
++        raise RuntimeError("KT layer masks not initialized; call ensure_kt_layer_masks")
++    return _LOGICAL_TO_GPU[layer_idx]
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index 1e674d05b..e1ab2bfa0 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -20,7 +20,7 @@ import signal
+ import sys
+ import time
+ from collections import deque
+-from contextlib import nullcontext
++from contextlib import contextmanager, nullcontext
+ from dataclasses import dataclass
+ from http import HTTPStatus
+ from typing import Any, Deque, Dict, List, Optional, Tuple, Union
+@@ -250,6 +250,120 @@ TEST_RETRACT_INTERVAL = envs.SGLANG_TEST_RETRACT_INTERVAL.get()
+ TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
+ 
+ _is_npu = is_npu()
++_npu_decode_profile_logged = False
++
++
++def _should_npu_profile_batch(batch: ScheduleBatch) -> bool:
++    """Profile exactly one decode step when enabled via SGLANG_NPU_PROFILE_* env vars."""
++    global _npu_decode_profile_logged
++    if not _is_npu or not envs.SGLANG_NPU_PROFILE_ENABLE.get():
++        return False
++    if batch is None or batch.forward_mode is None:
++        return False
++    if not batch.forward_mode.is_decode():
++        return False
++    target_decode_token = envs.SGLANG_NPU_PROFILE_DECODE_TOKEN.get()
++    if not batch.reqs:
++        return False
++    if not all(req.decode_batch_idx == target_decode_token for req in batch.reqs):
++        return False
++    if not _npu_decode_profile_logged:
++        logger.info(
++            "NPU profiling enabled: capturing decode step %d "
++            "(decode_batch_idx, i.e. the %d-th generated token after prefill) -> %s",
++            target_decode_token,
++            target_decode_token,
++            envs.SGLANG_NPU_PROFILE_DIR.get(),
++        )
++        _npu_decode_profile_logged = True
++    return True
++
++
++def _npu_profiler_level():
++    import torch_npu
++
++    level = envs.SGLANG_NPU_PROFILE_LEVEL.get()
++    return {
++        0: torch_npu.profiler.ProfilerLevel.Level0,
++        1: torch_npu.profiler.ProfilerLevel.Level1,
++        2: torch_npu.profiler.ProfilerLevel.Level2,
++    }.get(level, torch_npu.profiler.ProfilerLevel.Level0)
++
++
++@contextmanager
++def _npu_profile_force_eager_context(scheduler: "Scheduler"):
++    """NPUGraph replay + KT host callbacks are incompatible with inline torch_npu.profiler."""
++    if not envs.SGLANG_NPU_PROFILE_DISABLE_GRAPH.get():
++        yield
++        return
++    model_runner = scheduler.tp_worker.model_runner
++    graph_runner = model_runner.graph_runner
++    if graph_runner is None:
++        yield
++        return
++    orig_can_run = graph_runner.can_run
++
++    def _can_run_no_graph(forward_batch):
++        return False
++
++    graph_runner.can_run = _can_run_no_graph
++    logger.info(
++        "NPU profiler: forcing eager decode (NPUGraph replay disabled for this step)"
++    )
++    try:
++        yield
++    finally:
++        keep_eager = (
++            envs.SGLANG_NPU_PROFILE_ENABLE.get()
++            and envs.SGLANG_NPU_PROFILE_KEEP_EAGER_AFTER.get()
++        )
++        if keep_eager:
++            logger.info(
++                "NPU profiler: keeping eager decode for remaining server lifetime "
++                "(do not mix profiler eager step with NPUGraph replay on the same request)"
++            )
++        else:
++            graph_runner.can_run = orig_can_run
++
++
++@contextmanager
++def _npu_profiler_context():
++    import torch_npu
++
++    output_dir = envs.SGLANG_NPU_PROFILE_DIR.get()
++    analyse_flag = envs.SGLANG_NPU_PROFILE_ANALYSE.get()
++    profiler_level = _npu_profiler_level()
++    experimental_config = torch_npu.profiler._ExperimentalConfig(
++        profiler_level=profiler_level,
++        export_type=[torch_npu.profiler.ExportType.Text],
++    )
++    trace_handler = torch_npu.profiler.tensorboard_trace_handler(
++        output_dir, analyse_flag=analyse_flag, async_mode=True
++    )
++    logger.info(
++        "NPU profiler starting (level=%s, analyse_flag=%s, dir=%s)",
++        envs.SGLANG_NPU_PROFILE_LEVEL.get(),
++        analyse_flag,
++        output_dir,
++    )
++    with torch_npu.profiler.profile(
++        activities=[
++            torch_npu.profiler.ProfilerActivity.CPU,
++            torch_npu.profiler.ProfilerActivity.NPU,
++        ],
++        schedule=torch_npu.profiler.schedule(
++            wait=0, warmup=0, active=1, repeat=1, skip_first=0
++        ),
++        experimental_config=experimental_config,
++        on_trace_ready=trace_handler,
++    ) as prof:
++        yield prof
++    torch_npu.npu.synchronize()
++    logger.info(
++        "NPU profiler finished export to %s (analyse_flag=%s)",
++        output_dir,
++        analyse_flag,
++    )
+ 
+ 
+ @dataclass
+@@ -1362,6 +1476,29 @@ class Scheduler(
+         with self.device_module.StreamContext(self.schedule_stream):
+             dispatch_event_loop(self)
+ 
++    def _run_batch_with_optional_npu_profile(
++        self,
++        batch: ScheduleBatch,
++        *,
++        process_result: bool = True,
++    ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
++        def _execute():
++            result = self.run_batch(batch)
++            if process_result:
++                self.process_batch_result(batch, result)
++            return result
++
++        if _should_npu_profile_batch(batch):
++            logger.info(
++                "NPU profiler: running decode batch (export blocks scheduler until done)"
++            )
++            with _npu_profile_force_eager_context(self), _npu_profiler_context() as prof:
++                result = _execute()
++                prof.step()
++            logger.info("NPU profiler: decode batch done, scheduler resuming")
++            return result
++        return _execute()
++
+     @DynamicGradMode()
+     def event_loop_normal(self):
+         """A normal scheduler loop."""
+@@ -1379,8 +1516,7 @@ class Scheduler(
+ 
+             # Launch the current batch
+             if batch:
+-                result = self.run_batch(batch)
+-                self.process_batch_result(batch, result)
++                self._run_batch_with_optional_npu_profile(batch)
+             else:
+                 # When the server is idle, do self-check and re-init some states.
+                 self.self_check_during_idle()
+@@ -1421,7 +1557,9 @@ class Scheduler(
+ 
+             # Launch the current batch
+             if batch:
+-                batch_result = self.run_batch(batch)
++                batch_result = self._run_batch_with_optional_npu_profile(
++                    batch, process_result=False
++                )
+                 self.result_queue.append((batch.copy(), batch_result))
+             else:
+                 batch_result = None
+diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
+index 753d18c21..35ce41cd0 100644
+--- a/python/sglang/srt/server_args.py
++++ b/python/sglang/srt/server_args.py
+@@ -586,6 +586,8 @@ class ServerArgs:
+     kt_cpuinfer: Optional[int] = None
+     kt_threadpool_count: Optional[int] = None
+     kt_num_gpu_experts: Optional[int] = None
++    kt_expert_placement_strategy: str = "prefix"
++    kt_activation_freq_path: Optional[str] = None
+     kt_max_deferred_experts_per_token: Optional[int] = None
+ 
+     # Diffusion LLM
+@@ -5488,7 +5490,20 @@ class ServerArgs:
+         parser.add_argument(
+             "--kt-num-gpu-experts",
+             type=int,
+-            help="[ktransformers parameter] The number of GPU experts.",
++            help="[ktransformers parameter] The number of GPU experts per MoE layer.",
++        )
++        parser.add_argument(
++            "--kt-expert-placement-strategy",
++            type=str,
++            default=ServerArgs.kt_expert_placement_strategy,
++            choices=["prefix", "frequency"],
++            help="[ktransformers parameter] GPU expert placement: prefix (0..N-1) or frequency (top-N from activation stats).",
++        )
++        parser.add_argument(
++            "--kt-activation-freq-path",
++            type=str,
++            default=None,
++            help="[ktransformers parameter] Path to activation_freq .pt for frequency placement (shape: num_layers x num_experts).",
+         )
+         parser.add_argument(
+             "--kt-max-deferred-experts-per-token",
+diff --git a/python/sglang/srt/utils/kt_accel.py b/python/sglang/srt/utils/kt_accel.py
+new file mode 100644
+index 000000000..9cd84e51c
+--- /dev/null
++++ b/python/sglang/srt/utils/kt_accel.py
+@@ -0,0 +1,71 @@
++# SPDX-License-Identifier: Apache-2.0
++"""CUDA / Ascend NPU helpers for KT EP hybrid paths in ``kt_ep_wrapper``.
++
++``torch_npu`` mocks ``torch.cuda.is_available`` as False on Ascend; branch on
++``torch.Tensor.device.type`` instead of ``torch.cuda.is_available()`` alone.
++"""
++
++from __future__ import annotations
++
++from contextlib import AbstractContextManager, nullcontext
++from typing import Any, Optional
++
++import torch
++
++
++def _accel_mod(device: torch.device) -> Any:
++    if device.type == "cuda":
++        return torch.cuda
++    if device.type == "npu":
++        # Side-effect import: registers the NPU backend so torch.npu becomes available; do not remove (F401 expected).
++        import torch_npu  # noqa: F401
++
++        return torch.npu
++    raise TypeError(
++        f"KT EP hybrid stream APIs require device type 'cuda' or 'npu', got {device.type!r}"
++    )
++
++
++def kt_device_synchronize(device: Optional[torch.device] = None) -> None:
++    """Synchronize the current thread with work on ``device`` (or default accel)."""
++    if device is None:
++        if torch.cuda.is_available() and getattr(torch.version, "cuda", None):
++            torch.cuda.synchronize()
++            return
++        if hasattr(torch, "npu") and torch.npu.is_available():
++            torch.npu.synchronize()
++        return
++    _accel_mod(device).synchronize(device)
++
++
++def kt_current_stream(device: torch.device) -> Any:
++    return _accel_mod(device).current_stream(device)
++
++
++def kt_current_stream_handle(device: torch.device) -> int:
++    """Native stream handle for ``kt_kernel`` / ``submit_with_cuda_stream``."""
++    stream = kt_current_stream(device)
++    if device.type == "npu":
++        return int(stream.npu_stream)
++    return int(stream.cuda_stream)
++
++
++def kt_new_stream(device: torch.device) -> Any:
++    return _accel_mod(device).Stream(device=device)
++
++
++def kt_new_event(device: torch.device) -> Any:
++    return _accel_mod(device).Event()
++
++
++def kt_stream_context(stream: Any, device: torch.device) -> AbstractContextManager:
++    return _accel_mod(device).stream(stream)
++
++
++def kt_maybe_cuda_host_register(
++    cpu_tensor: torch.Tensor, nbytes: int, device: torch.device
++) -> None:
++    """Pin host memory for DMA when running on CUDA; no-op on NPU."""
++    if device.type != "cuda" or not torch.cuda.is_available():
++        return
++    torch.cuda.cudart().cudaHostRegister(cpu_tensor.data_ptr(), nbytes, 0)

@@ -1,0 +1,281 @@
+diff --git a/python/sglang/srt/hardware_backend/npu/allocator_npu.py b/python/sglang/srt/hardware_backend/npu/allocator_npu.py
+index c7a9f8c1d..30da384f4 100644
+--- a/python/sglang/srt/hardware_backend/npu/allocator_npu.py
++++ b/python/sglang/srt/hardware_backend/npu/allocator_npu.py
+@@ -15,6 +15,39 @@ if TYPE_CHECKING:
+     from sglang.srt.mem_cache.memory_pool import KVCache
+ 
+ 
++# ---------------------------------------------------------------------------
++# Triton availability probe (single-card NPU + KT downstream patch)
++# ---------------------------------------------------------------------------
++# 上游 `sgl_kernel_npu.mem_cache.allocator.alloc_extend_kernel` 是个 ``@triton.jit``
++# 内核，需要 triton-ascend 后端注册到 ``triton.runtime.driver``。在我们这台 NPU
++# docker 里 ``triton 3.7`` 与 ``triton-ascend 3.2`` 是版本错配（ascend/compiler.py
++# 引用了 upstream 已删除的 ``AttrsDescriptor``），后端注册失败，调用就会抛
++# ``RuntimeError: 0 active drivers ([])``；而本文件已经自带的 ``alloc_extend_naive``
++# 是纯 PyTorch 等价实现，bs 较小时性能差异可以忽略。我们在 import 期做一次性探测，
++# 失败则把后续 prefill 全部切到 naive 分支（triton×ascend 版本错配下这是常态，
++# 自动回退即可，无需任何开关）。
++def _detect_triton_driver_available() -> bool:
++    try:
++        # triton ships no type stubs; this is the availability probe whose failure falls back to the
++        # torch-equivalent path when triton x ascend is unusable, hence the type: ignore.
++        from triton.runtime.driver import driver as _triton_driver  # type: ignore
++
++        _ = _triton_driver.active  # triggers _create_driver()
++        return True
++    except Exception as e:  # ImportError / RuntimeError("0 active drivers") / etc.
++        logger.warning(
++            "[allocator_npu] Triton driver unavailable (%s: %s); falling back to "
++            "alloc_extend_naive for KV slot allocation. This is a pure-PyTorch path "
++            "and does not affect forward numerics.",
++            type(e).__name__,
++            e,
++        )
++        return False
++
++
++_TRITON_DRIVER_AVAILABLE = _detect_triton_driver_available()
++
++
+ class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
+     def __init__(
+         self,
+@@ -56,7 +89,7 @@ class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
+             )
+             return None
+ 
+-        if num_new_pages_item < 200:
++        if num_new_pages_item < 200 and _TRITON_DRIVER_AVAILABLE:
+             from sgl_kernel_npu.mem_cache.allocator import alloc_extend_kernel
+ 
+             out_indices = torch.empty(
+diff --git a/python/sglang/srt/hardware_backend/npu/attention/ascend_backend.py b/python/sglang/srt/hardware_backend/npu/attention/ascend_backend.py
+index 430bee910..b10fa5f1e 100644
+--- a/python/sglang/srt/hardware_backend/npu/attention/ascend_backend.py
++++ b/python/sglang/srt/hardware_backend/npu/attention/ascend_backend.py
+@@ -1603,7 +1603,9 @@ class AscendAttnBackend(AttentionBackend):
+                     metadata = self.forward_metadata.kernel_metadata[
+                         f"c{compress_ratio}a_metadata"
+                     ]
+-                    q = q.squeeze(0)
++                    # q 来自 deepseek_v4.forward_normal_prepare → [T, N, D]；T=1 时 squeeze(0) 会变成 [N,D]，head_num=0。
++                    if q.dim() == 4:
++                        q = q.squeeze(0)
+                     attn_kwargs = {
+                         "cu_seqlens_q": self.forward_metadata.actual_seq_lengths_q_pa,  # just for TND
+                         "seqused_kv": self.forward_metadata.actual_seq_lengths_kv,  # num of key elements used, DT_INT32, Tentative: kv_len 非压缩
+diff --git a/python/sglang/srt/layers/moe/fused_moe_triton/layer.py b/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
+index 01e9c16f6..d9fe2ef36 100644
+--- a/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
++++ b/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
+@@ -656,8 +656,12 @@ class FusedMoE(torch.nn.Module):
+             KTEPWrapperMethod,
+         ):
+             if self.quant_method.num_gpu_experts != -1:
+-                if expert_id >= self.quant_method.num_gpu_experts:
++                gpu_slot = self.quant_method.map_logical_expert_id_for_gpu_load(
++                    expert_id
++                )
++                if gpu_slot < 0:
+                     return
++                expert_id = gpu_slot
+ 
+         self._weight_loader_impl(
+             param=param,
+diff --git a/python/sglang/srt/mem_cache/common.py b/python/sglang/srt/mem_cache/common.py
+index a35458426..d41a7cfdf 100644
+--- a/python/sglang/srt/mem_cache/common.py
++++ b/python/sglang/srt/mem_cache/common.py
+@@ -35,6 +35,102 @@ MAMBA_STATE_PER_REQ_NO_CACHE = 1
+ logger = logging.getLogger(__name__)
+ 
+ 
++# ---------------------------------------------------------------------------
++# NPU + KT downstream patch:
++# ---------------------------------------------------------------------------
++# 在我们的 NPU docker 里 ``triton 3.7`` 与 ``triton-ascend 3.2`` 版本错配，
++# 任何 ``@triton.jit`` kernel 在调用时都会抛 ``0 active drivers ([])``。基线
++# 已经为 attention backend == "ascend" 在 ``support_triton`` 里把 ascend 标
++# 成 False，但本文件里 ``write_multi_cache_indices`` / ``get_last_loc`` 等公
++# 共函数并没全部去判这个旗子（应该是 oversight，因为 baseline 8 卡机器上
++# triton 装得是好的），到了 NPU 单卡 prefill 就会炸。
++#
++# 这里加一次性 driver 探测；探到不可用，则把所有调用点切到 torch 等价路径
++# （纯 PyTorch、bs=1/2 单卡场景性能可接受，且数值完全等价）。该探测和
++# ``hardware_backend/npu/allocator_npu.py`` 里那个用的是同样的逻辑，保持一致。
++def _detect_triton_driver_available() -> bool:
++    try:
++        # triton ships no type stubs; this is the availability probe whose failure falls back to the
++        # torch-equivalent path when triton x ascend is unusable, hence the type: ignore.
++        from triton.runtime.driver import driver as _triton_driver  # type: ignore
++
++        _ = _triton_driver.active
++        return True
++    except Exception:
++        return False
++
++
++_TRITON_DRIVER_AVAILABLE = _detect_triton_driver_available()
++
++
++def _write_req_to_token_pool_torch(
++    req_to_token_ptr: torch.Tensor,
++    req_pool_indices: torch.Tensor,
++    prefix_tensors: list[torch.Tensor],
++    pre_lens: torch.Tensor,
++    seq_lens: torch.Tensor,
++    extend_lens: torch.Tensor,
++    out_cache_loc: torch.Tensor,
++) -> None:
++    """Pure-PyTorch equivalent of ``write_req_to_token_pool_triton`` for NPU.
++
++    Mirrors the Triton kernel: for batch ``i`` copy ``prefix_tensors[i][:pre_len]``
++    into ``req_to_token_ptr[req_pool_index, :pre_len]`` and the extend slice of
++    ``out_cache_loc`` into ``req_to_token_ptr[req_pool_index, pre_len:seq_len]``.
++    """
++    bs = req_pool_indices.shape[0]
++    if bs == 0:
++        return
++    cumsum_start = 0
++    for i in range(bs):
++        req_idx = int(req_pool_indices[i].item())
++        pre_len = int(pre_lens[i].item())
++        seq_len = int(seq_lens[i].item())
++        extend_len = int(extend_lens[i].item())
++        if pre_len > 0:
++            req_to_token_ptr[req_idx, :pre_len] = prefix_tensors[i][:pre_len].to(
++                req_to_token_ptr.dtype
++            )
++        write_len = seq_len - pre_len
++        if write_len > 0:
++            req_to_token_ptr[req_idx, pre_len:seq_len] = out_cache_loc[
++                cumsum_start : cumsum_start + write_len
++            ].to(req_to_token_ptr.dtype)
++        cumsum_start += extend_len
++
++
++def _write_req_to_token_pool_only_alloc_size_torch(
++    req_to_token_ptr: torch.Tensor,
++    req_pool_indices: torch.Tensor,
++    prefix_tensors: list[torch.Tensor],
++    pre_lens: torch.Tensor,
++    seq_lens: torch.Tensor,
++    alloc_lens: torch.Tensor,
++    out_cache_loc: torch.Tensor,
++) -> None:
++    bs = req_pool_indices.shape[0]
++    if bs == 0:
++        return
++    cumsum_start = 0
++    for i in range(bs):
++        req_idx = int(req_pool_indices[i].item())
++        pre_len = int(pre_lens[i].item())
++        seq_len = int(seq_lens[i].item())
++        alloc_len = int(alloc_lens[i].item())
++        alloc_offset = seq_len - alloc_len
++        if pre_len > 0:
++            req_to_token_ptr[req_idx, :pre_len] = prefix_tensors[i][:pre_len].to(
++                req_to_token_ptr.dtype
++            )
++        if alloc_len > 0:
++            req_to_token_ptr[
++                req_idx, alloc_offset : alloc_offset + alloc_len
++            ] = out_cache_loc[cumsum_start : cumsum_start + alloc_len].to(
++                req_to_token_ptr.dtype
++            )
++        cumsum_start += alloc_len
++
++
+ @triton.jit
+ def write_req_to_token_pool_triton(
+     req_to_token_ptr,  # [max_batch, max_context_len]
+@@ -154,7 +250,7 @@ def write_cache_indices(
+     prefix_tensors: list[torch.Tensor],
+     req_to_token_pool: ReqToTokenPool,
+ ):
+-    if support_triton(get_global_server_args().attention_backend):
++    if support_triton(get_global_server_args().attention_backend) and _TRITON_DRIVER_AVAILABLE:
+         prefix_pointers = torch.tensor(
+             [t.data_ptr() for t in prefix_tensors],
+             device=req_to_token_pool.device,
+@@ -203,6 +299,66 @@ def write_multi_cache_indices(
+     prefix_tensors: list[torch.Tensor],
+     req_to_token_pool: ReqToTokenPool,
+ ):
++    if not _TRITON_DRIVER_AVAILABLE:
++        # NPU pure-PyTorch path. 与 write_cache_indices 的 else 分支一脉相承，
++        # 把每条 triton kernel 调用替换成 torch 等价实现。bs 在我们单卡场景下
++        # 通常 == 1，性能可接受。
++        _write_req_to_token_pool_torch(
++            req_to_token_pool.req_to_token,
++            req_pool_indices_tensor,
++            prefix_tensors,
++            prefix_lens_tensor,
++            seq_lens_tensor.full_kv_len,
++            seq_lens_tensor.full_kv_len,
++            out_cache_loc.out_full_loc,
++        )
++        _write_req_to_token_pool_only_alloc_size_torch(
++            req_to_token_pool.req_to_token_swa,
++            req_pool_indices_tensor,
++            prefix_tensors,
++            prefix_lens_tensor,
++            seq_lens_tensor.full_kv_len,
++            seq_lens_tensor.swa_kv_len,
++            out_cache_loc.out_swa_loc,
++        )
++        _write_req_to_token_pool_torch(
++            req_to_token_pool.req_to_token_c4,
++            req_pool_indices_tensor,
++            prefix_tensors,
++            prefix_lens_tensor,
++            seq_lens_tensor.c4_kv_len,
++            seq_lens_tensor.c4_kv_len,
++            out_cache_loc.out_c4_loc,
++        )
++        _write_req_to_token_pool_torch(
++            req_to_token_pool.req_to_token_c128,
++            req_pool_indices_tensor,
++            prefix_tensors,
++            prefix_lens_tensor,
++            seq_lens_tensor.c128_kv_len,
++            seq_lens_tensor.c128_kv_len,
++            out_cache_loc.out_c128_loc,
++        )
++        _write_req_to_token_pool_only_alloc_size_torch(
++            req_to_token_pool.req_to_token_c4_state,
++            req_pool_indices_tensor,
++            prefix_tensors,
++            prefix_lens_tensor,
++            seq_lens_tensor.full_kv_len,
++            seq_lens_tensor.c4_state_kv_len,
++            out_cache_loc.out_c4_state_loc,
++        )
++        _write_req_to_token_pool_only_alloc_size_torch(
++            req_to_token_pool.req_to_token_c128_state,
++            req_pool_indices_tensor,
++            prefix_tensors,
++            prefix_lens_tensor,
++            seq_lens_tensor.full_kv_len,
++            seq_lens_tensor.c128_state_kv_len,
++            out_cache_loc.out_c128_state_loc,
++        )
++        return
++
+     prefix_pointers = torch.tensor(
+         [t.data_ptr() for t in prefix_tensors],
+         device=req_to_token_pool.device,
+@@ -280,7 +436,10 @@ def get_last_loc(
+     req_pool_indices_tensor: torch.Tensor,
+     prefix_lens_tensor: torch.Tensor,
+ ) -> torch.Tensor:
+-    if get_global_server_args().attention_backend != "torch_native":
++    if (
++        get_global_server_args().attention_backend != "torch_native"
++        and _TRITON_DRIVER_AVAILABLE
++    ):
+         impl = get_last_loc_triton
+     else:
+         impl = get_last_loc_torch
