@@ -1,0 +1,32 @@
+model_name: "GLM-5.2"
+model_path: "/data/models/GLM-5.2-W8A8"
+exe_mode: "npugraph_ex"                  # ["ge_graph", "eager", "npugraph_ex"], mode of decode
+world_size: 32                           # world_size = 2 * chip_num in A3
+
+model_config:
+  enable_offload: True                   # [False, True]
+  next_n: 3
+  pa_block_size: 128
+  enable_weight_nz: True
+  with_ckpt: True                        # [False, True]
+  enable_multi_streams: True             # [False, True]
+  enable_profiler: False                 # [False, True]
+  perfect_eplb: False                    # [False, True]
+  enable_cache_compile: False            # [False, True]
+  enable_online_split_weight: True       # [False, True]
+  prefill_mini_batch_size: 1
+
+data_config:
+  dataset: default
+  input_max_len: 4096
+  max_new_tokens: 64
+  batch_size: 32
+
+parallel_config:
+  cp_size: 1                             # only active at prefill stage
+  attn_tp_size: 1
+  oproj_tp_size: 1                       # only support when attn_tp_size == 1
+  dense_tp_size: 1
+  moe_tp_size: 1
+  embed_tp_size: 32
+  lmhead_tp_size: 32
