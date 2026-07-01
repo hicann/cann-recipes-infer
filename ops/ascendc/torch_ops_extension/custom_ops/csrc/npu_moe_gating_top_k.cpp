@@ -24,31 +24,33 @@ std::tuple<at::Tensor, at::Tensor> construct_moe_gating_top_k_output_tensor(
     int64_t k, const c10::optional<at::Tensor>& bias,int64_t kGroup, int64_t groupCount, bool outFlag)
 {
     // Check input tensor validity
-    TORCH_CHECK(x.numel() > 0, "Input tensor x should not be empty.");
+    TORCH_CHECK(x.sym_numel() > 0, "Input tensor x should not be empty.");
     TORCH_CHECK(k > 0, "k should be greater than 0.");
     TORCH_CHECK(kGroup > 0, "kGroup should be greater than 0.");
     TORCH_CHECK(groupCount > 0, "groupCount should be greater than 0.");
-    TORCH_CHECK(k <= x.size(-1) / groupCount * kGroup, "k should be <= x_shape[-1] / groupCount * kGroup.");
+    TORCH_CHECK(k <= x.sym_size(-1) / groupCount * kGroup, "k should be <= x_shape[-1] / groupCount * kGroup.");
     TORCH_CHECK(kGroup <= groupCount, "kGroup should be <= groupCount.");
 
     // Get input tensor options
     auto options = x.options();
 
+    // 使用 sym_size/empty_symint 保留动态维（如 token 维），避免动态 shape 下
+    // .sizes() 将符号维具象化；维度个数用 x.dim() 而非 x.sizes().size()。
     // Construct yOut output tensor: same shape as x but last dimension is k
-    c10::SmallVector<int64_t, SIZE> yOut_shape;
-    for (size_t i = 0; i < x.sizes().size() - 1; i++) {
-        yOut_shape.push_back(x.sizes()[i]);
+    c10::SymDimVector yOut_shape;
+    for (int64_t i = 0; i < x.dim() - 1; i++) {
+        yOut_shape.push_back(x.sym_size(i));
     }
-    yOut_shape.push_back(k);
-    at::Tensor yOut = at::empty(yOut_shape, options.dtype(x.dtype()));
+    yOut_shape.push_back(c10::SymInt(k));
+    at::Tensor yOut = at::empty_symint(yOut_shape, options.dtype(x.dtype()));
 
     // Construct expertIdxOut output tensor: same shape as x but last dimension is k, dtype int32
-    c10::SmallVector<int64_t, SIZE> expertIdxOut_shape;
-    for (size_t i = 0; i < x.sizes().size() - 1; i++) {
-        expertIdxOut_shape.push_back(x.sizes()[i]);
+    c10::SymDimVector expertIdxOut_shape;
+    for (int64_t i = 0; i < x.dim() - 1; i++) {
+        expertIdxOut_shape.push_back(x.sym_size(i));
     }
-    expertIdxOut_shape.push_back(k);
-    at::Tensor expertIdxOut = at::empty(expertIdxOut_shape, options.dtype(at::kInt));
+    expertIdxOut_shape.push_back(c10::SymInt(k));
+    at::Tensor expertIdxOut = at::empty_symint(expertIdxOut_shape, options.dtype(at::kInt));
 
     return std::make_tuple(yOut, expertIdxOut);
 }
@@ -69,11 +71,11 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_moe_gating_top_k_npu(
     int64_t normType,
     bool outFlag)
 {
-    TORCH_CHECK(x.numel() > 0, "Input tensor x should not be empty.");
+    TORCH_CHECK(x.sym_numel() > 0, "Input tensor x should not be empty.");
     TORCH_CHECK(k > 0, "k should be greater than 0.");
     TORCH_CHECK(kGroup > 0, "kGroup should be greater than 0.");
     TORCH_CHECK(groupCount > 0, "groupCount should be greater than 0.");
-    TORCH_CHECK(k <= x.size(-1) / groupCount * kGroup, "k should be <= x_shape[-1] / groupCount * kGroup.");
+    TORCH_CHECK(k <= x.sym_size(-1) / groupCount * kGroup, "k should be <= x_shape[-1] / groupCount * kGroup.");
     TORCH_CHECK(kGroup <= groupCount, "kGroup should be <= groupCount.");
     TORCH_CHECK(groupSelectMode == 0 || groupSelectMode == 1, "groupSelectMode should be 0 or 1.");
     TORCH_CHECK(normType == 0 || normType == 1 ||  normType == 2, "normType should be 0, 1 or 2.");
@@ -82,21 +84,21 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_moe_gating_top_k_npu(
     // Check bias tensor if provided
     if (bias.has_value()) {
         const auto& bias_tensor = bias.value();
-        TORCH_CHECK(bias_tensor.numel() > 0, "Bias tensor should not be empty.");
+        TORCH_CHECK(bias_tensor.sym_numel() > 0, "Bias tensor should not be empty.");
         TORCH_CHECK(bias_tensor.dim() == 1, "Bias tensor should be 1-dimensional.");
-        TORCH_CHECK(bias_tensor.size(0) == x.size(-1), 
-            "Bias tensor size should match the last dimension of x. Expected: ", 
-            x.size(-1), ", Got: ", bias_tensor.size(0));
+        TORCH_CHECK(bias_tensor.sym_size(0) == x.sym_size(-1),
+            "Bias tensor size should match the last dimension of x. Expected: ",
+            x.sym_size(-1), ", Got: ", bias_tensor.sym_size(0));
     }
 
     if (input_ids.has_value()) {
         const auto& input_ids_tensor = input_ids.value();
-        TORCH_CHECK(input_ids_tensor.numel() > 0, "input_ids tensor should not be empty when not null.");
+        TORCH_CHECK(input_ids_tensor.sym_numel() > 0, "input_ids tensor should not be empty when not null.");
     }
     
     if (tid2eid.has_value()) {
         const auto& tid2eid_tensor = tid2eid.value();
-        TORCH_CHECK(tid2eid_tensor.numel() > 0, "tid2eid tensor should not be empty when not null.");
+        TORCH_CHECK(tid2eid_tensor.sym_numel() > 0, "tid2eid tensor should not be empty when not null.");
     }
 
     // Check input data types
@@ -110,11 +112,11 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_moe_gating_top_k_npu(
     std::tie(yOut, expertIdxOut) = construct_moe_gating_top_k_output_tensor(x, k, bias, kGroup, groupCount, outFlag);
 
     // Create normOut tensor if outFlag is true
-    c10::SmallVector<int64_t, SIZE> normOut_shape;
-    for (size_t i = 0; i < x.sizes().size(); i++) {
-        normOut_shape.push_back(x.sizes()[i]);
+    c10::SymDimVector normOut_shape;
+    for (int64_t i = 0; i < x.dim(); i++) {
+        normOut_shape.push_back(x.sym_size(i));
     }
-    normOut = at::empty(normOut_shape, x.options().dtype(at::kFloat));
+    normOut = at::empty_symint(normOut_shape, x.options().dtype(at::kFloat));
 
     // Execute the NPU operation
     EXEC_NPU_CMD_V1(aclnnMoeGatingTopKHash, x, bias, input_ids, tid2eid, k, kGroup, groupCount, groupSelectMode, renorm, normType,
@@ -140,11 +142,11 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_moe_gating_top_k_meta(
     int64_t normType,
     bool outFlag)
 {
-    TORCH_CHECK(x.numel() > 0, "Input tensor x should not be empty.");
+    TORCH_CHECK(x.sym_numel() > 0, "Input tensor x should not be empty.");
     TORCH_CHECK(k > 0, "k should be greater than 0.");
     TORCH_CHECK(kGroup > 0, "kGroup should be greater than 0.");
     TORCH_CHECK(groupCount > 0, "groupCount should be greater than 0.");
-    TORCH_CHECK(k <= x.size(-1) / groupCount * kGroup, "k should be <= x_shape[-1] / groupCount * kGroup.");
+    TORCH_CHECK(k <= x.sym_size(-1) / groupCount * kGroup, "k should be <= x_shape[-1] / groupCount * kGroup.");
     TORCH_CHECK(kGroup <= groupCount, "kGroup should be <= groupCount.");
 
     // construct the output tensors
@@ -154,11 +156,11 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_moe_gating_top_k_meta(
     std::tie(yOut, expertIdxOut) = construct_moe_gating_top_k_output_tensor(x, k, bias, kGroup, groupCount, outFlag);
 
     // Create normOut tensor if outFlag is true
-    c10::SmallVector<int64_t, SIZE> normOut_shape;
-    for (size_t i = 0; i < x.sizes().size(); i++) {
-        normOut_shape.push_back(x.sizes()[i]);
+    c10::SymDimVector normOut_shape;
+    for (int64_t i = 0; i < x.dim(); i++) {
+        normOut_shape.push_back(x.sym_size(i));
     }
-    normOut = at::empty(normOut_shape, x.options().dtype(at::kFloat));
+    normOut = at::empty_symint(normOut_shape, x.options().dtype(at::kFloat));
     return std::make_tuple(yOut, expertIdxOut, normOut);
 }
 

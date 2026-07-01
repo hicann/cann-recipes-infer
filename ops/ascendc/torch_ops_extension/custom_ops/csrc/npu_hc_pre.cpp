@@ -25,31 +25,42 @@ const int SINGLE_OP_BS_ALIGN_FACTOR = 16;
 const int FUSION_BASE_BS = 8192;
 const int FUSION_SPLIT_K_MAX_BS = 512;
 
+// 维度下标 / 维度个数常量
+const int DIM_0 = 0;
+const int DIM_1 = 1;
+const int DIM_2 = 2;
+const int DIM_3 = 3;
+const int DIM_4 = 4;
+const int HC_SCALE_LIMIT = 3;  // hc_scale 形状固定为 [3]
+
 // 工具函数，推导输出shape
 std::tuple<at::Tensor, at::Tensor, at::Tensor> construct_hc_pre_output_tensor(const at::Tensor& x, int64_t hc_mult)
 {
     auto xDims = x.dim();
-    at::SmallVector<int64_t, 8> y_size;
-    at::SmallVector<int64_t, 8> post_size;
-    at::SmallVector<int64_t, 8> comb_frag_size;
-    if (xDims == 4) {
-        auto batch = x.size(0);
-        auto size = x.size(1);
-        auto d = x.size(3);
+    // 使用 sym_size/empty_symint 保留动态维（如 dim-0 token 维），
+    // 避免 torch.compile 动态 shape 场景下 .size()/.sizes() 将符号维具象化。
+    c10::SymInt hc_mult_sym(hc_mult);
+    c10::SymDimVector y_size;
+    c10::SymDimVector post_size;
+    c10::SymDimVector comb_frag_size;
+    if (xDims == DIM_4) {
+        auto batch = x.sym_size(DIM_0);
+        auto size = x.sym_size(DIM_1);
+        auto d = x.sym_size(DIM_3);
         y_size = {batch, size, d};
-        post_size = {batch, size, hc_mult};
-        comb_frag_size = {batch, size, hc_mult, hc_mult};
-    } else if (xDims == 3) {
-        auto bs = x.size(0);
-        auto d = x.size(2);
+        post_size = {batch, size, hc_mult_sym};
+        comb_frag_size = {batch, size, hc_mult_sym, hc_mult_sym};
+    } else if (xDims == DIM_3) {
+        auto bs = x.sym_size(DIM_0);
+        auto d = x.sym_size(DIM_2);
         y_size = {bs, d};
-        post_size = {bs, hc_mult};
-        comb_frag_size = {bs, hc_mult, hc_mult};
+        post_size = {bs, hc_mult_sym};
+        comb_frag_size = {bs, hc_mult_sym, hc_mult_sym};
     }
 
-    at::Tensor y = at::empty(y_size, x.options().dtype(at::kBFloat16));
-    at::Tensor post = at::empty(post_size, x.options().dtype(at::kFloat));
-    at::Tensor comb_frag = at::empty(comb_frag_size, x.options().dtype(at::kFloat));
+    at::Tensor y = at::empty_symint(y_size, x.options().dtype(at::kBFloat16));
+    at::Tensor post = at::empty_symint(post_size, x.options().dtype(at::kFloat));
+    at::Tensor comb_frag = at::empty_symint(comb_frag_size, x.options().dtype(at::kFloat));
 
     return std::tuple<at::Tensor, at::Tensor, at::Tensor>(y, post, comb_frag);
 }
@@ -65,12 +76,12 @@ at::Tensor construct_hc_pre_rsqrt_output_tensor(const at::Tensor& x, float epsil
 
     // Construct yOut output tensor
     auto xDims = x.dim();
-    c10::SmallVector<int64_t, SIZE> yOut_shape;
-    for (size_t i = 0; i < xDims - 2; i++) {
-        yOut_shape.push_back(x.sizes()[i]);
+    c10::SymDimVector yOut_shape;
+    for (int64_t i = 0; i < xDims - DIM_2; i++) {
+        yOut_shape.push_back(x.sym_size(i));
     }
-    yOut_shape.push_back(1);
-    at::Tensor yOut = at::empty(yOut_shape, options.dtype(at::kFloat));
+    yOut_shape.push_back(c10::SymInt(1));
+    at::Tensor yOut = at::empty_symint(yOut_shape, options.dtype(at::kFloat));
 
     return yOut;
 }
@@ -81,34 +92,45 @@ void check_hc_pre_shape_and_dtype(
     const at::Tensor& hc_fn,
     const at::Tensor& hc_scale,
     const at::Tensor& hc_base,
-    bool is_ascend950 = false) {
+    bool is_ascend950 = false)
+{
     // check x shape: [b, s, hc, d]
     auto xDims = x.dim();
-    TORCH_CHECK(xDims == 4 || xDims == 3, "Input tensor x's dim num should be 4, actual ", xDims, ".");
-    for (size_t i = 0; i < 3; i++) {
-        TORCH_CHECK(x.size(i) > 0, "Input tensor x's shape should be positive, but x.shape[", i, "] is :", x.size(i), ".");
+    TORCH_CHECK(xDims == DIM_4 || xDims == DIM_3,
+                "Input tensor x's dim num should be 4, actual ", xDims, ".");
+    for (int64_t i = 0; i < DIM_3; i++) {
+        TORCH_CHECK(x.sym_size(i) > 0,
+                    "Input tensor x's shape should be positive, but x.shape[", i, "] is :", x.sym_size(i), ".");
     }
-    auto hc = x.size(1);
-    auto d = x.size(2);
-    if (xDims == 4) {
-        hc = x.size(2);
-        d = x.size(3);
+    auto hc = x.sym_size(DIM_1);
+    auto d = x.sym_size(DIM_2);
+    if (xDims == DIM_4) {
+        hc = x.sym_size(DIM_2);
+        d = x.sym_size(DIM_3);
     }
     TORCH_CHECK(hc == HC_LIMIT, "The hc of x only support ", HC_LIMIT, ", actual ", hc, ".");
     TORCH_CHECK(
         d == D_LIMIT || d == D_LIMIT_EXTEND,
         "The d of x only support ", D_LIMIT, " or ", D_LIMIT_EXTEND, ", actual ", d, ".");
     // check hc_fn: [mix_hc, hc * d]
-    TORCH_CHECK(hc_fn.dim() == 2, "Input tensor hc_fn's dim num should be 2, actual ", hc_fn.dim(), ".");
-    auto mix_hc = hc_fn.size(0);
-    TORCH_CHECK(mix_hc == MIX_HC_LIMIT, "The mix_hc of hc_fn only support ", MIX_HC_LIMIT, ", actual ", mix_hc, ".");
-    TORCH_CHECK(hc_fn.size(1) == hc * d, "The hc_fn.shape[1] should be hc * d, actual hc_fn.shape[1] is ", hc_fn.size(1), ", hc is ", hc, ", d is ", d, ".");
+    TORCH_CHECK(hc_fn.dim() == DIM_2, "Input tensor hc_fn's dim num should be 2, actual ", hc_fn.dim(), ".");
+    auto mix_hc = hc_fn.sym_size(DIM_0);
+    TORCH_CHECK(mix_hc == MIX_HC_LIMIT,
+                "The mix_hc of hc_fn only support ", MIX_HC_LIMIT, ", actual ", mix_hc, ".");
+    TORCH_CHECK(hc_fn.sym_size(DIM_1) == hc * d,
+                "The hc_fn.shape[1] should be hc * d, actual hc_fn.shape[1] is ",
+                hc_fn.sym_size(DIM_1), ", hc is ", hc, ", d is ", d, ".");
     // check hc_scale: [3]
-    TORCH_CHECK(hc_scale.dim() == 1, "Input tensor hc_scale's dim num should be 1, actual ", hc_scale.dim(), ".");
-    TORCH_CHECK(hc_scale.size(0) == 3, "Input tensor hc_scale's shape should be [3], actual [", hc_scale.size(0), "].");
+    TORCH_CHECK(hc_scale.dim() == 1,
+                "Input tensor hc_scale's dim num should be 1, actual ", hc_scale.dim(), ".");
+    TORCH_CHECK(hc_scale.sym_size(DIM_0) == HC_SCALE_LIMIT,
+                "Input tensor hc_scale's shape should be [3], actual [", hc_scale.sym_size(DIM_0), "].");
     // check hc_base: [mix_hc]
-    TORCH_CHECK(hc_base.dim() == 1, "Input tensor hc_base's dim num should be 1, actual ", hc_base.dim(), ".");
-    TORCH_CHECK(hc_base.size(0) == mix_hc, "The hc_base.shape[0] should be mix_hc, actual hc_base.shape[0] is ", hc_base.size(0), ", mix_hc is ", mix_hc, ".");
+    TORCH_CHECK(hc_base.dim() == 1,
+                "Input tensor hc_base's dim num should be 1, actual ", hc_base.dim(), ".");
+    TORCH_CHECK(hc_base.sym_size(DIM_0) == mix_hc,
+                "The hc_base.shape[0] should be mix_hc, actual hc_base.shape[0] is ",
+                hc_base.sym_size(DIM_0), ", mix_hc is ", mix_hc, ".");
     // check dtype
     TORCH_CHECK(x.dtype() == at::kBFloat16, "x's dtype should be BFLOAT16.");
     TORCH_CHECK(hc_fn.dtype() == at::kFloat, "hc_fn's dtype should be FLOAT32.");
@@ -129,9 +151,9 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> hc_pre_composite(
     // call matmul -> get mixes
     auto original_type = x.dtype();
     at::Tensor x_float = x.to(at::kFloat);
-    at::Tensor x_flattened = x_float.flatten(2, -1);
-    if (xDims == 3) {
-        x_flattened = x_float.flatten(1, -1);
+    at::Tensor x_flattened = x_float.flatten(DIM_2, -1);
+    if (xDims == DIM_3) {
+        x_flattened = x_float.flatten(DIM_1, -1);
     }
     auto mixes = at::linear(x_flattened, hc_fn);
 
