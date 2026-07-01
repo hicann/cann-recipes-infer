@@ -27,6 +27,7 @@ from module.quantization.compressed_tensors.compressed_tensors_w8a8_hif8 import 
 from module.linear import LinearBase, LinearMethodBase, UnquantizedLinearMethod
 from module.fuse_moe_gmm import FusedMoEGMM
 from module.quantization.mxfp8 import MxFp8LinearMethod
+from module.quantization.mxfp4 import MxFp4LinearMethod
 from module.quantization.fp8 import Fp8LinearMethod
 from .utils import (find_matched_target, is_activation_quantization_format, should_ignore_layer, get_moe_target)
 
@@ -294,13 +295,14 @@ class CompressedTensorsConfig(QuantizationConfig):
             weight_quant.strategy == QuantizationStrategy.TENSOR.value
             or weight_quant.strategy == QuantizationStrategy.CHANNEL.value
             or weight_quant.strategy == QuantizationStrategy.GROUP.value)
-        is_token = (weight_strategy and input_quant.strategy
-                    == QuantizationStrategy.TOKEN.value)
+        input_strategy = (
+            input_quant.strategy == QuantizationStrategy.TOKEN.value
+            or input_quant.strategy == QuantizationStrategy.GROUP.value)
         is_dynamic = not weight_quant.dynamic and input_quant.dynamic
 
         # Both symmetric and asymmetric input quantization supported.
         # Only symmetric weight quantization supported.
-        return is_w4a4_mxfp4 and is_token and weight_quant.symmetric and is_dynamic
+        return is_w4a4_mxfp4 and weight_strategy and input_strategy and weight_quant.symmetric and is_dynamic
     
     def is_dynamic_token_w8a8_hifloat8(self, 
                             weight_quant: BaseModel, 
@@ -341,6 +343,8 @@ class CompressedTensorsConfig(QuantizationConfig):
                 return MxFp8LinearMethod()
             elif self.is_dynamic_token_w8a8_fp8(weight_quant, input_quant):
                 return Fp8LinearMethod(self)
+            elif self.is_dynamic_token_w4a4_mxfp4(weight_quant, input_quant):
+                return MxFp4LinearMethod()
 
         raise NotImplementedError(
             "No compressed-tensors compatible scheme was found.")

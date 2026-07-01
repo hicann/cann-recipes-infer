@@ -855,6 +855,15 @@ def mxfp_weight_quant(tensor: torch.Tensor, bits=8, weight_clip_factor=None):
     return weight_fp, scale_e8m0
 
 
+def hadamard_transform(x, hadamard):
+    ori_shape = x.shape
+    x_dtype = x.dtype
+    x = x.reshape(-1, 128).float()
+    x = x.matmul(hadamard)
+    x = x.reshape(ori_shape).to(x_dtype)
+    return x
+
+
 def int4_assistance_bias(weight, weight_scale):
     repeat_times = weight.shape[1] // weight_scale.shape[1]
     expanded_scale = weight_scale.repeat_interleave(repeat_times, dim=1)
@@ -996,6 +1005,22 @@ def generate_quant_config(c8, ignores, w4a8=False, clip=False):
     return quant_config
 
 
+def generate_mxfp4_quant_config(ignores):
+    quant_config = {"config_groups": {"group_0": {}, "group_1": {}},
+                    "format": "float-quantized",
+                    "global_compression_ratio": None,
+                    "ignore": ignores,
+                    "kv_cache_scheme": None,
+                    "quant_method": "compressed-tensors",
+                    "quantization_status": "compressed",
+                    "weight_block_size": [1, 32]}
+    quant_config["config_groups"]["group_0"] = generate_quant_group(
+        a_num_bits=4, w_num_bits=4, targets=["Linear"])
+    quant_config["config_groups"]["group_1"] = generate_quant_group(
+        a_num_bits=4, w_num_bits=4, targets=["MoEGMM"])
+    return quant_config
+
+
 def generate_li_hadamard_matrix(quant_param_path, num_layers, dim=128):
     hadamard_matrixs = {}
     for layer_idx in range(0, num_layers):
@@ -1085,10 +1110,17 @@ def main(fp8_path, output_path, **kwargs):
     clip = kwargs.get("clip")
     quant_param_path = kwargs.get("quant_param_path")
     model_name = kwargs.get("model_name")
+    hadamard_weight_path = kwargs.get("hadamard_weight_path", "")
     torch.set_default_dtype(torch.bfloat16)
+    fp8_path = os.path.abspath(fp8_path)
+    output_path = os.path.abspath(output_path)
+    hadamard_weight_path = os.path.abspath(
+        hadamard_weight_path) if hadamard_weight_path else ""
     os.makedirs(output_path, exist_ok=True)
     assert quant_type in [
-        "bfloat16", "w8a8c16", "w8a8c8", "w4a8c16", "w4a8c8"], f"Unsupported quant_type: {quant_type}"
+        "w8a8c16", "w8a8c8", "w4a8c16", "w4a8c8", "w4a4c16"], f"Unsupported quant_type: {quant_type}"
+    if hadamard_weight_path and not os.path.isdir(hadamard_weight_path):
+        raise FileNotFoundError(f"Hadamard weight path not found: {hadamard_weight_path}")
 
     model_index_file = os.path.join(fp8_path, "model.safetensors.index.json")
     config_file = os.path.join(fp8_path, 'config.json')
@@ -1107,15 +1139,20 @@ def main(fp8_path, output_path, **kwargs):
     c8 = quant_type.endswith('c8')
     w4a8 = quant_type.startswith("w4a8")
     w8a8 = quant_type.startswith("w8a8")
+    w4a4 = quant_type.startswith("w4a4")
 
-    if w8a8 or w4a8:
+    if w8a8 or w4a8 or w4a4:
         quant_ignore_layers = generate_ignore_item(num_layers)
-        c8_fake = True if model_name == "qwen3_moe" else False
-        quantization_config = generate_quant_config(
-            c8=c8 if not c8_fake else c8_fake, 
-            ignores=quant_ignore_layers, 
-            w4a8=w4a8, 
-            clip=clip)
+        if w4a4:
+            quantization_config = generate_mxfp4_quant_config(
+                ignores=quant_ignore_layers)
+        else:
+            c8_fake = True if model_name == "qwen3_moe" else False
+            quantization_config = generate_quant_config(
+                c8=c8 if not c8_fake else c8_fake,
+                ignores=quant_ignore_layers,
+                w4a8=w4a8,
+                clip=clip)
         config['quantization_config'] = quantization_config
 
     if w4a8:
@@ -1123,6 +1160,8 @@ def main(fp8_path, output_path, **kwargs):
             num_layers)
 
     loaded_files = {}
+    hadamard_cache = {}
+    inv_hadamard_cache = {}
 
     def get_tensor(tensor_name):
         file_name = weight_map[tensor_name]
@@ -1130,6 +1169,47 @@ def main(fp8_path, output_path, **kwargs):
             file_path = os.path.join(fp8_path, file_name)
             loaded_files[file_name] = load_file(file_path, device="cpu")
         return loaded_files[file_name][tensor_name]
+
+    def get_hadamard_weight(layer_idx):
+        if layer_idx not in hadamard_cache:
+            weight_file = os.path.join(
+                hadamard_weight_path, f"layer_{layer_idx}_self_attn.pt")
+            if not os.path.exists(weight_file):
+                raise FileNotFoundError(
+                    f"Hadamard weight file not found for layer {layer_idx}: {weight_file}")
+            hadamard_cache[layer_idx] = torch.load(weight_file, map_location="cpu")
+        return hadamard_cache[layer_idx]
+
+    def get_inv_hadamard_transpose(layer_idx, transform_type, hadamard):
+        cache_key = (layer_idx, transform_type)
+        if cache_key not in inv_hadamard_cache:
+            inv_hadamard_cache[cache_key] = torch.linalg.inv(
+                hadamard.float()).T
+        return inv_hadamard_cache[cache_key]
+
+    def apply_hadamard_if_needed(weight_name, weight):
+        if not (w4a4 and hadamard_weight_path and weight_name.endswith(".weight")):
+            return weight
+        name_parts = weight_name.rsplit(".")
+        if len(name_parts) < 6:
+            return weight
+        layer_idx = name_parts[2]
+        module_name = name_parts[3]
+        linear_name = name_parts[4]
+        if module_name != "self_attn" or linear_name.split("_")[-1] != "proj":
+            return weight
+
+        qkvo_name = linear_name.split("_")[0]
+        layer_weight = get_hadamard_weight(layer_idx)
+        if qkvo_name == "o":
+            transform_type = "output"
+            hadamard = layer_weight["out_transform.transform.linear.weight"]
+        else:
+            transform_type = "input"
+            hadamard = layer_weight["input_transform.transform.linear.weight"]
+        inv_hadamard = get_inv_hadamard_transpose(
+            layer_idx, transform_type, hadamard)
+        return hadamard_transform(weight, inv_hadamard)
 
     safetensor_files = list(glob(os.path.join(fp8_path, "*.safetensors")))
     safetensor_files.sort()
@@ -1147,7 +1227,8 @@ def main(fp8_path, output_path, **kwargs):
                 try:
                     scale_inv = get_tensor(scale_inv_name)
                     bf16_weight = weight_dequant(weight, scale_inv)
-                    if w8a8 or w4a8:
+                    bf16_weight = apply_hadamard_if_needed(weight_name, bf16_weight)
+                    if w8a8 or w4a8 or w4a4:
                         is_ignore_layer = is_match_layer_name(
                             weight_name, quant_ignore_layers)
                         if is_ignore_layer:
@@ -1155,7 +1236,7 @@ def main(fp8_path, output_path, **kwargs):
                         if not is_ignore_layer:
                             weight_clip_factor = None
                             bits = 8
-                            if is_match_layer_name(weight_name, quant_w4a8_layers):
+                            if w4a4 or is_match_layer_name(weight_name, quant_w4a8_layers):
                                 bits = 4
                                 print(f" {weight_name} - bits {bits}")
                             mxfp_weight, scale_inv = mxfp_weight_quant(bf16_weight, bits=bits)
@@ -1180,6 +1261,7 @@ def main(fp8_path, output_path, **kwargs):
                     new_weight_map[weight_name] = file_name
             else:
                 is_ignore_layer = is_match_layer_name(weight_name, quant_ignore_layers)
+                weight = apply_hadamard_if_needed(weight_name, weight)
 
                 if is_ignore_layer:
                     print(f'Ignore quantization {weight_name}')
@@ -1187,7 +1269,7 @@ def main(fp8_path, output_path, **kwargs):
                     new_weight_map[weight_name] = file_name
                 else:
                     bits = 8
-                    if is_match_layer_name(weight_name, quant_w4a8_layers):
+                    if w4a4 or is_match_layer_name(weight_name, quant_w4a8_layers):
                         bits = 4
                         print(f" {weight_name} - bits {bits}")
 
@@ -1241,19 +1323,21 @@ def main(fp8_path, output_path, **kwargs):
 
 
 if __name__ == "__main__":
-    quant_type = "w4a8c16"
-    clip = False
-    quant_param_path = "None"
-    model_name = "qwen3_moe"
     parser = ArgumentParser()
     parser.add_argument("--input_bf16_hf_path", type=str, required=True)
     parser.add_argument("--output_hf_path", type=str, required=True)
+    parser.add_argument("--quant_type", type=str, default="w4a8c16",
+                        choices=["w8a8c16", "w8a8c8", "w4a8c16", "w4a8c8", "w4a4c16"],
+                        help="Default keeps the original W4A8 MXFP8 conversion. Use w4a4c16 for MXFP4.")
+    parser.add_argument("--hadamard_weight_path", type=str, default="",
+                        help="Hadamard parameter directory. Only used by w4a4c16 MXFP4 conversion.")
     args = parser.parse_args()
 
     main(args.input_bf16_hf_path,
          args.output_hf_path,
-         quant_type="w4a8c16", 
+         quant_type=args.quant_type,
          clip=False,
          quant_param_path="None",
-         model_name="qwen3_moe"
+         model_name="qwen3_moe",
+         hadamard_weight_path=args.hadamard_weight_path
          )

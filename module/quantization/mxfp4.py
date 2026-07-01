@@ -34,6 +34,25 @@ ACTIVATION_SCHEMES = ["static", "dynamic"]
 BEFORE_INIT = 0
 AFTER_INIT = 1
 BLOCK_K = 32
+PACK_FACTOR = 2
+
+
+def transpose_packed_fp4(weight: torch.Tensor) -> torch.Tensor:
+    """Convert packed [..., N, K/2] FP4 weights to packed [..., K, N/2]."""
+    if weight.dim() < 2:
+        raise ValueError(
+            "MXFP4 packed weight must have at least 2 dimensions, but got "
+            f"{weight.dim()}.")
+    if weight.shape[-2] % PACK_FACTOR != 0:
+        raise ValueError(
+            "MXFP4 output dimension must be even, but got "
+            f"{weight.shape[-2]}.")
+    low = weight & 0x0F
+    high = (weight // 16) & 0x0F
+    unpacked = torch.stack((low, high), dim=-1).reshape(
+        *weight.shape[:-2], weight.shape[-2], weight.shape[-1] * PACK_FACTOR)
+    transposed = unpacked.transpose(-2, -1).contiguous()
+    return (transposed[..., 0::2] | (transposed[..., 1::2] * 16)).contiguous()
 
 
 def unpack_mxfloat4_to_fp32(packed_tensor):
@@ -126,6 +145,9 @@ class W4A8MxFp4MoEGMMMethod(QuantizeMethodBase):
         final_output_dtype: torch.dtype = torch.bfloat16,
         **kwargs
     ):
+        # Keep the torch_npu operator argument name. pertoken_scale does not
+        # mean one scale for a whole token; the token dimension is indexed
+        # independently, and each token stores MX scales per BLOCK_K hidden values.
         if pertoken_scale is None:
             x, pertoken_scale = torch_npu.npu_dynamic_mx_quant(x, dst_type=torch.float8_e4m3fn)
         num_tokens = x.shape[0]
@@ -205,6 +227,214 @@ class W4A8MxFp4MoEGMMMethod(QuantizeMethodBase):
             w2_weight_scale.data = reshape_mx_scale(w2_weight_scale.data).transpose(1, 2)
         layer.w13_weight = Parameter(w13_weight, requires_grad=False)
         layer.w2_weight = Parameter(w2_weight, requires_grad=False)
+
+
+class W4A4MxFp4MoEGMMMethod(W4A8MxFp4MoEGMMMethod):
+    """MXFP4 MoE with FP4 activations for both grouped matmuls."""
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        expert_tokens: torch.Tensor,
+        group_list_type: int,
+        pertoken_scale: torch.Tensor = None,
+        final_output_dtype: torch.dtype = torch.bfloat16,
+        **kwargs,
+    ):
+        # Keep the torch_npu operator argument name. pertoken_scale does not
+        # mean one scale for a whole token; the token dimension is indexed
+        # independently, and each token stores MX scales per BLOCK_K hidden values.
+        if pertoken_scale is None:
+            x, pertoken_scale = torch_npu.npu_dynamic_mx_quant(
+                x.bfloat16(), dst_type=torch_npu.float4_e2m1fn_x2)
+
+        mm1_mm3 = torch_npu.npu_grouped_matmul(
+            [x], [layer.w13_weight],
+            scale=[layer.w13_weight_scale],
+            per_token_scale=[pertoken_scale],
+            group_list=expert_tokens,
+            split_item=3,
+            output_dtype=torch.bfloat16,
+            group_type=0,
+            x_dtype=torch_npu.float4_e2m1fn_x2,
+            weight_dtype=torch_npu.float4_e2m1fn_x2,
+            scale_dtype=torch_npu.float8_e8m0fnu,
+            per_token_scale_dtype=torch_npu.float8_e8m0fnu,
+            group_list_type=group_list_type,
+            tuning_config=[0],
+        )[0]
+
+        mm1_mm3 = torch_npu.npu_swiglu(mm1_mm3)
+        intermediate_h, pertoken_scale = torch_npu.npu_dynamic_mx_quant(
+            mm1_mm3.bfloat16(), dst_type=torch_npu.float4_e2m1fn_x2)
+
+        return torch_npu.npu_grouped_matmul(
+            [intermediate_h], [layer.w2_weight],
+            scale=[layer.w2_weight_scale],
+            per_token_scale=[pertoken_scale],
+            group_list=expert_tokens,
+            split_item=3,
+            output_dtype=final_output_dtype,
+            group_type=0,
+            x_dtype=torch_npu.float4_e2m1fn_x2,
+            weight_dtype=torch_npu.float4_e2m1fn_x2,
+            scale_dtype=torch_npu.float8_e8m0fnu,
+            per_token_scale_dtype=torch_npu.float8_e8m0fnu,
+            group_list_type=group_list_type,
+            tuning_config=[0],
+        )[0]
+
+    def process_weights_after_loading(
+        self,
+        layer: torch.nn.Module,
+        is_transpose: bool = True,
+        is_nz: bool = True,
+        **kwargs,
+    ) -> None:
+        w13_weight = transpose_packed_fp4(
+            layer.w13_weight.data.contiguous())
+        w2_weight = transpose_packed_fp4(
+            layer.w2_weight.data.contiguous())
+        w13_weight_scale = reshape_mx_scale(
+            layer.w13_weight_scale.data).transpose(1, 2).contiguous()
+        w2_weight_scale = reshape_mx_scale(
+            layer.w2_weight_scale.data).transpose(1, 2).contiguous()
+
+        layer.w13_weight = Parameter(w13_weight, requires_grad=False)
+        layer.w2_weight = Parameter(w2_weight, requires_grad=False)
+        layer.w13_weight_scale = Parameter(
+            w13_weight_scale, requires_grad=False)
+        layer.w2_weight_scale = Parameter(
+            w2_weight_scale, requires_grad=False)
+
+
+class MxFp4LinearMethod(LinearMethodBase):
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        **kwargs,
+    ) -> None:
+        input_size_per_partition = kwargs["input_size_per_partition"]
+        output_partition_sizes = kwargs["output_partition_sizes"]
+        weight_loader: Callable = kwargs["weight_loader"]
+
+        if input_size_per_partition % PACK_FACTOR != 0:
+            raise ValueError(
+                "MXFP4 requires an even input size, but got "
+                f"{input_size_per_partition}.")
+
+        weight = Parameter(
+            torch.empty(
+                sum(output_partition_sizes),
+                input_size_per_partition // PACK_FACTOR,
+                dtype=torch.uint8,
+            ),
+            requires_grad=False,
+        )
+        set_weight_attrs(weight, {
+            "input_dim": 1,
+            "output_dim": 0,
+            "packed_dim": 1,
+            "pack_factor": PACK_FACTOR,
+            "weight_loader": weight_loader,
+        })
+        layer.register_parameter("weight", weight)
+
+        weight_scale = Parameter(
+            torch.empty(
+                sum(output_partition_sizes),
+                math.ceil(input_size_per_partition / BLOCK_K),
+                dtype=torch.uint8,
+            ),
+            requires_grad=False,
+        )
+        set_weight_attrs(weight_scale, {
+            "input_dim": 1,
+            "output_dim": 0,
+            "weight_loader": weight_loader,
+        })
+        layer.register_parameter("weight_scale", weight_scale)
+        setattr(layer, "init_state", BEFORE_INIT)
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: Optional[torch.Tensor],
+        dynamic_scale: Optional[torch.Tensor] = None,
+        out_dtype: Optional[torch.dtype] = torch.bfloat16,
+        return_scale: bool = False,
+    ) -> Union[torch.Tensor, Dict[str, Any]]:
+        output_shape = x.shape[:-1]
+        x = x.view(-1, x.shape[-1])
+
+        original_m = x.shape[0]
+        pad_m = dynamic_scale is None and original_m == 1
+        if pad_m:
+            # Pad single-token input to avoid the FP4 quant matmul
+            # kernel's m == 1 limitation.
+            x = torch.cat([x, x], dim=0)
+
+        if dynamic_scale is None:
+            x, x_scale = torch_npu.npu_dynamic_mx_quant(
+                x.bfloat16(), dst_type=torch_npu.float4_e2m1fn_x2)
+        else:
+            x_scale = dynamic_scale
+
+        activation_scale = x_scale[:original_m] if pad_m else x_scale
+        if out_dtype == torch.int32:
+            return_scale = True
+            matmul_out_dtype = torch.bfloat16
+        else:
+            matmul_out_dtype = out_dtype or torch.bfloat16
+
+        # Keep the torch_npu operator argument name. pertoken_scale does not
+        # mean one scale for a whole token; the token dimension is indexed
+        # independently, and each token stores MX scales per BLOCK_K hidden values.
+        output = torch_npu.npu_quant_matmul(
+            x,
+            layer.weight,
+            layer.weight_scale,
+            pertoken_scale=x_scale,
+            bias=bias,
+            output_dtype=matmul_out_dtype,
+            x1_dtype=torch_npu.float4_e2m1fn_x2,
+            x2_dtype=torch_npu.float4_e2m1fn_x2,
+            scale_dtype=torch_npu.float8_e8m0fnu,
+            pertoken_scale_dtype=torch_npu.float8_e8m0fnu,
+            group_sizes=[1, 1, BLOCK_K],
+        )
+        if pad_m:
+            output = output[:original_m]
+        output = output.view(output_shape + (-1,))
+        if return_scale:
+            return output, activation_scale
+        return output
+
+    apply_weights = apply
+
+    def process_weights_after_loading(
+        self,
+        layer: torch.nn.Module,
+        is_transpose: bool = True,
+        is_nz: bool = True,
+        scales_dtype=None,
+    ) -> None:
+        weight = layer.weight
+        weight_scale = layer.weight_scale
+
+        if is_transpose:
+            weight.data = transpose_packed_fp4(weight.data)
+            weight_scale.data = reshape_mx_scale(
+                weight_scale.data).transpose(0, 1).contiguous()
+        else:
+            weight.data = weight.data.contiguous()
+            weight_scale.data = reshape_mx_scale(
+                weight_scale.data).contiguous()
+        setattr(layer, "init_state", AFTER_INIT)
+        layer.weight = Parameter(weight, requires_grad=False)
+        layer.weight_scale = Parameter(weight_scale, requires_grad=False)
 
 
 class UpGateW4A4DownW4A8MxFp4MoEGMMMethod(W4A8MxFp4MoEGMMMethod):

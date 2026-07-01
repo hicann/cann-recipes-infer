@@ -86,7 +86,7 @@ Qwen3-MoE模型是2025年开源的大语言模型，包括Qwen3-235B-A22B与Qwen
 
 ## 权重转换
 
-本样例在950系列产品上支持Qwen3-MoE模型量化W4A8混精推理，基于`models\qwen3_moe\utils\convert_model.py`可以完成从Bfloat16到W4A8 MXFP8的权重转换。
+本样例在950系列产品上支持Qwen3-MoE模型量化推理，基于`models\qwen3_moe\utils\convert_model.py`可以完成从Bfloat16到W4A8 MXFP8和A4W4 MXFP4的权重转换。默认不增加额外参数时，转换脚本保持原有W4A8 MXFP8流程；只有显式指定`--quant_type w4a4c16`时，才进入A4W4 MXFP4转换。
 
 > 入参介绍：`input_bf16_hf_path`：原始Bfloat16权重路径；`output_hf_path`：转换后输出的权重路径。
 
@@ -101,8 +101,51 @@ source ${cann_path}/bin/setenv.bash
 
 ```bash
 # 转换为W4A8权重
-python models/longcat_flash/utils/convert_model.py --input_bf16_hf_path /data/models/Qwen3-235B-A22B --output_hf_path /data/models/Qwen3-235B-A22B-MXFP48
+python models/qwen3_moe/utils/convert_model.py --input_bf16_hf_path /data/models/Qwen3-235B-A22B --output_hf_path /data/models/Qwen3-235B-A22B-MXFP48
 ```
+
+### MXFP4 + Hadamard 权重转换
+
+当 Attention Linear 采用 A4W4 MXFP4 量化时，低 bit 量化对 outlier 更敏感，可能带来较明显的精度损失；MoE MXFP4 对精度影响相对较小。为降低 Attention Linear 低 bit 量化中的 outlier 影响，可以在离线权重转换阶段融合 Hadamard 变换参数。
+
+1. 下载并解压 Hadamard 参数。
+
+```bash
+wget -O quant_params_attn-linear_4_24.rar https://cann-ai.obs.cn-north-4.myhuaweicloud.com/cann-quantization/quant_params_attn-linear_4_24.rar
+mkdir -p /data/models/quant_params_attn-linear_4_24
+unrar x quant_params_attn-linear_4_24.rar /data/models/quant_params_attn-linear_4_24/
+```
+
+解压后的目录中应包含按层保存的 `layer_<layer_idx>_self_attn.pt` 文件；如果解压后多了一层子目录，请在后续命令中使用实际包含该文件的目录。
+
+2. 转换为 A4W4 MXFP4 权重，并在转换阶段融合 Hadamard 参数。
+
+```bash
+cd /path/to/cann-recipes-infer
+
+python models/qwen3_moe/utils/convert_model.py \
+  --input_bf16_hf_path /data/models/Qwen3-235B-A22B \
+  --output_hf_path /data/models/Qwen3-235B-A22B-W4A4-Hadamard \
+  --quant_type w4a4c16 \
+  --hadamard_weight_path /data/models/quant_params_attn-linear_4_24
+```
+
+3. 推理时使用 MXFP4 + Hadamard YAML 样例。
+
+```yaml
+model_config:
+  model_path: "/data/models/Qwen3-235B-A22B-W4A4-Hadamard"
+  enable_hadamard: True
+  hadamard_weight_path: "/data/models/quant_params_attn-linear_4_24"
+```
+
+完整 YAML 可参考：
+
+```text
+models/qwen3_moe/config/qwen3_235b_mxfp4_hadamard.yaml
+```
+
+> 说明：Hadamard 只在 Attention Linear A4W4 MXFP4 通路启用。旧的 W4A8 MXFP8 推理链路即使配置了 `enable_hadamard` 和 `hadamard_weight_path`，也不会进入 Hadamard 分支。
 
 ## 推理执行
 

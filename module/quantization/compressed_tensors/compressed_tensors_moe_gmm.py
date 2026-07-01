@@ -22,7 +22,11 @@ from torch.nn import Parameter
 from module.utils import set_weight_attrs
 from module.fuse_moe_gmm import FusedMoeWeightScaleSupported
 from module.quantization import QuantizeMethodBase
-from module.quantization.mxfp4 import W4A8MxFp4MoEGMMMethod, UpGateW4A4DownW4A8MxFp4MoEGMMMethod
+from module.quantization.mxfp4 import (
+    W4A8MxFp4MoEGMMMethod,
+    W4A4MxFp4MoEGMMMethod,
+    UpGateW4A4DownW4A8MxFp4MoEGMMMethod,
+)
 from .utils import get_moe_target, is_quantization_scheme_of_moe_projs_same
 
 
@@ -52,6 +56,8 @@ class CompressedTensorsMoEGMMMethod(QuantizeMethodBase):
                 return CompressedTensorW4A8Int8MoEGMMMethod()
             elif quant_config.is_dynamic_token_w4a8_mxfp8(weight_quant, input_quant):
                 return W4A8MxFp4MoEGMMMethod()
+            elif quant_config.is_dynamic_token_w4a4_mxfp4(weight_quant, input_quant):
+                return W4A4MxFp4MoEGMMMethod()
             else:
                 raise RuntimeError(
                     f"Unsupported FusedMoe scheme: {weight_quant}, {input_quant}")

@@ -37,7 +37,11 @@ from module.linear import (
     VocabParallelEmbedding
     )
 from module.fuse_moe_gmm import FusedMoEGMM
-from module.quantization.mxfp4 import W4A8MxFp4MoEGMMMethod 
+from module.quantization.mxfp4 import (
+    UpGateW4A4DownW4A8MxFp4MoEGMMMethod,
+    W4A4MxFp4MoEGMMMethod,
+    W4A8MxFp4MoEGMMMethod,
+)
 from executor.utils import calc_moe_hccl_buffer_size
 from executor.utils.forward_metadata import ForwardMetaData, get_forward_metadata
 from executor.core.config import InferenceConfig, CommManager
@@ -46,6 +50,21 @@ from executor.model_loader.weight_utils import default_weight_loader
 from .configuration_qwen3_moe import Qwen3MoeConfig
 
 torchair.patch_for_hcom()
+
+
+def _get_quant_mode(config, attr: str, default: str = "w16a16") -> str:
+    quant_config = getattr(config, "quant_config", None)
+    return getattr(quant_config, attr, default) if quant_config is not None else default
+
+
+def hadamard_transform(x, hadamard):
+    ori_shape = x.shape
+    x_dtype = x.dtype
+    x = x.reshape(-1, 128).float()
+    hadamard = hadamard.float()
+    x = x.matmul(hadamard)
+    x = x.reshape(ori_shape).to(x_dtype)
+    return x
 
 
 class Qwen3MoeRMSNorm(nn.Module):
@@ -158,11 +177,8 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         self.force_eplb = infer_config.model_config.force_eplb
         self.ep_size = self.infer_config.parallel_config.moe_ep_size
         self.tp_size = self.infer_config.parallel_config.moe_tp_size
-        self.gmm_quant_mode = (
-            config.quant_config.gmm_quant_mode
-            if config.quant_config is not None
-            else "w16a16"
-        )
+        self.gmm_quant_mode = _get_quant_mode(config, "gmm_quant_mode")
+        self.mm_quant_mode = _get_quant_mode(config, "mm_quant_mode")
         self.experts = FusedMoEGMM(
             num_experts=self.num_experts,
             hidden_size=self.hidden_dim,
@@ -180,8 +196,12 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         self.row_idx_decode = torch.arange(
             0, self.row_idx_decode_len,
             dtype=torch.int32).view(self.top_k, -1).permute(1, 0).contiguous().npu()
-        # Use w4a8 for MOE
-        self.prefill_opt = (self.attn_tp_size == self.moe_ep_size and self.gmm_quant_mode == "w4a8mxfloat4")
+        # Keep the existing W4A8 MoE prefill path, but do not feed FP8 activations to A4W4 attention.
+        self.prefill_opt = (
+            self.attn_tp_size == self.moe_ep_size
+            and self.gmm_quant_mode == "w4a8mxfloat4"
+            and self.mm_quant_mode != "w4a4mxfloat4"
+        )
 
     def init_gate(self, prefix):
         self.norm_topk_prob = self.config.norm_topk_prob
@@ -506,10 +526,8 @@ class Qwen3MoeAttention(nn.Module):
                 "to errors during the forward call, if caching is used. Please make sure to provide a `layer_idx` "
                 "when creating this class."
             )
-        self.mm_quant_mode = (
-            config.quant_config.mm_quant_mode
-            if config.quant_config is not None
-            else "w16a16")
+        self.mm_quant_mode = _get_quant_mode(config, "mm_quant_mode")
+        self.gmm_quant_mode = _get_quant_mode(config, "gmm_quant_mode")
         self.kv_cache_quant_mode = (
             config.quant_config.kv_cache_quant_mode
             if config.quant_config is not None
@@ -551,8 +569,16 @@ class Qwen3MoeAttention(nn.Module):
         self.k_norm = Qwen3MoeRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.batch_size = infer_config.scheduler_config.batch_size
         self.input_len = infer_config.data_config.input_truncated_len
-        # Use w8a8 for attention
-        self.prefill_opt = (self.attn_tp_size == self.moe_ep_size and self.mm_quant_mode == "w8a8mxfloat8")
+        # Keep the existing W4A8 MoE prefill path, but do not feed FP8 activations to A4W4 attention.
+        self.prefill_opt = (
+            self.attn_tp_size == self.moe_ep_size
+            and self.gmm_quant_mode == "w4a8mxfloat4"
+            and self.mm_quant_mode != "w4a4mxfloat4"
+        )
+        self.enable_hadamard = (
+            infer_config.model_config.enable_hadamard
+            and self.mm_quant_mode == "w4a4mxfloat4"
+        )
 
         self.o_proj = RowParallelLinear(self.attn_intermediate_size,
                                         config.hidden_size,
@@ -621,6 +647,29 @@ class Qwen3MoeAttention(nn.Module):
                 block_size=self.block_size,
                 tensor_setter=lambda tensor, layer=self: setattr(layer, "vs_cache", tensor),
                 )
+            )
+
+        if self.enable_hadamard:
+            self._load_hadamard_weights(
+                infer_config.model_config.hadamard_weight_path)
+
+    def _load_hadamard_weights(self, hadamard_weight_path: str) -> None:
+        if not hadamard_weight_path:
+            raise ValueError("enable_hadamard is True, but hadamard_weight_path is empty.")
+        weight_file = os.path.join(
+            hadamard_weight_path, f"layer_{self.layer_idx}_self_attn.pt")
+        if not os.path.exists(weight_file):
+            raise FileNotFoundError(
+                f"Hadamard weight file not found for layer {self.layer_idx}: {weight_file}")
+        layer_weight = torch.load(weight_file, map_location="cpu")
+        for buffer_name, weight_name in [
+            ("input_transform_weight", "input_transform.transform.linear.weight"),
+            ("output_transform_weight", "out_transform.transform.linear.weight"),
+        ]:
+            self.register_buffer(
+                buffer_name,
+                layer_weight[weight_name].float().npu(),
+                persistent=False,
             )
 
     def kv_cache_update(
@@ -829,8 +878,12 @@ class Qwen3MoeAttention(nn.Module):
                     attn_output = gathered.view(tp_size, -1, out_shape_dim_last) \
                         .transpose(0, 1).contiguous() \
                         .view(-1, tp_size * out_shape_dim_last)
+                if self.enable_hadamard:
+                    attn_output = hadamard_transform(attn_output, self.output_transform_weight)
                 attn_output = self.o_proj(attn_output)
         else:            
+            if self.enable_hadamard:
+                attn_output = hadamard_transform(attn_output, self.output_transform_weight)
             attn_output = self.o_proj(attn_output)
             if is_prefill and q_len < padded_q_len:
                 pad_len = padded_q_len - q_len
@@ -895,6 +948,8 @@ class Qwen3MoeAttention(nn.Module):
             dist.all_gather_into_tensor(new_hidden_states, hidden_states, group=attn_tp_group)
             hidden_states = new_hidden_states
         
+        if self.enable_hadamard:
+            hidden_states = hadamard_transform(hidden_states, self.input_transform_weight)
         qkv = self.merged_qkv_proj(hidden_states, dynamic_scale=hidden_states_scale)
         output = self.exec_qkv(
             qkv=qkv,
@@ -943,8 +998,13 @@ class Qwen3MoeDecoderLayer(nn.Module):
         )
         self.batch_size = infer_config.scheduler_config.batch_size
         self.input_len = infer_config.data_config.input_truncated_len
-        self.gmm_quant_mode = config.quant_config.gmm_quant_mode if config.quant_config is not None else "w16a16"
-        self.prefill_opt = (self.attn_tp_size == self.moe_ep_size and self.gmm_quant_mode == "w4a8mxfloat4")
+        self.mm_quant_mode = _get_quant_mode(config, "mm_quant_mode")
+        self.gmm_quant_mode = _get_quant_mode(config, "gmm_quant_mode")
+        self.prefill_opt = (
+            self.attn_tp_size == self.moe_ep_size
+            and self.gmm_quant_mode == "w4a8mxfloat4"
+            and self.mm_quant_mode != "w4a4mxfloat4"
+        )
 
     def forward(
         self,
@@ -1037,8 +1097,13 @@ class Qwen3MoeModel(nn.Module):
         )
         self.norm = Qwen3MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen3MoeRotaryEmbedding(config=config, max_position_embeddings=self.max_position_embeddings)
-        self.gmm_quant_mode = config.quant_config.gmm_quant_mode if config.quant_config is not None else "w16a16"
-        self.prefill_opt = (self.attn_tp_size == self.moe_ep_size and self.gmm_quant_mode == "w4a8mxfloat4")
+        self.mm_quant_mode = _get_quant_mode(config, "mm_quant_mode")
+        self.gmm_quant_mode = _get_quant_mode(config, "gmm_quant_mode")
+        self.prefill_opt = (
+            self.attn_tp_size == self.moe_ep_size
+            and self.gmm_quant_mode == "w4a8mxfloat4"
+            and self.mm_quant_mode != "w4a4mxfloat4"
+        )
 
     def forward(
         self,
@@ -1106,7 +1171,7 @@ class Qwen3MoeModel(nn.Module):
 
         if is_prefill:
             seq_index = cu_seq_lens_q - 1
-            if self.attn_tp_size > 1:
+            if self.attn_tp_size > 1 and (self.attn_dp_size > 1 or prefill_sp):
                 q_len, hidden_size = hidden_states.size()
                 gathered_hidden_states = torch.empty(
                     [self.attn_tp_size * q_len, hidden_size],
@@ -1327,7 +1392,7 @@ class Qwen3MoeForCausalLM(nn.Module):
                     # Do not modify `name` since the loop may continue here
                     # Instead, create a new variable
                     name_mapped = name.replace(weight_name, param_name)
-  
+
                     # Skip loading extra parameters for GPTQ/modelopt models.
                     if name_mapped.endswith(".bias") and name_mapped not in params_dict:
                         continue
@@ -1372,7 +1437,11 @@ class Qwen3MoeForCausalLM(nn.Module):
         for module_name, module in self.named_modules():
             quant_method = getattr(module, "quant_method", None)
             if quant_method is not None:
-                if isinstance(quant_method, W4A8MxFp4MoEGMMMethod):
+                if (isinstance(quant_method, W4A8MxFp4MoEGMMMethod)
+                        and not isinstance(quant_method, (
+                            W4A4MxFp4MoEGMMMethod,
+                            UpGateW4A4DownW4A8MxFp4MoEGMMMethod,
+                        ))):
                     quant_method.process_weights_after_loading(
                         module,
                         is_nz=self.infer_config.model_config.enable_weight_nz,

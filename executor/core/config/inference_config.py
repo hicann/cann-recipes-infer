@@ -95,6 +95,8 @@ class ModelConfig:
 
         enable_profiler: Enable profiler (default: False)
         enable_weight_nz: Whether to enable NZ format for weights (default: True)
+        enable_hadamard: Whether to enable Hadamard transform for supported quantized models (default: False)
+        hadamard_weight_path: Path to offline Hadamard transform weights (default: "")
     """
     model_name: str = "model"
     model_path: str = ""
@@ -112,6 +114,8 @@ class ModelConfig:
     enable_profiler: bool = False
 
     enable_weight_nz: bool = True
+    enable_hadamard: bool = False
+    hadamard_weight_path: str = ""
 
     custom_params: dict = field(default_factory=dict)
 
@@ -137,6 +141,8 @@ class ModelConfig:
             force_eplb=model_config_dict.get("force_eplb", False),
             enable_profiler=model_config_dict.get("enable_profiler", False),
             enable_weight_nz=model_config_dict.get("enable_weight_nz", True),
+            enable_hadamard=model_config_dict.get("enable_hadamard", False),
+            hadamard_weight_path=model_config_dict.get("hadamard_weight_path", ""),
             custom_params=model_config_dict.get("custom_params", {}),
         )
         model_config._validate()
