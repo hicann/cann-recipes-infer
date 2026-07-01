@@ -79,7 +79,7 @@ global_last_recurrent_state = None
 global_core_attn_out = None
 global_mask = None
 global_mask_diagonal = None
-_QWEN3_5_IS_950_PLATFORM: bool | None = None
+_PLATFORM_VERSION: str | None = None
 
 
 def qwen3_5_prefill_mm_all_reduce(
@@ -278,29 +278,24 @@ def _normalize_quantization_method(quantization: str | None) -> str | None:
     return quantization.lower().replace("compressed_tensors", "compressed-tensors")
 
 
-def _is_qwen3_5_950_platform() -> bool:
-    global _QWEN3_5_IS_950_PLATFORM
-    if _QWEN3_5_IS_950_PLATFORM is not None:
-        return _QWEN3_5_IS_950_PLATFORM
+def _get_platform_version(infer_config: InferenceConfig | dict) -> str:
+    global _PLATFORM_VERSION
+    if _PLATFORM_VERSION is not None:
+        return _PLATFORM_VERSION
 
-    try:
-        device_name = torch.npu.get_device_name()
-    except (AttributeError, RuntimeError) as exc:
-        logger.warning("Failed to get NPU device name, treat as non-950 platform: %s", exc)
-        _QWEN3_5_IS_950_PLATFORM = False
-        return _QWEN3_5_IS_950_PLATFORM
+    platform_version = infer_config.model_config.platform_version
 
-    _QWEN3_5_IS_950_PLATFORM = "950" in device_name
-    if not _QWEN3_5_IS_950_PLATFORM:
-        logger.debug("Qwen3.5 detected non-950 NPU device name: %s", device_name)
-    return _QWEN3_5_IS_950_PLATFORM
+    _PLATFORM_VERSION = getattr(platform_version, "value", platform_version)
+    return _PLATFORM_VERSION
 
 
-def _validate_qwen3_5_quantization_support(config, infer_config: InferenceConfig) -> None:
+def _validate_qwen3_5_quantization_support(
+    config,
+    infer_config: InferenceConfig,
+) -> None:
     model_config = infer_config.model_config
     custom_params = model_config.custom_params or {}
 
-    is_950_platform = _is_qwen3_5_950_platform()
     exe_mode = model_config.exe_mode
 
     quantization = None
@@ -311,22 +306,37 @@ def _validate_qwen3_5_quantization_support(config, infer_config: InferenceConfig
     if custom_params.get("enable_online_mxfp8_quantization", False):
         quantization = "mxfp8"
 
-    if not is_950_platform and quantization in {"fp8", "mxfp8"}:
+    if _PLATFORM_VERSION != "950" and quantization in {"fp8", "mxfp8"}:
         raise ValueError(
-            f"Qwen3.5 {quantization} is only supported on Atlas 950."
+            f"The received model config platform_version is {_PLATFORM_VERSION}.\n"
+            f"Qwen3.5 {quantization} is not supported on Atlas {_PLATFORM_VERSION}."
         )
 
-    if is_950_platform and quantization == "mxfp8" and exe_mode == "ge_graph":
+    if _PLATFORM_VERSION == "950" and quantization == "mxfp8" and exe_mode == "ge_graph":
         raise ValueError(
-            f"Qwen3.5 mxfp8 is not supported with {exe_mode=} on Atlas 950."
+            f"The received model config platform_version is {_PLATFORM_VERSION}.\n"
+            f"Qwen3.5 mxfp8 is not supported with {exe_mode} on Atlas {_PLATFORM_VERSION}."
+        )
+
+
+def _validate_qwen3_5_mm_all_reduce_base_support(infer_config: InferenceConfig) -> None:
+    model_config = infer_config.model_config
+    custom_params = model_config.custom_params or {}
+
+    if (
+        custom_params.get("enable_mm_all_reduce_base", False)
+        and _PLATFORM_VERSION == "A3"
+    ):
+        raise ValueError(
+            f"The received model config platform_version is {_PLATFORM_VERSION}.\n"
+            "Qwen3.5 enable_mm_all_reduce_base is only supported on Atlas 950."
         )
 
 
 def _configure_qwen3_5_npugraph(infer_config: InferenceConfig) -> None:
-    is_950_platform = _is_qwen3_5_950_platform()
     exe_mode = infer_config.model_config.exe_mode
 
-    if not is_950_platform and exe_mode == "npugraph_ex":
+    if _PLATFORM_VERSION != "950" and exe_mode == "npugraph_ex":
         torch.npu.config.allow_internal_format = False
         torch.npu.set_compile_mode(jit_compile=False)
 
@@ -1055,9 +1065,9 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
 
         self.causal_conv1d_fn = causal_conv1d_fn
         self.causal_conv1d_update = causal_conv1d_update or torch_causal_conv1d_update
-        self.is_950_platform = _is_qwen3_5_950_platform()
         self.use_npu_chunk_gated_delta_rule = (
-            not self.is_950_platform and hasattr(torch_npu, "npu_chunk_gated_delta_rule")
+            _PLATFORM_VERSION != "950"
+            and hasattr(torch_npu, "npu_chunk_gated_delta_rule")
         )
 
         self.chunk_gated_delta_rule = chunk_gated_delta_rule or torch_chunk_gated_delta_rule
@@ -2094,8 +2104,6 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
             comm_manager.get_rank("moe_ep_group") if self.moe_ep_size > 1 else 0
         )
         self.exe_mode = infer_config.model_config.exe_mode
-        self.is_950_platform = _is_qwen3_5_950_platform()
-
         self.experts_per_rank = self.num_experts // self.moe_ep_size
         self.local_expert_start = self.moe_ep_rank * self.experts_per_rank
         self.local_expert_end = self.local_expert_start + self.experts_per_rank
@@ -2334,7 +2342,7 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
         }
         if use_mxfp8:
             dispatch_args["y_dtype"] = torch.float8_e4m3fn
-        if not self.is_950_platform:
+        if _PLATFORM_VERSION != "950":
             dispatch_args["comm_alg"] = "fullmesh_v2"
         output = torch_npu.npu_moe_distribute_dispatch_v2(**dispatch_args)
         expand_x, expand_scales, assist_info_for_combine, expert_token_num, ep_recv_counts, tp_recv_counts = output[:6]
@@ -2769,8 +2777,10 @@ class Qwen3_5MoeForCausalLM(nn.Module):
     def __init__(self, config, infer_config, comm_manager, prefix: str = ""):
     # def __init__(self, config):
         super().__init__()
+        _get_platform_version(infer_config)
         _init_qwen3_5_quant_config(config, infer_config)
         _validate_qwen3_5_quantization_support(config, infer_config)
+        _validate_qwen3_5_mm_all_reduce_base_support(infer_config)
         _configure_qwen3_5_npugraph(infer_config)
         self.config = config
         self.infer_config = infer_config
@@ -2785,7 +2795,6 @@ class Qwen3_5MoeForCausalLM(nn.Module):
         self.shared_tp_size = infer_config.parallel_config.shared_tp_size
         self.moe_tp_size = infer_config.parallel_config.moe_tp_size
         self.moe_ep_size = infer_config.parallel_config.moe_ep_size
-        self.is_950_platform = _is_qwen3_5_950_platform()
 
         # Initialize communication groups before creating model components
         self.init_parallel_comm_group()
@@ -2853,7 +2862,7 @@ class Qwen3_5MoeForCausalLM(nn.Module):
         # MoE EP group
         if self.moe_ep_size > 1:
             moe_ep_group_num = self.world_size // self.moe_ep_size
-            moe_ep_group_type = 0 if self.is_950_platform else None
+            moe_ep_group_type = 0 if _PLATFORM_VERSION == "950" else None
             self.comm_manager.register_group(
                 name="moe_ep_group",
                 group_num=moe_ep_group_num,
@@ -2866,7 +2875,7 @@ class Qwen3_5MoeForCausalLM(nn.Module):
         # MoE EP group for MC2 (dispatch/combine fusion)
         if self.moe_ep_size > 1 and self.moe_tp_size == 1:
             moe_ep_mc2_buffer_size = calc_moe_hccl_buffer_size(
-                self.infer_config, self.config, is_full_mesh_v2=not self.is_950_platform
+                self.infer_config, self.config, is_full_mesh_v2=_PLATFORM_VERSION != "950"
             )
             self.comm_manager.register_group(
                 name="moe_ep_group_mc2",
@@ -2876,7 +2885,7 @@ class Qwen3_5MoeForCausalLM(nn.Module):
                 return_name=True,
                 allow_physical_reuse=False,
                 hccl_buffer_size=moe_ep_mc2_buffer_size,
-                group_type=3 if self.is_950_platform else None,
+                group_type=3 if _PLATFORM_VERSION == "950" else None,
             )
 
     def forward(

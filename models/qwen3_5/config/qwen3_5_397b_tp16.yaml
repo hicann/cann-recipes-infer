@@ -6,11 +6,10 @@ model_config:
   with_ckpt: True
   enable_cache_compile: False
   force_eplb: False
-  platform_version: "A3"
   custom_params:
       # enable_mm_all_reduce_base: Whether to fuse TP matmul and all_reduce with npu_mm_all_reduce_base (default: False)
       # enable_gdn_solve_triangular: Whether to use solve_triangular in Qwen3.5 GatedDeltaNet chunk rule (default: False)
-      enable_mm_all_reduce_base: False
+      enable_mm_all_reduce_base: False # Only support 950.
       enable_gdn_solve_triangular: False
 
 data_config:
