@@ -32,6 +32,7 @@ from typing import Any, Literal
 class PlatformVersion(Enum):
     """Supported platform versions for the refactored executor."""
 
+    A2 = "A2"
     A3 = "A3"
     ASCEND_950 = "950"
 
@@ -117,6 +118,11 @@ class ModelConfig:
     @classmethod
     def from_dict(cls, model_config_dict: dict) -> "ModelConfig":
         """Create ModelConfig from YAML-parsed dictionary."""
+        # Priority: YAML > env var PLATFORM_VERSION > default "A3"
+        platform_version_raw = model_config_dict.get("platform_version")
+        if platform_version_raw is None:
+            platform_version_raw = os.environ.get("PLATFORM_VERSION", PlatformVersion.A3.value)
+        model_config_dict["platform_version"] = platform_version_raw
         model_config = cls(
             model_name=model_config_dict.get("model_name", "model"),
             model_path=model_config_dict.get("model_path", ""),
@@ -124,9 +130,7 @@ class ModelConfig:
             dtype=model_config_dict.get("dtype", "bfloat16"),
             with_ckpt=model_config_dict.get("with_ckpt", True),
             next_n=model_config_dict.get("next_n", 0),
-            platform_version=PlatformVersion.from_value(
-                model_config_dict.get("platform_version", PlatformVersion.A3.value)
-            ),
+            platform_version=PlatformVersion.from_value(platform_version_raw),
             exe_mode=model_config_dict.get("exe_mode", "eager"),
             enable_cache_compile=model_config_dict.get("enable_cache_compile", False),
             enable_static_kernel=model_config_dict.get("enable_static_kernel", False),

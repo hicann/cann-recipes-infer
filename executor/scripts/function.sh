@@ -96,6 +96,38 @@ function resolve_pd_role()
     fi
 }
 
+# Auto-detect platform version from NPU device name via torch.npu.get_device_name().
+# Substring mapping: "950" -> "950", "910_93" -> "A3", "910B" -> "A2".
+# Falls back to "A3" with a warning when detection fails or the name is unrecognised.
+# Idempotent — only runs once; subsequent calls reuse DETECTED_PLATFORM_VERSION.
+function detect_platform_version()
+{
+    if [ -n "${DETECTED_PLATFORM_VERSION}" ]; then
+        return
+    fi
+
+    local device_name
+    device_name=$(python3 -c "import torch;import torch_npu; print(torch.npu.get_device_name())" 2>/dev/null)
+
+    if [ -z "$device_name" ]; then
+        echo "[WARN] torch.npu.get_device_name() failed, defaulting platform to A3"
+        export DETECTED_PLATFORM_VERSION="A3"
+        return
+    fi
+
+    if [[ "$device_name" == *"950"* ]]; then
+        export DETECTED_PLATFORM_VERSION="950"
+    elif [[ "$device_name" == *"910_93"* ]]; then
+        export DETECTED_PLATFORM_VERSION="A3"
+    elif [[ "$device_name" == *"910B"* ]]; then
+        export DETECTED_PLATFORM_VERSION="A2"
+    else
+        echo "[WARN] Unknown device: $device_name, defaulting platform to A3"
+        export DETECTED_PLATFORM_VERSION="A3"
+    fi
+    echo "[INFO] Detected platform version: ${DETECTED_PLATFORM_VERSION} (device: ${device_name})"
+}
+
 function get_rank()
 {
     mode=$1
@@ -111,7 +143,16 @@ function get_rank()
     fi
     filename=$(basename "$YAML")
     world_size=$(python3 -c "import yaml; cfg=yaml.safe_load(open('$YAML')); print(cfg.get('parallel_config', {}).get('world_size', cfg.get('world_size')))")
-    platform_version=$(python3 -c "import yaml; print(yaml.safe_load(open('$YAML'))['model_config'].get('platform_version'))")
+    detect_platform_version
+    yaml_platform_version=$(python3 -c "import yaml; cfg=yaml.safe_load(open('$YAML')); print(cfg.get('model_config', {}).get('platform_version'))")
+    if [ "$yaml_platform_version" != "None" ] && [ -n "$yaml_platform_version" ]; then
+        platform_version="$yaml_platform_version"
+        echo "[INFO] Using platform_version from YAML: ${platform_version}"
+    else
+        platform_version="${DETECTED_PLATFORM_VERSION}"
+        echo "[INFO] Using auto-detected platform_version: ${platform_version}"
+    fi
+    export PLATFORM_VERSION="${platform_version}"
     if [ "$platform_version" = "950" ]; then
         chip_num=8
     else
