@@ -373,10 +373,10 @@ kv_b_proj_w_v = kv_b_proj_w[:, qk_nope_head_dim:, :]   # (N, 128, 512)
 
 | 模型 | 路径 | 关键参考点 |
 |------|------|-----------|
-| **longcat-flash**（同架构，最重要参考） | `models/longcat-flash/models/modeling_longcat_flash.py` | MLA 压缩缓存 + PA + FA v1 BSND_NBSD + npu_kv_rmsnorm_rope_cache + absorb 后 matmul kv_b_proj_w_v |
-| kimi-k2-thinking | `models/kimi-k2-thinking/models/modeling_deepseek.py` | MLA + PA + FA v1 TND_NTD + npu_mla_prolog_v3 融合算子 + NZ 格式 cache |
-| deepseek-r1 | `models/deepseek-r1/models/modeling_deepseek.py` | MLA + PA + FA v2 TND_NTD + absorb |
-| qwen3-moe | `models/qwen3-moe/models/modeling_qwen3_moe.py` | 连续缓存 + FA v1 BSH（非 MLA 参考） |
+| **longcat-flash**（同架构，最重要参考） | `models/longcat_flash/models/modeling_longcat_flash.py` | MLA 压缩缓存 + PA + FA v1 BSND_NBSD + npu_kv_rmsnorm_rope_cache + absorb 后 matmul kv_b_proj_w_v |
+| kimi-k2-thinking | `models/kimi_k2_thinking/models/modeling_deepseek.py` | MLA + PA + FA v1 TND_NTD + npu_mla_prolog_v3 融合算子 + NZ 格式 cache |
+| deepseek-r1 | `models/deepseek_r1/models/modeling_deepseek.py` | MLA + PA + FA v2 TND_NTD + absorb |
+| qwen3-moe | `models/qwen3_moe/models/modeling_qwen3_moe.py` | 连续缓存 + FA v1 BSH（非 MLA 参考） |
 
 **关键代码位置**：
 - longcat-flash cache 初始化：`modeling_longcat_flash.py` L1778-1809（cache_nope/cache_rope shape 定义）

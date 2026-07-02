@@ -31,7 +31,7 @@ ops/            # 自定义算子：AscendC、PyPTO、TileLang
 accelerator/    # 加速组件
 docs/           # 设计文档、模型文档
 dataset/        # 数据集和默认 prompt
-contrib/        # 社区贡献模型
+integration/custom/        # 社区贡献模型
 scripts/        # 工具脚本
 ```
 

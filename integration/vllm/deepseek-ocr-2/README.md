@@ -64,7 +64,7 @@ modelscope download --model deepseek-ai/DeepSeek-OCR-2 --local_dir /data/models/
 ```bash
 cd /workspace
 git clone https://gitcode.com/cann/cann-recipes-infer.git
-cd cann-recipes-infer/contrib/vllm-deepseek-ocr-2
+cd cann-recipes-infer/integration/vllm/deepseek-ocr-2
 ```
 执行转换脚本
 ```bash
@@ -145,7 +145,7 @@ python benchmark.py --image /path/to/image.jpg --concurrent 1,8,16 --warmup 2 --
 ## 项目结构
 
 ```
-vllm-deepseek-ocr-2/
+deepseek-ocr-2/
 ├── convert_to_npu.sh           # 一键转换脚本
 ├── README.md
 ├── LICENSE

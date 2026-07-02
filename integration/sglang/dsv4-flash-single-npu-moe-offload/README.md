@@ -18,7 +18,7 @@
 | **NPU** | 1× Atlas 910B（64 GB HBM）或 A3。运行占 HBM ~16–20 GB（常驻 expert）+ attention + KV |
 | **CPU** | aarch64，ARMv8.2-A + NEON dotprod（SDOT）；**不需要** SVE/BF16/I8MM。核越多越好（decode 内存带宽受限，默认 128 线程跨 8 NUMA）。验证于 Kunpeng-920（192 核 / 8 NUMA） |
 | **DDR（内存）** | **≥ 160 GiB 可用，推荐 ≥ 256 GiB**：要把 ~138 GiB 的 MXFP4 GGUF 常驻 page cache。decode 是内存带宽瓶颈 → **多通道高带宽（DDR4-3200+ / 多 NUMA）直接决定吞吐**，不只是容量。验证于 1.5 TB（8 NUMA） |
-| **磁盘** | 见下表。**建议预留 ≥ 600 GiB**（转换期 W8A8 + 原生 MXFP4 源 + 生成 GGUF 三者并存峰值 ~560 GiB）；GGUF 转完并校验后删原生 MXFP4 源，serving 常驻降到 ~415 GiB（见 `../../docs/models/dsv4-flash-single-npu-moe-offload/dsv4_flash_single_card_inference_guide.md` §5） |
+| **磁盘** | 见下表。**建议预留 ≥ 600 GiB**（转换期 W8A8 + 原生 MXFP4 源 + 生成 GGUF 三者并存峰值 ~560 GiB）；GGUF 转完并校验后删原生 MXFP4 源，serving 常驻降到 ~415 GiB（见 `../../../docs/integration/sglang/dsv4-flash-single-npu-moe-offload/dsv4_flash_single_card_inference_guide.md` §5） |
 
 权重/产物实际大小（本环境实测）：
 
@@ -28,15 +28,15 @@
 | 原生 MXFP4 源（HuggingFace） | **~150 GiB** | 仅转换/校验用，转完可删 |
 | MXFP4 GGUF（43 层，转换产物） | **~138 GiB** | CPU 专家，serving 常驻 |
 
-> 下载地址与流程见 `../../docs/models/dsv4-flash-single-npu-moe-offload/dsv4_flash_single_card_inference_guide.md` §1。
+> 下载地址与流程见 `../../../docs/integration/sglang/dsv4-flash-single-npu-moe-offload/dsv4_flash_single_card_inference_guide.md` §1。
 
 ## 交付物
 
 | 内容 | 位置 |
 |---|---|
 | **代码补丁**（仅三仓源码改动） | `main_repo/` `sglang/` `llama_cpp/` + `apply_all.sh` |
-| **使用文档**（端到端步骤） | `../../docs/models/dsv4-flash-single-npu-moe-offload/dsv4_flash_single_card_inference_guide.md` |
-| **方案文档**（架构/量化/roadmap/已证伪） | `../../docs/models/dsv4-flash-single-npu-moe-offload/dsv4_flash_single_card_design.md` |
+| **使用文档**（端到端步骤） | `../../../docs/integration/sglang/dsv4-flash-single-npu-moe-offload/dsv4_flash_single_card_inference_guide.md` |
+| **方案文档**（架构/量化/roadmap/已证伪） | `../../../docs/integration/sglang/dsv4-flash-single-npu-moe-offload/dsv4_flash_single_card_design.md` |
 | 独立脚本（转权重/拉起/校验，**不在 patch 内**） | `scripts/` |
 
 > **patch 只含三仓代码改动**；脚本、文档、权重都不进 patch。背景/方案/进度细节看 USAGE 与 DESIGN，本文不展开。
@@ -68,5 +68,5 @@
 
 ## 快速开始
 
-端到端步骤（拉镜像/权重 → 起容器 → clone 三仓到上述 SHA + 设 third_party → 打补丁 → 编译 → 转 GGUF → 拉起 → 连贯性验收）详见 [`../../docs/models/dsv4-flash-single-npu-moe-offload/dsv4_flash_single_card_inference_guide.md`](../../docs/models/dsv4-flash-single-npu-moe-offload/dsv4_flash_single_card_inference_guide.md)。
+端到端步骤（拉镜像/权重 → 起容器 → clone 三仓到上述 SHA + 设 third_party → 打补丁 → 编译 → 转 GGUF → 拉起 → 连贯性验收）详见 [`../../../docs/integration/sglang/dsv4-flash-single-npu-moe-offload/dsv4_flash_single_card_inference_guide.md`](../../../docs/integration/sglang/dsv4-flash-single-npu-moe-offload/dsv4_flash_single_card_inference_guide.md)。
 

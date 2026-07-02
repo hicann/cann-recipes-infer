@@ -97,7 +97,7 @@ export MODEL_PATH=/model/MiniMax-M2.5-MXFP4
 ### 1. 初始化环境
 
 ```bash
-cd /project/to/cann-recipes-infer/contrib/minimax_m2.5_mxfp4
+cd /project/to/cann-recipes-infer/integration/vllm/minimax_m2.5_mxfp4
 source set_env.sh
 ```
 

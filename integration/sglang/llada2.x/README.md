@@ -112,12 +112,12 @@ pip uninstall -y sglang
    git reset --hard 615a02dcd45adf875de698d2ba66b1cbef161aa5
 
    # 将修改本仓中的修改patch应用到sglang代码中
-   git am ../cann-recipes-infer/models/llada2.x-sglang/patches/*.patch
+   git am ../cann-recipes-infer/integration/sglang/llada2.x/patches/*.patch
    ```
 3. 基于patched之后的代码，重装sglang. 
    ```shell
    cd  ./python/
-   cp  ../../cann-recipes-infer/models/llada2.0-sglang/install_sglang_dev.sh ./
+   cp  ../../cann-recipes-infer/integration/sglang/llada2.x/install_sglang_dev.sh ./
    cp pyproject_npu.toml.toml pyproject.toml
    chmod +x install_sglang_dev.sh
    ./install_sglang_dev.sh

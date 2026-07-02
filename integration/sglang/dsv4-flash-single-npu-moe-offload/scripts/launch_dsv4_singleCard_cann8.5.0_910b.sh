@@ -62,4 +62,4 @@ docker run --rm -it \
   --shm-size "${SHM_SIZE}" \
   -p "${SERVICE_PORT}:${SERVICE_PORT}" \
   "${IMAGE}" bash
-# 进容器后按 docs/models/dsv4-flash-single-npu-moe-offload/dsv4_flash_single_card_inference_guide.md 继续（装 libhwloc → 拉代码 → 打补丁 → 编译 → 转 GGUF → 拉起）。
+# 进容器后按 docs/integration/sglang/dsv4-flash-single-npu-moe-offload/dsv4_flash_single_card_inference_guide.md 继续（装 libhwloc → 拉代码 → 打补丁 → 编译 → 转 GGUF → 拉起）。

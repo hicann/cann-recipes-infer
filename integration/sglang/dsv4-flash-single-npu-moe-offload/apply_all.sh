@@ -58,5 +58,5 @@ apply_set "$SGLANG"  "sglang"
 apply_set "$LLAMA"   "llama_cpp"  -p1
 
 echo
-echo "All code patches applied. Next: docs/models/dsv4-flash-single-npu-moe-offload/dsv4_flash_single_card_inference_guide.md (build kt-kernel, convert MXFP4 GGUF, launch, coherence smoke)."
+echo "All code patches applied. Next: docs/integration/sglang/dsv4-flash-single-npu-moe-offload/dsv4_flash_single_card_inference_guide.md (build kt-kernel, convert MXFP4 GGUF, launch, coherence smoke)."
 echo "Reminder: convert/launch/verify scripts in scripts/ are standalone — copy them into tools/ , script/ , and the repo root as needed."

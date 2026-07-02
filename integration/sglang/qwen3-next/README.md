@@ -4,7 +4,7 @@
 
 Qwen3-next模型是2025.9推出的混合注意力开源大语言模型，本样例针对Qwen3-next模型，基于[SGLang开源框架](https://github.com/sgl-project/sglang)，完成模型推理部署的优化适配。
 
-本项目基于NPU主要完成了以下优化特性，具体内容介绍可参见[基于SGLang&A3集群的Qwen3-next模型推理部署优化实践](../../docs/models/qwen3-next/qwen3_next_optimization.md)。
+本项目基于NPU主要完成了以下优化特性，具体内容介绍可参见[基于SGLang&A3集群的Qwen3-next模型推理部署优化实践](../../../docs/integration/sglang/qwen3-next/qwen3_next_optimization.md)。
 
 - 支持MTP1部署
 - 支持AscendC recurrent_gated_delta_rule大融合算子、mambav2_rmsnormgated融合算子
@@ -99,7 +99,7 @@ npu-smi info 检查Ascend NPU固件和驱动是否正确安装。如果已安装
    ```bash
    cd sglang
 
-   bash ../cann-recipes-infer/models/qwen3-next/apply_patches.sh
+   bash ../cann-recipes-infer/integration/sglang/qwen3-next/apply_patches.sh
    ```
 
    安装sglang：
@@ -116,7 +116,7 @@ npu-smi info 检查Ascend NPU固件和驱动是否正确安装。如果已安装
    **加载patch**
    在sgl_kernel_npu目录下加载sgl_kernel_npu_support_gdn_cp.patch:
    ```bash
-   git apply ../cann-recipes-infer/models/qwen3-next/patches/sgl_kernel_npu_support_gdn_cp.patch
+   git apply ../cann-recipes-infer/integration/sglang/qwen3-next/patches/sgl_kernel_npu_support_gdn_cp.patch
    ```
 
    请参考[安装文档](https://github.com/sgl-project/sgl-kernel-npu/blob/main/python/sgl_kernel_npu/README.md)，编译安装sgl-kernel-npu。
@@ -137,7 +137,7 @@ npu-smi info 检查Ascend NPU固件和驱动是否正确安装。如果已安装
 8. 编译安装自定义算子
     ```bash
     # 进入算子编译目录
-    cd ../cann-recipes-infer/models/qwen3-next/ops/npu_ops_transformer_ext
+    cd ../cann-recipes-infer/integration/sglang/qwen3-next/ops/npu_ops_transformer_ext
     ```
    请参考[编译文档](ops/npu_ops_transformer_ext/README.md)编译安装自定义算子。
 
@@ -279,7 +279,7 @@ python3 few_shot_gsm8k.py --parallel 16 --num-questions 100 --num-shots 5 --port
 ## 加载patch
 在sglang目录下加载PROFILE.patch:
 ```bash
-git apply ../cann-recipes-infer/models/qwen3-next/patches/PROFILE.patch
+git apply ../cann-recipes-infer/integration/sglang/qwen3-next/patches/PROFILE.patch
 ```
 ## profiler配置
 1. 通过设置环境变量`PROFILER_MODE`为`[all, decode, prefill]`中的指定值选择profiler的范围。
