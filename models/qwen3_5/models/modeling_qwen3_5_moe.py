@@ -81,6 +81,16 @@ global_mask = None
 global_mask_diagonal = None
 _PLATFORM_VERSION: str | None = None
 
+qwen3_5_use_aiv_all_reduce = os.environ.get("HCCL_OP_EXPANSION_MODE") == "AIV"
+
+
+def qwen3_5_all_reduce(tensor: torch.Tensor, group) -> None:
+    if qwen3_5_use_aiv_all_reduce and tensor.dtype == torch.bfloat16:
+        tensor_fp32 = tensor.to(torch.float32)
+        dist.all_reduce(tensor_fp32, group=group)
+        tensor.copy_(tensor_fp32.to(tensor.dtype))
+    dist.all_reduce(tensor, group=group)
+
 
 def qwen3_5_prefill_mm_all_reduce(
     layer: RowParallelLinear,
@@ -1622,7 +1632,7 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
             used_mm_all_reduce_base = False
 
         if self.attn_tp_size > 1 and not used_mm_all_reduce_base:
-            dist.all_reduce(
+            qwen3_5_all_reduce(
                 output,
                 group=self.comm_manager.get_group("attn_tp_group"),
             )
@@ -1924,7 +1934,7 @@ class Qwen3_5MoeAttention(nn.Module):
             attn_output = fused_attn_output
             used_mm_all_reduce_base = True
         if self.attn_tp_size > 1 and not used_mm_all_reduce_base:
-            dist.all_reduce(attn_output, group=self.comm_manager.get_group("attn_tp_group"))
+            qwen3_5_all_reduce(attn_output, group=self.comm_manager.get_group("attn_tp_group"))
         return attn_output
 
 
@@ -1990,7 +2000,7 @@ class Qwen3_5MoeMLP(nn.Module):
             down_proj = self.down_proj(x, dynamic_scale=swiglu_scale)
         # down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
         if self.shared_tp_size > 1 and not used_mm_all_reduce_base:
-            dist.all_reduce(down_proj, group=self.comm_manager.get_group("shared_tp_group"))
+            qwen3_5_all_reduce(down_proj, group=self.comm_manager.get_group("shared_tp_group"))
         return down_proj
 
 
@@ -2230,7 +2240,7 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
         )
         expert_output = self._finalize_routing(hidden_states_ordered_by_experts, routing_weights, expanded_row_idx)
         if self.moe_tp_size > 1:
-            dist.all_reduce(expert_output, group=self.comm_manager.get_group("moe_tp_group"))
+            qwen3_5_all_reduce(expert_output, group=self.comm_manager.get_group("moe_tp_group"))
         return expert_output
 
     def _run_experts_ep(
@@ -2300,8 +2310,6 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
         dist.all_to_all_single(gathered_tokens, new_x, input_splits, output_splits, group=moe_ep_group)
 
         expert_output = self._finalize_routing(gathered_tokens, routing_weights, expanded_row_idx)
-        if self.moe_tp_size > 1:
-            dist.all_reduce(expert_output, group=self.comm_manager.get_group("moe_tp_group"))
         return expert_output
 
     def _run_experts_dispatch_combine_v2(
