@@ -34,7 +34,7 @@
 
    # 安装依赖的python库，仅支持python 3.11
    cd cann-recipes-infer
-   pip3 install -r ./models/pangu-7b/requirements.txt
+   pip3 install -r ./models/pangu_7b/requirements.txt
    ```
 
 4. 配置样例运行所需环境信息。
@@ -65,7 +65,7 @@ snapshot_download(
 
 量化权重转换脚本的使用，以下以mxfp8为例子（目前仅支持mxfp8的A8W8量化，hif8和mxfp4 尚未开放）：
 ```bash
-python /cann-recipes-infer/models/pangu-7b/utils/convert_model.py --input_bf16_hf_path /dev/shm/ckpts/openPangu-Embedded-7B/ --output_hf_path /dev/shm/ckpts/openPangu-Embedded-7B-MXFP8/ --w8a8 --w_quant mxfp8
+python /cann-recipes-infer/models/pangu_7b/utils/convert_model.py --input_bf16_hf_path /dev/shm/ckpts/openPangu-Embedded-7B/ --output_hf_path /dev/shm/ckpts/openPangu-Embedded-7B-MXFP8/ --w8a8 --w_quant mxfp8
 ```
 > - 注意：mxfp8量化仅支持Atlas A5硬件。
 
@@ -76,9 +76,9 @@ python /cann-recipes-infer/models/pangu-7b/utils/convert_model.py --input_bf16_h
 
    - 修改YAML文件中`model_path`参数。关于YAML文件中的更多配置说明可参见[YAML参数描述](./config/README.md)。
 
-     在`models/pangu-7b/config`目录下已提供了较优性能的YAML样例供您参考，您可以根据模型类型选择对应的YAML文件，本文以`models/pangu-7b/config/openpangu_v5_7b.yaml`文件为例，修改其中的`model_path`参数，将其设置为[权重准备](#权重准备)阶段准备好的权重文件存储路径，例如`/dev/shm/ckpts/openPangu-Embedded-7B`。
+     在`models/pangu_7b/config`目录下已提供了较优性能的YAML样例供您参考，您可以根据模型类型选择对应的YAML文件，本文以`models/pangu_7b/config/openpangu_v5_7b.yaml`文件为例，修改其中的`model_path`参数，将其设置为[权重准备](#权重准备)阶段准备好的权重文件存储路径，例如`/dev/shm/ckpts/openPangu-Embedded-7B`。
 
-   - 修改`models/pangu-7b/infer.sh`脚本中`YAML_FILE_NAME`参数。
+   - 修改`models/pangu_7b/infer.sh`脚本中`YAML_FILE_NAME`参数。
 
      将`YAML_FILE_NAME`设置为`config`文件夹下YAML文件的名字，例如`openpangu_v5_7b.yaml`。
 
@@ -102,7 +102,7 @@ python /cann-recipes-infer/models/pangu-7b/utils/convert_model.py --input_bf16_h
 3. 执行推理脚本。
 
    ```shell
-   cd models/pangu-7b
+   cd models/pangu_7b
    bash infer.sh
    ```
    > 说明：如果是多机环境，需要在每个节点上执行。
@@ -112,6 +112,6 @@ python /cann-recipes-infer/models/pangu-7b/utils/convert_model.py --input_bf16_h
 使用命令说明：
 ```shell
 cd cann-recipes-infer
-bash ./models/pangu-7b/run_experiments.sh
+bash ./models/pangu_7b/run_experiments.sh
 ```
 

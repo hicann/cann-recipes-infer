@@ -4,7 +4,7 @@
 
 DeepSeek-V3.2-Exp是DeepSeek团队发布的大语言模型。本样例基于DeepSeek开源代码完成迁移，并适配到cann-recipes-infer统一推理框架，可在华为Atlas A3集群上运行。
 
-- 本样例的并行策略和性能优化点详细介绍可参见[基于Atlas A3集群的DeepSeek-V3.2-Exp模型推理优化实践](../../docs/models/deepseek-v3.2-exp/deepseek_v3.2_exp_inference_guide.md)。
+- 本样例的并行策略和性能优化点详细介绍可参见[基于Atlas A3集群的DeepSeek-V3.2-Exp模型推理优化实践](../../docs/models/deepseek_v3_2_exp/deepseek_v3.2_exp_inference_guide.md)。
 
 ---
 

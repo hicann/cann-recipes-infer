@@ -166,7 +166,7 @@ python models/longcat_flash/utils/convert_model.py --input_bf16_hf_path /data/mo
 
 ## 优化点参考
 
-本样例采用的详细优化点介绍及性能Benchmark可参见[基于Atlas A3训练/推理集群的LongCat-Flash模型推理性能优化实践](../../docs/models/longcat-flash/longcat_flash_optimization.md)。
+本样例采用的详细优化点介绍及性能Benchmark可参见[基于Atlas A3训练/推理集群的LongCat-Flash模型推理性能优化实践](../../docs/models/longcat_flash/longcat_flash_optimization.md)。
 
 ## Benchmark
 

@@ -184,8 +184,8 @@ bash infer.sh
 │   │       ├── dsv4-flash-single-npu-moe-offload
 │   │       └── qwen3-next
 │   └── models                                  # 原生深度优化模型文档
-│       ├── deepseek-r1                         
-│       ├── deepseek-v3.2-exp                   
+│       ├── deepseek_r1                         
+│       ├── deepseek_v3_2_exp                   
 │       ├── deepseek-v4                         
 │       └── ...                                 
 ├── accelerator                                 # 加速算法样例
@@ -234,7 +234,7 @@ bash infer.sh
 │   ├── kimi_k2_thinking                        # Kimi-K2-Thinking 的模型脚本及执行配置
 │   ├── longcat_flash                           # LongCat-Flash 的模型脚本及执行配置
 │   ├── longcat_flash_lite                      # LongCat-Flash-Lite 的模型脚本及执行配置
-│   ├── pangu-7b                                # PanGu-7B 的模型脚本及执行配置
+│   ├── pangu_7b                                # PanGu-7B 的模型脚本及执行配置
 │   ├── qwen                                    # Qwen2/Qwen3 Dense 模型统一脚本及执行配置
 │   ├── qwen3_5                                 # Qwen3.5 的模型脚本及执行配置
 │   ├── qwen3_moe                               # Qwen3-MoE 的模型脚本及执行配置

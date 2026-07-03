@@ -114,7 +114,7 @@ $$
 
 ### LI 量化支持
 
-当前`LightningIndexer`算子已支持 [Per-Token-Head 量化](../../../docs/models/deepseek-v3.2-exp/deepseek_v3.2_exp_inference_guide.md) 输入，即输入的 $Q_{index}$ 和 $K_{index}$ 都被量化为 INT8 数据类型，以此应对长序列场景下显存占用过大的问题。
+当前`LightningIndexer`算子已支持 [Per-Token-Head 量化](../../../docs/models/deepseek_v3_2_exp/deepseek_v3.2_exp_inference_guide.md) 输入，即输入的 $Q_{index}$ 和 $K_{index}$ 都被量化为 INT8 数据类型，以此应对长序列场景下显存占用过大的问题。
 
 支持量化输入的`LightningIndexerQuant`对于某个 token 对应的 Index Query $Q_{index}^{INT8}\in\R^{g\times d}$ 及其反量化系数$Scale_{Q}\in\R^{g\times1}$，给定上下文 Index Key $K_{index}^{INT8}\in\R^{S_{k}\times d}$ 及其反量化系数$Scale_{K}\in\R^{S_{k}\times1}$, $W\in\R^{g\times 1}$，其中 $g$ 为 GQA 对应的 group size，$d$ 为每一个头的维度，$S_{k}$ 是上下文的长度，`LightningIndexerQuant`的具体计算公式如下：
 $$

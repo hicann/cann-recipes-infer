@@ -136,7 +136,7 @@ MoE计算阶段采用EP (Expert Parallelism)切分策略，将路由专家和零
 使用[torch_npu.npu_moe_gating_top_k](https://www.hiascend.com/document/detail/zh/Pytorch/720/apiref/torchnpuCustomsapi/context/torch_npu-npu_moe_gating_top_k.md)算子，对router计算的结果排序，并选取前top-k个专家。
 
 #### Prefill阶段优化
-Prefill阶段路由专家采用**Double-Routing**的计算策略完成计算,具体计算步骤可参见[基于Atlas A3集群的DeepSeek-R1模型prefill阶段推理性能优化实践](../deepseek-r1/deepseek_r1_prefill_optimization.md)的MoE部署策略优化章节。
+Prefill阶段路由专家采用**Double-Routing**的计算策略完成计算,具体计算步骤可参见[基于Atlas A3集群的DeepSeek-R1模型prefill阶段推理性能优化实践](../deepseek_r1/deepseek_r1_prefill_optimization.md)的MoE部署策略优化章节。
 
 #### Decode阶段优化
 - 高性能专家计算：使用[torch_npu.npu_grouped_matmul](https://www.hiascend.com/document/detail/zh/Pytorch/720/apiref/torchnpuCustomsapi/context/torch_npu-npu_grouped_matmul.md)算子，可以同时处理多个专家的计算，提高计算和搬运效率；

@@ -2,7 +2,7 @@
 ## 概述
 智谱团队发布了最新的模型GLM-5，本样例基于GLM-5开源代码进行迁移，并在CANN平台上完成对应的优化适配，可在华为 Atlas A3 集群上运行起来。
 
-- GLM-5 模型结构与 DeepSeek-V3.2-Exp 保持一致，本样例的并行策略与性能优化方案均沿用 DeepSeek-V3.2-Exp。详细方案请参考[NPU DeepSeek-V3.2-Exp推理优化实践](../../docs/models/deepseek-v3.2-exp/deepseek_v3.2_exp_inference_guide.md)。
+- GLM-5 模型结构与 DeepSeek-V3.2-Exp 保持一致，本样例的并行策略与性能优化方案均沿用 DeepSeek-V3.2-Exp。详细方案请参考[NPU DeepSeek-V3.2-Exp推理优化实践](../../docs/models/deepseek_v3_2_exp/deepseek_v3.2_exp_inference_guide.md)。
 
 ---
 

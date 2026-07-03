@@ -1,7 +1,7 @@
 # Kimi-K2-Thinking 模型在 NPU 实现高性能推理
 
 ## 概述
-本样例基于 CANN 平台对 Kimi-K2-Thinking 模型进行迁移，可在华为 Atlas A3 集群上运行。并行策略和性能优化点详细介绍可参见 [NPU Kimi-K2-Thinking 推理优化实践](../../docs/models/kimi-k2-thinking/kimi_k2_thinking_inference_guide.md)。
+本样例基于 CANN 平台对 Kimi-K2-Thinking 模型进行迁移，可在华为 Atlas A3 集群上运行。并行策略和性能优化点详细介绍可参见 [NPU Kimi-K2-Thinking 推理优化实践](../../docs/models/kimi_k2_thinking/kimi_k2_thinking_inference_guide.md)。
 
 ## 支持的产品型号
 <term>Atlas A3 系列产品</term>

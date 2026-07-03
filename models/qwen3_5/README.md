@@ -205,4 +205,4 @@ python3 models/qwen3_5/benchmark/run_mmlu_benchmark.py \
 
 ## 优化点参考
 
-本样例采用的详细优化点介绍可参见[Qwen3.5-MoE模型推理性能优化实践](../../docs/models/qwen3-5/qwen3_5_moe_optimization.md)。
+本样例采用的详细优化点介绍可参见[Qwen3.5-MoE模型推理性能优化实践](../../docs/models/qwen3_5/qwen3_5_moe_optimization.md)。

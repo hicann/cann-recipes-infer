@@ -221,4 +221,4 @@ models/qwen3_moe/config/qwen3_235b_mxfp4_hadamard.yaml
 
 ## 优化点参考
 
-本样例采用的详细优化点介绍可参见[基于Atlas A3、950的Qwen3-MoE模型低时延推理性能优化实践](../../docs/models/qwen3-moe/qwen3_moe_optimization.md)。
+本样例采用的详细优化点介绍可参见[基于Atlas A3、950的Qwen3-MoE模型低时延推理性能优化实践](../../docs/models/qwen3_moe/qwen3_moe_optimization.md)。
