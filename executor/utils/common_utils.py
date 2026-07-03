@@ -117,6 +117,14 @@ def get_decode_mask(mask_length, device, position):
     return decode_mask
 
 
+def sample_logits(logits: torch.Tensor, temperature: float = 0.0) -> torch.Tensor:
+    if temperature > 0:
+        logits = logits / max(float(temperature), 1e-5)
+        probs = torch.softmax(logits, dim=-1, dtype=torch.float32)
+        return probs.div_(torch.empty_like(probs).exponential_(1)).argmax(dim=-1)
+    return torch.argmax(logits, dim=-1)
+
+
 def npu_wait_tensor(switch_flag: bool, out: torch.Tensor, wait_tensor: torch.Tensor):
     if switch_flag:
         out = tng.scope.npu_wait_tensor(out, wait_tensor)

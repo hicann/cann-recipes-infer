@@ -15,6 +15,7 @@ __all__ = [
     "calc_moe_hccl_buffer_size", "get_global_routed_expert_num", "MicroBatchMode",
     "remove_padding_left", "remove_eos_right", "get_had_pow2", "detokenize_outputs", "weight_dequant",
     "limit_core_num", "npu_prefetch", "obtain_mtp_stats", "record_event", "wait_event", "record_stream",
+    "sample_logits",
 ]
 
 from .common_utils import (update_settings, override, get_init_attn_mask, get_decode_mask,
@@ -23,7 +24,7 @@ from .common_utils import (update_settings, override, get_init_attn_mask, get_de
                            process_infer_time, MicroBatchMode, remove_padding_left, remove_eos_right,
                            get_had_pow2, detokenize_outputs,
                            limit_core_num, npu_prefetch, obtain_mtp_stats, record_event, wait_event,
-                           record_stream, weight_dequant
+                           record_stream, weight_dequant, sample_logits
                           )
 from .hccl_utils import (
     init_comm_group,

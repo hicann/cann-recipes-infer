@@ -22,8 +22,7 @@ SET_ENV_ABS_PATH=$(realpath "${SET_ENV_ABS_PATH}")
 FUNCTION_ABS_PATH=$(realpath "${FUNCTION_ABS_PATH}")
 VALIDATE_ABS_PATH=$(realpath "${VALIDATE_ABS_PATH}")
 
-source ${SET_ENV_ABS_PATH}
-source ${FUNCTION_ABS_PATH}
+source "${FUNCTION_ABS_PATH}"
 
 # Set defaults here (edit directly) or override via command-line args (--model / --mode / --pd-role / --yaml).
 MODEL="deepseek_r1"                           # model directory name under models/ (e.g. deepseek_r1, qwen3_moe, gpt_oss)
@@ -56,6 +55,12 @@ while [[ $# -gt 0 ]]; do
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
+
+MODEL_SET_ENV_ABS_PATH="${SCRIPT_PATH}/../../models/${MODEL}/set_env.sh"
+if [ -f "${MODEL_SET_ENV_ABS_PATH}" ]; then
+    SET_ENV_ABS_PATH=$(realpath "${MODEL_SET_ENV_ABS_PATH}")
+fi
+source "${SET_ENV_ABS_PATH}"
 
 export ENGINE_BACKEND
 

@@ -25,6 +25,7 @@ import torch
 import torch.nn.functional as F
 from ..registry import register_op_impl
 
+
 @register_op_impl(op_type="gate_topk")
 def gate_topk_ascendc(module, logits, input_ids):
     # select top-k experts

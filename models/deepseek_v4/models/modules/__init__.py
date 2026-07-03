@@ -18,7 +18,7 @@ __all__ = ["get_window_topk_idxs", "get_compress_topk_idxs",
            "yarn_get_mscale", "DeepseekV3RMSNorm", "_init_rope", "apply_rotary_pos_emb",
            "DEEPSEEKV3_START_DOCSTRING", "DEEPSEEKV3_INPUTS_DOCSTRING", "DeepseekV3PreTrainedModel",
            "apply_rotary_emb", "rotate_activation", "partial_rotary_mul_quant",
-           "Compressor", "Indexer", "CacheData", "AttnMetaData"]
+           "Compressor", "Indexer", "AttnMetaData"]
 
 from .common_modules import (get_window_topk_idxs, get_compress_topk_idxs,
                         _prepare_4d_causal_attention_mask, one_hot, yarn_get_mscale,
@@ -28,4 +28,4 @@ from .common_modules import (get_window_topk_idxs, get_compress_topk_idxs,
                         )
 from .compressor import Compressor
 from .indexer import Indexer
-from .attention_data import CacheData, AttnMetaData
+from .attention_data import AttnMetaData

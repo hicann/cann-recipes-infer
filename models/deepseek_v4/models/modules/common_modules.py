@@ -51,6 +51,7 @@ from transformers.utils import (
 
 from ..configuration_deepseek import DeepseekV3Config
 from executor.utils import align_up
+from executor.core.config import PlatformVersion
 
 
 # Compatibility fix for transformers 5.0.0: is_torch_fx_available was removed

@@ -276,6 +276,12 @@ class Scheduler:
             next_total_prefill_tokens = total_prefill_tokens + request.prompt_tokens
             if selected and next_total_prefill_tokens > max_prefill_tokens:
                 break
+            if (
+                parallel_config.cp_size > 1
+                and self.config.cp_mini_batch > 0
+                and len(selected) == self.config.cp_mini_batch
+            ):
+                break
 
             if enable_offline_cp:
                 request.cp_rank = (request_offset + len(selected)) % parallel_config.cp_size

@@ -25,27 +25,20 @@ from torchair.configs.compiler_config import CompilerConfig
 
 def compile_model_forward(
     model_forward,
-    exe_mode="ge_graph",
-    enable_cache_compile=False,
-    cache_dir=None,
+    infer_config,
     frozen_parameter=True,
     tiling_schedule_optimize=True,
     topology_sorting_strategy="StableRDFS",
-    enable_static_kernel=False,
-    enable_superkernel=False,
 ):
     """
     Compile a model.forward method for graph execution.
 
     Args:
         model_forward: The model.forward callable to compile.
-        exe_mode: Execution mode ("ge_graph", "npugraph_ex", etc.).
-        enable_cache_compile: Whether to use cache compilation.
-        cache_dir: Directory for cache compilation.
+        infer_config: Inference config that provides model graph compile options.
         frozen_parameter: Whether to freeze parameters.
         tiling_schedule_optimize: Whether to enable tiling schedule optimization.
         topology_sorting_strategy: Strategy for topology sorting.
-        enable_static_kernel: Whether to enable static kernel compile for npugraph_ex.
 
     Returns:
         Compiled forward function.
@@ -55,6 +48,15 @@ def compile_model_forward(
     tng.patch_for_hcom()
     # Compile model forward
     torch._dynamo.config.inline_inbuilt_nn_modules = False
+
+    model_config = infer_config.model_config
+    exe_mode = model_config.exe_mode
+    enable_cache_compile = model_config.enable_cache_compile
+    enable_dynamic_graph = model_config.enable_dynamic_graph
+    cache_dir = os.path.join(model_config.output_path, "compile_cache")
+    enable_static_kernel = model_config.enable_static_kernel
+    enable_superkernel = model_config.custom_params.get("enable_superkernel", False)
+
     if exe_mode == "npugraph_ex":
         # npugraph_ex uses torch.compile or cache_compile directly with backend options.
         compile_options = {
@@ -65,11 +67,12 @@ def compile_model_forward(
         }
         if enable_cache_compile:
             compiled = torch.npu.npugraph_ex.inference.cache_compile(model_forward, cache_dir=cache_dir,
-                                                                     dynamic=True, options=compile_options)
+                                                                     dynamic=enable_dynamic_graph,
+                                                                     options=compile_options)
 
         else:
-            compiled = torch.compile(model_forward, dynamic=True, fullgraph=True, backend="npugraph_ex",
-                                     options=compile_options)
+            compiled = torch.compile(model_forward, dynamic=enable_dynamic_graph, fullgraph=True,
+                                     backend="npugraph_ex", options=compile_options)
 
         return compiled
 
@@ -87,12 +90,12 @@ def compile_model_forward(
             model_forward,
             cache_dir=cache_dir,
             config=compiler_config,
-            dynamic=False,
+            dynamic=enable_dynamic_graph,
             fullgraph=True,
             ge_cache=True
         )
     else:
         npu_backend = tng.get_npu_backend(compiler_config=compiler_config)
-        compiled = torch.compile(model_forward, dynamic=False, fullgraph=True, backend=npu_backend)
+        compiled = torch.compile(model_forward, dynamic=enable_dynamic_graph, fullgraph=True, backend=npu_backend)
 
     return compiled

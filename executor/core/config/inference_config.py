@@ -61,19 +61,28 @@ class DataConfig:
     Attributes:
         dataset: Dataset name (e.g., "default", "LongBench") (default: "default")
         dataset_path: Path to the dataset (default: "")
+        temperature: Sampling temperature. Use 0 for greedy decoding. (default: 0.0)
     """
     dataset: str = "default"
     dataset_path: str = ""
     input_truncated_len: int = 256
+    temperature: float = 0.0
 
     @classmethod
     def from_dict(cls, data_config_dict: dict) -> "DataConfig":
         """Create DataConfig from YAML-parsed dictionary."""
-        return cls(
+        data_config = cls(
             dataset=data_config_dict.get("dataset", "default"),
             dataset_path=data_config_dict.get("dataset_path", ""),
-            input_truncated_len=data_config_dict.get("input_truncated_len", 256)
+            input_truncated_len=data_config_dict.get("input_truncated_len", 256),
+            temperature=data_config_dict.get("temperature", 0.0),
         )
+        data_config._validate()
+        return data_config
+
+    def _validate(self):
+        if self.temperature < 0.0:
+            raise ValueError(f"temperature={self.temperature} should be greater than or equal to 0.0")
 
 
 @dataclass
@@ -91,6 +100,7 @@ class ModelConfig:
         exe_mode: Execution mode (eager, ge_graph, npugraph_ex) (default: "eager")
         enable_cache_compile: Enable cache compilation (default: False)
         enable_static_kernel: Enable static kernel acceleration for npugraph_ex inference (default: False)
+        enable_dynamic_graph: Whether to use dynamic graph compilation (default: True)
         force_eplb: Whether to enable force expert load balancing for MoE models (default: False)
 
         enable_profiler: Enable profiler (default: False)
@@ -109,6 +119,7 @@ class ModelConfig:
     exe_mode: str = "eager"
     enable_cache_compile: bool = False
     enable_static_kernel: bool = False
+    enable_dynamic_graph: bool = True
     force_eplb: bool = False
 
     enable_profiler: bool = False
@@ -138,6 +149,7 @@ class ModelConfig:
             exe_mode=model_config_dict.get("exe_mode", "eager"),
             enable_cache_compile=model_config_dict.get("enable_cache_compile", False),
             enable_static_kernel=model_config_dict.get("enable_static_kernel", False),
+            enable_dynamic_graph=model_config_dict.get("enable_dynamic_graph", True),
             force_eplb=model_config_dict.get("force_eplb", False),
             enable_profiler=model_config_dict.get("enable_profiler", False),
             enable_weight_nz=model_config_dict.get("enable_weight_nz", True),
@@ -162,7 +174,6 @@ class ModelConfig:
             os.environ["TASK_QUEUE_ENABLE"] = "1"  # npugraph_ex only supports TASK_QUEUE_ENABLE 0 or 1
         else:
             os.environ["TASK_QUEUE_ENABLE"] = "2"  # 2: default value, opt host perf in eager
-
 
 
 @dataclass
@@ -292,6 +303,8 @@ class SchedulerConfig:
         batch_size_per_dp_rank: Batch size per rank for distributed inference (default: 1)
         mem_fraction_static: Fraction of device memory reserved for static allocation (default: 0.85)
         block_size: Number of tokens contained in one KV cache block (default: 128)
+        cp_mini_batch: Maximum number of requests scheduled in each CP prefill step.
+            A value < 0 disables this extra cap.
         num_reserved_decode_tokens: Per-in-flight-request KV reservation used by
             online PD decode admission control.  Each request in the prealloc /
             transfer / running pipeline reserves this many tokens of KV space
@@ -307,6 +320,7 @@ class SchedulerConfig:
     mem_fraction_static: float = 0.85
     block_size: int = 128
     num_reserved_decode_tokens: int = 64
+    cp_mini_batch: int = -1
 
     @classmethod
     def from_dict(cls, scheduler_config_dict: dict) -> "SchedulerConfig":
@@ -320,6 +334,7 @@ class SchedulerConfig:
             num_reserved_decode_tokens=scheduler_config_dict.get(
                 "num_reserved_decode_tokens", 64
             ),
+            cp_mini_batch=scheduler_config_dict.get("cp_mini_batch", -1),
         )
 
 
@@ -398,6 +413,11 @@ class InferenceConfig:
                     infer_config.scheduler_config.batch_size
                     // infer_config.parallel_config.cp_prefill_dp_size
                 )
+                if infer_config.scheduler_config.cp_mini_batch > 0:
+                    prefill_batch_size = min(
+                        prefill_batch_size,
+                        infer_config.scheduler_config.cp_mini_batch,
+                    )
             infer_config.scheduler_config.max_prefill_tokens = \
                 infer_config.data_config.input_truncated_len * prefill_batch_size
 

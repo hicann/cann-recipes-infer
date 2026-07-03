@@ -29,6 +29,11 @@ _specs: dict[str, list[tuple[str, str]]] = {
         ("models.deepseek_v3_2_exp.models.modeling_deepseek", "DeepseekV3ModelMTP"),
         ("models.deepseek_v3_2_exp.models.configuration_deepseek", "DeepseekV3IndexConfig"),
     ],
+    "deepseek_v4": [
+        ("models.deepseek_v4.models.modeling_deepseek", "DeepseekV3ForCausalLM"),
+        ("models.deepseek_v4.models.modeling_deepseek", "DeepseekV3ModelMTP"),
+        ("models.deepseek_v4.models.configuration_deepseek", "DeepseekV3Config"),
+    ],
     "deepseek_v2_lite": [
         ("models.deepseek_r1.models.modeling_deepseek", "DeepseekV3ForCausalLM"),
         ("models.deepseek_r1.models.configuration_deepseek", "DeepseekV3Config"),

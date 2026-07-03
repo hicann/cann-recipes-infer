@@ -22,7 +22,7 @@
 # limitations under the License.
 
 """ PyTorch Index model."""
-from typing import List, Optional, Tuple, Union, Dict
+from typing import Callable, List, Optional, Tuple, Union, Dict
 
 import torch
 import torch.nn.functional as F
@@ -35,6 +35,7 @@ import torch_npu
 import torchair as tng
 
 from transformers.cache_utils import Cache
+from executor.core.config import InferenceConfig, CommManager
 from executor.utils import get_had_pow2, limit_core_num
 from executor.utils.stream_utils import npu_stream_switch, record_event, wait_event, record_stream
 from module.linear import ReplicatedLinear
@@ -44,16 +45,21 @@ from .compressor import Compressor
 
 
 class Indexer(nn.Module):
-    def __init__(self, config, runner_settings, layer_idx: Optional[int] = None, compress_ratio: int = 4,
-                prefix: Optional[str] = "", **kwargs):
+    def __init__(self, config, infer_config: InferenceConfig, layer_idx: Optional[int] = None, compress_ratio: int = 4,
+                prefix: Optional[str] = "", comm_manager: CommManager = None,
+                cache_getter: Callable[[str], torch.Tensor] = None, **kwargs):
         super().__init__()
+        self.infer_config = infer_config
+        self.comm_manager = comm_manager
+        self.cache_getter = cache_getter
+        self.is_online = (
+            infer_config.disagg_config.disaggregation_mode in ("PREFILL", "DECODE")
+        )
         self.layer_idx = layer_idx
         if layer_idx == config.num_hidden_layers: # mtp model
             self.layer_idx = 0 # mtp model only has one layer of cache
         self.li_cache_quant_mode = config.quant_config.li_cache_quant_mode \
             if config.quant_config is not None else "unquant"
-        self.runner_settings = runner_settings
-        self.hccl_comm_dict = kwargs.get("hccl_comm_dict", None)
         self.dim = config.hidden_size
         self.n_heads = config.index_n_heads
         self.head_dim = config.index_head_dim
@@ -74,15 +80,16 @@ class Indexer(nn.Module):
         self.softmax_scale = self.head_dim ** -0.5
         self.compress_ratio = compress_ratio
 
-        self.max_seq_len = runner_settings.get("data_config").get("max_position_embeddings", 2048)
+        self.max_seq_len = self.infer_config.model_config.custom_params.get("max_position_embeddings", 2048)
         self.hadamard_matrix = get_had_pow2(self.head_dim)
-        self.compressor = Compressor(config, runner_settings, layer_idx, compress_ratio, rotate=True,
-                                     head_dim = self.head_dim, prefix=f"{prefix}.compressor", **kwargs)
-        self.enable_pypto = self.runner_settings.get("model_config").get("enable_pypto", False)
-        self.enable_multi_streams = self.runner_settings.get("model_config").get("enable_multi_streams", False) and \
-                                not self.enable_pypto
-        self.platform_version = self.runner_settings.get("model_config").get("platform_version", "A3")
-        self.enable_limit_core = self.runner_settings.get("model_config").get("enable_limit_core", False)
+        self.compressor = Compressor(config, self.infer_config, layer_idx, compress_ratio, rotate=True,
+                                     head_dim=self.head_dim, prefix=f"{prefix}.compressor",
+                                     comm_manager=self.comm_manager, cache_getter=self.cache_getter, **kwargs)
+        self.enable_pypto = self.infer_config.model_config.custom_params.get("enable_pypto", False)
+        self.enable_multi_streams = self.infer_config.model_config.custom_params.get("enable_multi_streams", False) \
+            and not self.enable_pypto
+        self.platform_version = self.infer_config.model_config.platform_version
+        self.enable_limit_core = self.infer_config.model_config.custom_params.get("enable_limit_core", False)
         self.mm_quant_mode = (
             config.quant_config.mm_quant_mode
             if config.quant_config is not None
@@ -99,7 +106,7 @@ class Indexer(nn.Module):
             # 2 is number of events used for event synchronization
             self.indexer_events = [torch.npu.Event(), torch.npu.Event()]
 
-        self.cp_size = self.runner_settings.get("parallel_config").get("cp_size", 1)
+        self.cp_size = self.infer_config.parallel_config.cp_size
         self.global_rank = kwargs.get("global_rank")
 
         if self.mm_quant_mode == "w8a8hifloat8":
@@ -108,12 +115,25 @@ class Indexer(nn.Module):
                 torch.ones([1, self.n_heads], dtype=torch.float32),
             )
 
+    def get_cache(self, cache_name: str) -> torch.Tensor:
+        if self.cache_getter is None:
+            raise RuntimeError(f"cache_getter is required when accessing {cache_name}.")
+        return self.cache_getter(cache_name)
+
+    def get_runtime_cache(self, cache_name: str, attn_metadata: Dict, is_prefill: bool) -> torch.Tensor:
+        if is_prefill and self.cp_size > 1 and not self.is_online and attn_metadata["cp_metadata"]:
+            tmp_cache = attn_metadata["cp_metadata"].get("cp_tmp_cache", None)
+            if tmp_cache is not None:
+                return tmp_cache["4"][cache_name]
+            else:
+                raise ValueError("When cp is enabled, a temporary cache is required, but no temporary cache is found.")
+        return self.get_cache(cache_name)
+
     def forward(
         self,
         x: torch.Tensor,
         qr: torch.Tensor,
         qr_scale: torch.Tensor,
-        cache_data: Tuple[Dict],
         attn_metadata: Dict,
         cmpr_switch_flag: bool,
         cmpr_event: tuple[torch.npu.Event],
@@ -134,20 +154,20 @@ class Indexer(nn.Module):
         with limit_core_num(enable_limit_core, self.cmpr_aic_num, self.cmpr_aiv_num):
             # weight project
             if is_prefill and self.cp_size > 1:
-                q_len = qr.shape[1] // 2
+                q_len = qr.shape[0] // 2
                 if attn_metadata["prev"]["is_start"]:
-                    x_for_weights_proj = torch.cat([x[0][:, :q_len], x[1][:, -q_len:]], dim=1)
+                    x_for_weights_proj = torch.cat([x[0][:q_len], x[1][-q_len:]], dim=0)
                 else:
-                    x_for_weights_proj = torch.cat([x[0][:, -q_len:], x[1][:, -q_len:]], dim=1)
+                    x_for_weights_proj = torch.cat([x[0][-q_len:], x[1][-q_len:]], dim=0)
             else:
                 x_for_weights_proj = x
             weights = self.weights_proj(x_for_weights_proj) * (self.softmax_scale * self.n_heads ** -0.5)
             if self.li_cache_quant_mode == "int8":
-                weights = weights.flatten(0, 1).to(torch.float16)
+                weights = weights.to(torch.float16)
             else:
-                weights = weights.flatten(0, 1).to(torch.float32)
+                weights = weights.to(torch.float32)
             # compressor
-            self.compressor(x, cache_data, attn_metadata, is_prefill)
+            self.compressor(x, attn_metadata, is_prefill)
 
         # li event 0 and input tensors are recorded in Attention.mal_prolog function, after calling mla qb
         cur_stream = torch.npu.current_stream()
@@ -155,34 +175,38 @@ class Indexer(nn.Module):
             wait_event(enable_multi_streams, self.indexer_events, 0)
             with limit_core_num(enable_limit_core, self.rope_aic_num, self.rope_aiv_num):
                 q = self.wq_b(qr, dynamic_scale=qr_scale)
-                q = q.view(qr.shape[0], -1, self.n_heads, self.head_dim)
+                q = q.view(-1, self.n_heads, self.head_dim)
 
                 # rope
                 if self.li_cache_quant_mode == "hifloat8":
                     q = partial_rotary_mul_quant(   # x: (T, 1, N, D); cos(T, 1, 1, D)
-                        q.flatten(0, 1).unsqueeze(2), cos, sin,
+                        q.unsqueeze(2), cos, sin,
                         partial_slice=self.partial_slice,
                         platform_version=self.platform_version,
                         origin_shape=q.shape,
                     )
                 else:
                     torch.ops.custom.inplace_partial_rotary_mul(
-                        q.flatten(0, 1).unsqueeze(2), cos, sin,
+                        q.unsqueeze(2), cos, sin,
                         rotary_mode="interleave",
                         partial_slice=self.partial_slice,
                     )
                 # hif8 covers outliers natively, no need for hadamard
                 if self.mm_quant_mode != "w8a8hifloat8":
                     q = rotate_activation(q, self.hadamard_matrix)
-                wait_event(cmpr_switch_flag, cmpr_event, cmpr_event_idx) # separate sfa compressor and li qb dynamic quant
+                # separate sfa compressor and li qb dynamic quant
+                wait_event(cmpr_switch_flag, cmpr_event, cmpr_event_idx)
                 if self.li_cache_quant_mode == "int8":
-                    q, q_scale = torch_npu.npu_dynamic_quant(q.flatten(0, 1))  # B,S,N,D -> T,N,D
+                    q, q_scale = torch_npu.npu_dynamic_quant(q)  # T,N,D
                     q_scale = q_scale.to(torch.float16)
                 elif self.li_cache_quant_mode == "hifloat8":
                     q = q.view(-1, self.n_heads, self.head_dim)
                     q_scale = self.q_scale_ones.expand(q.shape[0], -1)
                 else: # fp8
-                    q, q_scale = torch_npu.npu_dynamic_block_quant(q.view(-1, q.shape[-1]), dst_type=cache_data["li_cmp_kv"].dtype)
+                    q, q_scale = torch_npu.npu_dynamic_block_quant(
+                        q.view(-1, q.shape[-1]),
+                        dst_type=self.get_runtime_cache("li_cmp_kv", attn_metadata, is_prefill).dtype,
+                    )
                     q = q.view(-1, self.n_heads, self.head_dim)
                     q_scale = q_scale.view(-1, self.n_heads)
             record_stream(enable_multi_streams, q, cur_stream)
@@ -200,13 +224,25 @@ class Indexer(nn.Module):
             weights_dict = {"prev": weights_prev, "next": weights_next}
             topk_list = []
             for zz_flag in ["prev", "next"]:
-                topk_idxs = self.forward_li_quant(q_dict[zz_flag], q_scale_dict[zz_flag], cache_data["li_cmp_kv"],
-                                                  cache_data["li_key_dequant_scale"], weights_dict[zz_flag], attn_metadata[zz_flag])
+                topk_idxs = self.forward_li_quant(
+                    q_dict[zz_flag],
+                    q_scale_dict[zz_flag],
+                    self.get_runtime_cache("li_cmp_kv", attn_metadata, is_prefill),
+                    self.get_runtime_cache("li_key_dequant_scale", attn_metadata, is_prefill),
+                    weights_dict[zz_flag],
+                    attn_metadata[zz_flag],
+                )
                 topk_list.append(topk_idxs.view(-1, 1, topk_idxs.shape[-1]))
             return topk_list
         else:
             topk_idxs = self.forward_li_quant(
-                q, q_scale, cache_data["li_cmp_kv"], cache_data["li_key_dequant_scale"], weights, attn_metadata)
+                q,
+                q_scale,
+                self.get_runtime_cache("li_cmp_kv", attn_metadata, is_prefill),
+                self.get_runtime_cache("li_key_dequant_scale", attn_metadata, is_prefill),
+                weights,
+                attn_metadata,
+            )
             return topk_idxs.view(-1, 1, topk_idxs.shape[-1])
 
     def forward_li_quant(
@@ -216,10 +252,15 @@ class Indexer(nn.Module):
         k: torch.Tensor,
         k_scale: torch.Tensor,
         weights: torch.Tensor,
-        attn_metadata: Dict
+        attn_metadata: Dict,
     ):
         actual_seq_q = attn_metadata["actual_seq_q"]
         actual_seq_k = attn_metadata["actual_seq_k"]
+        if attn_metadata.get("tmp_block_table", None) and not self.is_online:
+            # enable prefill cp on offline mode
+            block_table = attn_metadata["tmp_block_table"]["c4a_cmp_kv"]
+        else:
+            block_table = attn_metadata["block_table"]["c4a_cmp_kv"]
         li_input_kwargs = {
             "query": q,
             "key": k,
@@ -228,7 +269,7 @@ class Indexer(nn.Module):
             "key_dequant_scale": k_scale.squeeze(-2),
             "actual_seq_lengths_query": actual_seq_q,
             "actual_seq_lengths_key": actual_seq_k,
-            "block_table": attn_metadata["block_table"]["c4a_cmp_kv"],
+            "block_table": block_table,
             "layout_key": 'PA_BSND',
             "sparse_count": self.index_topk,
             "sparse_mode": 3,

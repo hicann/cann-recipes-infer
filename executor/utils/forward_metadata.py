@@ -84,6 +84,7 @@ class PrefillCPMetaData:
 class ForwardMetaData:
     """Metadata passed during model forward pass"""
     is_prefill: bool = False
+    is_warm_up: bool = False
     attention_mask: Optional[torch.Tensor] = None
     kv_len: Optional[torch.Tensor] = None
     actual_seq_lengths_kv: Optional[torch.Tensor] = None

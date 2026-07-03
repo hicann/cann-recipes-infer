@@ -1,0 +1,38 @@
+model_config:
+  model_name: "deepseek_v4"
+  model_path: "/data/models/deepseek_v4_int8_w8a8"
+  platform_version: "A3"
+  with_ckpt: True
+  next_n: 1
+  exe_mode: "npugraph_ex"
+  enable_static_kernel: True
+  enable_dynamic_graph: False
+  enable_profiler: False
+  force_eplb: False
+  enable_cache_compile: False
+  custom_params:
+    enable_multi_streams: True
+    enable_pypto: False
+    enable_limit_core: True
+    moe_chunk_max_len: 65536
+
+data_config:
+  dataset: "InfiniteBench"
+  input_truncated_len: 8192
+  temperature: 1.0
+
+parallel_config:
+  world_size: 128
+  cp_size: 1
+  attn_tp_size: 1
+  dense_tp_size: 1
+  moe_tp_size: 1
+  embed_tp_size: 1
+  lmhead_tp_size: 4
+  o_proj_tp_size: 1
+
+scheduler_config:
+  block_size: 128
+  max_new_tokens: 256
+  max_prefill_tokens: 8192
+  batch_size: 256

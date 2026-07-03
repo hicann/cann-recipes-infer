@@ -16,6 +16,12 @@
 #!/bin/bash
 export IPs=('xxx.xxx.xxx.xxx' 'xxx.xxx.xxx.xxx') # IPs of all servers. Please seperate multiple servers with blank space in between. The first one is the master server.
 
+# only online need
+# When prefill and decode share the same host, set ASCEND_RT_VISIBLE_DEVICES
+# before calling infer.sh to isolate NPUs per role.
+PREFILL_IPS=('xx.xx.xx.xx')
+DECODE_IPS=('xx.xx.xx.xx')
+
 rm -rf /root/atc_data/
 
 CURRENT_PATH=$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
@@ -29,8 +35,8 @@ source $cann_path/opp/vendors/customize/bin/set_env.bash
 source $cann_path/opp/vendors/custom_transformer/bin/set_env.bash
 
 filename=$(basename "$YAML")
-enable_core_num=$(python3 -c "import yaml; print(yaml.safe_load(open('$YAML'))['model_config'].get('enable_limit_core', False))")
-enable_multi_streams=$(python3 -c "import yaml; print(yaml.safe_load(open('$YAML'))['model_config'].get('enable_multi_streams', False))")
+enable_core_num=$(python3 -c "import yaml; print(yaml.safe_load(open('$YAML'))['model_config'].get('custom_params', {}).get('enable_limit_core', False))")
+enable_multi_streams=$(python3 -c "import yaml; print(yaml.safe_load(open('$YAML'))['model_config'].get('custom_params', {}).get('enable_multi_streams', False))")
 if [ "$enable_core_num" = "True" ]; then
     export SC_BLOCK_OP="Compressor:InplacePartialRotaryMul"
     export FORCE_ENABLE_STATIC_SHAPE_KERNEL=True

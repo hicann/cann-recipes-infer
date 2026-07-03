@@ -21,13 +21,14 @@ from typing import Dict, Optional, Any
 
 import torch
 import torch_npu
-from transformers import AutoTokenizer
 
 from executor.core.config import InferenceConfig
 from executor.utils import get_default_group
 from executor.utils.forward_metadata import PrefillCPMetaData, set_forward_metadata, get_forward_metadata
 from executor.utils.profiler_context import ProfilerManager
 from executor.core.model_worker import ModelWorker, MTPWorker
+from executor.core.tokenizer_registry import get_tokenizer
+from executor.utils import sample_logits
 from executor.core.kv_cache import KVCacheManager, ModelCacheInfo, create_single_type_managers
 from executor.core.kv_cache.cache_utils import allocate_cache_tensors, calculate_block_num, \
     prepare_block_tables, prepare_slot_mapping, validate_cache_info
@@ -54,6 +55,7 @@ class ExecutionEngine:
         self.comm_manager = None
         self.max_new_tokens = self.infer_config.scheduler_config.max_new_tokens
         self.input_truncated_len = self.infer_config.data_config.input_truncated_len
+        self.temperature = self.infer_config.data_config.temperature
         self.block_size = self.infer_config.scheduler_config.block_size
         self.next_n = self.infer_config.model_config.next_n
         # PD (prefill or decode) roles hold only their own KV and do not need the MTP draft-token buffer
@@ -141,7 +143,8 @@ class ExecutionEngine:
 
         # Initialize tokenizer (from main worker)
         self.hf_config = self.main_worker.hf_config
-        self.tokenizer = AutoTokenizer.from_pretrained(
+        self.tokenizer = get_tokenizer(
+            self.infer_config.model_config.model_name,
             self.infer_config.model_config.model_path,
             padding_side="right",
             truncation_side='right',
@@ -387,6 +390,14 @@ class ExecutionEngine:
         if batch_size == 0:
             raise ValueError("Prefill CP requires at least one local request per rank in Phase1.")
 
+        # If a model has a minimum CP segment length requirement, define it as
+        # a model-side cp_segment_min_len attribute.
+        cp_segment_min_len = getattr(self.main_worker.model, "cp_segment_min_len", None)
+        if cp_segment_min_len is not None:
+            cp_segment_min_len = int(cp_segment_min_len)
+            if cp_segment_min_len <= 0:
+                raise ValueError(f"cp_segment_min_len must be positive, got {cp_segment_min_len}.")
+
         cp_segment_num = cp_size * 2
         cp_rank = self.global_rank % cp_size
         seq_lens = [int(seq_len) for seq_len in actual_seq_lengths_kv.detach().cpu().tolist()]
@@ -398,6 +409,8 @@ class ExecutionEngine:
         for seq_len in seq_lens:
             starts.append(starts[-1] + seq_len)
             segment_len = (seq_len + cp_segment_num - 1) // cp_segment_num
+            if cp_segment_min_len is not None:
+                segment_len = max(segment_len, cp_segment_min_len)
             padded_seq_len = segment_len * cp_segment_num
             padded_seq_lens.append(padded_seq_len)
             padded_starts.append(padded_starts[-1] + padded_seq_len)
@@ -609,7 +622,10 @@ class ExecutionEngine:
 
     def _get_warmup_shape(self):
         """Calculate warm-up input shapes based on current packed prefill/decode config."""
-        prefill_batch_size = self.infer_config.scheduler_config.batch_size_per_dp_rank
+        if self.infer_config.parallel_config.cp_size > 1 and self.infer_config.scheduler_config.cp_mini_batch >= 1:
+            prefill_batch_size = self.infer_config.scheduler_config.cp_mini_batch
+        else:
+            prefill_batch_size = self.infer_config.scheduler_config.batch_size_per_dp_rank
         decode_batch_size = self.infer_config.scheduler_config.batch_size_per_dp_rank
         seq_len = self.input_truncated_len
 
@@ -617,6 +633,14 @@ class ExecutionEngine:
         if max_prefill_tokens > 0:
             seq_len = min(seq_len, max_prefill_tokens)
             prefill_batch_size = max(1, max_prefill_tokens // seq_len)
+            if (
+                self.infer_config.parallel_config.cp_size > 1
+                and self.infer_config.scheduler_config.cp_mini_batch >= 1
+            ):
+                prefill_batch_size = min(
+                    prefill_batch_size,
+                    self.infer_config.scheduler_config.cp_mini_batch,
+                )
 
         return prefill_batch_size, decode_batch_size, seq_len
 
@@ -646,9 +670,11 @@ class ExecutionEngine:
             )
             if self.is_afd_ffn_rank:
                 num_tokens = prefill_batch_size * seq_len
-                model_inputs = self._build_afd_ffn_inputs(num_tokens, is_prefill=True)
+                model_inputs = self._build_afd_ffn_inputs(num_tokens, is_prefill=True, is_warm_up=True)
             else:
                 model_inputs = self._build_model_inputs(dummy_input_ids, is_prefill=True, seq_lens=dummy_seq_lens)
+            set_forward_metadata(is_warm_up=True)
+            model_inputs["forward_metadata"] = get_forward_metadata()
             output, _ = self.main_worker.inference(model_inputs, is_prefill=True)
             if self.mtp_worker:
                 logger.info("Warm-up [MTP]: executing model prefill step...")
@@ -672,7 +698,11 @@ class ExecutionEngine:
                 (decode_batch_size * seq_len,), dtype=torch.long, device=self.device,
             )
             if self.is_afd_ffn_rank:
-                model_inputs = self._build_afd_ffn_inputs(decode_batch_size * seq_len, is_prefill=False)
+                model_inputs = self._build_afd_ffn_inputs(
+                    decode_batch_size * seq_len,
+                    is_prefill=False,
+                    is_warm_up=True,
+                )
             else:
                 model_inputs = self._build_model_inputs(dummy_input_ids, is_prefill=False)
 
@@ -690,15 +720,18 @@ class ExecutionEngine:
                     self.mtp_worker.mtp_model_worker.compile_model()
                 _ = self.mtp_worker.mtp_model_worker.inference(model_inputs, is_prefill=False, is_mtp=True)
 
+        set_forward_metadata(is_warm_up=False)
         logger.info("Warm-up completed successfully.")
 
-    def _build_afd_ffn_inputs(self, num_tokens: int, is_prefill: bool) -> Dict:
-        return self.main_worker.model.build_afd_inputs(
+    def _build_afd_ffn_inputs(self, num_tokens: int, is_prefill: bool, is_warm_up: bool = False) -> Dict:
+        model_inputs = self.main_worker.model.build_afd_inputs(
             num_tokens,
             is_prefill,
             dtype=self.main_worker.dtype,
             device=self.device,
         )
+        model_inputs["is_warm_up"] = is_warm_up
+        return model_inputs
 
     def forward_batch(self, batch: Batch) -> Dict[str, Any]:
         """Execute forward pass for a batch of requests.
@@ -835,7 +868,7 @@ class ExecutionEngine:
     ) -> torch.Tensor:
         if batch.is_prefill:
             logits = logits[:, -1:, :]
-        next_tokens = torch.argmax(logits, dim=-1).to(self.device)
+        next_tokens = sample_logits(logits, self.temperature).to(self.device)
         return next_tokens
 
     def verify_spec_tokens(self, batch, main_next_tokens):

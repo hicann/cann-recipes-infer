@@ -13,6 +13,7 @@
 - `dataset`: 数据集名称（默认 "default"）。
 - `dataset_path`: 数据集路径（默认 ""），非"default"数据集时必须指定。
 - `input_truncated_len`: 最大输入序列长度（默认 256），如果prompt超过这一长度会被截断。
+- `temperature`: 采样温度（默认 0.0）。设置为 0 时使用 greedy decoding；值越大，采样随机性越强。
 
 ### 2.2 ModelConfig (模型配置)
 管理模型运行时的特有行为。
@@ -59,6 +60,7 @@
 - `batch_size_per_dp_rank`: **不支持配置**。每个 Rank 的 Batch Size。推导方式：`batch_size // attn_dp_size`。
 - `mem_fraction_static`: 静态内存分配比例（默认 0.85），用于控制推理阶段可用于静态占用的设备内存比例。
 - `block_size`: 单个 KV Cache block 可容纳的 token 数（默认 128），用于控制 Paged Attention 的 block 粒度。
+- `cp_mini_batch`: CP prefill 场景下单次调度的请求数上限（默认 -1，表示不额外限制）。当 `parallel_config.cp_size > 1` 时可用于将 prefill 请求拆成更小的 mini-batch；DeepSeek-V4 当前 CP 路径要求设置为 1。
 - `num_reserved_decode_tokens`: （仅 PD decode 端）每个在途请求保留的 KV token 数（默认 64），由 `DecodePreallocQueue.pop_preallocated` 用于准入控制。prealloc/transfer/running 流水线中的每条请求都会按此值预留近期 decode 步所需的 KV block 余量；若新请求的接纳会令 KV 池超出该余量，则不再准入。值越小吞吐越高，但突发负载下 retraction 抖动也越多。
 
 ## 3. 日志配置

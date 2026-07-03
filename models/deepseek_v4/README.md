@@ -89,7 +89,7 @@ CANNLab一站式开发平台已预置部署运行环境，使用CANNLab一站式
   在各个节点上通过如下命令进入容器：
   ```
   docker attach cann_recipes_infer
-  cd /home/code/cann-recipes-infer/models/deepseek-v4
+  cd /home/code/cann-recipes-infer/models/deepseek_v4
   ```
 
 ### 转换权重中的config.json
@@ -144,31 +144,72 @@ CANNLab一站式开发平台已预置部署运行环境，使用CANNLab一站式
 
   ```
 
-### 修改代码
-- 在各个节点上修改`cann-recipes-infer/models/deepseek-v4/set_env.sh`中的如下字段:
+### 修改配置
+- 在各个节点上修改`cann-recipes-infer/models/deepseek_v4/set_env.sh`中的如下字段:
    - `IPs`：配置所有节点的IP，按照rank id排序，多个节点的ip通过空格分开，例如：`('xxx.xxx.xxx.xxx' 'xxx.xxx.xxx.xxx')`。
    - `cann_path`: CANN软件包安装路径，例如`/usr/local/Ascend/cann`。
-- 在Atlas A3 Pod各个节点上修改 `config/ci_a3` 路径下需要执行的yaml文件中的model_path真实路径；在950PR/DT各个节点上修改 `config/ci_950` 路径下需要执行的yaml文件中的model_path路径。关于yaml文件中的更多配置说明可参见[YAML参数描述](./config/README.md)。
+- 在Atlas A3 Pod各个节点上修改 `config/ci_a3` 路径下需要执行的yaml文件中的 `model_config.model_path` 真实路径；在950PR/DT各个节点上修改 `config/ci_950` 路径下需要执行的yaml文件中的 `model_config.model_path` 路径。通用 YAML 配置说明可参见[YAML参数描述](../../docs/common/inference_config_guide.md)。
 
-- 在 yaml 配置中，默认采用npugraph_ex执行方式。这一后端是 NPU 平台全新推出的高性能图计算组件，其基于 CANN 的 AclGraph（对标 CUDAGraph）底层能力，深度融合了一系列 NPU 架构的亲和调度和图优化技术。从落地层面来看，npugraph_ex具备以下显著优势：可快速接入 PyTorch 生态、能无缝集成到 SGLang、vLLM 等主流推理框架中，同时保障极致的运行性能。
+- 在 yaml 配置中，默认采用 `npugraph_ex` 执行方式。这一后端是 NPU 平台全新推出的高性能图计算组件，其基于 CANN 的 AclGraph（对标 CUDAGraph）底层能力，深度融合了一系列 NPU 架构的亲和调度和图优化技术。从落地层面来看，`npugraph_ex` 具备以下显著优势：可快速接入 PyTorch 生态、能无缝集成到 SGLang、vLLM 等主流推理框架中，同时保障极致的运行性能。
 
-- 在各个节点上修改 infer.sh 文件中的YAML_FILE_NAME，指定为上一步需要执行的yaml文件名。
+- 除框架统一配置之外，DeepSeek-V4 还额外支持以下特性，放置在 YAML 文件 `model_config` 的 `custom_params` 字段下：
 
-  ```
-  # A3 用例
-  export YAML_FILE_NAME=ci_a3/deepseek_v4.yaml
-  # 950PR/DT  用例
-  export YAML_FILE_NAME=ci_950/deepseek_v4.yaml
-  ```
+  | 参数名 | 类型 | 默认值 | 含义 |
+  | --- | --- | --- | --- |
+  | `enable_multi_streams` | bool | `false` | 启用模型内多流并行，主要用于 decode 阶段 MLA、Indexer、Compressor、MoE shared expert 等模块的并行调度。 |
+  | `enable_limit_core` | bool | `false` | 在 Atlas A3 上配合多流使用，对部分算子限制 AI Core 数以提升多流重叠效果；开启时要求 `enable_multi_streams=True`，且不支持 `enable_pypto=True`。 |
+  | `enable_pypto` | bool | `false` | 启用 PyPTO 算子路径；当前与 `enable_limit_core` 互斥。 |
+  | `moe_chunk_max_len` | int | `65536` | MoE token 分发的最大 chunk 长度，用于长序列 prefill 场景规避 OOM。 |
 
   > CANNLab一站式开发平台 A3 场景请使用 `ci_a3/deepseek_v4_platform.yaml`，详见[CANNLab一站式开发平台指南](#cannlab一站式开发平台指南)。
 
-  > **Note**: 在A3环境下，INT8 W8A8场景支持 4~64卡部署。可分别在config下的yaml文件中修改world_size (chips * 2) 配置。
+  > **Note**: 在A3环境下，INT8 W8A8场景支持 4~64卡部署。可分别在config下的yaml文件中修改 `parallel_config.world_size`（chips * 2）配置。
+
 ### 拉起多卡推理
-  在各个节点上同步执行如下命令即可拉起多卡推理任务。
-  ```shell
-  bash infer.sh
-  ```
+以下命令在仓库根目录执行。统一入口脚本位于 `executor/scripts/infer.sh`，通过以下参数控制启动：
+
+| 参数 | 含义 | 取值示例 |
+| --- | --- | --- |
+| `--model` | 模型目录名，对应 `models/` 下的子目录 | `deepseek_v4` |
+| `--mode` | 推理模式 | `offline` / `online` |
+| `--yaml` | 离线模式：yaml 文件名，路径相对 `models/deepseek_v4/config/` | `ci_a3/deepseek_v4_flash.yaml` |
+| `--pd-role` | 在线 PD 模式部署角色 | `prefill` / `decode` |
+| `--p-yaml-name` | 可选，在线模式 prefill yaml 文件名 | `ci_a3/deepseek_v4_pd/prefill.yaml` |
+| `--d-yaml-name` | 可选，在线模式 decode yaml 文件名 | `ci_a3/deepseek_v4_pd/decode.yaml` |
+
+> 在线模式 IP 等更多配置可参考 [executor 设计文档 §5.1 启动方式](../../docs/design/executor_design.md#51-启动方式)。
+
+**使用方式一：命令行传参**
+```shell
+# offline 模式，A3 Flash
+bash executor/scripts/infer.sh --model deepseek_v4 --yaml ci_a3/deepseek_v4_flash.yaml
+
+# offline 模式，CANNLab A3
+bash executor/scripts/infer.sh --model deepseek_v4 --yaml ci_a3/deepseek_v4_platform.yaml
+
+# offline 模式，950PR/DT
+bash executor/scripts/infer.sh --model deepseek_v4 --yaml ci_950/deepseek_v4.yaml
+
+# online PD 模式，暂时只支持A3机型
+bash executor/scripts/infer.sh --model deepseek_v4 --mode online --pd-role prefill --p-yaml-name ci_a3/deepseek_v4_pd/prefill.yaml --d-yaml-name ci_a3/deepseek_v4_pd/decode.yaml
+bash executor/scripts/infer.sh --model deepseek_v4 --mode online --pd-role decode --p-yaml-name ci_a3/deepseek_v4_pd/prefill.yaml --d-yaml-name ci_a3/deepseek_v4_pd/decode.yaml
+```
+
+如需查看参数说明，可执行 `bash executor/scripts/infer.sh --help`。
+
+**使用方式二：直接修改脚本默认值后执行**
+编辑 `executor/scripts/infer.sh`，按需修改 `MODEL` / `MODE` / `YAML_FILE` / `PD_ROLE` / `P_YAML_NAME` / `D_YAML_NAME` 等参数的默认值，例如：
+```shell
+MODEL=deepseek_v4
+MODE=offline
+YAML_FILE=ci_a3/deepseek_v4_flash.yaml
+```
+保存后直接执行：
+```shell
+bash executor/scripts/infer.sh
+```
+
+> 如果是多机环境，需要在每个节点上同步执行拉起命令。
 
 > **Note：** 不同平台最小部署单元要求如下
 

@@ -116,7 +116,7 @@ def allocate_cache_tensors(device, cache_info: ModelCacheInfo, block_num_by_type
             block_num = block_num_by_type[group_key]
             allocator = CacheAllocator(cache.allocator)
             if cache.attn_type in ["FullAttention", "SlidingWindow"]:
-                block_size = cache.block_size
+                block_size = cache.storage_block_size
                 dims = cache.dim if isinstance(cache.dim, list) else [cache.dim]
                 shape = (block_num, block_size, cache.num_head, *dims)
                 numel = block_num * block_size * cache.num_head * cache.cache_dim_numel()
@@ -232,7 +232,7 @@ def calculate_block_num(
                 )
 
             cache_token_bytes = int(
-                cache.cache_dim_numel() * cache.num_head * dtype_itemsize(cache.dtype)
+                cache.cache_dim_numel() * cache.num_head * dtype_itemsize(cache.dtype) // cache.compress_ratio
             )
             paged_block_sizes_by_key[group_key] = block_size
             paged_manager_keys.add(group_key)
@@ -421,6 +421,9 @@ def prepare_slot_mapping(
         cur_block_size = manager.block_size
         if block_table.shape[1] == 0:
             raise ValueError(f"block_table for manager_key={manager_key} must have non-zero width")
+        compress_ratio = getattr(manager, "compress_ratio", 1)
+        if compress_ratio > 1:
+            continue
 
         slot_mappings = []
         for idx in range(actual_seq_lengths_cu_q.shape[0]):

@@ -16,7 +16,7 @@ DeepSeek团队发布了最新的模型DeepSeek-V4系列模型，包含DeepSeek-V
 上述融合算子的**AscendC**实现，均已在0 Day开源。此外，本次开源还提供了**PyPTO**和**TileLang**实现，为高效算子开发提供可直接参考的样例，仅需几百行代码即可完成复杂融合kernel的开发工作。
 
 ## Highlights
-- 整体部署策略沿用DeepSeek的EP并行方案，针对模型的新结构特征，设计实现NPU亲和的并行策略，支持`Atlas-A3 Pod`和`950PR/DT`多代际昇腾芯片部署，提供长达1M序列的高性能推理能力。[模型推理代码](../../../models/deepseek-v4/README.md)已在本仓开源，同时也适配了主流开源推理框架vLLM和SGLang。
+- 整体部署策略沿用DeepSeek的EP并行方案，针对模型的新结构特征，设计实现NPU亲和的并行策略，支持`Atlas-A3 Pod`和`950PR/DT`多代际昇腾芯片部署，提供长达1M序列的高性能推理能力。[模型推理代码](../../../models/deepseek_v4/README.md)已在本仓开源，同时也适配了主流开源推理框架vLLM和SGLang。
 - 基于AscendC开源发布HC Pre和HC Post融合算子，高性能计算mHC的前后处理流程。AscendC Kernel[技术文档](./deepseek_v4_mHC_guide.md)和[代码](../../../ops/ascendc/README.md)已开源。
 - 基于自研PyPTO发布HC Pre和MLAProlog融合算子，提高融合算子的编程易用性，算子前端无需感知芯片的代际差异，后端通过pass IR和PTO_ISA指令进行区分，实现代际兼容。PyPTO Kernel[技术文档](./deepseek_v4_pypto_operator_guide.md)、PTO ISA的[使用指南](https://gitcode.com/cann/pto-isa/blob/master/README.md)和[代码](../../../ops/pypto/README.md)已开源。
 - 开源社区TileLang同步支持了DeepSeek-V4中的所有新增算子开发，并分别对应Tilelang-Ascend的Expert和Developer开发模式，提供AscendC基础指令和PTO AS两种对接层次，为各种编程前端语言和编译器提供多层开放接口，在TileAi开源社区发布，TileLang Kernel[技术文档](./deepseek_v4_tilelang_operator_guide.md)和[代码](../../../ops/tilelang/README.md)已同步开源。

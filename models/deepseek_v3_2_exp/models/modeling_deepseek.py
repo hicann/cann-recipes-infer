@@ -2140,8 +2140,6 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
         # Initialize weights and apply final processing
         self.post_init()
 
-        if self.enable_cache_compile:
-            self.cached_decode = self.get_cached_graph()
         self.enable_offload = custom_params.get("enable_offload", False)
         self.offload_cache = None
 
@@ -2220,26 +2218,6 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
         if exe_mode == "npugraph_ex" and enable_superkernel:
             raise ValueError("npugraph_ex does not support superkernel.")
 
-    def get_cached_graph(self):
-        tng.patch_for_hcom()
-        tng_config = tng.CompilerConfig()
-        tng_config.experimental_config.frozen_parameter = True
-        tng_config.experimental_config.tiling_schedule_optimize = True
-        tng_config.experimental_config.topology_sorting_strategy = "StableRDFS"
-        case_name = "compile_cache/" + os.getenv("CASE_NAME")
-        cache_model = self.main_decode
-        if self.is_mtp:
-            cache_model = self.main_decode_mtp
-            case_name += "_spec"
-        cache_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), case_name)
-        if self.enable_npugraph_ex:
-            tng_config.mode = "reduce-overhead"
-            if self.enable_static_kernel:
-                tng_config.experimental_config.aclgraph._aclnn_static_shape_kernel = True
-
-        cached_decode = tng.inference.cache_compile(cache_model, cache_dir=cache_dir, config=tng_config,
-                                                    dynamic=False, fullgraph=True, ge_cache=not self.enable_npugraph_ex)
-        return cached_decode
 
     def init_parallel_comm_group(self):
         self.comm_manager.register_group(

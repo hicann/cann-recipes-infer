@@ -146,14 +146,39 @@ class SingleTypeKVCacheManager:
 class FullAttentionManager(SingleTypeKVCacheManager):
     """Manager for full attention KV cache layout."""
 
+    def __init__(
+        self,
+        attn_type: str,
+        block_num: int,
+        block_size: int,
+        manager_key: Optional[str] = None,
+        max_model_len: Optional[int] = None,
+        compress_ratio: int = 1,
+        **kwargs,
+    ):
+        super().__init__(
+            attn_type=attn_type,
+            block_num=block_num,
+            block_size=block_size,
+            manager_key=manager_key,
+            max_model_len=max_model_len,
+        )
+        self.compress_ratio = compress_ratio
+
     def get_num_skipped_tokens(self, _num_computed_tokens: int) -> int:
         """Full attention never skips tokens."""
         return 0
 
     @staticmethod
-    def validate_and_build_kwargs(_group_entries: List[CacheEntry]) -> Dict[str, object]:
-        """Full attention requires no additional kwargs."""
-        return {}
+    def validate_and_build_kwargs(group_entries: List[CacheEntry]) -> Dict[str, object]:
+        """Validate full-attention metadata and return required manager kwargs."""
+        compress_ratios = {cache.compress_ratio for cache in group_entries}
+        if len(compress_ratios) != 1:
+            raise ValueError(
+                "All FullAttention caches grouped into one manager must share the same "
+                f"compress_ratio, but got {sorted(compress_ratios)}."
+            )
+        return {"compress_ratio": next(iter(compress_ratios))}
 
 
 class SlidingWindowManager(SingleTypeKVCacheManager):

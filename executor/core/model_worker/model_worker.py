@@ -23,7 +23,6 @@ for a single model (either main model or MTP model), including:
 - Model compilation for graph mode
 """
 
-import os
 import logging
 import time
 from typing import Dict, Optional, Tuple
@@ -40,6 +39,14 @@ from executor.model_loader.dummy_loader import DummyModelLoader
 from module.quantization import (QUANTIZATION_METHODS, get_quant_config)
 
 logger = logging.getLogger(__name__)
+
+
+def main_decode(self, **kwargs):
+    return self.forward(**kwargs)
+
+
+def mtp_decode(self, **kwargs):
+    return self.forward(**kwargs)
 
 
 class ModelWorker:
@@ -84,9 +91,10 @@ class ModelWorker:
             enable_cache_compile: Whether to enable compiled graph cache.
     """
 
-    def __init__(self, infer_config: InferenceConfig, device):
+    def __init__(self, infer_config: InferenceConfig, device, is_mtp: bool = False):
         """Initialize ModelWorker with inference configuration and device."""
         # Config
+        self.is_mtp = is_mtp
         self.infer_config = infer_config
         self.model_name = self.infer_config.model_config.model_name
         self.model_path = self.infer_config.model_config.model_path
@@ -160,6 +168,10 @@ class ModelWorker:
         # Validate configuration
         self.infer_config.validate(self.hf_config)
 
+        # Let model-specific code adjust HF config before model initialization.
+        if hasattr(model_cls, "update_model_cfg"):
+            model_cls.update_model_cfg(self.hf_config, self.infer_config)
+
         # Phase 2: comm_manager. Secondary workers (MTP) pass the main worker's
         # comm_manager so we don't recreate process-wide state.
         if comm_manager is None:
@@ -196,6 +208,7 @@ class ModelWorker:
             model_path=self.model_path,
             comm_manager=self.comm_manager,
         )
+        self._ensure_compile_interface()
 
         # Check model settings
         if hasattr(self.model, "check_model_settings"):
@@ -211,6 +224,27 @@ class ModelWorker:
         if hasattr(self.model, "process_weights_after_loading"):
             self.model.process_weights_after_loading()
             self.model.to(self.device)
+
+    def _ensure_compile_interface(self):
+        """Provide a framework-side forward wrapper for graph compilation."""
+        if self.exe_mode not in ["ge_graph", "npugraph_ex"]:
+            return
+
+        if self.is_mtp:
+            compile_func_name = "mtp_decode"
+        else:
+            compile_func_name = "main_decode"
+
+        if hasattr(self.model, compile_func_name):
+            return
+
+        model_cls = self.model.__class__
+        compile_func = {
+            "main_decode": main_decode,
+            "mtp_decode": mtp_decode,
+        }[compile_func_name]
+        setattr(model_cls, compile_func_name, compile_func)
+        logger.info("Add framework-side compile interface: %s.%s", model_cls.__name__, compile_func_name)
 
     def get_cache_info(self):
         """Get the model's overall cache information."""
@@ -303,6 +337,13 @@ class ModelWorker:
                 self.decode_topk_list = self.gen_force_eplb_topk_idx(is_prefill, total_tokens)
             model_inputs.update({"cur_topk_list": self.prefill_topk_list if is_prefill else self.decode_topk_list})
 
+        if hasattr(self.model, "preprocess_model_inputs"):
+            model_inputs = self.model.preprocess_model_inputs(
+                model_inputs,
+                is_prefill=is_prefill,
+                is_mtp=is_mtp,
+            )
+
         # Synchronize and start timing
         self._barrier_before_timing()
         torch.npu.synchronize()
@@ -312,7 +353,16 @@ class ModelWorker:
         with torch.no_grad():
             if self.exe_mode in ["ge_graph", "npugraph_ex"] and not is_prefill:
                 # Use compiled model for decode phase
-                output = self.model_compiled(**model_inputs)
+                is_warm_up = getattr(
+                    model_inputs.get("forward_metadata"),
+                    "is_warm_up",
+                    model_inputs.get("is_warm_up", False),
+                )
+                if self.exe_mode == "npugraph_ex" and self.enable_cache_compile and not is_warm_up:
+                    with torch.compiler.set_stance(skip_guard_eval_unsafe=True):
+                        output = self.model_compiled(**model_inputs)
+                else:
+                    output = self.model_compiled(**model_inputs)
             else:
                 # Use eager execution for prefill or non-graph mode
                 output = self.model(**model_inputs)
@@ -335,14 +385,21 @@ class ModelWorker:
         logger.info("The final model structure is: \n %s", self.model)
         if self.exe_mode in ["ge_graph", "npugraph_ex"]:
             logger.info("Try to compile model")
-            enable_superkernel = self.infer_config.model_config.custom_params.get("enable_superkernel", False)
+            # For cache compile, the main model and draft/MTP model must use
+            # different compile interfaces; otherwise they may trigger unnecessary recompilation.
+            if self.is_mtp:
+                compile_func_name = "mtp_decode"
+            else:
+                compile_func_name = "main_decode"
+
+            # In graph mode, forward should be wrapped by a compiled method to avoid
+            # the effect of @torch.inference_mode.
+            model_forward = getattr(self.model, compile_func_name)
+            logger.info("Compile model interface: %s.%s", self.model.__class__.__name__, compile_func_name)
+
             self.model_compiled = compile_model_forward(
-                self.model.forward,
-                exe_mode=self.exe_mode,
-                enable_cache_compile=self.enable_cache_compile,
-                cache_dir=os.path.join(self.infer_config.model_config.output_path, "compile_cache"),
-                enable_static_kernel=self.enable_static_kernel,
-                enable_superkernel=enable_superkernel
+                model_forward,
+                self.infer_config,
             )
         else:
             self.model_compiled = None

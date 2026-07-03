@@ -164,7 +164,7 @@ class KVCacheManager:
                         f"has no tensor — allocate_cache_tensors must run first."
                     )
                 t = cache.tensor
-                block_size = cache.block_size
+                block_size = cache.storage_block_size
                 data_ptrs.append(t.data_ptr())
                 data_lens.append(t.numel() * t.element_size())
                 item_lens.append(

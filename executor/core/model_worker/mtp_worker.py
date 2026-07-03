@@ -28,6 +28,7 @@ import torch
 from executor.core.config import InferenceConfig
 from executor.core.model_worker.model_worker import ModelWorker
 from executor.core.kv_cache.cache_utils import prepare_slot_mapping
+from executor.utils import sample_logits
 from executor.utils.forward_metadata import set_forward_metadata, get_forward_metadata
 from ..forward_data_info import MTPInfo, Batch
 
@@ -66,10 +67,11 @@ class MTPWorker:
         self.exe_mode = self.infer_config.model_config.exe_mode
         self.batch_size_per_dp_rank = self.infer_config.scheduler_config.batch_size_per_dp_rank
         self.block_size = self.infer_config.scheduler_config.block_size
+        self.temperature = self.infer_config.data_config.temperature
 
         # Model Components
         self.device = device
-        self.mtp_model_worker = ModelWorker(self.infer_config, self.device)
+        self.mtp_model_worker = ModelWorker(self.infer_config, self.device, True)
         self.kvcache_manager = None
 
     def share_weights_from_main_model(self, main_model):
@@ -215,7 +217,7 @@ class MTPWorker:
             # MTP model also returns global CP prefill logits; postprocess only
             # updates speculative state for rows selected by the current rank.
             logits = torch.index_select(logits, 0, output_indices)
-        next_tokens = torch.argmax(logits, dim=-1)
+        next_tokens = sample_logits(logits, self.temperature)
         batch_size = next_tokens.shape[0]
         q_len = self.next_n + 1
         # is_prefill_step = mtp_info.is_prefill

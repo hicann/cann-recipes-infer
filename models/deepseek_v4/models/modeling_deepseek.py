@@ -48,13 +48,16 @@ from transformers.utils import (
 
 from executor.utils import (
     override, get_init_attn_mask, align_up, calc_moe_hccl_buffer_size,
-    init_comm_group, get_default_group, get_decode_mask)
+    get_decode_mask)
 
 from executor.model_loader.weight_utils import default_weight_loader
 from executor.utils import (
     superkernel_scope, weight_dequant,
     limit_core_num)
 from executor.utils.stream_utils import npu_stream_switch, record_event, wait_event, record_stream
+from executor.core.config import InferenceConfig, CommManager, PlatformVersion
+from executor.core.kv_cache.cache_info import CacheEntry, LayerCacheInfo, ModelCacheInfo
+from executor.utils.forward_metadata import ForwardMetaData
 from module.linear import (
     ColumnParallelLinear,
     ReplicatedLinear,
@@ -64,42 +67,65 @@ from module.linear import (
     )
 from module.fuse_moe_gmm import FusedMoEGMM
 from module.quantization.utils.quant_utils import reshape_mx_scale
+from module.quantization import QuantizeMethodBase
+from module.quantization.compressed_tensors.compressed_tensors_moe_gmm import (
+    CompressedTensorW8A8Int8MoEGMMMethod,
+    CompressedTensorW4A8Int8MoEGMMMethod,
+)
+from module.quantization.fp8 import Fp8MoEGMMMethod
 from .configuration_deepseek import DeepseekV3Config
 from .modules import (get_window_topk_idxs, get_compress_topk_idxs,
                       one_hot, yarn_get_mscale,
                       DeepseekV3RMSNorm, _init_rope, DEEPSEEKV3_START_DOCSTRING,
                       DEEPSEEKV3_INPUTS_DOCSTRING, DeepseekV3PreTrainedModel, apply_rotary_emb,
-                      partial_rotary_mul_quant
+                      partial_rotary_mul_quant, AttnMetaData
                     )
-from .modules import Indexer, Compressor, AttnMetaData, CacheData
-from .modules.registry import OpKernel
+from .modules import Indexer, Compressor
+from .modules.registry import OpKernel, auto_import_modules
 logger = logging.get_logger(__name__)
 
 HADAMARD_SIZE = 128
 MATMUL_MAX_AXIS_VALUE = 65535
 
 
+def get_max_position_embeddings(infer_config: InferenceConfig, is_mtp: bool = False):
+    input_truncated_len = infer_config.data_config.input_truncated_len
+    max_new_tokens = infer_config.scheduler_config.max_new_tokens
+    if is_mtp:
+        next_n = infer_config.model_config.next_n
+        return max_new_tokens * (next_n + 1) + input_truncated_len + next_n - 1
+    return input_truncated_len + max_new_tokens
+
+
 class DeepseekV3SharedExpert(nn.Module):
-    def __init__(self, config, runner_settings, is_moe_layer=False, prefix="", **kwargs):
+    def __init__(
+        self,
+        config,
+        infer_config: InferenceConfig,
+        comm_manager: CommManager = None,
+        is_moe_layer=False,
+        prefix="",
+        **kwargs,
+    ):
         super().__init__()
-        self.runner_settings = runner_settings
+        self.infer_config = infer_config
+        self.comm_manager = comm_manager
         self.mm_quant_mode = (
             config.quant_config.mm_quant_mode
             if config.quant_config is not None
             else "w16a16")
         self.swiglu_limit = config.swiglu_limit if hasattr(config, "swiglu_limit") else None
-        self.moe_tp_size = self.runner_settings.get("parallel_config").get("moe_tp_size", 1)
-        self.moe_ep_size = self.runner_settings.get("parallel_config").get("moe_ep_size", 1)
+        self.moe_tp_size = self.infer_config.parallel_config.moe_tp_size
+        self.moe_ep_size = self.infer_config.parallel_config.moe_ep_size
         self.config = config
         self.hidden_size = config.hidden_size
         self.is_moe_layer = is_moe_layer
-        self.hccl_comm_dict = kwargs.get("hccl_comm_dict", None)
         self.gate_up_proj = MergedColumnParallelLinear(
             input_size=self.hidden_size,
             output_sizes=[config.moe_intermediate_size * config.n_shared_experts] * 2,
             bias=False,
             tp_size=self.moe_tp_size,
-            tp_rank=dist.get_rank(self.hccl_comm_dict.get("moe_tp_group")) if self.moe_tp_size > 1 else 0,
+            tp_rank=self.comm_manager.get_rank("moe_tp_group") if self.moe_tp_size > 1 else 0,
             quant_config=config.quant_config,
             prefix=f"{prefix}.gate_up_proj",
             )
@@ -108,7 +134,7 @@ class DeepseekV3SharedExpert(nn.Module):
             config.hidden_size,
             bias=False,
             tp_size=self.moe_tp_size,
-            tp_rank=dist.get_rank(self.hccl_comm_dict["moe_tp_group"]) if self.moe_tp_size > 1 else 0,
+            tp_rank=self.comm_manager.get_rank("moe_tp_group") if self.moe_tp_size > 1 else 0,
             quant_config=config.quant_config,
             prefix=f"{prefix}.down_proj",
             )
@@ -149,7 +175,7 @@ class DeepseekV3SharedExpert(nn.Module):
 
     def forward_a8float8(self, x, enable_decode_stream=False, shared_expert_event=None):
         merged_x = self.gate_up_proj(x)
-        intermediate_hidden_states, pergroup_scale , _ = torch.ops.custom.npu_swiglu_group_quant(
+        intermediate_hidden_states, pergroup_scale, _ = torch.ops.custom.npu_swiglu_group_quant(
             merged_x,
             dst_type=torch.float8_e4m3fn,
             round_scale=True if "mx" in self.mm_quant_mode else False,
@@ -176,12 +202,20 @@ class DeepseekV3MoE(nn.Module):
     A mixed expert module containing shared experts.
     """
 
-    def __init__(self, config, runner_settings, prefix, **kwargs):
+    def __init__(
+        self,
+        config,
+        infer_config: InferenceConfig,
+        comm_manager: CommManager = None,
+        prefix="",
+        **kwargs,
+    ):
         super().__init__()
         self.config = config
         self.layer_idx = kwargs.get("layer_idx")
         self.hash = self.layer_idx < config.num_hash_layers
-        self.runner_settings = runner_settings
+        self.infer_config = infer_config
+        self.comm_manager = comm_manager
         self.gmm_quant_mode = (
             config.quant_config.gmm_quant_mode
             if config.quant_config is not None
@@ -189,13 +223,13 @@ class DeepseekV3MoE(nn.Module):
         self.swiglu_limit = config.swiglu_limit if hasattr(config, "swiglu_limit") else None
         self.hidden_dim = config.hidden_size
         self.intermediate_size = config.moe_intermediate_size
-        self.moe_tp_size = self.runner_settings.get("parallel_config").get("moe_tp_size", 1)
-        self.moe_ep_size = self.runner_settings.get("parallel_config").get("moe_ep_size", 1)
-        self.moe_chunk_max_len = self.runner_settings.get("model_config").get("moe_chunk_max_len", 65536)
-        self.platform_version = self.runner_settings.get("model_config").get("platform_version", "A3")
-        self.exe_mode = self.runner_settings.get("exe_mode", "eager")
-        self.enable_multi_streams = runner_settings.get("model_config").get("enable_multi_streams", False)
-        self.perfect_eplb = self.runner_settings.get("model_config").get("perfect_eplb", False)
+        self.moe_tp_size = self.infer_config.parallel_config.moe_tp_size
+        self.moe_ep_size = self.infer_config.parallel_config.moe_ep_size
+        self.moe_chunk_max_len = self.infer_config.model_config.custom_params.get("moe_chunk_max_len", 65536)
+        self.platform_version = self.infer_config.model_config.platform_version
+        self.exe_mode = self.infer_config.model_config.exe_mode
+        self.enable_multi_streams = self.infer_config.model_config.custom_params.get("enable_multi_streams", False)
+        self.force_eplb = self.infer_config.model_config.force_eplb
         self.num_experts_per_tok = config.num_experts_per_tok
         # total experts num
         self.num_experts = config.n_routed_experts
@@ -212,7 +246,6 @@ class DeepseekV3MoE(nn.Module):
         self.n_shared_experts = config.n_shared_experts
         self.n_routed_experts = config.n_routed_experts
         self.experts_per_rank = config.n_routed_experts // self.moe_ep_size
-        self.hccl_comm_dict = kwargs.get("hccl_comm_dict", None)
         self.experts = FusedMoEGMM(
             num_experts=config.n_routed_experts,
             hidden_size=self.hidden_dim,
@@ -221,17 +254,23 @@ class DeepseekV3MoE(nn.Module):
             bias=True if self.gmm_quant_mode == "w4a8int4" else False,
             quant_config=config.quant_config,
             tp_size=self.moe_tp_size,
-            tp_rank=dist.get_rank(self.hccl_comm_dict["moe_tp_group"]) if self.moe_tp_size > 1 else 0,
+            tp_rank=self.comm_manager.get_rank("moe_tp_group") if self.moe_tp_size > 1 else 0,
             ep_size=self.moe_ep_size,
-            ep_rank=dist.get_rank(self.hccl_comm_dict["moe_ep_group"]) if self.moe_ep_size > 1 else 0,
+            ep_rank=self.comm_manager.get_rank("moe_ep_group") if self.moe_ep_size > 1 else 0,
             prefix=f"{prefix}.experts",
         )
         self.gmm_int_quant = "a8" in self.gmm_quant_mode and "float" not in self.gmm_quant_mode
         self.moe_ffn = self.experts_w4a8int4 if self.gmm_quant_mode == "w4a8int4" else self.experts
         self._init_gate(prefix)
         if config.n_shared_experts is not None:
-            self.shared_experts = DeepseekV3SharedExpert(config, self.runner_settings,
-                                        is_moe_layer=True, prefix=f"{prefix}.shared_experts", **kwargs)
+            self.shared_experts = DeepseekV3SharedExpert(
+                config,
+                self.infer_config,
+                self.comm_manager,
+                is_moe_layer=True,
+                prefix=f"{prefix}.shared_experts",
+                **kwargs,
+            )
         self.dispatch_quant_mode = {
             "w16a16": 0,
             "w8a8int8": 2,
@@ -258,13 +297,16 @@ class DeepseekV3MoE(nn.Module):
                                      self.n_routed_experts,
                                      bias=False,
                                      quant_config=None,
-                                     params_dtype=torch.bfloat16 if self.platform_version == "950" else torch.float32,
+                                     params_dtype=torch.bfloat16 \
+                                        if self.platform_version == PlatformVersion.ASCEND_950 else torch.float32,
                                      prefix=f"{prefix}.gate",
                                      )
         self._reset_parameters()
         if self.hash:
             self.gate.e_score_correction_bias = None
-            self.tid2eid = nn.Parameter(torch.randint(high=self.n_routed_experts, size=(self.config.vocab_size, self.top_k), dtype=torch.int32), requires_grad=False)
+            self.tid2eid = nn.Parameter(torch.randint(high=self.n_routed_experts, \
+                                                      size=(self.config.vocab_size, self.top_k), \
+                                                        dtype=torch.int32), requires_grad=False)
         else:
             self.gate.e_score_correction_bias = nn.Parameter(torch.empty((self.n_routed_experts), dtype=torch.float32))
             self.tid2eid = None
@@ -291,7 +333,7 @@ class DeepseekV3MoE(nn.Module):
 
     def set_mc2_kwargs(self):
         global_rank = dist.get_rank()
-        moe_ep_group_name = self.hccl_comm_dict.get("moe_ep_group_mc2_name", None)
+        moe_ep_group_name = self.comm_manager.get_group_name("moe_ep_group_mc2")
         if self.gmm_quant_mode not in self.dispatch_quant_mode:
             quant_mode = self.dispatch_quant_mode["w16a16"]
         else:
@@ -329,11 +371,11 @@ class DeepseekV3MoE(nn.Module):
                 "tp_world_size": self.moe_tp_size,
                 "tp_rank_id": global_rank % self.moe_tp_size
             }
-        if self.platform_version != "950":
+        if self.platform_version != PlatformVersion.ASCEND_950:
             self.dispatch_kwargs["comm_alg"] = "fullmesh_v2"
 
     def forward(self, hidden_states, is_prefill=False, cur_topk_list=None, input_ids=None, shared_expert_stream=None):
-        bsz, seq_len, h = hidden_states.shape
+        _, h = hidden_states.shape
         if is_prefill:
             if self.n_shared_experts > 0:
                 hidden_states_share = self.forward_shared_expert(hidden_states, shared_expert_stream)
@@ -344,12 +386,12 @@ class DeepseekV3MoE(nn.Module):
             record_event(self.enable_multi_streams, self.npu_events, 0)
 
         # compute gating score
-        if self.platform_version == "950":
+        if self.platform_version == PlatformVersion.ASCEND_950:
             logits = torch_npu.npu_fused_matmul(hidden_states.view(-1, h), self.gate.weight, fused_op_type="16cast32")
         else:
             logits = self.gate(hidden_states.view(-1, h).to(torch.float32))
         topk_idx, topk_weight, _ = OpKernel.gate_topk(self, logits, input_ids)
-        if self.perfect_eplb:
+        if self.force_eplb:
             topk_idx = cur_topk_list
         topk_idx = topk_idx.to(torch.int32)
 
@@ -456,13 +498,13 @@ class DeepseekV3MoE(nn.Module):
         return out_hidden
 
     def combine_double_routing(self, new_x, expanded_x, input_splits, output_splits):
-        moe_ep_group = self.hccl_comm_dict.get("moe_ep_group", None)
+        moe_ep_group = self.comm_manager.get_group("moe_ep_group")
         gathered_tokens = new_x.new_empty(expanded_x.shape[0], new_x.shape[1])
         dist.all_to_all_single(gathered_tokens, new_x, input_splits, output_splits, group=moe_ep_group)
         return gathered_tokens
 
     def dispatch_double_routing(self, tokens_per_expert, expanded_x, pertoken_scale):
-        moe_ep_group = self.hccl_comm_dict.get("moe_ep_group", None)
+        moe_ep_group = self.comm_manager.get_group("moe_ep_group")
         tokens_per_expert_group = tokens_per_expert.new_empty(tokens_per_expert.shape[0])
         # (total_experts,)->(total_ranks*n_routed_experts_per_rank)
         dist.all_to_all_single(tokens_per_expert_group, tokens_per_expert, group=moe_ep_group)
@@ -485,7 +527,8 @@ class DeepseekV3MoE(nn.Module):
                 gathered_pertoken_scale = pertoken_scale.new_empty(gathered_tokens.shape[0], pertoken_scale.shape[1])
             elif "mxfloat" in self.gmm_quant_mode:
                 pertoken_scale = pertoken_scale.view(torch.int8)
-                gathered_pertoken_scale = pertoken_scale.new_empty(gathered_tokens.shape[0], pertoken_scale.shape[1], pertoken_scale.shape[2])
+                gathered_pertoken_scale = pertoken_scale.new_empty(gathered_tokens.shape[0], pertoken_scale.shape[1], \
+                    pertoken_scale.shape[2])
             else:
                 gathered_pertoken_scale = pertoken_scale.new_empty(gathered_tokens.shape[0])
         if "a16" not in self.gmm_quant_mode:
@@ -499,8 +542,7 @@ class DeepseekV3MoE(nn.Module):
         """
         pure ep strategy, for prefill stage mainly, only support eager mode
         """
-        batch_size, sequence_length, h = x.shape
-        x = x.view(-1, h)
+        num_tokens, h = x.shape
 
         # -1: non-quant; 1: dynamic quant; 0: static quant(not supported now)
         # 2: mxfp8 for dst_dtype e5m2; 3: mxfp8 for dst_dtype e4m3; 4: fp8 for dst_dtype e5m2; 5: fp8 for dst_dtype e4m3
@@ -537,7 +579,7 @@ class DeepseekV3MoE(nn.Module):
         enable_smooth_scale = "w8a8" in self.gmm_quant_mode and "float8" not in self.gmm_quant_mode
         hidden_states_list = []
         for hidden_states, topk_ids, topk_weight, hidden_states_share in zip(
-                *self._split_tensors(batch_size * sequence_length, x, topk_ids, topk_weight, hidden_states_share)):
+                *self._split_tensors(num_tokens, x, topk_ids, topk_weight, hidden_states_share)):
             sequence_length = hidden_states.shape[0]
             expanded_x, expanded_row_idx, tokens_per_expert, pertoken_scale = moe_init_routing(
                 hidden_states,
@@ -571,14 +613,14 @@ class DeepseekV3MoE(nn.Module):
 
         hidden_states = torch.cat(hidden_states_list, dim=0) if len(hidden_states_list) > 1 else hidden_states_list[0]
 
-        return hidden_states.view(batch_size, -1, h)
+        return hidden_states.view(num_tokens, h)
 
     def moe_infer_dispatch_combine(self, x, topk_ids, topk_weight, shared_expert_stream):
         """
         tp+ep mix strategy, for decode stage
         """
-        batch_size, sequence_length, h = x.shape
-        hidden_states = x.view(-1, h)
+        num_tokens, h = x.shape
+        hidden_states = x
         self.set_mc2_kwargs()
 
         # moe dispatch
@@ -628,34 +670,46 @@ class DeepseekV3MoE(nn.Module):
         hidden_states = torch_npu.npu_moe_distribute_combine_v2(**combine_args)
         wait_event(self.enable_multi_streams, self.npu_events, 1)
         hidden_states = hidden_states + hidden_states_share
-        hidden_states = hidden_states.view(batch_size, sequence_length, self.hidden_dim)
+        hidden_states = hidden_states.view(num_tokens, self.hidden_dim)
         return hidden_states
 
 
 class Attention(nn.Module):
     """Multi-Query Attention (MQA) Layer."""
-    def __init__(self, config: DeepseekV3Config, runner_settings: Dict, layer_idx: Optional[int] = None,
-                 prefix: Optional[str] = "", **kwargs):
+    def __init__(
+        self,
+        config: DeepseekV3Config,
+        infer_config: InferenceConfig,
+        comm_manager: CommManager = None,
+        layer_idx: Optional[int] = None,
+        prefix: Optional[str] = "",
+        **kwargs,
+    ):
         super().__init__()
         self.config = config
-        self.runner_settings = runner_settings
-        self.batch_size = self.runner_settings.get("data_config").get("batch_size", 16)
-        self.batch_size_per_rank = self.runner_settings.get("data_config").get("batch_size_per_rank", 1)
-        self.attn_tp_size = self.runner_settings.get("parallel_config").get("attn_tp_size", 1)
-        self.attn_dp_size = self.runner_settings.get("parallel_config").get("attn_dp_size", 1)
-        self.oproj_tp_size = self.runner_settings.get("parallel_config").get("oproj_tp_size", 1)
+        self.infer_config = infer_config
+        self.comm_manager = comm_manager
+        self.is_online = (
+            infer_config.disagg_config.disaggregation_mode in ("PREFILL", "DECODE")
+        )
+        self.batch_size = self.infer_config.scheduler_config.batch_size
+        self.batch_size_per_rank = self.infer_config.scheduler_config.batch_size_per_dp_rank
+        self.attn_tp_size = self.infer_config.parallel_config.attn_tp_size
+        self.attn_dp_size = self.infer_config.parallel_config.attn_dp_size
+        self.oproj_tp_size = self.infer_config.parallel_config.o_proj_tp_size
         if self.oproj_tp_size > config.o_groups:
             raise ValueError(f"{self.oproj_tp_size=} should not be greater than {config.o_groups =}")
-        self.moe_tp_size = self.runner_settings.get("parallel_config").get("moe_tp_size", 1)
-        self.moe_ep_size = self.runner_settings.get("parallel_config").get("moe_ep_size", 1)
-        self.world_size = self.runner_settings.get("world_size", 16)
-        self.enable_pypto = self.runner_settings.get("model_config").get("enable_pypto", False)
+        self.moe_tp_size = self.infer_config.parallel_config.moe_tp_size
+        self.moe_ep_size = self.infer_config.parallel_config.moe_ep_size
+        self.world_size = self.infer_config.parallel_config.world_size
+        self.enable_pypto = self.infer_config.model_config.custom_params.get("enable_pypto", False)
         # enable_global_multi_streams: global multistream, to wait for attention kernel metadata
-        self.enable_global_multi_streams = self.runner_settings.get("model_config").get("enable_multi_streams", False)
-        self.enable_npugraph_ex = runner_settings.get("exe_mode", "ge_graph") == "npugraph_ex"
+        self.enable_global_multi_streams = \
+            self.infer_config.model_config.custom_params.get("enable_multi_streams", False)
+        self.enable_npugraph_ex = self.infer_config.model_config.exe_mode == "npugraph_ex"
         # enable_multi_streams: multistream within current class
         self.enable_multi_streams = self.enable_global_multi_streams and not self.enable_pypto
-        self.platform_version = self.runner_settings.get("model_config").get("platform_version", "A3")
+        self.platform_version = self.infer_config.model_config.platform_version
         self.layer_idx = layer_idx
         self.is_mtp = False
         if layer_idx == config.num_hidden_layers:
@@ -666,9 +720,9 @@ class Attention(nn.Module):
             # 4 is number of events used for event synchronization
             self.mla_events = [torch.npu.Event(), torch.npu.Event(), torch.npu.Event(), torch.npu.Event()]
 
-        self.enable_limit_core = self.runner_settings.get("model_config").get("enable_limit_core", False)
+        self.enable_limit_core = self.infer_config.model_config.custom_params.get("enable_limit_core", False)
         self.compress_ratio = 1 if self.is_mtp else config.compress_ratios[layer_idx]
-        if self.enable_multi_streams and self.platform_version == "A3":
+        if self.enable_multi_streams and self.platform_version == PlatformVersion.A3:
             self.enable_compressor_parallel = self.compress_ratio == 128
             if self.compress_ratio == 4: # c4a supports compressor parallel only if it supports limit core num
                 self.enable_compressor_parallel = self.enable_limit_core
@@ -690,8 +744,6 @@ class Attention(nn.Module):
 
         self.dim = config.hidden_size
         self.n_heads = config.num_attention_heads
-
-        self.hccl_comm_dict = kwargs.get("hccl_comm_dict", None)
 
         self.num_heads_per_rank = self.n_heads // self.attn_tp_size
         self.q_lora_rank = config.q_lora_rank
@@ -722,8 +774,8 @@ class Attention(nn.Module):
                                         bias=False,
                                         quant_config=config.quant_config,
                                         tp_size=self.attn_tp_size,
-                                        tp_rank=dist.get_rank(self.hccl_comm_dict["attn_tp_group"])
-                                        if self.attn_tp_size > 1 else 0,
+                                        tp_rank=self.comm_manager.get_rank("attn_tp_group") \
+                                            if self.attn_tp_size > 1 else 0,
                                         prefix=f"{prefix}.wq_b",
                                         )
         self.wkv = ReplicatedLinear(self.dim,
@@ -737,10 +789,10 @@ class Attention(nn.Module):
         # consider oproj_tp
         if self.oproj_tp_size == 1:
             wo_tp_size = self.attn_tp_size
-            wo_tp_rank = dist.get_rank(self.hccl_comm_dict["attn_tp_group"]) if self.attn_tp_size > 1 else 0
+            wo_tp_rank = self.comm_manager.get_rank("attn_tp_group") if self.attn_tp_size > 1 else 0
         else:
             wo_tp_size = self.oproj_tp_size
-            wo_tp_rank = dist.get_rank(self.hccl_comm_dict["oproj_tp_group"])
+            wo_tp_rank = self.comm_manager.get_rank("oproj_tp_group")
         quant_config = config.quant_config if self.mm_quant_mode == "w8a8mxfloat8" \
             or self.mm_quant_mode == "w8a8hifloat8" else None
         self.wo_a = ColumnParallelLinear(self.n_heads * self.head_dim // self.n_groups,
@@ -763,16 +815,7 @@ class Attention(nn.Module):
                                     )
         self.softmax_scale = self.head_dim ** -0.5
 
-        if self.compress_ratio > 1:
-            self.compressor = Compressor(config, runner_settings, layer_idx, self.compress_ratio,
-                                         head_dim = self.head_dim, prefix=f"{prefix}.compressor", **kwargs)
-            if self.compress_ratio == 4:
-                self.indexer = Indexer(config, runner_settings, layer_idx, self.compress_ratio,
-                                       prefix=f"{prefix}.indexer", **kwargs)
-            else:
-                self.indexer = None
-
-        self.max_position_embeddings = runner_settings.get("data_config").get("max_position_embeddings", 2048)
+        self.max_position_embeddings = get_max_position_embeddings(self.infer_config, self.is_mtp)
         self.original_seq_len = config.max_seq_len
 
         self.li_cache_quant_mode = config.quant_config.li_cache_quant_mode \
@@ -781,36 +824,225 @@ class Attention(nn.Module):
         self.kv_cache_quant_mode = config.quant_config.kv_cache_quant_mode \
             if config.quant_config is not None else "unquant"
 
+        self.window_size = config.sliding_window
+        self.block_size = self.infer_config.scheduler_config.block_size
+
+        self._init_cache_entries()
+
+        if self.compress_ratio > 1:
+            self.compressor = Compressor(config, self.infer_config, layer_idx, self.compress_ratio,
+                                         head_dim=self.head_dim, prefix=f"{prefix}.compressor",
+                                         comm_manager=self.comm_manager, cache_getter=self._get_cache_tensor, **kwargs)
+            if self.compress_ratio == 4:
+                self.indexer = Indexer(config, self.infer_config, layer_idx, self.compress_ratio,
+                                       prefix=f"{prefix}.indexer", comm_manager=self.comm_manager,
+                                       cache_getter=self._get_cache_tensor, **kwargs)
+            else:
+                self.indexer = None
+
         self.sparse_attn_ops = torch.ops.custom.npu_sparse_attn_sharedkv
         if self.kv_cache_quant_mode == "float8" or self.kv_cache_quant_mode == "hifloat8":
             self.sparse_attn_ops = torch.ops.custom.npu_kv_quant_sparse_attn_sharedkv
 
-        self.cp_size = self.runner_settings.get("parallel_config").get("cp_size", 1)
+        self.cp_size = self.infer_config.parallel_config.cp_size
         self.global_rank = kwargs.get("global_rank")
 
         if self.mm_quant_mode == "w8a8hifloat8":
             self.register_buffer("beta", torch.zeros(self.q_lora_rank, dtype=torch.bfloat16))
 
+    def _get_cache_dtype_map(self):
+        return {
+            "int8": torch.int8,
+            "float8": torch.float8_e4m3fn,
+            "unquant": torch.bfloat16,
+            "hifloat8": torch.uint8
+        }
+
+    def _get_cache_dim_and_cmp_dtype(self):
+        cache_dim = self.config.head_dim
+        use_fused_kernel_compressor = (
+            self.infer_config.model_config.custom_params.get("kernel_config", {}).get("compressor", "native")
+            == "ascendc"
+        )
+        cmp_kv_dtype = torch.float8_e4m3fn if (
+            self.platform_version == PlatformVersion.ASCEND_950 and use_fused_kernel_compressor
+        ) else torch.bfloat16
+
+        if "float" in self.kv_cache_quant_mode:
+            rope_dim = self.config.qk_rope_head_dim
+            nope_dim = self.config.head_dim - rope_dim
+            cache_dim = align_up(nope_dim + 2 * rope_dim + nope_dim // 64, 128)
+            cmp_kv_dtype = torch.float8_e4m3fn
+        return cache_dim, cmp_kv_dtype
+
+    def _make_cache_setter(self, cache_name):
+        return lambda tensor, layer=self, name=cache_name: setattr(layer, name, tensor)
+
+    def _get_cache_tensor(self, cache_name):
+        cache_tensor = getattr(self, cache_name, None)
+        if cache_tensor is None:
+            raise KeyError(f"cache tensor {cache_name} is not initialized in Attention.")
+        return cache_tensor
+
+    def _get_runtime_cmp_cache(self, attn_metadata, is_prefill):
+        if is_prefill and self.cp_size > 1 and not self.is_online and attn_metadata["cp_tmp_cache"]:
+            tmp_cache = attn_metadata["cp_tmp_cache"]
+            if tmp_cache is not None:
+                return tmp_cache[f"{self.compress_ratio}"]["sfa_cmp_kv"]
+            else:
+                raise ValueError("When cp is enabled, a temporary cache is required, but no temporary cache is found.")
+        return self.sfa_cmp_kv
+
+    def _init_cache_entries(self):
+        self.cache_entries = []
+
+        cache_dtype_map = self._get_cache_dtype_map()
+        cache_dtype = cache_dtype_map[self.kv_cache_quant_mode]
+        li_cache_dtype = cache_dtype_map[self.li_cache_quant_mode]
+
+        if self.kv_cache_quant_mode == "hifloat8":
+            cache_dtype = torch.float8_e4m3fn
+        cache_dim, cmp_kv_dtype = self._get_cache_dim_and_cmp_dtype()
+
+        self.win_kv = torch.Tensor([])
+        self.cache_entries.append(
+            CacheEntry(
+                cache_name="win_kv",
+                attn_type="SlidingWindow",
+                dim=cache_dim,
+                num_head=1,
+                dtype=cache_dtype,
+                needs_block=True,
+                block_size=self.block_size,
+                manager_key="win_kv",
+                tensor_setter=self._make_cache_setter("win_kv"),
+                sliding_window=self.window_size,
+            )
+        )
+
+        if self.compress_ratio == 4:
+            self.sfa_cmp_kv = torch.Tensor([])
+            self.li_cmp_kv = torch.Tensor([])
+            self.sfa_kv_state = torch.Tensor([])
+            self.li_kv_state = torch.Tensor([])
+            self.li_key_dequant_scale = torch.Tensor([])
+            li_scale_dtype = torch.float16 if self.li_cache_quant_mode == "int8" else torch.float32
+            self.cache_entries.extend([
+                CacheEntry(
+                    cache_name="sfa_cmp_kv",
+                    attn_type="FullAttention",
+                    dim=cache_dim,
+                    num_head=1,
+                    dtype=cmp_kv_dtype,
+                    needs_block=True,
+                    block_size=self.block_size * 4,
+                    manager_key="c4a_cmp_kv",
+                    tensor_setter=self._make_cache_setter("sfa_cmp_kv"),
+                    compress_ratio=4,
+                ),
+                CacheEntry(
+                    cache_name="li_cmp_kv",
+                    attn_type="FullAttention",
+                    dim=self.config.index_head_dim,
+                    num_head=1,
+                    dtype=li_cache_dtype,
+                    needs_block=True,
+                    block_size=self.block_size * 4,
+                    manager_key="c4a_cmp_kv",
+                    tensor_setter=self._make_cache_setter("li_cmp_kv"),
+                    compress_ratio=4,
+                ),
+                CacheEntry(
+                    cache_name="sfa_kv_state",
+                    attn_type="SlidingWindow",
+                    dim=[2, self.config.head_dim],
+                    num_head=2, # state + score
+                    dtype=torch.float32,
+                    needs_block=True,
+                    block_size=self.block_size,
+                    manager_key="c4a_cmp_state",
+                    tensor_setter=self._make_cache_setter("sfa_kv_state"),
+                    sliding_window=8,
+                ),
+                CacheEntry(
+                    cache_name="li_kv_state",
+                    attn_type="SlidingWindow",
+                    dim=[2, self.config.index_head_dim],
+                    num_head=2, # state + score
+                    dtype=torch.float32,
+                    needs_block=True,
+                    block_size=self.block_size,
+                    manager_key="c4a_cmp_state",
+                    tensor_setter=self._make_cache_setter("li_kv_state"),
+                    sliding_window=8,
+                )])
+            if self.li_cache_quant_mode in ["int8", "float8", "hifloat8"]:
+                dtype = torch.float16 if self.li_cache_quant_mode == "int8" else torch.float32
+                self.cache_entries.extend([
+                    CacheEntry(
+                        cache_name="li_key_dequant_scale",
+                        attn_type="FullAttention",
+                        dim=1,
+                        num_head=1,
+                        dtype=dtype,
+                        needs_block=True,
+                        block_size=self.block_size * 4,
+                        manager_key="c4a_cmp_kv",
+                        tensor_setter=self._make_cache_setter("li_key_dequant_scale"),
+                        compress_ratio=4,
+                    ),
+                ])
+        elif self.compress_ratio == 128:
+            self.sfa_cmp_kv = torch.Tensor([])
+            self.sfa_kv_state = torch.Tensor([])
+            self.cache_entries.extend([
+                CacheEntry(
+                    cache_name="sfa_cmp_kv",
+                    attn_type="FullAttention",
+                    dim=cache_dim,
+                    num_head=1,
+                    dtype=cmp_kv_dtype,
+                    needs_block=True,
+                    block_size=self.block_size * 128,
+                    manager_key="c128a_cmp_kv",
+                    tensor_setter=self._make_cache_setter("sfa_cmp_kv"),
+                    compress_ratio=128,
+                ),
+                CacheEntry(
+                    cache_name="sfa_kv_state",
+                    attn_type="SlidingWindow",
+                    dim=[1, self.config.head_dim],
+                    num_head=2,
+                    dtype=torch.float32,
+                    needs_block=True,
+                    block_size=self.block_size,
+                    manager_key="c128a_cmp_state",
+                    tensor_setter=self._make_cache_setter("sfa_kv_state"),
+                    sliding_window=128,
+                    compress_ratio=1,
+                ),
+            ])
+
     def apply_norm_dynamic_quant(self, x):
         if self.mm_quant_mode == "w8a8float8":
             x = self.q_norm(x)
-            bsz, seq_len, _ = x.shape
-            x, x_scale = torch_npu.npu_dynamic_block_quant(x.view(-1, x.size(-1)),
+            num_tokens, _ = x.shape
+            x, x_scale = torch_npu.npu_dynamic_block_quant(x,
                 dst_type=torch.float8_e4m3fn,
                 row_block_size=1,
                 col_block_size=self.config.quant_config.weight_block_size[1])
-            return x.view(bsz, seq_len, -1), x_scale.view(bsz, seq_len, -1)
+            return x.view(num_tokens, -1), x_scale.view(num_tokens, -1)
         elif self.mm_quant_mode == "w8a8hifloat8":
-            bsz, seq_len, _ = x.shape
+            num_tokens, _ = x.shape
             x = torch_npu.npu_rms_norm_quant(x, self.q_norm.weight, \
                 self.beta, self.wq_b.scale, self.wq_b.offset, self.eps, \
                 dst_dtype=torch_npu.hifloat8)
-            return x.view(bsz, seq_len, -1), self.wq_b.scale
+            return x.view(num_tokens, -1), self.wq_b.scale
         elif self.mm_quant_mode == "w8a8mxfloat8":
             x = self.q_norm(x)
             return torch_npu.npu_dynamic_mx_quant(x, dst_type=torch.float8_e4m3fn)
         elif self.mm_quant_mode == "w8a8int8":
-            if self.platform_version == "950":
+            if self.platform_version == PlatformVersion.ASCEND_950:
                 x = self.q_norm(x)
                 return torch_npu.npu_dynamic_quant(x, smooth_scales=self.wq_b.smooth_scales)
             else:
@@ -824,7 +1056,6 @@ class Attention(nn.Module):
         self,
         x: torch.Tensor,
         attn_metadata: Optional[Dict] = None,
-        cache_data: Optional[Tuple[Dict]] = None,
         is_prefill: bool = True,
         **kwargs,
     ):
@@ -866,7 +1097,7 @@ class Attention(nn.Module):
             gather_indices = attn_metadata["slot_mapping"]["full_kv_gather_indices"]
             kv = torch.gather(kv.view(b, s, -1), 1, gather_indices.unsqueeze(-1).expand(-1, -1, self.head_dim))
 
-        win_cache = cache_data["win_kv"]
+        win_cache = self.win_kv
         win_kv_slot_mapping = attn_metadata["slot_mapping"]["win_kv"]
         self.update_win_kv(kv, win_kv_slot_mapping, win_cache)
         return q, qr, qr_scale, x
@@ -876,26 +1107,27 @@ class Attention(nn.Module):
         x: torch.Tensor,
         attn_metadata: Optional[Dict] = None,
     ):
-        bsz, seqlen, _ = x.size()
+        hidden_size = x.shape[-1]
+        cp_metadata = attn_metadata["cp_metadata"]
+        cp_rank = cp_metadata.get("cp_rank", self.global_rank % self.cp_size)
 
         # Collect tail windows (last 128 tokens) of all CP segments
-        x_prev, x_next = x.split(x.shape[1] // 2, dim=1)
+        x_prev, x_next = x.split(x.shape[0] // 2, dim=0)
         cur_win_list = []
         for zz_flag in ["prev", "next"]:
             x_seg = x_prev if zz_flag == "prev" else x_next
             cur_kv_len = attn_metadata[zz_flag]["cur_kv_len"]
             if cur_kv_len >= self.window_size:
-                cur_win = x_seg[:, cur_kv_len - self.window_size: cur_kv_len].view(-1, x.shape[-1])
+                cur_win = x_seg[cur_kv_len - self.window_size: cur_kv_len]
             else:
-                cur_win = x_seg[:, :cur_kv_len]
-                cur_win = torch.cat([cur_win, torch.zeros([bsz, self.window_size - cur_kv_len, x.shape[-1]], dtype=x.dtype).npu()],
-                                    dim=1).view(-1, x.shape[-1])
+                cur_win = x_seg[:cur_kv_len]
+                pad_win = x.new_zeros((self.window_size - cur_kv_len, hidden_size))
+                cur_win = torch.cat([cur_win, pad_win], dim=0)
             cur_win_list.append(cur_win)
         cur_win = torch.cat(cur_win_list, dim=0)
-        all_win = x.new_empty([cur_win.shape[0] * self.cp_size, x.shape[-1]])
-        dist.all_gather_into_tensor(all_win, cur_win, group=self.hccl_comm_dict["cp_group"])
-        all_win = all_win.view(-1, bsz, self.window_size,
-                               x.shape[-1])[attn_metadata["cp_metadata"]["reverse_index"]]
+        all_win = x.new_empty((cur_win.shape[0] * self.cp_size, hidden_size))
+        dist.all_gather_into_tensor(all_win, cur_win, group=self.comm_manager.get_group("cp_group"))
+        all_win = all_win.view(-1, self.window_size, hidden_size)[cp_metadata["reverse_index"]]
 
         # Retrieve the window from the tail of the previous CP segment,
         # and concatenate it to the current CP segment
@@ -905,10 +1137,10 @@ class Attention(nn.Module):
             if not (attn_metadata[zz_flag]["is_start"] and zz_flag == "prev"):
                 # get pre win except rank 0
                 if zz_flag == "prev":
-                    pre_win = all_win[self.global_rank - 1]
+                    pre_win = all_win[cp_rank - 1]
                 else:
-                    pre_win = all_win[2 * self.cp_size - self.global_rank - 2]
-                x_seg = torch.cat([pre_win, x_seg], dim=1)
+                    pre_win = all_win[2 * self.cp_size - cp_rank - 2]
+                x_seg = torch.cat([pre_win, x_seg], dim=0)
             x_list.append(x_seg)
 
         # Compute the last window kv of the entire sequence
@@ -922,9 +1154,9 @@ class Attention(nn.Module):
         elif last_rank == 0:
             last_win = all_win[last_rank]
         else:
-            last_win = all_win[last_rank, :, :last_kv_len]
+            last_win = all_win[last_rank, :last_kv_len]
             second_last_win = all_win[last_rank - 1]
-            last_win = torch.cat([second_last_win[:, -(self.window_size - last_kv_len):], last_win], dim=1)
+            last_win = torch.cat([second_last_win[-(self.window_size - last_kv_len):], last_win], dim=0)
         last_win_kv = self.wkv(last_win)
         last_win_kv = self.kv_norm(last_win_kv)
         torch.ops.custom.inplace_partial_rotary_mul(
@@ -938,12 +1170,11 @@ class Attention(nn.Module):
         self,
         x: torch.Tensor,
         attn_metadata: Optional[Dict] = None,
-        cache_data: Optional[Tuple[Dict]] = None,
         is_prefill: bool = True,
         **kwargs,
     ):
-        bsz, seqlen, _ = x.size()
-        enable_multi_streams = self.enable_multi_streams and self.platform_version != "950"
+        num_tokens, _ = x.size()
+        enable_multi_streams = self.enable_multi_streams and self.platform_version != PlatformVersion.ASCEND_950
         x_scale = None
         move_quant_before = "float8" in self.mm_quant_mode and self.cp_size == 1
         if self.cp_size == 1:
@@ -959,7 +1190,7 @@ class Attention(nn.Module):
                     x.view(-1, x.size(-1)), dst_type=torch.float8_e4m3fn
                 )
 
-        qr = self.wq_a(x_q if move_quant_before else x, dynamic_scale=x_scale).view(bsz, seqlen, -1)
+        qr = self.wq_a(x_q if move_quant_before else x, dynamic_scale=x_scale).view(num_tokens, -1)
         if self.cp_size > 1:
             cp_metadata_prev, cp_metadata_next = attn_metadata["prev"], attn_metadata["next"]
             cos_sin_prev, cos_sin_next = cp_metadata_prev["cos_sin"], cp_metadata_next["cos_sin"]
@@ -974,7 +1205,7 @@ class Attention(nn.Module):
                 else cos_sin_next["comp_with_pre_win"]
             cos = torch.cat([cos_prev, cos_next], dim=0)
             sin = torch.cat([sin_prev, sin_next], dim=0)
-            x = torch.cat(x_with_pre_win, dim=1)
+            x = torch.cat(x_with_pre_win, dim=0)
         else:
             cos_sin = attn_metadata["cos_sin"]
             cos, sin = cos_sin["c1a"] if self.compress_ratio == 1 else cos_sin["comp"]
@@ -1004,7 +1235,7 @@ class Attention(nn.Module):
 
         q = self.q_b_norm(q)
         torch.ops.custom.inplace_partial_rotary_mul(
-            q.flatten(0, 1).unsqueeze(2), cos_q, sin_q,
+            q.unsqueeze(2), cos_q, sin_q,
             rotary_mode="interleave",
             partial_slice=self.partial_slice,
         )
@@ -1022,13 +1253,14 @@ class Attention(nn.Module):
         # extract tail cache
         if self.cp_size > 1:
             kv = last_win_kv
-        else:
-            gather_indices = attn_metadata["slot_mapping"]["full_kv_gather_indices"]
-            kv = torch.gather(kv.view(bsz, seqlen, -1), 1, \
-                            gather_indices.unsqueeze(-1).expand(-1, -1, self.head_dim))
+            decode_token_indices = attn_metadata["cp_metadata"]["decode_token_indices"]
+            has_decode_requests = decode_token_indices.numel() > 0
+            if not has_decode_requests:
+                return q, qr, qr_scale, x
 
-        win_cache = cache_data["win_kv"]
+        win_cache = self.win_kv
         win_kv_slot_mapping = attn_metadata["slot_mapping"]["win_kv"]
+
         self.update_win_kv(kv, win_kv_slot_mapping, win_cache)
         return q, qr, qr_scale, x
 
@@ -1036,7 +1268,6 @@ class Attention(nn.Module):
         self,
         x: torch.Tensor,
         attn_metadata: Optional[Dict] = None,
-        cache_data: Optional[Tuple[Dict]] = None,
         is_prefill: bool = True,
         **kwargs,
     ):
@@ -1052,11 +1283,11 @@ class Attention(nn.Module):
         record_event(enable_cmpr_stream, self.cmpr_events, 0)
         record_stream(enable_cmpr_stream, x, attn_metadata.get('compressor_stream', None))
 
-        if self.platform_version == "A3":
+        if self.platform_version == PlatformVersion.A3:
             qa = self.wq_a(x)
         record_event(enable_multi_streams, self.mla_events, 0)
         record_stream(enable_multi_streams, x, attn_metadata.get('mla_stream', None))
-        if self.platform_version != "A3":
+        if self.platform_version != PlatformVersion.A3:
             qa = self.wq_a(x)
 
         qr, qr_scale = self.apply_norm_dynamic_quant(qa)
@@ -1089,43 +1320,45 @@ class Attention(nn.Module):
         with limit_core_num(enable_limit_core, qb_aic_num, qb_aic_num * self.aiv_to_aic_ratio):
             q = self.q_b_norm(q)
             torch.ops.custom.inplace_partial_rotary_mul(
-                q.flatten(0, 1).unsqueeze(2), cos, sin,
+                q.unsqueeze(2), cos, sin,
                 rotary_mode="interleave",
                 partial_slice=self.partial_slice,
             )
             # update kv cache in default stream can remove tensormove
             wait_event(enable_multi_streams, self.mla_events, 2)
-            self.update_win_kv(kv, attn_metadata["slot_mapping"]["win_kv"], cache_data["win_kv"])
+            self.update_win_kv(kv, attn_metadata["slot_mapping"]["win_kv"], self.win_kv)
         return q, qr, qr_scale, x
 
     def mla_prolog(
         self,
         x: torch.Tensor,
         attn_metadata: Optional[Dict] = None,
-        cache_data: Optional[Tuple[Dict]] = None,
         is_prefill: bool = True,
         **kwargs,
     ):
         if self.enable_pypto:
-            return self.mla_prolog_pypto(x, attn_metadata, cache_data, is_prefill, **kwargs)
+            return self.mla_prolog_pypto(x, attn_metadata, is_prefill, **kwargs)
         elif is_prefill:
-            return self.mla_prolog_prefill(x, attn_metadata, cache_data, is_prefill, **kwargs)
+            return self.mla_prolog_prefill(x, attn_metadata, is_prefill, **kwargs)
         else:
-            return self.mla_prolog_decode(x, attn_metadata, cache_data, is_prefill, **kwargs)
+            return self.mla_prolog_decode(x, attn_metadata, is_prefill, **kwargs)
 
     def prepare_fa_kwargs(
         self,
         attn_metadata,
         q: torch.Tensor,
         cmp_sparse_indices: torch.Tensor = None,
-        cache_data: Optional[Tuple[Dict]] = None,
         is_prefill: Optional[bool] = False
     ):
         if self.compress_ratio > 1:
-            cmp_block_table = attn_metadata["block_table"][f'c{self.compress_ratio}a_cmp_kv']
+            if attn_metadata.get("tmp_block_table", None): # not cp
+                cmp_block_table = attn_metadata["tmp_block_table"][f'c{self.compress_ratio}a_cmp_kv']
+            else:
+                cmp_block_table = attn_metadata["block_table"][f'c{self.compress_ratio}a_cmp_kv']
+
         else:
             cmp_block_table = None
-        win_cache = attn_metadata["full_kv_cache"] if is_prefill else cache_data["win_kv"]
+        win_cache = attn_metadata["full_kv_cache"] if is_prefill else self.win_kv
         win_block_table_str = "full_kv" if is_prefill else "win_kv"
         metadata = attn_metadata["kernel_metadata"][f'c{self.compress_ratio}a_metadata']
 
@@ -1144,7 +1377,7 @@ class Attention(nn.Module):
             "layout_kv": "PA_ND",
             "q": q,
             "ori_kv": win_cache,   # get from prefill is full cache, transfer bsnd to bbnd
-            "cmp_kv": cache_data["sfa_cmp_kv"],
+            "cmp_kv": self._get_runtime_cmp_cache(attn_metadata, is_prefill) if self.compress_ratio > 1 else None,
             "cmp_sparse_indices": cmp_sparse_indices,  # only for C4A
             "ori_block_table": attn_metadata["block_table"][win_block_table_str],
             "cmp_block_table": cmp_block_table,
@@ -1182,14 +1415,12 @@ class Attention(nn.Module):
         qr: torch.Tensor,
         qr_scale: torch.Tensor,
         attn_metadata: Optional[Dict] = None,
-        cache_data: Optional[Tuple[Dict]] = None,
         is_prefill: bool = True,
         **kwargs
     ):
-        bsz, seq_len, _ = x.size()
         if is_prefill and self.cp_size > 1:
-            q_len = q.shape[1] // 2
-            x = list(x.split([x.shape[1] - q_len - self.window_size, q_len + self.window_size], dim=1))
+            q_len = q.shape[0] // 2
+            x = list(x.split([x.shape[0] - q_len - self.window_size, q_len + self.window_size], dim=0))
 
         enable_cmpr_stream = self.enable_compressor_parallel and not is_prefill
         enable_limit_core = self.enable_limit_core and not is_prefill
@@ -1201,7 +1432,7 @@ class Attention(nn.Module):
             with npu_stream_switch(enable_cmpr_stream, attn_metadata.get('compressor_stream', None)):
                 wait_event(enable_cmpr_stream, self.cmpr_events, 0)
                 with limit_core_num(enable_limit_core, self.cmpr_aic_num, self.cmpr_aic_num * self.aiv_to_aic_ratio):
-                    self.compressor(x, cache_data, attn_metadata, is_prefill)
+                    self.compressor(x, attn_metadata, is_prefill)
                 record_event(enable_cmpr_stream, self.cmpr_events, 1)
 
         enable_metadata_stream = self.enable_multi_streams and not is_prefill
@@ -1211,7 +1442,8 @@ class Attention(nn.Module):
         # separate sfa compressor and li qb dynamic quant
         if self.compress_ratio == 4:
             # wait self.cmpr_events[1] in self.indexer
-            topk_idxs = self.indexer(x, qr, qr_scale, cache_data, attn_metadata, enable_cmpr_stream, self.cmpr_events, 1, is_prefill)
+            topk_idxs = \
+                self.indexer(x, qr, qr_scale, attn_metadata, enable_cmpr_stream, self.cmpr_events, 1, is_prefill)
         else:
             topk_idxs = None
 
@@ -1219,16 +1451,16 @@ class Attention(nn.Module):
             wait_event(enable_cmpr_stream, self.cmpr_events, 1) # finish compressor before sfa
 
         if is_prefill and self.cp_size > 1:
-            q_prev, q_next = q.split(q.shape[1] // 2, dim=1)
+            q_prev, q_next = q.split(q.shape[0] // 2, dim=0)
             if self.compress_ratio == 4:
                 topk_idxs_prev, topk_idxs_next = topk_idxs
             else:
                 topk_idxs_prev, topk_idxs_next = None, None
-            o_prev = self.attn_kernel(q_prev, topk_idxs_prev, attn_metadata["prev"], cache_data, is_prefill)
-            o_next = self.attn_kernel(q_next, topk_idxs_next, attn_metadata["next"], cache_data, is_prefill)
-            o = torch.cat([o_prev, o_next], dim=1)
+            o_prev = self.attn_kernel(q_prev, topk_idxs_prev, attn_metadata["prev"], is_prefill)
+            o_next = self.attn_kernel(q_next, topk_idxs_next, attn_metadata["next"], is_prefill)
+            o = torch.cat([o_prev, o_next], dim=0)
         else:
-            o = self.attn_kernel(q, topk_idxs, attn_metadata, cache_data, is_prefill)
+            o = self.attn_kernel(q, topk_idxs, attn_metadata, is_prefill)
         return o
 
     def attn_kernel(
@@ -1236,19 +1468,16 @@ class Attention(nn.Module):
         q: torch.Tensor,
         topk_idxs: torch.Tensor,
         attn_metadata: Optional[Dict] = None,
-        cache_data: Optional[Tuple[Dict]] = None,
         is_prefill: bool = True,
     ):
-        bsz, _ = q.shape[:2]
         # get fa input dict
         fa_input_kwargs = self.prepare_fa_kwargs(
                 attn_metadata,
-                q.flatten(0, 1),
+                q,
                 topk_idxs,
-                cache_data,
                 is_prefill
         )
-        o = self.sparse_attn_ops(**fa_input_kwargs)[0].unflatten(0, (bsz, q.shape[1]))
+        o = self.sparse_attn_ops(**fa_input_kwargs)[0]
         return o
 
     def attn_post(
@@ -1262,7 +1491,7 @@ class Attention(nn.Module):
         transpose to make the splitted dim to be the primary
         split o_a on group dim (batch); split o_b on group dim (reduce)
         '''
-        bsz, seq_len = o.shape[:2]
+        num_tokens = o.shape[0]
         if is_prefill and self.cp_size > 1:
             cos_sin_prev, cos_sin_next = attn_metadata["prev"]["cos_sin"], attn_metadata["next"]["cos_sin"]
             cos_prev = cos_sin_prev["c1a"][0] if self.compress_ratio == 1 else cos_sin_prev["comp"][0]
@@ -1278,27 +1507,27 @@ class Attention(nn.Module):
 
         if self.mm_quant_mode == "w8a8hifloat8":
             o = partial_rotary_mul_quant(
-                o.flatten(0, 1).unsqueeze(2), cos, sin,
+                o.unsqueeze(2), cos, sin,
                 partial_slice=self.partial_slice,
                 platform_version=self.platform_version,
                 origin_shape=o.shape,
             )
-            o = o.view(bsz * seq_len, self.num_groups_per_rank, -1)
+            o = o.view(num_tokens, self.num_groups_per_rank, -1)
         else:
             torch.ops.custom.inplace_partial_rotary_mul(
-                o.flatten(0, 1).unsqueeze(2), cos, sin,
+                o.unsqueeze(2), cos, sin,
                 rotary_mode="interleave",
                 partial_slice=self.partial_slice,
             )
-            o = o.view(bsz * seq_len, self.num_groups_per_rank, -1).to(torch.bfloat16)
+            o = o.view(num_tokens, self.num_groups_per_rank, -1).to(torch.bfloat16)
         if self.oproj_tp_size > 1:
-            # [BS, tp_size, G/tp_size, ND/G] -> [tp_size, BS, G/tp_size, ND/G]
-            o = o.view(bsz * seq_len, self.oproj_tp_size, self.num_groups_per_rank // self.oproj_tp_size, -1)
+            # [num_tokens, tp_size, G/tp_size, ND/G] -> [tp_size, BS, G/tp_size, ND/G]
+            o = o.view(num_tokens, self.oproj_tp_size, self.num_groups_per_rank // self.oproj_tp_size, -1)
             o = o.transpose(1, 0).contiguous().view(-1)
             all2all_output = torch.empty_like(o)
             dist.all_to_all_single(all2all_output, o,
-                                   group=self.hccl_comm_dict.get("oproj_tp_group", None))
-            o = all2all_output.view(self.oproj_tp_size * bsz * seq_len,
+                                   group=self.comm_manager.get_group("oproj_tp_group"))
+            o = all2all_output.view(self.oproj_tp_size * num_tokens,
                                     self.num_groups_per_rank // self.oproj_tp_size, -1)
 
         # o_a_proj
@@ -1312,66 +1541,82 @@ class Attention(nn.Module):
         elif self.mm_quant_mode == "w8a8hifloat8":
             o = torch_npu.npu_transpose_quant_batchmatmul(o, self.wo_a.weight, dtype=torch_npu.hifloat8,
                                                             x1_scale=self.wo_a.x_scale, x2_scale=self.wo_a.weight_scale,
-                                                            group_sizes=(0, 0, 0), perm_x1=(1, 0, 2), perm_x2=(0, 1, 2),
-                                                            perm_y=(1, 0, 2), batch_split_factor=1,
+                                                            group_sizes=(0, 0, 0), perm_x1=(1, 0, 2),
+                                                            perm_x2=(0, 1, 2), perm_y=(1, 0, 2), batch_split_factor=1,
                                                             x1_dtype=torch_npu.hifloat8, x2_dtype=torch_npu.hifloat8)
         else:
             if self.n_heads * self.head_dim // self.oproj_tp_size > MATMUL_MAX_AXIS_VALUE and \
-               self.platform_version == "A3":
+               self.platform_version == PlatformVersion.A3:
                 o = torch.matmul(o.transpose(0, 1), self.wo_a.weight).transpose(0, 1).contiguous()
             else:
                 o = torch_npu.npu_transpose_batchmatmul(o, self.wo_a.weight, perm_x1=(1, 0, 2), perm_y=(1, 0, 2))
         if self.oproj_tp_size > 1:
-            # [oproj_tp_size, bsz * seq_len, num_groups_per_rank // oproj_tp_size * o_lora_rank]
-            o = o.view(self.oproj_tp_size, bsz * seq_len, -1)
+            # [oproj_tp_size, num_tokens, num_groups_per_rank // oproj_tp_size * o_lora_rank]
+            o = o.view(self.oproj_tp_size, num_tokens, -1)
         else:
-            o = o.view(bsz, seq_len, -1)
+            o = o.view(num_tokens, -1)
 
         # o_b_proj
         x = self.wo_b(o)
 
         if self.oproj_tp_size > 1:
-            # [oproj_tp_size, bsz * seq_len, dim] --> [oproj_tp_size * bsz * seq_len, dim]
-            x = x.view(self.oproj_tp_size * bsz * seq_len, -1)
-            reduce_scatter_output = torch.empty((bsz * seq_len, x.shape[-1]), dtype=x.dtype, device=x.device)
+            # [oproj_tp_size, num_tokens, dim] --> [oproj_tp_size * num_tokens, dim]
+            x = x.view(self.oproj_tp_size * num_tokens, -1)
+            reduce_scatter_output = torch.empty((num_tokens, x.shape[-1]), dtype=x.dtype, device=x.device)
             dist.reduce_scatter_tensor(reduce_scatter_output, x,
-                                       group=self.hccl_comm_dict.get("oproj_tp_group", None))
-            x = reduce_scatter_output.view(bsz, seq_len, x.shape[-1])
+                                       group=self.comm_manager.get_group("oproj_tp_group"))
+            x = reduce_scatter_output.view(num_tokens, x.shape[-1])
         return x
 
     def forward(
         self,
         x: torch.Tensor,
         attn_metadata: Optional[Dict] = None,
-        cache_data: Optional[Tuple[Dict]] = None,
         is_prefill: bool = True,
         **kwargs,
     ):
-        cache_data = cache_data[self.layer_idx]
-        q, qr, qr_scale, x = self.mla_prolog(x, attn_metadata, cache_data, is_prefill, **kwargs)
+        q, qr, qr_scale, x = self.mla_prolog(x, attn_metadata, is_prefill, **kwargs)
 
-        # o TND -> BSND
+        # o TND
         o = self.sparse_attn(
-            x, q, qr, qr_scale, attn_metadata, cache_data, is_prefill, **kwargs)
+            x, q, qr, qr_scale, attn_metadata, is_prefill, **kwargs)
         x = self.attn_post(o, attn_metadata, is_prefill)
 
         return x
 
+
 class DeepseekV3DecoderLayer(nn.Module):
-    def __init__(self, config: DeepseekV3Config, runner_settings: Dict, layer_idx: int, prefix: str, **kwargs):
+    def __init__(
+        self,
+        config: DeepseekV3Config,
+        infer_config: InferenceConfig,
+        comm_manager: CommManager = None,
+        layer_idx: int = 0,
+        prefix: str = "",
+        **kwargs,
+    ):
         super().__init__()
         self.layer_idx = layer_idx
-        self.runner_settings = runner_settings
+        self.infer_config = infer_config
+        self.comm_manager = comm_manager
         self.hidden_size = config.hidden_size
         self.attn = Attention(
             config=config,
-            runner_settings=self.runner_settings,
+            infer_config=self.infer_config,
+            comm_manager=self.comm_manager,
             layer_idx=layer_idx,
             prefix=f"{prefix}.attn",
             **kwargs)
 
         self.ffn = (
-            DeepseekV3MoE(config, self.runner_settings, layer_idx=layer_idx, prefix=f"{prefix}.mlp", **kwargs)
+            DeepseekV3MoE(
+                config,
+                self.infer_config,
+                self.comm_manager,
+                layer_idx=layer_idx,
+                prefix=f"{prefix}.mlp",
+                **kwargs,
+            )
         )
         self.input_layernorm = DeepseekV3RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
@@ -1400,7 +1645,7 @@ class DeepseekV3DecoderLayer(nn.Module):
         self.ffn_norm = DeepseekV3RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.norm_eps = config.rms_norm_eps
 
-        self.cp_size = self.runner_settings.get("parallel_config").get("cp_size", 1)
+        self.cp_size = self.infer_config.parallel_config.cp_size
         self.global_rank = kwargs.get("global_rank")
 
     def forward(
@@ -1408,7 +1653,6 @@ class DeepseekV3DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         attn_metadata: Optional[Dict] = None,
         past_residual: Optional[torch.Tensor] = None,
-        cache_data: Optional[Tuple[Dict]] = None,
         is_prefill: Optional[bool] = False,
         cur_topk_list: Optional[torch.Tensor] = None,
         input_ids: Optional[torch.Tensor] = None,
@@ -1423,7 +1667,6 @@ class DeepseekV3DecoderLayer(nn.Module):
         hidden_states = self.attn(
             x=hidden_states,
             attn_metadata=attn_metadata,
-            cache_data=cache_data,
             is_prefill=is_prefill,
         )
         hidden_states = OpKernel.hc_post(hidden_states, residual, post, comb)
@@ -1437,11 +1680,12 @@ class DeepseekV3DecoderLayer(nn.Module):
             is_prefill=is_prefill,
             cur_topk_list=cur_topk_list,
             input_ids=input_ids,
-            shared_expert_stream =attn_metadata.get('shared_expert_stream', None),
+            shared_expert_stream=attn_metadata.get('shared_expert_stream', None),
         )
         hidden_states = OpKernel.hc_post(hidden_states, residual, post, comb)
 
         return hidden_states
+
 
 @add_start_docstrings(
     "The bare DeepseekV3 Model outputting raw hidden-states without any specific head on top.",
@@ -1455,24 +1699,34 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
         config: DeepseekV3Config
     """
 
-    def __init__(self, config: DeepseekV3Config, runner_settings: Dict, prefix: str, **kwargs):
+    def __init__(
+        self,
+        config: DeepseekV3Config,
+        infer_config: InferenceConfig,
+        comm_manager: CommManager = None,
+        prefix: str = "",
+        **kwargs,
+    ):
         super().__init__(config)
         self.config = config
-        self.runner_settings = runner_settings
-        self.embed_tp_size = self.runner_settings.get("parallel_config").get("embed_tp_size", 1)
-        self.embed_dp_size = self.runner_settings.get("parallel_config").get("embed_dp_size", 1)
-        self.attn_tp_size = self.runner_settings.get("parallel_config").get("attn_tp_size", 1)
-        self.cp_size = self.runner_settings.get("parallel_config").get("cp_size", 1)
-        self.moe_ep_size = self.runner_settings.get("parallel_config").get("moe_ep_size", 1)
+        self.infer_config = infer_config
+        self.comm_manager = comm_manager
+        self.embed_tp_size = self.infer_config.parallel_config.embed_tp_size
+        self.embed_dp_size = self.infer_config.parallel_config.embed_dp_size
+        self.attn_tp_size = self.infer_config.parallel_config.attn_tp_size
+        self.cp_size = self.infer_config.parallel_config.cp_size
+        self.moe_ep_size = self.infer_config.parallel_config.moe_ep_size
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.vocab_size_per_rank = self.vocab_size // self.embed_tp_size
         self.global_rank = kwargs.get("global_rank")
-        self.enable_superkernel = self.runner_settings.get("model_config").get("enable_superkernel", False)
-        self.enable_multi_streams = runner_settings.get("model_config").get("enable_multi_streams", False)
-        self.world_size = self.runner_settings.get("world_size", 16)
-        self.hccl_comm_dict = kwargs.get("hccl_comm_dict", None)
-        self.max_position_embeddings = self.runner_settings.get("data_config").get("max_position_embeddings", 2048)
+        self.enable_superkernel = self.infer_config.model_config.custom_params.get("enable_superkernel", False)
+        self.enable_multi_streams = self.infer_config.model_config.custom_params.get("enable_multi_streams", False)
+        self.world_size = self.infer_config.parallel_config.world_size
+        self.max_position_embeddings = get_max_position_embeddings(
+            self.infer_config,
+            kwargs.get("is_mtp", False),
+        )
 
         is_mtp = kwargs.get("is_mtp")
         if not is_mtp:
@@ -1482,12 +1736,13 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
                 self.padding_idx,
                 torch.bfloat16,
                 tp_size=self.embed_tp_size,
-                tp_rank=dist.get_rank(self.hccl_comm_dict["embed_tp_group"]) if self.embed_tp_size > 1 else 0)
+                tp_rank=self.comm_manager.get_rank("embed_tp_group") if self.embed_tp_size > 1 else 0)
             self.layers = nn.ModuleList(
                 [
                     DeepseekV3DecoderLayer(
                         config,
-                        self.runner_settings,
+                        self.infer_config,
+                        self.comm_manager,
                         layer_idx,
                         prefix=f"layers.{layer_idx}",
                         **kwargs)
@@ -1522,59 +1777,61 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
     def set_input_embeddings(self, value):
         self.embed_tokens = value
 
-    def prepare_inputs_for_layer(self, inputs_embeds, input_ids):
-        batch_size, seq_length = input_ids.shape
-
-        step = batch_size * seq_length // self.attn_tp_size
-        tp_rank = dist.get_rank(group=self.hccl_comm_dict.get("attn_tp_group", None)) % self.attn_tp_size
-        end = step * (tp_rank + 1)
-
-        inputs_embeds = inputs_embeds.view(batch_size * seq_length, self.config.hidden_size)
-        hidden_states = inputs_embeds[step * tp_rank: end]
-
-        # batch_size * seq_length: SP
-        hidden_states = hidden_states.view(-1, step, self.config.hidden_size)
-
-        return hidden_states
-
     def hc_head(self, x: torch.Tensor, hc_fn: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor):
         shape, dtype = x.size(), x.dtype
-        x = x.flatten(2).float()
+        x = x.flatten(1).float()
         rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + self.norm_eps)
         mixes = F.linear(x, hc_fn) * rsqrt
         pre = torch.sigmoid(mixes * hc_scale + hc_base) + self.hc_eps
-        y = torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=2)
+        y = torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=1)
         return y.to(dtype)
 
-    def calc_input_embeddings(self, input_ids, is_prefill):
-        batch_size, seq_length = input_ids.shape
+    def calc_input_embeddings(
+        self,
+        input_ids,
+        is_prefill,
+    ):
+        num_tokens = input_ids.shape[0]
         cp_size = self.cp_size if is_prefill else 1
         attn_dp_size = self.world_size // self.attn_tp_size // cp_size
         if self.embed_tp_size > 1:
-            embed_tp_group = self.hccl_comm_dict.get("embed_tp_group", None)
+            embed_tp_group = self.comm_manager.get_group("embed_tp_group")
             if attn_dp_size > self.embed_dp_size:
                 allgather_ratio = self.embed_tp_size // self.attn_tp_size
-                if input_ids.ndim == 1:
-                    all_input_ids = input_ids.new_empty(seq_length * allgather_ratio)
+                if is_prefill:
+                    local_num_tokens = num_tokens
+                    max_num_tokens = torch.tensor([local_num_tokens], dtype=torch.long, device=input_ids.device)
+                    dist.all_reduce(max_num_tokens, op=dist.ReduceOp.MAX, group=embed_tp_group)
+                    max_num_tokens = int(max_num_tokens.item())
+
+                    padded_input_ids = input_ids
+                    if local_num_tokens < max_num_tokens:
+                        padded_input_ids = torch.nn.functional.pad(
+                            input_ids, (0, max_num_tokens - local_num_tokens), value=0
+                        )
+                    all_input_ids = input_ids.new_empty(max_num_tokens * allgather_ratio)
+                    dist.all_gather_into_tensor(all_input_ids, padded_input_ids, group=embed_tp_group)
                 else:
-                    all_input_ids = input_ids.new_empty(batch_size * allgather_ratio, seq_length)
-                dist.all_gather_into_tensor(all_input_ids, input_ids, group=embed_tp_group)
+                    all_input_ids = input_ids.new_empty(num_tokens * allgather_ratio)
+                    dist.all_gather_into_tensor(all_input_ids, input_ids, group=embed_tp_group)
                 input_ids = all_input_ids
 
             new_input_ids = input_ids - (self.global_rank % self.embed_tp_size) * self.vocab_size_per_rank
-            mask = (new_input_ids >= 0) & (new_input_ids < self.vocab_size_per_rank) # (bs, qlen)
+            mask = (new_input_ids >= 0) & (new_input_ids < self.vocab_size_per_rank) # [T]
             new_input_ids_per_rank = new_input_ids * mask
             inputs_embeds = self.embed_tokens(new_input_ids_per_rank) * mask.unsqueeze(-1)
 
             if attn_dp_size <= self.embed_dp_size:
                 dist.all_reduce(inputs_embeds, group=embed_tp_group)
             else:
-                if input_ids.ndim == 1:
-                    inputs_embeds_attn = inputs_embeds.new_empty(seq_length, inputs_embeds.shape[-1])
+                if is_prefill:
+                    inputs_embeds_attn = inputs_embeds.new_empty(max_num_tokens, inputs_embeds.shape[-1])
+                    dist.reduce_scatter_tensor(inputs_embeds_attn, inputs_embeds, group=embed_tp_group)
+                    inputs_embeds = inputs_embeds_attn[:local_num_tokens]
                 else:
-                    inputs_embeds_attn = inputs_embeds.new_empty(batch_size, seq_length, inputs_embeds.shape[-1])
-                dist.reduce_scatter_tensor(inputs_embeds_attn, inputs_embeds, group=embed_tp_group)
-                inputs_embeds = inputs_embeds_attn
+                    inputs_embeds_attn = inputs_embeds.new_empty(num_tokens, inputs_embeds.shape[-1])
+                    dist.reduce_scatter_tensor(inputs_embeds_attn, inputs_embeds, group=embed_tp_group)
+                    inputs_embeds = inputs_embeds_attn
         else:
             inputs_embeds = self.embed_tokens(input_ids)
         hidden_states = inputs_embeds
@@ -1582,16 +1839,16 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
         return hidden_states
 
     def get_cp_input_ids(self, input_ids, attn_metadata):
-        input_ids_split = torch.split(input_ids, attn_metadata["cp_metadata"]["split_list"], dim=1)
+        input_ids_split = torch.split(input_ids, attn_metadata["cp_metadata"]["split_list"], dim=0)
         cp_input_ids = torch.cat(
-            [input_ids_split[i] for i in attn_metadata["cp_metadata"]["zigzag_idx"]], dim=1
+            [input_ids_split[i] for i in attn_metadata["cp_metadata"]["zigzag_idx"]], dim=0
         )
         return cp_input_ids
 
     def get_cp_hidden_states(self, hidden_states, attn_metadata):
-        hidden_states_split = torch.split(hidden_states, attn_metadata["cp_metadata"]["split_list"], dim=1)
+        hidden_states_split = torch.split(hidden_states, attn_metadata["cp_metadata"]["split_list"], dim=0)
         hidden_states_cp = torch.cat(
-            [hidden_states_split[i] for i in attn_metadata["cp_metadata"]["zigzag_idx"]], dim=1
+            [hidden_states_split[i] for i in attn_metadata["cp_metadata"]["zigzag_idx"]], dim=0
         )
         return hidden_states_cp
 
@@ -1654,13 +1911,11 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
     def forward(
         self,
         input_ids: torch.LongTensor,
+        position_ids: torch.Tensor,
         attn_metadata: Optional[Dict] = None,
-        cache_data: Optional[Tuple[Dict]] = None,
         is_prefill: Optional[bool] = False,
         cur_topk_list: Optional[torch.Tensor] = None,
     ):
-        batch_size, seq_length = input_ids.shape
-
         if is_prefill and self.cp_size > 1 and self.embed_tp_size == 1:
             input_ids = self.get_cp_input_ids(input_ids, attn_metadata)
 
@@ -1679,8 +1934,6 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
             cos_sin = self.generate_cos_sin(attn_metadata, hidden_states)
             attn_metadata.update({'cos_sin': cos_sin})
 
-        if is_prefill and self.attn_tp_size > 1 and self.moe_ep_size > 1:
-            hidden_states = self.prepare_inputs_for_layer(hidden_states, input_ids)
         residual = None
 
         label = f'decode_layer'
@@ -1690,7 +1943,7 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
             option = "option_xxx2"
 
         # mhc
-        hidden_states = hidden_states.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
+        hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
 
         with superkernel_scope(self.enable_superkernel and not is_prefill, label, option):
             for decoder_layer in self.layers:
@@ -1698,7 +1951,6 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
                     hidden_states,
                     attn_metadata=attn_metadata,
                     past_residual=residual,
-                    cache_data=cache_data,
                     is_prefill=is_prefill,
                     cur_topk_list=cur_topk_list,
                     input_ids=input_ids,
@@ -1709,15 +1961,24 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
 
 
 class DeepseekV3ModelMTPLayer(DeepseekV3Model):
-    def __init__(self, config: DeepseekV3Config, runner_settings: Dict, layer_idx: int, prefix: str, **kwargs):
-        super().__init__(config, runner_settings, prefix=prefix, **kwargs)
+    def __init__(
+        self,
+        config: DeepseekV3Config,
+        infer_config: InferenceConfig,
+        comm_manager: CommManager = None,
+        layer_idx: int = 0,
+        prefix: str = "",
+        **kwargs,
+    ):
+        super().__init__(config, infer_config, comm_manager, prefix=prefix, **kwargs)
         self.mtp_start_layer_idx = config.num_hidden_layers
         self.layers = nn.ModuleDict(
             {
                 str(self.mtp_start_layer_idx + i):
                 DeepseekV3DecoderLayer(
                     config,
-                    runner_settings,
+                    self.infer_config,
+                    self.comm_manager,
                     layer_idx,
                     prefix="mtp.0",
                     **kwargs)
@@ -1730,20 +1991,18 @@ class DeepseekV3ModelMTPLayer(DeepseekV3Model):
         attn_metadata: Optional[Dict] = None,
         past_residual: Optional[torch.Tensor] = None,
         is_prefill: Optional[bool] = False,
-        cache_data: Optional[Tuple[Dict]] = None,
         cur_topk_list: Optional[torch.Tensor] = None,
         mtp_layer_idx: Optional[int] = 0,
         input_ids: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
         # mhc
-        hidden_states = hidden_states.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
+        hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
         hidden_states = self.layers[str(self.mtp_start_layer_idx + mtp_layer_idx)](
             hidden_states,
             attn_metadata=attn_metadata,
             past_residual=past_residual,
             is_prefill=is_prefill,
-            cache_data=cache_data,
             cur_topk_list=cur_topk_list,
             input_ids=input_ids,
         )
@@ -1754,19 +2013,37 @@ class DeepseekV3ModelMTPLayer(DeepseekV3Model):
 class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
     _tied_weights_keys = ["lm_head.weight"]
 
-    def __init__(self, config, runner_settings, is_mtp=False, prefix: str = ""):
+    @staticmethod
+    def update_model_cfg(config, infer_config: InferenceConfig):
+        if config.compress_ratios is not None:
+            # When compress_ratio == 0, set compress_ratio to 1 for convenience.
+            for i, val in enumerate(config.compress_ratios):
+                if val == 0:
+                    config.compress_ratios[i] = 1
+
+    def __init__(
+        self,
+        config,
+        infer_config: InferenceConfig,
+        comm_manager: CommManager = None,
+        is_mtp=False,
+        prefix: str = "",
+    ):
         super().__init__(config)
         self.config = config
-        self.runner_settings = runner_settings
-        self.input_max_len = self.runner_settings.get("data_config").get("input_max_len", 32)
-        self.platform_version = self.runner_settings.get("model_config").get("platform_version", "A3")
+        self.infer_config = infer_config
+        self.comm_manager = comm_manager
+        self.input_max_len = self.infer_config.data_config.input_truncated_len
+        self.platform_version = self.infer_config.model_config.platform_version
         self.get_parallel_settings()
         self.experts_per_rank = config.n_routed_experts // self.moe_ep_size
         self.top_k = config.num_experts_per_tok
-        self.max_position_embeddings = self.runner_settings.get("data_config").get("max_position_embeddings", 2048)
-        self.perfect_eplb = self.runner_settings.get("model_config").get("perfect_eplb", False)
+        self.max_position_embeddings = get_max_position_embeddings(self.infer_config, is_mtp)
+        self.force_eplb = self.infer_config.model_config.force_eplb
+        self.num_experts_per_tok = config.num_experts_per_tok
+        # total experts num
+        self.num_experts = config.n_routed_experts
         self.is_mtp = is_mtp
-        self.enable_cache_compile = self.runner_settings.get("model_config").get("enable_cache_compile", False)
         self.mm_quant_mode = (
             config.quant_config.mm_quant_mode
             if config.quant_config is not None
@@ -1775,10 +2052,12 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
         self.update_gmm_quant_mode()
         self.kv_cache_quant_mode = config.quant_config.kv_cache_quant_mode
         self.li_cache_quant_mode = config.quant_config.li_cache_quant_mode
+        self.attention_data = AttnMetaData(self.config, comm_manager, self.infer_config, is_mtp)
+        self.enable_cache_compile = self.infer_config.model_config.enable_cache_compile
 
-        self.enable_static_kernel = self.runner_settings.get("model_config").get("enable_static_kernel", False)
-        self.enable_npugraph_ex = self.runner_settings.get("exe_mode", "ge_graph") == "npugraph_ex"
-        self.enable_multi_streams = self.runner_settings.get("model_config").get("enable_multi_streams", False)
+        self.enable_static_kernel = self.infer_config.model_config.enable_static_kernel
+        self.enable_npugraph_ex = self.infer_config.model_config.exe_mode == "npugraph_ex"
+        self.enable_multi_streams = self.infer_config.model_config.custom_params.get("enable_multi_streams", False)
         self.metadata_event = []
         if self.enable_multi_streams:
             self.metadata_event = [torch.npu.Event(), torch.npu.Event()]
@@ -1786,31 +2065,29 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
         self.local_rank = int(os.getenv("LOCAL_RANK", "0"))
         self.rank_offset = int(os.getenv("RANK_OFFSET", "0"))
         self.global_rank = self.local_rank + self.rank_offset
-        self.world_size = self.runner_settings.get("world_size", 16)
+        self.world_size = self.infer_config.parallel_config.world_size
         kwargs = {
                     "global_rank": self.global_rank,
                     "is_mtp": is_mtp
                 }
-        default_pg = get_default_group()
-        if default_pg is not None:
-            if dist.get_world_size() > 1:
-                self.hccl_comm_dict = self.init_parallel_comm_group()
-                kwargs.update({"hccl_comm_dict": self.hccl_comm_dict})
-        self.batch_size_per_rank = self.runner_settings.get("data_config").get("batch_size_per_rank", 1)
+        self.init_parallel_comm_group()
+        self.batch_size_per_rank = self.infer_config.scheduler_config.batch_size_per_dp_rank
 
         mtp_layer_idx = config.num_hidden_layers # MTP is the last layer
-        self.model = DeepseekV3ModelMTPLayer(config, self.runner_settings, mtp_layer_idx, prefix, **kwargs) \
-                    if is_mtp else DeepseekV3Model(config, self.runner_settings, prefix, **kwargs)
+        self.model = DeepseekV3ModelMTPLayer(
+            config, self.infer_config, self.comm_manager, mtp_layer_idx, prefix, **kwargs
+        ) if is_mtp else DeepseekV3Model(
+            config, self.infer_config, self.comm_manager, prefix, **kwargs
+        )
         self.vocab_size = config.vocab_size
         self.rope_head_dim = config.qk_rope_head_dim
-        self.attn_metadata = AttnMetaData(config, runner_settings, is_mtp)
         if not is_mtp:
             self.lm_head = ColumnParallelLinear(
                 input_size=config.hidden_size,
                 output_size=config.vocab_size,
                 bias=False,
                 tp_size=self.lmhead_tp_size,
-                tp_rank=dist.get_rank(self.hccl_comm_dict.get("lmhead_tp_group")) if self.lmhead_tp_size > 1 else 0,
+                tp_rank=self.comm_manager.get_rank("lmhead_tp_group") if self.lmhead_tp_size > 1 else 0,
                 quant_config=None,
                 prefix="lm_head"
                 )
@@ -1819,23 +2096,164 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
 
         # Initialize weights and apply final processing
         self.post_init()
-
-        if self.enable_cache_compile:
-            self.cached_decode = self.get_cached_graph()
-
-        # for prefill minibatch
-        self.prefill_mini_batch_size = self.runner_settings.get("model_config").get("prefill_mini_batch_size", 0)
-        self.pa_max_length = self.runner_settings.get("model_config").get("pa_max_length", 2048)
-        self.block_size = self.runner_settings.get("model_config").get("pa_block_size", 128)
-        self.cache_len = self.pa_max_length // self.block_size
+        self.block_size = self.infer_config.scheduler_config.block_size
         self.sas_metadata_ops = torch.ops.custom.npu_sparse_attn_sharedkv_metadata
         if self.kv_cache_quant_mode == "float8" or self.kv_cache_quant_mode == "hifloat8":
             self.sas_metadata_ops = torch.ops.custom.npu_kv_quant_sparse_attn_sharedkv_metadata
-        self.enable_prefill_multi_cycle = self.runner_settings.get("model_config").get("prefill_mini_batch_size", 0) > 0
         self.window_size = config.sliding_window
+        self.cp_segment_min_len = self.window_size
         self.init_cache_dim()
         self.first_layer_idx = mtp_layer_idx if is_mtp else 0
         self.first_layer_ratio = self.config.compress_ratios[self.first_layer_idx]
+
+    def check_model_settings(self):
+        model_config = self.infer_config.model_config
+        custom_params = model_config.custom_params
+        parallel_config = self.infer_config.parallel_config
+        scheduler_config = self.infer_config.scheduler_config
+        data_config = self.infer_config.data_config
+
+
+        exe_mode = model_config.exe_mode
+        enable_cache_compile = model_config.enable_cache_compile
+        enable_multi_streams = custom_params.get("enable_multi_streams", False)
+        enable_limit_core = custom_params.get("enable_limit_core", False)
+        platform_version = model_config.platform_version
+        enable_superkernel = custom_params.get("enable_superkernel", False)
+        enable_pypto = custom_params.get("enable_pypto", False)
+        next_n = model_config.next_n
+        with_ckpt = model_config.with_ckpt
+        perfect_eplb = custom_params.get("perfect_eplb", model_config.force_eplb)
+
+        if not with_ckpt and not perfect_eplb:
+            raise ValueError(f"{perfect_eplb=} must be True if {with_ckpt =}!")
+
+        if exe_mode not in ["ge_graph", "eager", "npugraph_ex"]:
+            raise ValueError(f"{exe_mode=} does not supported!")
+
+        dynamo_feat = enable_cache_compile or enable_superkernel
+        if exe_mode == "eager" and dynamo_feat:
+            raise ValueError(f"{exe_mode=} does not support cache compile or superkernel!")
+        if exe_mode == "eager" and enable_multi_streams:
+            logger.info(
+                "When using eager execution mode, enable-multi-streams only takes effect during the prefill phase.")
+        if enable_limit_core and not enable_multi_streams:
+            raise ValueError(f"{enable_limit_core=} only if enable_multi_streams!")
+        if enable_limit_core and platform_version != PlatformVersion.A3:
+            raise ValueError(f"{enable_limit_core=} only supports platform A3!")
+        if enable_limit_core and enable_pypto:
+            raise ValueError(f"{enable_pypto=} does not support {enable_limit_core=}!")
+        if next_n > 3:
+            raise ValueError(f"{next_n=} must equal or smaller than 3")
+
+        if parallel_config.cp_size > 1 and scheduler_config.cp_mini_batch != 1:
+            raise ValueError(f"when cp enabled, {scheduler_config.cp_mini_batch=} should be 1")
+
+        model_config.enable_weight_nz = platform_version != PlatformVersion.ASCEND_950
+        self.update_op_kernel_dict()
+
+    def update_op_kernel_dict(self):
+        """
+        kernel_config: Dict, op impls defined by user, {op_type: op_impls}
+        OpKernel.OP_TYPE: List, contain ops with different impls
+        OpKernel.KERNEL_MAP: Dict, contain op_impls {op_impl_name: op_impl}
+        """
+        # import all mudules under models.modules.op_impls files
+        auto_import_modules(f"{__package__}.modules.op_impls")
+        custom_params = self.infer_config.model_config.custom_params
+        kernel_config = custom_params.get("kernel_config", {})
+        platform_version = self.infer_config.model_config.platform_version.value.lower()
+        enable_pypto = custom_params.get("enable_pypto", False)
+        if enable_pypto and platform_version != "a3":
+            raise ValueError(f"PYPTO kernel for this model on {platform_version=} is not supported yet.")
+
+        for op_type in OpKernel.OP_TYPE:
+            if op_type in kernel_config:
+                kernel_impl = kernel_config[op_type]
+                used_kernel = f"{op_type}_{kernel_impl}_{platform_version}"
+            else:
+                default_kernel = f"{op_type}_ascendc_{platform_version}"
+                if default_kernel in OpKernel.KERNEL_MAP:
+                    used_kernel = default_kernel
+                else:
+                    used_kernel = f"{op_type}_native_{platform_version}"
+            if enable_pypto:
+                pypto_kernel = f"{op_type}_pypto_a3"
+                if pypto_kernel in OpKernel.KERNEL_MAP:
+                    used_kernel = pypto_kernel
+            OpKernel.op_impl_apply(op_type, used_kernel)
+            logger.info("%s use impl %s", op_type, used_kernel)
+
+    def process_weights_after_loading(self):
+        """
+        Do weight transpose, format cast to NZ, and scale dtype cast after loading weights.
+        """
+        float_scales_map = [
+            "gate_up_proj",
+            "q_b_proj",
+            "wq_b",
+        ]
+        float_smooth_scales_map = [
+            "down_proj"
+        ]
+        enable_weight_nz = self.infer_config.model_config.enable_weight_nz
+
+        for module_name, module in self.named_modules():
+            if "wo_a" in module_name:
+                config = self.config
+                head_dim_per_group = config.num_attention_heads * config.head_dim // config.o_groups
+                module.weight.data = module.weight.data.view(-1, config.o_lora_rank, head_dim_per_group) \
+                                                   .transpose(1, 2).contiguous()
+                if config.quant_config.mm_quant_mode == "w8a8mxfloat8":
+                    scale_data = reshape_mx_scale(module.weight_scale.data)
+                    module.weight_scale.data = scale_data.view(-1, config.o_lora_rank, *scale_data.shape[1:]) \
+                                                   .transpose(1, 2).contiguous()
+                elif config.quant_config.mm_quant_mode == "w8a8hifloat8":
+                    scale_data = torch_npu.npu_trans_quant_param(module.weight_scale.data.to(torch.float32).npu())
+                    module.weight_scale.data = scale_data.view(-1, config.o_lora_rank, *scale_data.shape[1:]) \
+                                                   .transpose(1, 2)[0, 0].contiguous()
+                continue
+
+            quant_method = getattr(module, "quant_method", None)
+            scales_dtype = {}
+            for scale_name in float_scales_map:
+                if scale_name in module_name:
+                    scales_dtype["scale_dtype"] = torch.float
+                    break
+
+            for smooth_scale_name in float_smooth_scales_map:
+                if smooth_scale_name in module_name:
+                    scales_dtype["smooth_scale_dtype"] = torch.float
+                    break
+
+            is_wq_b_transpose = self.config.num_attention_heads * self.config.head_dim > MATMUL_MAX_AXIS_VALUE
+            is_weight_nz = False if "compressor" in module_name or (is_wq_b_transpose and "attn.wq_b" in module_name) \
+                                 else enable_weight_nz
+            is_transpose = False if "compressor" in module_name else True
+            if isinstance(quant_method, QuantizeMethodBase):
+                quant_method.process_weights_after_loading(
+                    module,
+                    is_nz=is_weight_nz,
+                    is_transpose=is_transpose,
+                    scales_dtype=scales_dtype,
+                )
+
+            moe_quant_methods = (
+                CompressedTensorW8A8Int8MoEGMMMethod,
+                CompressedTensorW4A8Int8MoEGMMMethod,
+                Fp8MoEGMMMethod,
+            )
+            if isinstance(quant_method, moe_quant_methods) and self.moe_ep_size > 1:
+                all_experts_smooth_scale = module.smooth_scale_1.data.new_empty(
+                    module.smooth_scale_1.data.shape[0] * self.moe_ep_size,
+                    module.smooth_scale_1.data.shape[1],
+                )
+                dist.all_gather_into_tensor(
+                    all_experts_smooth_scale,
+                    module.smooth_scale_1.data,
+                    group=self.comm_manager.get_group("moe_ep_group"),
+                )
+                module.smooth_scale_1.data = all_experts_smooth_scale
 
     @staticmethod
     def _repeat_batch(tensor, repeat_num):
@@ -1866,183 +2284,159 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
         self.config.quant_config.set_quant_mode("li_cache_quant_mode", "unquant")
 
         # if quant to fp8 or mxfp8, set kv cache and li cache to fp8; if quant to int8, set li cache to int8
-        if self.platform_version == "950" and "hifloat" in self.mm_quant_mode:
+        if self.platform_version == PlatformVersion.ASCEND_950 and "hifloat" in self.mm_quant_mode:
             self.config.quant_config.kv_cache_quant_mode = "hifloat8"
             self.config.quant_config.li_cache_quant_mode = "hifloat8"
-        elif self.platform_version == "950" and "float" in self.mm_quant_mode:
+        elif self.platform_version == PlatformVersion.ASCEND_950 and "float" in self.mm_quant_mode:
             self.config.quant_config.kv_cache_quant_mode = "float8"
             self.config.quant_config.li_cache_quant_mode = "float8"
         else:
             self.config.quant_config.li_cache_quant_mode = "int8"
 
     def update_gmm_quant_mode(self):
-        if self.platform_version == "950" and "w4" in self.config.quant_config.gmm_quant_mode and "mx" not in self.config.quant_config.gmm_quant_mode:
-            self.config.quant_config.gmm_quant_mode = self.config.quant_config.gmm_quant_mode.replace("float", "mxfloat")
+        if self.platform_version == PlatformVersion.ASCEND_950 and "w4" in self.config.quant_config.gmm_quant_mode \
+            and "mx" not in self.config.quant_config.gmm_quant_mode:
+            self.config.quant_config.gmm_quant_mode = \
+                self.config.quant_config.gmm_quant_mode.replace("float", "mxfloat")
 
     def get_parallel_settings(self):
-        self.embed_tp_size = self.runner_settings.get("parallel_config").get("embed_tp_size", 1)
-        self.attn_dp_size = self.runner_settings.get("parallel_config").get("attn_dp_size", 1)
-        self.attn_tp_size = self.runner_settings.get("parallel_config").get("attn_tp_size", 1)
-        self.oproj_tp_size = self.runner_settings.get("parallel_config").get("oproj_tp_size", 1)
-        self.cp_size = self.runner_settings.get("parallel_config").get("cp_size", 1)
-        self.moe_ep_size = self.runner_settings.get("parallel_config").get("moe_ep_size", 1)
-        self.moe_tp_size = self.runner_settings.get("parallel_config").get("moe_tp_size", 1)
-        self.lmhead_tp_size = self.runner_settings.get("parallel_config").get("lmhead_tp_size", self.embed_tp_size)
-        self.moe_dp_size = self.runner_settings.get("parallel_config").get("moe_dp_size", 1)
-        self.embed_dp_size = self.runner_settings.get("parallel_config").get("embed_dp_size", 1)
-        self.attn_dp_size = self.runner_settings.get("parallel_config").get("attn_dp_size", 1)
-
-    def get_cached_graph(self):
-        case_name = "compile_cache/" + os.getenv("CASE_NAME")
-        cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), case_name)
-        cache_model = self.main_decode
-        if self.is_mtp:
-            cache_model = self.main_decode_mtp
-
-        torch._dynamo.config.inline_inbuilt_nn_modules = False
-        if self.enable_npugraph_ex:
-            compile_options = {
-                "frozen_parameter": True,
-                "static_kernel_compile": self.enable_static_kernel,
-            }
-            cached_decode = torch.npu.npugraph_ex.inference.cache_compile(cache_model, cache_dir=cache_dir,
-                                                                          dynamic=False, options=compile_options)
-        else:
-            tng_config = tng.CompilerConfig()
-            tng_config.experimental_config.frozen_parameter = True
-            tng_config.experimental_config.tiling_schedule_optimize = True
-            tng_config.experimental_config.topology_sorting_strategy = "StableRDFS"
-
-            cached_decode = tng.inference.cache_compile(cache_model, cache_dir=cache_dir, config=tng_config,
-                                                        dynamic=False, fullgraph=True, ge_cache=True)
-
-        return cached_decode
+        self.embed_tp_size = self.infer_config.parallel_config.embed_tp_size
+        self.attn_dp_size = self.infer_config.parallel_config.attn_dp_size
+        self.attn_tp_size = self.infer_config.parallel_config.attn_tp_size
+        self.oproj_tp_size = self.infer_config.parallel_config.o_proj_tp_size
+        self.cp_size = self.infer_config.parallel_config.cp_size
+        self.moe_ep_size = self.infer_config.parallel_config.moe_ep_size
+        self.moe_tp_size = self.infer_config.parallel_config.moe_tp_size
+        self.lmhead_tp_size = self.infer_config.parallel_config.lmhead_tp_size
+        self.moe_dp_size = self.infer_config.parallel_config.world_size // self.moe_tp_size
+        self.embed_dp_size = self.infer_config.parallel_config.embed_dp_size
 
     def init_parallel_comm_group(self):
-        world_size = dist.get_world_size()
-        global_rank = dist.get_rank()
+        if self.comm_manager is None:
+            raise ValueError("DeepseekV3ForCausalLM requires comm_manager to initialize communication groups.")
 
-        attn_tp_group = init_comm_group(
-            global_rank=global_rank, group_num=self.attn_dp_size, world_size=world_size,
-            group_stride=1, group_name="attn_tp_group", platform_version=self.platform_version)
+        world_size = self.world_size
+        platform_version = self.platform_version
+        self.comm_manager.register_group(
+            name="attn_tp_group",
+            group_num=self.world_size // self.attn_tp_size,
+            group_size=self.attn_tp_size,
+            platform_version=platform_version,
+        )
+        self.comm_manager.register_group(
+            name="oproj_tp_group",
+            group_num=world_size // self.oproj_tp_size,
+            group_size=self.oproj_tp_size,
+            platform_version=platform_version,
+        )
+        self.comm_manager.register_group(
+            name="embed_tp_group",
+            group_num=self.embed_dp_size,
+            group_size=self.embed_tp_size,
+            platform_version=platform_version,
+        )
+        self.comm_manager.register_group(
+            name="lmhead_tp_group",
+            group_num=world_size // self.lmhead_tp_size,
+            group_size=self.lmhead_tp_size,
+            platform_version=platform_version,
+        )
+        
+        self.comm_manager.register_group(
+            name="moe_tp_group",
+            group_num=self.moe_dp_size,
+            group_size=world_size // self.moe_dp_size,
+            platform_version=platform_version,
+        )
 
-        if self.oproj_tp_size == self.attn_tp_size:
-            oproj_tp_group = attn_tp_group
-        else:
-            oproj_tp_group = init_comm_group(
-                global_rank=global_rank, group_num=world_size // self.oproj_tp_size, world_size=world_size,
-                group_stride=1, group_name="oproj_tp_group", platform_version=self.platform_version)
-
-        if self.embed_tp_size == self.attn_tp_size:
-            embed_tp_group = attn_tp_group
-        else:
-            embed_tp_group = init_comm_group(
-                global_rank=global_rank, group_num=self.embed_dp_size, world_size=world_size,
-                group_stride=1, group_name="embed_tp_group", platform_version=self.platform_version)
-
-        if self.lmhead_tp_size == self.embed_tp_size:
-            lmhead_tp_group = embed_tp_group
-        else:
-            lmhead_tp_group = init_comm_group(
-                global_rank=global_rank, group_num=world_size // self.lmhead_tp_size, world_size=world_size,
-                group_stride=1, group_name="lmhead_tp_group", platform_version=self.platform_version)
-
-        if self.moe_tp_size == self.attn_tp_size:
-            moe_tp_group = attn_tp_group
-        else:
-            moe_tp_group = init_comm_group(
-                global_rank=global_rank, group_num=self.moe_dp_size, world_size=world_size,
-                group_stride=1, group_name="moe_tp_group", platform_version=self.platform_version)
-
-        group_type = None if self.platform_version != "950" else 0 # 950 use default group for prefill moe
-        moe_ep_group = init_comm_group(
-            global_rank=global_rank, group_num=self.moe_tp_size, world_size=world_size,
-            group_stride=self.moe_tp_size, group_name="moe_ep_group", group_type=group_type, platform_version=self.platform_version)
+        moe_ep_group_type = None if self.platform_version != PlatformVersion.ASCEND_950 else 0
+        # 950 use default group for prefill moe
+        self.comm_manager.register_group(
+            name="moe_ep_group",
+            group_num=self.moe_tp_size,
+            group_size=world_size // self.moe_tp_size,
+            group_stride=self.moe_tp_size,
+            group_type=moe_ep_group_type,
+            platform_version=platform_version,
+        )
 
         # used for fullmesh v2
-        group_type = None if self.platform_version != "950" else 3 # 950 use aiv group for mc2
-        is_full_mesh_v2 = self.platform_version != "950"
-        hccl_buffer_size = calc_moe_hccl_buffer_size(self.runner_settings, self.config, is_full_mesh_v2=is_full_mesh_v2)
-        moe_ep_group_mc2, moe_ep_group_mc2_name = init_comm_group(
-            global_rank=global_rank, group_num=self.moe_tp_size, world_size=world_size,
-            group_stride=self.moe_tp_size, group_name="moe_ep_group_mc2", return_name=True,
-            hccl_buffer_size=hccl_buffer_size, group_type=group_type, platform_version=self.platform_version)
-
-        cp_group = init_comm_group(
-            global_rank=global_rank, group_num=world_size // self.cp_size, world_size=world_size,
-            group_stride=1, group_name="cp_group", platform_version=self.platform_version)
-
-        hccl_comm_dict = {
-                "default_pg": get_default_group(),
-                "attn_tp_group": attn_tp_group, "embed_tp_group": embed_tp_group,
-                "moe_tp_group": moe_tp_group, "moe_ep_group": moe_ep_group,
-                "moe_ep_group_mc2": moe_ep_group_mc2,
-                "moe_ep_group_mc2_name": moe_ep_group_mc2_name,
-                "lmhead_tp_group": lmhead_tp_group,
-                "oproj_tp_group": oproj_tp_group,
-                "cp_group": cp_group
-            }
-        return hccl_comm_dict
+        moe_ep_mc2_group_type = None if self.platform_version != PlatformVersion.ASCEND_950 else 3
+        # 950 use aiv group for mc2
+        is_full_mesh_v2 = self.platform_version != PlatformVersion.ASCEND_950
+        hccl_buffer_size = calc_moe_hccl_buffer_size(
+            self.infer_config, self.config, is_full_mesh_v2=is_full_mesh_v2
+        )
+        self.comm_manager.register_group(
+            name="moe_ep_group_mc2",
+            group_num=self.moe_tp_size,
+            group_size=self.moe_ep_size,
+            group_stride=self.moe_tp_size,
+            return_name=True,
+            allow_physical_reuse=False,
+            hccl_buffer_size=hccl_buffer_size,
+            group_type=moe_ep_mc2_group_type,
+            platform_version=platform_version,
+        )
+        self.comm_manager.register_group(
+            name="cp_group",
+            group_num=world_size // self.cp_size,
+            group_size=self.cp_size,
+            group_stride=1,
+            platform_version=platform_version,
+        )
 
     def gather_cp_last_token_hidden(self, outputs, attn_metadata):
-        bs, q_len, hidden_size = outputs.shape
+        num_tokens, hidden_size = outputs.shape
         cp_metadata = attn_metadata["cp_metadata"]
-        segment_len = q_len // 2
+        segment_len = num_tokens // 2
         last_segment_idx = cp_metadata["last_rank"]
         if last_segment_idx < 0:
             raise ValueError("CP prefill requires at least one valid token")
-        last_segment_len = cp_metadata["split_kv_len"][0, last_segment_idx].item()
+        last_segment_len = cp_metadata["split_kv_len"][last_segment_idx].item()
 
         local_offset = last_segment_len - 1
         if cp_metadata["last_rank_flag"] == "next":
             local_offset += segment_len
 
-        last_hidden = outputs.new_zeros((bs, 1, hidden_size))
+        last_hidden = outputs.new_zeros((1, hidden_size))
         if self.global_rank == cp_metadata["last_rank_zz"]:
-            last_hidden.copy_(outputs[:, local_offset: local_offset + 1, :])
+            last_hidden.copy_(outputs[local_offset: local_offset + 1, :])
         # Only the owner rank writes data; sum broadcasts the selected hidden state across the CP group.
-        dist.all_reduce(last_hidden, group=self.hccl_comm_dict.get("cp_group", None))
+        dist.all_reduce(last_hidden, group=self.comm_manager.get_group("cp_group"))
         return last_hidden
 
     def forward_lm_head(self, outputs, kv_len, is_prefill=True, attn_metadata=None):
-        bs, q_len, hidden_size = outputs.shape
+        num_tokens, hidden_size = outputs.shape
+        seq_used_q = attn_metadata.get("seq_used_q")
+        bs = seq_used_q.numel()
         if is_prefill:
             if self.cp_size > 1:
                 outputs = self.gather_cp_last_token_hidden(outputs, attn_metadata)
-                q_len = 1
-
-            # attention: SP + TP，moe：DP + EP
-            if self.attn_tp_size > 1 and self.moe_ep_size > 1:
-                new_outputs = torch.zeros_like(outputs).repeat(self.attn_tp_size, 1, 1)
-                dist.all_gather_into_tensor(new_outputs, outputs,
-                                            group=self.hccl_comm_dict.get("attn_tp_group", None))
-                outputs = new_outputs
-            if self.cp_size == 1:
+            else:
                 gather_index = kv_len - 1
-                gather_index = gather_index.unsqueeze(1).unsqueeze(2).repeat(1, 1, outputs.shape[-1])
-                outputs = torch.gather(outputs, 1, gather_index)
-                q_len = 1 # prefill takes th last token
+                gather_index = gather_index.unsqueeze(1).repeat(1, outputs.shape[-1])
+                outputs = torch.gather(outputs, 0, gather_index).view(-1, 1, hidden_size)
+            q_len = 1 # prefill takes the last token
         else: # combine bs and q_len axes for lm_head
-            outputs = outputs.view(bs * q_len, 1, hidden_size)
-
+            outputs = outputs.view(num_tokens, 1, hidden_size)
+            q_len = num_tokens // bs
         if (self.attn_dp_size == 1) or (self.lmhead_tp_size == 1):
             hidden_states = outputs
         else:
             # allgather: (bs / attn_dp, hidden_size) -> (bs, hidden_size)
-            hidden_states = torch.zeros_like(outputs).repeat(self.lmhead_tp_size, 1, 1)
-            dist.all_gather_into_tensor(hidden_states, outputs,
-                                        group=self.hccl_comm_dict.get("lmhead_tp_group", None))
+            hidden_states = torch.empty_like(outputs).repeat(self.lmhead_tp_size, 1, 1)
+            dist.all_gather_into_tensor(hidden_states, outputs, group=self.comm_manager.get_group("lmhead_tp_group"))
 
         logits = self.lm_head(hidden_states) # (lmhead_tp_size * bs / attn_dp, 1, vocab_size / lmhead_tp_size)
         if self.lmhead_tp_size > 1: # -> (bs / attn_dp, 1, vocab_size)
             if self.attn_dp_size == 1:
-                new_logits = torch.zeros_like(logits).repeat(self.lmhead_tp_size, 1, 1)
-                dist.all_gather_into_tensor(new_logits, logits,
-                                            group=self.hccl_comm_dict.get("lmhead_tp_group", None))
+                new_logits = torch.empty_like(logits).repeat(self.lmhead_tp_size, 1, 1)
+                dist.all_gather_into_tensor(new_logits, logits, group=self.comm_manager.get_group("lmhead_tp_group"))
             else:
-                new_logits = torch.zeros_like(logits).view(-1)
+                new_logits = torch.empty_like(logits).view(-1)
                 dist.all_to_all_single(new_logits, logits.view(-1), \
-                        group=self.hccl_comm_dict.get("lmhead_tp_group", None))
+                        group=self.comm_manager.get_group("lmhead_tp_group"))
 
             # transpose: (lmhead_tp_size * bs / attn_dp, vocab_size / lmhead_tp_size) -> (bs / attn_dp, vocab_size)
             new_logits = new_logits.reshape(
@@ -2129,7 +2523,7 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
         c128a_metadata_kwargs.update({"cmp_ratio": 128, "has_cmp_kv": True})
 
         enable_metadata_multi_streams = self.enable_multi_streams and not is_prefill
-        record_event(enable_metadata_multi_streams , attn_metadata.get('metadata_event'), 0)
+        record_event(enable_metadata_multi_streams, attn_metadata.get('metadata_event'), 0)
         if is_mtp:  # only c1a in mtp
             with npu_stream_switch(enable_metadata_multi_streams, metadata_stream):
                 wait_event(enable_metadata_multi_streams, attn_metadata.get('metadata_event'), 0)
@@ -2143,36 +2537,52 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
                     self.generate_metadata(attn_metadata, c1a_metadata_kwargs, is_prefill, "c1a_metadata")
                     record_event(enable_metadata_multi_streams, attn_metadata.get('metadata_event'), 1)
                 self.generate_metadata(attn_metadata, c128a_metadata_kwargs, is_prefill, "c128a_metadata")
-                record_event(enable_metadata_multi_streams and self.first_layer_ratio == 128, attn_metadata.get('metadata_event'), 1)
+                record_event(enable_metadata_multi_streams and self.first_layer_ratio == 128,
+                             attn_metadata.get('metadata_event'), 1)
                 self.generate_metadata(attn_metadata, c4a_metadata_kwargs, is_prefill, "c4a_metadata")
                 if self.li_cache_quant_mode in ["int8", "float8", "hifloat8"]:
                     li_metadata_kwargs = self.generate_li_metadata_kwargs()
                     self.generate_metadata(attn_metadata, li_metadata_kwargs,\
                                             is_prefill, "lightning_indexer_quant", is_li=True)
 
+    def preprocess_model_inputs(self, model_inputs: Dict, is_prefill=False, is_mtp=False, **kwargs):
+        model_inputs = dict(model_inputs)
+
+        attn_metadata = self.attention_data.build_attn_metadata(
+            model_inputs.get("input_ids"),
+            model_inputs.get("position_ids"),
+            model_inputs.get("forward_metadata"),
+        )
+        attn_metadata.update({"metadata_event": self.metadata_event})
+        model_inputs["attn_metadata"] = attn_metadata
+
+        return model_inputs
+
     def forward(
         self,
         input_ids: torch.LongTensor = None,
+        position_ids: torch.LongTensor = None,
+        forward_metadata: ForwardMetaData = None,
         attn_metadata: Optional[Dict] = None,
-        cache_data: Optional[Tuple[Dict]] = None,
-        is_prefill: Optional[bool] = False,
         cur_topk_list: Optional[torch.Tensor] = None,
-        prev_hidden_states: Optional[torch.Tensor] = None,
         **kwargs
     ):
+        is_prefill = forward_metadata.is_prefill
+
         self.generate_kernel_metadata(attn_metadata, is_prefill)
 
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         outputs = self.model(
             input_ids=input_ids,
+            position_ids=position_ids,
             attn_metadata=attn_metadata,
-            cache_data=cache_data,
             is_prefill=is_prefill,
             cur_topk_list=cur_topk_list,
-        ) # (bs / attn_dp, S, hidden_size)
+        ) # (num_tokens, hidden_size)
 
         prev_hidden_states = outputs
-        logits = self.forward_lm_head(outputs, attn_metadata["kv_len"], is_prefill, attn_metadata)
+
+        logits = self.forward_lm_head(outputs, attn_metadata["actual_seq_q"], is_prefill, attn_metadata)
         return logits, prev_hidden_states
 
     def prefill(
@@ -2195,7 +2605,7 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
         )
         return logits, prev_hidden_states
 
-    def main_decode_mtp(
+    def mtp_decode(
         self,
         **kwargs
     ):
@@ -2205,91 +2615,24 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
         )
         return logits, prev_hidden_states
 
-    def decode(
+    def get_cache_info(
         self,
-        **kwargs
-    ):
-        if self.enable_cache_compile:
-            logits = self.cached_decode(**kwargs)
-        else:
-            logits = self.main_decode(**kwargs)
-        return logits
+    ) -> ModelCacheInfo:
+        layers = self.model.layers.values() if self.is_mtp else self.model.layers
+        layer_infos = []
+        for layer_idx, layer in enumerate(layers):
+            layer_infos.append(
+                LayerCacheInfo(
+                    layer_idx=layer_idx,
+                    caches=list(layer.attn.cache_entries),
+                )
+            )
 
-    def gen_cur_topk_idx(
-        self,
-        is_prefill,
-        batch_size,
-        seq_len
-    ):
-        if not self.perfect_eplb:
-            return None
-        # if use perfect_eplb
-        global_rank = dist.get_rank()
-        if is_prefill:
-            tokens_per_rank_prefill = batch_size * seq_len // self.attn_tp_size \
-            if self.moe_ep_size != 1 else batch_size * seq_len * self.attn_dp_size
-            step_prefill = tokens_per_rank_prefill * self.top_k
-            cur_topk_list_prefill = [
-                (i + global_rank) % self.config.n_routed_experts for i in range(step_prefill)]
-            cur_topk_list = torch.Tensor(cur_topk_list_prefill).int().view(tokens_per_rank_prefill, -1).npu()
-        else:
-            if self.moe_tp_size > 1:
-                tokens_per_rank_decode = batch_size * self.top_k * seq_len
-                cur_topk_list_decode = []
-                for offset in range(self.moe_ep_size):
-                    for i in range(offset * self.experts_per_rank, \
-                                   offset * self.experts_per_rank + tokens_per_rank_decode):
-                        cur_topk_list_decode.append(i)
-                cur_topk_list = torch.Tensor(cur_topk_list_decode).int().view(batch_size * seq_len, -1).npu()
-            else:
-                expanded_tokens = batch_size * self.top_k * seq_len  # Total tokens to be allocated to experts
-                step_gap = self.config.n_routed_experts // self.moe_ep_size # Number of experts per rank
-                expanded_offset = expanded_tokens * global_rank + global_rank # Token count offset
-                cur_topk_list_decode = []
-                # Allocate experts using round-robin algorithm
-                for idx in range(expanded_tokens):
-                    col = (expanded_offset + idx) % self.moe_ep_size  # Column index
-                    row = (expanded_offset + idx) // self.moe_ep_size % step_gap  # Row index
-                    expert_idx = row + col * step_gap  # Final expert index
-                    cur_topk_list_decode.append(expert_idx)
-                cur_topk_list = torch.Tensor(cur_topk_list_decode).int().view(batch_size * seq_len, -1).npu()
-        return cur_topk_list
-
-    def prepare_inputs_for_generation(
-        self,
-        input_ids,
-        cache_data=None,
-        attention_mask=None,
-        is_prefill=None,
-        kv_len=None,
-        prev_hidden_states=None,
-        **kwargs
-    ):
-        # input shape: [B, S]
-        batch_size, seq_len = input_ids.size()
-        # use reshape to avoid stride change, which will cause recompile in mtp case
-        input_ids = input_ids.contiguous().reshape(batch_size, seq_len)
-
-        attn_metadata = self.attn_metadata.get_attn_metadata(input_ids, attention_mask, kv_len, is_prefill)
-        if is_prefill:
-            # temporary full cache for win attention
-            cache = CacheData(self.config, self.runner_settings, self.is_mtp, \
-                              self.kv_cache_quant_mode, self.li_cache_quant_mode)
-            full_kv_cache = cache.init_full_buffer_c1a()
-            attn_metadata.update({"full_kv_cache": full_kv_cache})
-
-        attn_metadata.update({"metadata_event": self.metadata_event})
-
-        if is_prefill and self.cp_size > 1:
-            attn_metadata = self.attn_metadata.get_cp_metadata(input_ids, is_prefill, attn_metadata, self.is_mtp, self.hccl_comm_dict)
-
-        model_inputs = {
-            "input_ids": input_ids.to(torch.int32),
-            "cache_data": cache_data,
-            "attn_metadata": attn_metadata,
-            "prev_hidden_states": prev_hidden_states,
-        }
-        return model_inputs
+        return ModelCacheInfo(
+            num_layers=len(layer_infos),
+            layer_infos=layer_infos,
+            is_mla_backend=True,
+        )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Set[str]:
         stacked_params_mapping = [
@@ -2383,8 +2726,8 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
                                   expert_id=expert_id)
                     break
                 else:
-                    # The npu_transpose_batchmatmul op doesn't support the fp8 data type. The weight of wo_a needs to be
-                    # converted to bf16.
+                    # The npu_transpose_batchmatmul op doesn't support the fp8 data type. The weight of wo_a needs
+                    # to be converted to bf16.
                     if "wo_a" in name and self.config.quant_config.mm_quant_mode == "w8a8float8":
                         base_name, attr = name.rsplit(".", 1)
                         if base_name not in dequant_cache:
@@ -2427,8 +2770,14 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
 
 class DeepseekV3ModelMTP(DeepseekV3ForCausalLM):
 
-    def __init__(self, config: DeepseekV3Config, runner_settings: Dict, **kwargs):
-        super().__init__(config, runner_settings, is_mtp=True)
+    def __init__(
+        self,
+        config: DeepseekV3Config,
+        infer_config: InferenceConfig,
+        comm_manager: CommManager = None,
+        **kwargs,
+    ):
+        super().__init__(config, infer_config, comm_manager, is_mtp=True)
         self.mtp_start_layer_idx = config.num_hidden_layers
         self.local_rank = int(os.getenv("LOCAL_RANK", "0"))
         self.rank_offset = int(os.getenv("RANK_OFFSET", "0"))
@@ -2470,18 +2819,21 @@ class DeepseekV3ModelMTP(DeepseekV3ForCausalLM):
     def forward(
         self,
         input_ids: torch.LongTensor,
+        position_ids: torch.LongTensor = None,
+        forward_metadata: ForwardMetaData = None,
         prev_hidden_states: Optional[torch.Tensor] = None,
         attn_metadata: Optional[Dict] = None,
-        is_prefill: Optional[bool] = False,
-        cache_data: Optional[Tuple[Dict]] = None,
         cur_topk_list: Optional[torch.Tensor] = None,
         **kwargs
     ):
+        is_prefill = forward_metadata.is_prefill
+        model_input_ids = input_ids
+
         position_ids = attn_metadata["position_ids"]
         kv_len = attn_metadata["kv_len"]
-        self.generate_kernel_metadata(attn_metadata, is_prefill, True)
+        if not attn_metadata.get("kernel_metadata"):
+            self.generate_kernel_metadata(attn_metadata, is_prefill, True)
 
-        batch_size, seq_length = input_ids.shape
         if is_prefill and self.cp_size > 1 and self.embed_tp_size == 1:
             input_ids = self.model.get_cp_input_ids(input_ids, attn_metadata)
 
@@ -2512,18 +2864,20 @@ class DeepseekV3ModelMTP(DeepseekV3ForCausalLM):
             past_residual=residual,
             attn_metadata=attn_metadata,
             is_prefill=is_prefill,
-            cache_data=cache_data,
             cur_topk_list=cur_topk_list,
         )
 
-        prev_hidden_states = self.shared_head_norm(hidden_states)
+        outputs = self.shared_head_norm(hidden_states)
+        prev_hidden_states = outputs
 
-        outputs = prev_hidden_states
         logits = self.forward_lm_head(
-            outputs=outputs, kv_len=attn_metadata["kv_len"], is_prefill=is_prefill, \
+            outputs=outputs, kv_len=attn_metadata["actual_seq_q"], is_prefill=is_prefill, \
             attn_metadata=attn_metadata)
 
         return logits, prev_hidden_states
+
+    def decode(self, **kwargs):
+        return self.forward(**kwargs)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Set[str]:
         stacked_params_mapping, mtp_unique_weight_mapping, expert_params_mapping, repeat_loaded_weights_mapping \

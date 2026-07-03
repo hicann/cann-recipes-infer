@@ -64,6 +64,7 @@ class CacheEntry:
     tensor_setter: Optional[Callable[[torch.Tensor], None]] = None
     sliding_window: Optional[int] = None
     allocator: CacheAllocator = CacheAllocator.HBM
+    compress_ratio: int = 1
     tensor: Optional[torch.Tensor] = None
 
     @property
@@ -78,6 +79,18 @@ class CacheEntry:
         for cur_dim in dims:
             numel *= cur_dim
         return numel
+
+    @property
+    def storage_block_size(self) -> int:
+        """Calculate the physical block size when creating cache tensors."""
+        if self.block_size % self.compress_ratio > 0:
+            raise ValueError(
+                "block_size must be divisible by compress_ratio when calculating "
+                f"storage_block_size, but got cache_name={self.cache_name}, "
+                f"block_size={self.block_size}, compress_ratio={self.compress_ratio}."
+            )
+        storage_block_size = self.block_size // self.compress_ratio
+        return storage_block_size
 
 
 @dataclass

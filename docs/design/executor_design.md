@@ -249,6 +249,25 @@ KV cache 采用 paged attention 三层结构，定义在 `executor/core/kv_cache
 
 详见 [kv_cache_design.md](kv_cache_design.md)。
 
+### 3.7 Tokenizer Registry
+
+Tokenizer 负责文本和 token ID 之间的转换，框架将 tokenizer 管理拆成两层：
+
+| 层级 | 职责 |
+|------|------|
+| `ExecutionEngine` | 负责 tokenizer 的生命周期管理。在初始化阶段根据 `model_config.model_name` 和 `model_config.model_path` 请求 tokenizer，并把加载后的对象交给 `Scheduler` 复用 |
+| `TokenizerRegistry` | 负责 tokenizer 实现的选择。它维护模型名到 tokenizer 实现的映射，对外提供统一入口 `get_tokenizer()`，屏蔽默认加载和自定义加载之间的差异 |
+
+这种分层让调度和执行流程只依赖统一的 tokenizer 对象，具体加载策略分为两类：
+
+| 加载策略 | 说明 |
+|------|------|
+| 默认加载 | 面向标准 HF 权重目录。模型没有注册自定义 tokenizer 时，`TokenizerRegistry` 回退到 `AutoTokenizer.from_pretrained()`，作为大多数模型的通用路径 |
+| 自定义加载 | 面向 tokenizer 行为有差异的模型，例如特殊 chat template 等。自定义实现需要注册到 `_TOKENIZER_SPECS` 中，才能加载对应的实现 |
+
+默认加载保证标准模型可以沿用 HuggingFace tokenizer 生态；自定义加载提供模型特化能力，但扩展边界只在 tokenizer 层内部。无论使用哪种加载策略，最终交给 Scheduler 的对象都应保持相同的接口语义，例如支持 prompt 编码、`apply_chat_template`、`decode` 和 `eos_token_id`。
+
+
 ---
 
 ## 4. 离线推理流程
@@ -299,7 +318,7 @@ bash executor/scripts/infer.sh --model <model> [--mode offline] [--yaml <name>]
             │
             ├─ ExecutionEngine.init(config_cls, main_model_cls, mtp_model_cls=None)  # Phase 2: 真正装载
             │       ├─ main_worker.init()                   #   加载 hf_config + 权重 → 构造 CommManager
-            │       ├─ AutoTokenizer.from_pretrained()      #   加载 tokenizer
+            │       ├─ get_tokenizer()                      #   加载默认或自定义 tokenizer
             │       └─ if cache_info: _init_cache_manager() #   paged：建 KVCacheManager + 块池
             │            else:        main_worker.init_kvcache()  # legacy：非paged方法分配 kv_cache
             │
