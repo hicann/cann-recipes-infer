@@ -1104,17 +1104,25 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
             prefix=f"{prefix}.in_proj_ba",
         )
 
-        self.tmp = torch.zeros(
-            1,
+        self.decode_batch_size = infer_config.scheduler_config.batch_size_per_dp_rank
+        self.decode_recurrent_state_buffer = torch.zeros(
+            self.decode_batch_size,
             self.num_v_heads,
             self.head_v_dim,
             self.head_k_dim,
             dtype=torch.bfloat16,
             device=torch.npu.current_device(),
         )
-        self.gdn_actual_seq_lengths = torch.ones((1,), dtype=torch.int32, device=torch.npu.current_device())
-        self.gdn_ssm_state_indices = torch.arange(1, dtype=torch.int32, device=torch.npu.current_device())
-
+        self.gdn_actual_seq_lengths = torch.ones(
+            (self.decode_batch_size,),
+            dtype=torch.int32,
+            device=torch.npu.current_device(),
+        )
+        self.gdn_ssm_state_indices = torch.arange(
+            self.decode_batch_size,
+            dtype=torch.int32,
+            device=torch.npu.current_device(),
+        )
 
         self.conv_state = None
         self.recurrent_state = None
@@ -1144,26 +1152,15 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
         default_weight_loader(param, loaded_weight)
 
     def _ensure_recurrent_decode_buffers(self, batch_size: int, seq_len: int, device: torch.device):
-        expected_tmp_shape = (batch_size, self.num_v_heads, self.head_v_dim, self.head_k_dim)
-        if self.tmp.shape != expected_tmp_shape or self.tmp.device != device:
-            self.tmp = torch.zeros(
-                *expected_tmp_shape,
-                dtype=torch.bfloat16,
-                device=device,
+        assert batch_size == self.decode_batch_size
+        if self.decode_recurrent_state_buffer.device != device:
+            raise ValueError(
+                f"Decode recurrent state buffer is on {self.decode_recurrent_state_buffer.device}, "
+                f"but input is on {device}."
             )
-            torch._dynamo.mark_static(self.tmp)
-        else:
-            self.tmp.zero_()
 
-        expected_meta_shape = (batch_size,)
-        if self.gdn_actual_seq_lengths.shape != expected_meta_shape or self.gdn_actual_seq_lengths.device != device:
-            self.gdn_actual_seq_lengths = torch.empty(expected_meta_shape, dtype=torch.int32, device=device)
-            torch._dynamo.mark_static(self.gdn_actual_seq_lengths)
+        self.decode_recurrent_state_buffer.zero_()
         self.gdn_actual_seq_lengths.fill_(seq_len)
-
-        if self.gdn_ssm_state_indices.shape != expected_meta_shape or self.gdn_ssm_state_indices.device != device:
-            self.gdn_ssm_state_indices = torch.arange(batch_size, dtype=torch.int32, device=device)
-            torch._dynamo.mark_static(self.gdn_ssm_state_indices)
 
     def _forward_prefill(
         self,
@@ -1543,7 +1540,7 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
         )
 
         last_recurrent_state = (
-            self.tmp if recurrent_state is None else recurrent_state
+            self.decode_recurrent_state_buffer if recurrent_state is None else recurrent_state
         )
 
         core_attn_out = torch_npu.npu_recurrent_gated_delta_rule(
@@ -2899,7 +2896,6 @@ class Qwen3_5MoeForCausalLM(nn.Module):
     def forward(
         self,
         input_ids: torch.LongTensor | None = None,
-        attention_mask: torch.Tensor | None = None,
         position_ids: torch.LongTensor | None = None,
         forward_metadata: ForwardMetaData = None,
         **kwargs,
