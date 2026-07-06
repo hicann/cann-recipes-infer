@@ -21,11 +21,11 @@
 
 ## 📰 最新动态
 
+- [2026/07] Hy3 模型在 Atlas A3 系列和昇腾 950PR/DT 系列上已 **0day 支持推理部署**
 - [2026/06] GLM-5.2模型在昇腾Atlas A3系列上已支持推理部署
 - [2026/06] HunyuanVideo 模型在昇腾 950PR/DT 系列上支持 **mxfp8 a8w8 量化** 和 Flash Attention mxfp8 激活值量化
 - [2026/06] DeepSeek-V4 模型在昇腾 950PR/DT 系列上已支持 **HiF8 推理部署**
 - [2026/06] Qwen3.5 模型文生文通路在昇腾 Atlas A3 系列上已完成推理部署
-- [2026/05] Hy3-preview 模型基于模型优化 Agent（底座 DeepSeek-V4-Pro），在昇腾 Atlas A3 系列上已完成端到端优化适配，支持推理部署
 
 <details>
 <summary>📜 更多历史动态</summary>
@@ -230,7 +230,7 @@ bash infer.sh
 │   ├── hstu                                    # HSTU 的模型脚本及执行配置
 │   ├── hunyuan-image-3.0                       # HunyuanImage-3.0 的模型脚本及执行配置
 │   ├── hunyuan-video                           # HunyuanVideo 的模型脚本及执行配置
-│   ├── hy3_preview                             # Hy3-preview 的模型脚本及执行配置
+│   ├── hy3                                     # Hy3 的模型脚本及执行配置
 │   ├── kimi_k2_thinking                        # Kimi-K2-Thinking 的模型脚本及执行配置
 │   ├── longcat_flash                           # LongCat-Flash 的模型脚本及执行配置
 │   ├── longcat_flash_lite                      # LongCat-Flash-Lite 的模型脚本及执行配置

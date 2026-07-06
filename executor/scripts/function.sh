@@ -115,8 +115,13 @@ function detect_platform_version()
         return
     fi
 
+    unset INFER_DEVICE_IS_950DT
+
     if [[ "$device_name" == *"950"* ]]; then
         export DETECTED_PLATFORM_VERSION="950"
+        if [[ "$device_name" == *"950DT"* ]]; then
+            export INFER_DEVICE_IS_950DT=1
+        fi
     elif [[ "$device_name" == *"910_93"* ]]; then
         export DETECTED_PLATFORM_VERSION="A3"
     elif [[ "$device_name" == *"910B"* ]]; then
@@ -126,6 +131,9 @@ function detect_platform_version()
         export DETECTED_PLATFORM_VERSION="A3"
     fi
     echo "[INFO] Detected platform version: ${DETECTED_PLATFORM_VERSION} (device: ${device_name})"
+    if [ "${INFER_DEVICE_IS_950DT:-}" = "1" ]; then
+        echo "[INFO] ${device_name}: default pg hccl_op_expansion_mode=5"
+    fi
 }
 
 function get_rank()

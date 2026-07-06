@@ -66,6 +66,7 @@ class CacheEntry:
     allocator: CacheAllocator = CacheAllocator.HBM
     compress_ratio: int = 1
     tensor: Optional[torch.Tensor] = None
+    cache_layout: str = "BnBsND"
 
     @property
     def group_key(self) -> str:

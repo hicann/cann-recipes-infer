@@ -104,7 +104,8 @@ class ExecutionEngine:
             default_pg = get_default_group()
             if default_pg is None:
                 pg_options = None
-                if self.infer_config.model_config.platform_version.is_ascend_950():
+                is_950dt = os.getenv("INFER_DEVICE_IS_950DT") == "1"
+                if self.infer_config.model_config.platform_version.is_ascend_950() and is_950dt:
                     pg_options = torch_npu._C._distributed_c10d.ProcessGroupHCCL.Options()
                     pg_options.hccl_config = {"hccl_op_expansion_mode": 5}
                 torch.distributed.init_process_group(

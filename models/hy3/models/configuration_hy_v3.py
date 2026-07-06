@@ -130,7 +130,11 @@ class HYV3Config:
         self.use_cache = use_cache
         self.pad_token_id = pad_token_id
         self.bos_token_id = bos_token_id
-        self.eos_token_id = eos_token_id
+        # Some checkpoints (e.g. the fp8 export) store eos_token_id as a list;
+        # the tokenizer and the engine's stop check expect a scalar id.
+        self.eos_token_id = (
+            eos_token_id[0] if isinstance(eos_token_id, (list, tuple)) else eos_token_id
+        )
         self.tie_word_embeddings = tie_word_embeddings
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
@@ -204,4 +208,9 @@ class HYV3Config:
             if key in kwargs:
                 config_dict[key] = kwargs.pop(key)
 
-        return cls(**config_dict)
+        # Preserve compressed-tensors / fp8 quant metadata so the worker's
+        # _verify_quantization detects quant_method and binds the quant methods.
+        quantization_config = config_dict.pop("quantization_config", None)
+        config = cls(**config_dict)
+        config.quantization_config = quantization_config
+        return config

@@ -31,6 +31,7 @@ from .single_type_kv_cache_manager import ATTN_TYPE_MANAGER_MAP
 # e.g., sliding window attention. Distinguished from paged attention types
 # where block count scales with sequence length.
 FIXED_BLOCK_ATTN_TYPES = {"SlidingWindow"}
+SUPPORTED_CACHE_LAYOUTS = {"BnBsND", "BnNBsD"}
 
 
 def dtype_itemsize(dtype: torch.dtype) -> int:
@@ -76,6 +77,11 @@ def validate_cache_info(cache_info: ModelCacheInfo) -> None:
                     f"Unsupported attn_type '{cache.attn_type}' found in layer {layer_info.layer_idx}, "
                     f"cache {cache.cache_name}. Supported attn types are: {sorted(supported_attn_types)}"
                 )
+            if cache.cache_layout not in SUPPORTED_CACHE_LAYOUTS:
+                raise ValueError(
+                    f"cache {cache.cache_name} in layer {layer_info.layer_idx} has unsupported cache_layout "
+                    f"'{cache.cache_layout}'. Supported layouts are: {sorted(SUPPORTED_CACHE_LAYOUTS)}"
+                )
             if cache.num_head <= 0:
                 raise ValueError(
                     f"cache {cache.cache_name} in layer {layer_info.layer_idx} must have positive num_head, "
@@ -118,7 +124,15 @@ def allocate_cache_tensors(device, cache_info: ModelCacheInfo, block_num_by_type
             if cache.attn_type in ["FullAttention", "SlidingWindow"]:
                 block_size = cache.storage_block_size
                 dims = cache.dim if isinstance(cache.dim, list) else [cache.dim]
-                shape = (block_num, block_size, cache.num_head, *dims)
+                if cache.cache_layout == "BnNBsD":
+                    shape = (block_num, cache.num_head, block_size, *dims)
+                elif cache.cache_layout == "BnBsND":
+                    shape = (block_num, block_size, cache.num_head, *dims)
+                else:
+                    raise ValueError(
+                        f"Creating cache tensor with cache_layout='{cache.cache_layout}' is not supported. "
+                        f"Supported layouts are: {sorted(SUPPORTED_CACHE_LAYOUTS)}"
+                    )
                 numel = block_num * block_size * cache.num_head * cache.cache_dim_numel()
                 if allocator == CacheAllocator.HBM:
                     # HIXL_ALIGNMENT is in bytes; convert to element count for the padding.
