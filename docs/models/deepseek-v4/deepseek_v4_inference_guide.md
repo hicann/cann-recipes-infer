@@ -350,7 +350,7 @@ for layer in model_layers:
 
 ## Benchmark
 
-下述Benchmark数据均基于Offine推理模式采集，不包含Serving调度和框架负载均衡影响。
+下述Benchmark数据均基于Offline推理模式采集，不包含Serving调度和框架负载均衡影响。
 
 #### 950DT
 
