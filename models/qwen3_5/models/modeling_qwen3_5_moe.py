@@ -89,7 +89,8 @@ def qwen3_5_all_reduce(tensor: torch.Tensor, group) -> None:
         tensor_fp32 = tensor.to(torch.float32)
         dist.all_reduce(tensor_fp32, group=group)
         tensor.copy_(tensor_fp32.to(tensor.dtype))
-    dist.all_reduce(tensor, group=group)
+    else:
+        dist.all_reduce(tensor, group=group)
 
 
 def qwen3_5_prefill_mm_all_reduce(
