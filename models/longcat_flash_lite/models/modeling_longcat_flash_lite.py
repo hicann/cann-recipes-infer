@@ -104,6 +104,12 @@ class LongcatFlashRotaryEmbedding(nn.Module):
         self.rope_type = self.config.rope_parameters["rope_type"]
         rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
         inv_freq, self.attention_scaling = rope_init_fn(self.config, device)
+        # transformers 5.0 yarn rope_init returns attention_scaling=1.0; force the
+        # yarn mscale so cos/sin match the softmax_scale (base * m^2) convention.
+        scaling_factor = self.config.rope_parameters.get("factor", 1)
+        mscale_all_dim = self.config.rope_parameters.get("mscale_all_dim", 0)
+        if self.rope_type != "default" and mscale_all_dim:
+            self.attention_scaling = yarn_get_mscale(scaling_factor, mscale_all_dim)
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
         self._set_cos_sin_cache(max_seq_len, device, dtype)
@@ -595,6 +601,10 @@ class LongcatFlashMLA(nn.Module):
             query_quant_mode=0, key_quant_mode=0, value_quant_mode=0,
         )
         # attn_output: (N, num_tokens, kv_lora_rank) — NTD output layout.
+
+        # Cache is unscaled (kc_scale=1.0); q_nope*kv_lora covers the QK side, but
+        # V (softmax @ cache_nope) still needs the kv_lora fold to match prefill.
+        attn_output = attn_output * self.mla_scale_kv_lora
 
         # V absorb: attn_output (N, T, kv_lora) bmm kv_b_proj_w_v
         # (N, kv_lora, v_head_dim) → (T, N*v_head_dim) packed 2D for o_proj
