@@ -23,6 +23,7 @@ This module contains all configuration classes for the inference framework:
 - InferenceConfig: Unified configuration container
 """
 import os
+import logging
 import math
 from dataclasses import dataclass, field
 from enum import Enum
@@ -170,10 +171,16 @@ class ModelConfig:
         if self.enable_static_kernel and self.exe_mode != "npugraph_ex":
             raise ValueError("enable_static_kernel only supports exe_mode='npugraph_ex'")
 
-        if self.exe_mode == "npugraph_ex" and os.getenv("TASK_QUEUE_ENABLE", "2") != "1":
+        if self.exe_mode == "npugraph_ex" or self.platform_version.is_ascend_950():
             os.environ["TASK_QUEUE_ENABLE"] = "1"  # npugraph_ex only supports TASK_QUEUE_ENABLE 0 or 1
         else:
             os.environ["TASK_QUEUE_ENABLE"] = "2"  # 2: default value, opt host perf in eager
+
+        if self.exe_mode == "ge_graph" and self.enable_dynamic_graph:
+            logging.warning(
+                "When exe_mode is set to 'ge_graph', only static graph mode is supported; "
+                "enable_dynamic_graph=True will be ignored."
+            )
 
 
 @dataclass

@@ -90,12 +90,12 @@ def compile_model_forward(
             model_forward,
             cache_dir=cache_dir,
             config=compiler_config,
-            dynamic=enable_dynamic_graph,
+            dynamic=False,
             fullgraph=True,
             ge_cache=True
         )
     else:
         npu_backend = tng.get_npu_backend(compiler_config=compiler_config)
-        compiled = torch.compile(model_forward, dynamic=enable_dynamic_graph, fullgraph=True, backend=npu_backend)
+        compiled = torch.compile(model_forward, dynamic=False, fullgraph=True, backend=npu_backend)
 
     return compiled
