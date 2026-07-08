@@ -69,6 +69,16 @@ class OffloadCache(nn.Module):
             if self.config.quant_config is not None else "unquant"
         self.empty_rope = torch.tensor([], dtype=torch.int8, device="npu")
 
+        # MTP gather reuse: on MTP draft steps the IndexShare loop freezes the first decode step's
+        # top-k (reuse_shared_topk). Because the frozen top-k selects a fixed set of historical
+        # positions whose KV is immutable, the selection buffer gathered on that first step stays
+        # exactly valid for the later draft steps -> the per-step re-gather (and its O(TOPK)
+        # status-ledger hit-scan) is redundant. When enabled, later draft steps skip the gather and
+        # reuse the buffer; the per-token selection length is read back from the status ledger's last
+        # column (status[..., TOPK]), which the gather already persists. Byte-identical, only saves time.
+        self.enable_mtp_gather_reuse = self.runner_settings.get("model_config")\
+            .get("enable_mtp_gather_reuse", True)
+
     def init_cache(
         self,
         cache_device,

@@ -56,6 +56,7 @@ from .custom_op_loader import load_offload_gather_op, register_offload_ge_conver
 
 # Mount the custom offload-gather op onto torch_npu (no-op if not installed); see custom_op_loader.
 load_offload_gather_op()
+register_offload_ge_converter()
 from .modules import one_hot, DeepseekV3RMSNorm, _init_rope
 from .indexer import GlmMoeDsaIndexer
 from .offload_cache import OffloadCache
@@ -1016,7 +1017,8 @@ class GlmMoeDsaAttention(nn.Module):
             past_key_value=past_key_value,
             topk_indices=topk_indices,
             is_prefill=is_prefill,
-            offload_cache=offload_cache
+            offload_cache=offload_cache,
+            reuse_shared_topk=reuse_shared_topk,
         )
 
         output = self.mla_epilog(attn_output, absorb=True)
@@ -1442,6 +1444,7 @@ class GlmMoeDsaAttention(nn.Module):
         past_key_value: Optional[Cache] = None,
         is_prefill: bool = True,
         offload_cache: Optional[OffloadCache] = None,
+        reuse_shared_topk: bool = False,
     ):
         # repeat k/v heads if n_kv_heads < n_heads
         q_nope, q_pe = query_states
@@ -1469,12 +1472,21 @@ class GlmMoeDsaAttention(nn.Module):
             selection_kv_block_status = offload_cache.selection_kv_block_status[self.layer_idx]
 
             topk_indices = topk_indices.view(bsz, -1, 1, self.index_topk)
-            selection_kv_actual_seq = torch_npu.npu_gather_selection_kv_cache(
-                selection_k_rope, selection_kv_cache,
-                selection_kv_block_table, selection_kv_block_status,
-                topk_indices, full_k_rope, full_kv_cache,
-                block_table, actual_seq_lengths_kv,
-                actual_seq_qlen, selection_topk_block_size=1)
+            if reuse_shared_topk and offload_cache.enable_mtp_gather_reuse:
+                # MTP draft reuse step: top-k is frozen to the first decode step's selection, so the
+                # already-gathered selection buffer (selection_kv_cache / selection_k_rope) and status
+                # ledger are still exactly valid -- skip the re-gather and its O(TOPK) hit-scan. The
+                # per-token selection length the gather would return is persisted in the status
+                # ledger's last column; read it back (a persistent buffer -> graph-mode safe).
+                selection_kv_actual_seq = selection_kv_block_status.reshape(
+                    -1, self.index_topk + 1)[:, self.index_topk].contiguous()
+            else:
+                selection_kv_actual_seq = torch_npu.npu_gather_selection_kv_cache(
+                    selection_k_rope, selection_kv_cache,
+                    selection_kv_block_table, selection_kv_block_status,
+                    topk_indices, full_k_rope, full_kv_cache,
+                    block_table, actual_seq_lengths_kv,
+                    actual_seq_qlen, selection_topk_block_size=1)
 
             default_topk_indices = offload_cache.default_topk_indices
             sparse_indices = torch.where(default_topk_indices < selection_kv_actual_seq.unsqueeze(1), \
@@ -2094,12 +2106,6 @@ class GlmMoeDsaForCausalLM(GlmMoeDsaPreTrainedModel):
             cached_decode = torch.npu.npugraph_ex.inference.cache_compile(cache_model, cache_dir=cache_dir,
                                                                           dynamic=False, options=compile_options)
         else:
-            # ge_graph: register the offload-gather op's torchair GE converter once (eager / npugraph_ex
-            # paths do not need it).
-            if not getattr(GlmMoeDsaForCausalLM, "_offload_ge_converter_done", False):
-                register_offload_ge_converter()
-                GlmMoeDsaForCausalLM._offload_ge_converter_done = True
-
             tng_config = tng.CompilerConfig()
             tng_config.experimental_config.frozen_parameter = True
             tng_config.experimental_config.tiling_schedule_optimize = True
