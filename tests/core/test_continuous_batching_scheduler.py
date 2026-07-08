@@ -191,13 +191,10 @@ class TestSchedulerBatching:
         scheduler.add_request("prompt1")
         scheduler.add_request("prompt2")
         
-        step_output = scheduler.run_step(engine)
-        
-        assert step_output is not None
-        assert len(step_output.next_tokens) == 2
-        assert 0 in step_output.next_tokens
-        assert 1 in step_output.next_tokens
-        
+        progressed = scheduler.run_step(engine)
+
+        # run_step returns True when a real (non-dummy) batch ran.
+        assert progressed is True
         # Check requests moved to running
         assert len(scheduler.running_requests) == 2
     
@@ -210,11 +207,13 @@ class TestSchedulerBatching:
         req1.output_id_list = [10]
         
         scheduler.running_requests[0] = req1
-        
-        step_output = scheduler.run_step(engine)
-        
-        assert step_output is not None
-        assert 0 in step_output.next_tokens
+
+        progressed = scheduler.run_step(engine)
+
+        # run_step returns True when a real batch ran; the request has not hit
+        # max_new_tokens yet, so it stays in running.
+        assert progressed is True
+        assert 0 in scheduler.running_requests
     
     def test_request_completion(self, scheduler, engine):
         """Test request completion and result dispatch."""
@@ -232,13 +231,11 @@ class TestSchedulerBatching:
 
         scheduler.running_requests[0] = req
 
-        step_output = scheduler.run_step(engine)
+        progressed = scheduler.run_step(engine)
 
-        # Request should be finished after this decode
-        assert len(step_output.finished_requests) == 1
-        assert 0 in step_output.finished_requests
-
-        # Check request moved to finished
+        # Request should be finished after this decode; finished requests are
+        # recorded in finished_requests (dispatch reads that dict directly).
+        assert progressed is True
         assert 0 in scheduler.finished_requests
         assert 0 not in scheduler.running_requests
 
@@ -253,9 +250,11 @@ class TestSchedulerBatching:
             'inference_time': 0.0,
         }
 
-        step_output = scheduler.run_step(engine, phase="prefill")
+        progressed = scheduler.run_step(engine, phase="prefill")
 
-        assert step_output is None
+        # Dummy batch runs forward (for collective alignment) but is not a real
+        # step, so run_step returns False.
+        assert progressed is False
         engine.forward_batch.assert_called_once()
         dummy_batch = engine.forward_batch.call_args.args[0]
         assert dummy_batch.is_dummy is True
@@ -272,9 +271,9 @@ class TestSchedulerBatching:
             'inference_time': 0.0,
         }
 
-        step_output = scheduler.run_step(engine, phase="decode")
+        progressed = scheduler.run_step(engine, phase="decode")
 
-        assert step_output is None
+        assert progressed is False
         engine.forward_batch.assert_called_once()
         dummy_batch = engine.forward_batch.call_args.args[0]
         assert dummy_batch.is_dummy is True

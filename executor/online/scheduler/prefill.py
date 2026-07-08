@@ -19,7 +19,6 @@ import logging
 from collections import deque
 
 from executor.core.scheduler import Scheduler
-from executor.core.forward_data_info import StepOutput
 from executor.online.kv_transfer import AscendKVSender, KVPoll
 
 logger = logging.getLogger(__name__)
@@ -58,9 +57,8 @@ class PrefillDisaggScheduler(Scheduler):
         self.bootstrap_queue = deque()
         self.inflight_queue = deque()
         self._pending_pd_request = None
-        self._bootstrap_failures = []
-        # Last drain count from _pop_inflight + bootstrap_failures, exposed so
-        # _log_step can fold it into the per-step status line.
+        # Inflight-drain count from _pop_inflight, exposed so _log_step can fold
+        # it into the per-step status line.
         self._last_drained_count: int = 0
 
     def set_pd_request_context(self, request_dict):
@@ -70,6 +68,13 @@ class PrefillDisaggScheduler(Scheduler):
         self, prompt, request_id=None, sampling_params=None, input_ids=None
     ):
         req_id = super().add_request(prompt, request_id, sampling_params, input_ids)
+        # super() enforced the prompt-length cap: a rejected request lands in
+        # finished_requests (not queued); an admitted one sits at the
+        # waiting_queue tail. Route a rejection through the bootstrap-failure
+        # channel instead of entering the bootstrap queue.
+        if self.finished_requests.get(req_id) is not None:
+            self._pending_pd_request = None
+            return req_id
         req = self.waiting_queue.pop()
         request_dict = self._pending_pd_request or {}
         req.bootstrap_room = request_dict.get("bootstrap_room", req.bootstrap_room)
@@ -77,7 +82,6 @@ class PrefillDisaggScheduler(Scheduler):
         req.bootstrap_port = request_dict.get("bootstrap_port", req.bootstrap_port)
         req.disagg_kv_sender = self._create_sender(req)
         self.bootstrap_queue.append(req)
-        self.last_added_request = req
         self._pending_pd_request = None
         return req_id
 
@@ -120,10 +124,11 @@ class PrefillDisaggScheduler(Scheduler):
         Plan B guarantees decode sends to every prefill rank (with is_dummy tag
         for non-targets), so the consensus actually converges.
 
-        Bootstrap failures accumulate in `_bootstrap_failures` and are drained
-        by the next `run_step` — no dispatch-able StepOutput here.
+        Bootstrap failures are recorded in finished_requests and dispatched by
+        iterating that dict; nothing is returned here.
         """
         remaining = deque()
+        n_failed = 0
         while self.bootstrap_queue:
             req = self.bootstrap_queue.popleft()
             poll = req.disagg_kv_sender.poll_and_all_reduce(group=self.tp_cpu_group)
@@ -139,10 +144,14 @@ class PrefillDisaggScheduler(Scheduler):
                 req.finish_reason = "error"
                 self.finished_requests[req.request_id] = req
                 self._cleanup_terminal_request(req)
-                self._bootstrap_failures.append(req.request_id)
+                n_failed += 1
             else:
                 remaining.append(req)
         self.bootstrap_queue = remaining
+        # Start the per-iteration terminal tally for _log_step. _pop_inflight
+        # (called next, inside run_step) adds its inflight drains on top — the
+        # main loop always runs advance before run_step, so this ordering holds.
+        self._last_drained_count = n_failed
         return None
 
     def _schedule_prefill_batch(self, engine):
@@ -156,7 +165,7 @@ class PrefillDisaggScheduler(Scheduler):
         forward's running_requests disagree (HCCL deadlock).  Must be called
         on ALL ranks in lockstep (poll_and_all_reduce is a collective).
         """
-        finished = []
+        drained = 0
         remaining = deque()
         while self.inflight_queue:
             req = self.inflight_queue.popleft()
@@ -169,41 +178,26 @@ class PrefillDisaggScheduler(Scheduler):
                         "request %s: KV transfer failed (room=%s) — marking as error",
                         req.request_id, req.bootstrap_room,
                     )
+                # Recorded in finished_requests; dispatch iterates that dict.
                 self.finished_requests[req.request_id] = req
                 self._cleanup_terminal_request(req)
-                finished.append(req.request_id)
+                drained += 1
             else:
                 remaining.append(req)
         self.inflight_queue = remaining
-        return finished
+        # Add to advance_queues_consensus's bootstrap-failure tally so the
+        # _log_step "drained" count matches the old inflight+bootstrap total.
+        self._last_drained_count += drained
 
     def run_step(self, engine, phase=None):
-        # Drain inflight + bootstrap failures on ALL ranks. _pop_inflight is a
-        # Gloo collective and must see full-group participation; running it
-        # here (before the phase branch) lets both forward and idle paths
-        # surface completed requests through the same code.
-        finished = self._pop_inflight()
-        if self._bootstrap_failures:
-            finished += list(self._bootstrap_failures)
-            self._bootstrap_failures.clear()
-        self._last_drained_count = len(finished)
-
+        # Records completed transfers in finished_requests.
+        self._pop_inflight()
         if phase is None:
-            return (
-                StepOutput(next_tokens={}, finished_requests=finished)
-                if finished else None
-            )
-
+            return False
         # Every TP rank must enter forward_batch every iteration — skipping on
         # one rank while others proceed desyncs HCCL collectives → deadlock.
         # Status logging happens inside super().run_step via _log_step override.
-        base_output = super().run_step(engine, phase="prefill")
-
-        if finished and base_output:
-            base_output.finished_requests.extend(finished)
-        elif finished:
-            return StepOutput(next_tokens={}, finished_requests=finished)
-        return base_output
+        return super().run_step(engine, phase="prefill")
 
     def _log_step(self, engine, batch, output) -> None:
         # The base only invokes _log_step after a real forward, so any reach
@@ -255,7 +249,6 @@ class PrefillDisaggScheduler(Scheduler):
             request.finish_reason = "error"
             self.finished_requests[request.request_id] = request
             self._cleanup_terminal_request(request)
-            self._bootstrap_failures.append(request.request_id)
             return
         self.inflight_queue.append(request)
 
@@ -264,7 +257,7 @@ class PrefillDisaggScheduler(Scheduler):
         # and inflight_queue are CPU-only RDMA waits — counting them causes
         # tight-loop dummy forward_batch calls which trigger HCCL AIV
         # all-reduce counter divergence and deadlock on Ascend.
-        return bool(self.waiting_queue or self._bootstrap_failures)
+        return bool(self.waiting_queue)
 
     def _on_request_finished(self, request) -> None:
         self._cleanup_terminal_request(request)

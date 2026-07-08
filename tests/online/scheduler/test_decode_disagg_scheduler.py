@@ -17,7 +17,7 @@
 from unittest.mock import Mock
 
 from executor.online.kv_transfer import KVPoll
-from executor.online.scheduler.queues import (
+from executor.online.scheduler.decode_queues import (
     DecodePreallocQueue,
     DecodeTransferQueue,
 )
@@ -86,7 +86,6 @@ def test_decode_uses_query_dp_ranks():
         transfer_queue=transfer_queue,
         running_requests={},
         num_reserved_decode_tokens=64,
-        max_prefill_tokens=4096,
     )
     req = Mock()
     req.bootstrap_room = 1
@@ -112,7 +111,6 @@ def test_decode_keeps_pending_req_until_retry_limit():
         transfer_queue=transfer_queue,
         running_requests={},
         num_reserved_decode_tokens=64,
-        max_prefill_tokens=4096,
     )
     req = Mock()
     req.bootstrap_room = 5
@@ -137,7 +135,6 @@ def test_decode_query_miss_aborts_after_retry_limit():
         transfer_queue=transfer_queue,
         running_requests={},
         num_reserved_decode_tokens=64,
-        max_prefill_tokens=4096,
     )
     req = Mock()
     req.bootstrap_room = 9

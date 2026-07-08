@@ -24,7 +24,7 @@ from executor.core.kv_cache import (
     SlidingWindowManager,
 )
 from executor.core.scheduler import Scheduler
-from executor.core.forward_data_info import GenerationOutput, Request, StepOutput, Batch, MTPInfo
+from executor.core.forward_data_info import GenerationOutput, Request, Batch, MTPInfo
 
 __all__ = [
     "BlockPool",
@@ -39,7 +39,6 @@ __all__ = [
     "SlidingWindowManager",
     "GenerationOutput",
     "Request",
-    "StepOutput",
     "Batch",
     "MTPInfo"
 ]

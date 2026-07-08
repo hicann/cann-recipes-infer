@@ -74,12 +74,14 @@ class PrefillServerInfo:
     dp_size: int
     block_sizes: Optional[list[int]] = None
     kv_cache_dtype: Optional[str] = None
+    max_prefill_tokens: int = 0
     ranks: dict[str, dict[str, int | str]] = field(default_factory=dict)
 
     def __post_init__(self):
         self.attn_tp_size = int(self.attn_tp_size)
         self.attn_cp_size = int(self.attn_cp_size)
         self.dp_size = int(self.dp_size)
+        self.max_prefill_tokens = int(self.max_prefill_tokens)
 
 
 @dataclass

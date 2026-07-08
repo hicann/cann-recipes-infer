@@ -18,8 +18,7 @@ from __future__ import annotations
 import logging
 
 from executor.core.scheduler import Scheduler
-from executor.core.forward_data_info import StepOutput
-from executor.online.scheduler.queues import (
+from executor.online.scheduler.decode_queues import (
     DecodePreallocQueue,
     DecodeTransferQueue,
 )
@@ -64,14 +63,9 @@ class DecodeDisaggScheduler(Scheduler):
             transfer_queue=self.transfer_queue,
             running_requests=self.running_requests,
             num_reserved_decode_tokens=self.config.num_reserved_decode_tokens,
-            max_prefill_tokens=self.config.max_prefill_tokens,
             tp_cpu_group=tp_cpu_group,
         )
         self._pending_pd_request = None
-        # Retraction sink: ids freed by _schedule_decode_batch's pressure-relief
-        # path; merged into the next run_step's StepOutput so the dispatcher
-        # surfaces them to clients (instead of silently leaking).
-        self._retracted_ids: list[int] = []
 
     def set_pd_request_context(self, request_dict):
         self._pending_pd_request = dict(request_dict)
@@ -80,6 +74,13 @@ class DecodeDisaggScheduler(Scheduler):
         self, prompt, request_id=None, sampling_params=None, input_ids=None
     ):
         req_id = super().add_request(prompt, request_id, sampling_params, input_ids)
+        # super() enforced the prompt-length cap: a rejected request lands in
+        # finished_requests (not queued); an admitted one sits at the
+        # waiting_queue tail. A rejection allocated nothing, so just surface its
+        # id for dispatch — no receiver/KV/metadata to clean up.
+        if self.finished_requests.get(req_id) is not None:
+            self._pending_pd_request = None
+            return req_id
         req = self.waiting_queue.pop()
         request_dict = self._pending_pd_request or {}
         req.bootstrap_room = request_dict.get("bootstrap_room", req.bootstrap_room)
@@ -89,7 +90,6 @@ class DecodeDisaggScheduler(Scheduler):
             "disagg_prefill_dp_rank", req.disagg_prefill_dp_rank
         )
         self.prealloc_queue.add(req)
-        self.last_added_request = req
         self._pending_pd_request = None
         return req_id
 
@@ -109,8 +109,8 @@ class DecodeDisaggScheduler(Scheduler):
         requests in lockstep.  Cannot be gated on is_dp_leader — the all-reduce
         requires full-group participation.
 
-        Returns StepOutput for failed requests so the leader can dispatch them
-        (workers' StepOutput is silently dropped by _dispatch_results).
+        Finished/failed requests are recorded in finished_requests; dispatch
+        iterates that dict directly, so nothing is returned here.
         """
         self.prealloc_queue.pop_preallocated(next_n=engine.next_n)
         ready = self.transfer_queue.pop_transferred()
@@ -118,32 +118,22 @@ class DecodeDisaggScheduler(Scheduler):
         self.transfer_queue.terminal_failed.clear()
         for decode_req in ready:
             self.running_requests[decode_req.req.request_id] = decode_req.req
-        failed_ids = []
         for decode_req in failed:
             # clear() drops bootstrap/transfer_info state in KVTransferManager; must
             # run before _cleanup_terminal_request or those rooms leak.
             if decode_req.kv_receiver is not None:
                 decode_req.kv_receiver.clear()
+            # Recorded in finished_requests; dispatch iterates that dict.
             self.finished_requests[decode_req.req.request_id] = decode_req.req
             self._cleanup_terminal_request(decode_req.req)
-            failed_ids.append(decode_req.req.request_id)
-        return (
-            StepOutput(next_tokens={}, finished_requests=failed_ids)
-            if failed_ids else None
-        )
 
     def run_step(self, engine, phase=None):
         if phase is None:
-            return None
+            return False
         # Always call super().run_step to keep TP HCCL collectives aligned.
-        # Status logging happens inside super() via _log_step override.
-        output = super().run_step(engine, phase="decode")
-        if self._retracted_ids:
-            if output is None:
-                output = StepOutput(next_tokens={}, finished_requests=[])
-            output.finished_requests.extend(self._retracted_ids)
-            self._retracted_ids.clear()
-        return output
+        # Retractions are recorded in finished_requests and dispatched from that
+        # dict, so nothing extra is threaded through the return value here.
+        return super().run_step(engine, phase="decode")
 
     def _log_step(self, engine, batch, output) -> None:
         # See PD-Prefill _log_step: gate only on dummy batches; queue counts
@@ -161,7 +151,7 @@ class DecodeDisaggScheduler(Scheduler):
             f"[PD-Decode] step={self._step} batch={len(batch.requests)} "
             f"kv={kv_str} "
             f"running={n_running} prealloc={n_prealloc} pending={n_pending} "
-            f"transfer={n_transfer} retracted={len(self._retracted_ids)} "
+            f"transfer={n_transfer} "
             f"infer={infer_ms:.2f}ms"
         )
 
@@ -206,7 +196,6 @@ class DecodeDisaggScheduler(Scheduler):
         self.running_requests.pop(victim.request_id, None)
         self.finished_requests[victim.request_id] = victim
         self._cleanup_terminal_request(victim)
-        self._retracted_ids.append(victim.request_id)
         logger.warning(
             "[PD-Decode] retracted request %s (%s): output=%d prompt=%d running_left=%d",
             victim.request_id, victim.finish_reason,

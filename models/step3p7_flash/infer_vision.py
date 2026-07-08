@@ -145,12 +145,11 @@ def run_pretokenized(llm, input_ids, batch_per_dp):
         rid = llm.scheduler.add_request(prompt="<image+text>", input_ids=input_ids.clone())
         rids.append(rid)
     while llm.scheduler.has_work():
-        step = llm.scheduler.run_step(llm.engine)
-        if step is None:
+        if not llm.scheduler.run_step(llm.engine):
             break
     outs = []
     for rid in rids:
-        req = llm.scheduler.get_finished_request(rid)
+        req = llm.scheduler.pop_finished_request(rid)
         if req is None:
             outs.append(("", "error"))
             continue

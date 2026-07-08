@@ -43,6 +43,7 @@ class BootstrapState:
     attn_dp_size: int = field(init=False)
     block_sizes: list[int] = field(default_factory=list)
     kv_cache_dtype: str = field(init=False, default="bfloat16")
+    max_prefill_tokens: int = field(init=False, default=0)
     rank_table: Dict[Tuple[int, int, int], Dict[str, int | str]] = field(
         default_factory=dict
     )
@@ -98,6 +99,10 @@ def init_bootstrap(app: FastAPI, yaml_dict: dict) -> BootstrapState:
             except (TypeError, ValueError) as exc:
                 raise HTTPException(status_code=400, detail="Invalid block_sizes") from exc
         state.kv_cache_dtype = str(payload.get("kv_cache_dtype", state.kv_cache_dtype))
+        try:
+            state.max_prefill_tokens = int(payload.get("max_prefill_tokens", state.max_prefill_tokens))
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail="Invalid max_prefill_tokens") from exc
         async with state.lock:
             state.rank_table[(dp, cp, tp)] = {"rank_ip": ip, "rank_port": port}
             size = len(state.rank_table)
@@ -118,6 +123,7 @@ def init_bootstrap(app: FastAPI, yaml_dict: dict) -> BootstrapState:
                 "dp_size": state.attn_dp_size,
                 "block_sizes": list(state.block_sizes),
                 "kv_cache_dtype": state.kv_cache_dtype,
+                "max_prefill_tokens": state.max_prefill_tokens,
                 "ranks": {
                     f"{dp},{cp},{tp}": endpoint
                     for (dp, cp, tp), endpoint in state.rank_table.items()

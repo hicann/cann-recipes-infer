@@ -334,15 +334,3 @@ class Batch:
                 request.infer_time.append(infer_time)
 
         return next_tokens_by_request
-
-
-@dataclass
-class StepOutput:
-    """Output from a single scheduler step.
-
-    Attributes:
-        next_tokens: Dict mapping request_id to generated token IDs.
-        finished_requests: List of request IDs that completed.
-    """
-    next_tokens: Dict[int, List[int]] = field(default_factory=dict)
-    finished_requests: List[int] = field(default_factory=list)

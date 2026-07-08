@@ -32,7 +32,7 @@ from executor.utils import sample_logits
 from executor.core.kv_cache import KVCacheManager, ModelCacheInfo, create_single_type_managers
 from executor.core.kv_cache.cache_utils import allocate_cache_tensors, calculate_block_num, \
     prepare_block_tables, prepare_slot_mapping, validate_cache_info
-from ..forward_data_info import Batch, StepOutput
+from ..forward_data_info import Batch
 
 torch.npu.config.allow_internal_format = True
 logger = logging.getLogger(__name__)

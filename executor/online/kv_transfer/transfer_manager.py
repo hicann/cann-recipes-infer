@@ -79,6 +79,7 @@ class KVTransferManager:
         attn_dp_rank: int = 0,
         local_rank: int = 0,
         kv_cache_dtype: str | None = None,
+        max_prefill_tokens: int = 0,
         is_mla_backend: bool = False,
         metadata_pool: Optional[MetadataBufferPool] = None,
         bootstrap_timeout: float = 1800.0,
@@ -135,6 +136,9 @@ class KVTransferManager:
             os.environ.get("ENABLE_ALL_CP_RANKS_FOR_TRANSFER", "0") == "1"
         )
         self.kv_cache_dtype = kv_cache_dtype
+        # PREFILL publishes this via bootstrap/register_rank; DECODE enforces the
+        # decode-cap >= prefill-cap contract in validate_prefill_info (see there).
+        self.max_prefill_tokens = max_prefill_tokens
         self.kv_data_ptrs: list[int] = []
         self.kv_data_lens: list[int] = []
         self.kv_item_lens: list[int] = []
@@ -714,6 +718,21 @@ class KVTransferManager:
                 )
         if info.attn_cp_size < 1 or info.attn_tp_size < 1:
             raise ValueError("Invalid prefill parallel info")
+        # Admission-cap contract: decode's cap must be >= prefill's. Both roles
+        # reject over-long prompts independently at admission, and there is no
+        # decode->prefill notify on a decode-side reject — so if decode were the
+        # stricter side, a prompt prefill admits but decode rejects would leave
+        # prefill RDMA'ing KV to a room decode never created a receiver for
+        # (hang). Guarded on >0 so a rolling deploy where prefill predates this
+        # field (max_prefill_tokens=0) skips the check instead of false-alarming.
+        if info.max_prefill_tokens > 0 and self.max_prefill_tokens > 0:
+            if self.max_prefill_tokens < info.max_prefill_tokens:
+                raise ValueError(
+                    "Mismatched max_prefill_tokens: decode={} < prefill={}; "
+                    "decode's admission cap must be >= prefill's".format(
+                        self.max_prefill_tokens, info.max_prefill_tokens
+                    )
+                )
 
     def _resolve_rank_mapping(self, info: PrefillServerInfo) -> TargetRankMapping:
         # TP rank mapping. MLA's KV is replicated across prefill TP ranks, so
@@ -831,6 +850,7 @@ class KVTransferManager:
             "rank_port": self.rank_port,
             "block_sizes": list(self.kv_block_sizes),
             "kv_cache_dtype": self.kv_cache_dtype,
+            "max_prefill_tokens": self.max_prefill_tokens,
         }
         max_attempts = 10
         last_exc: Exception | None = None

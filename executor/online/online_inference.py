@@ -116,6 +116,7 @@ class OnlineInference(OfflineInference):
             attn_dp_size=self.dp_size, attn_dp_rank=self.dp_rank,
             local_rank=self.local_rank,
             kv_cache_dtype=self.infer_config.model_config.dtype,
+            max_prefill_tokens=self.infer_config.scheduler_config.max_prefill_tokens,
             is_mla_backend=self.engine.kvcache_manager.is_mla_backend,
             metadata_pool=metadata_pool,
         )
@@ -151,14 +152,14 @@ class OnlineInference(OfflineInference):
           ① receive: leader drains ZMQ + broadcasts to TP followers
           ② advance_queues_consensus: all-rank Gloo-backed queue advancement
              (PREFILL: bootstrap_queue; DECODE: prealloc + transfer_queue).
-             May surface failed requests as a StepOutput.
           ③ negotiate phase: DP-level all_gather → TP broadcast
           ④ run_step: forward when phase is set; inflight drain when None
-          ⑤ idle_wait: only when globally idle (no work anywhere)
+          ⑤ dispatch_results: send + retire everything finished this round
+          ⑥ idle_wait: only when globally idle (no work anywhere)
 
-        Workers' StepOutput is silently dropped by _dispatch_results (which
-        checks is_dp_leader + output_socket), so scheduler methods can return
-        StepOutput on every rank.
+        All finished requests are recorded in the scheduler's finished_requests
+        dict; dispatch iterates that dict directly (the DP leader sends, every
+        rank pops), so no per-step id list is threaded through.
         """
         ctx = zmq.Context()
         sockets = None
@@ -168,15 +169,16 @@ class OnlineInference(OfflineInference):
                 for request in self.get_receive_requests(sockets):
                     self._add_request_pd(request)
 
-                pre_output = self.scheduler.advance_queues_consensus(self.engine)
-                if pre_output:
-                    self._dispatch_results(pre_output, sockets.output_socket)
+                self.scheduler.advance_queues_consensus(self.engine)
 
                 phase = self._negotiate_phase()
 
-                step_output = self.scheduler.run_step(self.engine, phase=phase)
-                if step_output:
-                    self._dispatch_results(step_output, sockets.output_socket)
+                self.scheduler.run_step(self.engine, phase=phase)
+
+                # Single dispatch per iteration: drains everything the scheduler
+                # finished this round (admission rejects, bootstrap/transfer
+                # failures, retractions, completions) straight from its dict.
+                self._dispatch_results(sockets.output_socket)
 
                 if phase is None and not self.scheduler.has_work():
                     self._idle_wait(sockets)
@@ -368,14 +370,21 @@ class OnlineInference(OfflineInference):
         phase = self._decide_phase(states)
         return self._broadcast_group(phase)
 
-    def _dispatch_results(self, step_output, output_socket: Optional[zmq.Socket]):
-        """Dispatch finished results. Only DP leader does this."""
-        if not self.is_dp_leader or not output_socket:
-            return
+    def _dispatch_results(self, output_socket: Optional[zmq.Socket]):
+        """Emit finished requests to the client and retire them — every rank.
 
-        for req_id in step_output.finished_requests:
-            request = self.scheduler.get_finished_request(req_id)
-            if request:
+        The scheduler is the single source of truth: any request it marked
+        finished this iteration sits in finished_requests. We iterate that dict
+        directly (no id-list signalling), send each from the DP leader, and pop
+        on every rank so the dict can't grow unbounded.
+        """
+        is_leader = self.is_dp_leader and output_socket is not None
+
+        for req_id in list(self.scheduler.finished_requests.keys()):
+            request = self.scheduler.pop_finished_request(req_id)
+            if request is None:
+                continue
+            if is_leader:
                 result = {
                     "output": self.engine.tokenizer.decode(request.output_id_list),
                     "finish_reason": request.finish_reason,
@@ -393,4 +402,3 @@ class OnlineInference(OfflineInference):
                     f"DP Leader {self.dp_rank} completed request {req_id}: "
                     f"{len(request.output_id_list)} tokens"
                 )
-            self.scheduler.finished_requests.pop(req_id, None)

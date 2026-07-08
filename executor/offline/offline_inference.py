@@ -146,8 +146,7 @@ class OfflineInference:
 
         # Run scheduling loop until all requests complete
         while self.scheduler.has_work():
-            step_output = self.scheduler.run_step(self.engine)
-            if step_output is None:
+            if not self.scheduler.run_step(self.engine):
                 logger.warning("Scheduler has work but no batch was scheduled. Breaking loop to avoid infinite wait.")
                 break
 
@@ -167,7 +166,7 @@ class OfflineInference:
                 if request_id % parallel_config.cp_size == current_cp_rank
             ]
         for request_id in result_request_ids:
-            request = self.scheduler.get_finished_request(request_id)
+            request = self.scheduler.pop_finished_request(request_id)
             if request is None:
                 logger.warning(
                     "request %s: not found in finished_requests after scheduler "
@@ -219,8 +218,7 @@ class OfflineInference:
 
         infer_time = []
         while self.scheduler.has_work():
-            step_output = self.scheduler.run_step(self.engine)
-            if step_output is None:
+            if not self.scheduler.run_step(self.engine):
                 logger.warning("AFD FFN scheduler has work but no batch was scheduled.")
                 break
             request = self.scheduler.running_requests.get(request_ids[0])

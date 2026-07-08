@@ -50,7 +50,6 @@ class DecodePreallocQueue:
         transfer_queue,
         running_requests,
         num_reserved_decode_tokens: int,
-        max_prefill_tokens: int,
         tp_cpu_group=None,
     ):
         self.kv_transfer_manager = kv_transfer_manager
@@ -61,12 +60,6 @@ class DecodePreallocQueue:
         # admission decision to gauge pipeline depth.
         self.running_requests = running_requests
         self.num_reserved_decode_tokens = num_reserved_decode_tokens
-        # Per-request prompt length cap. D rejects oversized prompts at admission
-        # before any KV / metadata / bootstrap state is allocated; P also rejects
-        # at its own _schedule_prefill_batch (different YAML may carry different
-        # values) and notifies D via abort(), so both endpoints converge on
-        # KVPoll.Failed regardless of which side caught it first.
-        self.max_prefill_tokens = max_prefill_tokens
         # Gloo CPU group for receiver.poll consensus (MIN) across TP ranks.
         # None for single-rank setups; all-reduce becomes a no-op.
         self.tp_cpu_group = tp_cpu_group
@@ -222,24 +215,10 @@ class DecodePreallocQueue:
             if not decode_req.waiting_for_input:
                 remaining.append(decode_req)
                 continue
+            # Prompt-length is enforced once upstream at admission
+            # (core add_request -> reject_if_prompt_too_long), so anything
+            # reaching here is already within the cap.
             num_tokens = int(decode_req.req.input_ids.numel())
-            if num_tokens > self.max_prefill_tokens:
-                logger.warning(
-                    "Dropping room=%s from decode prealloc: prompt_tokens=%d "
-                    "exceeds max_prefill_tokens=%d",
-                    room, num_tokens, self.max_prefill_tokens,
-                )
-                decode_req.req.is_finished = True
-                decode_req.req.finish_reason = "prompt_too_long"
-                decode_req.req.prompt_tokens = num_tokens
-                # Surface via transfer_queue.terminal_failed so
-                # advance_queues_consensus picks it up (kv_receiver.clear() +
-                # _cleanup_terminal_request + StepOutput dispatch). When P's
-                # own max_prefill_tokens is smaller, P also catches the overflow
-                # in _schedule_prefill_batch and aborts the room — both sides
-                # converge on KVPoll.Failed regardless of who detects first.
-                self.transfer_queue.terminal_failed.append(decode_req)
-                continue
             if self.metadata_pool.available_size() <= 0:
                 logger.debug("preallocate skip room=%s: no metadata slot available", room)
                 remaining.append(decode_req)

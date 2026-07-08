@@ -20,7 +20,7 @@ from typing import List, Dict, Optional, Union
 from collections import deque
 import torch
 from executor.core.config import SchedulerConfig
-from ..forward_data_info import Request, Batch, StepOutput, MTPInfo, SamplingParams
+from ..forward_data_info import Request, Batch, MTPInfo, SamplingParams
 from ..engine import ExecutionEngine
 
 logger = logging.getLogger(__name__)
@@ -67,9 +67,6 @@ class Scheduler:
         self.running_requests: Dict[int, Request] = {}
         self.finished_requests: Dict[int, Request] = {}
         self.prefilled_request_count: int = 0
-        # Last request added — used by online PD schedulers to attach per-request
-        # PD fields (bootstrap_room/host/port, disagg_kv_sender) after add_request.
-        self.last_added_request: Optional[Request] = None
         self._step: int = 0
 
         # ID generators
@@ -136,15 +133,19 @@ class Scheduler:
         if input_ids is not None:
             request.input_ids = input_ids
             request.prompt_tokens = input_ids.numel()
+        # Rejected requests are recorded in finished_requests
+        # and NOT queued, so every downstream stage (e.g. _schedule_prefill_batch)
+        # can assume the queue holds only valid requests and never re-checks.
+        if self.reject_if_prompt_too_long(request):
+            return request_id
         self.waiting_queue.append(request)
-        self.last_added_request = request
         return request_id
 
     def run_step(
         self,
         engine: ExecutionEngine,
         phase: Optional[str] = None,
-    ) -> Optional[StepOutput]:
+    ) -> bool:
         """Execute one scheduling step.
 
         This is the main entry point for driving the generation process.
@@ -160,14 +161,14 @@ class Scheduler:
         Args:
             engine: ExecutionEngine instance for model inference.
 
-        Returns:
-            StepOutput containing batch results,
-            or None if no work to do.
+        Finished requests are recorded in ``finished_requests``; dispatch reads
+        that dict directly. Returns True if a real (non-dummy) batch ran, False
+        otherwise — offline uses this to break a has_work-but-no-batch stall.
         """
         # Assemble batch (normal mode)
         batch = self._schedule_batch(engine, phase)
         if batch is None or batch.is_empty():
-            return None
+            return False
 
         # Execute batch through engine (runs forward + TP collectives even on
         # dummy batches so other TP ranks in the DP group don't hang).
@@ -176,17 +177,14 @@ class Scheduler:
         # Dummy batch is only there to keep collectives aligned; it has a
         # fake request and no real state — skip state updates / output emit.
         if batch.is_dummy:
-            return None
+            return False
 
         # Process outputs and update request states
-        finished = self._process_batch_output(batch, engine)
+        self._process_batch_output(batch, engine)
 
         self._step += 1
         self._log_step(engine, batch, output)
-        return StepOutput(
-            next_tokens=output.get("next_tokens", {}),
-            finished_requests=finished,
-        )
+        return True
 
     def _schedule_batch(
         self,
@@ -253,25 +251,8 @@ class Scheduler:
         # instead of skipping ahead to shorter requests behind it.
         while self.waiting_queue:
             request = self.waiting_queue[0]
-            self._prepare_request_prompt(request)
-
-            # Check prompt length first so we don't allocate KV slots for a
-            # request we're about to drop (would leak the just-allocated blocks).
-            if request.prompt_tokens > max_prefill_tokens:
-                request = self.waiting_queue.popleft()
-                request.is_finished = True
-                request.finish_reason = "prompt_too_long"
-                self.finished_requests[request.request_id] = request
-                logger.warning(
-                    "Dropping request %s from prefill: prompt_tokens=%s exceeds max_prefill_tokens=%s",
-                    request.request_id,
-                    request.prompt_tokens,
-                    max_prefill_tokens,
-                )
-                # Hook so PD prefill can notify the decode peer (KVPoll.Failed)
-                # before the request silently disappears here.
-                self._on_request_finished(request)
-                continue
+            # Prompt length is enforced once at admission (add_request), so the
+            # queue holds only within-cap requests here — no re-check needed.
 
             next_total_prefill_tokens = total_prefill_tokens + request.prompt_tokens
             if selected and next_total_prefill_tokens > max_prefill_tokens:
@@ -330,6 +311,27 @@ class Scheduler:
 
         request.input_ids = self.tokenize_request(request.prompt, self.input_truncated_len)
         request.prompt_tokens = int(request.input_ids.numel())
+
+    def reject_if_prompt_too_long(self, request: Request) -> bool:
+        """Admission-time prompt-length guard — single source of truth.
+
+        If the prompt exceeds ``max_prefill_tokens``, mark the request finished
+        (``prompt_too_long``), record it in ``finished_requests`` and return
+        True. Dispatch later picks it up by iterating ``finished_requests``.
+        Returns False when within the cap. Centralizing the threshold and the
+        length source here keeps prefill and decode from drifting apart.
+        """
+        self._prepare_request_prompt(request)
+        if request.prompt_tokens <= self.config.max_prefill_tokens:
+            return False
+        request.is_finished = True
+        request.finish_reason = "prompt_too_long"
+        self.finished_requests[request.request_id] = request
+        logger.warning(
+            "Rejecting request %s at admission: prompt_tokens=%s exceeds max_prefill_tokens=%s",
+            request.request_id, request.prompt_tokens, self.config.max_prefill_tokens,
+        )
+        return True
 
     def _schedule_decode_batch(self, engine: ExecutionEngine) -> Optional[Batch]:
         """Schedule a batch of decode requests.
@@ -395,17 +397,16 @@ class Scheduler:
         self,
         batch: Batch,
         engine: ExecutionEngine,
-    ) -> List[int]:
+    ) -> None:
         """Process batch execution output and update request states.
+
+        Finished requests are recorded in ``finished_requests``; dispatch reads
+        that dict directly, so no id list is collected or returned here.
 
         Args:
             batch: The batch that was executed.
             engine: Execution engine that owns KV cache and parallel config.
-
-        Returns:
-            List of request IDs that finished in this step.
         """
-        finished = []
         parallel_config = engine.infer_config.parallel_config
         enable_offline_cp = self.mode == 'offline' and batch.is_prefill and parallel_config.cp_size > 1
         current_cp_rank = (
@@ -432,9 +433,7 @@ class Scheduler:
                     self.finished_requests[request.request_id] = request
                     if engine.kvcache_manager:
                         engine.kvcache_manager.free(request.request_id)
-                    finished.append(request.request_id)
                     self._on_request_finished(request)
-        return finished
 
     def _should_finish(self, request: Request) -> bool:
         """Determine if a request has completed generation.
@@ -520,8 +519,8 @@ class Scheduler:
         for idx, t in enumerate(output.get("inference_times_mtp", [])):
             logger.info(f"[MTP {idx}] Inference time ({stage}): {t * 1000:.2f} ms")
 
-    def get_finished_request(self, request_id: int) -> Optional[Request]:
-        """Get a finished request by ID.
+    def pop_finished_request(self, request_id: int) -> Optional[Request]:
+        """Remove and return a finished request by ID.
 
         Args:
             request_id: The request ID to look up.
@@ -529,15 +528,7 @@ class Scheduler:
         Returns:
             The finished Request, or None if not found.
         """
-        return self.finished_requests.get(request_id)
-
-    def get_all_finished_requests(self) -> List[Request]:
-        """Get all finished requests.
-
-        Returns:
-            List of finished requests.
-        """
-        return list(self.finished_requests.values())
+        return self.finished_requests.pop(request_id, None)
 
     def reset(self) -> None:
         """Reset scheduler state. Clears all requests."""

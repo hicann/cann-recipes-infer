@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# pylint: disable=protected-access  # tests inspect scheduler internals (_bootstrap_failures)
+# pylint: disable=protected-access  # tests inspect scheduler internals (bootstrap_queue, finished_requests)
 
 from collections import deque
 from types import SimpleNamespace
@@ -73,5 +73,7 @@ def test_failed_bootstrap_request_does_not_return_to_waiting_queue(tokenizer, co
     scheduler.bootstrap_queue = deque([req])
     scheduler.advance_queues_consensus(engine=Mock())
     assert len(scheduler.waiting_queue) == 0
+    # Bootstrap failure is recorded in finished_requests (dispatch reads that
+    # dict directly; the old _bootstrap_failures sink was removed).
     assert 7 in scheduler.finished_requests
-    assert scheduler._bootstrap_failures == [7]
+    assert req.finish_reason == "error"
