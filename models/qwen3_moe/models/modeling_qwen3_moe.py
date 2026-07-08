@@ -37,11 +37,6 @@ from module.linear import (
     VocabParallelEmbedding
     )
 from module.fuse_moe_gmm import FusedMoEGMM
-from module.quantization.mxfp4 import (
-    UpGateW4A4DownW4A8MxFp4MoEGMMMethod,
-    W4A4MxFp4MoEGMMMethod,
-    W4A8MxFp4MoEGMMMethod,
-)
 from executor.utils import calc_moe_hccl_buffer_size
 from executor.utils.forward_metadata import ForwardMetaData, get_forward_metadata
 from executor.core.config import InferenceConfig, CommManager
@@ -1437,20 +1432,9 @@ class Qwen3MoeForCausalLM(nn.Module):
         for module_name, module in self.named_modules():
             quant_method = getattr(module, "quant_method", None)
             if quant_method is not None:
-                if (isinstance(quant_method, W4A8MxFp4MoEGMMMethod)
-                        and not isinstance(quant_method, (
-                            W4A4MxFp4MoEGMMMethod,
-                            UpGateW4A4DownW4A8MxFp4MoEGMMMethod,
-                        ))):
-                    quant_method.process_weights_after_loading(
-                        module,
-                        is_nz=self.infer_config.model_config.enable_weight_nz,
-                        exe_mode=self.infer_config.model_config.exe_mode,
-                    )
-                else:
-                    quant_method.process_weights_after_loading(
-                        module, is_nz=self.infer_config.model_config.enable_weight_nz
-                    )
+                quant_method.process_weights_after_loading(
+                    module, is_nz=self.infer_config.model_config.enable_weight_nz
+                )
                 if "gate" in module_name:
                     # Avoid GE graph performance degradation: make gate tensor contiguous after transpose.
                     module.weight.data = module.weight.data.contiguous()
