@@ -123,9 +123,11 @@ class GlmRunner(ModelRunner):
                 ):
                     enable_weight_nz = True
 
+            is_nz = False if ("mlp.gate" in module_name and "proj" not in module_name) else enable_weight_nz
+            is_transpose = False if ("mlp.gate" in module_name and "proj" not in module_name) else True
             if isinstance(quant_method, QuantizeMethodBase):
-                quant_method.process_weights_after_loading(
-                    module, is_nz=enable_weight_nz, scales_dtype=scales_dtype)
+                quant_method.process_weights_after_loading(module, is_nz=is_nz, is_transpose=is_transpose,\
+                                                           scales_dtype=scales_dtype)
 
             if self.platform_version == "950" and self.model.config.quant_config.mm_quant_mode == "w8a8mxfloat8":
                 if any(

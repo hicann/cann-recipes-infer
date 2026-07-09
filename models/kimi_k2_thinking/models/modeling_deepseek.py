@@ -305,7 +305,7 @@ class DeepseekV3MoE(nn.Module):
         num_tokens, h = hidden_states.shape   # packed [T, H]
         # compute gating score
         hidden_states = hidden_states.view(-1, h)
-        logits = self.gate(hidden_states)
+        logits = F.linear(hidden_states, self.gate.weight)
 
         # use fused kernel, currently only support 256 or 384 experts
         if self.topk_method == "noaux_tc" and self.n_routed_experts in [256, 384]:
@@ -2163,9 +2163,11 @@ class DeepseekV3ForCausalLM(nn.Module):
                     scales_dtype['smooth_scale_dtype'] = torch.float
                     break
 
+            is_nz = False if ("mlp.gate" in module_name and "proj" not in module_name) else self.enable_weight_nz
+            is_transpose = False if ("mlp.gate" in module_name and "proj" not in module_name) else True
             if isinstance(quant_method, QuantizeMethodBase):
-                quant_method.process_weights_after_loading(
-                    module, is_nz=self.enable_weight_nz, scales_dtype=scales_dtype)
+                quant_method.process_weights_after_loading(module, is_nz=is_nz, is_transpose=is_transpose,\
+                                                           scales_dtype=scales_dtype)
             # Dynamic quant for input_activation of first grouped matmul requires complete smooth scale.
             # Only applies to W8A8 MoE GMM; for W4 (CompressedTensorW4A16Int4MoEGMMMethod) this isinstance
             # check is False, so the all_gather block is skipped (harmless).

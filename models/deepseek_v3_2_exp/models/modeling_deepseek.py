@@ -328,7 +328,7 @@ class DeepseekV3MoE(nn.Module):
         token_num, h = self._token_shape(hidden_states)
         # compute gating score
         hidden_states = hidden_states.view(-1, h)
-        logits = self.gate(hidden_states)
+        logits = F.linear(hidden_states, self.gate.weight)
 
         # use fused kernel, currently only support 256 or 384 experts
         if self.topk_method == "noaux_tc" and self.n_routed_experts in [256, 384]:
@@ -2478,10 +2478,12 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
                     scales_dtype["smooth_scale_dtype"] = torch.float
                     break
 
+            is_nz = False if ("mlp.gate" in module_name and "proj" not in module_name) else \
+                self.infer_config.model_config.enable_weight_nz
+            is_transpose = False if ("mlp.gate" in module_name and "proj" not in module_name) else True
             if isinstance(quant_method, QuantizeMethodBase):
-                quant_method.process_weights_after_loading(
-                    module, is_nz=self.infer_config.model_config.enable_weight_nz,
-                    scales_dtype=scales_dtype)
+                quant_method.process_weights_after_loading(module, is_nz=is_nz, is_transpose=is_transpose,\
+                                                           scales_dtype=scales_dtype)
 
             if isinstance(quant_method, CompressedTensorW8A8Int8MoEGMMMethod) or \
                     isinstance(quant_method, CompressedTensorW4A8Int8MoEGMMMethod):

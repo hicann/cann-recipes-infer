@@ -293,7 +293,7 @@ class GlmMoeDsaMoE(nn.Module):
         bsz, seq_len, h = hidden_states.shape
         # compute gating score
         hidden_states = hidden_states.view(-1, h)
-        logits = self.gate(hidden_states)
+        logits = F.linear(hidden_states, self.gate.weight)
 
         # use fused kernel
         if self.topk_method == "noaux_tc":
