@@ -2111,7 +2111,6 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
         custom_params = model_config.custom_params
         parallel_config = self.infer_config.parallel_config
         scheduler_config = self.infer_config.scheduler_config
-        data_config = self.infer_config.data_config
 
 
         exe_mode = model_config.exe_mode
@@ -2123,13 +2122,14 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
         enable_pypto = custom_params.get("enable_pypto", False)
         next_n = model_config.next_n
         with_ckpt = model_config.with_ckpt
-        perfect_eplb = custom_params.get("perfect_eplb", model_config.force_eplb)
 
-        if not with_ckpt and not perfect_eplb:
-            raise ValueError(f"{perfect_eplb=} must be True if {with_ckpt =}!")
+        if not with_ckpt and not model_config.force_eplb:
+            raise ValueError(f"{model_config.force_eplb=} must be True if {with_ckpt =}!")
 
-        if exe_mode not in ["ge_graph", "eager", "npugraph_ex"]:
+        if exe_mode not in ["eager", "npugraph_ex"]:
             raise ValueError(f"{exe_mode=} does not supported!")
+        if parallel_config.attn_tp_size > 1:
+            raise ValueError(f"{parallel_config.attn_tp_size=} is not supported yet!")
 
         dynamo_feat = enable_cache_compile or enable_superkernel
         if exe_mode == "eager" and dynamo_feat:

@@ -132,10 +132,10 @@ for func in [hc_post_compiled, hc_post, hc_post_compiled_dynamic]:
 
 ```shell
 git clone https://gitcode.com/cann/cann-recipes-infer.git
-cd cann-recipes-infer/models/deepseek-v4-tilelang-and-inductorAF
+cd cann-recipes-infer-gptoss/models/deepseek_v4_flash_tilelang_and_inductor_af
 ```
 
-后续示例命令均在 `cann-recipes-infer/models/deepseek-v4-tilelang-and-inductorAF/` 目录下执行。
+后续示例命令均在 `cann-recipes-infer-gptoss/models/deepseek_v4_flash_tilelang_and_inductor_af/` 目录下执行。
 
 ## DeepSeek 模型下载与权重切分
 
@@ -152,13 +152,13 @@ cd cann-recipes-infer/models/deepseek-v4-tilelang-and-inductorAF
 
 ### 权重转换为bf16格式
 
-使用 [convert_model.py](../deepseek-v4/utils/convert_model.py) 执行如下命令将权重转换为 bf16 格式：
+使用 [convert_model.py](../deepseek_v4/utils/convert_model.py) 执行如下命令将权重转换为 bf16 格式：
 
 > 入参介绍：`input_fp8_hf_path`：原始fp8权重路径；`output_hf_path`：转换后输出的权重路径；`quant_type`：量化模式
 > 示例输出路径为 `/data/models/deepseek_v4_bf16`，您可以根据需要修改为其他路径。
 
 ```bash
-python3 ../deepseek-v4/utils/convert_model.py \
+python3 ../deepseek_v4/utils/convert_model.py \
     --input_fp8_hf_path /data/models/deepseek_v4 \
     --output_hf_path /data/models/deepseek_v4_bf16 \
     --quant_type bfloat16

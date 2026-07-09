@@ -110,13 +110,13 @@ python3 test_hc_pre_pypto.py
 算子已支持集成到DeepSeek-V4整网，样例执行过程如下：
 
 ### 权重和数据集准备
-DeepSeek-V4模型和数据集准备，请参考[模型权重和数据集准备](../../models/deepseek-v4/README.md)中相关章节
+DeepSeek-V4模型和数据集准备，请参考[模型权重和数据集准备](../../models/deepseek_v4/README.md)中相关章节
 
 ### 代码修改适配
-网络执行前需对配置做一些调整，参考[修改代码](../../models/deepseek-v4/README.md)章节进行适配
+网络执行前需对配置做一些调整，参考[修改代码](../../models/deepseek_v4/README.md)章节进行适配
 
 ### 修改网络配置和环境配置
-当前网络脚本中，在各个节点上修改models/deepseek-v4/config/ 路径下需要执行的yaml文件中model_config配置项，配置过程如下：
+当前网络脚本中，在各个节点上修改models/deepseek_v4/config/ 路径下需要执行的yaml文件中model_config配置项，配置过程如下：
 - 增加 enable_pypto: True配置将pypto算子集成到网络中
 - 修改 enable_limit_core: False配置将limit_core配置关闭
 ```
@@ -126,6 +126,6 @@ model_config:
 ```
 
 ### 推理执行
-参考[拉起多卡推理](../../models/deepseek-v4/README.md)章节。
+参考[拉起多卡推理](../../models/deepseek_v4/README.md)章节。
 
 执行结束后，出现`model run success`，则表示推理执行成功。

@@ -83,7 +83,7 @@ mHC是对于传统残差连接的扩展，它将`hidden_state`从一路扩展到
     $$
     \mathrm{batch\_size}\times (\mathrm{compress\_ratio - 1}) \times \mathrm{compress\_dim} \times \mathrm{storage\_bytes} \times \mathrm{num\_compress\_layers}
   $$
-- 在压缩倍率为4的层中（CSA），采用了LI进一步稀疏KV Cache，因此与DeepSeek-3.2类似，LI需要保留对应的Indexer Cache。为了与KV Cache的压缩对应，在LI中也通过Compressor模块进行了4倍压缩，因此Indexer Cache的存储数据量也为压缩后的长度，如当前的`kv_length`不满足压缩长度，则会暂存在`indexer_kv_state`和`indexer_score_state`中。
+- 在压缩倍率为4的层中（CSA），采用了LI进一步稀疏KV Cache，因此与DeepSeek-V3.2类似，LI需要保留对应的Indexer Cache。为了与KV Cache的压缩对应，在LI中也通过Compressor模块进行了4倍压缩，因此Indexer Cache的存储数据量也为压缩后的长度，如当前的`kv_length`不满足压缩长度，则会暂存在`indexer_kv_state`和`indexer_score_state`中。
 
 综合来看，得益于滑窗和高倍率压缩，不保留Full Cache可以使得KV Cache整体存储的数据量明显降低，如128k序列，在128倍压缩（HCA）后，仅需保留1k KV；在4倍压缩（CSA）后，保留32k KV，对于长序列下的内存压力得以显著缓解。
 
@@ -124,7 +124,7 @@ Attention部分的融合算子包括Compressor、LI、KvCompressEpilog、Indexer
 
 DeepSeek-V4主要面向长序列推理场景，Prefill阶段的内存占用和TTFT会面临巨大挑战，因此优化内存占用和TTFT是并行策略设计的主要目的。如果采用Attention DP (Data Parallel) 策略，每个Rank都需要推理超长序列，总体计算量较大，TTFT较高，用户体验较差。因此，针对长序列场景，在Attention部分设计选用Context Parallel（CP）并行，通过多Rank分摊计算和访存开销，提升整体性能。
 
-由于LI采用`causal_mask`，越往后的Context Chunk访存和计算量越大，在CP切分时，可以沿用之前Recipes在DeepSeek-3.2使用的`zig_zag`切分方式，将首尾的序列块放在同一Rank上，使得CP后各卡间的计算量相对均衡。
+由于LI采用`causal_mask`，越往后的Context Chunk访存和计算量越大，在CP切分时，可以沿用之前Recipes在DeepSeek-V3.2使用的`zig_zag`切分方式，将首尾的序列块放在同一Rank上，使得CP后各卡间的计算量相对均衡。
 
 <p align="center">
   <img src="./figures/prefill_cp_zigzag.jpg" width="30%" alt="cp_zigzag">
@@ -159,7 +159,7 @@ DeepSeek-V4主要面向长序列推理场景，Prefill阶段的内存占用和TT
 
 
 ### Decode并行策略
-在Decode阶段，并行策略参考DeepSeek-R1和DeepSeek-3.2的并行方案：
+在Decode阶段，并行策略参考DeepSeek-R1和DeepSeek-V3.2的并行方案：
 - Attention采用Data Parallel (DP) 并行；
 - MoE采用Expert Parallel (EP) 并行；
 - LM_head采用Tensor Parallel (TP) 并行；

@@ -186,7 +186,7 @@ bash infer.sh
 │   └── models                                  # 原生深度优化模型文档
 │       ├── deepseek_r1                         
 │       ├── deepseek_v3_2_exp                   
-│       ├── deepseek-v4                         
+│       ├── deepseek_v4                         
 │       └── ...                                 
 ├── accelerator                                 # 加速算法样例
 ├── dataset                                     # 数据集和默认 prompt
@@ -220,7 +220,7 @@ bash infer.sh
 │       └── pd-hybrid-dp-ep                     
 ├── models                                      # 模型脚本目录
 │   ├── deepseek_v4                             # DeepSeek-V4 的模型脚本及执行配置
-│   ├── deepseek-v4-flash-tilelang-and-inductorAF  # DeepSeek-V4 Flash TileLang/Inductor 算子样例
+│   ├── deepseek_v4_flash_tilelang_and_inductor_af  # DeepSeek-V4 Flash TileLang/Inductor 算子样例
 │   ├── deepseek_r1                             # DeepSeek-R1 的模型脚本及执行配置
 │   ├── deepseek_v3_2_exp                       # DeepSeek-V3.2-Exp 的模型脚本及执行配置
 │   ├── gemma_4                                 # Gemma4 模型脚本及执行配置

@@ -2,7 +2,7 @@
 ## 概述
 DeepSeek团队发布了最新的模型DeepSeek-V4，本实践基于DeepSeek开源代码进行迁移，并在CANN平台上完成性能优化，支持在昇腾`Atlas A3 Pod`平台和`950PR/DT`平台部署。
 
-- 本实践的优化特性和性能Benchmark可参见[NPU DeepSeek-V4推理优化实践](../../docs/models/deepseek-v4/deepseek_v4_inference_guide.md)。
+- 本实践的优化特性和性能Benchmark可参见[NPU DeepSeek-V4推理优化实践](../../docs/models/deepseek_v4/deepseek_v4_inference_guide.md)。
 
 ---
 
@@ -25,7 +25,7 @@ CANNLab一站式开发平台已预置部署运行环境，使用CANNLab一站式
 - **模型支持**：CANNLab一站式开发平台环境为 Atlas A3 8卡环境，仅支持部署 DeepSeek-V4 Flash。
 - **环境部署**：平台已搭建好运行环境，无需获取 docker 镜像，也无需拉起 docker 容器。
 - **CANN 路径**：CANN 安装路径为 `/home/developer/Ascend/cann`，涉及 `cann_path` 的脚本（如权重转换前的 `source` 命令）均需使用此路径。
-- **YAML 配置**：CANNLab一站式开发平台请使用 `ci_a3/deepseek_v4_platform.yaml` 作为配置文件。由于CANNLab一站式开发平台和 A3 Pod 硬件核数差异，本实践不支持多流控核，yaml 配置中 `enable_limit_core` 需设置为 `False`。
+- **YAML 配置**：CANNLab一站式开发平台请使用 `ci_a3/deepseek_v4_flash_rank_16_16ep_w8a8_platform.yaml` 作为配置文件。由于CANNLab一站式开发平台和 A3 Pod 硬件核数差异，本实践不支持多流控核，yaml 配置中 `enable_limit_core` 需设置为 `False`。
 
 
 > 以下快速启动章节中各步骤的标准操作适用于非CANNLab一站式开发平台环境，CANNLab一站式开发平台用户请根据上述差异调整对应步骤。
@@ -145,9 +145,11 @@ CANNLab一站式开发平台已预置部署运行环境，使用CANNLab一站式
   ```
 
 ### 修改配置
-- 在各个节点上修改`cann-recipes-infer/models/deepseek_v4/set_env.sh`中的如下字段:
-   - `IPs`：配置所有节点的IP，按照rank id排序，多个节点的ip通过空格分开，例如：`('xxx.xxx.xxx.xxx' 'xxx.xxx.xxx.xxx')`。
+- 在各个节点上修改公共环境脚本 `cann-recipes-infer/executor/scripts/set_env.sh` 中的如下字段:
+   - `IPs`：离线模式配置所有节点的IP，按照rank id排序，多个节点的ip通过空格分开，例如：`('xxx.xxx.xxx.xxx' 'xxx.xxx.xxx.xxx')`。
+   - `PREFILL_IPS` / `DECODE_IPS`：在线 PD 模式分别配置 prefill 和 decode 节点 IP。
    - `cann_path`: CANN软件包安装路径，例如`/usr/local/Ascend/cann`。
+- `executor/scripts/infer.sh` 会先加载公共环境脚本 `executor/scripts/set_env.sh`；然后再继续加载模型私有环境脚本 `models/deepseek_v4/set_env.sh`。
 - 在Atlas A3 Pod各个节点上修改 `config/ci_a3` 路径下需要执行的yaml文件中的 `model_config.model_path` 真实路径；在950PR/DT各个节点上修改 `config/ci_950` 路径下需要执行的yaml文件中的 `model_config.model_path` 路径。通用 YAML 配置说明可参见[YAML参数描述](../../docs/common/inference_config_guide.md)。
 
 - 在 yaml 配置中，默认采用 `npugraph_ex` 执行方式。这一后端是 NPU 平台全新推出的高性能图计算组件，其基于 CANN 的 AclGraph（对标 CUDAGraph）底层能力，深度融合了一系列 NPU 架构的亲和调度和图优化技术。从落地层面来看，`npugraph_ex` 具备以下显著优势：可快速接入 PyTorch 生态、能无缝集成到 SGLang、vLLM 等主流推理框架中，同时保障极致的运行性能。
@@ -161,7 +163,7 @@ CANNLab一站式开发平台已预置部署运行环境，使用CANNLab一站式
   | `enable_pypto` | bool | `false` | 启用 PyPTO 算子路径；当前与 `enable_limit_core` 互斥。 |
   | `moe_chunk_max_len` | int | `65536` | MoE token 分发的最大 chunk 长度，用于长序列 prefill 场景规避 OOM。 |
 
-  > CANNLab一站式开发平台 A3 场景请使用 `ci_a3/deepseek_v4_platform.yaml`，详见[CANNLab一站式开发平台指南](#cannlab一站式开发平台指南)。
+  > CANNLab一站式开发平台 A3 场景请使用 `ci_a3/deepseek_v4_flash_rank_16_16ep_w8a8_platform.yaml`，详见[CANNLab一站式开发平台指南](#cannlab一站式开发平台指南)。
 
   > **Note**: 在A3环境下，INT8 W8A8场景支持 4~64卡部署。可分别在config下的yaml文件中修改 `parallel_config.world_size`（chips * 2）配置。
 
@@ -172,7 +174,7 @@ CANNLab一站式开发平台已预置部署运行环境，使用CANNLab一站式
 | --- | --- | --- |
 | `--model` | 模型目录名，对应 `models/` 下的子目录 | `deepseek_v4` |
 | `--mode` | 推理模式 | `offline` / `online` |
-| `--yaml` | 离线模式：yaml 文件名，路径相对 `models/deepseek_v4/config/` | `ci_a3/deepseek_v4_flash.yaml` |
+| `--yaml` | 离线模式：yaml 文件名，路径相对 `models/deepseek_v4/config/` | `ci_a3/deepseek_v4_flash_rank_128_128ep_w8a8.yaml` |
 | `--pd-role` | 在线 PD 模式部署角色 | `prefill` / `decode` |
 | `--p-yaml-name` | 可选，在线模式 prefill yaml 文件名 | `ci_a3/deepseek_v4_pd/prefill.yaml` |
 | `--d-yaml-name` | 可选，在线模式 decode yaml 文件名 | `ci_a3/deepseek_v4_pd/decode.yaml` |
@@ -182,13 +184,13 @@ CANNLab一站式开发平台已预置部署运行环境，使用CANNLab一站式
 **使用方式一：命令行传参**
 ```shell
 # offline 模式，A3 Flash
-bash executor/scripts/infer.sh --model deepseek_v4 --yaml ci_a3/deepseek_v4_flash.yaml
+bash executor/scripts/infer.sh --model deepseek_v4 --yaml ci_a3/deepseek_v4_flash_rank_128_128ep_w8a8.yaml
 
 # offline 模式，CANNLab A3
-bash executor/scripts/infer.sh --model deepseek_v4 --yaml ci_a3/deepseek_v4_platform.yaml
+bash executor/scripts/infer.sh --model deepseek_v4 --yaml ci_a3/deepseek_v4_flash_rank_16_16ep_w8a8_platform.yaml
 
 # offline 模式，950PR/DT
-bash executor/scripts/infer.sh --model deepseek_v4 --yaml ci_950/deepseek_v4.yaml
+bash executor/scripts/infer.sh --model deepseek_v4 --yaml ci_950/deepseek_v4_pro_rank_16_16ep.yaml
 
 # online PD 模式，暂时只支持A3机型
 bash executor/scripts/infer.sh --model deepseek_v4 --mode online --pd-role prefill --p-yaml-name ci_a3/deepseek_v4_pd/prefill.yaml --d-yaml-name ci_a3/deepseek_v4_pd/decode.yaml
@@ -202,7 +204,7 @@ bash executor/scripts/infer.sh --model deepseek_v4 --mode online --pd-role decod
 ```shell
 MODEL=deepseek_v4
 MODE=offline
-YAML_FILE=ci_a3/deepseek_v4_flash.yaml
+YAML_FILE=ci_a3/deepseek_v4_flash_rank_128_128ep_w8a8.yaml
 ```
 保存后直接执行：
 ```shell
