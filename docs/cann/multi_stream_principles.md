@@ -48,7 +48,7 @@ NPU 上 Device 侧拥有多类可以独立调度的物理执行资源，而多 S
 1. 配置 [HCCL_OP_EXPANSION_MODE](https://www.hiascend.com/document/detail/zh/canncommercial/900/maintenref/envvar/envref_07_0096.html) 为 "AIV"，此时占用部分 AIV 计算资源；
 2. [通算融合算子](https://hiascend.com/document/detail/zh/CANNCommunityEdition/910beta1/programug/Ascendcopdevg/docs/guide/算子实践参考/SIMD算子实现/融合算子编程/通算融合/基础知识.md)同时利用了计算单元和通信单元，算子内润存在计算与通信的分片并行，适合数据量较大时；
 
-> 此外 [npu_prefetch](https://www.hiascend.com/document/detail/zh/Pytorch/2600/apiref/torchnpuCustomsapi/docs/zh/custom_APIs/torch_npu/torch_npu-npu_prefetch.md) 也是利用硬件资源（数据搬运）进行并行加速，框架会自动分配一条 Stream 进行任务并行，该特性不在本文档介绍。
+> 此外 [npu_prefetch](https://www.hiascend.com/document/detail/zh/Pytorch/2600/apiref/torchnpuCustomsapi/docs/zh/custom_APIs/torch_npu/torch_npu-npu_prefetch.md) 也是利用硬件资源（数据搬运）进行并行加速，框架会自动分配一条 Stream 进行任务并行，该特性细节可参考[ prefetch 文档](./prefetch_principles.md)。
 
 #### 2.1.2 Stream
 
