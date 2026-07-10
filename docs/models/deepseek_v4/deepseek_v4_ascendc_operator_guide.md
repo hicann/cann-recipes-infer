@@ -261,7 +261,7 @@ $$
 ### Tiling 设计
 
 **Atlas-A3**
-本次 Atlas-A3 上 `LightningIndexer`的 Tiling 沿用之前的设计，可参考：[Atlas-A3 LightningIndexer](https://gitcode.com/cann/cann-recipes-infer/blob/master/docs/models/deepseek-v3.2-exp/deepseek_v3.2_exp_ascendc_operator_guide.md#lightningindexer)。
+本次 Atlas-A3 上 `LightningIndexer`的 Tiling 沿用之前的设计，可参考：[Atlas-A3 LightningIndexer](https://gitcode.com/cann/cann-recipes-infer/blob/master/docs/models/deepseek_v3_2_exp/deepseek_v3.2_exp_ascendc_operator_guide.md#lightningindexer)。
 
 ### Top-k 950PR/DT 方案
 `LightningIndexer`融合算子的核心是在长达数十万 (序列长度记为$S_{k}$) 的序列中，为每个 token 高效地筛选出分数最高的 $k$ (例如 512) 个索引。同时，对于算子而言，Top-$k$ 的计算必须是准确无误的，不能采用近似算法求解。
@@ -325,7 +325,7 @@ $$
 
 累计以上所有开销, 在 950PR/DT 上采用多级直方图和向量化筛选的方式，理论开销估计为 $(S_k/256*111+192)$ cycle, 在 $S_k=16384$时，理论开销计算为 7296 cycle。
 
-相比之下，对于相同的 $S_k$ 和 $k$， Atlas-A3 上基于 sort32 和 mrgsort 的实现方式 ([Atlas-A3 LI Top-k 指令实现](https://gitcode.com/cann/cann-recipes-infer/blob/master/docs/models/deepseek-v3.2-exp/deepseek_v3.2_exp_ascendc_operator_guide.md#top-k-%E6%8C%87%E4%BB%A4%E5%AE%9E%E7%8E%B0)) 需要 $
+相比之下，对于相同的 $S_k$ 和 $k$， Atlas-A3 上基于 sort32 和 mrgsort 的实现方式 ([Atlas-A3 LI Top-k 指令实现](https://gitcode.com/cann/cann-recipes-infer/blob/master/docs/models/deepseek_v3_2_exp/deepseek_v3.2_exp_ascendc_operator_guide.md#top-k-%E6%8C%87%E4%BB%A4%E5%AE%9E%E7%8E%B0)) 需要 $
 (1.36S_k+3.32k+\lceil\frac{max(log_2(k)-5,0)}{2}S_k \rceil)/2
 $ cycle 的理论开销。在 $S_k=16384, k=512$ 时，开销约 28375 cycle。
 

@@ -10,22 +10,22 @@ DeepSeek团队发布了最新的模型DeepSeek-V3.2-Exp，可利用稀疏架构 
 
 ## Highlights
 - 整体部署策略沿用DeepSeek的大EP并行方案，针对稀疏DSA结构，叠加实现长序列亲和的CP并行策略，兼顾时延和吞吐。[模型推理代码](../../../models/deepseek_v3_2_exp/README.md)已开源，同时也适配了主流开源推理框架vLLM和SGLang
-- 基于AscendC实现NPU LI和SFA融合Kernel，发挥稀疏计算潜力，AscendC Kernel技术文档和代码已开源在[CANN/ops-transformer仓](CANN/ops-transformer仓)对应算子目录，包含[Lightning Indexer](https://gitcode.com/cann/ops-transformer/tree/master/attention/lightning_indexer)和[Sparse Flash Attention](https://gitcode.com/cann/ops-transformer/tree/master/attention/sparse_flash_attention)等
+- 基于AscendC实现NPU LI和SFA融合Kernel，发挥稀疏计算潜力，AscendC Kernel技术文档和代码已开源在[CANN/ops-transformer仓](https://gitcode.com/cann/ops-transformer)对应算子目录，包含[Lightning Indexer](https://gitcode.com/cann/ops-transformer/tree/master/attention/lightning_indexer)和[Sparse Flash Attention](https://gitcode.com/cann/ops-transformer/tree/master/attention/sparse_flash_attention)等
 - 基于自研PyPTO框架实现NPU DSA，提高融合算子编程易用性。不仅实现了LI融合Kernel，同时实现了更大范围的Decode Attention融合，PyPTO Kernel[技术文档](./deepseek_v3.2_exp_pypto_operator_guide.md)和[代码](../../../ops/pypto/README.md)已开源
 - 开源社区TileLang同步支持DSA结构中的LI和SFA算子，TileLang Kernel[技术文档](./deepseek_v3.2_exp_tilelang_operator_guide.md)和[代码](../../../ops/tilelang/README.md)已开源
 - 基于上述优化点，CANN已0day支持DeepSeek-V3.2-Exp BF16推理部署，1day支持Int8量化。Prefill和Decode的参考性能：采用BF16精度无损方式，64卡128K长序列TTFT小于2s（无缓存命中），TPOT小于30ms；W8A8C8量化场景64卡128K长序列TPOT小于20ms
 
 ## Outline
 
-- [DeepSeek-V3.2-Exp vs V3.1](##DeepSeek-V3.2-Exp-vs-V3.1)
-- [并行策略](##并行策略)
-- [MTP](##MTP)
-- [融合Kernel](##融合Kernel)
+- [DeepSeek-V3.2-Exp vs V3.1](#deepseek-v32-exp-vs-v31)
+- [并行策略](#并行策略)
+- [MTP](#mtp)
+- [融合Kernel](#融合kernel)
 - [量化策略](#量化策略)
-- [多流并行优化](##多流并行优化)
-- [KVCache Offload](##KVCache-Offload)
-- [Benchmark](##Benchmark)
-- [Future Plan](##Future-Plan)
+- [多流并行优化](#多流并行优化)
+- [KVCache Offload](#kvcache-offload)
+- [Benchmark](#benchmark)
+- [Future Plan](#future-plan)
 
 ## DeepSeek-V3.2-Exp vs V3.1
 

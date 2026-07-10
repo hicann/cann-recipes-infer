@@ -12,10 +12,10 @@
 
 ## Outline
 
-- [并行策略](##并行策略)
-- [融合Kernel](##融合Kernel)
-- [MTP](##MTP)
-- [Future Plan](##Future-Plan)
+- [并行策略](#并行策略)
+- [融合Kernel](#融合kernel)
+- [MTP](#mtp)
+- [Future Plan](#future-plan)
 
 
 ## 并行策略

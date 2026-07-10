@@ -161,10 +161,10 @@ python3 test_lightning_indexer_prolog.py
 lightning_indexer_pto算子已支持集成到DeepSeek-V3.2-Exp整网，样例执行过程如下：
 
 ### 权重和数据集准备
-DeepSeek-V3.2-Exp模型和数据集准备，请参考[模型权重和数据集准备](../../models/deepseek-v3.2-exp/README.md)中相关章节
+DeepSeek-V3.2-Exp模型和数据集准备，请参考[模型权重和数据集准备](../../models/deepseek_v3_2_exp/README.md)中相关章节
 
 ### 代码修改适配
-网络执行前需对配置做一些调整，参考[修改代码](../../models/deepseek-v3.2-exp/README.md)章节进行适配
+网络执行前需对配置做一些调整，参考[修改代码](../../models/deepseek_v3_2_exp/README.md)章节进行适配
 
 ### 修改网络配置和环境配置
 当前网络脚本中，在各个节点上修改models/deepseek-v3.2-exp/config/ 路径下需要执行的yaml文件中model_config配置项，配置过程如下：
@@ -175,7 +175,6 @@ model_config:
 ```
 
 ### 推理执行
-参考[拉起多卡推理](../../models/deepseek-v3.2-exp/README.md)章节。
+参考[拉起多卡推理](../../models/deepseek_v3_2_exp/README.md)章节。
 
 执行结束后，出现`model run success`，则表示推理执行成功。
-

@@ -45,7 +45,7 @@ LongCat-2.0的MoE部分模块参数详见下表，总共包括768个路由专家
 
 ### Attention 稀疏与滑窗
 
-- LongCat-2.0模型使能了[DSA稀疏结构](./../deepseek-v3.2-exp/deepseek_v3.2_exp_inference_guide.md)，在Attention计算之前，使用Lightning Indexer为每个`token`选择 `topk=2048`组KV，极大节约了Attention计算耗时。在SC MOE结构下，每层的两个Sparse Flash Attention (SFA)共用一组`topk_indices`。参照[DSA计算量分析](./../deepseek-v3.2-exp/deepseek_v3.2_exp_inference_guide.md#deepseek-v32-exp-vs-v31)分析，本次开源的实践样例的Prefill和Decode都使用了`absorb`模式，亲和DSA的性能。
+- LongCat-2.0模型使能了[DSA稀疏结构](./../deepseek_v3_2_exp/deepseek_v3.2_exp_inference_guide.md)，在Attention计算之前，使用Lightning Indexer为每个`token`选择 `topk=2048`组KV，极大节约了Attention计算耗时。在SC MOE结构下，每层的两个Sparse Flash Attention (SFA)共用一组`topk_indices`。参照[DSA计算量分析](./../deepseek_v3_2_exp/deepseek_v3.2_exp_inference_guide.md#deepseek-v32-exp-vs-v31)分析，本次开源的实践样例的Prefill和Decode都使用了`absorb`模式，亲和DSA的性能。
 - 在DSA基础上，LongCat-2.0模型额外叠加了Sink Sliding Window(3S)设计，在预留的 `topk=2048`组KV里，固定选择每段请求的`init 16`（序列维度最前面的16组KV，对应`sink`）和`local 1024`（序列维度最后面的1024组KV，对应`sliding_window`），再从中段选择`top 1008`组KV，进一步提升模型能力。3S LI对KV Pair的筛选方式如下图示例。
 
 <p align="center">

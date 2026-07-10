@@ -242,7 +242,7 @@ torch_npu.scatter_update_(v_cache, kv_len, value_states, -2)
 
 ### 仓内资料
 
-- [Offline Inference 执行机制设计文档](../design/offline_inference_design.md)
+- [Offline Inference 执行机制设计文档](../design/executor_design.md#4-离线推理流程)
 - [InferenceConfig 类使用指南](../common/inference_config_guide.md)
 - [MTP 模型接入指南](../common/mtp_model_guide.md)
 

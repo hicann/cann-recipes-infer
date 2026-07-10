@@ -164,7 +164,7 @@ with torchair.scope.super_kernel("super_kernel_0"):
 以 Longcat Flash 模型优化为例，由于不同流上采用了不同的分核策略，按照分核与分流的范围在整网中共标定了三个 SuperKernel ，如下图所示。
 
 <div align="center">
-<img src="../models/longcat-flash/figures/superkernel.png" width="800" />
+<img src="../models/longcat_flash/figures/superkernel.png" width="800" />
 </div>
 
 ## 5. 约束

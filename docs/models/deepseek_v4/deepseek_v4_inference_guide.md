@@ -28,7 +28,7 @@ DeepSeek团队发布了最新的模型DeepSeek-V4系列模型，包含DeepSeek-V
 ## Outline
 
 - [模型结构](#模型结构)
-- [融合Kernel](#融合Kernel)
+- [融合Kernel](#融合kernel)
 - [并行策略](#并行策略)
 - [MTP](#mtp)
 - [量化策略](#量化策略)
