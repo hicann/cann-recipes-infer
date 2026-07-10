@@ -8,7 +8,6 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 
 import math
-import subprocess
 import unittest
 
 import numpy as np
@@ -28,16 +27,15 @@ torch_npu.npu.set_device(int(DEVICE_ID))
 
 def get_npu_chip_name():
     try:
-        result = subprocess.run(['npu-smi', 'info'], capture_output=True, text=True, timeout=5)
-        for line in result.stdout.split('\n'):
-            if 'Ascend950' in line or 'Ascend95' in line:
-                return 'Ascend950'
-            if 'Ascend910_93' in line:
-                return 'Ascend910_93'
-            if '910B' in line:
-                return 'Ascend910B'
-            if 'Ascend310' in line:
-                return 'Ascend310'
+        name = torch_npu.npu.get_device_properties(DEVICE_ID).name
+        if name.startswith('Ascend95'):
+            return 'Ascend950'
+        if name.startswith('Ascend910_93'):
+            return 'Ascend910_93'
+        if name.startswith('Ascend910B'):
+            return 'Ascend910B'
+        if name.startswith('Ascend310'):
+            return 'Ascend310'
         return 'Unknown'
     except Exception:
         return 'Unknown'
