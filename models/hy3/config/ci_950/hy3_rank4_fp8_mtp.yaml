@@ -8,7 +8,6 @@ model_config:
   enable_cache_compile: False       # [False, True]
   next_n: 1
   custom_params:
-    enable_online_split_weight: True    # [False, True]
     enable_multi_streams: False         # [False, True]
     enable_sp: True                     # [False, True]
 

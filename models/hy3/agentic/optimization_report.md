@@ -102,7 +102,6 @@ Embedding (120832 × 4096, 495M params)
 
 - 通信组：注意力、Dense、Embedding、LM Head 均按 TP=4 切分，各自建立 4 组 TP 通信组；MoE 按 16 卡专家并行建立一个 EP 通信组。
 - EP 路由：eager 模式使用手动 all_to_all 完成专家 dispatch/combine，图模式改用 MC2 dispatch/combine。
-- 权重加载：启用在线切分权重（enable_online_split_weight），112 个 shard 约 12s 完成加载。
 - padding_idx：全局 padding 索引 120002 在 Embedding 切分后映射为每 rank 的局部索引。
 
 ### 3.3 验收结果

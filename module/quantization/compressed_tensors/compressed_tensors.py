@@ -240,8 +240,7 @@ class CompressedTensorsConfig(QuantizationConfig):
                       self.weight_block_size[1] == MX_BLOCK_K and weight_quant.type == "float")
         is_w8a8_mxfp8 = (weight_quant.num_bits == 8) and (input_quant.num_bits == 8) and is_mxfloat
         weight_strategy = (
-            weight_quant.strategy == QuantizationStrategy.TENSOR.value
-            or weight_quant.strategy == QuantizationStrategy.CHANNEL.value
+            weight_quant.strategy == QuantizationStrategy.CHANNEL.value
             or weight_quant.strategy == QuantizationStrategy.GROUP.value)
         # The strategy of mxfp8 is group
         is_group = (weight_strategy and input_quant.strategy
@@ -259,8 +258,7 @@ class CompressedTensorsConfig(QuantizationConfig):
                       self.weight_block_size[1] != MX_BLOCK_K) and weight_quant.type == "float")
         is_w8a8_fp8 = (weight_quant.num_bits == 8) and (input_quant.num_bits == 8) and is_not_mxfloat
         weight_strategy = (
-            weight_quant.strategy == QuantizationStrategy.TENSOR.value
-            or weight_quant.strategy == QuantizationStrategy.CHANNEL.value
+            weight_quant.strategy == QuantizationStrategy.CHANNEL.value
             or weight_quant.strategy == QuantizationStrategy.GROUP.value)
         is_token = (weight_strategy and input_quant.strategy
                     == QuantizationStrategy.TOKEN.value)
@@ -275,8 +273,7 @@ class CompressedTensorsConfig(QuantizationConfig):
                                input_quant: BaseModel,) -> bool:
         is_w4a8_mxfp8 = (weight_quant.num_bits == 4) and (input_quant.num_bits == 8) and weight_quant.type == "float"
         weight_strategy = (
-            weight_quant.strategy == QuantizationStrategy.TENSOR.value
-            or weight_quant.strategy == QuantizationStrategy.CHANNEL.value
+            weight_quant.strategy == QuantizationStrategy.CHANNEL.value
             or weight_quant.strategy == QuantizationStrategy.GROUP.value)
         # The strategy of mxfp8 is group
         is_group = (weight_strategy and input_quant.strategy
@@ -292,8 +289,7 @@ class CompressedTensorsConfig(QuantizationConfig):
                                input_quant: BaseModel,) -> bool:
         is_w4a4_mxfp4 = (weight_quant.num_bits == 4) and (input_quant.num_bits == 4) and weight_quant.type == "float"
         weight_strategy = (
-            weight_quant.strategy == QuantizationStrategy.TENSOR.value
-            or weight_quant.strategy == QuantizationStrategy.CHANNEL.value
+            weight_quant.strategy == QuantizationStrategy.CHANNEL.value
             or weight_quant.strategy == QuantizationStrategy.GROUP.value)
         input_strategy = (
             input_quant.strategy == QuantizationStrategy.TOKEN.value

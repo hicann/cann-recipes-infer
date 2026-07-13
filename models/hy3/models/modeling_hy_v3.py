@@ -179,7 +179,9 @@ def _build_pad_aware_prefill_metadata(forward_metadata, slot_mapping, block_tabl
 
 @lru_cache(maxsize=1)
 def _ensure_qkv_fused_kscale_registered():
-    from cann_ops_transformer.ops import qkv_rms_norm_rope_cache_with_k_scale as _register_qkv_fused_kscale  # noqa: F401
+    from cann_ops_transformer.ops import (
+        qkv_rms_norm_rope_cache_with_k_scale as _register_qkv_fused_kscale,  # noqa: F401
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -398,18 +400,18 @@ class HYV3Attention(nn.Module):
         self.k_scale_cache = torch.Tensor([])
         self.cache_unit = (self.num_kv_heads_per_rank * self.head_dim,)
 
-        # FIA FP8 paged path (additive, off by default). When enabled it swaps the
-        # split+QKNorm+RoPE+scatter for the fused qkv_rms_norm_rope_cache_with_k_scale
-        # op and a fp8-KV / fp8-Q FIA. All scale/rotation buffers below are trivial
-        # (persistent=False) so weight loading is unchanged when the switch is off.
-        custom_params = infer_config.model_config.custom_params
-        self.use_fia_fp8 = bool(custom_params.get("enable_fia_fp8", False))
-        self.use_qkv_fused_kscale = bool(
-            custom_params.get("enable_qkv_fused_kscale", self.use_fia_fp8)
+        # FIA FP8 paged path is derived from config.json's kv_cache_scheme after
+        # the framework parses it into config.quant_config.kv_cache_quant_mode:
+        # C8/float8 KV cache requires the fused qkv_rms_norm_rope_cache_with_k_scale
+        # producer so K/V cache dtype, layout, and scales stay consistent.
+        self.kv_cache_quant_mode = (
+            config.quant_config.kv_cache_quant_mode
+            if config.quant_config is not None
+            else "unquant"
         )
+        kv_cache_quant_mode = self.kv_cache_quant_mode
+        self.use_fia_fp8 = kv_cache_quant_mode == "float8"
         if self.use_fia_fp8:
-            if not self.use_qkv_fused_kscale:
-                raise ValueError("FIA FP8 paged path requires enable_qkv_fused_kscale=True")
             if self.head_dim != 128:
                 raise ValueError("FIA GQA full-quant paged path requires head_dim == 128")
             if self.block_size != 128:
@@ -800,7 +802,6 @@ class HYV3MLP(nn.Module):
             and self.fuse_gate_up
             and gate_up_quant_config is not None
         )
-        self.swiglu_limit = getattr(config, "swiglu_limit", None)
 
         if dense_tp_size > 1:
             if comm_manager is not None:
@@ -883,7 +884,6 @@ class HYV3MLP(nn.Module):
                 dst_type=torch.float8_e4m3fn,
                 round_scale=True,
                 quant_mode=1,
-                clamp_limit=self.swiglu_limit,
             )
             down = self.down_proj(act, dynamic_scale=act_scale)
         else:
@@ -981,12 +981,6 @@ class HYV3MoE(nn.Module):
         self.gmm_quant_mode = (
             self.quant_config.gmm_quant_mode if self.quant_config is not None else "w16a16"
         )
-        self.expert_swiglu_kwargs = {}
-        if self.gmm_quant_mode in ("w4a8mxfloat4", "w4a8mx", "w8a8mxfloat8"):
-            self.expert_swiglu_kwargs = {
-                "enable_custom_ops": True,
-                "swiglu_limit": getattr(config, "swiglu_limit", None),
-            }
         self.attn_dp_size = infer_config.parallel_config.attn_dp_size
         self.experts_per_rank = self.num_experts // self.moe_ep_size
         self.enable_sp = _sp_enabled(infer_config)
@@ -1222,9 +1216,7 @@ class HYV3MoE(nn.Module):
             quant_mode=-1,
         )
         expert_output = self.experts(
-            expanded_x, tokens_per_expert, group_list_type=1,
-            **self.expert_swiglu_kwargs,
-        )
+            expanded_x, tokens_per_expert, group_list_type=1)
         hidden_states = torch_npu.npu_moe_finalize_routing(
             expert_output, skip1=None, skip2=None, bias=None,
             scales=topk_weight.to(expert_output.dtype),
@@ -1270,10 +1262,7 @@ class HYV3MoE(nn.Module):
                 gathered_tokens, tokens_per_expert_group.view(self.moe_ep_size, -1)
             )
 
-        hidden_states_ordered = self.experts(
-            hidden_states_ordered, tokens_per_local_expert, group_list_type=1,
-            **self.expert_swiglu_kwargs,
-        )
+        hidden_states_ordered = self.experts(hidden_states_ordered, tokens_per_local_expert, group_list_type=1)
 
         new_x = torch.index_select(
             hidden_states_ordered, 0,
@@ -1335,10 +1324,7 @@ class HYV3MoE(nn.Module):
         exp_scale_bf16, _, _, _ = torch_npu.npu_moe_init_routing_v2(x_scale_bf16, **routing_kwargs)
         pertoken_scale = exp_scale_bf16.to(x_scale.dtype).view(-1, *x_scale.shape[1:])
 
-        ordered = self.experts(
-            expanded_x, tokens_per_expert, group_list_type=1, pertoken_scale=pertoken_scale,
-            **self.expert_swiglu_kwargs,
-        )
+        ordered = self.experts(expanded_x, tokens_per_expert, group_list_type=1, pertoken_scale=pertoken_scale)
         # subset expert range emits -1 for non-local (token,k); same -1 fix as moe_infer_ag.
         lo = ep_rank * self.experts_per_rank
         hi = (ep_rank + 1) * self.experts_per_rank
@@ -1391,10 +1377,7 @@ class HYV3MoE(nn.Module):
                                      (ep_rank + 1) * self.experts_per_rank],
                 quant_mode=-1,
             )
-        ordered = self.experts(
-            expanded_x, tokens_per_expert, group_list_type=1,
-            **self.expert_swiglu_kwargs,
-        )
+        ordered = self.experts(expanded_x, tokens_per_expert, group_list_type=1)
         # subset expert range: init_routing emits -1 for non-local (token,k), and this
         # torch_npu OOB-gathers on -1 in finalize (~10x blowup). Zero non-local scales
         # + clamp -1->0 so they add 0; ReduceScatter sums local parts = full output.
@@ -1681,10 +1664,11 @@ class HYV3Model(nn.Module):
             # hy3 dp-tp-dp shards the decode batch within a single attn_tp group
             # (request axis). It is only validated/adapted for attn_dp==1 (one TP
             # group spanning all ranks); attn_dp>1 (multi-group) is not supported.
-            assert self.attn_dp_size == 1, (
-                "hy3 dp-tp-dp 只支持 attn_dp==1(单TP组);attn_dp>1 未适配 "
-                f"(attn_dp_size={self.attn_dp_size})"
-            )
+            if self.attn_dp_size != 1:
+                raise ValueError(
+                    "hy3 dp-tp-dp 只支持 attn_dp==1(单TP组);attn_dp>1 未适配 "
+                    f"(attn_dp_size={self.attn_dp_size})"
+                )
         if self.sp_quant and infer_config is not None:
             _bs = infer_config.scheduler_config.batch_size_per_dp_rank
             if _bs < self.attn_tp_size or _bs % self.attn_tp_size != 0:
@@ -1733,9 +1717,6 @@ class HYV3Model(nn.Module):
             config=config, max_position_embeddings=self.max_position_embeddings
         )
         # FIA fused qkv path needs the packed cos_sin_table; derive from the layers.
-        self.use_qkv_fused_kscale = any(
-            layer.self_attn.use_qkv_fused_kscale for layer in self.layers
-        )
         self.use_fia_fp8 = any(layer.self_attn.use_fia_fp8 for layer in self.layers)
         self.qkv_fused_attn_type = next(
             (layer.self_attn.attn_type for layer in self.layers if layer.self_attn.use_fia_fp8),
@@ -1855,7 +1836,7 @@ class HYV3Model(nn.Module):
         cos_sin = self.rotary_emb(hidden_states, position_ids, self.max_position_embeddings)
         cos_sin_table = (
             self.rotary_emb.get_cos_sin_table(self.max_position_embeddings)
-            if self.use_qkv_fused_kscale else None
+            if self.use_fia_fp8 else None
         )
         qkv_fused_cu_seq_len = None
         qkv_fused_actual_seq_lens = None
@@ -1867,7 +1848,10 @@ class HYV3Model(nn.Module):
                 padded_forward_metadata
             )
         if self.use_fia_fp8:
-            if padded_forward_metadata.actual_seq_lengths_cu_q is None or padded_forward_metadata.actual_seq_lengths_kv is None:
+            if (
+                padded_forward_metadata.actual_seq_lengths_cu_q is None
+                or padded_forward_metadata.actual_seq_lengths_kv is None
+            ):
                 raise RuntimeError("fused qkv operator requires actual_seq_lengths_cu_q and actual_seq_lengths_kv")
             if slot_mapping is None or self.qkv_fused_attn_type not in slot_mapping:
                 raise RuntimeError("fused qkv operator requires slot_mapping for the attention type")
@@ -2205,7 +2189,8 @@ class HYV3ForCausalLM(nn.Module):
             # Dense MLP / MoE shared_mlp gate-up shards are stored unfused in
             # the checkpoint.
             gate_up_match = re.match(
-                r"(model\.layers\.\d+\.mlp(?:\.shared_mlp)?)\.(gate_proj|up_proj)\.(weight_scale|input_scale|scale|weight)$",
+                r"(model\.layers\.\d+\.mlp(?:\.shared_mlp)?)\."
+                r"(gate_proj|up_proj)\.(weight_scale|input_scale|scale|weight)$",
                 name
             )
             if gate_up_match:
@@ -2374,9 +2359,6 @@ class HYV3ModelMTPLayer(HYV3Model):
         # iterating ModuleDict.values() inside the graph trips dynamo.
         self.mtp_layers = list(self.layers.values())
         # FIA fused qkv path needs the packed cos_sin_table; derive from the layers.
-        self.use_qkv_fused_kscale = any(
-            layer.self_attn.use_qkv_fused_kscale for layer in self.mtp_layers
-        )
         self.use_fia_fp8 = any(layer.self_attn.use_fia_fp8 for layer in self.mtp_layers)
         self.qkv_fused_attn_type = next(
             (layer.self_attn.attn_type for layer in self.mtp_layers if layer.self_attn.use_fia_fp8),
@@ -2504,7 +2486,7 @@ class HYV3ModelMTP(HYV3ForCausalLM):
         cos_sin = m.rotary_emb(hidden_states, position_ids, m.max_position_embeddings)
         cos_sin_table = (
             m.rotary_emb.get_cos_sin_table(m.max_position_embeddings)
-            if m.use_qkv_fused_kscale else None
+            if m.use_fia_fp8 else None
         )
 
         qkv_fused_cu_seq_len = None
@@ -2517,7 +2499,10 @@ class HYV3ModelMTP(HYV3ForCausalLM):
                 padded_forward_metadata
             )
         if m.use_fia_fp8:
-            if padded_forward_metadata.actual_seq_lengths_cu_q is None or padded_forward_metadata.actual_seq_lengths_kv is None:
+            if (
+                padded_forward_metadata.actual_seq_lengths_cu_q is None
+                or padded_forward_metadata.actual_seq_lengths_kv is None
+            ):
                 raise RuntimeError("fused qkv operator requires actual_seq_lengths_cu_q and actual_seq_lengths_kv")
             if slot_mapping is None or m.qkv_fused_attn_type not in slot_mapping:
                 raise RuntimeError("fused qkv operator requires slot_mapping for the attention type")

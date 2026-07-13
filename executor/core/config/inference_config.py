@@ -22,12 +22,15 @@ This module contains all configuration classes for the inference framework:
 - SchedulerConfig: Request scheduler configuration
 - InferenceConfig: Unified configuration container
 """
-import os
 import logging
 import math
+import os
 from dataclasses import dataclass, field
 from enum import Enum
+from functools import lru_cache
 from typing import Any, Literal
+import torch
+import torch_npu
 
 
 class PlatformVersion(Enum):
@@ -40,6 +43,27 @@ class PlatformVersion(Enum):
     def is_ascend_950(self) -> bool:
         """Return whether the platform is Ascend 950."""
         return self is PlatformVersion.ASCEND_950
+
+    @classmethod
+    @lru_cache(maxsize=1)
+    def get_device_name(cls) -> str:
+        try:
+            return torch.npu.get_device_name()
+        except Exception:
+            return ""
+
+    @classmethod
+    def detect(cls) -> "PlatformVersion | None":
+        """Detect platform from current NPU device name."""
+        device_name = cls.get_device_name()
+        if "950" in device_name:
+            return cls.ASCEND_950
+        if "910_93" in device_name:
+            return cls.A3
+        if "910B" in device_name:
+            return cls.A2
+        logging.error("Failed to detect platform version from NPU device name: %r", device_name)
+        return None
 
     @classmethod
     def from_value(cls, value: "PlatformVersion | str") -> "PlatformVersion":
@@ -134,10 +158,18 @@ class ModelConfig:
     @classmethod
     def from_dict(cls, model_config_dict: dict) -> "ModelConfig":
         """Create ModelConfig from YAML-parsed dictionary."""
-        # Priority: YAML > env var PLATFORM_VERSION > default "A3"
+        # Priority: YAML > detected NPU device name > default "A3"
         platform_version_raw = model_config_dict.get("platform_version")
         if platform_version_raw is None:
-            platform_version_raw = os.environ.get("PLATFORM_VERSION", PlatformVersion.A3.value)
+            detected_platform = PlatformVersion.detect()
+            if detected_platform is not None:
+                platform_version_raw = detected_platform.value
+            else:
+                platform_version_raw = PlatformVersion.A3.value
+                logging.warning(
+                    "Platform version is not configured and auto detection failed; using default %s.",
+                    platform_version_raw,
+                )
         model_config_dict["platform_version"] = platform_version_raw
         model_config = cls(
             model_name=model_config_dict.get("model_name", "model"),

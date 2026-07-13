@@ -8,7 +8,6 @@ model_config:
   enable_cache_compile: False       # [False, True]
   next_n: 1
   custom_params:
-    enable_online_split_weight: True    # [False, True]
     enable_multi_streams: False         # [False, True]
     enable_sp: False                    # [False, True]; A3 dense_tp>1 须 False
 
@@ -25,6 +24,5 @@ parallel_config:
   lmhead_tp_size: 4
 
 scheduler_config:
-  max_new_tokens: 112
+  max_new_tokens: 128
   batch_size: 4
-  mem_fraction_static: 0.45

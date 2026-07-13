@@ -19,8 +19,9 @@
 
 | 平台 | 产品型号 | 配置 |
 | --- | --- | --- |
-| Atlas A3 | Atlas A3 系列产品 | `ci_a3/hy3_rank16_bf16.yaml` |
-| Atlas A5 | Ascend 950PR/DT 系列产品 | `ci_950/hy3_rank4_mxfp48.yaml` |
+| Atlas A3 | Atlas A3 系列产品 | `ci_a3/hy3_rank16_bf16_mtp.yaml` |
+| Atlas A5 | Ascend 950PR/DT 系列产品 | `ci_950/hy3_rank4_mxfp4_mtp.yaml` |
+| Atlas A5 | Ascend 950PR/DT 系列产品 | `ci_950/hy3_rank4_fp8_mtp.yaml` |
 
 基础软件版本：
 
@@ -72,7 +73,7 @@ modelscope download --model Tencent-Hunyuan/Hy3 --local_dir /data/models/Hy3-BF1
 modelscope download --model Tencent-Hunyuan/Hy3-FP8 --local_dir /data/models/Hy3-FP8
 ```
 
-> 说明：A5/950 的 MXFP8+MXFP4（mxfp48）权重需从 BF16 转换，见[转换权重](#转换权重)章节。
+> 说明：A5/950 的 MXFP8+MXFP4 权重需从 BF16 转换，见[转换权重](#转换权重)章节。
 
 ### 环境准备
 
@@ -208,15 +209,12 @@ moe:
 
 在各个节点上修改需要执行的 YAML 文件，将 `model_config.model_path` 设置为权重实际路径。YAML 通用参数说明可参考 [YAML 参数描述](../../docs/common/inference_config_guide.md)。
 
-当前仓内提供的 Hy3 配置如下：
+当前仓内提供的 Hy3 MTP 配置如下：
 
 | 平台 | YAML 文件 | 默认 `model_path` | 精度/特性 | 说明 |
 | --- | --- | --- | --- | --- |
-| A3 | `ci_a3/hy3_rank16_bf16.yaml` | `/data/models/Hy3-BF16` | BF16 | 8卡 16rank，`npugraph_ex` |
 | A3 | `ci_a3/hy3_rank16_bf16_mtp.yaml` | `/data/models/Hy3-BF16` | BF16 + MTP | 8卡 16rank，`next_n=1` |
-| A5/950 | `ci_950/hy3_rank4_mxfp48.yaml` | `/data/models/Hy3-MXFP4` | MXFP8 + MXFP4 | 4卡，`npugraph_ex` |
-| A5/950 | `ci_950/hy3_rank4_mxfp48_mtp.yaml` | `/data/models/Hy3-MXFP4` | MXFP8 + MXFP4 + MTP | 4卡，`next_n=1` |
-| A5/950 | `ci_950/hy3_rank4_fp8.yaml` | `/data/models/Hy3-FP8` | FP8 | 4卡，`npugraph_ex` |
+| A5/950 | `ci_950/hy3_rank4_mxfp4_mtp.yaml` | `/data/models/Hy3-MXFP4` | MXFP8 + MXFP4 + MTP | 4卡，`next_n=1` |
 | A5/950 | `ci_950/hy3_rank4_fp8_mtp.yaml` | `/data/models/Hy3-FP8` | FP8 + MTP | 4卡，`next_n=1` |
 
 > 说明：A5/950 配置当前面向量化权重，快速启动阶段只下载 BF16 权重；量化权重准备方式见[转换权重](#转换权重)章节。
@@ -225,24 +223,14 @@ moe:
 
 | 参数名 | 类型 | 默认值 | 含义 |
 | --- | --- | --- | --- |
-| `enable_online_split_weight` | bool | `True` | 启用在线权重切分。未启用时需提前离线转换切分好的权重。 |
 | `enable_multi_streams` | bool | `True` | 启用多流并行，重叠计算与通信以提升推理性能。 |
 | `enable_sp` | bool | `True` | 启用序列并行（Sequence Parallel），`attn_tp_size>1` 时按 token 切分。 |
-| `enable_fia_fp8` | bool | `True` | 启用 FIA FP8 C8 分页注意力（FP8 全量化 Flash Attention 配 C8 KV Cache），量化配置生效。 |
-| `enable_qkv_fused_kscale` | bool | `True` | 启用 `qkv_rms_norm_rope_cache_with_k_scale` 融合算子（QKV split + RMSNorm + RoPE + 动态量化 + Cache 写回）。 |
 
+当权重目录的 `config.json` 中 `quantization_config.kv_cache_scheme` 表示 float8 KV cache 时，Hy3 会自动启用对应路径。
 
 ### 拉起多卡推理
 
 请先进入模型目录，再执行统一推理入口，避免日志输出到错误目录。
-
-A3 BF16 示例：
-
-```bash
-cd /home/code/cann-recipes-infer/models/hy3
-export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
-bash ../../executor/scripts/infer.sh --model hy3 --yaml ci_a3/hy3_rank16_bf16.yaml
-```
 
 A3 BF16 + MTP 示例：
 
@@ -252,12 +240,20 @@ export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
 bash ../../executor/scripts/infer.sh --model hy3 --yaml ci_a3/hy3_rank16_bf16_mtp.yaml
 ```
 
-A5/950 量化配置示例。该命令仅在已准备对应量化权重，并将 YAML 中的 `model_path` 修改为真实路径后执行：
+A5/950 MXFP8+MXFP4 + MTP 示例。该命令仅在已准备对应量化权重，并将 YAML 中的 `model_path` 修改为真实路径后执行：
 
 ```bash
 cd /home/code/cann-recipes-infer/models/hy3
 export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3
-bash ../../executor/scripts/infer.sh --model hy3 --yaml ci_950/hy3_rank4_mxfp48.yaml
+bash ../../executor/scripts/infer.sh --model hy3 --yaml ci_950/hy3_rank4_mxfp4_mtp.yaml
+```
+
+A5/950 FP8 + MTP 示例。该命令仅在已准备 FP8 权重，并将 YAML 中的 `model_path` 修改为真实路径后执行：
+
+```bash
+cd /home/code/cann-recipes-infer/models/hy3
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3
+bash ../../executor/scripts/infer.sh --model hy3 --yaml ci_950/hy3_rank4_fp8_mtp.yaml
 ```
 
 > 说明：多机环境需要在每个节点上执行同一条推理命令。脚本会根据 YAML 中的 `world_size` 与 `executor/scripts/set_env.sh` 中的 IP 列表计算各节点 rank 信息。

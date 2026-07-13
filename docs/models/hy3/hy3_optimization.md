@@ -52,7 +52,83 @@ Attention部分可以考虑的并行方式包括DP/TP/SP，由于TTFT的时延�
 
 两种方案的差异如下图所示：
 
-<div align="center"><img src="./figures/two_schemes.png" width="600" alt="两种方案"></div>
+<div style="max-width: 100%; overflow-x: auto;">
+<div style="width: 1120px; max-width: 100%; margin: 0 auto;">
+
+```mermaid
+%%{init: {"flowchart": {"rankSpacing": 18, "nodeSpacing": 320}}}%%
+flowchart LR
+    subgraph scheme_agrs[" "]
+        direction TB
+        s1_in([input])
+        subgraph s1_sp_pre["<div style='text-align:left;width:680px;color:#d14;font-size:18px;font-weight:600;transform:translate(-8px,-6px)'>SP</div>"]
+            direction TB
+            s1_norm_pre["<div style='width:320px'>AddRMSNorm</div>"]
+        end
+        s1_ag["<div style='width:320px'>AllGather</div>"]
+        subgraph s1_tp["<div style='text-align:left;width:680px;color:#d14;font-size:18px;font-weight:600;transform:translate(-8px,-6px)'>TP</div>"]
+            direction TB
+            s1_qkv["<div style='width:320px'>qkv_proj</div>"]
+            s1_fa["<div style='width:320px'>FA</div>"]
+            s1_o["<div style='width:320px'>o_proj</div>"]
+        end
+        s1_rs["<div style='width:320px'>ReduceScatter</div>"]
+        subgraph s1_sp_post["<div style='text-align:left;width:680px;color:#d14;font-size:18px;font-weight:600;transform:translate(-8px,-6px)'>SP</div>"]
+            direction TB
+            s1_norm_post["<div style='width:320px'>AddRMSNorm</div>"]
+        end
+        s1_end[" "]
+
+        s1_in --> s1_norm_pre --> s1_ag --> s1_qkv --> s1_fa --> s1_o --> s1_rs --> s1_norm_post --> s1_end
+    end
+
+    subgraph scheme_a2a[" "]
+        direction TB
+        s2_in([input])
+        subgraph s2_sp_pre["<div style='text-align:left;width:680px;color:#d14;font-size:18px;font-weight:600;transform:translate(-8px,-6px)'>SP</div>"]
+            direction TB
+            s2_norm_pre["<div style='width:320px'>AddRMSNorm</div>"]
+            s2_qkv["<div style='width:320px'>qkv_proj</div>"]
+        end
+        s2_a2a_pre["<div style='width:320px'>AllToAll</div>"]
+        subgraph s2_tp["<div style='text-align:left;width:680px;color:#d14;font-size:18px;font-weight:600;transform:translate(-8px,-6px)'>TP</div>"]
+            direction TB
+            s2_fa["<div style='width:320px'>FA</div>"]
+        end
+        s2_a2a_post["<div style='width:320px'>AllToAll</div>"]
+        subgraph s2_sp_post["<div style='text-align:left;width:680px;color:#d14;font-size:18px;font-weight:600;transform:translate(-8px,-6px)'>SP</div>"]
+            direction TB
+            s2_o["<div style='width:320px'>o_proj</div>"]
+            s2_norm_post["<div style='width:320px'>AddRMSNorm</div>"]
+        end
+        s2_end[" "]
+
+        s2_in --> s2_norm_pre --> s2_qkv --> s2_a2a_pre --> s2_fa --> s2_a2a_post --> s2_o --> s2_norm_post --> s2_end
+    end
+
+    %% Invisible subgraph link keeps the two schemes side by side without adding a business edge.
+    scheme_agrs ~~~ scheme_a2a
+
+    classDef compute fill:#eaf2ff,stroke:#4b5f93,color:#1f2a44;
+    classDef comm fill:#fff0f0,stroke:#b86b6b,color:#3a2020;
+    classDef io fill:#ffffff,stroke:#4b5f93,color:#1f2a44;
+    classDef hidden fill:transparent,stroke:transparent,color:transparent;
+    class s1_norm_pre,s1_qkv,s1_fa,s1_o,s1_norm_post,s2_norm_pre,s2_qkv,s2_fa,s2_o,s2_norm_post compute;
+    class s1_ag,s1_rs,s2_a2a_pre,s2_a2a_post comm;
+    class s1_in,s2_in io;
+    class s1_end,s2_end hidden;
+    style scheme_agrs fill:transparent,stroke:transparent,color:transparent
+    style scheme_a2a fill:transparent,stroke:transparent,color:transparent
+    style s1_sp_pre fill:#f7fbf3,stroke:#5b6f9e,stroke-dasharray: 6 4,color:#d14
+    style s1_tp fill:#f7fbf3,stroke:#5b6f9e,stroke-dasharray: 6 4,color:#d14
+    style s1_sp_post fill:#f7fbf3,stroke:#5b6f9e,stroke-dasharray: 6 4,color:#d14
+    style s2_sp_pre fill:#f7fbf3,stroke:#5b6f9e,stroke-dasharray: 6 4,color:#d14
+    style s2_tp fill:#f7fbf3,stroke:#5b6f9e,stroke-dasharray: 6 4,color:#d14
+    style s2_sp_post fill:#f7fbf3,stroke:#5b6f9e,stroke-dasharray: 6 4,color:#d14
+```
+
+</div>
+</div>
 
 综合考虑通信数据量、数据类型和融合算子兼容性三个因素，Prefill阶段Attention采用**SP+TP上述两方案的组合**：
 
@@ -65,7 +141,46 @@ Attention部分可以考虑的并行方式包括DP/TP/SP，由于TTFT的时延�
 
 最终选择的切分策略如下：
 
-<div align="center"><img src="./figures/partition_strategy.png" width="360" alt="切分策略"></div>
+<div style="width: fit-content; max-width: 100%; margin: 0 auto; overflow-x: auto;">
+
+```mermaid
+%%{init: {"flowchart": {"rankSpacing": 22, "nodeSpacing": 50}}}%%
+flowchart TB
+    input([input])
+    subgraph sp_pre["<div style='text-align:left;width:260px;color:#d14;transform:translate(-8px,-6px)'>SP</div>"]
+        direction TB
+        norm_pre["<div style='width:150px'>AddRMSNorm</div>"]
+    end
+    ag["<div style='width:150px'>AllGather</div>"]
+    subgraph tp_block["<div style='text-align:left;width:260px;color:#d14;transform:translate(-8px,-6px)'>TP</div>"]
+        direction TB
+        qkv["<div style='width:150px'>qkv_proj</div>"]
+        fa["<div style='width:150px'>FA</div>"]
+    end
+    a2a["<div style='width:150px'>AllToAll</div>"]
+    subgraph sp_post["<div style='text-align:left;width:260px;color:#d14;transform:translate(-8px,-6px)'>SP</div>"]
+        direction TB
+        o_proj["<div style='width:150px'>o_proj</div>"]
+        norm_post["<div style='width:150px'>AddRMSNorm</div>"]
+    end
+    end_node[" "]
+
+    input --> norm_pre --> ag --> qkv --> fa --> a2a --> o_proj --> norm_post --> end_node
+
+    classDef compute fill:#eaf2ff,stroke:#4b5f93,color:#1f2a44;
+    classDef comm fill:#fff0f0,stroke:#b86b6b,color:#3a2020;
+    classDef io fill:#ffffff,stroke:#4b5f93,color:#1f2a44;
+    classDef hidden fill:transparent,stroke:transparent,color:transparent;
+    class norm_pre,qkv,fa,o_proj,norm_post compute;
+    class ag,a2a comm;
+    class input io;
+    class end_node hidden;
+    style sp_pre fill:#f7fbf3,stroke:#5b6f9e,stroke-dasharray: 6 4,color:#d14
+    style tp_block fill:#f7fbf3,stroke:#5b6f9e,stroke-dasharray: 6 4,color:#d14
+    style sp_post fill:#f7fbf3,stroke:#5b6f9e,stroke-dasharray: 6 4,color:#d14
+```
+
+</div>
 
 ### MoE EP优化
 
@@ -93,14 +208,122 @@ EP AG-RS 方案：每个 rank 先 AllGather 拿到全序列 token，通过 InitR
 
 EP Double Routing（AlltoAll）方案：每个 rank 先用 InitRouting 将本地 token 按专家展开分组，再通过去程 AlltoAll 把 token 精确投递到目标专家所在 rank，经 ReRouting 重排后做 GMM，GMM 输出经回程 AlltoAll 原路送回来源 rank，最后由 FinalizeRouting 乘路由权重加权收回——以两次 AlltoAll 的精确投递换取零冗余通信与零冗余计算，数据量 (BS×top_k/ep_size,H)×2 随 EP 增大而降，适用于大 EP（ep > top_k）场景。
 
-<div align="center"><img src="./figures/moe.png" width="460" alt="moe"></div>
+<div style="max-width: 100%; overflow-x: auto;">
+<div style="width: 1120px; max-width: 100%; margin: 0 auto;">
+
+```mermaid
+%%{init: {"flowchart": {"rankSpacing": 48, "nodeSpacing": 460}}}%%
+flowchart LR
+    subgraph moe_agrs[" "]
+        direction TB
+        ag_in(["各rank token"])
+        ag_allgather["<div style='width:400px'>AllGather</div>"]
+        ag_init["<div style='width:400px'>InitRouting<br/>GMM</div>"]
+        ag_finalize["<div style='width:430px'>FinalizeRouting</div>"]
+        ag_rs["<div style='width:400px'>ReduceScatter</div>"]
+        ag_out(["各rank token"])
+        ag_caption["<div style='font-size:18px;font-weight:600;color:#555'>AllGather方案</div>"]
+
+        ag_in --> ag_allgather --> ag_init --> ag_finalize --> ag_rs --> ag_out
+        ag_out ~~~ ag_caption
+    end
+
+    subgraph moe_dr[" "]
+        direction TB
+        dr_in(["各rank token"])
+        dr_init["<div style='width:400px'>InitRouting</div>"]
+        dr_a2a_pre["<div style='width:400px'>AllToAll</div>"]
+        dr_rerouting["<div style='width:400px'>ReRouting<br/>GMM</div>"]
+        dr_a2a_post["<div style='width:400px'>AllToAll</div>"]
+        dr_finalize["<div style='width:430px'>FinalizeRouting</div>"]
+        dr_out(["各rank token"])
+        dr_caption["<div style='font-size:18px;font-weight:600;color:#555'>Double Routing方案</div>"]
+
+        dr_in --> dr_init --> dr_a2a_pre --> dr_rerouting --> dr_a2a_post --> dr_finalize --> dr_out
+        dr_out ~~~ dr_caption
+    end
+
+    %% Invisible subgraph link keeps both MoE schemes side by side.
+    moe_agrs ~~~ moe_dr
+
+    classDef compute fill:#eaf2ff,stroke:#4b5f93,color:#1f2a44;
+    classDef comm fill:#fff0f0,stroke:#b86b6b,color:#3a2020;
+    classDef io fill:#ffffff,stroke:#4b5f93,color:#1f2a44;
+    classDef caption fill:transparent,stroke:transparent,color:#666666;
+    class ag_init,ag_finalize,dr_init,dr_rerouting,dr_finalize compute;
+    class ag_allgather,ag_rs,dr_a2a_pre,dr_a2a_post comm;
+    class ag_in,ag_out,dr_in,dr_out io;
+    class ag_caption,dr_caption caption;
+    style moe_agrs fill:transparent,stroke:transparent,color:transparent
+    style moe_dr fill:transparent,stroke:transparent,color:transparent
+```
+
+</div>
+</div>
 
 ## 量化策略
 
 本实践支持了原生FP8量化，同时也支持了使用MXFP8替换原生FP8格式的Linear模块，MoE部分替换MXFP4，可以进一步提高整体性能。
 Hybrid MXFP8-MXFP4整体量化策略如下：
 
-<div align="center"><img src="./figures/quant_scheme.png" width="720" alt="量化方案"></div>
+```mermaid
+%%{init: {"flowchart": {"rankSpacing": 30, "nodeSpacing": 55}}}%%
+flowchart LR
+    subgraph attention_quant["<b>Attention</b>"]
+        direction LR
+        qkv_quant["qkv_proj<br/>W8A8"]
+        split["split"]
+        v_quant["Dynamic<br/>Quant"]
+        v_cache(["v_cache"])
+        qk_norm["RMSNorm"]
+        rope["RoPE"]
+        rotation["rotation"]
+        k_quant["Dynamic<br/>Quant"]
+        k_cache(["k_cache<br/>k_scale_cache"])
+        fa["FA"]
+        o_proj["o_proj"]
+
+        qkv_quant --> split
+        split -->|v| v_quant
+        v_quant --> v_cache
+        v_quant --> fa
+        split -->|qk| qk_norm --> rope --> rotation --> k_quant
+        k_quant --> k_cache
+        k_quant --> fa
+        fa --> o_proj
+    end
+
+    subgraph quant_right[" "]
+        direction TB
+        add_pre["AddRmsNorm"]
+        subgraph moe_quant["<b>MoE</b>"]
+            direction TB
+            gating["Gating"]
+            dispatch["Dispatch"]
+            experts["router W4A8<br/>shared W8A8"]
+            combine["Combine"]
+
+            gating --> dispatch --> experts --> combine
+        end
+        add_post["AddRmsNorm"]
+
+        add_pre --> gating
+        combine --> add_post
+    end
+
+    o_proj --> add_pre
+
+    classDef compute fill:#eaf2ff,stroke:#4b5f93,color:#1f2a44;
+    classDef quant fill:#fff7eb,stroke:#b9823a,color:#3a2a12;
+    classDef cache fill:#ffffff,stroke:#4b5f93,color:#1f2a44;
+    classDef moe fill:#fff0f0,stroke:#b86b6b,color:#3a2020;
+    class split,qk_norm,rope,rotation,fa,o_proj,add_pre,gating,dispatch,combine,add_post compute;
+    class qkv_quant,v_quant,k_quant,experts quant;
+    class v_cache,k_cache cache;
+    style attention_quant fill:#f7f7f7,stroke:#5b6f9e,stroke-dasharray: 6 4
+    style quant_right fill:transparent,stroke:transparent,color:transparent
+    style moe_quant fill:#f7f7f7,stroke:#5b6f9e,stroke-dasharray: 6 4
+```
 
 - Attention：q_proj, k_proj, v_proj, o_proj 使用W8A8量化，KV Cache采用C8量化；
 
@@ -114,7 +337,67 @@ Hybrid MXFP8-MXFP4整体量化策略如下：
 
 如下图所示：
 
-<div align="center"><img src="./figures/fused_ops.png" width="720" alt="融合算子"></div>
+```mermaid
+%%{init: {"flowchart": {"rankSpacing": 30, "nodeSpacing": 55}}}%%
+flowchart LR
+    subgraph attention_fused["<b>Attention</b>"]
+        direction LR
+        qkv_quant["qkv_proj<br/>W8A8"]
+        subgraph qkv_fused["<b><span style='white-space:nowrap'>QkvRmsNormRopeCacheWithKScale</span></b>"]
+            direction LR
+            split["split"]
+            v_quant["Dynamic<br/>Quant"]
+            qk_norm["RMSNorm"]
+            rope["RoPE"]
+            rotation["rotation"]
+            k_quant["Dynamic<br/>Quant"]
+            k_cache(["k_cache<br/>k_scale_cache"])
+        end
+        v_cache(["v_cache"])
+        fa["FA"]
+        o_proj["o_proj"]
+
+        qkv_quant --> split
+        split -->|v| v_quant
+        v_quant --> v_cache
+        v_quant --> fa
+        split -->|qk| qk_norm --> rope --> rotation --> k_quant
+        k_quant --> k_cache
+        k_quant --> fa
+        fa --> o_proj
+    end
+
+    subgraph fused_right[" "]
+        direction TB
+        add_pre["AddRmsNorm"]
+        subgraph moe_fused["<b>MoE</b>"]
+            direction TB
+            gating["Gating"]
+            dispatch["Dispatch"]
+            experts["router W4A8<br/>shared W8A8"]
+            combine["Combine"]
+
+            gating --> dispatch --> experts --> combine
+        end
+        add_post["AddRmsNorm"]
+
+        add_pre --> gating
+        combine --> add_post
+    end
+
+    o_proj --> add_pre
+
+    classDef compute fill:#eaf2ff,stroke:#4b5f93,color:#1f2a44;
+    classDef quant fill:#fff7eb,stroke:#b9823a,color:#3a2a12;
+    classDef cache fill:#ffffff,stroke:#4b5f93,color:#1f2a44;
+    class split,qk_norm,rope,rotation,fa,o_proj,add_pre,gating,dispatch,combine,add_post compute;
+    class qkv_quant,v_quant,k_quant,experts quant;
+    class v_cache,k_cache cache;
+    style attention_fused fill:#f7f7f7,stroke:#5b6f9e,stroke-dasharray: 6 4
+    style qkv_fused fill:#fbffe9,stroke:#5b6f9e,stroke-dasharray: 6 4
+    style fused_right fill:transparent,stroke:transparent,color:transparent
+    style moe_fused fill:#f7f7f7,stroke:#5b6f9e,stroke-dasharray: 6 4
+```
 
 - QKV 前处理融合算子：包含QKV split、RMSNorm、RoPE、rotation、动态量化、Cache写回等操作，拿到访存收益与计算流水收益；
 - Flash Attention：包含了FP8 全量化 flash attention计算过程；
@@ -124,7 +407,44 @@ Hybrid MXFP8-MXFP4整体量化策略如下：
 ## 使能图编译缓存
 在模型推理场景下，使能图编译缓存可以缓存编译后的静态图，避免每次推理都需要编译模型，从而提高推理性能。
 
-<div align="center"><img src="./figures/cache_compile.png" width="720" alt="cache_compile"></div>
+```mermaid
+%%{init: {"themeVariables": {"lineColor": "#999999"}}}%%
+block-beta
+    columns 16
+    header_label[" "]:2 header_first["<div style='font-size:18px'>首次执行</div>"]:9 header_sep((" ")) header_second["<div style='font-size:18px'>再次执行</div>"]:4
+    original_label["<div style='font-size:18px;line-height:1.2'>原始推理任务执行</div>"]:2 original_compile["<div style='font-size:18px;padding:10px 4px'>Dynamo编译</div>"]:5 original_guards_1["<div style='font-size:17px;padding:10px 2px'>Guards</div>"] original_capture_1["<div style='font-size:17px;line-height:1.2;padding:8px 2px'>aclgraph<br/>Capture</div>"] original_input_1["<div style='font-size:17px;line-height:1.2;padding:8px 2px'>Input<br/>处理</div>"] original_replay_1["<div style='font-size:17px;padding:10px 2px'>Replay</div>"] original_sep((" ")) original_guards_2["<div style='font-size:17px;padding:10px 2px'>Guards</div>"] original_capture_2["<div style='font-size:17px;line-height:1.2;padding:8px 2px'>aclgraph<br/>Capture</div>"] original_input_2["<div style='font-size:17px;line-height:1.2;padding:8px 2px'>Input<br/>处理</div>"] original_replay_2["<div style='font-size:17px;padding:10px 2px'>Replay</div>"]
+    cache_label["<div style='font-size:18px;line-height:1.2'>开启模型编译缓存</div>"]:2 cache_save_1["<div style='font-size:18px;padding:10px 4px'>Time save</div>"]:6 cache_capture_1["<div style='font-size:17px;line-height:1.2;padding:8px 2px'>aclgraph<br/>Capture</div>"] cache_input_1["<div style='font-size:17px;line-height:1.2;padding:8px 2px'>Input<br/>处理</div>"] cache_replay_1["<div style='font-size:17px;padding:10px 2px'>Replay</div>"] cache_sep((" ")) cache_save_2["<div style='font-size:17px;line-height:1.2;padding:8px 2px'>Time<br/>save</div>"] cache_capture_2["<div style='font-size:17px;line-height:1.2;padding:8px 2px'>aclgraph<br/>Capture</div>"] cache_input_2["<div style='font-size:17px;line-height:1.2;padding:8px 2px'>Input<br/>处理</div>"] cache_replay_2["<div style='font-size:17px;padding:10px 2px'>Replay</div>"]
+    space:11 bottom_sep((" ")) space:4
+
+    header_sep -.- bottom_sep
+
+    style header_label fill:transparent,stroke:transparent,color:transparent
+    style header_first fill:transparent,stroke:transparent,color:#202124
+    style header_second fill:transparent,stroke:transparent,color:#202124
+    style header_sep fill:transparent,stroke:transparent,color:transparent
+    style original_label fill:transparent,stroke:transparent,color:#202124
+    style cache_label fill:transparent,stroke:transparent,color:#202124
+    style original_compile fill:#4d73ff,stroke:#2f4ab3,color:#ffffff
+    style original_guards_1 fill:#ffe9b8,stroke:#d0a044,color:#3a2a12
+    style original_guards_2 fill:#ffe9b8,stroke:#d0a044,color:#3a2a12
+    style original_capture_1 fill:#ffe8e8,stroke:#d28f8f,color:#3a2020
+    style original_input_1 fill:#ffe8e8,stroke:#d28f8f,color:#3a2020
+    style original_replay_1 fill:#ffe8e8,stroke:#d28f8f,color:#3a2020
+    style original_capture_2 fill:#ffe8e8,stroke:#d28f8f,color:#3a2020
+    style original_input_2 fill:#ffe8e8,stroke:#d28f8f,color:#3a2020
+    style original_replay_2 fill:#ffe8e8,stroke:#d28f8f,color:#3a2020
+    style cache_save_1 fill:#a7eee6,stroke:#48a79e,color:#153936
+    style cache_save_2 fill:#a7eee6,stroke:#48a79e,color:#153936
+    style cache_capture_1 fill:#ffe8e8,stroke:#d28f8f,color:#3a2020
+    style cache_input_1 fill:#ffe8e8,stroke:#d28f8f,color:#3a2020
+    style cache_replay_1 fill:#ffe8e8,stroke:#d28f8f,color:#3a2020
+    style cache_capture_2 fill:#ffe8e8,stroke:#d28f8f,color:#3a2020
+    style cache_input_2 fill:#ffe8e8,stroke:#d28f8f,color:#3a2020
+    style cache_replay_2 fill:#ffe8e8,stroke:#d28f8f,color:#3a2020
+    style original_sep fill:transparent,stroke:transparent,color:transparent
+    style cache_sep fill:transparent,stroke:transparent,color:transparent
+    style bottom_sep fill:transparent,stroke:transparent,color:transparent
+```
 
 相关接口调用形式如下：
 

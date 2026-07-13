@@ -22,7 +22,7 @@ from typing import Dict, Optional, Any
 import torch
 import torch_npu
 
-from executor.core.config import InferenceConfig
+from executor.core.config import InferenceConfig, PlatformVersion
 from executor.utils import get_default_group
 from executor.utils.forward_metadata import PrefillCPMetaData, set_forward_metadata, get_forward_metadata
 from executor.utils.profiler_context import ProfilerManager
@@ -104,10 +104,14 @@ class ExecutionEngine:
             default_pg = get_default_group()
             if default_pg is None:
                 pg_options = None
-                is_950dt = os.getenv("INFER_DEVICE_IS_950DT") == "1"
-                if self.infer_config.model_config.platform_version.is_ascend_950() and is_950dt:
-                    pg_options = torch_npu._C._distributed_c10d.ProcessGroupHCCL.Options()
-                    pg_options.hccl_config = {"hccl_op_expansion_mode": 5}
+                if self.infer_config.model_config.platform_version.is_ascend_950():
+                    device_name = PlatformVersion.get_device_name().upper()
+                    if "950DT" in device_name:
+                        pg_options = torch_npu._C._distributed_c10d.ProcessGroupHCCL.Options()
+                        pg_options.hccl_config = {"hccl_op_expansion_mode": 5}
+                    elif "950PR" in device_name:
+                        pg_options = torch_npu._C._distributed_c10d.ProcessGroupHCCL.Options()
+                        pg_options.hccl_config = {"hccl_op_expansion_mode": 6}
                 torch.distributed.init_process_group(
                     backend="hccl",
                     world_size=self.world_size,
