@@ -1,103 +1,164 @@
-# NPU 图模式优化及其在 cann-recipes-infer 框架下的使能
+# NPU 图模式优化原理
 
-## 1. 文档目标
+本文档说明昇腾 NPU 上图模式优化的背景、基本原理、GE 图模式与 npugraph_ex 图模式的关系，以及在 cann-recipes-infer 框架中的使能方式和常见调试方法。
 
-本文主要回答四个问题：
+## 1. 背景
 
-1. 什么是图模式，它解决什么问题？
-2. NPU 图模式有哪些主要实现方式，它们之间是什么关系？
-3. 在本仓的执行框架下，如何为模型使能图模式？
-4. 适配和调试过程中最常见的问题是什么，应该如何排查？
+PyTorch 默认使用 `eager` 模式执行模型，可以理解为“边解释边执行”：如下图所示，模型前向执行到某个位置时，框架才把当前位置对应的算子逐个下发到 Device。该模式开发和调试都比较直接，但在大模型推理场景中，尤其是 Decode 阶段，单次输入 token 数少、算子粒度小，Host 侧逐算子下发和运行时调度开销容易暴露出来，最终形成 host bound。
 
----
+```mermaid
+block-beta
+  columns 13
+  s0["CPU Time"]:2 d1["下发<br/>kernel 1"]:2 d2["下发<br/>kernel 2"]:2 d3["下发<br/>kernel 3"]:2 dd["…"]:2 dn["下发<br/>kernel n"]:2 space:1
+  s1["NPU Time"]:2 space:1 e1["执行<br/>kernel 1"]:2 e2["执行<br/>kernel 2"]:2 e3["执行<br/>kernel 3"]:2 ed["…"]:2 en["执行<br/>kernel n"]:2
 
-## 2. 图模式基础知识
+  d1 --> e1
+  d2 --> e2
+  d3 --> e3
+  dn --> en
 
-### 2.1 什么是图模式
+  classDef hdr fill:#eee,stroke:#999,color:#000
+  classDef host fill:#5B9BD5,color:#fff,stroke:#1F4E79
+  classDef dev fill:#70AD47,color:#fff,stroke:#385723
 
-pytorch 默认按照`eager` 模式，可以理解为“边解释边执行”的模式。模型前向走到哪里，框架就把当前位置对应的算子逐个下发到 Device 执行，开发和调试都比较直接，但在推理场景下也更容易暴露 Host 侧逐算子下发的开销。  
-在图模式下，前向逻辑会先被 `torch.compile` 捕获为图，再交给 NPU 后端编译和执行。这样做的核心收益是：
+  class s0,s1 hdr
+  class d1,d2,d3,dd,dn host
+  class e1,e2,e3,ed,en dev
+```
 
-- 减少 Host 逐算子下发开销，缓解 host bound。
-- 让后端在更大范围上做算子融合、内存复用、调度优化。
+<div align="center">图 1　eager 模式：Host 与 Device 交替下发和执行算子</div>
 
-这通常可以显著降低时延。
+图模式优化的目标是将模型前向逻辑提前捕获为计算图，再交给 NPU 后端统一编译和执行。后端获得更完整的计算图之后，可以在更大范围内进行算子融合、内存复用、调度优化和下沉执行，图模式下 Host 只需一次性下发整张图（图内已固定 1 > 2 > 3 > n 的执行顺序），Device 即可连续执行各算子，从而减少 Host 侧下发开销，缩短端到端时延。
+```mermaid
+block-beta
+  columns 14
+  s0["CPU Time"]:2 g["下发<br/>图（1 &gt; 2 &gt; 3 &gt; n）"]:4 space:8
+  s1["NPU Time"]:2 space:4 e1["执行<br/>kernel 1"]:2 e2["执行<br/>kernel 2"]:2 e3["执行<br/>kernel 3"]:2 ed["…"]:1 en["执行<br/>kernel n"]:2
 
-### 2.2 为什么图模式通常只用于 decode
+  g --> e1
 
-对 LLM 推理来说，`prefill` 和 `decode` 的特征差异很大：
+  classDef hdr fill:#eee,stroke:#999,color:#000
+  classDef host fill:#5B9BD5,color:#fff,stroke:#1F4E79
+  classDef dev fill:#70AD47,color:#fff,stroke:#385723
 
-| 阶段 | 输入特征 | 是否适合图模式 | 原因 |
-|------|----------|----------------|------|
-| `prefill` | 序列长度动态变化，序列通常较长 | 通常不建议 | shape 和控制流容易变化，容易断图或重编译；同时 prefill 阶段单次算子执行时间更长，下发 bound 往往没有 decode 明显 |
-| `decode` | 单 token 或固定小长度输入 | 推荐 | shape 更稳定，更容易形成可复用图 |
+  class s0,s1 hdr
+  class g host
+  class e1,e2,e3,ed,en dev
+```
 
-### 2.3 什么是编译缓存
+<div align="center">图 2　图模式：Host 一次性下发整图，Device 连续执行</div>
 
-图模式除了“如何编译”，还有一个经常一起出现的概念：**编译缓存**，也就是 `cache compile`。
+对 LLM 推理来说，`prefill` 和 `decode` 对图模式的适配价值并不相同：
 
-它解决的问题是**重复启动或重复执行同一图时的启动开销**。  
-如果模型结构、输入 shape、dtype 和图模式配置等保持稳定，把第一次编译的结果缓存下来，后续运行可以直接复用缓存，减少启动开销。
-需要注意的是，编译缓存是否命中，强依赖模型代码、缓存目录和图模式配置是否一致。
+| 阶段 | 输入特征 | 图模式适配建议 | 原因 |
+| --- | --- | --- | --- |
+| `prefill` | 序列长度动态变化，单次计算量较大 | 通常保持 eager | shape 与控制流更容易变化，且算子执行时间较长，Host 下发开销占比相对较低 |
+| `decode` | 单 token 或固定小长度输入 | 推荐使用图模式 | shape 更稳定，算子更小，更容易复用已编译图并降低下发开销 |
 
----
+因此，在 cann-recipes-infer 当前执行框架中，图模式主要用于 Decode 阶段；Prefill 阶段默认仍走 eager 路径。
 
-## 3. NPU 图模式的支持方式
+除了普通图编译外，图模式还经常与编译缓存一起使用。编译缓存也称为 `cache compile`，用于保存第一次图编译的结果。当模型结构、输入 shape、dtype、缓存目录和图模式配置保持一致时，后续启动或重复运行可以直接复用缓存，减少首次编译带来的启动开销。
 
-### 3.1 实现方式
+## 2. 原理
 
-NPU 图模式实现方式可以归纳为两大类：
+### 2.1 图模式的基本原理
 
-1. **GE 图模式**：将 FX 图转换成 Ascend IR，再由 GE 引擎编译执行
+图模式的核心是“捕获一次、多次回放”：第一次运行时把模型前向捕获并编译成一张可复用的图，后续运行在满足复用条件时直接回放，从而省去逐算子下发和重复编译的开销。下面以 `npugraph_ex` 为例，说明这一过程涉及的几个关键环节。
 
-2. **npugraph_ex 图模式**：基于 npugraph capture & replay，强调下沉调度和低开销执行
+1. Dynamo compile：一个 Python 级的 Just-In-Time（JIT）编译器。它在运行时重写 Python 字节码，把模型前向中的 PyTorch 操作序列提取到一张 FX 图中，再交给可定制的后端（此处为 `npugraph_ex`）进行编译。
+2. Guards：Dynamo 编译时会生成一组 Guards（对输入 shape、dtype、部分标量等的假设），并在每次执行前先执行 Guards 校验，用于区分当前程序是否需要被重新捕获与编译——Guards 全部命中则复用已有图，否则触发重新捕获与编译。
+3. aclgraph Capture：`npugraph_ex` 将 Stream 上的任务捕获到 Device 侧，把一段稳定的 NPU 执行过程（kernel 序列与内存布局）固化为可低开销回放的执行序列。
+4. Input 处理：回放前，将图内 input 类参数的输入地址更新为图实际运行时的输入地址。若输入 Tensor 的格式为私有格式（如 `FRACTAL_NZ`），其私有格式信息会被保留。
+5. Replay：Device 基于给定的输入执行已捕获的图，进行真正的计算并得到输出结果。
 
-### 3.2 为什么文档里还会看到 `acl_graph`
+```mermaid
+flowchart LR
+    FW["模型前向<br/>Python 逻辑"] --> Dyn["Dynamo compile<br/>重写字节码 → FX 图"]
+    Dyn --> Cap["aclgraph Capture<br/>捕获 Stream 任务到 Device"]
+    Run["每次运行"] --> Guard{"Guards 校验"}
+    Guard -->|命中| Inp["Input 处理"]
+    Guard -->|未命中| Dyn
+    Inp --> Replay["Replay<br/>Device 计算并输出"]
+```
 
-仓内存在一部分较早的模型代码和文档，仍然使用 `acl_graph` 这个历史命名，实际阅读时通常可以把它对应到 `npugraph_ex` 这一路图模式。但注意：
-- 新接入模型时，优先使用执行框架的 `ge_graph` / `npugraph_ex` 配置。
-- 后续会逐步废弃 `acl_graph`，并清理对应实现和文档。
+<div align="center">图 3　npugraph_ex 捕获与复用流程</div>
 
-### 3.3 两种方式如何选择
+在 cann-recipes-infer 中，上述捕获与编译发生在 warm-up 阶段：warm-up 会先跑一遍 Decode 以触发 Dynamo compile 和 aclgraph Capture，把图编译好并缓存下来；后续正式推理时不再重新编译，而是直接复用 warm-up 阶段编好的图，仅走 Guards 校验、Input 处理和 Replay 环节，因此图编译开销不落在正式推理的关键路径上。
 
-目前建议：
+因此，图模式收益的前提是 Guards 稳定命中。Decode 阶段 shape 稳定、算子固定，天然适合复用同一张图；这也解释了为什么图模式主要用于 Decode，并要求模型侧保持输入 shape 和常驻 buffer 地址稳定（详见 [§3.2 模型代码需要满足的条件](#32-模型代码需要满足的条件)）。
 
-- **优先功能稳定、性能更优**：选择 `ge_graph`。当然，`npugraph_ex` 也在持续优化中，本文档会持续更新。
-- **优先适配更轻量，使用体验更接近 eager 模式**：选择 `npugraph_ex`，是本仓后续主推的模式。
+#### 2.1.1 编译缓存的原理
 
----
+上述捕获与编译默认只在进程内生效：warm-up 阶段编好的图缓存在内存中，进程退出后即失效，下次启动仍需重新执行 Dynamo compile 与 aclgraph Capture。编译缓存（compile cache）在此基础上进一步把编译结果持久化到磁盘，使其可以跨进程、跨启动复用，原理可参考 [npugraph_ex 编译缓存](https://www.hiascend.com/document/detail/zh/Pytorch/2600/modthirdparty/torchairuseguide/docs/zh/npugraph_ex/advanced/compile_cache.md)。
 
-## 4. cann-recipes-infer 如何使能图模式
+其核心思路是把一次完整编译的产物落盘保存：
 
-### 4.1 使能链路
+1. 首次编译：`cache_compile` 完成 Dynamo compile、图优化和 aclgraph Capture 后，把编译产物（图结构、kernel 序列、内存布局等）序列化写入 `cache_dir`。
+2. 缓存命中：后续启动时，`cache_compile` 在 `cache_dir` 中查找匹配项。命中则直接从磁盘加载已编译的图，跳过 Dynamo compile 与 Capture，直接进入 Guards 校验、Input 处理和 Replay。
+3. 缓存失效：若模型代码、输入 shape / dtype、编译配置或 `cache_dir` 中任意一项发生变化，缓存视为未命中，回退到首次编译流程并重新落盘。
 
-1. 配置层：
-   - `executor/core/config/inference_config.py`
-   - 通过 `model_config.exe_mode` 选择 `eager` / `ge_graph` / `npugraph_ex`
+编译缓存与 §2.1 的图复用是两个层次的复用：图复用解决的是“同一进程内多次 Decode 复用同一张图”，编译缓存解决的是“跨进程 / 跨启动复用编译产物”，避免每次启动都重新承担图编译开销。
 
-2. 预热层：
-   - `executor/core/engine/execution_engine.py`
-   - `warm_up()` 会先跑一次 `prefill`，再跑一次 `decode`，如果启用了图模式，`decode` 预热阶段会触发编译
+### 2.2 图模式解决的问题
 
-3. 编译层：
-   - `executor/core/model_worker/model_worker.py`
-   - `compile_model()` 最终调用 `executor/utils/graph_utils.py` 中的 `compile_model_forward()`
+图模式主要解决两类问题：Host 调度开销和后端全局优化空间不足。
 
-4. 执行层：
-   - `ModelWorker.inference()` 中，只有 `not is_prefill` 且 `exe_mode in ["ge_graph", "npugraph_ex"]` 时，才走 `self.model_compiled(**model_inputs)`
+在 eager 模式下，Host 需要按 Python 前向逻辑逐步调度算子（见[§1 背景](#1-背景)图 1）。对 Decode 阶段的小算子来说，Device 上真实计算耗时可能并不长，Host 下发、同步和调度开销就会占据较大比例。图模式将前向过程转换为一张可复用计算图，使运行时可以按图整体调度（见[§1 背景](#1-背景)图 2），Host 只需一次性下发整图，Device 即可连续执行，减少逐算子进入 Python 和框架运行时的开销。
 
-5. 元数据层：
-   - `executor/utils/forward_metadata.py`
-   - `ForwardMetaData` 负责把 `is_prefill`、`kv_len`、`actual_seq_lengths_*`、`attention_mask` 等动态信息传给模型
+另一方面，eager 模式下后端每次看到的通常是局部算子，能够做的优化范围有限。图模式下，后端可以基于完整图结构分析数据依赖、生命周期和执行顺序，从而进行算子融合、常量折叠、内存复用、通信入图、多流调度等优化。
 
-需要注意的是，图模式开关只对 decode 阶段生效，prefill 阶段统一走 eager 模式。
+### 2.3 NPU 图模式的两类实现
 
-### 4.2 `graph_utils.compile_model_forward()` 核心逻辑解析
+NPU 图模式在本仓中主要有两类实现路径：`ge_graph` 和 `npugraph_ex`。两者都基于 TorchAir，完整能力和接口说明可参考 [TorchAir 文档总览](https://www.hiascend.com/document/detail/zh/Pytorch/2600/modthirdparty/torchairuseguide/docs/zh/overview.md)。
 
-`OfflineInference` 最终真正执行图编译的核心函数在 `../../executor/utils/graph_utils.py` 里的 `compile_model_forward()`。
-`npugraph_ex` 和 `ge_graph` 在这个函数里的主流程大体一致：先做通用准备，再根据 `exe_mode` 组织图编译配置，最后根据 `enable_cache_compile` 选择普通编译还是 `cache_compile`。差异主要在于配置承载方式，以及 `dynamic` 的默认取值不同。
+#### 2.3.1 GE 图模式
 
-#### 通用准备逻辑
+GE 图模式会将 `torch.compile` 捕获到的 FX 图转换为 Ascend IR，再由 GE 引擎进行编译和执行。该路径更强调图编译期优化，适合将计算、通信、多流、限核等信息表达进图内，由编译器统一分析和调度，具体细节可参考 [GE / Ascend IR 图模式](https://www.hiascend.com/document/detail/zh/Pytorch/2600/modthirdparty/torchairuseguide/docs/zh/ascend_ir/features) 各文档 。
+
+GE 图模式的典型特征包括：
+
+1. 图内表达能力更强，适合承载 TorchAir scope、通信入图、图内多流等能力。
+2. 编译配置主要通过 `CompilerConfig.experimental_config` 承载。
+3. 普通编译后端使用 `torchair.get_npu_backend(...)`。
+4. 缓存编译使用 `torchair.inference.cache_compile(...)`。
+
+#### 2.3.2 npugraph_ex 图模式
+
+npugraph_ex 基于 npugraph capture & replay，核心思路是捕获一段稳定的 NPU 执行过程，并在后续 Decode 中低开销 replay，具体细节可参考 [npugraph_ex 后端](https://www.hiascend.com/document/detail/zh/Pytorch/2600/modthirdparty/torchairuseguide/docs/zh/npugraph_ex/basic/force_eager.md) 各文档。它的使用体验更接近 eager，模型代码中的 Stream / Event 等对象也更接近运行时显式对象。
+
+npugraph_ex 的典型特征包括：
+
+1. 适配路径相对轻量，便于从 eager 代码逐步迁移。
+2. 编译配置主要通过 `options` kwargs 传入。
+3. 普通编译后端使用 `backend="npugraph_ex"`。
+4. 缓存编译使用 `torch.npu.npugraph_ex.inference.cache_compile(...)`。
+
+>注意：仓内部分早期模型代码和文档仍会出现 `acl_graph` 命名。实际阅读时，通常可以将它理解为早期图模式路径，与当前 `npugraph_ex` 方向关系更近。新接入模型时，应优先使用执行框架中的 `ge_graph` / `npugraph_ex` 配置；历史 `acl_graph` 命名后续会逐步收敛和清理。
+
+### 2.4 两种图模式的选择
+
+两种模式没有绝对的优劣，选择时需要结合模型适配成本、功能稳定性和性能目标。
+
+| 对比项 | `ge_graph` | `npugraph_ex` |
+| --- | --- | --- |
+| 适配目标 | 更完整的图编译和后端优化 | 更接近 eager 的 capture / replay |
+| 配置承载 | `CompilerConfig.experimental_config` | `options` kwargs |
+| 编译后端 | `torchair.get_npu_backend(...)` | `backend="npugraph_ex"` |
+| 缓存编译接口 | `torchair.inference.cache_compile(...)` | `torch.npu.npugraph_ex.inference.cache_compile(...)` |
+| 常见 `dynamic` 配置 | `False` | `True` |
+| 典型增强能力 | [frozen_parameter](https://www.hiascend.com/document/detail/zh/Pytorch/2600/modthirdparty/torchairuseguide/docs/zh/ascend_ir/features/advanced/frozen_parameter.md)、[tiling_schedule_optimize](https://www.hiascend.com/document/detail/zh/Pytorch/2600/modthirdparty/torchairuseguide/docs/zh/ascend_ir/features/advanced/tiling_schedule_optimize.md)、[topology_sorting_strategy](https://www.hiascend.com/document/detail/zh/Pytorch/2600/modthirdparty/torchairuseguide/docs/zh/ascend_ir/features/advanced/topology_sorting_strategy.md) | [static_kernel_compile](https://www.hiascend.com/document/detail/zh/Pytorch/2600/modthirdparty/torchairuseguide/docs/zh/npugraph_ex/basic/static_kernel_compile.md)、[frozen_parameter](https://www.hiascend.com/document/detail/zh/Pytorch/2600/modthirdparty/torchairuseguide/docs/zh/npugraph_ex/basic/frozen_parameter.md) |
+
+当前建议是：优先选择 `npugraph_ex`，可以降低适配成本、保留更接近 eager 的开发体验。
+
+需要注意的是，`npugraph_ex` 当前常保持 `dynamic=True`，并不是因为图本身必须动态，而是与当前推理场景中部分 FIA 算子接口有关。例如部分 `actual_seq_lengths` 入参仍常以 `list[int]` 形式传入，如果强行静态化，容易触发重编译。后续算子接口补齐 Tensor 输入后，这类配置可以继续收敛。
+
+## 3. 实现方式
+
+图模式的接入可以拆成两步：先用 `torch.compile` 配合对应后端，把模型前向（通常是 Decode 前向）编译成可复用的图；再让模型代码满足图捕获和图复用的约束。本章先说明两种模式的编译接口与缓存编译接口，再说明模型代码需要满足的条件与 FIA 算子适配。
+
+### 3.1 编译接口
+
+接口实现细节可对照 [框架图编译](../../executor/utils/graph_utils.py)，图编译前通常都需要一段通用准备：
 
 ```python
 import torchair as tng
@@ -107,164 +168,211 @@ tng.patch_for_hcom()
 torch._dynamo.config.inline_inbuilt_nn_modules = False
 ```
 
-- `tng.patch_for_hcom()` 是用来处理集合通信入图的；在 PyTorch 2.6 及之后版本中，这一步通常可以省略。
-- `inline_inbuilt_nn_modules = False` 用于避免内建模块被过度内联，减少部分图编译场景下的不确定性。
+- `tng.patch_for_hcom()`：处理集合通信入图；在 PyTorch 2.6 及之后版本中通常可以省略。
+- `inline_inbuilt_nn_modules = False`：避免内建模块被过度内联，降低部分图编译场景下的不确定性。
 
-#### 两种图模式的主要差异
+两种模式都通过 `torch.compile` 使能，区别主要在 `backend` 与配置承载方式。编译得到的 `model_compiled` 与原始 `model` 的调用方式一致，用相同的关键字入参调用即可触发图执行 / replay。
 
-真正需要开发者关注的差异主要有下面几项：
 
-| 项目 | `npugraph_ex` 模式 | `ge_graph` 模式 |
-|------|--------------------|-----------------|
-| 配置承载方式 | 通过 `options` kwargs 传入 | 通过 `CompilerConfig.experimental_config` 成员配置 |
-| 普通编译后端 | `backend="npugraph_ex"` | `backend=tng.get_npu_backend(...)` |
-| 缓存编译接口 | `torch.npu.npugraph_ex.inference.cache_compile(...)` | `tng.inference.cache_compile(...)` |
-| `dynamic` 设置 | `True` | `False` |
-| 配置项 | `static_kernel_compile` / `frozen_parameter` | `frozen_parameter` / `tiling_schedule_optimize` / `topology_sorting_strategy` |
+#### 3.1.1 ge_graph
 
-补充说明：当前 `npugraph_ex` 模式之所以保持 `dynamic=True`，核心原因并不是图本身必须动态，而是当前配套使用的 FIA 算子接口里，`actual_seq_lengths` 等入参还不支持 Tensor 输入，只支持 `list[int]` 输入。在这种前提下如果强行使用 `dynamic=False`，容易触发重编译。后续算子接口补齐 Tensor 输入支持，这里的配置也会随之调整。
+`ge_graph` 使用 TorchAir 提供的 NPU 后端，可参考 [GE 图模式快速上手](https://gitcode.com/Ascend/torchair/tree/master/docs/zh/ascend_ir/quick_start.md)，编译配置通过 `CompilerConfig` 承载：
 
-### 4.3 图模式适配里最常见的两个问题
+```python
+import torchair as tng
+from torchair import CompilerConfig
 
-- **Graph Break**：图捕获过程中断，部分逻辑回退到 Python/Eager 执行。一般需要通过减少 Python 控制流、避免 `.item()`、补齐入图适配来解决。
-- **Recompile**：虽然能入图，但由于 shape、地址或 guard 条件变化，导致反复重新编译，性能变差。一般需要通过固定 shape、固定缓存地址，并把动态量改为显式输入来解决。
+compile_config = CompilerConfig()
+# 按需在 config.experimental_config 上开启图内优化
+model_compiled = torch.compile(
+    model,
+    backend=tng.get_npu_backend(compiler_config=compile_config),
+    dynamic=False,
+    fullgraph=True,
+)
+```
 
-### 4.4 模型适配时必须满足的条件
+接口说明：
 
-仅仅打开 `exe_mode` 不够。模型本身需要满足图模式约束。
+- `tng.get_npu_backend(compiler_config=config)`：返回 GE 图模式的编译后端，作为 `torch.compile` 的 `backend`。
+- `CompilerConfig`：GE 图模式的配置入口，`frozen_parameter`、`tiling_schedule_optimize`、`topology_sorting_strategy` 等图内优化通过 `config.experimental_config` 开启。
+- `dynamic=False`：Decode 阶段 shape 稳定，固定为静态可减少重编译。
 
-#### 条件一：模型必须先能在 eager 下稳定运行
+开启缓存编译后，`torch.compile` 替换为 `torchair.inference.cache_compile`，首次运行时把编译结果落盘到 `cache_dir`，后续命中缓存即可跳过重新编译，具体细节与参数可参考 [ge_graph 编译缓存说明](https://www.hiascend.com/document/detail/zh/Pytorch/2600/modthirdparty/torchairuseguide/docs/zh/ascend_ir/features/advanced/compile_cache.md)：
 
-图模式不会修复 eager 下本来就存在的错误。
+```python
+import torchair as tng
 
-#### 条件二：prefill 和 decode 要明确区分
+model_compiled = tng.inference.cache_compile(
+    model_forward,
+    cache_dir=cache_dir,     # 编译缓存落盘目录，需固定且可写
+    config=compiler_config,  # 与普通编译一致的 CompilerConfig
+    dynamic=False,
+    fullgraph=True,
+    ge_cache=True,           # 同时复用 GE 编译缓存
+)
+```
 
-推荐做法：
+#### 3.1.2 npugraph_ex
 
-- `prefill` 保持 eager
-- `decode` 使用图模式
-- 用 `forward_metadata.is_prefill` 或独立的 `prefill()/decode()` 方法区分两条路径
+`npugraph_ex` 直接以字符串指定后端，可参考 [npugraph_ex 快速上手](https://gitcode.com/Ascend/torchair/tree/master/docs/zh/npugraph_ex/quick_start.md)，配置通过 `options` kwargs 传入：
 
-#### 条件三：将动态信息以显式输入形式传入模型
+```python
+options = {
+    # 例如 static_kernel_compile / frozen_parameter 等增强开关
+}
+model_compiled = torch.compile(
+    model,
+    backend="npugraph_ex",
+    dynamic=enable_dynamic_graph,
+    fullgraph=True,
+    options=options,
+)
+```
 
-典型动态信息包括：
+接口说明：
 
-- `kv_len`
-- `position_ids`
-- `actual_seq_lengths_q`
-- `actual_seq_lengths_kv`
-- `is_prefill`
+- `backend="npugraph_ex"`：选择 npugraph capture & replay 后端。
+- `options`：npugraph_ex 的配置承载方式，`static_kernel_compile`、`frozen_parameter` 等增强能力通过它传入。
+- `dynamic=enable_dynamic_graph`：`enable_dynamic_graph` 是可控参数，需结合模型的输入形态选择。当前推理场景中，若部分 FIA 接口仍以 `list[int]` 形式传入 `actual_seq_lengths`，应保持 `enable_dynamic_graph=True`，避免强行静态化触发重编译；若模型不存在这类 `list` 输入（例如 deepseek_v4），则建议选择静态图，即 `enable_dynamic_graph=False`，以获得更稳定的图复用和更低的下发开销。
 
-这些信息应该由框架构造后传给模型，而不是在模型内部临时生成 Python 标量或依赖隐式状态推导。
+开启缓存编译后，`torch.compile` 替换为 `torch.npu.npugraph_ex.inference.cache_compile`，首次运行时把编译结果落盘到 `cache_dir`，后续命中缓存即可跳过重新编译，具体细节与参数可参考 [npugraph_ex 编译缓存说明](https://www.hiascend.com/document/detail/zh/Pytorch/2600/modthirdparty/torchairuseguide/docs/zh/npugraph_ex/advanced/compile_cache.md)：
 
-#### 条件四：KV Cache 和常驻 buffer 需要预分配并原地更新
+```python
+model_compiled = torch.npu.npugraph_ex.inference.cache_compile(
+    model_forward,
+    cache_dir=cache_dir,           # 编译缓存落盘目录，需固定且可写
+    dynamic=enable_dynamic_graph,  # 与普通编译一致
+    options=compile_options,       # 与普通编译一致的后端 options
+)
+```
 
-错误示例：
+> 无论哪种模式，缓存是否命中都取决于模型代码、输入规格（shape / dtype）、编译配置和 `cache_dir` 是否保持一致；任意一项发生变化都会导致缓存失效并重新编译。因此使用缓存编译时应固定缓存目录，并保持模型代码、shape、dtype 和编译配置稳定。
+
+### 3.2 模型代码需要满足的条件
+
+仅完成上述编译接入不足以保证图模式可用。模型前向本身需要满足图捕获和图复用的约束。
+
+#### 3.2.1 eager 路径先稳定
+
+图模式不会修复 eager 下本来就存在的功能或精度问题。接入图模式前，应先确保模型在 eager 下可以稳定完成 Prefill 和多轮 Decode，并且输出精度符合预期。
+
+#### 3.2.2 Prefill 与 Decode 明确区分
+
+推荐将 Prefill 和 Decode 的执行路径明确区分：
+
+1. Prefill 保持 eager。
+2. Decode 使用图模式。
+3. 使用 `forward_metadata.is_prefill` 或独立的 `prefill()` / `decode()` 方法区分两条路径。
+
+这样可以避免 Prefill 的动态 shape 和控制流影响 Decode 图的稳定性。
+
+#### 3.2.3 动态信息显式传入
+
+典型动态信息包括 `kv_len`、`position_ids`、`actual_seq_lengths_q`、`actual_seq_lengths_kv` 和 `is_prefill`。这些信息应由框架构造后作为显式输入传给模型，而不是在模型内部临时生成 Python 标量，或依赖隐式全局状态推导。
+
+#### 3.2.4 KV Cache 与常驻 buffer 原地更新
+
+Decode 图复用要求关键输入的 shape 和地址尽量稳定。因此 KV Cache、attention mask、position buffer 等常驻数据应预分配，并在运行时原地更新。
+
+不推荐写法：
 
 ```python
 key = torch.cat([past_key, new_key], dim=1)
 ```
 
-推荐示例：
+推荐写法：
 
 ```python
 torch_npu.scatter_update_(k_cache, kv_len, key_states, -2)
 torch_npu.scatter_update_(v_cache, kv_len, value_states, -2)
 ```
 
-目标是：
+目标是避免 Decode 过程中 KV Cache 的 shape 或地址发生变化，从而减少 dynamo guard 失败和重编译。
 
-- 避免 decode 场景下 KV Cache 的 shape 或地址发生变化，以减少 dynamo guard 失败和重编译
+#### 3.2.5 避免 Graph Break 写法
 
-#### 条件五：避免典型的 Graph Break 写法
+图捕获过程中应尽量避免以下写法：
 
-尤其要避免：
+1. `tensor.item()`。
+2. 基于 Tensor 值的 Python `if` / `while`。
+3. 在 `forward` 内部临时创建影响 shape 的控制分支。
+4. 根据 Python list / tuple 长度变化切换图内控制流。
 
-- `tensor.item()`
-- 基于 Tensor 值的 Python `if/while`
-- 在 forward 内部临时创建影响 shape 的控制分支
-- 根据 Python list/tuple 长度变化来切换图内控制流
 
-### 4.5 FIA 融合算子适配建议
+## 4. 具体网络样例
 
-不同模式下，FIA算子的接口入参有所区别，推荐按照如下方式使用：
+### 4.1 Qwen3-MoE：Decode 图模式适配
 
-| 模式 | 常见 FIA 接口 | `actual_seq_lengths` 建议 | 说明 |
-|------|--------------|---------------------------|------|
-| `ge_graph` | `torchair.ops` | Tensor | 只适合 GE 图模式 |
-| `npugraph_ex` | `torch_npu` | 常见为 `list[int]` | 当前以推理场景的 FIA 接口为主，后续算子支持变化时再调整 |
+Qwen3-MoE 的图模式适配体现了本仓 Decode 图模式的典型做法：Prefill 保持 eager，Decode 根据 `exe_mode` 切换到 `ge_graph` 或 `npugraph_ex`，并对 FIA 接口和动态输入进行模式化处理。
 
-可以参考qwen3-moe的样例代码：
+#### 4.1.1 关键路径
 
-- `models/qwen3_moe/models/modeling_qwen3_moe.py` 在 decode 且 `enable_gegraph` 时，会切到 `torchair.ops`
-- `ExecutionEngine` 在 `npugraph_ex` decode 模式下，会把 `actual_seq_lengths_*` 转成 `list`
+关键路径分为两个阶段：warm-up 阶段封装输入并完成 Decode 图编译，正式推理阶段直接复用编好的图。
 
----
+```mermaid
+flowchart LR
+    subgraph WarmUp["warm-up 阶段"]
+        WInput["封装 Decode 输入"] --> Compile["Decode 图编译"]
+        Compile
+    end
+    subgraph Infer["正式推理阶段"]
+        Reuse["复用已编译图"] --> Replay["校验并 Replay"]
+    end
+    Compile --> Reuse
+```
 
-## 5. 模型接入图模式的推荐步骤
+<div align="center">图 4　Decode 图模式关键路径</div>
 
-建议按下面的顺序推进，而不是一次性把所有优化叠加上去。
+warm-up 阶段先封装好 `kv_len`、`actual_seq_lengths_*`、`position_ids` 等 Decode 输入，并跑一遍 Decode 触发图编译，把编好的图缓存下来；正式推理时不再重新编译，而是直接复用 warm-up 阶段编好的图，仅走 Guards 校验、Input 处理和 Replay 环节，使图编译开销不落在正式推理的关键路径上。
 
-1. 先跑通 eager 模式并确认精度正确。
-2. 消除 graph break 和重编译风险，去掉 `.item()` 和动态 Python 控制流，固定 KV cache 与常驻 buffer 的地址和 shape，并明确 `actual_seq_lengths` 的类型与来源。
-3. 做功能、精度验证，对比 eager 和 graph 输出，至少覆盖一轮 prefill + 多轮 decode；如果模型有 MTP，还要确认 main model 和 MTP model 的图模式输入 shape、dtype 和长度组织方式都稳定。
-4. 最后再按需开启增强特性，例如 `enable_cache_compile`、`enable_static_kernel`（仅 `npugraph_ex`）、model 自带的 `enable_superkernel`（目前仅 `ge_graph`），以及多流、限核等能力。
+#### 4.1.2 GE 图模式
 
----
+在 `ge_graph` 模式下，模型优先使用适合入 GE 图的 `torchair.ops` 接口，并将 `actual_seq_lengths` 等动态长度信息组织为 Tensor 输入。这样后端可以在图内追踪数据依赖，并配合 GE 编译器完成图优化。
 
-## 6. 常见 Troubleshooting
+#### 4.1.3 npugraph_ex 图模式
 
-### 6.1 高频问题速查表
+在 `npugraph_ex` 模式下，模型更接近 eager 执行语义，常用 `torch_npu` 推理接口。当前仓内执行链路会在 Decode 阶段将部分 `actual_seq_lengths_*` 转换为 `list[int]`，以匹配现有 FIA 接口要求。接入时需要保证这些 list 的长度组织方式稳定，避免 replay 过程中触发重编译或捕获失败。
+
+### 4.2 图模式与增强特性叠加
+
+图模式通常不是单独存在的优化开关，而是会与缓存编译、静态 kernel、多流（[NPU 多流原理](./multi_stream_principles.md)）、预取（[NPU Prefetch 原理](./prefetch_principles.md)）、superkernel（[NPU superkernel 原理](./super_kernel.md)）等能力组合使用。推荐按下面的顺序推进：
+
+1. 先跑通 eager，并完成功能与精度验证。
+2. 打开图模式，消除 graph break 和 recompile。
+3. 对比 eager 与 graph 输出，至少覆盖一轮 Prefill 和多轮 Decode。
+4. 再按需开启 `enable_cache_compile`、`enable_static_kernel`、多流、限核或模型自带的 `enable_superkernel`。
+
+其中，`enable_static_kernel` 当前仅用于 `npugraph_ex` 相关路径，算子在 `ge_graph` 的静态图中默认是静态算子；`enable_superkernel` 当前主要在 `ge_graph` 模式下尝试。不同增强特性的适用范围不同，接入时需要结合模型配置和当前后端能力确认。
+
+### 4.3 常见问题与调试
+
+#### 4.3.1 高频问题速查
 
 | 现象 | 常见根因 | 处理建议 |
-|------|----------|----------|
-| 编译前就报错 | eager 路径本身不正确，或者模型输入的 shape、dtype、长度组织方式不稳定 | 先单独验证 eager，再检查图模式输入和前向参数组织 |
-| 图捕获中断（Graph Break） | `.item()`、Tensor 驱动的 Python 分支、print、自定义算子未适配 | 改写为 Tensor 逻辑，或补齐入图适配 |
-| decode 性能没有提升甚至变差 | 发生重编译；`kv_len`、`actual_seq_lengths_*`、缓存地址或输入 shape 不稳定 | 打开 `torch._logging.set_logs(recompiles=True)` 检查重编译原因，重点关注 guard 变化来源 |
-| `actual_seq_lengths` 类型报错 | 图模式与 FA 接口不匹配 | `ge_graph` 优先 Tensor + `torchair.ops`，`npugraph_ex` 对齐本仓当前 `list[int]` 方案 |
-| `enable_static_kernel` 报错 | 模式不对 | 该选项只允许在 `npugraph_ex` 模式使用 |
-| `superkernel` 相关报错 | 在不支持的模式上开启 | 目前只在 `ge_graph` 模式尝试 |
-| 通信无法入图 | 当前依赖版本要求的集合通信入图前置处理没有完成 | 结合当前 PyTorch / TorchAir 版本检查是否需要 `torchair.patch_for_hcom()` 或其他等效前置配置 |
-| cache compile 不生效 | 缓存目录、输入 shape / dtype / 长度组织方式或配置变化 | 固定 cache 目录，避免模型代码或编译参数频繁变化 |
-| 图模式下精度异常 | KV cache / FA / 原地更新语义变化 | 先回退到 eager 对齐，再逐项恢复优化 |
+| --- | --- | --- |
+| 编译前报错 | eager 路径本身不正确，或模型输入 shape、dtype、长度组织方式不稳定 | 先单独验证 eager，再检查图模式输入和前向参数 |
+| 图捕获中断 | `.item()`、Tensor 驱动的 Python 分支、`print`、自定义算子未适配 | 改写为 Tensor 逻辑，或补齐入图适配 |
+| Decode 性能没有提升甚至变差 | 发生重编译，或图执行没有命中预期优化 | 打开重编译日志，检查 guard 变化、shape、地址和缓存命中情况 |
+| `actual_seq_lengths` 类型报错 | 图模式与 FIA 接口不匹配 | `ge_graph` 优先 Tensor + `torchair.ops`，`npugraph_ex` 对齐当前 `list[int]` 方案 |
+| `enable_static_kernel` 报错 | 开启模式不匹配 | 该选项只在 `npugraph_ex` 模式下使用 |
+| `superkernel` 相关报错 | 在不支持的模式上开启 | 当前主要在 `ge_graph` 模式下尝试 |
+| 通信无法入图 | 集合通信入图前置处理不完整 | 结合 PyTorch / TorchAir 版本检查是否需要 `torchair.patch_for_hcom()` |
+| cache compile 不生效 | 缓存目录、输入规格或编译配置发生变化 | 固定 cache 目录，保持模型代码、函数名称、Tensor shape、dtype 和配置稳定 |
+| 图模式下精度异常 | KV Cache、FA 接口或原地更新语义变化 | 回退到 eager 对齐，再逐项恢复图模式优化 |
 
-### 6.2 常用调试手段
+#### 4.3.2 常用调试手段
 
-实践中常用的调试手段包括：
+实践中常用的调试方式包括：
 
-- `torch._logging.set_logs(recompiles=True)`：出现重编译时打开相关日志
-- eager / graph 输出比对：看功能、精度是否一致
-- cache compile 开关测试：区分“图编译问题”还是“缓存命中问题”
+1. 打开重编译日志：
+出现重编译时打开相关日志，固定输入 shape、KV Cache 地址和常驻 buffer，观察重编译是否消失。
+```python
+torch._logging.set_logs(recompiles=True)
+```
 
----
+2. 对比 eager / graph 输出，确认功能和精度一致。
+3. 分别测试普通编译和 `cache_compile`，区分图编译问题与缓存命中问题。
+4. 将优化特性逐项打开，避免一次性叠加导致问题来源不清晰。
 
-## 7. 参考资料
-
-### 仓内资料
-
-- [Offline Inference 执行机制设计文档](../design/executor_design.md#4-离线推理流程)
-- [InferenceConfig 类使用指南](../common/inference_config_guide.md)
-- [MTP 模型接入指南](../common/mtp_model_guide.md)
-
-### 官方资料
-
-- TorchAir 文档总览  
-  https://gitcode.com/Ascend/torchair/tree/master/docs/zh
-
-- GE / Ascend IR 图模式  
-  https://gitcode.com/Ascend/torchair/tree/master/docs/zh/ascend_ir/ascend_ir.md
-
-- GE 图模式快速上手  
-  https://gitcode.com/Ascend/torchair/tree/master/docs/zh/ascend_ir/quick_start.md
-
-- npugraph_ex 后端  
-  https://gitcode.com/Ascend/torchair/tree/master/docs/zh/npugraph_ex/npugraph_ex.md
-
-- npugraph_ex 快速上手  
-  https://gitcode.com/Ascend/torchair/tree/master/docs/zh/npugraph_ex/quick_start.md
-
-- 常见案例与定位方法  
-  https://gitcode.com/Ascend/torchair/tree/master/docs/zh/appendix/cases
-
-- FAQ  
-  https://gitcode.com/Ascend/torchair/tree/master/docs/zh/appendix/faq.md
+更多典型问题的定位思路和历史案例，可参考 TorchAir [常见案例与定位方法](https://gitcode.com/Ascend/torchair/tree/master/docs/zh/appendix/cases) 和 [FAQ](https://gitcode.com/Ascend/torchair/tree/master/docs/zh/appendix/faq.md)。
