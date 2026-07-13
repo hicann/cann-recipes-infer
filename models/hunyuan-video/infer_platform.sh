@@ -51,7 +51,7 @@ hf_download() {
 }
 
 ensure_torch_runtime() {
-    "$PYTHON_BIN" -m pip install "PyYAML" "numpy==1.26.4" > /dev/null || die "pip install torch_npu import dependencies failed"
+    "$PYTHON_BIN" -m pip install "$PIP_USER_FLAG"  "PyYAML" "numpy==1.26.4" > /dev/null || die "pip install torch_npu import dependencies failed"
 
     if "$PYTHON_BIN" -c "import torch, torch_npu" &>/dev/null; then
         echo "[platform] torch and torch_npu already installed, skipping runtime installation"
@@ -97,8 +97,8 @@ PYEOF
     download_with_sha256 "$torch_npu_url" "$wheel_dir/$torch_npu_wheel" "$torch_npu_sha256"
 
     echo "[platform] installing PyTorch runtime"
-    "$PYTHON_BIN" -m pip install "$wheel_dir/$torch_wheel" || die "install PyTorch wheel failed"
-    "$PYTHON_BIN" -m pip install "$wheel_dir/$torch_npu_wheel" || die "install torch_npu wheel failed"
+    "$PYTHON_BIN" -m pip install "$PIP_USER_FLAG"  "$wheel_dir/$torch_wheel" || die "install PyTorch wheel failed"
+    "$PYTHON_BIN" -m pip install "$PIP_USER_FLAG"  "$wheel_dir/$torch_npu_wheel" || die "install torch_npu wheel failed"
     "$PYTHON_BIN" -c "import torch, torch_npu" &>/dev/null || die "torch / torch_npu is still not importable after installation"
 }
 
@@ -112,6 +112,7 @@ REPO_ROOT=$(cd "$SCRIPT_PATH/../.." &>/dev/null && pwd)
 WORK_DIR=$(cd "$REPO_ROOT/.." &>/dev/null && pwd)
 PYTHON_BIN=${PYTHON_BIN:-$(command -v python)}
 PYTHON_BIN_DIR=$(dirname "$PYTHON_BIN")
+echo "[platform] using Python: $PYTHON_BIN ($($PYTHON_BIN --version 2>&1))"
 
 HUNYUAN_DIR="$SCRIPT_PATH"
 HUNYUAN_COMMIT="e260ed40c88d104801a8b1de05d2ab81e965a9ef"
@@ -126,6 +127,12 @@ echo "[platform] source CANN env: $CANN_SET_ENV"
 source "$CANN_SET_ENV"
 export PATH="$PYTHON_BIN_DIR:$PATH"
 export PYTHONNOUSERSITE=1
+
+if [ -z "$CONDA_PREFIX" ]; then
+    PIP_USER_FLAG="--user"
+else
+    PIP_USER_FLAG=""
+fi
 
 for _glx in /lib/aarch64-linux-gnu/libGLdispatch.so.0 /usr/lib/aarch64-linux-gnu/libGLdispatch.so.0; do
     if [ -f "$_glx" ]; then
@@ -157,8 +164,8 @@ fi
 
 echo "[platform] ensuring Python runtime dependencies"
 cd "$HUNYUAN_DIR" || die "cd $HUNYUAN_DIR failed"
-"$PYTHON_BIN" -m pip install -r requirements.txt > /dev/null || die "pip install requirements failed"
-"$PYTHON_BIN" -m pip install "huggingface_hub[cli]<1.0" > /dev/null || die "pip install huggingface_hub failed"
+"$PYTHON_BIN" -m pip install "$PIP_USER_FLAG"  -r requirements.txt > /dev/null || die "pip install requirements failed"
+"$PYTHON_BIN" -m pip install "$PIP_USER_FLAG"  "huggingface_hub[cli]<1.0" > /dev/null || die "pip install huggingface_hub failed"
 
 "$PYTHON_BIN" -c "import torch_npu" &>/dev/null || die "torch_npu is not importable in the active Python environment"
 

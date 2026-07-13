@@ -315,9 +315,11 @@ dit_cache:
 
 ## CANNLab一站式开发平台的快速启动
 
-本章节面向使用CANNLab一站式开发平台的用户，平台已预置完整的 CANN 环境，按以下步骤即可在单卡上完成 Hunyuan-Video 文生视频推理。
+本章节面向使用CANNLab一站式开发平台的用户，平台已预置完整的 CANN 环境和torch_npu环境，按以下步骤即可在单卡上完成 Hunyuan-Video 文生视频推理。
 
-### 1. 安装 Miniconda 并创建 Python 环境
+### 1. 安装 Miniconda 并创建 Python 虚拟环境 (可选)
+
+CANNLab一站式开发平台的裸机Python环境中预装了torch和torch_npu，如果用户想要自行管理虚拟环境，可选执行此步骤。
 
 若当前环境未预装 conda，在用户目录下安装 Miniconda（无需 root 权限）：
 
@@ -329,6 +331,13 @@ echo "source $HOME/miniconda3/etc/profile.d/conda.sh" >> ~/.bashrc   # 永久生
 ```
 
 说明：x86_64 机器将命令中的 `aarch64` 替换为 `x86_64`。
+
+初次创建conda环境需要接受 Anaconda 频道的 Terms of Service：
+
+```bash
+conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main
+conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r
+```
 
 创建并激活 Python 环境：
 
@@ -353,7 +362,7 @@ cd cann-recipes-infer/models/hunyuan-video
 bash infer_platform.sh
 ```
 
-前置条件：已完成 §1（conda 环境已激活）。脚本本身会依次完成：source CANN 环境脚本 → 安装 torch / torch_npu → 合入上游 HunyuanVideo 源码 → 通过 hf-mirror 下载权重 → 生成指向本地权重的临时 YAML → 启动单卡推理。各步骤均幂等，已完成的环节会自动跳过。
+前置条件：已完成 §1（可选：激活conda 环境）。脚本本身会依次完成：source CANN 环境脚本 → 安装 Python环境 → 合入上游 HunyuanVideo 源码 → 通过 hf-mirror 下载权重 → 生成指向本地权重的临时 YAML → 启动单卡推理。各步骤均幂等，已完成的环节会自动跳过。
 
 说明：`infer_platform.sh` 会读取 `/models/hunyuan-video/config/single_platform.yaml` 作为平台模板，目前默认规格为 81 帧 360*640。脚本会校验 torch / torch_npu wheel 的 SHA256，并固定上游 HunyuanVideo 源码 commit。普通 `infer.sh` 与CANNLab一站式开发平台启动互不影响。
 
