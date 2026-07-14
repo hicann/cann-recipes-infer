@@ -126,12 +126,12 @@ echo "[platform] source CANN env: $CANN_SET_ENV"
 [ -f "$CANN_SET_ENV" ] || die "CANN set_env.sh not found at $CANN_SET_ENV"
 source "$CANN_SET_ENV"
 export PATH="$PYTHON_BIN_DIR:$PATH"
-export PYTHONNOUSERSITE=1
 
 if [ -z "$CONDA_PREFIX" ]; then
     PIP_USER_FLAG="--user"
 else
     PIP_USER_FLAG=""
+    export PYTHONNOUSERSITE=1
 fi
 
 for _glx in /lib/aarch64-linux-gnu/libGLdispatch.so.0 /usr/lib/aarch64-linux-gnu/libGLdispatch.so.0; do
