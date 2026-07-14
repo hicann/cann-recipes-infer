@@ -246,10 +246,11 @@ class Compressor(nn.Module):
         else:
             sfa_cmp_cache = cache_getter("sfa_cmp_kv")
             if self.kv_cache_quant_mode == "float8" or self.kv_cache_quant_mode == "hifloat8":
-                torch.ops.custom.kv_compress_epilog(
+                torch.ops.cann_ops_transformer.kv_compress_epilog(
                     x=kv if is_prefill else kv.view(-1, self.head_dim),
                     slot_mapping=cmp_slot_mapping if is_prefill else cmp_slot_mapping.view(-1),
-                    kv_compress_cache=sfa_cmp_cache
+                    cache=sfa_cmp_cache.view(torch.uint8),
+                    quant_mode="fp8_bf16"
                 )
             else:
                 torch.ops.custom.scatter_nd_update_asc(sfa_cmp_cache.view(-1, sfa_cmp_cache.shape[-1]),

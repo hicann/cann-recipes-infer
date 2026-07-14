@@ -105,7 +105,10 @@ class AttnMetaData(nn.Module):
         if "float" in self.kv_cache_quant_mode:
             rope_dim = self.config.qk_rope_head_dim
             nope_dim = self.config.head_dim - rope_dim
-            cache_dim = align_up(nope_dim + 2 * rope_dim + nope_dim // 64, 128)
+            # when FA FP8 quant is enabled, nope_cache, rope_cache, and scales
+            # are concatenated and passed via the kv input (FP8).
+            # nope(fp8 1B) + rope(bf16 2B) + scales(bf16 2B per group, group_size=64)，align_up(128B)
+            cache_dim = align_up(nope_dim + 2 * rope_dim + 2 * nope_dim // 64, 128)
         self.cache_dim = cache_dim
 
     def get_cmp_kv_dtype(self):

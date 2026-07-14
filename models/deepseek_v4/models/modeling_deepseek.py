@@ -38,7 +38,7 @@ import torch.distributed as dist
 import torch_npu
 import torchair as tng
 import custom_ops
-
+import cann_ops_transformer
 from transformers.cache_utils import Cache
 from transformers.utils import (
     add_start_docstrings,
@@ -871,7 +871,7 @@ class Attention(nn.Module):
         if "float" in self.kv_cache_quant_mode:
             rope_dim = self.config.qk_rope_head_dim
             nope_dim = self.config.head_dim - rope_dim
-            cache_dim = align_up(nope_dim + 2 * rope_dim + nope_dim // 64, 128)
+            cache_dim = align_up(nope_dim + 2 * rope_dim + 2 * nope_dim // 64, 128)
             cmp_kv_dtype = torch.float8_e4m3fn
         return cache_dim, cmp_kv_dtype
 
@@ -1176,7 +1176,11 @@ class Attention(nn.Module):
         num_tokens, _ = x.size()
         enable_multi_streams = self.enable_multi_streams and self.platform_version != PlatformVersion.ASCEND_950
         x_scale = None
-        move_quant_before = "float8" in self.mm_quant_mode and self.cp_size == 1
+        fp8_quant_modes = {"w8a8float8", "w8a8mxfloat8"}
+        move_quant_before = (
+            self.cp_size == 1
+            and self.mm_quant_mode in fp8_quant_modes
+        )
         if self.cp_size == 1:
             if self.mm_quant_mode == "w8a8float8":
                 x_q, x_scale = torch_npu.npu_dynamic_block_quant(
@@ -1398,10 +1402,11 @@ class Attention(nn.Module):
         win_cache: torch.Tensor,
     ):
         if self.kv_cache_quant_mode == "float8" or self.kv_cache_quant_mode == "hifloat8":
-            torch.ops.custom.kv_compress_epilog(
+            torch.ops.cann_ops_transformer.kv_compress_epilog(
                     x=kv.view(-1, self.head_dim),
                     slot_mapping=win_kv_slot_mapping,
-                    kv_compress_cache=win_cache
+                    cache=win_cache.view(torch.uint8),
+                    quant_mode="fp8_bf16"
                 )
         else:
             torch.ops.custom.scatter_nd_update_asc(win_cache.view(-1, win_cache.shape[-1]),
@@ -2471,7 +2476,10 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
         if self.kv_cache_quant_mode == "float8" or self.kv_cache_quant_mode == "hifloat8":
             rope_dim = self.config.qk_rope_head_dim
             nope_dim = self.config.head_dim - rope_dim
-            cache_dim = align_up(nope_dim + 2 * rope_dim + nope_dim // 64, 128)
+            # when FA FP8 quant is enabled, nope_cache, rope_cache, and scales
+            # are concatenated and passed via the kv input (FP8).
+            # nope(fp8 1B) + rope(bf16 2B) + scales(bf16 2B per group, group_size=64)，align_up(128B)
+            cache_dim = align_up(nope_dim + 2 * rope_dim + 2 * nope_dim // 64, 128)
         self.cache_dim = cache_dim
 
     def generate_sas_metadata_kwargs(self):
