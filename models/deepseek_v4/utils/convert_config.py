@@ -1,3 +1,18 @@
+# coding=utf-8
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import json
 import math
 import os
@@ -39,21 +54,37 @@ def generate_ignore_item(num_layers, compress_ratios, is_fp=False):
     return ignore
 
 
-def generate_quant_group(a_num_bits=8, w_num_bits=8, qtype="float", activation_use_clip=False):
+def generate_quant_group(a_num_bits=8, w_num_bits=8, qtype="float", activation_use_clip=False, is_mx=False):
+    input_group_size = None
+    weight_group_size = None
+    weight_block_size = None
+    if qtype == "int":
+        activation_quant_strategy = "token"
+        weight_quant_strategy = "channel"
+    elif qtype == "float":
+        activation_quant_strategy = "group"
+        weight_quant_strategy = "group" if is_mx else "block"
+        # 32: 32 elements has same scale element when mxfp for dsv4
+        # 128: 128 elements has same scale element when fp for dsv4
+        input_group_size = 32 if is_mx else 128
+        weight_group_size = 32 if is_mx else None
+        weight_block_size = "128x128" if not is_mx else None
+    else:
+        raise ValueError(f"Unsupported quant dtype {qtype}")
     quant_group = {"input_activations": {"actorder": None, "block_structure": None, "dynamic": True,
-                                         "group_size": None, "num_bits": a_num_bits,
+                                         "group_size": input_group_size, "num_bits": a_num_bits,
                                          "observer": "memoryless", "observer_kwargs": {},
-                                         "strategy": "token", "symmetric": True, "type": qtype},
+                                         "strategy": activation_quant_strategy, "symmetric": True, "type": qtype},
                    "activation_use_clip": activation_use_clip,
                    "output_activations": None,
-                   "weights": {"actorder": None, "block_structure": None, "dynamic": False,
-                               "group_size": None, "num_bits": w_num_bits,
+                   "weights": {"actorder": None, "block_structure": weight_block_size, "dynamic": False,
+                               "group_size": weight_group_size, "num_bits": w_num_bits,
                                "observer": "minmax", "observer_kwargs": {},
-                               "strategy": "channel", "symmetric": True, "type": qtype}}
+                               "strategy": weight_quant_strategy, "symmetric": True, "type": qtype}}
     return quant_group
 
 
-def generate_quant_config(cache_scheme, ignores, w4a8=False, is_fp=False):
+def generate_quant_config(cache_scheme, ignores, w4a8=False, is_fp=False, is_mx=False):
     """
     Generate a quantization configuration dictionary based on the specified parameters.
     """
@@ -68,11 +99,18 @@ def generate_quant_config(cache_scheme, ignores, w4a8=False, is_fp=False):
                     "quantization_status": "compressed"}
     quant_config.update(cache_scheme)
     qtype = "float" if is_fp else "int"
-    quant_config["config_groups"]["group_0"].update(generate_quant_group(a_num_bits=NUM_BITS_8, w_num_bits=NUM_BITS_8, qtype=qtype))
+    quant_config["config_groups"]["group_0"].update(
+        generate_quant_group(a_num_bits=NUM_BITS_8, w_num_bits=NUM_BITS_8, qtype=qtype, is_mx=is_mx)
+        )
     if w4a8:
-        quant_config["config_groups"]["group_1"].update(generate_quant_group(a_num_bits=NUM_BITS_8, w_num_bits=NUM_BITS_4 if w4a8 else NUM_BITS_8, qtype=qtype))
-    if is_fp:
-        quant_config["weight_block_size"] = [1, 32]
+        quant_config["config_groups"]["group_1"].update(
+            generate_quant_group(
+                a_num_bits=NUM_BITS_8, 
+                w_num_bits=NUM_BITS_4, 
+                qtype=qtype, 
+                is_mx=is_fp,  # only support mxfp4 for w4a8 with float type
+                )
+            )
     return quant_config
 
 
@@ -96,8 +134,6 @@ def main(fp8_path):
     config['quantization_config'] = quantization_config
     config['quantization_config']["quant_method"] = "compressed-tensors"
     config['quantization_config']["quantization_status"] = "compressed"
-    config['quantization_config']["weight_block_size"] = [128, 128]
-
 
     with open(config_file, "w") as f:
         json.dump(config, f, indent=2)

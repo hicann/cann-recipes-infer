@@ -332,7 +332,7 @@ def main(fp8_path, output_path, quant_type, quant_param_path=None):
                 config.pop('quantization_config')
             quant_ignore_layers = generate_ignore_item(num_layers, compress_ratios, is_fp=mx)
             quantization_config = generate_quant_config(
-                cache_scheme, quant_ignore_layers, w4a8=w4a8, is_fp=mx)
+                cache_scheme, quant_ignore_layers, w4a8=w4a8, is_fp=mx, is_mx=mx)
             config['quantization_config'] = quantization_config
     quant_layers = generate_quant_layers(num_layers, num_experts, compress_ratios, w4a8=w4a8, is_mx=mx)
     # Cache for loaded safetensor files

@@ -28,7 +28,7 @@ from module.linear import LinearBase, LinearMethodBase, UnquantizedLinearMethod
 from module.fuse_moe_gmm import FusedMoEGMM
 from module.quantization.mxfp8 import MxFp8LinearMethod
 from module.quantization.mxfp4 import MxFp4LinearMethod
-from module.quantization.fp8 import Fp8LinearMethod
+from module.quantization.fp8 import Fp8PerTileLinearMethod
 from .utils import (find_matched_target, is_activation_quantization_format, should_ignore_layer, get_moe_target)
 
 QUANTIZATION_SCHEME_MAP_TYPE = dict[str, Optional[dict[str, QuantizationArgs]]]
@@ -162,24 +162,22 @@ class CompressedTensorsConfig(QuantizationConfig):
     def _get_quant_mode(self, target_scheme_map: dict[str, Any], target: str) -> str:
         # get quant mode from quant_config
         # it's a string formed by concatenating num_bits of weights and num_bits of activations.
+        weight_quant = target_scheme_map[target].get("weights")
+        input_quant = target_scheme_map[target].get("input_activations")
         weight_bits = str(
-            target_scheme_map[target].get("weights").num_bits
-            if target_scheme_map[target].get("weights") is not None
-            else "16")
+            weight_quant.num_bits if weight_quant is not None else "16")
         weight_quant_mode = "w" + weight_bits
         input_quant_mode = "a" + str(
-            target_scheme_map[target].get("input_activations").num_bits
-            if target_scheme_map[target].get("input_activations") is not None
-            else "16")
-        data_type = (target_scheme_map[target].get("weights").type
-            if target_scheme_map[target].get("weights") is not None
-            else "float") + weight_bits
-        if (self.weight_block_size is not None and self.weight_block_size[0] == 1 and
-            self.weight_block_size[1] == MX_BLOCK_K and "float" in data_type):
+            input_quant.num_bits if input_quant is not None else "16")
+        data_type = (weight_quant.type if weight_quant is not None else "float") + weight_bits
+
+        weight_block_size = self.get_weight_block_size(weight_quant)
+        is_mx_quant = (weight_block_size is not None and weight_block_size[0] == 1 and
+            weight_block_size[1] == MX_BLOCK_K and "float" in data_type)
+        if is_mx_quant:
             quant_mode = weight_quant_mode + input_quant_mode + "mx" + data_type
-        elif (target_scheme_map[target].get("input_activations") is not None
-              and target_scheme_map[target].get("input_activations").strategy == QuantizationStrategy.TENSOR.value
-              and "float" in data_type):
+        elif (input_quant is not None and input_quant.strategy == QuantizationStrategy.TENSOR.value and
+            "float" in data_type):
             quant_mode = weight_quant_mode + input_quant_mode + "hi" + data_type
         else:
             quant_mode = weight_quant_mode + input_quant_mode + data_type
@@ -196,13 +194,13 @@ class CompressedTensorsConfig(QuantizationConfig):
             weight_quant.strategy == QuantizationStrategy.TENSOR.value
             or weight_quant.strategy == QuantizationStrategy.CHANNEL.value
             or weight_quant.strategy == QuantizationStrategy.GROUP.value)
-        is_token = (weight_strategy and input_quant.strategy
-                    == QuantizationStrategy.TOKEN.value)
+        input_strategy = (input_quant.strategy == QuantizationStrategy.TOKEN.value)
+        satisfied_strategies = input_strategy and weight_strategy
         is_dynamic = not weight_quant.dynamic and input_quant.dynamic
 
         # Both symmetric and asymmetric input quantization are supported.
         # Only symmetric weight quantization is supported.
-        return is_8_bits and is_token and weight_quant.symmetric and is_dynamic
+        return is_8_bits and satisfied_strategies and weight_quant.symmetric and is_dynamic
 
     def is_wNa16_group_channel(self,
                             weight_quant: BaseModel,
@@ -225,84 +223,94 @@ class CompressedTensorsConfig(QuantizationConfig):
             weight_quant.strategy == QuantizationStrategy.TENSOR.value
             or weight_quant.strategy == QuantizationStrategy.CHANNEL.value
             or weight_quant.strategy == QuantizationStrategy.GROUP.value)
-        is_token = (weight_strategy and input_quant.strategy
-                    == QuantizationStrategy.TOKEN.value)
+        input_strategy = (input_quant.strategy == QuantizationStrategy.TOKEN.value)
+        satisfied_strategies = input_strategy and weight_strategy
         is_dynamic = not weight_quant.dynamic and input_quant.dynamic
 
         # Both symmetric and asymmetric input quantization supported.
         # Only symmetric weight quantization supported.
-        return is_w4a8_int8 and is_token and weight_quant.symmetric and is_dynamic
+        return is_w4a8_int8 and satisfied_strategies and weight_quant.symmetric and is_dynamic
 
-    def is_dynamic_token_w8a8_mxfp8(self,
+    def is_dynamic_group_w8a8_mxfp8(self,
                                weight_quant: BaseModel,
                                input_quant: BaseModel,) -> bool:
-        is_mxfloat = (self.weight_block_size is not None and self.weight_block_size[0] == 1 and
-                      self.weight_block_size[1] == MX_BLOCK_K and weight_quant.type == "float")
+        weight_block_size = self.get_weight_block_size(weight_quant)
+        is_mxfloat = (weight_block_size is not None and weight_block_size[0] == 1 and
+                      weight_block_size[1] == MX_BLOCK_K and weight_quant.type == "float")
         is_w8a8_mxfp8 = (weight_quant.num_bits == 8) and (input_quant.num_bits == 8) and is_mxfloat
         weight_strategy = (
-            weight_quant.strategy == QuantizationStrategy.CHANNEL.value
-            or weight_quant.strategy == QuantizationStrategy.GROUP.value)
-        # The strategy of mxfp8 is group
-        is_group = (weight_strategy and input_quant.strategy
+            weight_quant.strategy == QuantizationStrategy.GROUP.value
+            or weight_quant.strategy == QuantizationStrategy.BLOCK.value)
+        # The strategy of mxfp8 is group
+        input_strategy = (input_quant.strategy
                     == QuantizationStrategy.GROUP.value)
+        satisfied_strategies = input_strategy and weight_strategy
         is_dynamic = not weight_quant.dynamic and input_quant.dynamic
 
         # Both symmetric and asymmetric input quantization supported.
         # Only symmetric weight quantization supported.
-        return is_w8a8_mxfp8 and is_group and weight_quant.symmetric and is_dynamic
+        return is_w8a8_mxfp8 and satisfied_strategies and weight_quant.symmetric and is_dynamic
 
-    def is_dynamic_token_w8a8_fp8(self,
+    def is_dynamic_group_w8a8_fp8(self,
                                weight_quant: BaseModel,
                                input_quant: BaseModel,) -> bool:
-        is_not_mxfloat = (self.weight_block_size is not None and (self.weight_block_size[0] != 1 or
-                      self.weight_block_size[1] != MX_BLOCK_K) and weight_quant.type == "float")
+        weight_block_size = self.get_weight_block_size(weight_quant)
+        is_not_mxfloat = (weight_block_size is not None and (weight_block_size[0] != 1 or
+            weight_block_size[1] != MX_BLOCK_K) and weight_quant.type == "float")
         is_w8a8_fp8 = (weight_quant.num_bits == 8) and (input_quant.num_bits == 8) and is_not_mxfloat
         weight_strategy = (
-            weight_quant.strategy == QuantizationStrategy.CHANNEL.value
-            or weight_quant.strategy == QuantizationStrategy.GROUP.value)
-        is_token = (weight_strategy and input_quant.strategy
-                    == QuantizationStrategy.TOKEN.value)
+            weight_quant.strategy == QuantizationStrategy.GROUP.value
+            or weight_quant.strategy == QuantizationStrategy.BLOCK.value)
+        input_strategy = (input_quant.strategy == QuantizationStrategy.GROUP.value)
+        satisfied_strategies = input_strategy and weight_strategy
         is_dynamic = not weight_quant.dynamic and input_quant.dynamic
 
         # Both symmetric and asymmetric input quantization supported.
         # Only symmetric weight quantization supported.
-        return is_w8a8_fp8 and is_token and weight_quant.symmetric and is_dynamic
+        return is_w8a8_fp8 and satisfied_strategies and weight_quant.symmetric and is_dynamic
 
-    def is_dynamic_token_w4a8_mxfp8(self,
+    def is_dynamic_group_w4a8_mxfp8(self,
                                weight_quant: BaseModel,
                                input_quant: BaseModel,) -> bool:
-        is_w4a8_mxfp8 = (weight_quant.num_bits == 4) and (input_quant.num_bits == 8) and weight_quant.type == "float"
+        weight_block_size = self.get_weight_block_size(weight_quant)
+        is_mxfloat = (weight_block_size is not None and weight_block_size[0] == 1 and
+                      weight_block_size[1] == MX_BLOCK_K and weight_quant.type == "float")
+        is_w4a8_mxfp8 = (weight_quant.num_bits == 4) and (input_quant.num_bits == 8) and is_mxfloat
         weight_strategy = (
-            weight_quant.strategy == QuantizationStrategy.CHANNEL.value
-            or weight_quant.strategy == QuantizationStrategy.GROUP.value)
-        # The strategy of mxfp8 is group
-        is_group = (weight_strategy and input_quant.strategy
-                    == QuantizationStrategy.GROUP.value)
+            weight_quant.strategy == QuantizationStrategy.GROUP.value
+            or weight_quant.strategy == QuantizationStrategy.BLOCK.value)
+        # The strategy of mxfp8 is group
+        input_strategy = (input_quant.strategy == QuantizationStrategy.GROUP.value)
+        satisfied_strategies = input_strategy and weight_strategy
         is_dynamic = not weight_quant.dynamic and input_quant.dynamic
 
         # Both symmetric and asymmetric input quantization supported.
         # Only symmetric weight quantization supported.
-        return is_w4a8_mxfp8 and is_group and weight_quant.symmetric and is_dynamic
+        return is_w4a8_mxfp8 and satisfied_strategies and weight_quant.symmetric and is_dynamic
 
-    def is_dynamic_token_w4a4_mxfp4(self,
+    def is_dynamic_group_w4a4_mxfp4(self,
                                weight_quant: BaseModel,
                                input_quant: BaseModel,) -> bool:
-        is_w4a4_mxfp4 = (weight_quant.num_bits == 4) and (input_quant.num_bits == 4) and weight_quant.type == "float"
+        weight_block_size = self.get_weight_block_size(weight_quant)
+        is_mxfloat = (weight_block_size is not None and weight_block_size[0] == 1 and
+                      weight_block_size[1] == MX_BLOCK_K and weight_quant.type == "float")
+        is_w4a4_mxfp4 = (weight_quant.num_bits == 4) and (input_quant.num_bits == 4) and is_mxfloat
         weight_strategy = (
-            weight_quant.strategy == QuantizationStrategy.CHANNEL.value
-            or weight_quant.strategy == QuantizationStrategy.GROUP.value)
+            weight_quant.strategy == QuantizationStrategy.GROUP.value
+            or weight_quant.strategy == QuantizationStrategy.BLOCK.value)
         input_strategy = (
             input_quant.strategy == QuantizationStrategy.TOKEN.value
             or input_quant.strategy == QuantizationStrategy.GROUP.value)
+        satisfied_strategies = input_strategy and weight_strategy
         is_dynamic = not weight_quant.dynamic and input_quant.dynamic
 
         # Both symmetric and asymmetric input quantization supported.
         # Only symmetric weight quantization supported.
-        return is_w4a4_mxfp4 and weight_strategy and input_strategy and weight_quant.symmetric and is_dynamic
+        return is_w4a4_mxfp4 and satisfied_strategies and weight_quant.symmetric and is_dynamic
 
     def is_dynamic_token_w8a8_hifloat8(self,
-                               weight_quant: BaseModel,
-                               input_quant: BaseModel,) -> bool:
+                                       weight_quant: BaseModel,
+                                       input_quant: BaseModel,) -> bool:
         # avoid a16 none input_quant that input_quant.num_bits will be error
         if input_quant is None:
             return False
@@ -313,7 +321,7 @@ class CompressedTensorsConfig(QuantizationConfig):
             or weight_quant.strategy == QuantizationStrategy.GROUP.value)
         is_tensor = (weight_strategy and input_quant.strategy == QuantizationStrategy.TENSOR.value)
         is_dynamic = not weight_quant.dynamic and input_quant.dynamic
-        
+
         # Both symmetric and asymmetric input quantization are supported.
         # Only symmetric weight quantization is supported.
         return is_8_bits and is_tensor and weight_quant.symmetric and is_dynamic
@@ -335,11 +343,12 @@ class CompressedTensorsConfig(QuantizationConfig):
                     strategy=weight_quant.strategy,
                     is_static_input_scheme=False,
                     input_symmetric=input_quant.symmetric)
-            elif self.is_dynamic_token_w8a8_mxfp8(weight_quant, input_quant):
+            elif self.is_dynamic_group_w8a8_mxfp8(weight_quant, input_quant):
                 return MxFp8LinearMethod()
-            elif self.is_dynamic_token_w8a8_fp8(weight_quant, input_quant):
-                return Fp8LinearMethod(self)
-            elif self.is_dynamic_token_w4a4_mxfp4(weight_quant, input_quant):
+            elif self.is_dynamic_group_w8a8_fp8(weight_quant, input_quant):
+                weight_block_size = self.get_weight_block_size(weight_quant)
+                return Fp8PerTileLinearMethod(self, weight_block_size)
+            elif self.is_dynamic_group_w4a4_mxfp4(weight_quant, input_quant):
                 return MxFp4LinearMethod()
 
         raise NotImplementedError(
@@ -400,6 +409,36 @@ class CompressedTensorsConfig(QuantizationConfig):
             return name.replace(".v_proj.output_scale", ".attn.v_scale")
         # If no matches, return None
         return None
+
+    def get_weight_block_size(self, weight_quant):
+        if weight_quant is None:
+            return self.weight_block_size
+        weight_block_size = None
+        if weight_quant.strategy == QuantizationStrategy.GROUP.value:
+            weight_block_size = [1, weight_quant.group_size]
+        elif weight_quant.strategy == QuantizationStrategy.BLOCK.value:
+            error = ValueError(
+                f"Invalid block_structure '{weight_quant.block_structure}'. Must be a list of positive ints "
+                "[rows, cols] or a str 'rowsxcols'."
+            )
+            if isinstance(weight_quant.block_structure, str):
+                try:
+                    weight_block_size = [int(x) for x in weight_quant.block_structure.split("x")]
+                except Exception as e:
+                    raise error from e
+            elif isinstance(weight_quant.block_structure, (list, tuple)):
+                if (
+                    len(weight_quant.block_structure) != 2
+                    or not all(isinstance(v, int) for v in weight_quant.block_structure)
+                    or not all(v > 0 for v in weight_quant.block_structure)
+                ):
+                    raise error
+                weight_block_size = list(weight_quant.block_structure)
+            else:
+                raise error
+        else:
+            weight_block_size = self.weight_block_size
+        return weight_block_size
 
 
 class CompressedTensorsLinearMethod(LinearMethodBase):

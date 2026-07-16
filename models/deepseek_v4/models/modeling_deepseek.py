@@ -72,7 +72,7 @@ from module.quantization.compressed_tensors.compressed_tensors_moe_gmm import (
     CompressedTensorW8A8Int8MoEGMMMethod,
     CompressedTensorW4A8Int8MoEGMMMethod,
 )
-from module.quantization.fp8 import Fp8MoEGMMMethod
+from module.quantization.fp8 import Fp8PerTileMoEGMMMethod
 from .configuration_deepseek import DeepseekV3Config
 from .modules import (get_window_topk_idxs, get_compress_topk_idxs,
                       one_hot, yarn_get_mscale,
@@ -1030,7 +1030,7 @@ class Attention(nn.Module):
             x, x_scale = torch_npu.npu_dynamic_block_quant(x,
                 dst_type=torch.float8_e4m3fn,
                 row_block_size=1,
-                col_block_size=self.config.quant_config.weight_block_size[1])
+                col_block_size=self.wq_b.weight_block_size[1])
             return x.view(num_tokens, -1), x_scale.view(num_tokens, -1)
         elif self.mm_quant_mode == "w8a8hifloat8":
             num_tokens, _ = x.shape
@@ -1187,7 +1187,7 @@ class Attention(nn.Module):
                     x.view(-1, x.size(-1)),
                     dst_type=torch.float8_e4m3fn,
                     row_block_size=1,
-                    col_block_size=self.config.quant_config.weight_block_size[1],
+                    col_block_size=self.wq_a.weight_block_size[1],
                 )
             elif self.mm_quant_mode == "w8a8mxfloat8":
                 x_q, x_scale = torch_npu.npu_dynamic_mx_quant(
@@ -2246,7 +2246,7 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
             moe_quant_methods = (
                 CompressedTensorW8A8Int8MoEGMMMethod,
                 CompressedTensorW4A8Int8MoEGMMMethod,
-                Fp8MoEGMMMethod,
+                Fp8PerTileMoEGMMMethod,
             )
             if isinstance(quant_method, moe_quant_methods) and self.moe_ep_size > 1:
                 all_experts_smooth_scale = module.smooth_scale_1.data.new_empty(

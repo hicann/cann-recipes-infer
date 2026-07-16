@@ -54,9 +54,9 @@ class CompressedTensorsMoEGMMMethod(QuantizeMethodBase):
                 return CompressedTensorW8A8Int8MoEGMMMethod()
             elif quant_config.is_dynamic_token_w4a8_int8(weight_quant, input_quant):
                 return CompressedTensorW4A8Int8MoEGMMMethod()
-            elif quant_config.is_dynamic_token_w4a8_mxfp8(weight_quant, input_quant):
+            elif quant_config.is_dynamic_group_w4a8_mxfp8(weight_quant, input_quant):
                 return W4A8MxFp4MoEGMMMethod()
-            elif quant_config.is_dynamic_token_w4a4_mxfp4(weight_quant, input_quant):
+            elif quant_config.is_dynamic_group_w4a4_mxfp4(weight_quant, input_quant):
                 return W4A4MxFp4MoEGMMMethod()
             else:
                 raise RuntimeError(
@@ -75,8 +75,8 @@ class CompressedTensorsMoEGMMMethod(QuantizeMethodBase):
                 f"target 'MoEGMMDown' must contained in quantization config "
                 "if target 'MoEGMMUpGate' in quantization config")
 
-        if (quant_config.is_dynamic_token_w4a4_mxfp4(weight_quant_up_gate, input_quant_up_gate) and
-            quant_config.is_dynamic_token_w4a8_mxfp8(weight_quant_down, input_quant_down)):
+        if (quant_config.is_dynamic_group_w4a4_mxfp4(weight_quant_up_gate, input_quant_up_gate) and
+            quant_config.is_dynamic_group_w4a8_mxfp8(weight_quant_down, input_quant_down)):
             return UpGateW4A4DownW4A8MxFp4MoEGMMMethod()
         else:
             raise RuntimeError(

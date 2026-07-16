@@ -116,20 +116,20 @@ class Fp8Config(QuantizationConfig):
                 return UnquantizedLinearMethod()
             if self.weight_block_size is None:
                 return Fp8PerTensorLinearMethod(self)
-            return Fp8LinearMethod(self)
+            return Fp8PerTileLinearMethod(self, self.weight_block_size)
         elif isinstance(layer, FusedMoEGMM):
             if self.weight_block_size is None:
                 return Fp8PerTensorMoEGMMMethod(self)
-            return Fp8MoEGMMMethod(self)
+            return Fp8PerTileMoEGMMMethod(self, self.weight_block_size)
         return None
 
 
-class Fp8LinearMethod(LinearMethodBase):
+class Fp8PerTileLinearMethod(LinearMethodBase):
     _kernel_backends_being_used: set[str] = set()
 
-    def __init__(self, quant_config):
+    def __init__(self, quant_config, weight_block_size):
         self.out_dtype = torch.get_default_dtype()
-        self.weight_block_size = quant_config.weight_block_size
+        self.weight_block_size = weight_block_size
         self.block_quant = self.weight_block_size is not None
 
     def create_weights(self,
@@ -164,6 +164,7 @@ class Fp8LinearMethod(LinearMethodBase):
         set_weight_attrs(
             scale, {"input_dim": 1, "output_dim": 0, "is_per_block_scale": True, "weight_loader": weight_loader})
         layer.register_parameter("scale", scale)
+        layer.weight_block_size = self.weight_block_size
 
         setattr(layer, "init_state", BEFORE_INIT)
 
@@ -322,11 +323,11 @@ class Fp8PerTensorLinearMethod(LinearMethodBase):
         layer.weight = Parameter(weight, requires_grad=False)
 
 
-class Fp8MoEGMMMethod(QuantizeMethodBase):
-    def __init__(self, quant_config: Fp8Config):
+class Fp8PerTileMoEGMMMethod(QuantizeMethodBase):
+    def __init__(self, quant_config: Fp8Config, weight_block_size):
         super().__init__()
         self.quant_config = quant_config
-        self.weight_block_size = self.quant_config.weight_block_size
+        self.weight_block_size = weight_block_size
         self.block_quant = self.weight_block_size is not None
 
     def create_weights(

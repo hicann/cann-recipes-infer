@@ -623,7 +623,7 @@ class MergedColumnParallelLinear(LinearBase):
             raise RuntimeError("loaded_shard_id must be less than the length of self.output_sizes")
         if output_dim is not None:
             if is_per_block_scale:
-                block_size = self.quant_config.weight_block_size[0]
+                block_size = self.weight_block_size[0]
                 shard_offset = math.ceil(sum(self.output_sizes[:loaded_shard_id]) / block_size) // self.tp_size
                 shard_size = math.ceil(self.output_sizes[loaded_shard_id] / block_size) // self.tp_size
             else:
