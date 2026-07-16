@@ -140,7 +140,7 @@ PyTorch版本：2.6
 8. 配置样例运行所需环境信息。
    修改`npu_test/flash26b/run_pro_dsa_pp.sh`中的如下字段:
    - `iplist`：配置所有节点的IP，按照rank id排序；
-   - `MODE_PATH`: 权重所在路径，例如`/data/meituan-longcat/LongCat-2.0-Int8`。
+   - `MODEL_PATH`: 权重所在路径，例如`/data/meituan-longcat/LongCat-2.0-Int8`。
 
 ## 权重准备
 
