@@ -389,7 +389,9 @@ class AttnMetaData(nn.Module):
             block_table[row_indices, indices // self.block_size] * self.block_size
             + indices % self.block_size
         )
-        return self.pad_tensor_tnd(slot_mapping.view(-1), position_ids.shape[0], self.slot_mapping_pad_value)
+        return self.pad_tensor_tnd(
+            slot_mapping.view(-1).to(torch.int32), position_ids.shape[0], self.slot_mapping_pad_value
+            )
 
     def get_cmp_metadata(self, attn_metadata, is_prefill):
         attn_metadata['position_ids_c'] = {}
