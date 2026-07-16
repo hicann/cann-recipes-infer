@@ -37,9 +37,8 @@
   ```
 
 ### 下载权重
-  智谱团队开源了 GLM-5.2 模型的 Bfloat16 与 FP8 两种格式权重, 可按需选择下载。
-  - 下载[GLM-5.2原始Bfloat16权重](https://huggingface.co/zai-org/GLM-5.2)，并上传到Atlas A3各节点某个固定的路径下，比如`/data/models/GLM-5.2`。
-  - 下载[GLM-5.2原始FP8权重](https://huggingface.co/zai-org/GLM-5.2-FP8)，并上传到Atlas A3各节点某个固定的路径下，比如`/data/models/GLM-5.2-FP8`。
+  智谱团队开源了 GLM-5.2 模型的 Bfloat16 权重。
+  - 下载[GLM-5.2原始Bfloat16权重](https://huggingface.co/zai-org/GLM-5.2)，并上传到Atlas A3各节点某个固定的路径下，比如`/data/models/GLM-5.2-BF16`。
 
 ### 获取 docker 镜像
   从[ARM镜像地址](https://cann-ai.obs.cn-north-4.myhuaweicloud.com/cann-quantization/GLM/cann9.1_pt2.8.0_glm_aarch_image_v0.1.tar)中下载 docker 镜像，然后上传到A3服务器的每个节点上，并通过命令导入镜像 `docker load -i cann9.1_pt2.8.0_glm_aarch_image_v0.1.tar`。
@@ -81,9 +80,9 @@
 
 ### 转换权重
 
-  在各个节点上使用`weight_convert.sh` 脚本完成FP8到Int8权重转换。
+  在各个节点上使用`weight_convert.sh` 脚本完成BF16到Int8权重转换。
 
-  >入参介绍：`input_fp8_hf_path`：原始fp8权重路径；`output_hf_path`：转换后输出的权重路径；`quant_mode`：量化模式
+  >入参介绍：`input_hf_path`：原始权重路径；`output_hf_path`：转换后输出的权重路径；`quant_mode`：量化模式
 
 如果权重转换的运行环境为NPU，需要先执行：
 
@@ -96,7 +95,7 @@ source ${cann_path}/bin/setenv.bash
 
   ```shell
   # 转换为W8A8C16权重
-  bash utils/weight_convert.sh --input_fp8_hf_path /data/models/GLM-5.2-BF16 --output_hf_path /data/models/GLM-5.2-W8A8 --quant_mode w8a8c16
+  bash utils/weight_convert.sh --input_hf_path /data/models/GLM-5.2-BF16 --output_hf_path /data/models/GLM-5.2-W8A8 --quant_mode w8a8c16
   ```
 
   > **GLM-5.2 IndexShare 说明**：`utils/convert_model.py` 已按 `config.indexer_types` 感知 IndexShare —

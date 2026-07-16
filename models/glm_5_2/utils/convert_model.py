@@ -614,7 +614,7 @@ def main(fp8_path, output_path, quant_type, clip=False, quant_param_path=None):
 
 if __name__ == "__main__":
     parser = ArgumentParser()
-    parser.add_argument("--input_fp8_hf_path", type=str, required=True)
+    parser.add_argument("--input_hf_path", type=str, required=True)
     parser.add_argument("--output_hf_path", type=str, required=True)
     parser.add_argument("--quant_type", type=str, default="bfloat16",
                         choices=["bfloat16", "w8a8c16", "w8a8c8", "w4a8c16", "w4a8c8", "w8a8-mx"])
@@ -622,5 +622,5 @@ if __name__ == "__main__":
     parser.add_argument("--quant_param_path", type=str, default=None)
     args = parser.parse_args()
 
-    main(args.input_fp8_hf_path, args.output_hf_path,
+    main(args.input_hf_path, args.output_hf_path,
          args.quant_type, args.clip, args.quant_param_path)

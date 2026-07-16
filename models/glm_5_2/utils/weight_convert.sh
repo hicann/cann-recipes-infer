@@ -14,15 +14,15 @@
 # limitations under the License.
 
 #!/bin/bash
-INPUT_FP8_HF_PATH=""
+INPUT_HF_PATH=""
 OUTPUT_HF_PATH=""
 QUANT_MODE=""
 
 
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --input_fp8_hf_path)
-            INPUT_FP8_HF_PATH="$2"
+        --input_hf_path)
+            INPUT_HF_PATH="$2"
             shift 2
             ;;
         --output_hf_path)
@@ -35,7 +35,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         *)
             echo "Unknown Parameters: $1"
-            echo "Usage: $0 --input_fp8_hf_path <input_path> --output_hf_path <output_path> --quant_mode <mode>"
+            echo "Usage: $0 --input_hf_path <input_path> --output_hf_path <output_path> --quant_mode <mode>"
             echo "Supported Quant Mode: bfloat16, w8a8c16, w8a8c8, w4a8c8"
             exit 1
             ;;
@@ -43,8 +43,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 
-if [[ -z "$INPUT_FP8_HF_PATH" ]] || [[ -z "$OUTPUT_HF_PATH" ]] || [[ -z "$QUANT_MODE" ]]; then
-    echo "Usage: $0 --input_fp8_hf_path <input_path> --output_hf_path <output_path> --quant_mode <mode>"
+if [[ -z "$INPUT_HF_PATH" ]] || [[ -z "$OUTPUT_HF_PATH" ]] || [[ -z "$QUANT_MODE" ]]; then
+    echo "Usage: $0 --input_hf_path <input_path> --output_hf_path <output_path> --quant_mode <mode>"
     echo "Supported Quant Mode: bfloat16, w8a8c16, w8a8c8, w4a8c8"
     exit 1
 fi
@@ -54,13 +54,13 @@ case "${QUANT_MODE,,}" in
     bfloat16)
         echo "Convert to bfloat16 weights..."
         python utils/convert_model.py \
-            --input_fp8_hf_path "$INPUT_FP8_HF_PATH" \
+            --input_hf_path "$INPUT_HF_PATH" \
             --output_hf_path "$OUTPUT_HF_PATH"
         ;;
     w8a8c16)
         echo "Convert to w8a8c16 weights..."
         python utils/convert_model.py \
-            --input_fp8_hf_path "$INPUT_FP8_HF_PATH" \
+            --input_hf_path "$INPUT_HF_PATH" \
             --output_hf_path "$OUTPUT_HF_PATH" \
             --quant_type "w8a8c16"
         ;;
@@ -83,7 +83,7 @@ case "${QUANT_MODE,,}" in
 
         echo "Convert to w8a8c8 weights..."
         python utils/convert_model.py \
-            --input_fp8_hf_path "$INPUT_FP8_HF_PATH" \
+            --input_hf_path "$INPUT_HF_PATH" \
             --output_hf_path "$OUTPUT_HF_PATH" \
             --quant_type "w8a8c8" \
             --clip \
@@ -108,7 +108,7 @@ case "${QUANT_MODE,,}" in
 
         echo "Convert to w4a8c8 weights..."
         python utils/convert_model.py \
-            --input_fp8_hf_path "$INPUT_FP8_HF_PATH" \
+            --input_hf_path "$INPUT_HF_PATH" \
             --output_hf_path "$OUTPUT_HF_PATH" \
             --quant_type "w4a8c8" \
             --clip \
