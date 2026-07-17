@@ -29,6 +29,8 @@ import torch.distributed as dist
 import torch_npu
 import torch.nn as nn
 from models.modeling_glm import GlmMoeDsaForCausalLM, GlmMoeDsaModelMTP
+from models.custom_op_loader import load_dsa_shared_custom_ops
+from models.shared_indexer_offload import shared_indexer_offload_enabled
 from executor.utils import override, get_init_attn_mask
 from executor.model_runner import ModelRunner
 from module.quantization import QuantizeMethodBase
@@ -64,10 +66,27 @@ class GlmRunner(ModelRunner):
         self.query_id_list = []
         self.max_new_tokens = runner_settings.get("data_config").get("max_new_tokens", 32)
         self.enable_static_kernel = self.runner_settings.get("model_config").get("enable_static_kernel", False)
+        model_config = runner_settings.get("model_config", {})
+        self.shared_indexer_offload = shared_indexer_offload_enabled(model_config)
+
+    def _load_dsa_shared_custom_ops_if_needed(self):
+        if not self.shared_indexer_offload or getattr(self, "is_mtp", False):
+            return
+        exe_mode = self.runner_settings.get("exe_mode", "ge_graph")
+        if not load_dsa_shared_custom_ops(
+            register_ge_converters=(exe_mode == "ge_graph"),
+            register_npugraph_reinplace=(exe_mode == "npugraph_ex"),
+        ):
+            raise RuntimeError(
+                "GLM-5.2 shared-indexer offload requires dsa_plan, dsa_serve, "
+                "dsa_serve_functional, dsa_install, and dsa_install_functional custom ops. Build and "
+                "install ops/ascendc before enabling shared_indexer_offload."
+            )
 
     @override
     def init_model(self, is_mtp=False):
         self.is_mtp = is_mtp
+        self._load_dsa_shared_custom_ops_if_needed()
         if self.with_ckpt:
             self.use_pretrained_model = True
             config = None
@@ -159,6 +178,8 @@ class GlmRunner(ModelRunner):
                     "frozen_parameter": True,
                     "static_kernel_compile": self.enable_static_kernel,
                 }
+                if self.shared_indexer_offload and not self.is_mtp:
+                    compile_options["clone_input"] = False
                 self.model.decode = torch.compile(self.model.decode, dynamic=False, fullgraph=True,
                                                 backend="npugraph_ex", options=compile_options)
             else:

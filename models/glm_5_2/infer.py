@@ -16,10 +16,12 @@
 import os
 import argparse
 import logging
+import copy
 import torch
 
 from runner_glm import GlmRunner
 from models.model_infer import Infer
+from models.shared_indexer_offload import shared_indexer_offload_enabled
 from executor.utils import update_settings, align_up, read_yaml
 from executor.utils.data_utils import generate_prompt
 
@@ -50,7 +52,11 @@ def run_glm(runner_settings):
     model_runner_mtp = None
     next_n = runner_settings.get("model_config").get("next_n", 0)
     if next_n > 0:
-        model_runner_mtp = GlmRunner(runner_settings)
+        runner_settings_mtp = runner_settings
+        if shared_indexer_offload_enabled(runner_settings.get("model_config", {})):
+            runner_settings_mtp = copy.deepcopy(runner_settings)
+            runner_settings_mtp["model_config"]["enable_offload"] = False
+        model_runner_mtp = GlmRunner(runner_settings_mtp)
         model_runner_mtp.init_model(is_mtp=True)
         # the mtp modules share embed, lm_head, rotary_emb with the main model
         model_runner_mtp.model.model.embed_tokens = model_runner_main.model.model.embed_tokens
@@ -72,7 +78,7 @@ def run_glm(runner_settings):
     offload_cache_mtp = None
     if enable_offload:
         offload_cache = input_dict_main['offload_cache']
-        offload_cache_mtp = input_dict_mtp['offload_cache'] if next_n > 0 else None
+        offload_cache_mtp = input_dict_mtp.get('offload_cache') if next_n > 0 and input_dict_mtp is not None else None
 
     infer.model_generate(preset_prompts, past_key_values=input_dict_main['past_key_values'],
                          past_key_values_indexer=input_dict_main['past_key_values_indexer'],

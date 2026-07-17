@@ -52,7 +52,11 @@ from module.linear import (
 from module.fuse_moe_gmm import FusedMoEGMM
 from module.quantization.mxfp8 import reshape_mx_scale
 from .configuration_glm import GlmMoeDsaConfig
-from .custom_op_loader import load_offload_gather_op, register_offload_ge_converter
+from .custom_op_loader import (
+    load_offload_gather_op,
+    register_offload_ge_converter,
+    register_dsa_shared_ge_converters,
+)
 
 # Mount the custom offload-gather op onto torch_npu (no-op if not installed); see custom_op_loader.
 load_offload_gather_op()
@@ -60,6 +64,10 @@ register_offload_ge_converter()
 from .modules import one_hot, DeepseekV3RMSNorm, _init_rope
 from .indexer import GlmMoeDsaIndexer
 from .offload_cache import OffloadCache
+from .shared_indexer_offload import (
+    shared_indexer_offload_enabled,
+    run_shared_indexer_offload,
+)
 
 logger = logging.get_logger(__name__)
 
@@ -829,6 +837,9 @@ class GlmMoeDsaAttention(nn.Module):
         if prefill_mini_batch_size > 0:
             self.prefill_block_table = torch.arange(0, prefill_mini_batch_size * cache_len) \
                 .reshape(prefill_mini_batch_size, -1).to(dtype=torch.int32, device="npu")
+        model_config = self.runner_settings.get("model_config", {})
+        self.shared_indexer_offload = shared_indexer_offload_enabled(model_config) and not kwargs.get("is_mtp", False)
+        self.dsa_static_identity_pa = self.shared_indexer_offload
 
         self.enable_weight_nz = runner_settings.get("model_config").get("enable_weight_nz", True)
 
@@ -850,6 +861,14 @@ class GlmMoeDsaAttention(nn.Module):
         self.exe_mode = self.runner_settings.get("exe_mode", "eager")
         self.global_rank = kwargs.get("global_rank")
         self.enable_multi_streams = self.runner_settings.get("model_config").get("enable_multi_streams", False)
+        self.enable_dsa_install_stream = self.shared_indexer_offload
+        self.dsa_install_stream = kwargs.get("dsa_install_stream", None)
+        self.dsa_install_events = (
+            create_event(
+                self.exe_mode,
+                self.enable_dsa_install_stream and self.exe_mode == "npugraph_ex",
+            ),
+        )
 
         self.kv_cache_quant_mode = config.quant_config.kv_cache_quant_mode \
             if config.quant_config is not None else "unquant"
@@ -1472,7 +1491,41 @@ class GlmMoeDsaAttention(nn.Module):
             selection_kv_block_status = offload_cache.selection_kv_block_status[self.layer_idx]
 
             topk_indices = topk_indices.view(bsz, -1, 1, self.index_topk)
-            if reuse_shared_topk and offload_cache.enable_mtp_gather_reuse:
+            dsa_raw_seq = int(topk_indices.size(1))
+            if self.shared_indexer_offload:
+                if self.kv_cache_quant_mode != "unquant":
+                    raise ValueError("Shared-indexer offload supports unquant KV/rope only")
+                full_seq = int(block_table.size(1) * self.block_size)
+                static_identity_pa = (
+                    self.dsa_static_identity_pa
+                    and int(full_kv_cache.size(0)) == bsz * int(block_table.size(1))
+                    and int(full_kv_cache.size(1)) == self.block_size
+                    and int(full_k_rope.size(0)) == bsz * int(block_table.size(1))
+                    and int(full_k_rope.size(1)) == self.block_size
+                )
+                if not static_identity_pa:
+                    raise ValueError("Shared-indexer offload requires static identity PA layout")
+                dsa_pool_kv_cache, dsa_pool_k_rope = offload_cache.get_dsa_layer_pool_values(self.layer_idx)
+                selection_kv_cache, selection_k_rope, selection_kv_actual_seq, _, _ = run_shared_indexer_offload(
+                    layer_idx=self.layer_idx,
+                    topk_indices=topk_indices,
+                    full_kv_actual_seq=actual_seq_lengths_kv.to(torch.int32),
+                    full_kv_cache=full_kv_cache.view(bsz, full_seq, full_kv_cache.size(-1)),
+                    full_k_rope=full_k_rope.view(bsz, full_seq, full_k_rope.size(-1)),
+                    selection_kv_cache=selection_kv_cache,
+                    selection_k_rope=selection_k_rope,
+                    pool_kv_cache=dsa_pool_kv_cache,
+                    pool_k_rope=dsa_pool_k_rope,
+                    offload_cache=offload_cache,
+                    raw_seq=dsa_raw_seq,
+                    topk=self.index_topk,
+                    selection_block_size=self.block_size,
+                    enable_install_stream=self.enable_dsa_install_stream,
+                    install_stream=self.dsa_install_stream,
+                    install_events=self.dsa_install_events,
+                    exe_mode=self.exe_mode,
+                )
+            elif reuse_shared_topk and offload_cache.enable_mtp_gather_reuse:
                 # MTP draft reuse step: top-k is frozen to the first decode step's selection, so the
                 # already-gathered selection buffer (selection_kv_cache / selection_k_rope) and status
                 # ledger are still exactly valid -- skip the re-gather and its O(TOPK) hit-scan. The
@@ -1961,6 +2014,8 @@ class GlmMoeDsaForCausalLM(GlmMoeDsaPreTrainedModel):
         self.enable_static_kernel = self.runner_settings.get("model_config").get("enable_static_kernel", False)
         self.enable_npugraph_ex = runner_settings.get("exe_mode", "ge_graph") == "npugraph_ex"
         self.exe_mode = runner_settings.get("exe_mode", "ge_graph")
+        model_config = self.runner_settings.get("model_config", {})
+        self.shared_indexer_offload = shared_indexer_offload_enabled(model_config) and not self.is_mtp
         self.local_rank = int(os.getenv("LOCAL_RANK", "0"))
         self.rank_offset = int(os.getenv("RANK_OFFSET", "0"))
         self.global_rank = self.local_rank + self.rank_offset
@@ -1979,6 +2034,7 @@ class GlmMoeDsaForCausalLM(GlmMoeDsaPreTrainedModel):
             "shared_expert_stream": create_stream("11", self.exe_mode),
             "indexer_stream": create_stream("22", self.exe_mode),
             "weights_stream": create_stream("33", self.exe_mode),
+            "dsa_install_stream": create_stream("dsa_install", self.exe_mode),
         })
         self.batch_size_per_rank = self.runner_settings.get("data_config").get("batch_size_per_rank", 1)
         self.pa_max_length = self.runner_settings.get("model_config").get("pa_max_length", 2048)
@@ -2103,9 +2159,13 @@ class GlmMoeDsaForCausalLM(GlmMoeDsaPreTrainedModel):
                 "frozen_parameter": True,
                 "static_kernel_compile": self.enable_static_kernel,
             }
+            if self.shared_indexer_offload and not self.is_mtp:
+                compile_options["clone_input"] = False
             cached_decode = torch.npu.npugraph_ex.inference.cache_compile(cache_model, cache_dir=cache_dir,
                                                                           dynamic=False, options=compile_options)
         else:
+            if self.shared_indexer_offload:
+                register_dsa_shared_ge_converters()
             tng_config = tng.CompilerConfig()
             tng_config.experimental_config.frozen_parameter = True
             tng_config.experimental_config.tiling_schedule_optimize = True

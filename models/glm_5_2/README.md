@@ -130,14 +130,14 @@ source ${cann_path}/bin/setenv.bash
 
 ## KV Offload 启用（长序列，需自定义算子）
 
-GLM-5.2 的 KV offload（`enable_offload: True`）把全量 MLA KV 卸载到 host swapped memory，decode 时按 DSA top-k 用 `npu_gather_selection_kv_cache` 把命中 block gather 回 device，面向长上下文（全量 KV 放不下 HBM）场景。
+GLM-5.2 的 KV offload（`enable_offload: True`）把全量 MLA KV 卸载到 host swapped memory，decode 时按 DSA top-k 把命中 block gather 回 device，面向长上下文（全量 KV 放不下 HBM）场景。开启 `shared_indexer_offload: True` 时，模型会利用 GLM-5.2 的 IndexShare 特性复用同一组 top-k 规划，减少共享层重复的命中判断和缓存管理开销，并将常驻池回填与 SFA、MoE 计算并行。该路径释放 HBM 以支持更长上下文或更大 batch；`enlarge_pool_size: True` 会把设备侧常驻 token 池从 8K 扩大到 16K，进一步提高命中率并减少 host 到 device 的 KV 搬运。
 
-`npu_gather_selection_kv_cache` 是**仓内自定义 AscendC 算子**（非 torch_npu 内置），offload 路径用到它，须先编译安装：
+KV offload 依赖**仓内自定义 AscendC 算子**（非 torch_npu 内置），须先编译安装：
 
 ```bash
 # 1) 编译算子内核（A3 默认 ascend910_93；bisheng 随 CANN 提供）
 cd ops/ascendc
-bash build.sh -n "gather_selection_kv_cache"          # 产物在 output/CANN-custom_ops-*-linux.<arch>.run
+bash build.sh -n "gather_selection_kv_cache;dsa_plan;dsa_serve;dsa_install"  # 安装包位于 output/CANN-custom_ops-*-linux.<arch>.run
 
 # 2) 安装内核到 CANN opp
 cd output
@@ -151,11 +151,14 @@ bash build_and_install.sh                              # 生成并 pip 安装 cu
 source "${ASCEND_HOME_PATH}/opp/vendors/customize/bin/set_env.bash"
 ```
 
-> `models/modeling_glm.py` 在 import 时自动把该算子挂到 `torch_npu.npu_gather_selection_kv_cache`（只挂这一个自定义算子，**不**整体 `import custom_ops` 以免覆盖内置算子）；因此模型侧无需改动，只要上面的算子已安装、且运行前 source 了第 4 步的环境即可。
+> `models/modeling_glm.py` 在 import 时自动把基础 offload 算子挂到 `torch_npu.npu_gather_selection_kv_cache`；开启 `shared_indexer_offload` 时，模型 Runner 初始化会按需加载共享 IndexShare offload 相关自定义算子。因此模型侧无需改动，只要上面的算子已安装、且运行前 source 了第 4 步的环境即可。
 
-运行（在 `config/*.yaml` 的 `model_config` 中设 `enable_offload: True`）：
+运行（在 `config/*.yaml` 的 `model_config` 中设置 offload 选项）：
 
 ```bash
+enable_offload: True
+shared_indexer_offload: True
+enlarge_pool_size: False
 # eager
 exe_mode: "eager"
 # 或图模式

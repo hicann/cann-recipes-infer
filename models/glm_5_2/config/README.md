@@ -8,6 +8,9 @@ Basic Config
   world_size: 128                                   # The world size. Int type
 
 Model Config
+  enable_offload: False            # Whether enable KV offload. Support [False, True]
+  shared_indexer_offload: False    # Whether use the GLM-5.2 shared-indexer offload path. Support [False, True]
+  enlarge_pool_size: False         # Whether enlarge the resident token pool from 8K to 16K for shared-indexer offload. Support [False, True]
   pa_block_size: 128              # PA Block Size value. Support [128, 256]
   enable_weight_nz: True          # Whether use nz-weight format for better performance. Support [False, True]
   with_ckpt: True                 # Whether load ckpt. Support [False, True]

@@ -5,6 +5,8 @@ world_size: 32                           # world_size = 2 * chip_num in A3
 
 model_config:
   enable_offload: True                   # [False, True]
+  shared_indexer_offload: True           # [False, True]
+  enlarge_pool_size: False               # [False, True]
   next_n: 3
   pa_block_size: 128
   enable_weight_nz: True

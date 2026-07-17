@@ -16,6 +16,27 @@
 // 在custom命名空间里注册add_custom和npu_sparse_flash_attention和后续的XXX算子，每次新增自定义aten ir都需先增加定义
 // step1, 为新增自定义算子添加定义
 TORCH_LIBRARY(custom, m) {
+    m.def("dsa_plan(Tensor selection_topk_indices, Tensor full_kv_actual_seq, Tensor pool_ids, "
+        "Tensor id_to_slot, Tensor lru_counter, *, "
+        "int raw_seq=1, int group_id=0, int owner_layer=0, "
+        "int group_kind=0) -> (Tensor, Tensor, Tensor)");
+    m.def("dsa_serve(Tensor plan, Tensor full_kv_cache, Tensor full_k_rope, Tensor pool_kv_cache, "
+        "Tensor pool_k_rope, Tensor(a!) selection_kv_cache, Tensor(b!) selection_k_rope, *, "
+        "int raw_seq=1, int topk=2048, int selection_block_size=128, "
+        "int compact_layout=1) -> ()");
+    m.def("dsa_serve_functional(Tensor plan, Tensor full_kv_cache, Tensor full_k_rope, Tensor pool_kv_cache, "
+        "Tensor pool_k_rope, Tensor selection_kv_cache, Tensor selection_k_rope, *, "
+        "int raw_seq=1, int topk=2048, int selection_block_size=128, "
+        "int compact_layout=1) -> (Tensor, Tensor)");
+    m.def("dsa_install(Tensor install_records, Tensor selection_kv_cache, Tensor selection_k_rope, "
+        "Tensor selection_kv_block_table, Tensor(a!) pool_kv_cache, Tensor(b!) pool_k_rope, "
+        "Tensor(c!) pool_ids, Tensor(d!) id_to_slot, Tensor(e!) lru_counter, *, int raw_seq=1, int topk=2048, "
+        "int selection_block_size=128, int metadata_update=1) -> ()");
+    m.def("dsa_install_functional(Tensor install_records, Tensor selection_kv_cache, Tensor selection_k_rope, "
+        "Tensor selection_kv_block_table, Tensor pool_kv_cache, Tensor pool_k_rope, Tensor pool_ids, "
+        "Tensor id_to_slot, Tensor lru_counter, *, int raw_seq=1, int topk=2048, int selection_block_size=128, "
+        "int metadata_update=1) "
+        "-> (Tensor, Tensor, Tensor, Tensor, Tensor)");
     m.def("npu_swiglu_clip_quant(Tensor x, Tensor group_index, Tensor group_alpha, *, bool activate_left=False, int quant_mode=1, int clamp_mode=1) -> (Tensor, Tensor)");
     m.def("npu_swiglu_group_quant(Tensor x, *, Tensor? weight=None, Tensor? group_index=None, "
         "ScalarType dst_type, int quant_mode=0, int block_size=0, bool round_scale=False, "
