@@ -251,32 +251,34 @@ def parallel_attention(
     cu_seqlens_q,	 
     cu_seqlens_kv	 
 ):	 
-    b, s, n, d = q.shape	 
+    b, s, n, d = q.shape
 
-    attn1 = hybrid_seq_parallel_attn(	 
+    pre_attn_layout, post_attn_layout = MEMORY_LAYOUT["BSND"]
+    process_config = AttentionProcessConfig(
+        "parallel", pre_attn_layout, post_attn_layout
+    )
+
+    attn_prefix = hybrid_seq_parallel_attn(
         q=q[:, :img_q_len, :, :],
         k=k[:, :img_kv_len, :, :],
         v=v[:, :img_kv_len, :, :],
-        dropout_p=0.0, 
-        causal=False,	 
-        joint_tensor_query=q[:, img_q_len:cu_seqlens_q[1]],	 
-        joint_tensor_key=k[:, img_kv_len:cu_seqlens_kv[1]],	 
-        joint_tensor_value=v[:, img_kv_len:cu_seqlens_kv[1]],	 
-        joint_strategy="rear",	 
-    )	 
+        dropout_p=0.0,
+        causal=False,
+        joint_tensor_query=q[:, img_q_len:cu_seqlens_q[1]],
+        joint_tensor_key=k[:, img_kv_len:cu_seqlens_kv[1]],
+        joint_tensor_value=v[:, img_kv_len:cu_seqlens_kv[1]],
+        joint_strategy="rear",
+    )
 
-    attn2 = torch_npu.npu_fused_infer_attention_score(	 
-        q[:, cu_seqlens_q[1]:], 	 
-        k[:, cu_seqlens_kv[1]:], 	 
-        v[:, cu_seqlens_kv[1]:],	 
-        num_heads=n,	 
-        input_layout="BSND",	 
-        scale=q.shape[-1] ** (-0.5),	 
-    )[0]	 
+    attn_cu_seqlens = attn_prefix.shape[1]
+    pad_len = s - attn_cu_seqlens
+    padding_info = AttentionPaddingInfo(
+        pad_shape=[b, pad_len, n, d], cat_dim=1
+    )
 
-    attn = torch.cat([attn1, attn2], dim=1)
+    attn = postprocess_attention(attn_prefix, process_config, padding_info)
     attn = attn.reshape(b, s, -1)
-    
+
     return attn
 
 
@@ -290,6 +292,11 @@ def parallel_sparse_attention(
     joint_q_local_bnsd = block_args.get("joint_q_local_bnsd")
     b, s, n, d = q.shape
     from module.blockwise_sparse.sparse_method import sparse_predictor_manager
+
+    pre_attn_layout, post_attn_layout = MEMORY_LAYOUT["BSND"]
+    process_config = AttentionProcessConfig(
+        "sparse", pre_attn_layout, post_attn_layout
+    )
 
     q_img, k_img, v_img = q[:, :img_q_len, :, :], k[:, :img_kv_len, :, :], v[:, :img_kv_len, :, :]
     txt_q = (
@@ -323,15 +330,14 @@ def parallel_sparse_attention(
         )
 
     attn = attn_prefix
-    if int(attn_prefix.shape[1]) < s:
-        attn2 = torch_npu.npu_fused_infer_attention_score(
-            q[:, cu_seqlens_q[1]:],
-            k[:, cu_seqlens_kv[1]:],
-            v[:, cu_seqlens_kv[1]:],
-            num_heads=n,
-            input_layout="BSND",
-            scale=q.shape[-1] ** (-0.5),
-        )[0]
-        attn = torch.cat([attn_prefix, attn2], dim=1)
+    attn_cu_seqlens = attn_prefix.shape[1]
+    
+    if attn_cu_seqlens < s:
+        pad_len = s - attn_cu_seqlens
+        padding_info = AttentionPaddingInfo(
+            pad_shape=[b, pad_len, n, d], cat_dim=1
+        )
+        attn = postprocess_attention(attn_prefix, process_config, padding_info)
+
     attn = attn.reshape(b, s, -1)
     return attn
