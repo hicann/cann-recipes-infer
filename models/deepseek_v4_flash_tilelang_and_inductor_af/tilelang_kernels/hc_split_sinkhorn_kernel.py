@@ -16,7 +16,7 @@ pass_configs = {
 
 # kernel
 @tilelang.jit(out_idx=[4, 5, 6], workspace_idx=[3], pass_configs=pass_configs)
-def hc_split_sinkhorn(hc, sinkhorn_iters, eps):
+def hc_split_sinkhorn_kernel(hc, sinkhorn_iters, eps):
     n = T.symbolic("n")
     mix_hc = (2 + hc) * hc
     dtype = "float"
