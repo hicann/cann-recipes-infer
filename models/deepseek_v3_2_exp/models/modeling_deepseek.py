@@ -786,14 +786,8 @@ class DeepseekIndexerAttention(nn.Module):
             config.quant_config.mm_quant_mode
             if config.quant_config is not None
             else "w16a16")
-        self.batch_size = scheduler_config.batch_size
-        self.batch_size_per_rank = scheduler_config.batch_size_per_dp_rank
         self.attn_tp_size = parallel_config.attn_tp_size
-        self.attn_dp_size = parallel_config.attn_dp_size
         self.o_proj_tp_size = parallel_config.o_proj_tp_size
-        self.cp_size = parallel_config.cp_size
-        self.moe_tp_size = parallel_config.moe_tp_size
-        self.moe_ep_size = parallel_config.moe_ep_size
         self.layer_idx = layer_idx
         self.is_mtp = False
         if layer_idx == config.num_hidden_layers: # mtp model
@@ -817,7 +811,7 @@ class DeepseekIndexerAttention(nn.Module):
         self.kv_lora_rank = config.kv_lora_rank
         self.v_head_dim = config.v_head_dim
         self.qk_nope_head_dim = config.qk_nope_head_dim
-        self.q_head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim  # 64
+        self.q_head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim  # 192
 
         self.is_causal = True
         self.attn_type = "FullAttention"
@@ -939,17 +933,6 @@ class DeepseekIndexerAttention(nn.Module):
                 allocator=full_kv_allocator,
             ),
             CacheEntry(
-                cache_name="rope_cache",
-                attn_type=self.attn_type,
-                dim=self.config.qk_rope_head_dim,
-                num_head=1,
-                dtype=dtype_rope,
-                needs_block=True,
-                block_size=self.block_size,
-                tensor_setter=lambda tensor, layer=self: setattr(layer, "rope_cache", tensor),
-                allocator=full_kv_allocator,
-            ),
-            CacheEntry(
                 cache_name="indexer_key_cache",
                 attn_type=self.attn_type,
                 dim=self.config.index_head_dim,
@@ -960,6 +943,22 @@ class DeepseekIndexerAttention(nn.Module):
                 tensor_setter=lambda tensor, layer=self: setattr(layer, "indexer_key_cache", tensor),
             ),
         ]
+        # Only allocate rope_cache in non-quantized mode.
+        # In quant mode, rope data is merged into nope_cache and passed via k_nope input.
+        if self.kv_cache_quant_mode == "unquant":
+            self.cache_entries.append(
+                CacheEntry(
+                    cache_name="rope_cache",
+                    attn_type=self.attn_type,
+                    dim=self.config.qk_rope_head_dim,
+                    num_head=1,
+                    dtype=dtype_rope,
+                    needs_block=True,
+                    block_size=self.block_size,
+                    tensor_setter=lambda tensor, layer=self: setattr(layer, "rope_cache", tensor),
+                    allocator=full_kv_allocator,
+                )
+            )
         if self.kv_cache_quant_mode == "int8":
             self.cache_entries.append(
                 CacheEntry(
@@ -1851,18 +1850,6 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
     def set_input_embeddings(self, value):
         self.embed_tokens = value
 
-    def prepare_inputs_for_layer(self, inputs_embeds, input_ids):
-        seq_length = input_ids.shape[0]
-
-        step = seq_length // self.attn_tp_size
-        tp_rank = self.comm_manager.get_rank("attn_tp_group") % self.attn_tp_size
-        end = step * (tp_rank + 1)
-
-        inputs_embeds = inputs_embeds.view(seq_length, self.config.hidden_size)
-        hidden_states = inputs_embeds[step * tp_rank: end]
-
-        return hidden_states
-
     def calc_input_embeddings(self, input_ids, is_prefill):
         num_tokens = input_ids.shape[0]
         attn_dp_size = self.attn_dp_size
@@ -1913,8 +1900,8 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
         position_ids = torch.index_select(position_ids, 0, local_indices)
         return input_ids, position_ids, None
 
-    def get_prefill_o_proj_padded_tokens(self, hidden_states, is_prefill):
-        if not is_prefill or self.o_proj_tp_size <= 1:
+    def get_prefill_o_proj_padded_tokens(self, hidden_states):
+        if self.o_proj_tp_size == 1:
             return None
         local_token_num = hidden_states.shape[0]
         max_token_num = torch.tensor([local_token_num], dtype=torch.long, device=hidden_states.device)
@@ -1925,8 +1912,8 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
         )
         return int(max_token_num.item())
 
-    def get_prefill_dense_padded_tokens(self, hidden_states, is_prefill):
-        if not is_prefill or self.dense_tp_size <= 1 or self.moe_ep_size <= 1:
+    def get_prefill_dense_padded_tokens(self, hidden_states):
+        if self.dense_tp_size == 1 or self.moe_ep_size == 1:
             return None
         local_token_num = hidden_states.shape[0]
         max_token_num = torch.tensor([local_token_num], dtype=torch.long, device=hidden_states.device)
@@ -1968,10 +1955,11 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
         rotary_emb = self.rotary_emb if self.rotary_emb is not None else self.model.rotary_emb
         cos_sin = rotary_emb(hidden_states, position_ids, kv_len, self.max_position_embeddings)
 
-        if is_prefill and self.attn_tp_size > 1 and self.moe_ep_size > 1:
-            hidden_states = self.prepare_inputs_for_layer(inputs_embeds, input_ids)
-        prefill_o_proj_padded_tokens = self.get_prefill_o_proj_padded_tokens(hidden_states, is_prefill)
-        prefill_dense_padded_tokens = self.get_prefill_dense_padded_tokens(hidden_states, is_prefill)
+        prefill_o_proj_padded_tokens = None
+        prefill_dense_padded_tokens = None
+        if is_prefill:
+            prefill_o_proj_padded_tokens = self.get_prefill_o_proj_padded_tokens(hidden_states)
+            prefill_dense_padded_tokens = self.get_prefill_dense_padded_tokens(hidden_states)
         residual = None
 
         label = f'decode_layer'
@@ -2038,15 +2026,14 @@ class DeepseekV3ModelMTPLayer(DeepseekV3Model):
         block_table: Optional[torch.Tensor] = None,
         mtp_layer_idx: Optional[int] = 0,
         offload_cache: Optional[OffloadCache] = None,
-        prefill_o_proj_padded_tokens: Optional[int] = None,
-        prefill_dense_padded_tokens: Optional[int] = None,
         cp_metadata: Optional[PrefillCPMetaData] = None,
         **kwargs,
     ) -> torch.Tensor:
-        if prefill_o_proj_padded_tokens is None:
-            prefill_o_proj_padded_tokens = self.get_prefill_o_proj_padded_tokens(hidden_states, is_prefill)
-        if prefill_dense_padded_tokens is None:
-            prefill_dense_padded_tokens = self.get_prefill_dense_padded_tokens(hidden_states, is_prefill)
+        prefill_o_proj_padded_tokens = None
+        prefill_dense_padded_tokens = None
+        if is_prefill:
+            prefill_o_proj_padded_tokens = self.get_prefill_o_proj_padded_tokens(hidden_states)
+            prefill_dense_padded_tokens = self.get_prefill_dense_padded_tokens(hidden_states)
         return self.layers[str(self.mtp_start_layer_idx + mtp_layer_idx)](
             hidden_states,
             kv_len,
@@ -2204,6 +2191,11 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
 
         if exe_mode not in ["eager", "ge_graph", "npugraph_ex"]:
             raise ValueError(f"{exe_mode=} is not supported!")
+        if self.kv_cache_quant_mode not in ("unquant", "int8"):
+            raise ValueError(
+                "Deepseek V3.2 Exp only supports unquant and int8 KV cache; "
+                f"got kv_cache_quant_mode={self.kv_cache_quant_mode!r}."
+            )
         if enable_offload and disaggregation_mode != "NONE":
             raise ValueError(
                 "Deepseek V3.2 Exp KVCache offload currently supports offline mode only; "
@@ -2287,10 +2279,10 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
         outputs,
         is_prefill=True,
         actual_seq_lengths_q=None,
-        decode_batch_size=None,
     ):
         num_tokens = outputs.shape[0]
         hidden_size = outputs.shape[-1]
+        bs = actual_seq_lengths_q.shape[0]
         if is_prefill:
             # attention: SP + TP，moe：DP + EP
             if self.attn_tp_size > 1 and self.moe_ep_size > 1:
@@ -2298,12 +2290,11 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
                 dist.all_gather_into_tensor(new_outputs, outputs,
                                             group=self.comm_manager.get_group("attn_tp_group"))
                 outputs = new_outputs
-            bs = actual_seq_lengths_q.numel()
+
             seq_index = actual_seq_lengths_q.to(dtype=torch.long, device=outputs.device) - 1
             outputs = torch.index_select(outputs.view(-1, hidden_size), 0, seq_index).view(bs, 1, hidden_size)
             q_len = 1  # Prefill takes the last token.
         else:  # Combine bs and q_len axes for lm_head.
-            bs = decode_batch_size if decode_batch_size is not None else num_tokens
             q_len = num_tokens // bs
             outputs = outputs.view(bs * q_len, 1, hidden_size)
 
@@ -2374,7 +2365,6 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
             outputs,
             is_prefill=forward_metadata.is_prefill,
             actual_seq_lengths_q=forward_metadata.actual_seq_lengths_cu_q,
-            decode_batch_size=forward_metadata.kv_len.shape[0] if not forward_metadata.is_prefill else None,
         )
 
         # Keep selected-cache status lifecycle local until the framework owns offload workspace.
@@ -2690,7 +2680,6 @@ class DeepseekV3ModelMTP(DeepseekV3ForCausalLM):
                 outputs=prev_hidden_states,
                 is_prefill=is_prefill,
                 actual_seq_lengths_q=forward_metadata.actual_seq_lengths_cu_q,
-                decode_batch_size=kv_len.shape[0] if not is_prefill else None,
             )
 
             # Keep selected-cache status lifecycle local until the framework owns offload workspace.

@@ -82,6 +82,7 @@ class ChatCompletionRequest(_PDRequest):
     top_p: float = 1.0
     n: int = 1
     stop: List[str] = []
+    chat_template_kwargs: Optional[dict] = None
 
 
 class PDDispatcher:

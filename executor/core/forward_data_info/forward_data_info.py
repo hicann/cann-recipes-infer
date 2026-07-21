@@ -99,7 +99,7 @@ class Request:
         spec_num_accepted_tokens: Number of accepted speculative tokens for MTP acceptance statistics.
         decode_step_count: Number of decode steps completed (each step generates one or more tokens).
         valid_output_len: Length of valid output tokens when hitting EOS or max_new_tokens.
-        eos_output_len: Output length after the first EOS token. This records
+        eos_output_len: Output length through the first EOS token. This records
             EOS inside a multi-token MTP step without making finish decisions.
         cp_rank: Phase1 CP owner rank that stores persistent KV and runs decode for this request.
     """
@@ -271,7 +271,7 @@ class Batch:
         is_prefill: bool,
         next_tokens: Optional[torch.Tensor],
         infer_time: Optional[List],
-        eos_token_id: Optional[int] = None,
+        eos_token_ids: Optional[set[int]] = None,
     ) -> Dict[int, List[int]]:
         """Split batch outputs by index and update each request in-place."""
         next_tokens_by_request: Dict[int, List[int]] = {}
@@ -317,12 +317,11 @@ class Batch:
                     request_next_tokens = next_tokens[output_idx].tolist()
                 old_output_len = len(request.output_id_list)
                 request.output_id_list += request_next_tokens
-                if (
-                    eos_token_id is not None
-                    and request.eos_output_len is None
-                    and eos_token_id in request_next_tokens
-                ):
-                    request.eos_output_len = old_output_len + request_next_tokens.index(eos_token_id) + 1
+                if eos_token_ids and request.eos_output_len is None:
+                    for token_idx, token_id in enumerate(request_next_tokens):
+                        if token_id in eos_token_ids:
+                            request.eos_output_len = old_output_len + token_idx + 1
+                            break
                 next_tokens_by_request[request.request_id] = request_next_tokens
 
             if computed_lens is not None:

@@ -74,14 +74,27 @@ class Scheduler:
         self._batch_counter = 0
         self.mode = 'offline'
 
-    def tokenize_request(self, prompt, input_truncated_len=None) -> torch.Tensor:
+    def tokenize_request(
+        self,
+        prompt,
+        input_truncated_len=None,
+        chat_template_kwargs: Optional[dict] = None,
+    ) -> torch.Tensor:
         """Tokenize a prompt and return input_ids tensor."""
         if isinstance(prompt, list):
             if len(prompt) == 0:
                 raise ValueError("Empty prompt list")
             if isinstance(prompt[0], dict):
+                template_kwargs = {}
+                if chat_template_kwargs and "enable_thinking" in chat_template_kwargs:
+                    # Keep framework-controlled apply_chat_template kwargs fixed;
+                    # only pass the supported template option for now.
+                    template_kwargs["enable_thinking"] = chat_template_kwargs["enable_thinking"]
                 prompt_text = self.tokenizer.apply_chat_template(
-                    prompt, tokenize=False, add_generation_prompt=True
+                    prompt,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                    **template_kwargs,
                 )
             elif isinstance(prompt[0], str):
                 raise ValueError(

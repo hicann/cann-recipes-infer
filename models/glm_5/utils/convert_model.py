@@ -49,7 +49,7 @@ def get_had_pow2(n, norm=True):
     return had
 
 
-def weight_dequant(weight: torch.Tensor, scale: torch.Tensor, 
+def weight_dequant(weight: torch.Tensor, scale: torch.Tensor,
                    block_size: int = 128, is_mx: bool = False) -> torch.Tensor:
     """
     Dequantizes the given weight tensor using the provided scale tensor, efficiently handling cases where
@@ -429,7 +429,7 @@ def main(fp8_path, output_path, quant_type, clip=False, quant_param_path=None):
         config['quantization_config'] = quantization_config
 
     quant_layers = generate_quant_layers(num_layers, num_experts,
-        first_k_dense_replace=first_k_dense_replace, 
+        first_k_dense_replace=first_k_dense_replace,
         w4a8=w4a8, is_mx=is_mx
     )
 
@@ -492,7 +492,7 @@ def main(fp8_path, output_path, quant_type, clip=False, quant_param_path=None):
             else:
                 new_state_dict[weight_name] = weight
                 new_weight_map[weight_name] = file_name
-            
+
             if w4a8 or w8a8:
                 new_weight_name = weight_name.rsplit(".", 1)[0]
                 if new_weight_name in list(quant_layers.keys()):

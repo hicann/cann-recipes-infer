@@ -69,20 +69,6 @@ logger = logging.get_logger(__name__)
 _CONFIG_FOR_DOC = "DeepseekV3Config"
 
 
-def _get_unpad_data(attention_mask):
-    seqlens_in_batch = attention_mask.sum(dim=-1, dtype=torch.int32)
-    indices = torch.nonzero(attention_mask.flatten(), as_tuple=False).flatten()
-    max_seqlen_in_batch = seqlens_in_batch.max().item()
-    cu_seqlens = F.pad(
-        torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.torch.int32), (1, 0)
-    )
-    return (
-        indices,
-        cu_seqlens,
-        max_seqlen_in_batch,
-    )
-
-
 class DeepseekV3RMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
         """
@@ -157,7 +143,7 @@ class DeepseekV3RotaryEmbedding(nn.Module):
 
         cos = torch.index_select(self.cos_cached, dim=0, index=position_ids.view(-1)).unsqueeze(1).unsqueeze(1)
         sin = torch.index_select(self.sin_cached, dim=0, index=position_ids.view(-1)).unsqueeze(1).unsqueeze(1)
-        
+
         return (
             cos.to(dtype=x.dtype),
             sin.to(dtype=x.dtype),
@@ -196,7 +182,7 @@ class DeepseekV3LinearScalingRotaryEmbedding(DeepseekV3RotaryEmbedding):
 # Copied from transformers.models.llama.modeling_llama.LlamaDynamicNTKScalingRotaryEmbedding with Llama->DeepseekV3
 class DeepseekV3DynamicNTKScalingRotaryEmbedding(DeepseekV3RotaryEmbedding):
     """
-    DeepseekV3RotaryEmbedding extended with Dynamic NTK scaling. 
+    DeepseekV3RotaryEmbedding extended with Dynamic NTK scaling.
     Credits to the Reddit users /u/bloc97 and /u/emozilla
     """
 

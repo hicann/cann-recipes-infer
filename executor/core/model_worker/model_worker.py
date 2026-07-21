@@ -30,6 +30,7 @@ from typing import Dict, Optional, Tuple
 import torch
 import torch_npu
 import torch.distributed as dist
+from transformers import GenerationConfig
 
 from executor.core.config import InferenceConfig, CommManager
 from executor.core.kv_cache.cache_info import CacheEntry, LayerCacheInfo, ModelCacheInfo, OffloadWorkspaceMemoryInfo
@@ -114,6 +115,7 @@ class ModelWorker:
         self.dtype = torch.bfloat16
         self.quant_cache_dtype = None
         self.quantization = None
+        self.hf_generation_config = None
 
         # MoE Load Balance
         self.force_eplb = self.infer_config.model_config.force_eplb
@@ -150,6 +152,7 @@ class ModelWorker:
             ignore_mismatched_sizes=True,
             runner_settings=self.infer_config
         )
+        self.hf_generation_config = self._load_generation_config()
 
         # Allow custom_params to override hf_config fields (e.g. num_hidden_layers for reduced-layer testing)
         custom_params = self.infer_config.model_config.custom_params
@@ -180,6 +183,23 @@ class ModelWorker:
 
         # Phase 3: build model layers and load weights
         self._load_weights(model_cls)
+
+    def _load_generation_config(self) -> Optional[GenerationConfig]:
+        try:
+            return GenerationConfig.from_pretrained(
+                self.model_path,
+                trust_remote_code=True,
+            )
+        except OSError:
+            logger.debug("generation_config.json not found, skip generation config loading.")
+            return None
+        except Exception as e:
+            logger.warning(
+                f"Failed to load generation_config.json from {self.model_path}: {e}. "
+                "Using default EOS configuration. If the model requires multiple EOS tokens "
+                "(e.g., GLM), ensure generation_config.json is valid."
+            )
+            return None
 
     def _build_comm_manager(self) -> CommManager:
         """Construct and initialize the process-wide CommManager."""

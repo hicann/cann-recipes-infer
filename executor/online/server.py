@@ -83,12 +83,15 @@ def load_server_app_config(
 def build_online_request_dict(  # pylint: disable=too-many-arguments
     prompt,
     sampling_params: Optional[dict] = None,
+    chat_template_kwargs: Optional[dict] = None,
     bootstrap_room: Optional[int] = None,
     bootstrap_host: Optional[str] = None,
     bootstrap_port: Optional[int] = None,
     require_bootstrap: bool = False,
 ) -> dict:
     request_dict = {"prompt": prompt, "sampling_params": sampling_params or {}}
+    if chat_template_kwargs is not None:
+        request_dict["chat_template_kwargs"] = dict(chat_template_kwargs)
     if bootstrap_room is not None:
         request_dict["bootstrap_room"] = bootstrap_room
     if bootstrap_host is not None:
@@ -324,6 +327,7 @@ class ChatCompletionRequest(BaseModel):
     top_p: float = 1.0
     n: int = 1
     stop: List[str] = []
+    chat_template_kwargs: Optional[dict] = None
     bootstrap_room: Optional[int] = None
     bootstrap_host: Optional[str] = None
     bootstrap_port: Optional[int] = None
@@ -376,6 +380,7 @@ def create_app(dispatcher, server_config: ServerAppConfig):
         return build_online_request_dict(
             prompt=prompt,
             sampling_params=sampling_params,
+            chat_template_kwargs=getattr(src, "chat_template_kwargs", None),
             bootstrap_room=src.bootstrap_room,
             bootstrap_host=src.bootstrap_host,
             bootstrap_port=src.bootstrap_port,

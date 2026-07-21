@@ -60,7 +60,7 @@ class OffloadWorkspaceSpec:
                 bytes=self.batchseq * self.index_topk * int32_size,
             ),
         ]
-        if self.kv_cache_quant_mode != "int8":
+        if self.kv_cache_quant_mode == "unquant":
             items.extend([
                 MemoryBudgetItem(
                     name="deepseek_v3_2_exp.offload.temp_rope",

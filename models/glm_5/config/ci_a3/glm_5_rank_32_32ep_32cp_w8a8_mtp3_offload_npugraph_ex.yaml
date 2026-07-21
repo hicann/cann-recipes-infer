@@ -1,8 +1,8 @@
 model_config:
   model_name: "glm_5"
-  model_path: "/data/models/GLM-5-W8A8-MXFP8"
+  model_path: "/data/models/GLM-5-W8A8"
   exe_mode: "npugraph_ex"       # ["eager", "npugraph_ex", "ge_graph"], mode of decode
-  platform_version: "950"       # ["A3", "950"]
+  platform_version: "A3"        # ["A3", "950"]
   with_ckpt: True               # [False, True]
   next_n: 3
   force_eplb: False             # [False, True]
@@ -13,23 +13,24 @@ model_config:
   custom_params:
     moe_chunk_max_len: 65536
     enable_multi_streams: True  # [False, True]
+    enable_offload: True        # [False, True]
 
 data_config:
   dataset: InfiniteBench
-  input_truncated_len: 8192
+  input_truncated_len: 65536
 
 parallel_config:
-  world_size: 16                # world_size = chip_num in 950
-  cp_size: 1                    # only active at prefill stage
-  o_proj_tp_size: 1             # only support when attn_tp_size == 1
+  world_size: 32                # world_size = 2 * chip_num in A3
+  cp_size: 32                   # only active at prefill stage
+  o_proj_tp_size: 16            # only support when attn_tp_size == 1
   attn_tp_size: 1
-  dense_tp_size: 1
+  dense_tp_size: 8
   moe_tp_size: 1
-  embed_tp_size: 1
-  lmhead_tp_size: 4
+  embed_tp_size: 32
+  lmhead_tp_size: 32
 
 scheduler_config:
   block_size: 128
   max_new_tokens: 256
-  batch_size: 16
-  max_prefill_tokens: 8192
+  batch_size: 32
+  max_prefill_tokens: 65536

@@ -338,7 +338,13 @@ class OnlineInference(OfflineInference):
                     logger.error(f"Error receiving request: {e}")
                     break
         return [
-            {**r, "input_ids": self.scheduler.tokenize_request(r.get("prompt"))}
+            {
+                **r,
+                "input_ids": self.scheduler.tokenize_request(
+                    r.get("prompt"),
+                    chat_template_kwargs=r.get("chat_template_kwargs"),
+                ),
+            }
             for r in requests
         ]
 

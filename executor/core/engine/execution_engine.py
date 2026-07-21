@@ -15,9 +15,9 @@
 
 """ExecutionEngine for model inference."""
 
-import os
 import logging
-from typing import Dict, Optional, Any
+import os
+from typing import Any, Dict, Optional, Set
 
 import torch
 import torch_npu
@@ -49,8 +49,9 @@ class ExecutionEngine:
         self.infer_config = infer_config
         self.device = None
         self.tokenizer = None
-        self.eos_token_id = None
+        self.eos_token_ids = set()
         self.hf_config = None
+        self.hf_generation_config = None
         self.kvcache_manager = None
         self.comm_manager = None
         self.max_new_tokens = self.infer_config.scheduler_config.max_new_tokens
@@ -148,6 +149,7 @@ class ExecutionEngine:
 
         # Initialize tokenizer (from main worker)
         self.hf_config = self.main_worker.hf_config
+        self.hf_generation_config = self.main_worker.hf_generation_config
         self.tokenizer = get_tokenizer(
             self.infer_config.model_config.model_name,
             self.infer_config.model_config.model_path,
@@ -155,9 +157,7 @@ class ExecutionEngine:
             truncation_side='right',
             trust_remote_code=True
         )
-        if getattr(self.hf_config, "eos_token_id", None) is not None:
-            self.tokenizer.eos_token_id = self.hf_config.eos_token_id
-        self.eos_token_id = getattr(self.tokenizer, "eos_token_id", None)
+        self.eos_token_ids = self._collect_eos_token_ids()
 
         # Initialize KV cache
         if cache_info is not None:
@@ -170,6 +170,30 @@ class ExecutionEngine:
             if self.mtp_worker is not None:
                 # Support MTP
                 self.mtp_worker.mtp_model_worker.init_kvcache()
+
+    @staticmethod
+    def _normalize_eos_token_ids(eos_token_id: Any) -> Set[int]:
+        if eos_token_id is None:
+            return set()
+        if isinstance(eos_token_id, int):
+            return {eos_token_id}
+        if isinstance(eos_token_id, list):
+            return {int(token_id) for token_id in eos_token_id}
+        raise TypeError(f"Unsupported eos_token_id type: {type(eos_token_id)}")
+
+    def _collect_eos_token_ids(self) -> Set[int]:
+        """Collect all token ids that should stop generation.
+
+        HF configs may define multiple generation stop ids while tokenizer.eos_token_id
+        usually represents only the tokenizer's default EOS token. Keep the tokenizer
+        object unchanged and maintain the runtime stop set in the engine.
+        """
+        hf_config_eos = self._normalize_eos_token_ids(getattr(self.hf_config, "eos_token_id", None))
+        generation_config_eos = self._normalize_eos_token_ids(
+            getattr(self.hf_generation_config, "eos_token_id", None)
+        )
+        tokenizer_eos = self._normalize_eos_token_ids(getattr(self.tokenizer, "eos_token_id", None))
+        return hf_config_eos | generation_config_eos | tokenizer_eos
 
     def _init_cache_manager(self, cache_info: ModelCacheInfo):
         validate_cache_info(cache_info)
@@ -814,7 +838,7 @@ class ExecutionEngine:
             batch.is_prefill,
             next_tokens,
             infer_time_total,
-            eos_token_id=self.eos_token_id,
+            eos_token_ids=self.eos_token_ids,
         )
         return {
             "next_tokens": next_tokens_by_request,

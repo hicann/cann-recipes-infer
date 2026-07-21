@@ -46,6 +46,11 @@ _specs: dict[str, list[tuple[str, str]]] = {
         ("models.gpt_oss.models.modeling_gpt_oss", "GptOssForCausalLM"),
         ("models.gpt_oss.models.configuration_gpt_oss", "GptOssConfig"),
     ],
+    "glm_5": [
+        ("models.glm_5.models.modeling_glm", "GlmMoeDsaForCausalLM"),
+        ("models.glm_5.models.modeling_glm", "GlmMoeDsaModelMTP"),
+        ("models.glm_5.models.configuration_glm", "GlmMoeDsaConfig"),
+    ],
     "hy3": [
         ("models.hy3.models.modeling_hy_v3", "HYV3ForCausalLM"),
         ("models.hy3.models.modeling_hy_v3", "HYV3ModelMTP"),

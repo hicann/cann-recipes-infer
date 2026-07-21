@@ -13,129 +13,182 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from dataclasses import dataclass
+
 import torch
 import torch.nn as nn
-import torch_npu
+
+from executor.core.config import InferenceConfig
+from executor.core.kv_cache.cache_info import MemoryBudgetItem, OffloadWorkspaceMemoryInfo
+
+
+@dataclass(frozen=True)
+class OffloadWorkspaceSpec:
+    dtype: torch.dtype
+    cache_last_dim: int
+    num_hidden_layers: int
+    batchseq: int
+    selection_num_blocks: int
+    block_size: int
+    index_topk: int
+    batch_len: int
+    qk_rope_head_dim: int
+    kv_cache_quant_mode: str
+
+    @staticmethod
+    def _dtype_itemsize(dtype: torch.dtype) -> int:
+        return torch.empty((), dtype=dtype).element_size()
+
+    def memory_info(self) -> OffloadWorkspaceMemoryInfo:
+        dtype_size = self._dtype_itemsize(self.dtype)
+        int32_size = self._dtype_itemsize(torch.int32)
+        selected_blocks_per_token = (self.index_topk + self.block_size - 1) // self.block_size
+        items = [
+            MemoryBudgetItem(
+                name="glm_5.offload.temp_nope",
+                bytes=self.batch_len * self.block_size * self.cache_last_dim * dtype_size,
+            ),
+            MemoryBudgetItem(
+                name="glm_5.offload.selected_nope",
+                bytes=self.num_hidden_layers * self.selection_num_blocks
+                * self.block_size * self.cache_last_dim * dtype_size,
+            ),
+            MemoryBudgetItem(
+                name="glm_5.offload.selection_kv_block_table",
+                bytes=self.num_hidden_layers * self.batchseq * selected_blocks_per_token * int32_size,
+            ),
+            MemoryBudgetItem(
+                name="glm_5.offload.selection_kv_block_status",
+                bytes=self.num_hidden_layers * self.batchseq * (self.index_topk + 1) * int32_size,
+            ),
+            MemoryBudgetItem(
+                name="glm_5.offload.default_topk_indices",
+                bytes=self.batchseq * self.index_topk * int32_size,
+            ),
+        ]
+        if self.kv_cache_quant_mode == "unquant":
+            items.extend([
+                MemoryBudgetItem(
+                    name="glm_5.offload.temp_rope",
+                    bytes=self.batch_len * self.block_size * self.qk_rope_head_dim * dtype_size,
+                ),
+                MemoryBudgetItem(
+                    name="glm_5.offload.selected_rope",
+                    bytes=self.num_hidden_layers * self.selection_num_blocks
+                    * self.block_size * self.qk_rope_head_dim * dtype_size,
+                ),
+            ])
+        return OffloadWorkspaceMemoryInfo(items=items)
 
 
 class OffloadCache(nn.Module):
-    def __init__(self, runner_settings, model):
+    def __init__(self, infer_config: InferenceConfig, model):
         super().__init__()
-        self.runner_settings = runner_settings
-        self.next_n = runner_settings.get("model_config").get("next_n", 0)
-
+        self.infer_config = infer_config
         self.config = model.config
-        self.is_mtp = model.is_mtp
+        self.spec = self.build_workspace_spec(infer_config, model)
 
-        self.num_hidden_layers = self.config.num_nextn_predict_layers if self.is_mtp else self.config.num_hidden_layers
-        self.batch_size_per_rank = self.runner_settings.get("data_config").get("batch_size_per_rank", 1)
-        self.index_topk = self.config.index_topk
-        self.block_size = self.runner_settings.get("model_config").get("pa_block_size", 128)
+        self.num_hidden_layers = self.spec.num_hidden_layers
+        self.index_topk = self.spec.index_topk
+        self.block_size = self.spec.block_size
+        self.selection_num_blocks = self.spec.selection_num_blocks
+        self.batch_len = self.spec.batch_len
+        self.kv_cache_quant_mode = self.spec.kv_cache_quant_mode
 
-        # num of selected blocks per query token
-        self.s_maxblocknum = (self.index_topk + self.block_size - 1) // self.block_size
-        self.next_n = self.runner_settings.get("model_config").get("next_n", 0)
-        # bsz*seq
-        batchseq = self.batch_size_per_rank * (1 + self.next_n)
-        # total num of selected blocks
-        self.selection_num_blocks = self.s_maxblocknum * batchseq
+        batchseq = self.spec.batchseq
 
         self.selection_kv_block_table = ()
         for _ in range(self.num_hidden_layers):
-            self.selection_kv_block_table += (torch.arange(0, self.selection_num_blocks
-                                                     ).reshape(batchseq, -1).to(device="npu", dtype=torch.int32),)
+            self.selection_kv_block_table += (
+                torch.arange(0, self.selection_num_blocks).reshape(batchseq, -1).to(device="npu", dtype=torch.int32),
+            )
         self.selection_kv_block_status = ()
         for _ in range(self.num_hidden_layers):
-            size = (self.batch_size_per_rank, 1 + self.next_n, 1, self.index_topk + 1) # bsnd
+            size = (batchseq, 1, self.index_topk + 1)
             self.selection_kv_block_status += (torch.full(size, -1).to(device="npu", dtype=torch.int32),)
 
         self.d2h_stream = torch.npu.Stream(device="npu")
         self.d2h_event = torch.npu.Event(blocking=True, enable_timing=False)
 
-        self.pa_max_length = self.runner_settings.get("model_config").get("pa_max_length", 2048)
-        # num of blocks of full kv in each batch
-        self.cache_len = self.pa_max_length // self.block_size
-        self.kv_cache_num_block = self.cache_len * self.batch_size_per_rank
-
-        self.prefill_mini_batch_size = runner_settings.get("model_config").get("prefill_mini_batch_size", 0)
-        self.mini_batch = self.prefill_mini_batch_size \
-            if self.prefill_mini_batch_size > 0 else self.batch_size_per_rank
-        self.batch_len = self.cache_len * self.mini_batch
-
         self.default_topk_indices = torch.arange(self.index_topk, dtype=torch.int32, device="npu")\
                                     .view(1, -1).repeat(batchseq, 1)
 
-        self.kv_cache_quant_mode = self.config.quant_config.kv_cache_quant_mode \
-            if self.config.quant_config is not None else "unquant"
         self.empty_rope = torch.tensor([], dtype=torch.int8, device="npu")
 
-    def init_cache(
-        self,
-        cache_device,
-    ):
-        dtype = torch.int8 if self.kv_cache_quant_mode == "int8" else self.config.torch_dtype
+    @staticmethod
+    def build_workspace_spec(infer_config: InferenceConfig, model) -> OffloadWorkspaceSpec:
+        config = model.config
+        kv_cache_quant_mode = config.quant_config.kv_cache_quant_mode if config.quant_config is not None else "unquant"
+        if kv_cache_quant_mode not in ("unquant", "int8"):
+            raise ValueError(
+                "GLM-5 KVCache offload only supports unquant and int8 KV cache; "
+                f"got kv_cache_quant_mode={kv_cache_quant_mode!r}."
+            )
+        dtype = torch.int8 if kv_cache_quant_mode == "int8" else config.torch_dtype
+        cache_last_dim = config.kv_lora_rank + config.qk_rope_head_dim * 2 + 4 * 4 \
+            if kv_cache_quant_mode == "int8" else config.kv_lora_rank
+        num_hidden_layers = config.num_nextn_predict_layers if model.is_mtp else config.num_hidden_layers
+        batch_size_per_rank = infer_config.scheduler_config.batch_size_per_dp_rank
+        index_topk = config.index_topk
+        block_size = infer_config.scheduler_config.block_size
+        s_maxblocknum = (index_topk + block_size - 1) // block_size
+        batchseq = batch_size_per_rank * (1 + infer_config.model_config.next_n)
+        selection_num_blocks = s_maxblocknum * batchseq
+        pa_max_length = infer_config.model_config.custom_params.get(
+            "pa_max_length",
+            infer_config.data_config.input_truncated_len
+            + infer_config.scheduler_config.max_new_tokens * (infer_config.model_config.next_n + 1)
+            + infer_config.model_config.next_n,
+        )
+        cache_len = (pa_max_length + block_size - 1) // block_size
+        batch_len = cache_len * batch_size_per_rank + 1
+        return OffloadWorkspaceSpec(
+            dtype=dtype,
+            cache_last_dim=cache_last_dim,
+            num_hidden_layers=num_hidden_layers,
+            batchseq=batchseq,
+            selection_num_blocks=selection_num_blocks,
+            block_size=block_size,
+            index_topk=index_topk,
+            batch_len=batch_len,
+            qk_rope_head_dim=config.qk_rope_head_dim,
+            kv_cache_quant_mode=kv_cache_quant_mode,
+        )
 
-        past_key_values = ()
+    def init_workspace(self, cache_device):
         self.temp_kv_cache = None
         self.selected_key_values = ()
-        self.past_key_values_unmapped = ()
 
-        # When the kvcache INT8 quantization is enabled
-        # nope_cache, rope_cache, and nope_scale need to be concatenated for SFA/MLAprolog kernel in INT8 dtype.
-        # kv_lora_rank(INT8) + qk_rope_head_dim(BF16) * 2(->INT8) + kv_scale(FP32) * 4(->INT8)
-        cache_last_dim = self.config.kv_lora_rank + self.config.qk_rope_head_dim * 2 + 4 * 4 \
-            if self.kv_cache_quant_mode == "int8" else self.config.kv_lora_rank
-
-        cache_nope_shape = (
-                        self.kv_cache_num_block,
-                        self.block_size,
-                        1,
-                        cache_last_dim
-                    )
-
-        cache_rope_shape = (
-                        self.kv_cache_num_block,
-                        self.block_size,
-                        1,
-                        self.config.qk_rope_head_dim
-                    )
-
-        # temp cache for prefill
-        temp_nope = torch.zeros((
-                    self.batch_len,
-                    self.block_size,
-                    1,
-                    cache_last_dim
-                ), dtype=dtype, device=cache_device)
+        temp_nope = torch.zeros(
+            (self.batch_len, self.block_size, 1, self.spec.cache_last_dim),
+            dtype=self.spec.dtype,
+            device=cache_device,
+        )
         if self.kv_cache_quant_mode == "int8":
             temp_rope = torch.tensor([], dtype=torch.int8, device=cache_device)
         else:
-            temp_rope = torch.zeros((
-                        self.batch_len,
-                        self.block_size,
-                        1,
-                        self.config.qk_rope_head_dim
-                    ), dtype=dtype, device=cache_device)
-        self.temp_kv_cache = (temp_nope, temp_rope,)
+            temp_rope = torch.zeros(
+                (self.batch_len, self.block_size, 1, self.spec.qk_rope_head_dim),
+                dtype=self.spec.dtype,
+                device=cache_device,
+            )
+        self.temp_kv_cache = (temp_nope, temp_rope)
 
         for _ in range(self.num_hidden_layers):
-            cache_nope = torch_npu.empty_with_swapped_memory(cache_nope_shape, dtype=dtype, device=cache_device)
-            if self.kv_cache_quant_mode == "int8":
-                cache_rope = None
-            else:
-                cache_rope = torch_npu.empty_with_swapped_memory(cache_rope_shape, dtype=dtype, device=cache_device)
-            past_key_values += ((cache_nope, cache_rope),)
-
-            selected_nope = torch.zeros((self.selection_num_blocks, self.block_size, cache_last_dim),
-                                        dtype=dtype, device=cache_device)
+            selected_nope = torch.zeros(
+                (self.selection_num_blocks, self.block_size, self.spec.cache_last_dim),
+                dtype=self.spec.dtype,
+                device=cache_device,
+            )
             if self.kv_cache_quant_mode == "int8":
                 selected_rope = torch.tensor([], dtype=torch.int8, device=cache_device)
             else:
-                selected_rope = torch.zeros((self.selection_num_blocks, self.block_size, self.config.qk_rope_head_dim),
-                                            dtype=dtype, device=cache_device)
+                selected_rope = torch.zeros(
+                    (self.selection_num_blocks, self.block_size, self.spec.qk_rope_head_dim),
+                    dtype=self.spec.dtype,
+                    device=cache_device,
+                )
             self.selected_key_values += ((selected_nope, selected_rope),)
-
-        return past_key_values
 
     def reinit_status(self):
         for i in range(self.num_hidden_layers):
