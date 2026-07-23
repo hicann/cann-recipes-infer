@@ -1,6 +1,6 @@
 model_config:
   model_name: "deepseek_v4"
-  model_path: "/data/models/Deepseek_v4_pro_w4a8"
+  model_path: "/data/models/Deepseek_v4_int_w4a8"
   platform_version: "A3"
   with_ckpt: True
   next_n: 1
