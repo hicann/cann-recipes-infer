@@ -246,6 +246,7 @@ class Compressor(nn.Module):
         else:
             sfa_cmp_cache = cache_getter("sfa_cmp_kv")
             if self.kv_cache_quant_mode == "float8" or self.kv_cache_quant_mode == "hifloat8":
+                import cann_ops_transformer
                 torch.ops.cann_ops_transformer.kv_compress_epilog(
                     x=kv if is_prefill else kv.view(-1, self.head_dim),
                     slot_mapping=cmp_slot_mapping if is_prefill else cmp_slot_mapping.view(-1),

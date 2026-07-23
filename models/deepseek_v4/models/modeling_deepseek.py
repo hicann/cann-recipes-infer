@@ -38,7 +38,6 @@ import torch.distributed as dist
 import torch_npu
 import torchair as tng
 import custom_ops
-import cann_ops_transformer
 from transformers.cache_utils import Cache
 from transformers.utils import (
     add_start_docstrings,
@@ -1402,6 +1401,7 @@ class Attention(nn.Module):
         win_cache: torch.Tensor,
     ):
         if self.kv_cache_quant_mode == "float8" or self.kv_cache_quant_mode == "hifloat8":
+            import cann_ops_transformer
             torch.ops.cann_ops_transformer.kv_compress_epilog(
                     x=kv.view(-1, self.head_dim),
                     slot_mapping=win_kv_slot_mapping,
