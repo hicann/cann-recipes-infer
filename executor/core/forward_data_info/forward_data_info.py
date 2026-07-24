@@ -23,6 +23,61 @@ from executor.utils.forward_metadata import get_forward_metadata, set_forward_me
 
 
 @dataclass
+class Logprobs:
+    """
+        dim info:
+        logprob_token_id: [max_num_logprobs + 1]
+        logprobs: [max_num_logprobs + 1]
+        selected_token_rank: [1]
+    """
+    logprob_token_id: list
+    logprobs: list
+    selected_token_rank: int
+
+
+@dataclass
+class LogprobsTensors:
+    """
+        dim info:
+        logprob_token_ids: [num_reqs, num_tokens, max_num_logprobs + 1]
+        logprobs_tensors: [num_reqs, num_tokens, max_num_logprobs + 1]
+        selected_token_ranks: [num_reqs, num_tokens, 1]
+    """
+    logprob_token_ids: torch.Tensor
+    logprobs_tensors: torch.Tensor
+    selected_token_ranks: torch.Tensor
+
+    def filter(self, req_idx: int, accepted_num: int | None = None) -> list[Logprobs]:
+        output_len = self.logprob_token_ids.size(1)
+        if accepted_num is not None:
+            output_len = accepted_num + 1
+        logprob_token_ids = self.logprob_token_ids[req_idx, :output_len]
+        logprobs_tensors = self.logprobs_tensors[req_idx, :output_len]
+        selected_token_ranks = self.selected_token_ranks[req_idx, :output_len]
+        logprobs_list = []
+        for i in range(output_len):
+            logprobs = Logprobs(
+                logprob_token_id=logprob_token_ids[i].tolist(),
+                logprobs=logprobs_tensors[i].tolist(),
+                selected_token_rank=selected_token_ranks[i].item()
+            )
+            logprobs_list.append(logprobs)
+        return logprobs_list
+
+
+@dataclass
+class SamplingMetadata:
+    temperature: torch.Tensor | None
+    top_p: torch.Tensor | None
+    top_k: torch.Tensor | None
+    all_greedy: bool
+    all_random: bool
+    max_num_logprobs: int | None
+    logprobs: bool
+    generators: dict[int, torch.Generator] = field(default_factory=dict)
+
+
+@dataclass
 class GenerationOutput:
     """Output from batch generation.
 
@@ -75,6 +130,12 @@ class SamplingParams:
 
     max_tokens: Optional[int] = None
     ignore_eos: bool = False
+    temperature: Optional[float] = 0.0
+    top_p: Optional[float] = 1.0
+    top_k: Optional[int] = 0
+    logprobs: Optional[bool] = False
+    top_logprobs: Optional[int] = 0
+    seed: Optional[int] = None
 
 
 @dataclass
@@ -110,6 +171,7 @@ class Request:
     computed_len: int = 0
     prompt_tokens: int = 0
     output_id_list: List[int] = field(default_factory=list)
+    output_logprobs: List[Logprobs] = field(default_factory=list)
     is_prefill_done: bool = False
     is_finished: bool = False
     finish_reason: Optional[str] = None
@@ -131,6 +193,7 @@ class Request:
     metadata_buffer_index: int = -1
     disagg_kv_sender: Optional[Any] = None
     cp_rank: int = 0
+    generator: torch.Generator = None
 
     @property
     def bootstrap_addr(self) -> str:
@@ -271,6 +334,7 @@ class Batch:
         is_prefill: bool,
         next_tokens: Optional[torch.Tensor],
         infer_time: Optional[List],
+        logprobs_tensors: Optional[LogprobsTensors] = None,
         eos_token_ids: Optional[set[int]] = None,
     ) -> Dict[int, List[int]]:
         """Split batch outputs by index and update each request in-place."""
@@ -323,6 +387,10 @@ class Batch:
                             request.eos_output_len = old_output_len + token_idx + 1
                             break
                 next_tokens_by_request[request.request_id] = request_next_tokens
+            
+            if logprobs_tensors is not None:
+                request_logprobs = logprobs_tensors.filter(output_idx, accepted_num)
+                request.output_logprobs += request_logprobs
 
             if computed_lens is not None:
                 request.computed_len = computed_lens[output_idx].item()

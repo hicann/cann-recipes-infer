@@ -18,6 +18,7 @@
 import logging
 import json
 import pickle
+import math
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 from urllib import request as urllib_request
@@ -197,6 +198,12 @@ class OnlineInference(OfflineInference):
         sampling_params = request.get("sampling_params", {})
         params = SamplingParams(
             max_tokens=sampling_params.get("max_tokens", 32),
+            temperature=sampling_params.get("temperature", 0.0),
+            top_p=sampling_params.get("top_p", 1.0),
+            top_k=sampling_params.get("top_k", 0),
+            logprobs=sampling_params.get("logprobs", False),
+            top_logprobs=sampling_params.get("top_logprobs", 0),
+            seed=sampling_params.get("seed", None),
         )
         if hasattr(self.scheduler, "set_pd_request_context"):
             self.scheduler.set_pd_request_context(request)
@@ -375,6 +382,17 @@ class OnlineInference(OfflineInference):
             states = [(local_prefill, local_decode)]
         phase = self._decide_phase(states)
         return self._broadcast_group(phase)
+    
+    @staticmethod
+    def safe_float(val_list: list) -> list:
+        result = []
+        float_info = torch.finfo(torch.float32)
+        for val in val_list:
+            if isinstance(val, float) and not math.isfinite(val):
+                result.append(-float_info.max)
+            else:
+                result.append(val)
+        return result
 
     def _dispatch_results(self, output_socket: Optional[zmq.Socket]):
         """Emit finished requests to the client and retire them — every rank.
@@ -391,11 +409,22 @@ class OnlineInference(OfflineInference):
             if request is None:
                 continue
             if is_leader:
+                logprobs_dict_list = []
+                if request.output_logprobs:
+                    for logprob in request.output_logprobs:
+                        logprobs_dict_list.append({
+                            "logprob_token_id": logprob.logprob_token_id,
+                            "logprobs": self.safe_float(logprob.logprobs),
+                            "selected_token_rank": logprob.selected_token_rank,
+                            "logprob_token": [self.engine.tokenizer.decode(token_id)
+                                              for token_id in logprob.logprob_token_id],
+                        })
                 result = {
                     "output": self.engine.tokenizer.decode(request.output_id_list),
                     "finish_reason": request.finish_reason,
                     "prompt_tokens": request.prompt_tokens,
                     "completion_tokens": len(request.output_id_list),
+                    "logprobs": logprobs_dict_list if request.sampling_params.logprobs else None,
                 }
                 output_socket.send_multipart(
                     [

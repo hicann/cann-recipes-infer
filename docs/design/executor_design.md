@@ -499,7 +499,7 @@ Client ──POST /generate──▶ Router (prefill-node-0:8000)
 
 ```shell
 # 单请求
-curl -s -X POST http://localhost:8000/v1/chat/completions -H 'Content-Type: application/json' -d '{"model":"default","messages":[{"role":"user","content":"hello"}],"max_tokens":10}'
+curl -s -X POST http://localhost:8000/v1/chat/completions -H 'Content-Type: application/json' -d '{"model":"default","messages":[{"role":"user","content":"hello"}],"max_tokens":10,"temperature":0.6,"top_p":0.95,"top_k":10,"logprobs":true,"top_logprobs":5,"seed":42}'
 
 # 数据集评测
 evalscope eval \
@@ -509,8 +509,6 @@ evalscope eval \
     --eval-batch 32 \
     --generation-config '{"max_tokens":65535}'
 ```
-
-> *当前尚未支持 temperature、top_k等采样参数*
 
 ---
 

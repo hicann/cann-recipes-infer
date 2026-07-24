@@ -16,6 +16,9 @@ model_config:
 data_config:
   dataset: "default"  # ["default", "LongBench", "InfiniteBench"]
   input_truncated_len: 32
+  temperature: 0.6
+  top_p: 0.95
+  top_k: 10
 
 parallel_config:
   world_size: 16

@@ -23,6 +23,7 @@ from executor.utils.data_utils import generate_default_prompt, load_longbench_da
     load_infinitebench_dataset
 from executor.utils.common_utils import process_infer_time
 from executor.utils.logging_config import setup_logging
+from executor.core.forward_data_info import SamplingParams
 
 logger = logging.getLogger(__name__)
 
@@ -167,7 +168,15 @@ def main():
     if config.data_config.dataset != "default":
         prompts = preprocess_prompts_for_scheduler(
             prompts, llm.engine.tokenizer, config.scheduler_config, config.data_config)
-    results, mtp_stats, infer_time = llm.generate(prompts)
+    sampling_params = SamplingParams(
+        temperature=config.data_config.temperature,
+        top_p=config.data_config.top_p,
+        top_k=config.data_config.top_k,
+        seed=config.data_config.seed,
+        top_logprobs=0,
+        logprobs=False
+    )
+    results, mtp_stats, infer_time = llm.generate(prompts=prompts, sampling_params=sampling_params)
     if llm.engine.is_afd_ffn_rank:
         return
     log_results(results, mtp_stats, infer_time, llm.engine.next_n, llm.engine.main_worker.model_name)

@@ -28,11 +28,11 @@ from executor.utils.forward_metadata import PrefillCPMetaData, set_forward_metad
 from executor.utils.profiler_context import ProfilerManager
 from executor.core.model_worker import ModelWorker, MTPWorker
 from executor.core.tokenizer_registry import get_tokenizer
-from executor.utils import sample_logits
 from executor.core.kv_cache import KVCacheManager, ModelCacheInfo, create_single_type_managers
 from executor.core.kv_cache.cache_utils import allocate_cache_tensors, calculate_block_num, \
     prepare_block_tables, prepare_slot_mapping, validate_cache_info
 from ..forward_data_info import Batch
+from .sampler import Sampler
 
 torch.npu.config.allow_internal_format = True
 logger = logging.getLogger(__name__)
@@ -119,6 +119,9 @@ class ExecutionEngine:
                     rank=self.global_rank,
                     pg_options=pg_options,
                 )
+
+        # Initialize sampler after device is set
+        self.sampler = Sampler(self.device)
 
     def init(self, config_cls, main_model_cls, mtp_model_cls=None):
         """Bring the engine to ready: load the model (and MTP draft if any),
@@ -813,8 +816,7 @@ class ExecutionEngine:
                 # request rows are consumed by sampling and request updates.
                 selected_logits = torch.index_select(logits, 0, output_indices)
             set_forward_metadata(kv_len=kv_len)
-
-        next_tokens = self._sample_tokens(batch, selected_logits)
+        next_tokens, logprobs_tensors = self.sampler.sample_and_gather_logprobs(batch, selected_logits)
 
         infer_times_mtp: list[float] = []
         if self.mtp_worker:
@@ -838,6 +840,7 @@ class ExecutionEngine:
             batch.is_prefill,
             next_tokens,
             infer_time_total,
+            logprobs_tensors,
             eos_token_ids=self.eos_token_ids,
         )
         return {
@@ -889,16 +892,6 @@ class ExecutionEngine:
             "inference_time_main": infer_time_main,
             "inference_times_mtp": [],
         }
-
-    def _sample_tokens(
-        self,
-        batch: Batch,
-        logits: torch.Tensor
-    ) -> torch.Tensor:
-        if batch.is_prefill:
-            logits = logits[:, -1:, :]
-        next_tokens = sample_logits(logits, self.temperature).to(self.device)
-        return next_tokens
 
     def verify_spec_tokens(self, batch, main_next_tokens):
         '''

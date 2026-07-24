@@ -92,6 +92,9 @@ class DataConfig:
     dataset_path: str = ""
     input_truncated_len: int = 256
     temperature: float = 0.0
+    top_p: float = 1.0
+    top_k: int = 0
+    seed: int | None = None
 
     @classmethod
     def from_dict(cls, data_config_dict: dict) -> "DataConfig":
@@ -101,13 +104,27 @@ class DataConfig:
             dataset_path=data_config_dict.get("dataset_path", ""),
             input_truncated_len=data_config_dict.get("input_truncated_len", 256),
             temperature=data_config_dict.get("temperature", 0.0),
+            top_p=data_config_dict.get("top_p", 1.0),
+            top_k=data_config_dict.get("top_k", 0),
+            seed=data_config_dict.get("seed", None)
         )
         data_config._validate()
         return data_config
 
     def _validate(self):
+        """Validate data configuration parameters."""
         if self.temperature < 0.0:
-            raise ValueError(f"temperature={self.temperature} should be greater than or equal to 0.0")
+            raise ValueError(
+                f"temperature must be non-negative, got {self.temperature}"
+            )
+        if not 0 <= self.top_p <= 1:
+            raise ValueError(
+                f"top_p must be in [0, 1], got {self.top_p}"
+            )
+        if self.top_k < 0:
+            raise ValueError(
+                f"top_k must be non-negative, got {self.top_k}"
+            )
 
 
 @dataclass

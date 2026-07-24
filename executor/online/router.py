@@ -68,8 +68,12 @@ class CompletionRequest(_PDRequest):
     model: str
     prompt: str | List[str]
     max_tokens: int = 16
-    temperature: float = 1.0
+    temperature: float = 0.0
     top_p: float = 1.0
+    top_k: int = 0
+    logprobs: bool = False
+    top_logprobs: int = 0
+    seed: int | None = None
     n: int = 1
     stop: List[str] = []
 
@@ -78,8 +82,12 @@ class ChatCompletionRequest(_PDRequest):
     model: str
     messages: List[dict]
     max_tokens: int = 16
-    temperature: float = 1.0
+    temperature: float = 0.0
     top_p: float = 1.0
+    top_k: int = 0
+    logprobs: bool = False
+    top_logprobs: int = 0
+    seed: int | None = None
     n: int = 1
     stop: List[str] = []
     chat_template_kwargs: Optional[dict] = None

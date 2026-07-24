@@ -137,9 +137,15 @@ class Scheduler:
             request_id = self._request_counter
         self._request_counter += 1
 
+        if sampling_params is not None and sampling_params.seed is not None:
+            generator = torch.Generator(device='npu')
+            generator.manual_seed(sampling_params.seed)
+        else:
+            generator = None
         request = Request(
             request_id=request_id,
             prompt=prompt,
+            generator=generator,
             sampling_params=sampling_params
             or SamplingParams(max_tokens=self.config.max_new_tokens),
         )

@@ -15,6 +15,18 @@
 
 """Forward data info module"""
 
-from .forward_data_info import GenerationOutput, Request, Batch, MTPInfo, SamplingParams
+from .forward_data_info import (
+    GenerationOutput, Request, Batch, MTPInfo, 
+    SamplingParams, LogprobsTensors, Logprobs, SamplingMetadata
+)
 
-__all__ = ["GenerationOutput", "Request", "Batch", "MTPInfo", "SamplingParams"]
+__all__ = [
+    "GenerationOutput",
+    "Request",
+    "Batch",
+    "MTPInfo",
+    "SamplingParams",
+    "LogprobsTensors",
+    "Logprobs",
+    "SamplingMetadata",
+]

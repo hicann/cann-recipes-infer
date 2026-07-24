@@ -310,8 +310,12 @@ class CompletionRequest(BaseModel):
     model: str
     prompt: str | List[str]
     max_tokens: int = 16
-    temperature: float = 1.0
+    temperature: float = 0.0
     top_p: float = 1.0
+    top_k: int = 0
+    logprobs: bool = False
+    top_logprobs: int = 0
+    seed: int | None = None
     n: int = 1
     stop: List[str] = []
     bootstrap_room: Optional[int] = None
@@ -323,9 +327,13 @@ class ChatCompletionRequest(BaseModel):
     model: str
     messages: List[dict]
     max_tokens: int = 16
-    temperature: float = 1.0
+    temperature: float = 0.0
     top_p: float = 1.0
+    top_k: int = 0
     n: int = 1
+    logprobs: bool = False
+    top_logprobs: int = 0
+    seed: int | None = None
     stop: List[str] = []
     chat_template_kwargs: Optional[dict] = None
     bootstrap_room: Optional[int] = None
@@ -403,13 +411,45 @@ def create_app(dispatcher, server_config: ServerAppConfig):
         if disagg_mode == ROLE_PREFILL:
             return result
         return {"status": "success", "result": result}
+    
+    def _generate_completions_logprobs(output_logprobs: list, top_logprobs: int) -> dict:
+        text_offset = []
+        token_logprobs = []
+        tokens = []
+        top_logprobs_list = []
+        token_len = 0
+        for output_logprob in output_logprobs:
+            text_offset.append(token_len)
+            token_len += len(output_logprob.get("logprob_token")[0])
+            token_logprobs.append(output_logprob.get("logprobs")[0])
+            tokens.append(output_logprob.get("logprob_token")[0])
+            top_logprobs_pairs = []
+            token_id_set = set()
+            for i in range(1, len(output_logprob.get("logprob_token_id"))):
+                if len(top_logprobs_pairs) >= top_logprobs:
+                    break
+                if output_logprob.get("logprob_token_id")[i] in token_id_set:
+                    continue
+                token_id_set.add(output_logprob.get("logprob_token_id")[i])
+                top_logprobs_pairs.append((output_logprob.get("logprob_token")[i], output_logprob.get("logprobs")[i]))
+            top_logprobs_list.append(dict(top_logprobs_pairs))
+        return {
+            "text_offset": text_offset,
+            "token_logprobs": token_logprobs,
+            "tokens": tokens,
+            "top_logprobs": top_logprobs_list
+        }
 
     @app.post("/v1/completions", dependencies=[Depends(_require_server_ready)])
     async def completions(request: CompletionRequest):
-        # temperature/top_p/stop are accepted at the API surface for OpenAI
-        # client compatibility but not yet wired into the sampling path.
         sampling_params = {
             "max_tokens": request.max_tokens,
+            "temperature": request.temperature,
+            "top_p": request.top_p,
+            "top_k": request.top_k,
+            "logprobs": request.logprobs,
+            "top_logprobs": request.top_logprobs,
+            "seed": request.seed,
         }
         prompts = request.prompt if isinstance(request.prompt, list) else [request.prompt]
         if disagg_mode == ROLE_PREFILL and len(prompts) != 1:
@@ -429,9 +469,14 @@ def create_app(dispatcher, server_config: ServerAppConfig):
         totals = {"prompt_tokens": 0, "completion_tokens": 0}
         for idx, rid in enumerate(request_ids):
             result = await _wait_result(rid)
+            completion_logprobs = (
+                _generate_completions_logprobs(result["logprobs"], request.top_logprobs)
+                if result["logprobs"] is not None else None
+            )
             choices.append({
                 "index": idx,
                 "text": result["output"],
+                "logprobs": completion_logprobs,
                 "finish_reason": result.get("finish_reason", "stop"),
             })
             totals["prompt_tokens"] += result["prompt_tokens"]
@@ -445,13 +490,51 @@ def create_app(dispatcher, server_config: ServerAppConfig):
             "choices": choices,
             "usage": totals,
         }
+    
+    def _generate_chat_logprobs(output_logprobs: list, top_logprobs: int) -> dict:
+        # "logprobs": {"content": [{"token":xx, "logprob":xx, "bytes":xx, "top_logprobs":[xxxxxxxxxx]},
+        #                          {"token":xx, "logprob":xx, "bytes":xx, "top_logprobs":[xxxxxxxxxx]},
+        #                          {"token":xx, "logprob":xx, "bytes":xx, "top_logprobs":[xxxxxxxxxx]}]},
+        content_dict_list = []
+        for output_logprob in output_logprobs:
+            token = output_logprob.get("logprob_token")[0]
+            logprob = output_logprob.get("logprobs")[0]
+            bytes_val = list(token.encode("utf-8", errors="replace"))
+            top_logprobs_list = []
+            token_id_set = set()
+            for i in range(1, len(output_logprob.get("logprob_token_id"))):
+                if len(top_logprobs_list) >= top_logprobs:
+                    break
+                if output_logprob.get("logprob_token_id")[i] in token_id_set:
+                    continue
+                token_id_set.add(output_logprob.get("logprob_token_id")[i])
+                top_token = output_logprob.get("logprob_token")[i]
+                top_logprob = output_logprob.get("logprobs")[i]
+                top_bytes = list(top_token.encode("utf-8", errors="replace"))
+                top_logprobs_list.append({
+                    "token": top_token,
+                    "logprob": top_logprob,
+                    "bytes": top_bytes,
+                })
+            logprobs_dict = {
+                "token": token,
+                "logprob": logprob,
+                "bytes": bytes_val,
+                "top_logprobs": top_logprobs_list,
+            }
+            content_dict_list.append(logprobs_dict)
+        return {"content": content_dict_list}
 
     @app.post("/v1/chat/completions", dependencies=[Depends(_require_server_ready)])
     async def chat_completions(request: ChatCompletionRequest):
-        # temperature/top_p/stop are accepted at the API surface for OpenAI
-        # client compatibility but not yet wired into the sampling path.
         sampling_params = {
             "max_tokens": request.max_tokens,
+            "temperature": request.temperature,
+            "top_p": request.top_p,
+            "top_k": request.top_k,
+            "logprobs": request.logprobs,
+            "top_logprobs": request.top_logprobs,
+            "seed": request.seed,
         }
         request_id = await dispatcher.submit_request(
             _build_req(request.messages, sampling_params, request)
@@ -460,6 +543,10 @@ def create_app(dispatcher, server_config: ServerAppConfig):
         result = await _wait_result(request_id)
         if disagg_mode == ROLE_PREFILL:
             return result
+        chat_logprobs = (
+            _generate_chat_logprobs(result["logprobs"], request.top_logprobs)
+            if result["logprobs"] is not None else None
+        )
         return {
             "id": f"chatcmpl-{uuid.uuid4().hex[:8]}",
             "object": "chat.completion",
@@ -468,6 +555,7 @@ def create_app(dispatcher, server_config: ServerAppConfig):
             "choices": [{
                 "index": 0,
                 "message": {"role": "assistant", "content": result["output"]},
+                "logprobs": chat_logprobs,
                 "finish_reason": result.get("finish_reason", "stop"),
             }],
             "usage": _usage(result),

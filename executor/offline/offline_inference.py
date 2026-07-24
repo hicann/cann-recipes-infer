@@ -21,6 +21,7 @@ import logging
 import torch
 
 from executor.core.config import InferenceConfig
+from executor.core.forward_data_info import SamplingParams
 from executor.core.engine import ExecutionEngine
 from executor.core.scheduler import Scheduler
 from executor.core.forward_data_info import GenerationOutput, Request
@@ -89,6 +90,7 @@ class OfflineInference:
     def generate(
         self,
         prompts: List[str],
+        sampling_params: Optional[SamplingParams] = None
     ) -> tuple[List[GenerationOutput], Optional[dict], List[float]]:
         """Generate text for a batch of prompts.
 
@@ -130,7 +132,7 @@ class OfflineInference:
         request_ids = []
         prompt_map = {}
         for prompt in prompts:
-            request_id = self.scheduler.add_request(prompt)
+            request_id = self.scheduler.add_request(prompt=prompt, sampling_params=sampling_params)
             request_ids.append(request_id)
             # simplified process, to be optimized
             prompt_map[request_id] = prompt
@@ -141,7 +143,7 @@ class OfflineInference:
         if len(request_ids) < batch_size:
             # Pad requests to batch_size if needed
             while len(request_ids) < batch_size:
-                request_id = self.scheduler.add_request(prompts[-1])
+                request_id = self.scheduler.add_request(prompt=prompts[-1], sampling_params=sampling_params)
                 request_ids.append(request_id)
 
         # Run scheduling loop until all requests complete

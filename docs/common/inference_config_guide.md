@@ -14,6 +14,9 @@
 - `dataset_path`: 数据集路径（默认 ""），非"default"数据集时必须指定。
 - `input_truncated_len`: 最大输入序列长度（默认 256），如果prompt超过这一长度会被截断。
 - `temperature`: 采样温度（默认 0.0）。设置为 0 时使用 greedy decoding；值越大，采样随机性越强。
+- `top_p`: 采样参数-top_p（默认 1.0）。
+- `top_k`: 采样参数-top_k（默认 0）。 
+- `seed`: 采样参数-seed（默认 None）。
 
 ### 2.2 ModelConfig (模型配置)
 管理模型运行时的特有行为。
