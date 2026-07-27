@@ -85,6 +85,7 @@ Kimi K3 采用 Block AttnRes（分块注意力残差）作为 Full AttnRes 的�
 进入一个 Block 时，partial 尚未生成，因此第一个 Attention 子层仅对历史块状态集合 $\mathcal{B}_n$ 执行 AttnRes 聚合，并以聚合结果作为子层输入。该子层的输出用于初始化 partial。此后，每个 Attention 或 FFN/MoE 子层均将当前 partial 作为新增候选状态，与 $\mathcal{B}_n$ 拼接为$[\mathbf{b}_0,\mathbf{b}_1,\ldots,\mathbf{b}_{n-1}, \mathbf{p}]$ 共同参与 AttnRes 聚合；子层输出随后累加至 partial。Attention 与 FFN/MoE 分别使用独立的 pseudo-query，因此二者具有相互独立的深度权重。
 
 为减少块内重复计算，Block AttnRes 可等价地拆分为以下两个阶段：
+
 <p align="center">
   <img src="./figures/decoder_attnres.svg" width="90%" alt="Kimi K3 two-phase AttnRes execution within one block">
 </p>
@@ -132,6 +133,7 @@ KDA 的长期状态大小与序列长度无关；每个请求、每个 KDA 层�
 <p align="center">
   <img src="./figures/kda_architecture.svg?v=8" width="92%" alt="Kimi K3 KDA fused QKV ShortConv and state flow">
 </p>
+
 `qkv_proj` 按通道生成 Q/K/V。融合 QKV ShortConv 在 Prefill 调用 [`causal_conv1d_fn`](https://gitcode.com/cann/ops-transformer/blob/master/torch_extension/cann_ops_transformer/docs/zh/causal_conv1d_fn.md)，在 Decode 调用 [`causal_conv1d_update`](https://gitcode.com/cann/ops-transformer/blob/master/torch_extension/cann_ops_transformer/docs/zh/causal_conv1d_update.md)，完成逐通道因果卷积与 SiLU 后再拆分三路。三组通道使用各自的卷积权重，共同维护一份拼接的 `conv_state`。
 
 `conv_state` 与 KDA SSM State 分别注册为 `MambaCacheEntry`，由框架统一分配并维护请求到状态块的映射。Prefill 清零对应状态行，`causal_conv1d_fn` 更新 `conv_state`，Torch chunk KDA 按请求计算并写回 KDA SSM State；Decode 复用相同 block id，通过 `causal_conv1d_update` 与 [`npu_recurrent_gated_delta_rule`](https://gitcode.com/Ascend/op-plugin/blob/master/docs/zh/custom_APIs/torch_npu/torch_npu-npu_recurrent_gated_delta_rule.md) 分别原地推进两类状态。
@@ -143,6 +145,7 @@ Gated MLA 沿用 MLA 的 Q/KV 低秩投影，并在 Attention 输出后增加逐
 <p align="center">
   <img src="./figures/gated_mla_architecture.svg" width="90%" alt="Kimi K3 Gated MLA architecture and paged cache flow">
 </p>
+
 Recipes 提供 Prefill native、Decode absorb 的实现参考。Prefill 和 Decode 均通过 `npu_kv_rmsnorm_rope_cache_v2`（接口说明参考 [`npu_kv_rmsnorm_rope_cache`](https://gitcode.com/Ascend/op-plugin/blob/26.1.0/docs/context/torch_npu-npu_kv_rmsnorm_rope_cache.md)）融合 KV latent 的 RMSNorm，并依据 `slot_mapping` 将归一化后的 latent 与额外 K 特征写入两份 Paged Cache。
 
 Prefill 通过 `kv_b_proj` 将本轮 latent 临时展开为 per-head K/V，并调用 `npu_fused_infer_attention_score`，以 `NTD_TND` 布局和 `sparse_mode=3` 完成变长序列的 causal Attention。Decode 将 KV up-projection 的 K 矩阵吸收到 Query 侧，再调用 [`npu_fused_infer_attention_score_v2`](https://gitcode.com/Ascend/op-plugin/blob/26.1.0/docs/zh/custom_APIs/torch_npu/torch_npu-npu_fused_infer_attention_score_v2.md)，直接读取 NZ 布局的 latent Paged Cache 完成 absorb Attention；随后通过吸收后的 V 投影将算子输出还原到各 Attention head 的 value 空间。
