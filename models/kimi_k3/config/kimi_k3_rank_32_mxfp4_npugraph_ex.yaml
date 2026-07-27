@@ -1,0 +1,29 @@
+model_config:
+  model_name: "kimi_k3"
+  # Same real MXFP4 K3 checkpoint as the eager config, run under npugraph_ex
+  # so the quantized decode path is exercised in graph mode.
+  model_path: "/data/models/kimi_k3"
+  exe_mode: "npugraph_ex"
+  enable_profiler: False
+  enable_weight_nz: False
+  with_ckpt: True
+  custom_params:
+    enable_attn_res_two_phase: False
+    enable_multi_streams: True
+
+data_config:
+  dataset: "default"
+  input_truncated_len: 128
+
+parallel_config:
+  world_size: 32
+  attn_tp_size: 32
+  moe_tp_size: 1
+  embed_tp_size: 32
+  lmhead_tp_size: 32
+  dense_tp_size: 32
+  o_proj_tp_size: 32
+
+scheduler_config:
+  batch_size: 32
+  max_new_tokens: 128

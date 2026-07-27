@@ -1,0 +1,116 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1080" height="900" viewBox="0 0 1080 900" preserveAspectRatio="xMidYMid meet" role="img" aria-labelledby="title desc">
+  <title id="title">Kimi K3 overall architecture</title>
+  <desc id="desc">KDA and Stable LatentMoE mechanism cards beside the Kimi K3 Block AttnRes backbone. Independent block-anchor rails and the current block partial feed learned alpha aggregators before every attention and feed-forward sublayer.</desc>
+  <defs>
+    <marker id="data-arrow" markerWidth="5.5" markerHeight="5.5" refX="5.1" refY="2.75" orient="auto" markerUnits="userSpaceOnUse"><path d="M0 0 L5.5 2.75 L0 5.5 Z" fill="#334155"/></marker>
+    <marker id="attn-arrow" markerWidth="5.5" markerHeight="5.5" refX="5.1" refY="2.75" orient="auto" markerUnits="userSpaceOnUse"><path d="M0 0 L5.5 2.75 L0 5.5 Z" fill="#9A5862"/></marker>
+    <marker id="bus-arrow" markerWidth="4.5" markerHeight="4.5" refX="4.1" refY="2.25" orient="auto" markerUnits="userSpaceOnUse"><path d="M0 0 L4.5 2.25 L0 4.5 Z" fill="#9A5862"/></marker>
+    <marker id="control-arrow" markerWidth="5" markerHeight="5" refX="4.7" refY="2.5" orient="auto" markerUnits="userSpaceOnUse"><path d="M0 0 L5 2.5 L0 5 Z" fill="#A97B14"/></marker>
+    <style>
+      .panel-title { font: 650 18px -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; fill: #172033; }
+      .backbone-title { font: 700 20px -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; fill: #172033; }
+      .node { font: 600 15px -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; fill: #26364B; }
+      .label { font: 550 14px -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; fill: #526176; }
+      .small { font: 500 13px -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; fill: #667085; }
+      .micro { font: 500 11.5px -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; fill: #667085; }
+      .badge { font: 650 13px -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; fill: #FFFFFF; }
+      .alpha { font: italic 650 13px Georgia, "Times New Roman", serif; fill: #9A3E4E; }
+      .data { fill: none; stroke: #334155; stroke-width: 1.65; stroke-linecap: round; stroke-linejoin: round; marker-end: url(#data-arrow); }
+      .candidate { fill: none; stroke: #9A5862; stroke-width: 1.45; stroke-linecap: round; stroke-linejoin: round; marker-end: url(#attn-arrow); }
+      .anchor-tap { fill: none; stroke: #9A5862; stroke-width: 1.35; stroke-linecap: round; stroke-linejoin: round; marker-end: url(#bus-arrow); }
+      .state { fill: none; stroke: #78879A; stroke-width: 1.25; stroke-dasharray: 4 4; stroke-linecap: round; }
+      .control { fill: none; stroke: #A97B14; stroke-width: 1.35; stroke-dasharray: 4 3; stroke-linecap: round; marker-end: url(#control-arrow); }
+      .weight { fill: none; stroke: #526176; stroke-width: 1.15; stroke-linecap: round; }
+    </style>
+  </defs>
+  <rect width="1080" height="900" fill="#FBFCFE"/>
+
+  <g id="kda-card">
+    <rect x="20" y="20" width="360" height="425" rx="12" fill="#FFFFFF" stroke="#AFCDEB" stroke-width="1.6"/>
+    <path d="M20 32 Q20 20 32 20 H368 Q380 20 380 32 V62 H20 Z" fill="#E4F0FC"/>
+    <circle cx="42" cy="41" r="12" fill="#4F83B7"/><text x="42" y="46" text-anchor="middle" class="badge">A</text>
+    <text x="64" y="48" class="panel-title">Kimi Delta Attention</text>
+    <rect x="135" y="74" width="110" height="32" rx="7" fill="#FFFFFF" stroke="#527BA6" stroke-width="1.4"/><text x="190" y="95" text-anchor="middle" class="node">o_proj</text>
+    <circle cx="190" cy="125" r="9" fill="#FFFFFF" stroke="#334155" stroke-width="1.5"/><path d="M185 120 L195 130 M195 120 L185 130" stroke="#334155" stroke-width="1.6" stroke-linecap="round"/><path d="M190 116 V106" class="data"/>
+    <rect x="135" y="150" width="110" height="32" rx="7" fill="#F3F5F8" stroke="#94A3B8" stroke-width="1.3"/><text x="190" y="171" text-anchor="middle" class="node">RMSNorm</text><path d="M190 150 V134" class="data"/>
+    <rect x="125" y="204" width="130" height="38" rx="8" fill="#DCEBFA" stroke="#5D8DBC" stroke-width="1.4"/><text x="190" y="228" text-anchor="middle" class="node">KDA core</text><path d="M190 204 V182" class="data"/>
+    <rect x="28" y="202" width="40" height="22" rx="11" fill="#FFF8E2" stroke="#C39A38" stroke-width="1.2"/><text x="48" y="217" text-anchor="middle" class="small">gk</text><path d="M68 213 H125" class="control"/>
+    <rect x="28" y="230" width="40" height="22" rx="11" fill="#FFF8E2" stroke="#C39A38" stroke-width="1.2"/><text x="48" y="245" text-anchor="middle" class="small">β</text><path d="M68 241 H125" class="control"/>
+    <rect x="25" y="270" width="85" height="26" rx="13" fill="#F6F7F9" stroke="#9AA8B8" stroke-width="1.15"/><text x="67.5" y="287" text-anchor="middle" class="small">SSM state</text><path d="M110 283 H114 Q118 283 118 279 V260 Q118 256 122 256 H151 Q155 256 155 252 V242" class="state"/>
+    <rect x="125" y="264" width="130" height="40" rx="8" fill="#EDF5FD" stroke="#6C9AC5" stroke-width="1.3"/><text x="190" y="281" text-anchor="middle" class="node">Q/K L2Norm</text><text x="190" y="297" text-anchor="middle" class="micro">V bypass</text><path d="M190 264 V242" class="data"/>
+    <rect x="125" y="326" width="130" height="34" rx="7" fill="#EDF5FD" stroke="#6C9AC5" stroke-width="1.3"/><text x="190" y="348" text-anchor="middle" class="node">QKV ShortConv</text><path d="M190 326 V304" class="data"/>
+    <rect x="25" y="330" width="85" height="26" rx="13" fill="#F6F7F9" stroke="#9AA8B8" stroke-width="1.15"/><text x="67.5" y="347" text-anchor="middle" class="small">conv_state</text><path d="M110 343 H125" class="state"/>
+    <rect x="135" y="382" width="110" height="32" rx="7" fill="#EDF5FD" stroke="#6C9AC5" stroke-width="1.3"/><text x="190" y="403" text-anchor="middle" class="node">QKV proj</text><path d="M190 382 V360" class="data"/>
+    <circle cx="190" cy="432" r="8" fill="#FFFFFF" stroke="#64748B" stroke-width="1.3"/><text x="190" y="436" text-anchor="middle" class="micro">x</text><path d="M190 424 V414" class="data"/>
+    <rect x="280" y="328" width="75" height="38" rx="8" fill="#FFF1E8" stroke="#D28A6B" stroke-width="1.3"/><text x="317.5" y="344" text-anchor="middle" class="small">Output</text><text x="317.5" y="359" text-anchor="middle" class="small">gate</text><path d="M198 432 H317.5 V366" class="data"/><path d="M317.5 328 V125 H199" class="data"/>
+  </g>
+
+  <g id="moe-card">
+    <rect x="20" y="465" width="360" height="415" rx="12" fill="#FFFFFF" stroke="#A9D0B6" stroke-width="1.6"/>
+    <path d="M20 477 Q20 465 32 465 H368 Q380 465 380 477 V507 H20 Z" fill="#E6F3E9"/>
+    <circle cx="42" cy="486" r="12" fill="#4F9368"/><text x="42" y="491" text-anchor="middle" class="badge">B</text><text x="64" y="493" class="panel-title">Stable LatentMoE</text>
+    <rect x="135" y="520" width="110" height="30" rx="15" fill="#FFFFFF" stroke="#5D9070" stroke-width="1.3"/><text x="190" y="540" text-anchor="middle" class="node">FFN delta</text>
+    <circle cx="190" cy="575" r="9" fill="#FFFFFF" stroke="#334155" stroke-width="1.5"/><path d="M185 575 H195 M190 570 V580" stroke="#334155" stroke-width="1.6" stroke-linecap="round"/><path d="M190 566 V550" class="data"/>
+    <rect x="130" y="600" width="120" height="34" rx="8" fill="#E5F3E8" stroke="#679B78" stroke-width="1.3"/><text x="190" y="622" text-anchor="middle" class="node">Latent Up</text><path d="M190 600 V584" class="data"/>
+    <rect x="140" y="655" width="100" height="32" rx="7" fill="#F3F5F8" stroke="#94A3B8" stroke-width="1.2"/><text x="190" y="676" text-anchor="middle" class="node">RMSNorm</text><path d="M190 655 V634" class="data"/>
+    <rect x="125" y="720" width="130" height="42" rx="8" fill="#DDF0E2" stroke="#5F9973" stroke-width="1.4"/><text x="190" y="738" text-anchor="middle" class="node">Routed Experts</text><text x="190" y="755" text-anchor="middle" class="small">SiTU</text><path d="M190 720 V687" class="data"/>
+    <rect x="135" y="795" width="110" height="32" rx="8" fill="#EAF6ED" stroke="#72A783" stroke-width="1.3"/><text x="190" y="816" text-anchor="middle" class="node">Latent Down</text><path d="M190 795 V762" class="data"/>
+    <circle cx="190" cy="858" r="8" fill="#FFFFFF" stroke="#64748B" stroke-width="1.3"/><text x="190" y="862" text-anchor="middle" class="micro">x</text><path d="M190 850 V827" class="data"/>
+    <rect x="25" y="730" width="80" height="44" rx="8" fill="#FFF8E2" stroke="#C39A38" stroke-width="1.2"/><text x="65" y="748" text-anchor="middle" class="small">Router</text><text x="65" y="765" text-anchor="middle" class="micro">Top-16</text><path d="M182 858 H65 V774" class="data"/><path d="M105 752 H125" class="control"/>
+    <rect x="275" y="675" width="80" height="48" rx="8" fill="#E8F5EB" stroke="#69A07B" stroke-width="1.3"/><text x="315" y="695" text-anchor="middle" class="small">Shared ×2</text><text x="315" y="713" text-anchor="middle" class="small">SiTU</text><path d="M198 858 H315 V723" class="data"/><path d="M315 675 V575 H199" class="data"/>
+  </g>
+
+  <g id="decoder-backbone">
+    <rect x="405" y="20" width="655" height="860" rx="14" fill="#FFFFFF" stroke="#C7D0DC" stroke-width="1.6"/>
+    <text x="430" y="48" class="backbone-title">Block AttnRes Backbone</text>
+    <rect x="640" y="60" width="100" height="28" rx="6" fill="#FFFFFF" stroke="#64748B" stroke-width="1.3"/><text x="690" y="79" text-anchor="middle" class="node">LM Head</text>
+    <rect x="615" y="100" width="150" height="28" rx="6" fill="#F3F5F8" stroke="#94A3B8" stroke-width="1.25"/><text x="690" y="119" text-anchor="middle" class="node">Final RMSNorm</text><path d="M690 100 V88" class="data"/>
+
+    <rect x="646" y="145" width="24" height="20" rx="4" fill="#FFFFFF" stroke="#64748B" stroke-width="1.15"/><text x="658" y="159" text-anchor="middle" class="micro">w</text>
+    <circle cx="690" cy="155" r="13" fill="#FFF7F1" stroke="#9A5862" stroke-width="1.55"/><text x="690" y="160" text-anchor="middle" class="alpha">α</text><path d="M670 155 H677" class="weight"/><path d="M690 142 V128" class="data"/>
+
+    <rect x="475" y="200" width="430" height="390" rx="10" fill="#FCFCFD" stroke="#ADB8C7" stroke-width="1.25"/>
+    <path d="M515 240 H650 L680 310 H515 Q505 310 505 300 V250 Q505 240 515 240 Z" fill="#26364B" opacity="0.16"/>
+    <path d="M515 320 H650 L680 390 H515 Q505 390 505 380 V330 Q505 320 515 320 Z" fill="#26364B" opacity="0.16"/>
+    <path d="M515 400 H650 L680 470 H515 Q505 470 505 460 V410 Q505 400 515 400 Z" fill="#26364B" opacity="0.16"/>
+    <path d="M515 480 H650 L680 550 H515 Q505 550 505 540 V490 Q505 480 515 480 Z" fill="#26364B" opacity="0.16"/>
+
+    <path d="M780 650 H922 Q930 650 930 642 V157 Q930 149 922 149 H702 M780 695 H942 Q950 695 950 687 V161 Q950 153 942 153 H702 M780 740 H962 Q970 740 970 732 V165 Q970 157 962 157 H702 M780 835 H982 Q990 835 990 827 V169 Q990 161 982 161 H702" class="anchor-tap"/>
+    <path d="M930 264 H852 M950 268 H852 M970 272 H852 M990 276 H852" class="anchor-tap"/>
+    <path d="M930 344 H852 M950 348 H852 M970 352 H852 M990 356 H852" class="anchor-tap"/>
+    <path d="M930 424 H852 M950 428 H852 M970 432 H852 M990 436 H852" class="anchor-tap"/>
+    <path d="M930 504 H852 M950 508 H852 M970 512 H852 M990 516 H852" class="anchor-tap"/>
+
+    <path d="M690 550 H510 V470 H680 M690 470 H510 V390 H680 M690 390 H510 V310 H680 M690 310 H510 V230 H680" class="data"/>
+    <path d="M690 494 V480 M690 414 V400 M690 334 V320 M690 254 V240" class="data"/>
+    <path d="M690 550 H840 V523 M700 470 H840 V443 M700 390 H840 V363 M700 310 H840 V283 M690 220 V168" class="candidate"/>
+
+    <text x="490" y="475" class="label">3×</text>
+    <rect x="595" y="494" width="190" height="32" rx="7" fill="#DCEBFA" stroke="#5D8DBC" stroke-width="1.3"/><circle cx="595" cy="510" r="9.5" fill="#4F83B7" stroke="#FFFFFF" stroke-width="1.2"/><text x="595" y="515" text-anchor="middle" class="badge">A</text><text x="690" y="515" text-anchor="middle" class="node">KDA</text>
+    <rect x="828" y="468" width="24" height="18" rx="4" fill="#FFFFFF" stroke="#64748B" stroke-width="1.1"/><text x="840" y="481" text-anchor="middle" class="micro">w</text><circle cx="840" cy="510" r="13" fill="#FFF7F1" stroke="#9A5862" stroke-width="1.55"/><text x="840" y="515" text-anchor="middle" class="alpha">αA</text><path d="M840 486 V497" class="weight"/><path d="M827 510 H785" class="data"/>
+    <rect x="680" y="460" width="20" height="20" rx="5" fill="#FFFFFF" stroke="#334155" stroke-width="1.45"/><path d="M685 470 H695 M690 465 V475" stroke="#334155" stroke-width="1.5" stroke-linecap="round"/>
+
+    <rect x="595" y="414" width="190" height="32" rx="7" fill="#E5F3E8" stroke="#679B78" stroke-width="1.3"/><circle cx="595" cy="430" r="9.5" fill="#4F9368" stroke="#FFFFFF" stroke-width="1.2"/><text x="595" y="435" text-anchor="middle" class="badge">B</text><text x="690" y="435" text-anchor="middle" class="node">Stable LatentMoE</text>
+    <rect x="828" y="388" width="24" height="18" rx="4" fill="#FFFFFF" stroke="#64748B" stroke-width="1.1"/><text x="840" y="401" text-anchor="middle" class="micro">w</text><circle cx="840" cy="430" r="13" fill="#FFF7F1" stroke="#9A5862" stroke-width="1.55"/><text x="840" y="435" text-anchor="middle" class="alpha">αF</text><path d="M840 406 V417" class="weight"/><path d="M827 430 H785" class="data"/>
+    <rect x="680" y="380" width="20" height="20" rx="5" fill="#FFFFFF" stroke="#334155" stroke-width="1.45"/><path d="M685 390 H695 M690 385 V395" stroke="#334155" stroke-width="1.5" stroke-linecap="round"/>
+
+    <text x="490" y="315" class="label">1×</text>
+    <rect x="595" y="334" width="190" height="32" rx="7" fill="#EEE8FA" stroke="#8270AD" stroke-width="1.3"/><text x="690" y="355" text-anchor="middle" class="node">Gated MLA</text>
+    <rect x="828" y="308" width="24" height="18" rx="4" fill="#FFFFFF" stroke="#64748B" stroke-width="1.1"/><text x="840" y="321" text-anchor="middle" class="micro">w</text><circle cx="840" cy="350" r="13" fill="#FFF7F1" stroke="#9A5862" stroke-width="1.55"/><text x="840" y="355" text-anchor="middle" class="alpha">αA</text><path d="M840 326 V337" class="weight"/><path d="M827 350 H785" class="data"/>
+    <rect x="680" y="300" width="20" height="20" rx="5" fill="#FFFFFF" stroke="#334155" stroke-width="1.45"/><path d="M685 310 H695 M690 305 V315" stroke="#334155" stroke-width="1.5" stroke-linecap="round"/>
+
+    <rect x="595" y="254" width="190" height="32" rx="7" fill="#E5F3E8" stroke="#679B78" stroke-width="1.3"/><circle cx="595" cy="270" r="9.5" fill="#4F9368" stroke="#FFFFFF" stroke-width="1.2"/><text x="595" y="275" text-anchor="middle" class="badge">B</text><text x="690" y="275" text-anchor="middle" class="node">Stable LatentMoE</text>
+    <rect x="828" y="228" width="24" height="18" rx="4" fill="#FFFFFF" stroke="#64748B" stroke-width="1.1"/><text x="840" y="241" text-anchor="middle" class="micro">w</text><circle cx="840" cy="270" r="13" fill="#FFF7F1" stroke="#9A5862" stroke-width="1.55"/><text x="840" y="275" text-anchor="middle" class="alpha">αF</text><path d="M840 246 V257" class="weight"/><path d="M827 270 H785" class="data"/>
+    <rect x="680" y="220" width="20" height="20" rx="5" fill="#FFFFFF" stroke="#334155" stroke-width="1.45"/><path d="M685 230 H695 M690 225 V235" stroke="#334155" stroke-width="1.5" stroke-linecap="round"/>
+
+    <path d="M690 590 V550" class="data"/>
+    <circle cx="690" cy="565" r="1.5" fill="#526176"/><circle cx="690" cy="575" r="1.5" fill="#526176"/><circle cx="690" cy="585" r="1.5" fill="#526176"/>
+
+    <text x="800" y="620" class="small">8 anchor slots</text>
+    <rect x="600" y="635" width="180" height="30" rx="6" fill="#F3F5F8" stroke="#94A3B8" stroke-width="1.2"/><text x="690" y="655" text-anchor="middle" class="node">Block n−1</text>
+    <rect x="600" y="680" width="180" height="30" rx="6" fill="#F3F5F8" stroke="#94A3B8" stroke-width="1.2"/><text x="690" y="700" text-anchor="middle" class="node">Block n−2</text>
+    <rect x="600" y="725" width="180" height="30" rx="6" fill="#F3F5F8" stroke="#94A3B8" stroke-width="1.2"/><text x="690" y="745" text-anchor="middle" class="node">Block n−3</text>
+    <circle cx="690" cy="775" r="1.5" fill="#526176"/><circle cx="690" cy="785" r="1.5" fill="#526176"/><circle cx="690" cy="795" r="1.5" fill="#526176"/>
+    <rect x="600" y="820" width="180" height="30" rx="6" fill="#FFFFFF" stroke="#64748B" stroke-width="1.3"/><text x="690" y="840" text-anchor="middle" class="node">Embedding</text>
+  </g>
+</svg>

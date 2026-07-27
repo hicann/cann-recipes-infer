@@ -65,6 +65,10 @@ _specs: dict[str, list[tuple[str, str]]] = {
         ("models.kimi_k2_thinking.models.modeling_deepseek", "DeepseekV3ModelMTP"),
         ("models.kimi_k2_thinking.models.configuration_deepseek", "DeepseekV3Config"),
     ],
+    "kimi_k3": [
+        ("models.kimi_k3.models.modeling_kimi_k3", "KimiLinearForCausalLM"),
+        ("models.kimi_k3.models.configuration_kimi_k3", "KimiLinearConfig"),
+    ],
     "longcat_flash_lite": [
         ("models.longcat_flash_lite.models.modeling_longcat_flash_lite", "LongcatFlashNgramForCausalLM"),
         ("models.longcat_flash_lite.models.configuration_longcat_flash_lite", "LongcatFlashNgramConfig"),

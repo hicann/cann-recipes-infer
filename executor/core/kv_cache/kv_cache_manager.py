@@ -158,6 +158,11 @@ class KVCacheManager:
             for cache in layer_info.caches:
                 if not cache.needs_block:
                     continue
+                if cache.attn_type == "Mamba":
+                    raise NotImplementedError(
+                        "PD disaggregation does not support Mamba state cache yet: "
+                        f"cache {cache.cache_name} in layer {layer_info.layer_idx}."
+                    )
                 if cache.tensor is None:
                     raise RuntimeError(
                         f"CacheEntry {cache.cache_name} in layer {layer_info.layer_idx} "

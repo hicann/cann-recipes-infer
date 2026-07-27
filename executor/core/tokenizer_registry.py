@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 
 _TOKENIZER_SPECS = {
     "deepseek_v4": ("models.deepseek_v4.utils.tokenizer", "DeepseekV4Tokenizer"),
+    "kimi_k3": ("models.kimi_k3.utils.tokenizer", "KimiK3Tokenizer"),
 }
 
 

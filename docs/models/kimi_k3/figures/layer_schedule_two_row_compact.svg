@@ -1,0 +1,181 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1440 540" width="1440" height="540" preserveAspectRatio="xMidYMid meet" role="img" aria-labelledby="title desc">
+  <title id="title">Kimi K3 decoder layer schedule</title>
+  <desc id="desc">A continuous two-row serial pipeline. The first row runs from Embedding through Layers 1 to 4, then a directed line wraps from the upper right to the lower left and continues through Layers 5 to 92, Layer 93, Output AttnRes, and RMSNorm. Every decoder layer contains one attention module followed by one feed-forward module.</desc>
+  <defs>
+    <style>
+      svg {
+        background: #fff;
+        color: #1c1c1e;
+        font-family: "MiSans VF", -apple-system, BlinkMacSystemFont, "Segoe UI",
+          system-ui, Roboto, Arial, "PingFang SC", "Source Han Sans SC",
+          "Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+      }
+      .box { stroke: #1c1c1e; stroke-width: 1.2; }
+      .layer-card { fill: #fbfbfc; stroke: #d2d2d7; stroke-width: 1.1; }
+      .kda { fill: #c8dcf5; }
+      .mla { fill: #e6b3b2; }
+      .moe { fill: #cbe7cf; }
+      .dense { fill: #f6d3ce; }
+      .gray { fill: #f3f3f4; }
+      .white { fill: #fff; }
+      .group-label { fill: #1c1c1e; font-size: 17px; font-weight: 600; text-anchor: middle; }
+      .group-meta { fill: #6e6e73; font-size: 14px; text-anchor: middle; }
+      .layer-label { fill: #6e6e73; font-size: 14px; font-weight: 500; text-anchor: middle; dominant-baseline: central; }
+      .module-label { fill: #1c1c1e; font-size: 15px; text-anchor: middle; dominant-baseline: central; }
+      .module-label-small { fill: #1c1c1e; font-size: 13px; text-anchor: middle; dominant-baseline: central; }
+      .endpoint-label { fill: #1c1c1e; font-size: 15px; text-anchor: middle; dominant-baseline: central; }
+      .summary { fill: #3a3a3c; font-size: 15px; text-anchor: middle; dominant-baseline: central; }
+      .bracket { fill: none; stroke: #6e6e73; stroke-width: 1.15; stroke-linecap: round; }
+      .flow { fill: none; stroke: #1c1c1e; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
+      .accent { fill: #b92622; }
+    </style>
+    <marker id="arrow-dark" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="7" refX="7" refY="3.5" orient="auto">
+      <path d="M0.5,0.5 L7.5,3.5 L0.5,6.5 z" fill="#1c1c1e"/>
+    </marker>
+  </defs>
+
+  <rect width="1440" height="540" fill="#fff"/>
+
+  <!-- Row 1: Embedding and Cycle 1. -->
+  <text x="682.5" y="52" class="group-label">Cycle 1 · Layers 1–4</text>
+  <path d="M310 92 V80 H1055 V92" class="bracket"/>
+
+  <rect x="160" y="142" width="110" height="62" rx="5" class="box gray"/>
+  <text x="215" y="173" class="endpoint-label">Embedding</text>
+  <path d="M270 173 H318" class="flow" marker-end="url(#arrow-dark)"/>
+
+  <g aria-label="Layer 1: KDA then Dense FFN">
+    <rect x="310" y="105" width="175" height="136" rx="9" class="layer-card"/>
+    <text x="397.5" y="125" class="layer-label">Layer 1</text>
+    <rect x="318" y="142" width="70" height="62" rx="4" class="box kda"/>
+    <text x="353" y="173" class="module-label">KDA</text>
+    <path d="M390 173 H403" class="flow" marker-end="url(#arrow-dark)"/>
+    <rect x="408" y="142" width="69" height="62" rx="4" class="box dense"/>
+    <text x="442.5" y="165" class="module-label-small">Dense</text>
+    <text x="442.5" y="182" class="module-label-small">FFN</text>
+  </g>
+  <path d="M477 173 H508" class="flow" marker-end="url(#arrow-dark)"/>
+
+  <g aria-label="Layer 2: KDA then Stable LatentMoE">
+    <rect x="500" y="105" width="175" height="136" rx="9" class="layer-card"/>
+    <text x="587.5" y="125" class="layer-label">Layer 2</text>
+    <rect x="508" y="142" width="70" height="62" rx="4" class="box kda"/>
+    <text x="543" y="173" class="module-label">KDA</text>
+    <path d="M580 173 H593" class="flow" marker-end="url(#arrow-dark)"/>
+    <rect x="598" y="142" width="69" height="62" rx="4" class="box moe"/>
+    <text x="632.5" y="165" class="module-label-small">Stable</text>
+    <text x="632.5" y="182" class="module-label-small">LatentMoE</text>
+  </g>
+  <path d="M667 173 H698" class="flow" marker-end="url(#arrow-dark)"/>
+
+  <g aria-label="Layer 3: KDA then Stable LatentMoE">
+    <rect x="690" y="105" width="175" height="136" rx="9" class="layer-card"/>
+    <text x="777.5" y="125" class="layer-label">Layer 3</text>
+    <rect x="698" y="142" width="70" height="62" rx="4" class="box kda"/>
+    <text x="733" y="173" class="module-label">KDA</text>
+    <path d="M770 173 H783" class="flow" marker-end="url(#arrow-dark)"/>
+    <rect x="788" y="142" width="69" height="62" rx="4" class="box moe"/>
+    <text x="822.5" y="165" class="module-label-small">Stable</text>
+    <text x="822.5" y="182" class="module-label-small">LatentMoE</text>
+  </g>
+  <path d="M857 173 H888" class="flow" marker-end="url(#arrow-dark)"/>
+
+  <g aria-label="Layer 4: Gated MLA then Stable LatentMoE">
+    <rect x="880" y="105" width="175" height="136" rx="9" class="layer-card"/>
+    <text x="967.5" y="125" class="layer-label">Layer 4</text>
+    <rect x="888" y="142" width="70" height="62" rx="4" class="box mla"/>
+    <text x="923" y="165" class="module-label-small">Gated</text>
+    <text x="923" y="182" class="module-label-small">MLA</text>
+    <path d="M960 173 H973" class="flow" marker-end="url(#arrow-dark)"/>
+    <rect x="978" y="142" width="69" height="62" rx="4" class="box moe"/>
+    <text x="1012.5" y="165" class="module-label-small">Stable</text>
+    <text x="1012.5" y="182" class="module-label-small">LatentMoE</text>
+  </g>
+
+  <!-- The same serial backbone wraps directly from the upper right to the lower left. -->
+  <path d="M1047 173 H1095 V260 H45 V403 H98" class="flow" marker-end="url(#arrow-dark)"/>
+  <path d="M1053 173 H1082" class="flow" marker-end="url(#arrow-dark)"/>
+  <path d="M1095 213 V247" class="flow" marker-end="url(#arrow-dark)"/>
+  <path d="M620 260 H578" class="flow" marker-end="url(#arrow-dark)"/>
+
+  <!-- Row 2: Cycles 2–23, Layer 93, and output. -->
+  <text x="472.5" y="286" class="group-label">Cycles 2–23 · Layers 5–92 · ×22</text>
+  <text x="472.5" y="308" class="group-meta"><tspan font-style="italic">j</tspan> = 1, …, 22</text>
+  <path d="M90 333 V321 H855 V333" class="bracket"/>
+
+  <text x="985" y="286" class="group-label">Tail Layer</text>
+  <path d="M890 333 V321 H1080 V333" class="bracket"/>
+
+  <g aria-label="Layer 4j plus 1: KDA then Stable LatentMoE">
+    <rect x="90" y="340" width="180" height="136" rx="9" class="layer-card"/>
+    <text x="180" y="360" class="layer-label">Layer 4j+1</text>
+    <rect x="98" y="372" width="72" height="62" rx="4" class="box kda"/>
+    <text x="134" y="403" class="module-label">KDA</text>
+    <path d="M172 403 H187" class="flow" marker-end="url(#arrow-dark)"/>
+    <rect x="192" y="372" width="70" height="62" rx="4" class="box moe"/>
+    <text x="227" y="395" class="module-label-small">Stable</text>
+    <text x="227" y="412" class="module-label-small">LatentMoE</text>
+  </g>
+  <path d="M262 403 H293" class="flow" marker-end="url(#arrow-dark)"/>
+
+  <g aria-label="Layer 4j plus 2: KDA then Stable LatentMoE">
+    <rect x="285" y="340" width="180" height="136" rx="9" class="layer-card"/>
+    <text x="375" y="360" class="layer-label">Layer 4j+2</text>
+    <rect x="293" y="372" width="72" height="62" rx="4" class="box kda"/>
+    <text x="329" y="403" class="module-label">KDA</text>
+    <path d="M367 403 H382" class="flow" marker-end="url(#arrow-dark)"/>
+    <rect x="387" y="372" width="70" height="62" rx="4" class="box moe"/>
+    <text x="422" y="395" class="module-label-small">Stable</text>
+    <text x="422" y="412" class="module-label-small">LatentMoE</text>
+  </g>
+  <path d="M457 403 H488" class="flow" marker-end="url(#arrow-dark)"/>
+
+  <g aria-label="Layer 4j plus 3: KDA then Stable LatentMoE">
+    <rect x="480" y="340" width="180" height="136" rx="9" class="layer-card"/>
+    <text x="570" y="360" class="layer-label">Layer 4j+3</text>
+    <rect x="488" y="372" width="72" height="62" rx="4" class="box kda"/>
+    <text x="524" y="403" class="module-label">KDA</text>
+    <path d="M562 403 H577" class="flow" marker-end="url(#arrow-dark)"/>
+    <rect x="582" y="372" width="70" height="62" rx="4" class="box moe"/>
+    <text x="617" y="395" class="module-label-small">Stable</text>
+    <text x="617" y="412" class="module-label-small">LatentMoE</text>
+  </g>
+  <path d="M652 403 H683" class="flow" marker-end="url(#arrow-dark)"/>
+
+  <g aria-label="Layer 4j plus 4: Gated MLA then Stable LatentMoE">
+    <rect x="675" y="340" width="180" height="136" rx="9" class="layer-card"/>
+    <text x="765" y="360" class="layer-label">Layer 4j+4</text>
+    <rect x="683" y="372" width="72" height="62" rx="4" class="box mla"/>
+    <text x="719" y="395" class="module-label-small">Gated</text>
+    <text x="719" y="412" class="module-label-small">MLA</text>
+    <path d="M757 403 H772" class="flow" marker-end="url(#arrow-dark)"/>
+    <rect x="777" y="372" width="70" height="62" rx="4" class="box moe"/>
+    <text x="812" y="395" class="module-label-small">Stable</text>
+    <text x="812" y="412" class="module-label-small">LatentMoE</text>
+  </g>
+  <path d="M847 403 H898" class="flow" marker-end="url(#arrow-dark)"/>
+
+  <g aria-label="Layer 93: Gated MLA then Stable LatentMoE">
+    <rect x="890" y="340" width="190" height="136" rx="9" class="layer-card"/>
+    <text x="985" y="360" class="layer-label">Layer 93</text>
+    <rect x="898" y="372" width="78" height="62" rx="4" class="box mla"/>
+    <text x="937" y="395" class="module-label-small">Gated</text>
+    <text x="937" y="412" class="module-label-small">MLA</text>
+    <path d="M978 403 H990" class="flow" marker-end="url(#arrow-dark)"/>
+    <rect x="995" y="372" width="77" height="62" rx="4" class="box moe"/>
+    <text x="1033.5" y="395" class="module-label-small">Stable</text>
+    <text x="1033.5" y="412" class="module-label-small">LatentMoE</text>
+  </g>
+
+  <path d="M1072 403 H1106" class="flow" marker-end="url(#arrow-dark)"/>
+  <rect x="1110" y="372" width="110" height="62" rx="5" class="box white"/>
+  <circle cx="1133" cy="403" r="10" class="box white"/>
+  <text x="1133" y="403" class="module-label accent" style="font-style:italic">α</text>
+  <text x="1177" y="395" class="group-meta">Output</text>
+  <text x="1177" y="412" class="group-meta">AttnRes</text>
+  <path d="M1220 403 H1246" class="flow" marker-end="url(#arrow-dark)"/>
+  <rect x="1250" y="372" width="105" height="62" rx="5" class="box gray"/>
+  <text x="1302.5" y="403" class="endpoint-label">RMSNorm</text>
+
+  <text x="720" y="518" class="summary">93 Decoder Layers · 69 KDA · 24 Gated MLA · 1 Dense FFN · 92 Stable LatentMoE</text>
+</svg>

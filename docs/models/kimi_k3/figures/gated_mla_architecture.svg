@@ -1,0 +1,221 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1800 800" width="1800" height="800" preserveAspectRatio="xMidYMid meet" role="img" aria-labelledby="title desc">
+  <title id="title">Kimi K3 Gated MLA architecture</title>
+  <desc id="desc">Normalized decoder states branch into query, compressed key-value, and output-gate paths. The normalized KV latent and extra key are written to two single-KV-head paged caches. Prefill expands the current latent through kv_b before causal attention. Decode absorbs W_UK into the query, reads both paged caches with FIA v2, and maps the latent output through W_UV. Both phases share the sigmoid output gate and o_proj.</desc>
+  <defs>
+    <style>
+      svg {
+        background: #fff;
+        color: #1c1c1e;
+        font-family: "MiSans VF", -apple-system, BlinkMacSystemFont, "Segoe UI",
+          system-ui, Roboto, Arial, "PingFang SC", "Source Han Sans SC",
+          "Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+      }
+      .panel { fill: #fff; stroke: #1c1c1e; stroke-width: 1.2; stroke-dasharray: 8 6; }
+      .lane { fill: none; stroke: #9a9aa0; stroke-width: 1.1; stroke-dasharray: 5 5; }
+      .box { stroke: #1c1c1e; stroke-width: 1.25; }
+      .projection { fill: #f6d3ce; }
+      .compute { fill: #c8dcf5; }
+      .gate { fill: #f2f3c1; }
+      .state { fill: #f3f3f4; }
+      .io { fill: #fff; }
+      .label {
+        fill: #1c1c1e;
+        font-size: 20px;
+        font-weight: 500;
+        text-anchor: middle;
+        dominant-baseline: central;
+      }
+      .label-small {
+        fill: #1c1c1e;
+        font-size: 17px;
+        font-weight: 500;
+        text-anchor: middle;
+        dominant-baseline: central;
+      }
+      .annotation {
+        fill: #4a4a4e;
+        font-size: 15px;
+        font-weight: 500;
+        text-anchor: middle;
+      }
+      .section {
+        fill: #1c1c1e;
+        font-size: 21px;
+        font-weight: 620;
+        dominant-baseline: central;
+      }
+      .lane-title {
+        fill: #4a4a4e;
+        font-size: 17px;
+        font-weight: 620;
+        dominant-baseline: central;
+      }
+      .flow {
+        fill: none;
+        stroke: #1c1c1e;
+        stroke-width: 1.6;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+      }
+      .bridge {
+        fill: none;
+        stroke: #fff;
+        stroke-width: 5;
+        stroke-linecap: round;
+      }
+      .junction { fill: #1c1c1e; }
+    </style>
+    <marker id="arrow" markerUnits="userSpaceOnUse" markerWidth="9" markerHeight="8" refX="8.2" refY="4" orient="auto">
+      <path d="M0.6,0.6 L8.4,4 L0.6,7.4 z" fill="#1c1c1e"/>
+    </marker>
+  </defs>
+
+  <rect width="1800" height="800" fill="#fff"/>
+
+  <rect x="170" y="38" width="580" height="724" rx="12" class="panel"/>
+  <text x="198" y="70" class="section">Gated MLA Input Paths</text>
+
+  <rect x="770" y="38" width="660" height="724" rx="12" class="panel"/>
+  <text x="798" y="70" class="section">Latent Cache &amp; Attention</text>
+
+  <rect x="1450" y="38" width="315" height="724" rx="12" class="panel"/>
+  <text x="1478" y="70" class="section">Output</text>
+
+  <rect x="792" y="92" width="616" height="190" rx="8" class="lane"/>
+  <text x="812" y="112" class="lane-title">Prefill · Expand</text>
+
+  <rect x="792" y="500" width="616" height="190" rx="8" class="lane"/>
+  <text x="812" y="520" class="lane-title">Decode · Absorb</text>
+
+  <!-- Normalized input and branch bus. -->
+  <rect x="26" y="352" width="114" height="66" rx="33" class="box io"/>
+  <text x="83" y="385" class="label">xₜ</text>
+  <path d="M140 385 H160" class="flow"/>
+  <path d="M160 140 V670" class="flow"/>
+
+  <!-- Query path. -->
+  <path d="M160 140 H205" class="flow" marker-end="url(#arrow)"/>
+  <rect x="205" y="110" width="110" height="60" rx="5" class="box projection"/>
+  <text x="260" y="140" class="label">q_a</text>
+
+  <path d="M315 140 H345" class="flow" marker-end="url(#arrow)"/>
+  <rect x="345" y="110" width="130" height="60" rx="5" class="box compute"/>
+  <text x="410" y="140" class="label-small">RMSNorm</text>
+
+  <path d="M475 140 H505" class="flow" marker-end="url(#arrow)"/>
+  <rect x="505" y="110" width="110" height="60" rx="5" class="box projection"/>
+  <text x="560" y="140" class="label">q_b</text>
+
+  <path d="M615 140 H635" class="flow"/>
+  <path d="M635 115 V190" class="flow"/>
+  <path d="M635 115 H650" class="flow" marker-end="url(#arrow)"/>
+  <rect x="650" y="88" width="90" height="54" rx="5" class="box compute"/>
+  <text x="695" y="115" class="label-small">Q NoPE</text>
+
+  <path d="M635 190 H650" class="flow" marker-end="url(#arrow)"/>
+  <rect x="650" y="163" width="90" height="54" rx="5" class="box compute"/>
+  <text x="695" y="190" class="label-small">Q Extra</text>
+
+  <!-- Compressed KV path. -->
+  <path d="M160 350 H205" class="flow" marker-end="url(#arrow)"/>
+  <rect x="205" y="320" width="130" height="60" rx="5" class="box projection"/>
+  <text x="270" y="350" class="label">kv_a</text>
+
+  <path d="M335 350 H360" class="flow"/>
+  <path d="M360 315 V440" class="flow"/>
+  <path d="M360 315 H385" class="flow" marker-end="url(#arrow)"/>
+  <rect x="385" y="285" width="120" height="60" rx="5" class="box compute"/>
+  <text x="445" y="315" class="label-small">KV Latent</text>
+
+  <path d="M505 315 H535" class="flow" marker-end="url(#arrow)"/>
+  <rect x="535" y="285" width="135" height="60" rx="5" class="box compute"/>
+  <text x="602.5" y="315" class="label-small">RMSNorm</text>
+  <path d="M670 315 H750" class="flow"/>
+
+  <path d="M360 440 H385" class="flow" marker-end="url(#arrow)"/>
+  <rect x="385" y="410" width="120" height="60" rx="5" class="box compute"/>
+  <text x="445" y="440" class="label-small">K Extra</text>
+  <path d="M505 440 H750" class="flow"/>
+
+  <!-- Output gate path. -->
+  <path d="M160 670 H205" class="flow" marker-end="url(#arrow)"/>
+  <rect x="205" y="640" width="110" height="60" rx="5" class="box projection"/>
+  <text x="260" y="670" class="label-small">g_proj</text>
+  <path d="M315 670 H345" class="flow" marker-end="url(#arrow)"/>
+  <rect x="345" y="640" width="130" height="60" rx="5" class="box compute"/>
+  <text x="410" y="670" class="label-small">Sigmoid</text>
+
+  <!-- Prefill expands the current latent before attention. -->
+  <path d="M750 315 H825 V230 H835" class="flow" marker-end="url(#arrow)"/>
+  <rect x="835" y="200" width="135" height="60" rx="5" class="box projection"/>
+  <text x="902.5" y="230" class="label-small">kv_b · Expand</text>
+  <path d="M970 230 H995" class="flow" marker-end="url(#arrow)"/>
+  <rect x="995" y="200" width="105" height="60" rx="5" class="box compute"/>
+  <text x="1047.5" y="230" class="label-small">K / V</text>
+
+  <path d="M740 115 H800 V145 H1160" class="flow" marker-end="url(#arrow)"/>
+  <path d="M740 190 H1135 V180 H1160" class="flow" marker-end="url(#arrow)"/>
+  <path d="M1100 230 H1160" class="flow" marker-end="url(#arrow)"/>
+  <path d="M805 300 V330" class="bridge"/>
+  <path d="M810 270 H840" class="bridge"/>
+  <path d="M750 440 H805 V270 H1135 V250 H1160" class="flow" marker-end="url(#arrow)"/>
+  <rect x="1160" y="120" width="175" height="140" rx="7" class="box compute"/>
+  <text x="1247.5" y="177" class="label">FIA</text>
+  <text x="1247.5" y="211" class="annotation">Causal Attention</text>
+
+  <!-- Two single-KV-head latent caches. -->
+  <path d="M825 315 V390 H870" class="flow" marker-end="url(#arrow)"/>
+  <ellipse cx="970" cy="390" rx="100" ry="36" class="box state"/>
+  <text x="970" y="382" class="label-small">Latent Cache</text>
+  <text x="970" y="407" class="annotation">512</text>
+
+  <path d="M750 440 H1105 V390 H1160" class="flow" marker-end="url(#arrow)"/>
+  <ellipse cx="1250" cy="390" rx="90" ry="36" class="box state"/>
+  <text x="1250" y="382" class="label-small">Extra Cache</text>
+  <text x="1250" y="407" class="annotation">64</text>
+  <text x="1088" y="350" class="annotation">slot_mapping</text>
+
+  <!-- Decode absorbs kv_b around paged attention. -->
+  <path d="M760 175 V205" class="bridge"/>
+  <path d="M760 300 V455" class="bridge"/>
+  <path d="M740 115 H760 V590 H825" class="flow" marker-end="url(#arrow)"/>
+  <rect x="825" y="560" width="110" height="60" rx="5" class="box projection"/>
+  <text x="880" y="590" class="label-small">W_UK</text>
+  <path d="M935 590 H1120" class="flow" marker-end="url(#arrow)"/>
+
+  <path d="M780 300 V455" class="bridge"/>
+  <path d="M740 190 H780 V650 H1095 V630 H1120" class="flow" marker-end="url(#arrow)"/>
+  <path d="M970 426 V555 H1120" class="flow" marker-end="url(#arrow)"/>
+  <path d="M1250 426 V535" class="flow" marker-end="url(#arrow)"/>
+  <text x="1050" y="475" class="annotation">block_table</text>
+
+  <rect x="1120" y="535" width="175" height="120" rx="7" class="box compute"/>
+  <text x="1207.5" y="580" class="label">FIA v2</text>
+  <text x="1207.5" y="615" class="annotation">Latent Attention</text>
+
+  <path d="M1295 595 H1320" class="flow" marker-end="url(#arrow)"/>
+  <rect x="1320" y="565" width="90" height="60" rx="5" class="box projection"/>
+  <text x="1365" y="595" class="label-small">W_UV</text>
+
+  <!-- Phase outputs converge before the common output gate. -->
+  <path d="M1335 190 H1438 V385 H1490" class="flow" marker-end="url(#arrow)"/>
+  <path d="M1410 595 H1438 V385" class="flow"/>
+  <circle cx="1438" cy="385" r="3.2" class="junction"/>
+  <circle cx="760" cy="115" r="3.2" class="junction"/>
+  <circle cx="780" cy="190" r="3.2" class="junction"/>
+  <circle cx="825" cy="315" r="3.2" class="junction"/>
+  <circle cx="805" cy="440" r="3.2" class="junction"/>
+
+  <rect x="1490" y="350" width="85" height="70" rx="5" class="box gate"/>
+  <text x="1532.5" y="385" class="label">Mul</text>
+
+  <path d="M475 670 H1532.5 V420" class="flow" marker-end="url(#arrow)"/>
+
+  <path d="M1575 385 H1600" class="flow" marker-end="url(#arrow)"/>
+  <rect x="1600" y="350" width="100" height="70" rx="5" class="box projection"/>
+  <text x="1650" y="385" class="label-small">o_proj</text>
+
+  <path d="M1700 385 H1715" class="flow" marker-end="url(#arrow)"/>
+  <rect x="1715" y="352" width="42" height="66" rx="21" class="box io"/>
+  <text x="1736" y="385" class="label">yₜ</text>
+</svg>

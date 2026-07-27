@@ -200,6 +200,26 @@ class ExecutionEngine:
 
     def _init_cache_manager(self, cache_info: ModelCacheInfo):
         validate_cache_info(cache_info)
+        # Mamba entries carry their own next_n, so check the model agrees with the
+        # speculation depth the engine was configured with. CP is rejected up front:
+        # a recurrent state has no defined split across CP ranks, and non-owner ranks
+        # skip prefill allocation, so their state block table would come up empty.
+        cp_size = self.infer_config.parallel_config.cp_size
+        for layer_info in cache_info.layer_infos:
+            for cache in layer_info.caches:
+                if not cache.needs_block or cache.attn_type != "Mamba":
+                    continue
+                if cp_size > 1:
+                    raise NotImplementedError(
+                        "Context parallel does not support Mamba state cache yet: "
+                        f"cache {cache.cache_name} in layer {layer_info.layer_idx}, cp_size={cp_size}."
+                    )
+                if cache.next_n != self.next_n:
+                    raise ValueError(
+                        f"cache {cache.cache_name} in layer {layer_info.layer_idx} declares "
+                        f"next_n={cache.next_n}, but the engine is configured with "
+                        f"next_n={self.next_n}."
+                    )
         # Offload models may still need model-owned HBM workspace, for example
         # selected KV buffers. Reserve that budget before sizing framework KV
         # blocks, then initialize the workspace after KV cache tensors exist.
@@ -346,7 +366,8 @@ class ExecutionEngine:
             batch_size = actual_seq_lengths_cu_q.shape[0]
             block_table_max_lens = self.kvcache_manager.get_block_table_max_lens(self.max_total_len)
             block_tables = prepare_block_tables(batch.requests if batch else None, self.kvcache_manager,
-                                                block_table_max_lens, device=self.device, batch_size=batch_size)
+                                                block_table_max_lens, device=self.device, batch_size=batch_size,
+                                                is_prefill=is_prefill)
             slot_mapping = prepare_slot_mapping(
                 position_ids,
                 actual_seq_lengths_cu_q,

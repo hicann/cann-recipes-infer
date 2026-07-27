@@ -277,9 +277,62 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         return {"sliding_window": next(iter(sliding_windows))}
 
 
+class MambaManager(SingleTypeKVCacheManager):
+    """Manager for fixed-size Mamba state cache."""
+
+    def __init__(
+        self,
+        attn_type: str,
+        block_num: int,
+        block_size: int,
+        manager_key: Optional[str] = None,
+        next_n: int = 0,
+        max_model_len: Optional[int] = None,
+        **kwargs,
+    ):
+        super().__init__(
+            attn_type=attn_type,
+            block_num=block_num,
+            block_size=block_size,
+            manager_key=manager_key,
+            max_model_len=max_model_len,
+        )
+        self.next_n = next_n
+
+    def pre_allocate_blocks(
+        self,
+        request_id: int,
+        num_tokens: int,
+        reserved_tokens: int = 0,
+    ) -> tuple:
+        """Return required state blocks and whether the current pool can satisfy it."""
+        if num_tokens < 0:
+            raise ValueError("num_tokens must be non-negative")
+        existing_block_num = len(self.req_to_blocks.get(request_id, []))
+        total_needed = 1 if existing_block_num == 0 else 1 + self.next_n
+        need_block_num = max(0, total_needed - existing_block_num)
+        return need_block_num, need_block_num <= self.get_num_free_blocks()
+
+    def get_num_skipped_tokens(self, _num_computed_tokens: int) -> int:
+        """Mamba has no token-window block recycling."""
+        return 0
+
+    @staticmethod
+    def validate_and_build_kwargs(group_entries: List[CacheEntry]) -> Dict[str, object]:
+        """Validate Mamba state metadata and return required manager kwargs."""
+        next_ns = {cache_entry.next_n for cache_entry in group_entries}
+        if len(next_ns) != 1:
+            raise ValueError(
+                "All Mamba caches grouped into one manager must share the same next_n, "
+                f"but got {sorted(next_ns)}."
+            )
+        return {"next_n": next(iter(next_ns))}
+
+
 ATTN_TYPE_MANAGER_MAP: Dict[str, Type[SingleTypeKVCacheManager]] = {
     "FullAttention": FullAttentionManager,
     "SlidingWindow": SlidingWindowManager,
+    "Mamba": MambaManager,
 }
 
 

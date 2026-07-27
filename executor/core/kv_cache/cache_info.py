@@ -15,7 +15,7 @@
 
 """Cache metadata structures for paged-attention initialization."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Callable, List, Optional, Union
 
@@ -92,6 +92,62 @@ class CacheEntry:
             )
         storage_block_size = self.block_size // self.compress_ratio
         return storage_block_size
+
+
+@dataclass
+class MambaCacheEntry(CacheEntry):
+    """Cache entry for a fixed-size Mamba-style recurrent state.
+
+    Paged attention entries describe ``num_head x dim`` per token; a recurrent
+    state is instead one whole fixed-shape tensor per request, so ``shape``
+    carries the complete trailing shape and ``dim``/``num_head`` are unused.
+
+    Construct with keyword arguments only: the overridden fields are keyword-only,
+    which shifts the positional order away from the base class.
+    """
+
+    attn_type: str = field(default="Mamba", kw_only=True)
+    dim: Optional[Union[int, List[int]]] = field(default=None, kw_only=True)
+    num_head: Optional[int] = field(default=None, kw_only=True)
+    block_size: int = field(default=1, kw_only=True)
+    shape: List[int] = field(default_factory=list, kw_only=True)
+    # Speculative decoding depth. The manager reserves 1 + next_n state blocks
+    # per request; models that support speculative state advancement override it.
+    next_n: int = field(default=0, kw_only=True)
+
+    def __post_init__(self) -> None:
+        if self.attn_type != "Mamba":
+            raise ValueError(
+                f"Mamba cache '{self.cache_name}' must keep attn_type='Mamba', "
+                f"but got '{self.attn_type}'."
+            )
+        if self.block_size != 1:
+            raise ValueError(
+                f"Mamba cache '{self.cache_name}' block_size must be 1, "
+                f"but got {self.block_size}."
+            )
+        if not isinstance(self.shape, list) or len(self.shape) == 0:
+            raise ValueError(
+                f"Mamba cache '{self.cache_name}' must define a "
+                f"non-empty shape list, but got {self.shape}."
+            )
+        if any(not isinstance(cur_dim, int) or cur_dim <= 0 for cur_dim in self.shape):
+            raise ValueError(
+                f"Mamba cache '{self.cache_name}' shape dimensions "
+                f"must all be positive integers, but got {self.shape}."
+            )
+        if self.next_n < 0:
+            raise ValueError(
+                f"Mamba cache '{self.cache_name}' next_n must be "
+                f"non-negative, but got {self.next_n}."
+            )
+
+    def cache_dim_numel(self) -> int:
+        """Return flattened element count of one state block."""
+        numel = 1
+        for cur_dim in self.shape:
+            numel *= cur_dim
+        return numel
 
 
 @dataclass

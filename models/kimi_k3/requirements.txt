@@ -1,0 +1,10 @@
+torch==2.8.0
+transformers==5.0.0
+einops==0.8.1
+compressed-tensors==0.12.2
+datasets==3.6.0
+tiktoken==0.12.0
+numpy==1.26.4
+protobuf==5.29.6
+safetensors==0.6.2
+pillow==11.3.0

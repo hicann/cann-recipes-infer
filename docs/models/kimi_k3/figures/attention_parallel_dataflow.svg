@@ -1,0 +1,289 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1640 920" width="1640" height="920" preserveAspectRatio="xMidYMid meet" role="img" aria-labelledby="title desc">
+  <title id="title">Kimi K3 attention parallel data flow</title>
+  <desc id="desc">Prefill and Decode data flows for KDA and Gated MLA. Prefill gathers the token stream before head-parallel Attention. Decode KDA follows the same TP path, while Decode MLA keeps Q, KV and Attention data-parallel and gathers the Attention output and normalized hidden separately before the output gate and row-parallel output projection.</desc>
+  <defs>
+    <style>
+      svg {
+        background: #fff;
+        color: #1c1c1e;
+        font-family: "MiSans VF", -apple-system, BlinkMacSystemFont, "Segoe UI",
+          system-ui, Roboto, Arial, "PingFang SC", "Source Han Sans SC",
+          "Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+      }
+      .panel { fill: #fff; stroke: #1c1c1e; stroke-width: 1.5; stroke-dasharray: 9 7; }
+      .lane { fill: #fff; stroke: #b0b0b5; stroke-width: 1.1; stroke-dasharray: 6 5; }
+      .box { stroke: #1c1c1e; stroke-width: 1.35; }
+      .io { fill: #f4f4f5; }
+      .norm { fill: #dfe1f0; }
+      .rep { fill: #eeeeef; }
+      .tp { fill: #c8dcf5; }
+      .mixed { fill: #e7e4f2; }
+      .dp { fill: #cbe7cf; }
+      .gate { fill: #f6d3ce; stroke: #a85f55; }
+      .comm { fill: #fff0f0; stroke: #b86b6b; }
+      .section {
+        fill: #1c1c1e;
+        font-size: 28px;
+        font-weight: 680;
+        dominant-baseline: central;
+      }
+      .lane-title {
+        fill: #1c1c1e;
+        font-size: 21px;
+        font-weight: 680;
+        text-anchor: middle;
+        dominant-baseline: central;
+      }
+      .label {
+        fill: #1c1c1e;
+        font-size: 18px;
+        font-weight: 620;
+        text-anchor: middle;
+        dominant-baseline: central;
+      }
+      .sub {
+        fill: #4f4f54;
+        font-size: 15px;
+        font-weight: 540;
+        text-anchor: middle;
+        dominant-baseline: central;
+      }
+      .flow {
+        fill: none;
+        stroke: #1c1c1e;
+        stroke-width: 2;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+      }
+      .gate-flow {
+        fill: none;
+        stroke: #a85f55;
+        stroke-width: 2.2;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+      }
+    </style>
+    <marker id="arrow" markerUnits="userSpaceOnUse" markerWidth="10" markerHeight="9" refX="9.1" refY="4.5" orient="auto">
+      <path d="M0.8,0.7 L9.3,4.5 L0.8,8.3 z" fill="#1c1c1e"/>
+    </marker>
+    <marker id="gate-arrow" markerUnits="userSpaceOnUse" markerWidth="10" markerHeight="9" refX="9.1" refY="4.5" orient="auto">
+      <path d="M0.8,0.7 L9.3,4.5 L0.8,8.3 z" fill="#a85f55"/>
+    </marker>
+  </defs>
+
+  <rect width="1640" height="920" fill="#fff"/>
+
+  <!-- Prefill -->
+  <rect x="20" y="20" width="1600" height="400" rx="14" class="panel"/>
+  <text x="45" y="50" class="section">Prefill</text>
+
+  <!-- Prefill KDA -->
+  <rect x="40" y="72" width="1560" height="145" rx="10" class="lane"/>
+  <rect x="60" y="106" width="95" height="48" rx="24" class="box io"/>
+  <text x="107.5" y="130" class="lane-title">KDA</text>
+
+  <path d="M155 130 H185" class="flow" marker-end="url(#arrow)"/>
+  <rect x="185" y="100" width="150" height="60" rx="7" class="box norm"/>
+  <text x="260" y="120" class="label">AttnRes αA</text>
+  <text x="260" y="143" class="sub">Norm</text>
+
+  <path d="M335 130 H365" class="flow" marker-end="url(#arrow)"/>
+  <rect x="365" y="104" width="58" height="52" rx="7" class="box comm"/>
+  <text x="394" y="130" class="label">AG</text>
+
+  <path d="M423 130 H455" class="flow" marker-end="url(#arrow)"/>
+  <rect x="455" y="97" width="220" height="66" rx="7" class="box mixed"/>
+  <text x="565" y="117" class="label">qkv · Head TP</text>
+  <text x="565" y="143" class="sub">f_a Rep. · f_b/b Col TP</text>
+
+  <path d="M675 130 H705" class="flow" marker-end="url(#arrow)"/>
+  <rect x="705" y="100" width="170" height="60" rx="7" class="box tp"/>
+  <text x="790" y="120" class="label">ShortConv + KDA</text>
+  <text x="790" y="143" class="sub">Head TP</text>
+
+  <path d="M875 130 H905" class="flow" marker-end="url(#arrow)"/>
+  <rect x="905" y="100" width="100" height="60" rx="7" class="box rep"/>
+  <text x="955" y="130" class="label">o_norm</text>
+
+  <path d="M1005 130 H1183" class="flow" marker-end="url(#arrow)"/>
+  <circle cx="1200" cy="130" r="16" class="box gate"/>
+  <text x="1200" y="130" class="label">×</text>
+
+  <path d="M440 130 V191 H1115" class="gate-flow" marker-end="url(#gate-arrow)"/>
+  <rect x="1115" y="170" width="170" height="42" rx="7" class="box gate"/>
+  <text x="1200" y="182" class="label">g_proj + σ</text>
+  <text x="1200" y="201" class="sub">Column TP</text>
+  <path d="M1200 170 V147" class="gate-flow" marker-end="url(#gate-arrow)"/>
+
+  <path d="M1216 130 H1230" class="flow" marker-end="url(#arrow)"/>
+  <rect x="1230" y="100" width="125" height="60" rx="7" class="box tp"/>
+  <text x="1292.5" y="120" class="label">o_proj</text>
+  <text x="1292.5" y="143" class="sub">Row TP</text>
+
+  <path d="M1355 130 H1385" class="flow" marker-end="url(#arrow)"/>
+  <rect x="1385" y="104" width="58" height="52" rx="7" class="box comm"/>
+  <text x="1414" y="130" class="label">RS</text>
+
+  <path d="M1443 130 H1475" class="flow" marker-end="url(#arrow)"/>
+  <rect x="1475" y="104" width="105" height="52" rx="26" class="box io"/>
+  <text x="1527.5" y="130" class="label">Output</text>
+
+  <!-- Prefill MLA -->
+  <rect x="40" y="238" width="1560" height="160" rx="10" class="lane"/>
+  <rect x="60" y="274" width="95" height="48" rx="24" class="box io"/>
+  <text x="107.5" y="298" class="lane-title">MLA</text>
+
+  <path d="M155 298 H185" class="flow" marker-end="url(#arrow)"/>
+  <rect x="185" y="268" width="150" height="60" rx="7" class="box norm"/>
+  <text x="260" y="288" class="label">AttnRes αA</text>
+  <text x="260" y="311" class="sub">Norm</text>
+
+  <path d="M335 298 H365" class="flow" marker-end="url(#arrow)"/>
+  <rect x="365" y="272" width="58" height="52" rx="7" class="box comm"/>
+  <text x="394" y="298" class="label">AG</text>
+
+  <path d="M423 298 H455" class="flow" marker-end="url(#arrow)"/>
+  <rect x="455" y="268" width="140" height="60" rx="7" class="box rep"/>
+  <text x="525" y="288" class="label">q_a / kv_a</text>
+  <text x="525" y="311" class="sub">Replicated</text>
+
+  <path d="M595 298 H625" class="flow" marker-end="url(#arrow)"/>
+  <rect x="625" y="268" width="160" height="60" rx="7" class="box tp"/>
+  <text x="705" y="288" class="label">q_b / kv_b</text>
+  <text x="705" y="311" class="sub">Head TP</text>
+
+  <path d="M785 298 H815" class="flow" marker-end="url(#arrow)"/>
+  <rect x="815" y="268" width="140" height="60" rx="7" class="box tp"/>
+  <text x="885" y="288" class="label">MLA Core</text>
+  <text x="885" y="311" class="sub">Head TP</text>
+
+  <path d="M955 298 H1183" class="flow" marker-end="url(#arrow)"/>
+  <circle cx="1200" cy="298" r="16" class="box gate"/>
+  <text x="1200" y="298" class="label">×</text>
+
+  <path d="M440 298 V356 H1115" class="gate-flow" marker-end="url(#gate-arrow)"/>
+  <rect x="1115" y="335" width="170" height="42" rx="7" class="box gate"/>
+  <text x="1200" y="347" class="label">g_proj + σ</text>
+  <text x="1200" y="366" class="sub">Column TP</text>
+  <path d="M1200 335 V315" class="gate-flow" marker-end="url(#gate-arrow)"/>
+
+  <path d="M1216 298 H1230" class="flow" marker-end="url(#arrow)"/>
+  <rect x="1230" y="268" width="125" height="60" rx="7" class="box tp"/>
+  <text x="1292.5" y="288" class="label">o_proj</text>
+  <text x="1292.5" y="311" class="sub">Row TP</text>
+
+  <path d="M1355 298 H1385" class="flow" marker-end="url(#arrow)"/>
+  <rect x="1385" y="272" width="58" height="52" rx="7" class="box comm"/>
+  <text x="1414" y="298" class="label">RS</text>
+
+  <path d="M1443 298 H1475" class="flow" marker-end="url(#arrow)"/>
+  <rect x="1475" y="272" width="105" height="52" rx="26" class="box io"/>
+  <text x="1527.5" y="298" class="label">Output</text>
+
+  <!-- Decode -->
+  <rect x="20" y="440" width="1600" height="460" rx="14" class="panel"/>
+  <text x="45" y="470" class="section">Decode</text>
+
+  <!-- Decode KDA -->
+  <rect x="40" y="492" width="1560" height="165" rx="10" class="lane"/>
+  <rect x="60" y="534" width="95" height="48" rx="24" class="box io"/>
+  <text x="107.5" y="558" class="lane-title">KDA</text>
+
+  <path d="M155 558 H185" class="flow" marker-end="url(#arrow)"/>
+  <rect x="185" y="528" width="150" height="60" rx="7" class="box norm"/>
+  <text x="260" y="548" class="label">AttnRes αA</text>
+  <text x="260" y="571" class="sub">Norm</text>
+
+  <path d="M335 558 H365" class="flow" marker-end="url(#arrow)"/>
+  <rect x="365" y="532" width="58" height="52" rx="7" class="box comm"/>
+  <text x="394" y="558" class="label">AG</text>
+
+  <path d="M423 558 H455" class="flow" marker-end="url(#arrow)"/>
+  <rect x="455" y="525" width="220" height="66" rx="7" class="box mixed"/>
+  <text x="565" y="545" class="label">qkv · Head TP</text>
+  <text x="565" y="571" class="sub">f_a Rep. · f_b/b Col TP</text>
+
+  <path d="M675 558 H705" class="flow" marker-end="url(#arrow)"/>
+  <rect x="705" y="528" width="170" height="60" rx="7" class="box tp"/>
+  <text x="790" y="548" class="label">ShortConv + KDA</text>
+  <text x="790" y="571" class="sub">Head TP</text>
+
+  <path d="M875 558 H905" class="flow" marker-end="url(#arrow)"/>
+  <rect x="905" y="528" width="100" height="60" rx="7" class="box rep"/>
+  <text x="955" y="558" class="label">o_norm</text>
+
+  <path d="M1005 558 H1183" class="flow" marker-end="url(#arrow)"/>
+  <circle cx="1200" cy="558" r="16" class="box gate"/>
+  <text x="1200" y="558" class="label">×</text>
+
+  <path d="M440 558 V621 H1115" class="gate-flow" marker-end="url(#gate-arrow)"/>
+  <rect x="1115" y="600" width="170" height="42" rx="7" class="box gate"/>
+  <text x="1200" y="612" class="label">g_proj + σ</text>
+  <text x="1200" y="631" class="sub">Column TP</text>
+  <path d="M1200 600 V575" class="gate-flow" marker-end="url(#gate-arrow)"/>
+
+  <path d="M1216 558 H1230" class="flow" marker-end="url(#arrow)"/>
+  <rect x="1230" y="528" width="125" height="60" rx="7" class="box tp"/>
+  <text x="1292.5" y="548" class="label">o_proj</text>
+  <text x="1292.5" y="571" class="sub">Row TP</text>
+
+  <path d="M1355 558 H1385" class="flow" marker-end="url(#arrow)"/>
+  <rect x="1385" y="532" width="58" height="52" rx="7" class="box comm"/>
+  <text x="1414" y="558" class="label">RS</text>
+
+  <path d="M1443 558 H1475" class="flow" marker-end="url(#arrow)"/>
+  <rect x="1475" y="532" width="105" height="52" rx="26" class="box io"/>
+  <text x="1527.5" y="558" class="label">Output</text>
+
+  <!-- Decode MLA -->
+  <rect x="40" y="678" width="1560" height="200" rx="10" class="lane"/>
+  <rect x="60" y="726" width="95" height="48" rx="24" class="box io"/>
+  <text x="107.5" y="750" class="lane-title">MLA</text>
+
+  <path d="M155 750 H185" class="flow" marker-end="url(#arrow)"/>
+  <rect x="185" y="720" width="150" height="60" rx="7" class="box norm"/>
+  <text x="260" y="740" class="label">AttnRes αA</text>
+  <text x="260" y="763" class="sub">Norm</text>
+
+  <path d="M335 750 H365" class="flow" marker-end="url(#arrow)"/>
+  <rect x="365" y="717" width="280" height="66" rx="7" class="box dp"/>
+  <text x="505" y="737" class="label">Q/KV Projections + MLA Core</text>
+  <text x="505" y="763" class="sub">Decode DP</text>
+
+  <path d="M645 750 H675" class="flow" marker-end="url(#arrow)"/>
+  <rect x="675" y="724" width="80" height="52" rx="7" class="box comm"/>
+  <text x="715" y="741" class="label">AG</text>
+  <text x="715" y="762" class="sub">output</text>
+
+  <path d="M755 750 H785" class="flow" marker-end="url(#arrow)"/>
+  <rect x="785" y="724" width="130" height="52" rx="7" class="box tp"/>
+  <text x="850" y="750" class="label">Head Slice</text>
+
+  <path d="M915 750 H1183" class="flow" marker-end="url(#arrow)"/>
+  <circle cx="1200" cy="750" r="16" class="box gate"/>
+  <text x="1200" y="750" class="label">×</text>
+
+  <path d="M350 750 V836 H675" class="gate-flow" marker-end="url(#gate-arrow)"/>
+  <rect x="675" y="810" width="80" height="52" rx="7" class="box comm"/>
+  <text x="715" y="827" class="label">AG</text>
+  <text x="715" y="848" class="sub">hidden</text>
+
+  <path d="M755 836 H1115" class="gate-flow" marker-end="url(#gate-arrow)"/>
+  <rect x="1115" y="815" width="170" height="42" rx="7" class="box gate"/>
+  <text x="1200" y="827" class="label">g_proj + σ</text>
+  <text x="1200" y="846" class="sub">Column TP</text>
+  <path d="M1200 815 V767" class="gate-flow" marker-end="url(#gate-arrow)"/>
+
+  <path d="M1216 750 H1230" class="flow" marker-end="url(#arrow)"/>
+  <rect x="1230" y="720" width="125" height="60" rx="7" class="box tp"/>
+  <text x="1292.5" y="740" class="label">o_proj</text>
+  <text x="1292.5" y="763" class="sub">Row TP</text>
+
+  <path d="M1355 750 H1385" class="flow" marker-end="url(#arrow)"/>
+  <rect x="1385" y="724" width="58" height="52" rx="7" class="box comm"/>
+  <text x="1414" y="750" class="label">RS</text>
+
+  <path d="M1443 750 H1475" class="flow" marker-end="url(#arrow)"/>
+  <rect x="1475" y="724" width="105" height="52" rx="26" class="box io"/>
+  <text x="1527.5" y="750" class="label">Output</text>
+</svg>

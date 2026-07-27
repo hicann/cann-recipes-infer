@@ -21,6 +21,7 @@
 
 ## 📰 最新动态
 
+- [2026/07] Kimi K3 模型在昇腾 950PR/DT 系列上已 **0day 支持推理部署**
 - [2026/07] Hy3 模型在 Atlas A3 系列和昇腾 950PR/DT 系列上已 **0day 支持推理部署**
 - [2026/06] GLM-5.2模型在昇腾Atlas A3系列上已支持推理部署
 - [2026/06] HunyuanVideo 模型在昇腾 950PR/DT 系列上支持 **mxfp8 a8w8 量化** 和 Flash Attention mxfp8 激活值量化

@@ -1,0 +1,245 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 2100 1080" width="2100" height="1080" preserveAspectRatio="xMidYMid meet" role="img" aria-labelledby="title desc">
+  <title id="title">Kimi K3 end-to-end parallel data flow</title>
+  <desc id="desc">Input IDs pass through vocabulary-parallel Embedding, AllReduce, and a local owner split. Layer 1 starts with Input Norm without alpha-A AttnRes, then runs Attention tensor parallelism and Dense tensor parallelism. Layers 2 through 93 run alpha-A AttnRes, Attention, alpha-F AttnRes, and Stable LatentMoE, where routed experts use expert parallelism and the shared expert uses tensor parallelism. Output tokens are gathered before the vocabulary-parallel LM Head, and vocabulary-sharded logits are gathered at the output.</desc>
+  <defs>
+    <style>
+      svg {
+        background: #fff;
+        color: #1c1c1e;
+        font-family: "MiSans VF", -apple-system, BlinkMacSystemFont, "Segoe UI",
+          system-ui, Roboto, Arial, "PingFang SC", "Source Han Sans SC",
+          "Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+      }
+      .panel { fill: #fff; stroke: #1c1c1e; stroke-width: 1.5; stroke-dasharray: 9 7; }
+      .subpanel { fill: #fff; stroke: #8b8b90; stroke-width: 1.25; stroke-dasharray: 6 5; }
+      .box { stroke: #1c1c1e; stroke-width: 1.45; }
+      .projection { fill: #f6d3ce; }
+      .compute { fill: #c8dcf5; }
+      .routed { fill: #dcdff0; }
+      .shared { fill: #cbe7cf; }
+      .comm { fill: #fff0f0; stroke: #b86b6b; }
+      .owner { fill: #f3f3f4; }
+      .io { fill: #fff; }
+      .label {
+        fill: #1c1c1e;
+        font-size: 25px;
+        font-weight: 580;
+        text-anchor: middle;
+        dominant-baseline: central;
+      }
+      .label-small {
+        fill: #1c1c1e;
+        font-size: 23px;
+        font-weight: 560;
+        text-anchor: middle;
+        dominant-baseline: central;
+      }
+      .annotation {
+        fill: #4a4a4e;
+        font-size: 20px;
+        font-weight: 520;
+        text-anchor: middle;
+        dominant-baseline: central;
+      }
+      .subhead {
+        fill: #4a4a4e;
+        font-size: 21px;
+        font-weight: 650;
+        dominant-baseline: central;
+      }
+      .section {
+        fill: #1c1c1e;
+        font-size: 29px;
+        font-weight: 680;
+        dominant-baseline: central;
+      }
+      .flow {
+        fill: none;
+        stroke: #1c1c1e;
+        stroke-width: 2;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+      }
+    </style>
+    <marker id="arrow" markerUnits="userSpaceOnUse" markerWidth="10" markerHeight="9" refX="9.1" refY="4.5" orient="auto">
+      <path d="M0.8,0.7 L9.3,4.5 L0.8,8.3 z" fill="#1c1c1e"/>
+    </marker>
+  </defs>
+
+  <rect width="2100" height="1080" fill="#fff"/>
+
+  <!-- Input boundary. -->
+  <rect x="30" y="25" width="2040" height="140" rx="14" class="panel"/>
+  <text x="60" y="55" class="section">Input Boundary</text>
+
+  <rect x="350" y="78" width="120" height="60" rx="30" class="box io"/>
+  <text x="410" y="108" class="label-small">input_ids</text>
+  <path d="M470 108 H505" class="flow" marker-end="url(#arrow)"/>
+
+  <rect x="505" y="68" width="240" height="80" rx="7" class="box projection"/>
+  <text x="625" y="95" class="label-small">Embedding</text>
+  <text x="625" y="124" class="annotation">Vocab TP</text>
+  <path d="M745 108 H785" class="flow" marker-end="url(#arrow)"/>
+
+  <rect x="785" y="73" width="170" height="70" rx="7" class="box comm"/>
+  <text x="870" y="108" class="label-small">AllReduce</text>
+  <path d="M955 108 H995" class="flow" marker-end="url(#arrow)"/>
+
+  <rect x="995" y="73" width="160" height="70" rx="7" class="box owner"/>
+  <text x="1075" y="108" class="label-small">Local Split</text>
+  <path d="M1155 108 H1195" class="flow" marker-end="url(#arrow)"/>
+
+  <rect x="1195" y="73" width="190" height="70" rx="35" class="box owner"/>
+  <text x="1290" y="95" class="label-small">Owner</text>
+  <text x="1290" y="123" class="annotation">Token / Request</text>
+
+  <path d="M1290 143 V180 H55 V318 H75" class="flow" marker-end="url(#arrow)"/>
+
+  <!-- Dense layer. -->
+  <rect x="30" y="200" width="2040" height="230" rx="14" class="panel"/>
+  <text x="60" y="230" class="section">Layer 1 · Dense</text>
+
+  <rect x="75" y="283" width="140" height="70" rx="7" class="box compute"/>
+  <text x="145" y="318" class="label-small">Input Norm</text>
+  <path d="M215 318 H270" class="flow" marker-end="url(#arrow)"/>
+
+  <rect x="245" y="250" width="570" height="136" rx="10" class="subpanel"/>
+  <text x="270" y="275" class="subhead">Attention · Head TP</text>
+  <rect x="270" y="292" width="80" height="60" rx="7" class="box comm"/>
+  <text x="310" y="322" class="label-small">AG</text>
+  <path d="M350 322 H370" class="flow" marker-end="url(#arrow)"/>
+  <rect x="370" y="287" width="170" height="70" rx="7" class="box compute"/>
+  <text x="455" y="322" class="label-small">KDA</text>
+  <path d="M540 322 H560" class="flow" marker-end="url(#arrow)"/>
+  <rect x="560" y="287" width="125" height="70" rx="7" class="box compute"/>
+  <text x="622.5" y="309" class="label-small">o_proj</text>
+  <text x="622.5" y="338" class="annotation">Row TP</text>
+  <path d="M685 322 H705" class="flow" marker-end="url(#arrow)"/>
+  <rect x="705" y="292" width="80" height="60" rx="7" class="box comm"/>
+  <text x="745" y="322" class="label-small">RS</text>
+
+  <path d="M785 322 H850" class="flow" marker-end="url(#arrow)"/>
+  <rect x="850" y="283" width="150" height="70" rx="7" class="box compute"/>
+  <text x="925" y="306" class="label-small">Prefix → αF</text>
+  <text x="925" y="335" class="annotation">Local · Norm</text>
+  <path d="M1000 318 H1060" class="flow" marker-end="url(#arrow)"/>
+
+  <rect x="1035" y="250" width="605" height="136" rx="10" class="subpanel"/>
+  <text x="1060" y="275" class="subhead">Dense FFN · TP</text>
+  <rect x="1060" y="292" width="80" height="60" rx="7" class="box comm"/>
+  <text x="1100" y="322" class="label-small">AG</text>
+  <path d="M1140 322 H1160" class="flow" marker-end="url(#arrow)"/>
+  <rect x="1160" y="287" width="155" height="70" rx="7" class="box projection"/>
+  <text x="1237.5" y="309" class="label-small">gate_up</text>
+  <text x="1237.5" y="338" class="annotation">Column TP</text>
+  <path d="M1315 322 H1335" class="flow" marker-end="url(#arrow)"/>
+  <rect x="1335" y="287" width="145" height="70" rx="7" class="box compute"/>
+  <text x="1407.5" y="309" class="label-small">down</text>
+  <text x="1407.5" y="338" class="annotation">Row TP</text>
+  <path d="M1480 322 H1500" class="flow" marker-end="url(#arrow)"/>
+  <rect x="1500" y="292" width="80" height="60" rx="7" class="box comm"/>
+  <text x="1540" y="322" class="label-small">RS</text>
+
+  <path d="M1580 322 H1695" class="flow" marker-end="url(#arrow)"/>
+  <rect x="1695" y="283" width="150" height="70" rx="35" class="box owner"/>
+  <text x="1770" y="306" class="label-small">Next Prefix</text>
+  <text x="1770" y="335" class="annotation">Owner Shard</text>
+
+  <path d="M1770 353 V455 H55 V660 H75" class="flow" marker-end="url(#arrow)"/>
+
+  <!-- Repeated Stable LatentMoE layers. -->
+  <rect x="30" y="480" width="2040" height="365" rx="14" class="panel"/>
+  <text x="60" y="512" class="section">Layers 2–93 · Stable LatentMoE · repeated 92×</text>
+
+  <rect x="75" y="625" width="145" height="70" rx="7" class="box compute"/>
+  <text x="147.5" y="648" class="label-small">AttnRes αA</text>
+  <text x="147.5" y="677" class="annotation">Norm</text>
+  <path d="M220 660 H275" class="flow" marker-end="url(#arrow)"/>
+
+  <rect x="250" y="575" width="570" height="150" rx="10" class="subpanel"/>
+  <text x="275" y="601" class="subhead">Attention · Head TP</text>
+  <rect x="275" y="630" width="80" height="60" rx="7" class="box comm"/>
+  <text x="315" y="660" class="label-small">AG</text>
+  <path d="M355 660 H375" class="flow" marker-end="url(#arrow)"/>
+  <rect x="375" y="625" width="170" height="70" rx="7" class="box compute"/>
+  <text x="460" y="647" class="label-small">KDA / Gated</text>
+  <text x="460" y="676" class="annotation">MLA</text>
+  <path d="M545 660 H565" class="flow" marker-end="url(#arrow)"/>
+  <rect x="565" y="625" width="125" height="70" rx="7" class="box compute"/>
+  <text x="627.5" y="647" class="label-small">o_proj</text>
+  <text x="627.5" y="676" class="annotation">Row TP</text>
+  <path d="M690 660 H710" class="flow" marker-end="url(#arrow)"/>
+  <rect x="710" y="630" width="80" height="60" rx="7" class="box comm"/>
+  <text x="750" y="660" class="label-small">RS</text>
+
+  <path d="M790 660 H855" class="flow" marker-end="url(#arrow)"/>
+  <rect x="855" y="625" width="145" height="70" rx="7" class="box compute"/>
+  <text x="927.5" y="648" class="label-small">Prefix → αF</text>
+  <text x="927.5" y="677" class="annotation">Local · Norm</text>
+
+  <path d="M1000 660 H1060" class="flow" marker-end="url(#arrow)"/>
+  <rect x="1035" y="535" width="790" height="270" rx="10" class="subpanel"/>
+  <text x="1060" y="565" class="subhead">LatentMoE</text>
+
+  <!-- The LatentMoE input forks into routed EP and shared TP branches. -->
+  <rect x="1060" y="625" width="170" height="70" rx="7" class="box projection"/>
+  <text x="1145" y="648" class="label-small">Router</text>
+  <text x="1145" y="677" class="annotation">Latent Down</text>
+  <path d="M1230 660 H1260" class="flow" marker-end="url(#arrow)"/>
+  <rect x="1260" y="625" width="230" height="70" rx="7" class="box routed"/>
+  <text x="1375" y="648" class="label-small">Routed Experts</text>
+  <text x="1375" y="677" class="annotation">Expert Parallel</text>
+  <path d="M1490 660 H1520" class="flow" marker-end="url(#arrow)"/>
+  <rect x="1520" y="625" width="140" height="70" rx="7" class="box compute"/>
+  <text x="1590" y="648" class="label-small">Norm</text>
+  <text x="1590" y="677" class="annotation">Latent Up</text>
+  <path d="M1660 660 H1675" class="flow" marker-end="url(#arrow)"/>
+  <circle cx="1695" cy="660" r="20" class="box compute"/>
+  <text x="1695" y="660" class="label">+</text>
+
+  <path d="M1035 660 H1045 V750 H1150" class="flow" marker-end="url(#arrow)"/>
+  <rect x="1150" y="722" width="80" height="56" rx="7" class="box comm"/>
+  <text x="1190" y="750" class="label-small">AG</text>
+  <path d="M1230 750 H1260" class="flow" marker-end="url(#arrow)"/>
+  <rect x="1260" y="715" width="190" height="70" rx="7" class="box shared"/>
+  <text x="1355" y="738" class="label-small">Shared Expert</text>
+  <text x="1355" y="767" class="annotation">Tensor Parallel</text>
+  <path d="M1450 750 H1480" class="flow" marker-end="url(#arrow)"/>
+  <rect x="1480" y="722" width="80" height="56" rx="7" class="box comm"/>
+  <text x="1520" y="750" class="label-small">RS</text>
+  <path d="M1560 750 H1695 V680" class="flow" marker-end="url(#arrow)"/>
+
+  <path d="M1715 660 H1880" class="flow" marker-end="url(#arrow)"/>
+  <rect x="1880" y="625" width="145" height="70" rx="35" class="box owner"/>
+  <text x="1952.5" y="648" class="label-small">Next Prefix</text>
+  <text x="1952.5" y="677" class="annotation">Owner Shard</text>
+
+  <path d="M1952.5 695 V865 H370 V975 H400" class="flow" marker-end="url(#arrow)"/>
+
+  <!-- Output boundary. -->
+  <rect x="30" y="885" width="2040" height="155" rx="14" class="panel"/>
+  <text x="60" y="915" class="section">Output Boundary</text>
+
+  <rect x="400" y="940" width="230" height="70" rx="7" class="box compute"/>
+  <text x="515" y="963" class="label-small">Output AttnRes</text>
+  <text x="515" y="992" class="annotation">Final Norm · Local</text>
+  <path d="M630 975 H665" class="flow" marker-end="url(#arrow)"/>
+
+  <rect x="665" y="940" width="160" height="70" rx="7" class="box comm"/>
+  <text x="745" y="963" class="label-small">Owner Shards</text>
+  <text x="745" y="992" class="annotation">AllGather</text>
+  <path d="M825 975 H860" class="flow" marker-end="url(#arrow)"/>
+
+  <rect x="860" y="935" width="230" height="80" rx="7" class="box projection"/>
+  <text x="975" y="963" class="label-small">LM Head</text>
+  <text x="975" y="992" class="annotation">Vocab TP</text>
+  <path d="M1090 975 H1125" class="flow" marker-end="url(#arrow)"/>
+
+  <rect x="1125" y="940" width="175" height="70" rx="7" class="box comm"/>
+  <text x="1212.5" y="963" class="label-small">Logits</text>
+  <text x="1212.5" y="992" class="annotation">AllGather</text>
+  <path d="M1300 975 H1340" class="flow" marker-end="url(#arrow)"/>
+
+  <rect x="1340" y="945" width="110" height="60" rx="30" class="box io"/>
+  <text x="1395" y="975" class="label-small">logits</text>
+</svg>

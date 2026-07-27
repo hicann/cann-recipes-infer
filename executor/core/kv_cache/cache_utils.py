@@ -22,15 +22,15 @@ import torch
 import torch.distributed as dist
 import torch_npu
 
-from .cache_info import CacheAllocator, CacheEntry, ModelCacheInfo
+from .cache_info import CacheAllocator, CacheEntry, MambaCacheEntry, ModelCacheInfo
 from .kv_cache_manager import KVCacheManager
-from .single_type_kv_cache_manager import ATTN_TYPE_MANAGER_MAP
+from .single_type_kv_cache_manager import ATTN_TYPE_MANAGER_MAP, MambaManager
 
 
 # Cache types with fixed block count (independent of seq_len),
 # e.g., sliding window attention. Distinguished from paged attention types
 # where block count scales with sequence length.
-FIXED_BLOCK_ATTN_TYPES = {"SlidingWindow"}
+FIXED_BLOCK_ATTN_TYPES = {"SlidingWindow", "Mamba"}
 SUPPORTED_CACHE_LAYOUTS = {"BnBsND", "BnNBsD"}
 
 
@@ -82,18 +82,53 @@ def validate_cache_info(cache_info: ModelCacheInfo) -> None:
                     f"cache {cache.cache_name} in layer {layer_info.layer_idx} has unsupported cache_layout "
                     f"'{cache.cache_layout}'. Supported layouts are: {sorted(SUPPORTED_CACHE_LAYOUTS)}"
                 )
-            if cache.num_head <= 0:
+            # Mamba state entries describe one whole state tensor via `shape`
+            # instead of num_head x dim per token. MambaCacheEntry validates that
+            # shape on construction; this gate only enforces the type.
+            if cache.attn_type == "Mamba":
+                if not isinstance(cache, MambaCacheEntry):
+                    raise ValueError(
+                        f"cache {cache.cache_name} in layer {layer_info.layer_idx} declares "
+                        f"attn_type='Mamba' and must be a MambaCacheEntry, "
+                        f"but got {type(cache).__name__}"
+                    )
+            elif cache.attn_type in ["FullAttention", "SlidingWindow"]:
+                if cache.num_head <= 0:
+                    raise ValueError(
+                        f"cache {cache.cache_name} in layer {layer_info.layer_idx} must have positive num_head, "
+                        f"but got {cache.num_head}"
+                    )
+                dims = cache.dim if isinstance(cache.dim, list) else [cache.dim]
+                if any(d <= 0 for d in dims):
+                    raise ValueError(
+                        f"cache {cache.cache_name} in layer {layer_info.layer_idx} must have positive dim, "
+                        f"but got {cache.dim}"
+                    )
+            else:
                 raise ValueError(
-                    f"cache {cache.cache_name} in layer {layer_info.layer_idx} must have positive num_head, "
-                    f"but got {cache.num_head}"
-                )
-            dims = cache.dim if isinstance(cache.dim, list) else [cache.dim]
-            if any(d <= 0 for d in dims):
-                raise ValueError(
-                    f"cache {cache.cache_name} in layer {layer_info.layer_idx} must have positive dim, "
-                    f"but got {cache.dim}"
+                    f"cache {cache.cache_name} in layer {layer_info.layer_idx} has attn_type "
+                    f"'{cache.attn_type}' with no metadata validation rule. "
+                    f"Please add one in validate_cache_info."
                 )
             _normalize_cache_allocator(cache, layer_info.layer_idx)
+
+
+def _alloc_aligned_hbm_tensor(device, dtype: torch.dtype, numel: int, shape: Tuple[int, ...]) -> torch.Tensor:
+    """Allocate a HIXL-aligned HBM cache tensor of `numel` elements viewed as `shape`."""
+    from executor.utils import align_memory
+    from executor.online.kv_transfer.buffer import HIXL_ALIGNMENT
+
+    # HIXL_ALIGNMENT is in bytes; convert to element count for the padding.
+    elem_size = dtype_itemsize(dtype)
+    slack = (HIXL_ALIGNMENT + elem_size - 1) // elem_size
+    raw = torch.empty(numel + slack, dtype=dtype, device=device)
+    cache_tensor = align_memory(raw, HIXL_ALIGNMENT).narrow(0, 0, numel).view(shape)
+    if cache_tensor.data_ptr() % HIXL_ALIGNMENT != 0:
+        raise RuntimeError(
+            f"cache_tensor not aligned to {HIXL_ALIGNMENT} bytes "
+            f"(ptr={cache_tensor.data_ptr()})"
+        )
+    return cache_tensor
 
 
 def allocate_cache_tensors(device, cache_info: ModelCacheInfo, block_num_by_type: Dict[str, int]) -> None:
@@ -102,9 +137,6 @@ def allocate_cache_tensors(device, cache_info: ModelCacheInfo, block_num_by_type
     KV-cache tensors are 2 MiB aligned (HIXL HCCS IPC contract) via the
     over-allocate + `align_memory` slice pattern.
     """
-    from executor.utils import align_memory
-    from executor.online.kv_transfer.buffer import HIXL_ALIGNMENT
-
     for layer_info in cache_info.layer_infos:
         for cache in layer_info.caches:
             if not cache.needs_block:
@@ -135,21 +167,22 @@ def allocate_cache_tensors(device, cache_info: ModelCacheInfo, block_num_by_type
                     )
                 numel = block_num * block_size * cache.num_head * cache.cache_dim_numel()
                 if allocator == CacheAllocator.HBM:
-                    # HIXL_ALIGNMENT is in bytes; convert to element count for the padding.
-                    elem_size = dtype_itemsize(cache.dtype)
-                    slack = (HIXL_ALIGNMENT + elem_size - 1) // elem_size
-                    raw = torch.empty(numel + slack, dtype=cache.dtype, device=device)
-                    cache_tensor = align_memory(raw, HIXL_ALIGNMENT).narrow(0, 0, numel).view(shape)
-                    if cache_tensor.data_ptr() % HIXL_ALIGNMENT != 0:
-                        raise RuntimeError(
-                            f"cache_tensor not aligned to {HIXL_ALIGNMENT} bytes "
-                            f"(ptr={cache_tensor.data_ptr()})"
-                        )
+                    cache_tensor = _alloc_aligned_hbm_tensor(device, cache.dtype, numel, shape)
                 elif allocator == CacheAllocator.SWAPPED_MEMORY:
                     cache_tensor = torch_npu.empty_with_swapped_memory(shape, dtype=cache.dtype, device=device)
                 else:
                     raise ValueError(
                         f"Creating cache tensor with allocator='{cache.allocator}' is not supported."
+                    )
+            elif cache.attn_type == "Mamba":
+                shape = (block_num, *cache.shape)
+                numel = block_num * cache.cache_dim_numel()
+                if allocator == CacheAllocator.HBM:
+                    cache_tensor = _alloc_aligned_hbm_tensor(device, cache.dtype, numel, shape)
+                else:
+                    raise ValueError(
+                        f"Creating cache tensor with allocator='{cache.allocator}' is not supported "
+                        f"for attn_type='{cache.attn_type}'."
                     )
             else:
                 raise ValueError(
@@ -195,6 +228,11 @@ def calculate_fixed_block_memory_bytes(infer_config, cache_info: ModelCacheInfo)
                 if CacheAllocator(cache.allocator) == CacheAllocator.HBM:
                     tmp_memory_bytes = fixed_block_num * block_size * cache.num_head \
                         * cache.cache_dim_numel() * dtype_itemsize(cache.dtype)
+            elif cache.attn_type == "Mamba":
+                fixed_block_num = max_concurrency * (1 + cache.next_n) + 1
+                tmp_memory_bytes = 0
+                if CacheAllocator(cache.allocator) == CacheAllocator.HBM:
+                    tmp_memory_bytes = fixed_block_num * cache.cache_dim_numel() * dtype_itemsize(cache.dtype)
             else:
                 raise AttributeError(
                         f"If other attention types {cache.attn_type} are added to FIXED_BLOCK_ATTN_TYPES, "
@@ -373,18 +411,74 @@ def calculate_block_num(
     return block_num_by_type
 
 
+def _prepare_mamba_block_tables(
+    requests: Sequence,
+    mamba_manager: MambaManager,
+    device: torch.device,
+    batch_size: int = 0,
+    is_prefill: bool = False,
+) -> torch.Tensor:
+    """Prepare request-state block table for Mamba caches."""
+    table_width = 1 if is_prefill else 1 + mamba_manager.next_n
+    null_block_id = mamba_manager.block_pool.get_null_block()
+    block_table_tensor = torch.full(
+        [batch_size, table_width],
+        null_block_id,
+        dtype=torch.int32,
+        device=device,
+    )
+    if requests is None:
+        return block_table_tensor
+
+    block_table_list: List[List[int]] = []
+    for request in requests:
+        request_id = request.request_id
+        block_ids = list(mamba_manager.req_to_blocks.get(request_id, []))
+        valid_block_ids = block_ids[:table_width]
+        if len(valid_block_ids) < table_width:
+            # Dummy padding requests (request_id=-1, see scheduler._build_dummy_batch)
+            # carry no allocation; a real request missing state blocks is a bug.
+            if request_id < 0:
+                valid_block_ids = valid_block_ids + [null_block_id] * (table_width - len(valid_block_ids))
+            else:
+                raise ValueError(
+                    f"Mamba block table requires {table_width} blocks "
+                    f"for request {request_id}, but got {len(valid_block_ids)} blocks: {valid_block_ids}."
+                )
+        block_table_list.append(valid_block_ids)
+
+    actual_batch = len(block_table_list)
+    if actual_batch > 0:
+        block_table_tensor[:actual_batch, :] = torch.tensor(
+            block_table_list,
+            dtype=torch.int32,
+            device=device,
+        ).view(actual_batch, table_width)
+    return block_table_tensor
+
+
 def prepare_block_tables(
     requests: Sequence,
     kv_cache_manager: KVCacheManager,
     max_block_num: Dict[str, int],
     device: torch.device,
     batch_size: int = 0,
+    is_prefill: bool = False,
 ) -> Dict[str, torch.Tensor]:
     """Prepare block tables for all requests across all KV cache types."""
     block_tables_by_key: Dict[str, torch.Tensor] = {}
 
     for manager in kv_cache_manager.single_type_managers:
         manager_key = manager.manager_key
+        if manager.attn_type == "Mamba":
+            block_tables_by_key[manager_key] = _prepare_mamba_block_tables(
+                requests=requests,
+                mamba_manager=manager,
+                device=device,
+                batch_size=batch_size,
+                is_prefill=is_prefill,
+            )
+            continue
         null_block_id = manager.block_pool.get_null_block()
         cur_max_block_num = max_block_num.get(manager_key) if isinstance(max_block_num, dict) else max_block_num
         if cur_max_block_num is None:
@@ -429,6 +523,10 @@ def prepare_slot_mapping(
 
     for manager in kv_cache_manager.single_type_managers:
         manager_key = manager.manager_key
+        # Mamba state is addressed by block_table directly (one state block per
+        # request), so it has no per-token slot mapping and emits no entry here.
+        if manager.attn_type == "Mamba":
+            continue
         block_table = block_tables.get(manager_key)
         if block_table is None:
             raise ValueError(f"block_table is required for manager_key={manager_key}")

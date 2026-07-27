@@ -1,0 +1,200 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1800 800" width="1800" height="800" preserveAspectRatio="xMidYMid meet" role="img" aria-labelledby="title desc">
+  <title id="title">Kimi K3 KDA architecture</title>
+  <desc id="desc">KDA input paths apply one fused stateful QKV causal convolution before splitting query, key, and value. Prefill uses causal_conv1d_fn and Decode uses causal_conv1d_update. L2 normalization applies only to query and key. Independent decay and beta paths feed the recurrent KDA core, while the output-gate path joins after the core RMSNorm.</desc>
+  <defs>
+    <style>
+      svg {
+        background: #fff;
+        color: #1c1c1e;
+        font-family: "MiSans VF", -apple-system, BlinkMacSystemFont, "Segoe UI",
+          system-ui, Roboto, Arial, "PingFang SC", "Source Han Sans SC",
+          "Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+      }
+      .panel { fill: #fff; stroke: #1c1c1e; stroke-width: 1.2; stroke-dasharray: 8 6; }
+      .box { stroke: #1c1c1e; stroke-width: 1.25; }
+      .projection { fill: #f6d3ce; }
+      .compute { fill: #c8dcf5; }
+      .fusion-kernel { fill: #fff4e5; }
+      .gate { fill: #f2f3c1; }
+      .state { fill: #f3f3f4; }
+      .io { fill: #fff; }
+      .label {
+        fill: #1c1c1e;
+        font-size: 20px;
+        font-weight: 500;
+        text-anchor: middle;
+        dominant-baseline: central;
+      }
+      .label-small {
+        fill: #1c1c1e;
+        font-size: 18px;
+        font-weight: 500;
+        text-anchor: middle;
+        dominant-baseline: central;
+      }
+      .fusion-title {
+        fill: #b94f49;
+        font-size: 20px;
+        font-weight: 700;
+        text-anchor: middle;
+        dominant-baseline: central;
+      }
+      .fusion-mode {
+        fill: #b94f49;
+        font-size: 17px;
+        font-weight: 700;
+        text-anchor: start;
+        dominant-baseline: central;
+      }
+      .fusion-op {
+        fill: #1c1c1e;
+        font-size: 17px;
+        font-weight: 550;
+        text-anchor: start;
+        dominant-baseline: central;
+      }
+      .section {
+        fill: #1c1c1e;
+        font-size: 21px;
+        font-weight: 620;
+        dominant-baseline: central;
+      }
+      .flow {
+        fill: none;
+        stroke: #1c1c1e;
+        stroke-width: 1.6;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+      }
+      .divider { stroke: #1c1c1e; stroke-width: 1; }
+    </style>
+    <marker id="arrow" markerUnits="userSpaceOnUse" markerWidth="9" markerHeight="8" refX="8.2" refY="4" orient="auto">
+      <path d="M0.6,0.6 L8.4,4 L0.6,7.4 z" fill="#1c1c1e"/>
+    </marker>
+  </defs>
+
+  <rect width="1800" height="800" fill="#fff"/>
+
+  <!-- Three module-level stages -->
+  <rect x="180" y="38" width="780" height="724" rx="12" class="panel"/>
+  <text x="208" y="70" class="section">KDA Input Paths</text>
+
+  <rect x="980" y="38" width="245" height="724" rx="12" class="panel"/>
+  <text x="1008" y="70" class="section">KDA Core</text>
+
+  <rect x="1245" y="38" width="520" height="724" rx="12" class="panel"/>
+  <text x="1273" y="70" class="section">Output</text>
+
+  <!-- Shared input and four-way branch bus -->
+  <rect x="26" y="354" width="114" height="66" rx="33" class="box io"/>
+  <text x="83" y="387" class="label">xₜ</text>
+  <path d="M140 387 H160" class="flow"/>
+  <path d="M160 250 V690" class="flow"/>
+
+  <!-- qkv_proj stays separate; one fused Conv1D runs before the QKV split. -->
+  <path d="M160 250 H215" class="flow" marker-end="url(#arrow)"/>
+  <rect x="215" y="215" width="150" height="70" rx="5" class="box projection"/>
+  <text x="290" y="250" class="label-small">qkv_proj</text>
+  <path d="M365 250 H390" class="flow" marker-end="url(#arrow)"/>
+
+  <rect x="390" y="175" width="270" height="130" rx="7" class="box fusion-kernel"/>
+  <text x="525" y="195" class="fusion-title">Fused QKV ShortConv</text>
+  <path d="M390 215 H660" class="divider"/>
+  <text x="405" y="237" class="fusion-mode">Prefill</text>
+  <text x="470" y="237" class="fusion-op">causal_conv1d_fn</text>
+  <text x="405" y="267" class="fusion-mode">Decode</text>
+  <text x="470" y="267" class="fusion-op">causal_conv1d_update</text>
+
+  <path d="M660 250 H680" class="flow" marker-end="url(#arrow)"/>
+  <rect x="680" y="215" width="100" height="70" rx="5" class="box compute"/>
+  <text x="730" y="250" class="label-small">QKV Split</text>
+  <path d="M780 250 H800 M800 175 V325" class="flow"/>
+
+  <path d="M800 175 H830" class="flow" marker-end="url(#arrow)"/>
+  <rect x="830" y="140" width="125" height="70" rx="5" class="box compute"/>
+  <text x="892.5" y="175" class="label-small">Q L2Norm</text>
+
+  <path d="M800 250 H830" class="flow" marker-end="url(#arrow)"/>
+  <rect x="830" y="215" width="125" height="70" rx="5" class="box compute"/>
+  <text x="892.5" y="250" class="label-small">K L2Norm</text>
+
+  <!-- V reaches the recurrent core directly; only Q and K are normalized. -->
+  <path d="M955 175 H965 V220 H1010" class="flow" marker-end="url(#arrow)"/>
+  <path d="M955 250 H975 V290 H1010" class="flow" marker-end="url(#arrow)"/>
+  <text x="835" y="313" class="label-small">V</text>
+  <path d="M800 325 H960 V360 H1010" class="flow" marker-end="url(#arrow)"/>
+
+  <!-- conv_state exchange -->
+  <ellipse cx="525" cy="380" rx="112" ry="40" class="box state"/>
+  <text x="525" y="380" class="label-small">conv_state</text>
+  <path d="M505 305 V340" class="flow" marker-end="url(#arrow)"/>
+  <path d="M545 340 V305" class="flow" marker-end="url(#arrow)"/>
+
+  <!-- Decay path -->
+  <path d="M160 530 H215" class="flow" marker-end="url(#arrow)"/>
+  <rect x="215" y="495" width="135" height="70" rx="5" class="box projection"/>
+  <text x="282.5" y="530" class="label-small">f_a_proj</text>
+  <path d="M350 530 H400" class="flow" marker-end="url(#arrow)"/>
+  <rect x="400" y="495" width="135" height="70" rx="5" class="box projection"/>
+  <text x="467.5" y="530" class="label-small">f_b_proj</text>
+  <path d="M535 530 H590" class="flow" marker-end="url(#arrow)"/>
+  <rect x="590" y="495" width="90" height="70" rx="5" class="box gate"/>
+  <text x="635" y="530" class="label">gk</text>
+  <path d="M680 530 H975 V500 H1010" class="flow" marker-end="url(#arrow)"/>
+
+  <!-- Delta-update strength path -->
+  <path d="M160 610 H215" class="flow" marker-end="url(#arrow)"/>
+  <rect x="215" y="575" width="135" height="70" rx="5" class="box projection"/>
+  <text x="282.5" y="610" class="label-small">b_proj</text>
+  <path d="M350 610 H400" class="flow" marker-end="url(#arrow)"/>
+  <rect x="400" y="575" width="135" height="70" rx="5" class="box compute"/>
+  <text x="467.5" y="610" class="label-small">Sigmoid</text>
+  <path d="M535 610 H590" class="flow" marker-end="url(#arrow)"/>
+  <rect x="590" y="575" width="90" height="70" rx="5" class="box gate"/>
+  <text x="635" y="610" class="label">β</text>
+  <path d="M680 610 H990 V570 H1010" class="flow" marker-end="url(#arrow)"/>
+
+  <!-- Output-gate path bypasses the recurrent core. -->
+  <path d="M160 690 H215" class="flow" marker-end="url(#arrow)"/>
+  <rect x="215" y="655" width="135" height="70" rx="5" class="box projection"/>
+  <text x="282.5" y="690" class="label-small">g_proj</text>
+  <path d="M350 690 H400" class="flow" marker-end="url(#arrow)"/>
+  <rect x="400" y="655" width="135" height="70" rx="5" class="box compute"/>
+  <text x="467.5" y="690" class="label-small">Sigmoid</text>
+  <path d="M535 690 H590" class="flow" marker-end="url(#arrow)"/>
+  <rect x="590" y="655" width="140" height="70" rx="5" class="box gate"/>
+  <text x="660" y="690" class="label-small">Output Gate</text>
+
+  <!-- KDA SSM State and core -->
+  <ellipse cx="1100" cy="125" rx="94" ry="36" class="box state"/>
+  <text x="1100" y="117" class="label-small">KDA SSM State</text>
+  <text x="1100" y="139" class="label-small">S</text>
+  <path d="M1080 161 V185" class="flow" marker-end="url(#arrow)"/>
+  <path d="M1120 185 V161" class="flow" marker-end="url(#arrow)"/>
+
+  <rect x="1010" y="185" width="180" height="435" rx="7" class="box gate"/>
+  <text x="1100" y="402.5" class="label">
+    <tspan x="1100" dy="-12">Recurrent</tspan>
+    <tspan x="1100" dy="25">KDA</tspan>
+  </text>
+
+  <!-- Main KDA output path -->
+  <path d="M1190 395 H1275" class="flow" marker-end="url(#arrow)"/>
+  <rect x="1275" y="360" width="120" height="70" rx="5" class="box compute"/>
+  <text x="1335" y="395" class="label-small">RMSNorm</text>
+  <path d="M1395 395 H1435" class="flow" marker-end="url(#arrow)"/>
+
+  <rect x="1435" y="360" width="105" height="70" rx="5" class="box gate"/>
+  <text x="1487.5" y="395" class="label">Mul</text>
+  <path d="M1540 395 H1580" class="flow" marker-end="url(#arrow)"/>
+
+  <rect x="1580" y="360" width="110" height="70" rx="5" class="box projection"/>
+  <text x="1635" y="395" class="label-small">o_proj</text>
+  <path d="M1690 395 H1715" class="flow" marker-end="url(#arrow)"/>
+
+  <rect x="1715" y="360" width="50" height="70" rx="5" class="box io"/>
+  <text x="1740" y="395" class="label">yₜ</text>
+
+  <!-- The output gate joins only at element-wise multiplication. -->
+  <path d="M730 690 H1487.5 V430" class="flow" marker-end="url(#arrow)"/>
+</svg>

@@ -87,7 +87,7 @@ graph TD
 - `get_block_sizes() -> Dict[str, int]`：返回每个 manager key 对应的 `block_size`。
 - `get_block_table_max_lens(max_model_len) -> Dict[str, int]`：返回每个 manager key 对应的 block table 最大宽度。
 - `format_usage() -> str`：返回**逐 manager key** 的 `used/total` 汇总字符串，例如 `"FullAttention:16:12/100,SlidingWindow:32:8/100"`；由 `Scheduler._log_step` 调用，用于在每步状态日志中暴露各 cache 分组的 KV 压力。
-- `get_contiguous_buf_infos() -> (data_ptrs, data_lens, item_lens, attn_types, block_sizes)`：把 paged-attention 管理的所有物理 cache tensor 扁平化导出，供 PD KV 传输使用——按 `layer_idx` 升序、再按层内 `cache` 原始定义序遍历，仅导出 `needs_block=True` 的 cache。返回五个等长 list：`data_ptrs`（每个 tensor 的 `data_ptr()`）、`data_lens`（每个 tensor 总字节数）、`item_lens`（每块字节数 = `block_size × num_head × dim × element_size`）、`attn_types`（每项的 manager key，用于在对端按 manager key 查 block id）、`block_sizes`（每项 cache 实际使用的 block size）。Prefill 与 Decode 各自独立调用，返回顺序由模型配置决定，两端必然对齐。
+- `get_contiguous_buf_infos() -> (data_ptrs, data_lens, item_lens, attn_types, block_sizes)`：把 paged-attention 管理的所有物理 cache tensor 扁平化导出，供 PD KV 传输使用——按 `layer_idx` 升序、再按层内 `cache` 原始定义序遍历，仅导出 `needs_block=True` 的 cache。返回五个等长 list：`data_ptrs`（每个 tensor 的 `data_ptr()`）、`data_lens`（每个 tensor 总字节数）、`item_lens`（每块字节数 = `block_size × num_head × dim × element_size`）、`attn_types`（每项的 manager key，用于在对端按 manager key 查 block id）、`block_sizes`（每项 cache 实际使用的 block size）。Prefill 与 Decode 各自独立调用，返回顺序由模型配置决定，两端必然对齐。`attn_type="Mamba"` 的 cache 暂不支持 PD 传输。
 
 其中 `allocate_slots` 的关键点是”两阶段处理”（具体实现可见：[块分配核心流程](#3-块分配核心流程allocate_slots)）：
 
@@ -401,12 +401,14 @@ graph TD
 
 ##### 4.2.2 构建 block_table 与 slot_mapping
 
-`prepare_block_tables()` 和 `prepare_slot_mapping()` 的输出均为字典结构，键为 `manager_key`，值为对应的 `block_tables / slot_mapping` 张量，即：
+`prepare_block_tables()` 和 `prepare_slot_mapping()` 均返回以 `manager_key` 为键的字典：
 
 - `block_tables[manager_key] = block_table_tensor`
 - `slot_mapping[manager_key] = slot_mapping_tensor`
 
 这种形式与多 cache 分组的设计一致，推理运行时可以按 `manager_key` 取出对应的 `block_table` 和 `slot_mapping`。`prepare_slot_mapping()` 会使用当前 manager 的 `block_size` 计算 `block_indices = position_ids // block_size` 和 `position_offsets = position_ids % block_size`，因此不同 manager 的 slot mapping 可以自然对应不同 block 粒度。
+
+`slot_mapping` 仅针对需要逐 token 写入寻址的 manager 构造。`attn_type="Mamba"` 的 manager 只构造 `block_table`（循环状态按整块寻址，没有 token 内偏移的概念）；`compress_ratio > 1` 的 manager 也会跳过 `slot_mapping` 构造。模型侧读取 `slot_mapping[manager_key]` 前应确认对应类型需要该条目，详见 5.1.1 节。
 
 ---
 
@@ -424,18 +426,29 @@ graph TD
 |-------------------|----------------|---------|
 | `FullAttention` | `FullAttentionManager` | 全注意力，cache 随序列增长线性追加 |
 | `SlidingWindow` | `SlidingWindowManager` | 滑动窗口注意力，支持过期块回收 |
+| `Mamba` | `MambaManager` | 线性注意力 / Mamba 类循环状态，每请求固定尺寸的整块状态，不随序列增长 |
+
+`Mamba` 类型与前两者有三点契约差异，模型侧接入时必须注意：
+
+1. **必须使用 `MambaCacheEntry` 而非 `CacheEntry`**，且只能用关键字参数构造。它用 `shape` 描述一整块状态的完整尾部形状（例如 conv_state 的 `[conv_dim, conv_kernel_size]`），`dim` / `num_head` 不使用；`shape` 合法性在构造时即校验。
+2. **没有 `slot_mapping` 条目**。循环状态直接由 `block_table` 寻址，`prepare_slot_mapping()` 不会为 `Mamba` 构造条目，模型侧取 `forward_metadata.slot_mapping[self.attn_type]` 会 KeyError。正确取法是 `forward_metadata.block_table[manager_key]`，形状为 `[batch_size, 1]`（prefill）或 `[batch_size, 1 + next_n]`（decode），按 `block_table[:, 0]` 取每个请求的状态块 id。
+3. **`next_n` 由模型填入 `MambaCacheEntry.next_n`**（取自 `infer_config.model_config.next_n`），框架据此预留 `1 + next_n` 个状态块；引擎会校验它与自身配置一致，不一致直接报错。
+
+当前限制：`Mamba` 尚不支持 PD 分离与 Context Parallel（`cp_size > 1`），两种场景均在初始化阶段直接报错。
 
 **检查位置**：[single_type_kv_cache_manager.py](../../executor/core/kv_cache/single_type_kv_cache_manager.py) 的 `ATTN_TYPE_MANAGER_MAP`：
 ```python
 ATTN_TYPE_MANAGER_MAP: Dict[str, Type[SingleTypeKVCacheManager]] = {
     "FullAttention": FullAttentionManager,
     "SlidingWindow": SlidingWindowManager,
+    "Mamba": MambaManager,
 }
 ```
 
 **判断逻辑**：
 - 若模型使用标准 MHA/MQA/GQA/MLA 等全注意力机制，使用 `"FullAttention"`
 - 若模型使用滑动窗口注意力（如 gpt-oss），使用 `"SlidingWindow"`，需额外设置 `sliding_window` 参数
+- 若模型使用线性注意力 / Mamba 类循环状态（conv_state、ssm_state 等每请求固定尺寸的状态），使用 `"Mamba"`，并改用 `MambaCacheEntry`
 - 若现有 `ATTN_TYPE_MANAGER_MAP` 不满足需求，参考步骤 3 新增 SingleTypeKVCacheManager 类
 
 
