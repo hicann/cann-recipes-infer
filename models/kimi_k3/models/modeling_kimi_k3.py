@@ -141,7 +141,7 @@ def _torch_chunk_kda(
 
     corrected_key = transition @ (g.exp() * k)
     corrected_value = transition @ v
-    state = initial_state.float()
+    state = initial_state
     output = torch.zeros_like(v)
     for index in range(chunk_count):
         q_i = q[:, :, index]
@@ -1112,11 +1112,10 @@ class KimiDeltaAttention(nn.Module):
                     )
                 ),
             ),
-            # KDA computes its state in FP32, then stores the BF16 layout
-            # required by the fused decode operator.
+            # Prefill & Decode operator share one FP32 state
             MambaCacheEntry(
                 cache_name="kda_recurrent_state",
-                dtype=torch.bfloat16,
+                dtype=torch.float32,
                 needs_block=True,
                 shape=[self.num_heads, self.head_dim, self.head_dim],
                 tensor_setter=(
@@ -1307,7 +1306,7 @@ class KimiDeltaAttention(nn.Module):
 
         Model tensors use ``[B,S,H,D]`` and are packed to the operator's TND
         layout. The resident state uses the ``[BlockNum,H,Dv,Dk]`` layout and
-        BF16 dtype required by the operator.
+        FP32 dtype Shared with Prefill.
         """
         batch, seq, num_heads, key_dim = query.shape
         value_dim = value.shape[-1]
