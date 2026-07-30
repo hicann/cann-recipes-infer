@@ -1628,7 +1628,8 @@ class HYV3Model(nn.Module):
         self.max_position_embeddings = 131072
         if infer_config is not None:
             self.max_position_embeddings = infer_config.data_config.input_truncated_len + \
-                infer_config.scheduler_config.max_new_tokens
+                infer_config.scheduler_config.max_new_tokens * (infer_config.model_config.next_n + 1) + \
+                infer_config.model_config.next_n
         # MTP needs the full-prompt hidden [T,H]; baseline (next_n=0) keeps last-token only.
         self.next_n = infer_config.model_config.next_n if infer_config is not None else 0
 
@@ -2320,7 +2321,8 @@ class HYV3ModelMTPLayer(HYV3Model):
         self.max_position_embeddings = 131072
         if infer_config is not None:
             self.max_position_embeddings = infer_config.data_config.input_truncated_len + \
-                infer_config.scheduler_config.max_new_tokens
+                infer_config.scheduler_config.max_new_tokens * (infer_config.model_config.next_n + 1) + \
+                infer_config.model_config.next_n
         self.embed_tp_size = infer_config.parallel_config.embed_tp_size
         self.attn_tp_size = infer_config.parallel_config.attn_tp_size
         self.attn_dp_size = infer_config.parallel_config.attn_dp_size
