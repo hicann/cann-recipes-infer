@@ -124,7 +124,7 @@ GE 图模式的典型特征包括：
 
 #### 2.3.2 npugraph_ex 图模式
 
-npugraph_ex 基于 npugraph capture & replay，核心思路是捕获一段稳定的 NPU 执行过程，并在后续 Decode 中低开销 replay，具体细节可参考 [npugraph_ex 后端](https://www.hiascend.com/document/detail/zh/Pytorch/2600/modthirdparty/torchairuseguide/docs/zh/npugraph_ex/basic/force_eager.md) 各文档。它的使用体验更接近 eager，模型代码中的 Stream / Event 等对象也更接近运行时显式对象。
+npugraph_ex 基于 npugraph capture & replay，核心思路是捕获一段稳定的 NPU 执行过程，并在后续 Decode 中低开销 replay，具体细节可参考 [npugraph_ex 后端](https://gitcode.com/Ascend/torchair/blob/26.0.0/docs/zh/npugraph_ex/npugraph_ex.md) 各文档。它的使用体验更接近 eager，模型代码中的 Stream / Event 等对象也更接近运行时显式对象。
 
 npugraph_ex 的典型特征包括：
 
@@ -158,7 +158,7 @@ npugraph_ex 的典型特征包括：
 
 ### 3.1 编译接口
 
-接口实现细节可对照 [框架图编译](../../executor/utils/graph_utils.py)，图编译前通常都需要一段通用准备：
+接口实现细节可对照 [框架图编译](../../../executor/utils/graph_utils.py)，图编译前通常都需要一段通用准备：
 
 ```python
 import torchair as tng
@@ -366,10 +366,11 @@ warm-up 阶段先封装好 `kv_len`、`actual_seq_lengths_*`、`position_ids` �
 实践中常用的调试方式包括：
 
 1. 打开重编译日志：
-出现重编译时打开相关日志，固定输入 shape、KV Cache 地址和常驻 buffer，观察重编译是否消失。
-```python
-torch._logging.set_logs(recompiles=True)
-```
+   出现重编译时打开相关日志，固定输入 shape、KV Cache 地址和常驻 buffer，观察重编译是否消失。
+
+   ```python
+   torch._logging.set_logs(recompiles=True)
+   ```
 
 2. 对比 eager / graph 输出，确认功能和精度一致。
 3. 分别测试普通编译和 `cache_compile`，区分图编译问题与缓存命中问题。
