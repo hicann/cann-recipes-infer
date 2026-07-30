@@ -178,16 +178,16 @@ modelscope download --model Tencent-Hunyuan/Hy3-FP8 --local_dir /data/models/Hy3
   混合精度的yaml文件没有上传至`amct`仓库，请用户在`amct_pytorch/configs/`路径下创建`mxfp_moe_w4a8_attn_w8a8.yaml`，文件配置如下：
   
    ```shell
-w_bits: 8
-a_bits: 8
+   w_bits: 8
+   a_bits: 8
 
-moe:
-  routed:
-    w_bits: 4
-    a_bits: 8
-  shared:
-    w_bits: 8
-    a_bits: 8
+   moe:
+     routed:
+       w_bits: 4
+       a_bits: 8
+     shared:
+       w_bits: 8
+       a_bits: 8
   ```
 
   权重转换拉起示例：
