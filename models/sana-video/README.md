@@ -209,9 +209,17 @@ echo "source $HOME/miniconda3/etc/profile.d/conda.sh" >> ~/.bashrc   # 永久生
 创建并激活 Python 环境：
 
 ```bash
-conda create -n sana python=3.10 -y
+conda create -n sana python=3.10
 conda activate sana
 ```
+
+推荐安装 aria2 以加速模型权重下载(可选)：
+
+```bash
+sudo apt-get install -y aria2
+```
+
+`infer_platform.sh` 检测到 `aria2c` 时会自动使用 hfd + aria2c 下载权重；未检测到时仍使用原来的 `hf download`。下载中断后重新执行脚本即可继续。
 
 ### 2. 修改 `infer_platform.sh` 中的两处路径
 
@@ -229,7 +237,7 @@ cd cann-recipes-infer/models/sana-video
 bash infer_platform.sh
 ```
 
-前置条件：已完成 §1（conda 环境已激活）。脚本本身会依次完成：source CANN 环境脚本 → 安装 torch / torch_npu → 合入上游 Sana 源码 → 安装项目依赖与 NPU mmcv → 通过 hf-mirror 下载权重 → 生成指向本地权重的临时 YAML → 调用 python 启动单卡推理。各步骤均幂等，已完成的环节会自动跳过。
+前置条件：已完成 §1（conda 环境已激活）。脚本本身会依次完成：source CANN 环境脚本 → 安装 torch / torch_npu → 合入上游 Sana 源码 → 安装项目依赖与 NPU mmcv → 通过 hf-mirror 下载权重 → 生成指向本地权重的临时 YAML → 调用 python 启动单卡推理。安装 aria2 后使用 hfd + aria2c 加速下载，否则自动回退到 `hf download`。各步骤均幂等，已完成的环节会自动跳过。
 
 说明：`infer_platform.sh` 不直接读取普通离线配置 `2b_480p_single.yaml`，而是读取 `2b_480p_single_platform.yaml` 作为平台模板，再按 `WEIGHTS_DIR` 生成临时 YAML。普通 `infer.sh` 与CANNLab一站式开发平台启动互不影响。
 

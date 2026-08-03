@@ -39,6 +39,8 @@ WORK_DIR=$(cd "$REPO_ROOT/.." &>/dev/null && pwd)
 SANA_DIR="$SCRIPT_PATH"
 DIT_PATH="$WEIGHTS_DIR/SANA-Video_2B_480p/checkpoints/SANA_Video_2B_480p.pth"
 VAE_PATH="$WEIGHTS_DIR/SANA-Video_2B_480p/vae/Wan2.1_VAE.pth"
+GEMMA_PATH="$WEIGHTS_DIR/gemma-2-2b-it"
+HFD_PATH="$WORK_DIR/hfd.sh"
 
 echo "[platform] source CANN env: $CANN_SET_ENV"
 [ -f "$CANN_SET_ENV" ] || die "CANN set_env.sh not found at $CANN_SET_ENV"
@@ -186,18 +188,38 @@ else
     python -c "import mmcv" || die "mmcv build completed but still not importable (see error above)"
 fi
 
-# 5. model weights (hf_download_or_fpath returns existing local path; only download missing files)
+# 5. model weights
 echo "[platform] checking model weights"
-if [ ! -f "$DIT_PATH" ]; then
-    hf download Efficient-Large-Model/SANA-Video_2B_480p checkpoints/SANA_Video_2B_480p.pth \
-        --local-dir "$WEIGHTS_DIR/SANA-Video_2B_480p" || die "DiT weights download failed"
-fi
-if [ ! -f "$VAE_PATH" ]; then
-    hf download Efficient-Large-Model/SANA-Video_2B_480p vae/Wan2.1_VAE.pth \
-        --local-dir "$WEIGHTS_DIR/SANA-Video_2B_480p" || die "VAE weights download failed"
-fi
-if [ ! -d "$GEMMA_CACHE" ]; then
-    hf download Efficient-Large-Model/gemma-2-2b-it || die "Gemma download failed"
+GEMMA_LOCAL_PATH=""
+if command -v aria2c &>/dev/null; then
+    echo "[platform] using hfd + aria2c for model weights"
+    [ -f "$HFD_PATH" ] || wget -O "$HFD_PATH" https://hf-mirror.com/hfd/hfd.sh || die "hfd.sh download failed"
+
+    if [ ! -f "$DIT_PATH" ] || [ ! -f "$VAE_PATH" ]; then
+        bash "$HFD_PATH" Efficient-Large-Model/SANA-Video_2B_480p --tool aria2c -x 8 \
+            --include "checkpoints/SANA_Video_2B_480p.pth" "vae/Wan2.1_VAE.pth" \
+            --local-dir "$WEIGHTS_DIR/SANA-Video_2B_480p" || die "DiT/VAE weights download failed"
+    fi
+    if [ ! -f "$GEMMA_PATH/model-00001-of-00002.safetensors" ] || \
+       [ ! -f "$GEMMA_PATH/model-00002-of-00002.safetensors" ]; then
+        bash "$HFD_PATH" Efficient-Large-Model/gemma-2-2b-it --tool aria2c -x 8 \
+            --exclude "gemma-2-2b-it.safetensors" "*.md" --local-dir "$GEMMA_PATH" \
+            || die "Gemma download failed"
+    fi
+    GEMMA_LOCAL_PATH="$GEMMA_PATH"
+else
+    echo "[platform] aria2c not found, using hf download"
+    if [ ! -f "$DIT_PATH" ]; then
+        hf download Efficient-Large-Model/SANA-Video_2B_480p checkpoints/SANA_Video_2B_480p.pth \
+            --local-dir "$WEIGHTS_DIR/SANA-Video_2B_480p" || die "DiT weights download failed"
+    fi
+    if [ ! -f "$VAE_PATH" ]; then
+        hf download Efficient-Large-Model/SANA-Video_2B_480p vae/Wan2.1_VAE.pth \
+            --local-dir "$WEIGHTS_DIR/SANA-Video_2B_480p" || die "VAE weights download failed"
+    fi
+    if [ ! -d "$GEMMA_CACHE" ]; then
+        hf download Efficient-Large-Model/gemma-2-2b-it || die "Gemma download failed"
+    fi
 fi
 
 # 6. generate a temporary YAML with local paths (upstream yaml stays pristine)
@@ -210,6 +232,8 @@ with open("$SANA_DIR/config/2b_480p_single_platform.yaml") as f:
 ma = cfg.setdefault("model_args", {})
 ma["model_path"] = "$DIT_PATH"
 ma["vae.vae_pretrained"] = "$VAE_PATH"
+if "$GEMMA_LOCAL_PATH":
+    ma["text_encoder.text_encoder_name"] = "$GEMMA_LOCAL_PATH"
 ma["sample_nums"] = 1
 with open("$TMP_YAML", "w") as f:
     yaml.safe_dump(cfg, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
