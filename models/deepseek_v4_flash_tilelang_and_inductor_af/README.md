@@ -132,10 +132,10 @@ for func in [hc_post_compiled, hc_post, hc_post_compiled_dynamic]:
 
 ```shell
 git clone https://gitcode.com/cann/cann-recipes-infer.git
-cd cann-recipes-infer-gptoss/models/deepseek_v4_flash_tilelang_and_inductor_af
+cd cann-recipes-infer/models/deepseek_v4_flash_tilelang_and_inductor_af
 ```
 
-后续示例命令均在 `cann-recipes-infer-gptoss/models/deepseek_v4_flash_tilelang_and_inductor_af/` 目录下执行。
+后续示例命令均在 `cann-recipes-infer/models/deepseek_v4_flash_tilelang_and_inductor_af/` 目录下执行。
 
 ## DeepSeek 模型下载与权重切分
 
