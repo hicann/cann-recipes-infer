@@ -55,7 +55,7 @@
 
 ### 2.4 SchedulerConfig (调度配置)
 控制请求调度器的策略。
-- `batch_size`: 全局总 Batch Size（默认 1）。
+- `batch_size`: 全局总 Batch Size（默认 1），batch_size 必须为 attn_dp_size 的整数倍。
 - `max_new_tokens`: 最大生成 token 数（默认 32）。
 - `max_prefill_tokens`: 单次 prefill batch 的最大 prompt token 预算（默认 0）。
   当设置为 0 时，框架默认按 `input_truncated_len * batch_size_per_dp_rank` 计算预算。

@@ -111,7 +111,7 @@ class FusedLayerNormModulate(nn.Module):
         self.dim = dim
         self.eps = eps
 
-    def forward(self, x, weight, shift):
+    def forward(self, x, scale, shift):
         r"""
         Args:
             x(Tensor)
