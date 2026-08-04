@@ -18,6 +18,8 @@ flowchart LR
     C2 --> D
 ```
 
+<div align="center">图 1　无数据依赖的两条分支可分别承载于两条 Stream</div>
+
 除了模型中原生结构支持多流并行外，也可以通过对模型计算过程的调整使得模型可以满足这种多流并行的要求，例如将输入数据切分为两 batch 使得可以多出两个并行计算分支（Dual batch overlap）。
 
 本文档介绍以算子粒度充分利用硬件资源进行并发执行的方式，这种并发在框架运行时层面通过多 Stream 编排实现，称为多流优化。下文将从 NPU 硬件和 Stream 机制等原理出发，再介绍如何在模型代码层面实现多流并行，最后给出已落地的多流优化案例。
@@ -54,7 +56,7 @@ NPU 上 Device 侧拥有多类可以独立调度的物理执行资源，而多 S
 
 Stream 是 Host 向 Device 下发任务的队列，同一 Stream 上的任务按入队顺序串行执行，Stream 之间的算子执行顺序由同步语句（如 Event，见下文）和调度器决定。Stream 本身承载调度上下文，算力来自下层物理资源单元。通常有两种方式进行划分 Stream：
 
-1. 将如第1章图中的 B/C 分支分别放在两条 Stream 上；
+1. 将如[§1 背景](#1-背景)图中的 B/C 分支分别放在两条 Stream 上；
 2. 按资源类型划分出两条 Stream，例如一条计算 Stream，一条通信 Stream，将图中的算子按类别分别划分到对应的 Stream，在两条 Stream 间加对应的 Event（见下文）。
 
 #### 2.1.3 Event
@@ -80,6 +82,8 @@ block-beta
   class a2,b2 cube
 ```
 
+<div align="center">图 2　不使用 Event 控制，耗时 110us</div>
+
 方案二：使用 Event 控制顺序，关键路径更短，耗时 100us。
 
 ```mermaid
@@ -96,6 +100,8 @@ block-beta
   class c1,c3,d1,d3 vector
   class c2,d2 cube
 ```
+
+<div align="center">图 3　使用 Event 控制顺序，耗时 100us</div>
 
 ### 2.2 并行的典型形态
 
@@ -121,6 +127,8 @@ block-beta
   class a0,a2,a4,b0,b3 vector
 ```
 
+<div align="center">图 4　Cube 与 Vector 算子交替编排在两条 Stream 上，使 Cube 单元保持忙碌</div>
+
 #### 2.2.2 同类计算池分核
 
 在很多场景中，算子对计算资源的利用效率不是很高，例如某个算子使用所有核计算时间为 $T$，使用 1/2 核的计算时间为 $\frac{3}{2} T$，那么两个相近的 Matmul 的计算时间从串行的 $2T$ 优化到各占一半核并行的 $\frac{3}{2} T$，优化了 25%。其主要原理是数据量比较小时，计算资源和带宽利用率不高，且算子启动开销占比较高，使用更多的核加速效果不明显（但不是不能加速，因此当没有可以并行分支时，最优策略任然可能是利用更多的核进行计算），引入并行的 Stream 可以提高资源利用率。
@@ -142,6 +150,8 @@ block-beta
   class a0,a1,a2 main
   style b0 fill:#70AD47,color:#fff,stroke:#385723
 ```
+
+<div align="center">图 5　同类计算池在两条并行 Stream 间分核</div>
 
 实际收益需要根据模型情况进行测试和调整：
 * 分核并行的方式能一定程度上提升算力的利用率，但在实际场景中也会有部分性能损失，如上图所示，分核后两条并行的 Stream 耗时不相同，而后续计算依赖两条 Stream 的结果，因此分给对应的 Stream 的核处于闲置状态，会抵消掉部分性能收益，严重情况下可能会导致没有收益甚至性能劣化；
@@ -171,7 +181,9 @@ block-beta
   class a1,b2,a3 parr
 ```
 
-默认情况下通信不占用通信资源，但有两种情况下通信算子会占用 Vector（见上文 `HCCL_OP_EXPANSION_MODE` 与通算融合算子），此时按大部分算子默认占用所有 AiCore 的情况，会导致两条 Stream 无法并行，可以按上一节所示的分核，给通信 Stream 分配部分 Vector 核，而计算 Stream 需要减去对应数量的 Vector 核。
+<div align="center">图 6　通信算子切至独立 Stream，与主流计算并发执行</div>
+
+默认情况下通信不占用计算资源，但有两种情况下通信算子会占用 Vector（见上文 `HCCL_OP_EXPANSION_MODE` 与通算融合算子），此时按大部分算子默认占用所有 AiCore 的情况，会导致两条 Stream 无法并行，可以按上一节所示的分核，给通信 Stream 分配部分 Vector 核，而计算 Stream 需要减去对应数量的 Vector 核。
 通常模型里的计算与通信算子之间有数据依赖，因此只能串行，但可以按 DBO(Dual Batch Overlap) 的方式拆分出两个并行分支，这两个分支中的通信和计算没有数据依赖，可以并行执行。如下所示，将 Moe 模块拆分出两个 micro-batch 的前后通信部分与另一个 batch 的计算部分并行执行。
 
 ```mermaid
@@ -183,13 +195,13 @@ block-beta
   classDef hdr fill:#eee,stroke:#999,color:#000
   classDef main fill:#5B9BD5,color:#fff,stroke:#1F4E79
   classDef parr fill:#70AD47,color:#fff,stroke:#385723
-  classDef sync fill:#ED7D31,color:#fff,stroke:#7C390F
 
   class s0,s1 hdr
   class a1,a3,b1,b3 main
   class a2,a4,b2,b4 parr
-  class a5 sync
 ```
+
+<div align="center">图 7　DBO：一个 micro-batch 的通信与另一个 micro-batch 的计算并行</div>
 
 DBO 的性能收益主要来自通信和计算的并行，充分利用了硬件资源，但拆分也会引入开销：对深度神经网络加速芯片，单个算子处理的数据量越大，其相关的硬件使用效率越高，带宽效率、指令效率都比较高，调度、启动开销占比比较小，反之一份数据拆分成多份计算时间一般是负面的，这部分如果将并行的性能收益抵消了，整体没有收益甚至可能会劣化。例如 Decode 一般是访存瓶颈（weight 加载），DBO 切分的两 batch 加载的 weight 都是全量的，从而导致两份 batch 的计算时间近乎翻倍，因此 DBO 一般主要用在 Prefill 优化上。
 
@@ -199,7 +211,7 @@ DBO 的性能收益主要来自通信和计算的并行，充分利用了硬件�
 
 三种模式通过 `exe_mode` 配置（取值 `eager` / `ge_graph` / `npugraph_ex`）。
 
-下文以第 1 章中 A → (B 分支, C 分支) → D 的 DAG 为统一例子。主流执行 A → C1 → C2，副流并行执行 B1 → B2；`op_D` 启动前需要等待两条流的结果汇合。三种实现方式的代码不同，但执行时序的语义一致：
+下文以[§1 背景](#1-背景)中 A → (B 分支, C 分支) → D 的 DAG 为统一例子。主流执行 A → C1 → C2，副流并行执行 B1 → B2；`op_D` 启动前需要等待两条流的结果汇合。三种实现方式的代码不同，但执行时序的语义一致：
 
 ```mermaid
 block-beta
@@ -220,6 +232,8 @@ block-beta
   class b1,b2 parr
   class w sync
 ```
+
+<div align="center">图 8　三种实现方式共用的执行时序</div>
 
 图中 `wait` 块在 eager / npugraph_ex 下表现为代码中的 `wait_event` 调用，在主流上等待副流的执行结束，在 ge_graph 下由编译器从 `out_B2` 的数据依赖自动插入。
 
@@ -375,7 +389,9 @@ flowchart LR
     Combine --> Output["hidden_states_out"]
 ```
 
-Routed 与 Shared 之间没有数据依赖，对应 §2.2.1 Cube↔Vector 互补的并行方式。
+<div align="center">图 9　DeepSeek-R1 MoE 层：路由专家与共享专家无数据依赖</div>
+
+Routed 与 Shared 之间没有数据依赖，对应[§2.2.1 Cube 与 Vector 互补](#221-cube-与-vector-互补)的并行方式。
 
 #### 4.1.2 Decode 阶段：共享专家、路由专家并行
 
@@ -403,6 +419,8 @@ block-beta
   class gmm,gup,dp cube
   class disp,comb comm
 ```
+
+<div align="center">图 10　Decode 阶段：共享专家三段与路由专家三段逐段错开</div>
 
 颜色按资源类型：蓝 = Vector、绿 = Cube、橙 = HCCL 通信。三段并行对各自的资源互补关系：
 
@@ -441,6 +459,8 @@ block-beta
   class a1,l1,sh1,e1,d1,c1 mb1c
 ```
 
+<div align="center">图 11　Prefill 阶段：mb0 / mb1 在计算流与通信流上的 micro-batch 流水</div>
+
 颜色按 micro-batch 分：蓝 = mb0、绿 = mb1。`L0`/`L1` 是 post_attention_layernorm + gate_init_routing，`S0`/`S1` 是 shared expert，`fin` 是 finalize_routing。
 
 跨层覆盖：上一层的 mb1 combine 在下一层入口触发 mb1 finalize_routing，与下一层 mb0 attn 并行，使 mb1 combine 也被掩盖。
@@ -448,7 +468,7 @@ block-beta
 
 ### 4.2 LongCat-Flash：同类计算池分核 + 跨节点通信 overlap
 
-LongCat-Flash 每层包含两段：第一段是单条 attention，第二段把 **dense → 第二个 attention → dense** 与 **shortcut MoE** 拆成两条并行路径。两条并行路径均 Cube 占优，需 `limit_core_num` 切分核数（§2.2.2 同类计算池分核）。AFD 部署下副流的 shortcut MoE 换为跨节点 Send/Recv（§2.2.5 跨节点通信 overlap）。
+LongCat-Flash 每层包含两段：第一段是单条 attention，第二段把 **dense → 第二个 attention → dense** 与 **shortcut MoE** 拆成两条并行路径。两条并行路径均 Cube 占优，需 `limit_core_num` 切分核数（[§2.2.2 同类计算池分核](#222-同类计算池分核)）。AFD 部署下副流的 shortcut MoE 换为跨节点 Send/Recv，该通信与主流计算并行（[§2.2.3 计算与通信互补](#223-计算与通信互补)）。
 
 #### 4.2.1 关键结构
 
@@ -466,7 +486,9 @@ flowchart LR
     Add --> Out["hidden_states_out"]
 ```
 
-第一段 attention 完成后，主流的 `dense[0] → attn[1] → dense[1]` 与副流的 shortcut MoE 之间无数据依赖，构成 §2.2.2 同类计算池分核的典型场景。
+<div align="center">图 12　LongCat-Flash 每层结构：两条 Cube 占优路径在 Add 处汇合</div>
+
+第一段 attention 完成后，主流的 `dense[0] → attn[1] → dense[1]` 与副流的 shortcut MoE 之间无数据依赖，构成[§2.2.2 同类计算池分核](#222-同类计算池分核)的典型场景。
 
 #### 4.2.2 多流编排
 
@@ -492,3 +514,5 @@ block-beta
   class moe parr
   class ln,add sync
 ```
+
+<div align="center">图 13　LongCat-Flash 多流编排，两条路径间分核</div>

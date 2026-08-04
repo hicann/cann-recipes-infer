@@ -62,7 +62,7 @@ In small-batch Decode workloads, the number of input tokens is low and the compu
 
 ### 2.2 Multi-Stream Asynchronous Transfer
 
-Prefetch requires a multi-stream mechanism to provide a benefit. On an NPU, the Host dispatches tasks to the Device through Streams. Tasks in one Stream execute in order, while tasks in different Streams can be scheduled concurrently as long as their dependencies are satisfied. Multi-stream optimization exploits this behavior by placing computation, communication, or data movement on different Streams so that they overlap and part of the non-critical-path latency is hidden. For the basic concepts, see [NPU Multi-Stream Principles (Chinese)](../zh/multi_stream_principles.md).
+Prefetch requires a multi-stream mechanism to provide a benefit. On an NPU, the Host dispatches tasks to the Device through Streams. Tasks in one Stream execute in order, while tasks in different Streams can be scheduled concurrently as long as their dependencies are satisfied. Multi-stream optimization exploits this behavior by placing computation, communication, or data movement on different Streams so that they overlap and part of the non-critical-path latency is hidden. For the basic concepts, see [NPU Multi-Stream Principles](./multi_stream_principles.md).
 
 The key role of `torch_npu.npu_prefetch` is to execute movement of target weights on a dedicated prefetch stream. After model code obtains a dependency Tensor on the main execution stream, it calls `torch_npu.npu_prefetch(weight, depend, size, offset)` to initiate prefetch. The runtime uses `depend` to establish synchronization, ensuring that prefetch does not begin before the dependency Tensor is produced while allowing the main execution stream to continue with subsequent operators.
 

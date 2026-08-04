@@ -335,7 +335,7 @@ In `npugraph_ex` mode, the model is closer to eager execution semantics and comm
 
 ### 4.2 Combining Graph Mode with Enhancement Features
 
-Graph mode is usually not an isolated optimization switch. It is commonly combined with cached compilation, static kernels, multi-stream execution ([NPU Multi-Stream Principles (Chinese)](../zh/multi_stream_principles.md)), prefetching ([NPU Prefetch Principles](./prefetch_principles.md)), SuperKernel ([NPU SuperKernel Principles (Chinese)](../zh/super_kernel.md)), and other capabilities. The following order is recommended:
+Graph mode is usually not an isolated optimization switch. It is commonly combined with cached compilation, static kernels, multi-stream execution ([NPU Multi-Stream Principles](./multi_stream_principles.md)), prefetching ([NPU Prefetch Principles](./prefetch_principles.md)), SuperKernel ([NPU SuperKernel Principles (Chinese)](../zh/super_kernel.md)), and other capabilities. The following order is recommended:
 
 1. First make eager mode work and validate functionality and accuracy.
 2. Enable graph mode and eliminate graph breaks and recompilation.
