@@ -166,7 +166,7 @@ for k, v in env_vars.items():
     # DiT weight resolution. Without this auto-export, users must specify model-base twice
     # (once in model_args, once in env_vars) for VAE / text encoders to find local weights.
     # Only triggers when MODEL_BASE is not already exported (yaml env_vars takes precedence).
-    if [ -z "${MODEL_BASE}" ]; then
+    if [ -z "${MODEL_BASE:-}" ]; then
         AUTO_MODEL_BASE=$(python3 -c "
 import yaml
 cfg = yaml.safe_load(open('$YAML')) or {}

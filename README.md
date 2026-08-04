@@ -21,6 +21,7 @@
 
 ## 📰 最新动态
 
+- [2026/07] daVinci-MagiHuman模型在昇腾Atlas A2/A3系列上已支持推理部署
 - [2026/07] Kimi K3 模型在昇腾 950PR/DT 系列上已 **0day 支持推理部署**
 - [2026/07] Hy3 模型在 Atlas A3 系列和昇腾 950PR/DT 系列上已 **0day 支持推理部署**
 - [2026/06] GLM-5.2模型在昇腾Atlas A3系列上已支持推理部署
@@ -148,6 +149,7 @@ bash infer.sh
 
 | 模型实践 | 简介 |
 |------|------|
+| [daVinci-MagiHuman](models/davinci-magihuman/README.md)                     |基于Transformers库，在Atlas A2/A3环境中完成daVinci-MagiHuman模型部署，使能融合算子等优化特性。
 | [Kimi-K3](models/kimi_k3/README.md)                     |基于Transformers库，在昇腾950PR/DT环境中完成Kimi-K3混合注意力MoE模型的推理部署，KDA接入框架Mamba Cache，Routed Expert采用原生MXFP4权重与动态MXFP8激活，使能图模式编译与多流并行等优化特性。
 | [GLM-5.2](models/glm_5_2/README.md)                     |基于Transformers库，沿用 DSA + MoE + MTP 结构，新增 IndexShare（跨层 top-k 复用），支持 W8A8 量化与 KV Offload 长序列部署。
 | [DeepSeek-V4](models/deepseek_v4/README.md)             |支持Atlas A3和950PR/DT多代际昇腾芯片，兼具1M长序列推理能力与超低交互时延表现，为DeepSeek模型支持Agentic应用提供计算底座，满足千行百业灵活要求。
