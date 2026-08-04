@@ -24,9 +24,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch_npu
+from packaging import version
 from einops import rearrange
 
-_npu_available = torch.npu.is_available() and torch_npu.__version__ >= "2.6.0"
+_npu_available = torch.npu.is_available() and version.parse(torch_npu.__version__) >= version.parse("2.6.0")
 
 
 def patch_rms_norm() -> None:
