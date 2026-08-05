@@ -29,7 +29,7 @@
 
 ## 3. Packed Sequence
 
-- [ ] 验证在多 batch 输入（batch_size_per_dp_rank > 1）且序列不等长的场景下，模型功能和吐字精度正常。
+- [ ] 参考 [Packed Sequence 机制设计文档](../design/packed_sequence_design.md)，并验证在多请求 batch（`batch_size_per_dp_rank > 1`）且序列不等长的场景下，模型功能和输出精度正常。
 
 ## 4. npugraph_ex 图模式优化
 

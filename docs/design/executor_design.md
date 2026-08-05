@@ -6,6 +6,7 @@
 2. **online 推理**：Client-Server 服务模式，客户端通过 HTTP 发起请求并实时拿到结果。参考开源框架的简易在线功能，方便用 evalscope 等评测工具做精度评测；以 PD 分离的方式支持 Prefill / Decode 各自选用最优并行策略；保证基础功能，不做流程相关的性能优化。模型需按 [KV Cache 管理](kv_cache_design.md) 适配（offline 另提供非 KV Cache 管理机制）。
 
 本文档介绍关键模块和主要流程、逻辑，细节专题见以下文档：
+- [Packed Sequence 机制](packed_sequence_design.md)
 - [KV Cache 管理](kv_cache_design.md)
 - [MTP 投机采样执行流程](mtp_design.md)
 - [在线推理（PD 分离）执行机制](online_inference_design.md)
@@ -374,8 +375,7 @@ model.forward(input_ids, position_ids, forward_metadata,  ← ModelWorker.infere
               slot_mapping, block_table, ...)              eager 或图模式（model_compiled）
     │
     ▼
-logits [TotalTokens, vocab]                            （prefill 场景由 _sample_tokens 内部按
-                                                         actual_seq_lengths 取每请求最后位置）
+logits [batch_size, 1, vocab_size]                     ← Prefill 由模型内部按 actual_seq_lengths_cu_q - 1 取每请求最后位置后计算 lm_head
     │
     ▼
 next_tokens [num_requests]                              ← ExecutionEngine._sample_tokens()：argmax
@@ -535,6 +535,6 @@ evalscope eval \
 |------|----------|
 | 通信域管理 | 模型通过 `CommManager.register_group()` 声明所需 HCCL 通信域及建域配置；`CommManager` 统一处理通信域创建与物理复用，维护通信域对象、组内 rank 和 HCCL comm name等信息，并提供强制独立建域能力 |
 | Paged KV cache | `KVCacheManager` 按 `cache_info` 申请块；attention forward 按 `block_table` / `slot_mapping` 索引 |
-| Packed Sequence | 唯一输入布局：`Batch.input_ids` 始终为 `[TotalTokens]` 一维
+| Packed Sequence | `Batch` 按请求顺序组织有效 token；`ExecutionEngine` 构造与 token 对齐的 `position_ids`，并通过 `ForwardMetaData` 提供请求长度边界和可选 KV Cache 索引，详见 [Packed Sequence 机制](packed_sequence_design.md) |
 | 图编译 | `ModelConfig.exe_mode ∈ {ge_graph, npugraph_ex}` 开启；`ExecutionEngine.warm_up()` 在 dummy prefill 后调用 `compile_model()`；模型需保证输入 shape 静态 |
 | Profiler | `ModelConfig.enable_profiler=True` 开启；`ProfilerManager` 自动插入 profiling 桩 |
