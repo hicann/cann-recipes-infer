@@ -105,9 +105,14 @@ class Gemma4RotaryEmbedding(nn.Module):
         full_dim = config.global_head_dim
         rotary_dim = int(full_dim * partial_rotary_factor)
         self.rotary_dim_full = rotary_dim
+        # Gemma4 full attention uses "proportional" RoPE.  The number of
+        # rotated channels is controlled by partial_rotary_factor, but the
+        # frequency exponent is normalized by the complete global head
+        # dimension (matching transformers' proportional RoPE definition).
+        full_factor = full_params.get("factor", 1.0)
         inv_freq_full = 1.0 / (
-            full_theta ** (torch.arange(0, rotary_dim, 2, dtype=torch.float32, device=device) / rotary_dim)
-        )
+            full_theta ** (torch.arange(0, rotary_dim, 2, dtype=torch.float32, device=device) / full_dim)
+        ) / full_factor
 
         # Precompute cos/sin to avoid .item() in graph mode.
         cos_sliding, sin_sliding = self._compute_cos_sin(
@@ -185,8 +190,7 @@ class Gemma4MLP(nn.Module):
         self.act_fn = ACT2FN[config.hidden_activation]
 
     def forward(self, x):
-        # npu_fast_gelu == gelu(approximate='tanh'), graph-safe.
-        return self.down_proj(torch_npu.npu_fast_gelu(self.gate_proj(x)) * self.up_proj(x))
+        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
 
 # ---------------------------------------------------------------------------
@@ -245,10 +249,16 @@ class _GegluMoEMethod(QuantizeMethodBase):
             group_list_type=group_list_type, split_item=3,
         )[0]
         if is_prefill or not self.use_manual_geglu:
-            mm1_mm3, _ = torch_npu.npu_geglu(mm1_mm3, -1, 1)
+            # Checkpoint gate_up_proj is packed as [gate | up].  npu_geglu
+            # defaults to activate_left=False (activating the right half),
+            # so request the left/gate half explicitly to match
+            # gelu_pytorch_tanh(gate) * up.
+            mm1_mm3, _ = torch_npu.npu_geglu(
+                mm1_mm3, dim=-1, approximate=1, activate_left=True,
+            )
         else:
             gate, up = mm1_mm3.chunk(2, dim=-1)
-            mm1_mm3 = torch_npu.npu_fast_gelu(gate) * up
+            mm1_mm3 = torch.nn.functional.gelu(gate, approximate="tanh") * up
         out = torch_npu.npu_grouped_matmul(
             [mm1_mm3], [layer.w2_weight],
             group_list=expert_tokens, group_type=0,
@@ -520,6 +530,14 @@ class Gemma4Attention(nn.Module):
         self.num_kv_groups = self.num_heads // self.num_kv_heads
         self.use_k_eq_v = config.attention_k_eq_v and not self.is_sliding
         self.sliding_window = config.sliding_window if self.is_sliding else None
+        self.rotary_dim_full = (
+            int(
+                self.head_dim
+                * config.rope_parameters["full_attention"].get("partial_rotary_factor", 0.25)
+            )
+            if not self.is_sliding
+            else 0
+        )
 
         self.q_proj = nn.Linear(config.hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias)
         self.k_proj = nn.Linear(config.hidden_size, self.num_kv_heads * self.head_dim, bias=config.attention_bias)
@@ -549,6 +567,7 @@ class Gemma4Attention(nn.Module):
                 dim=self.head_dim,
                 num_head=self.num_kv_heads,
                 dtype=cache_dtype,
+                block_size=self.block_size,
                 needs_block=True,
                 tensor_setter=lambda tensor, layer=self: setattr(layer, "k_cache", tensor),
                 sliding_window=self.sliding_window if self.sliding_window else None,
@@ -559,6 +578,7 @@ class Gemma4Attention(nn.Module):
                 dim=self.head_dim,
                 num_head=self.num_kv_heads,
                 dtype=cache_dtype,
+                block_size=self.block_size,
                 needs_block=True,
                 tensor_setter=lambda tensor, layer=self: setattr(layer, "v_cache", tensor),
                 sliding_window=self.sliding_window if self.sliding_window else None,
@@ -621,7 +641,8 @@ class Gemma4Attention(nn.Module):
 
         # Sliding: full head_dim fused rotate-half via npu_rotary_mul.
         # 3D TND → 4D BSND view (zero-copy) — npu_rotary_mul requires 4D in graph mode.
-        # Full: partial rotary_dim via npu_apply_rotary_pos_emb on 3D TND.
+        # Full proportional RoPE pairs the rotated quarter across the two
+        # halves of the complete head.
         cos, sin = cos_sin
         if self.is_sliding:
             # npu_rotary_mul 需 4D 输入，按 (batch_size, seq_len) reshape，假设同批次内
@@ -638,17 +659,44 @@ class Gemma4Attention(nn.Module):
             query_states = q4.view(q_len, self.num_heads, self.head_dim)
             key_states = k4.view(q_len, self.num_kv_heads, self.head_dim)
         else:
-            rotary_dim = cos.shape[-1]
-            q_rot = query_states[..., :rotary_dim].contiguous()
-            q_pass = query_states[..., rotary_dim:].contiguous()
-            k_rot = key_states[..., :rotary_dim].contiguous()
-            k_pass = key_states[..., rotary_dim:].contiguous()
+            pair_dim = self.rotary_dim_full // 2
+            half_dim = self.head_dim // 2
+            q_rot = torch.cat(
+                [
+                    query_states[..., :pair_dim],
+                    query_states[..., half_dim:half_dim + pair_dim],
+                ],
+                dim=-1,
+            ).contiguous()
+            k_rot = torch.cat(
+                [
+                    key_states[..., :pair_dim],
+                    key_states[..., half_dim:half_dim + pair_dim],
+                ],
+                dim=-1,
+            ).contiguous()
             q_rot, k_rot = torch_npu.npu_apply_rotary_pos_emb(
                 q_rot, k_rot, cos, sin, layout="TND",
             )
-            query_states = torch.cat([q_rot, q_pass], dim=-1)
-            key_states = torch.cat([k_rot, k_pass], dim=-1)
+            query_states = torch.cat(
+                [
+                    q_rot[..., :pair_dim],
+                    query_states[..., pair_dim:half_dim],
+                    q_rot[..., pair_dim:],
+                    query_states[..., half_dim + pair_dim:],
+                ],
+                dim=-1,
+            )
 
+            key_states = torch.cat(
+                [
+                    k_rot[..., :pair_dim],
+                    key_states[..., pair_dim:half_dim],
+                    k_rot[..., pair_dim:],
+                    key_states[..., half_dim + pair_dim:],
+                ],
+                dim=-1,
+            )
         attention_mask = forward_metadata.attention_mask
 
         if not (self.k_cache.numel() and self.v_cache.numel()):
@@ -726,10 +774,11 @@ class Gemma4Attention(nn.Module):
         return attn_output.reshape(inputs.q_len, self.num_heads * self.head_dim)
 
     def _attn_bnsd_full(self, inputs: _AttnInputs):
-        """BNSD + FA v2 + PA for full layers (head_dim=512).
+        """FA v2 + paged attention for full layers (head_dim=512).
 
-        TND non-MLA rejects D=512; BNSD has no D cap. Q transposes to
-        [B,N,S,D]; KV cache uses non-contig BNBD view [bn, N, bs, D].
+        Prefill runs BNSD; decode reads the paged cache as a contiguous BSH
+        view of its native BnBsND [block_num, block_size, N*D] layout, as
+        FIA v2 requires contiguous key/value.
         """
         is_prefill = inputs.is_prefill
         forward_metadata = inputs.forward_metadata
@@ -743,13 +792,13 @@ class Gemma4Attention(nn.Module):
             per_batch_kv = forward_metadata.actual_seq_lengths_kv
         batch_size = forward_metadata.actual_seq_lengths_cu_q.shape[0]
 
-        # BNSD reshape 同样假设同批次内各请求等长（同 sliding 分支）；变长 batch 暂不支持。
+        # Assumes equal per-request length within a batch; varlen batch unsupported.
         seq_len = inputs.q_len // batch_size
-        q_bnsd = inputs.query.view(
-            batch_size, seq_len, self.num_heads, self.head_dim,
-        ).transpose(1, 2).contiguous()
 
         if is_prefill:
+            q_bnsd = inputs.query.view(
+                batch_size, seq_len, self.num_heads, self.head_dim,
+            ).transpose(1, 2).contiguous()
             k_bnsd = inputs.key.view(
                 batch_size, seq_len, self.num_kv_heads, self.head_dim,
             ).transpose(1, 2).contiguous()
@@ -770,16 +819,21 @@ class Gemma4Attention(nn.Module):
                 actual_seq_kvlen=per_batch_q,
             )
             self._update_cache(inputs.slot_mapping, inputs.key, inputs.value)
+            attn_output = attn_output.transpose(1, 2).contiguous()
         else:
             self._update_cache(inputs.slot_mapping, inputs.key, inputs.value)
-            k_cache_bnbd = self.k_cache.transpose(1, 2)
-            v_cache_bnbd = self.v_cache.transpose(1, 2)
+            # Contiguous BSH view of the paged cache; FIA v2 requires contiguous key/value.
+            q_bsh = inputs.query.reshape(
+                batch_size, seq_len, self.num_heads * self.head_dim,
+            )
             attn_output, _ = self._fa_ops_for(is_prefill).npu_fused_infer_attention_score_v2(
-                q_bnsd, k_cache_bnbd, v_cache_bnbd,
+                q_bsh,
+                self.k_cache.view(*self.k_cache.shape[:2], -1),
+                self.v_cache.view(*self.v_cache.shape[:2], -1),
                 num_query_heads=self.num_heads,
                 num_key_value_heads=self.num_kv_heads,
                 softmax_scale=self.scale_fa,
-                input_layout="BNSD",
+                input_layout="BSH",
                 sparse_mode=0,
                 pre_tokens=pre_tokens,
                 next_tokens=0,
@@ -790,7 +844,6 @@ class Gemma4Attention(nn.Module):
                 block_size=self.block_size,
             )
 
-        attn_output = attn_output.transpose(1, 2).contiguous()
         return attn_output.reshape(inputs.q_len, self.num_heads * self.head_dim)
 
     def _update_cache(self, slot_mapping, key_states, value_states):
@@ -1139,7 +1192,6 @@ class Gemma4ForCausalLM(nn.Module):
             )
         return ModelCacheInfo(
             num_layers=len(layer_infos),
-            block_size=self.block_size,
             layer_infos=layer_infos,
         )
 
