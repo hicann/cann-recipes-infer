@@ -190,16 +190,24 @@ DIT-Cache作为扩散模型推理加速的缓存框架，通过复用/预测已�
 
 [TeaCache](https://liewfeng.github.io/TeaCache/) 利用模型输入与输出的强相关性，通过Timestep Emebdding（输入）来估计输出差异：先利用该输入粗估输出变化，再通过多项式拟合修正缩放偏差，最终以累积差异作为判断标准，动态决定是否复用上一步被Cache的输出，避免冗余计算。由于WAN2.2具有CFG串行的特点，因此本项目采用teacache官方实现的cond/uncond分别管理的 [TeaCache](https://github.com/ali-vilab/TeaCache/tree/main/TeaCache4Wan2.1)。在本代码中详情见[`module/dit_cache/cache_method.py`](../../../module/dit_cache/cache_method.py)。
 
-**启动方式：** Dit-Cache 配置已收敛到启动 YAML 的 `dit_cache` 段。仓库在 `models/wan2.2-i2v/config/` 下预置了 `14b_single_fbcache.yaml` / `14b_single_teacache.yaml` 两份配置，切换 `infer.sh` 中的 `YAML_FILE_NAME` 即可启用对应策略。参数示例：
+**启动方式：** Dit-Cache 配置已收敛到启动 YAML 的 `dit_cache` 段。单卡启用 Dit-Cache 时，将 `infer.sh` 中的 `YAML_FILE_NAME` 设置为`14b_single.yaml`，然后通过 `dit_cache.method` 选择 `FBCache` 或 `TeaCache`。当前 wan2.2-i2v 多卡路径与 Dit-Cache 不兼容，`world_size` > 1 时框架会自动回退到 NoCache 并打印提示。
+
+以 TeaCache 为例：
 ```yaml
 dit_cache:
   method: "TeaCache"                # NoCache / FBCache / TeaCache
-  enable_separate_cfg: true         # CFG 分离开关，true 时 cond/uncond 分开管理
-  params:                           # 仅需覆盖的键；其余沿用 DEFAULT_CACHE_CONFIG
-    rel_l1_thresh: 0.1              # TeaCache 阈值，越大跳越多，精度损失越大
+  enable_separate_cfg: true         # CFG 分离开关，true 时 cond/uncond 各自维护缓存状态
+  params:                           # 仅填写需覆盖的参数；其余沿用 DEFAULT_CACHE_CONFIG
+    rel_l1_thresh: 0.15              # 示例覆盖值；内置默认值 0.15，越大缓存复用越多、精度损失越大
     coefficients: [733.226126, -401.131952, 67.5869174, -3.149879, 0.0961237896]
-    warmup: 2                       # 前 N 步强制完整计算
+    warmup: 2                       # 前 N 步与最后 N 步强制完整计算，不进行缓存判定
 ```
+
+infer.sh 配置示例：
+```bash
+export YAML_FILE_NAME=14b_single.yaml
+```
+
 `mm_function.sh` 在拉起时会将该 YAML 作为 `--cache_config` 路径传给 `generate.py`，由 `module/dit_cache/cache_method.py` 的 `load_cache_config()` 解析 `dit_cache` 段并合并内置默认值。各方法完整默认值见 `module/dit_cache/cache_method.py:DEFAULT_CACHE_CONFIG`，也可参考 [多模态推理统一拉起设计](../../design/mm_inference_design.md) §5。
 
 - **框架位置：** 使用 `module/dit_cache/` 作为自定义库，在模型 forward 处导入，具体如下：
