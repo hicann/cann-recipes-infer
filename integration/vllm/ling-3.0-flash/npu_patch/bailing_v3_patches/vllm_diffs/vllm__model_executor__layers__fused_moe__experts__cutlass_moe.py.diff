@@ -1,0 +1,104 @@
+diff --git a/vllm/model_executor/layers/fused_moe/experts/cutlass_moe.py b/vllm/model_executor/layers/fused_moe/experts/cutlass_moe.py
+index fdd802e7da..ad6cd6d009 100644
+--- a/vllm/model_executor/layers/fused_moe/experts/cutlass_moe.py
++++ b/vllm/model_executor/layers/fused_moe/experts/cutlass_moe.py
+@@ -75,6 +75,7 @@ def run_cutlass_moe_fp8(
+     per_out_ch: bool,
+     use_batched_format: bool,
+     topk_weights: torch.Tensor | None,
++    gemm1_clamp_limit: float | None,
+ ):
+     a1q = hidden_states
+ 
+@@ -229,7 +230,7 @@ def run_cutlass_moe_fp8(
+         per_out_ch,
+     )
+ 
+-    apply_moe_activation(activation, act_out, mm1_out)
++    apply_moe_activation(activation, act_out, mm1_out, limit=gemm1_clamp_limit)
+ 
+     a2q, a2q_scale = ops.scaled_fp8_quant(
+         act_out, a2_scale, use_per_token_if_dynamic=per_act_token, output=quant_out
+@@ -381,6 +382,7 @@ class CutlassExpertsFp8Base(mk.FusedMoEExpertsModular):
+             self.per_out_ch_quant,
+             use_batched_format,
+             topk_weights,
++            self.moe_config.gemm1_clamp_limit,
+         )
+ 
+ 
+@@ -501,6 +503,7 @@ def run_cutlass_moe_fp4(
+     k: int,
+     e: int,
+     device: torch.device,
++    gemm1_clamp_limit: float | None,
+     apply_router_weight_on_input: bool = False,
+ ) -> None:
+     """
+@@ -631,7 +634,7 @@ def run_cutlass_moe_fp4(
+             c1, a2_gscale, expert_offsets, blockscale_offsets, num_topk
+         )
+     else:
+-        apply_moe_activation(activation, c2, c1)
++        apply_moe_activation(activation, c2, c1, limit=gemm1_clamp_limit)
+         int_fp4, int_blockscale = ops.scaled_fp4_experts_quant(
+             c2, a2_gscale, expert_offsets, blockscale_offsets, num_topk
+         )
+@@ -793,6 +796,7 @@ class CutlassExpertsFp4(mk.FusedMoEExpertsModular):
+             k=k,
+             e=e,
+             device=hidden_states.device,
++            gemm1_clamp_limit=self.moe_config.gemm1_clamp_limit,
+             apply_router_weight_on_input=apply_router_weight_on_input,
+         )
+ 
+@@ -814,6 +818,7 @@ def run_cutlass_moe_mxfp4(
+     k: int,
+     e: int,
+     device: torch.device,
++    gemm1_clamp_limit: float | None,
+     apply_router_weight_on_input: bool = False,
+ ) -> None:
+     """MXFP4 x MXFP4 MoE implementation using CUTLASS grouped GEMM."""
+@@ -901,7 +906,7 @@ def run_cutlass_moe_mxfp4(
+             c1, expert_offsets, blockscale_offsets, e, num_topk
+         )
+     else:
+-        apply_moe_activation(activation, c2, c1)
++        apply_moe_activation(activation, c2, c1, limit=gemm1_clamp_limit)
+         int_fp4, int_blockscale = ops.mxfp4_experts_quant(
+             c2, expert_offsets, blockscale_offsets, e, num_topk
+         )
+@@ -1086,6 +1091,7 @@ class CutlassExpertsMxfp4(mk.FusedMoEExpertsModular):
+             k=k,
+             e=e,
+             device=hidden_states.device,
++            gemm1_clamp_limit=self.moe_config.gemm1_clamp_limit,
+             apply_router_weight_on_input=apply_router_weight_on_input,
+         )
+ 
+@@ -1123,6 +1129,7 @@ def run_cutlass_moe_w4a8_fp8(
+     use_batched_format: bool,
+     topk_weights: torch.Tensor | None,
+     group_size: int,
++    gemm1_clamp_limit: float | None,
+ ):
+     a1q = hidden_states
+     M = a1q.size(0)
+@@ -1201,7 +1208,7 @@ def run_cutlass_moe_w4a8_fp8(
+         s_strides1,
+     )
+ 
+-    apply_moe_activation(activation, act_out, mm1_out)
++    apply_moe_activation(activation, act_out, mm1_out, limit=gemm1_clamp_limit)
+ 
+     a2q, a2q_scale = ops.scaled_fp8_quant(
+         act_out, a2_scale, use_per_token_if_dynamic=per_act_token, output=quant_out
+@@ -1393,6 +1400,7 @@ class CutlassExpertsW4A8Fp8(mk.FusedMoEExpertsModular):
+             use_batched_format,
+             topk_weights,
+             self.group_size,
++            self.moe_config.gemm1_clamp_limit,
+         )
+ 
+ 

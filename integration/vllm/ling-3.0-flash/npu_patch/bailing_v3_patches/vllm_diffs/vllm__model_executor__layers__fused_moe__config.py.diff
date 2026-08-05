@@ -1,0 +1,14 @@
+diff --git a/vllm/model_executor/layers/fused_moe/config.py b/vllm/model_executor/layers/fused_moe/config.py
+index 25b8c331bc..7f57b3ca67 100644
+--- a/vllm/model_executor/layers/fused_moe/config.py
++++ b/vllm/model_executor/layers/fused_moe/config.py
+@@ -1257,6 +1257,9 @@ class FusedMoEConfig:
+     # kernel is free to use inplace or not.
+     disable_inplace: bool = True
+ 
++    # Optional GEMM1 output clamp limit for SwiGLU variants.
++    gemm1_clamp_limit: float | None = None
++
+     def __post_init__(self):
+         if self.dp_size > 1:
+             logger.debug_once(

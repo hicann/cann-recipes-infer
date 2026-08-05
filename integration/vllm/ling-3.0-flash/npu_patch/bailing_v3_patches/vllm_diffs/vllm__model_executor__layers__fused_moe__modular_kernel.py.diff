@@ -1,0 +1,15 @@
+diff --git a/vllm/model_executor/layers/fused_moe/modular_kernel.py b/vllm/model_executor/layers/fused_moe/modular_kernel.py
+index b0f967085a..2a6ac39e57 100644
+--- a/vllm/model_executor/layers/fused_moe/modular_kernel.py
++++ b/vllm/model_executor/layers/fused_moe/modular_kernel.py
+@@ -883,7 +883,9 @@ class FusedMoEExpertsModular(FusedMoEExperts):
+     def activation(
+         self, activation: MoEActivation, output: torch.Tensor, input: torch.Tensor
+     ) -> None:
+-        apply_moe_activation(activation, output, input)
++        apply_moe_activation(
++            activation, output, input, limit=self.moe_config.gemm1_clamp_limit
++        )
+ 
+     @abstractmethod
+     def finalize_weight_and_reduce_impl(self) -> TopKWeightAndReduce:

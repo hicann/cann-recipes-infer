@@ -1,0 +1,40 @@
+diff --git a/vllm/model_executor/layers/fused_moe/fused_moe.py b/vllm/model_executor/layers/fused_moe/fused_moe.py
+index 7e7bcc7099..a36a85406f 100644
+--- a/vllm/model_executor/layers/fused_moe/fused_moe.py
++++ b/vllm/model_executor/layers/fused_moe/fused_moe.py
+@@ -1614,6 +1614,7 @@ def fused_experts(
+     global_num_experts: int = -1,
+     expert_map: torch.Tensor | None = None,
+     quant_config: FusedMoEQuantConfig | None = None,
++    gemm1_clamp_limit: float | None = None,
+ ) -> torch.Tensor:
+     """Run fused MoE expert computation using Triton kernels."""
+     if quant_config is None:
+@@ -1628,6 +1629,7 @@ def fused_experts(
+         topk_weights=topk_weights,
+         topk_ids=topk_ids,
+         activation=activation.value,
++        gemm1_clamp_limit=gemm1_clamp_limit,
+         apply_router_weight_on_input=apply_router_weight_on_input,
+         use_fp8_w8a8=quant_config.use_fp8_w8a8,
+         use_int8_w8a8=quant_config.use_int8_w8a8,
+@@ -1687,6 +1689,7 @@ def fused_experts_impl(
+     topk_ids: torch.Tensor,
+     inplace: bool,
+     activation: str = "silu",
++    gemm1_clamp_limit: float | None = None,
+     apply_router_weight_on_input: bool = False,
+     use_fp8_w8a8: bool = False,
+     use_int8_w8a8: bool = False,
+@@ -1841,7 +1844,10 @@ def fused_experts_impl(
+     )
+ 
+     apply_moe_activation(
+-        activation_enum, intermediate_cache2, intermediate_cache1.view(-1, N)
++        activation_enum,
++        intermediate_cache2,
++        intermediate_cache1.view(-1, N),
++        limit=gemm1_clamp_limit,
+     )
+ 
+     qintermediate_cache2, a2q_scale = moe_kernel_quantize_input(

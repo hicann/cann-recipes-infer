@@ -1,0 +1,20 @@
+diff --git a/vllm/model_executor/models/registry.py b/vllm/model_executor/models/registry.py
+index 01f357a499..e90f4d675f 100644
+--- a/vllm/model_executor/models/registry.py
++++ b/vllm/model_executor/models/registry.py
+@@ -83,6 +83,7 @@ _TEXT_GENERATION_MODELS = {
+     "BailingMoeForCausalLM": ("bailing_moe", "BailingMoeForCausalLM"),
+     "BailingMoeV2ForCausalLM": ("bailing_moe", "BailingMoeV2ForCausalLM"),
+     "BailingMoeV2_5ForCausalLM": ("bailing_moe_linear", "BailingMoeV25ForCausalLM"),
++    "BailingMoeV3ForCausalLM": ("bailing_moe_v3", "BailingMoeV3ForCausalLM"),
+     "BambaForCausalLM": ("bamba", "BambaForCausalLM"),
+     "BloomForCausalLM": ("bloom", "BloomForCausalLM"),
+     "ChatGLMModel": ("chatglm", "ChatGLMForCausalLM"),
+@@ -588,6 +589,7 @@ _SPECULATIVE_DECODING_MODELS = {
+     "EagleDeepSeekMTPModel": ("deepseek_eagle", "EagleDeepseekV3ForCausalLM"),
+     "DeepSeekMTPModel": ("deepseek_mtp", "DeepSeekMTP"),
+     "DeepSeekV4MTPModel": ("deepseek_v4_mtp", "DeepSeekV4MTP"),
++    "BailingMoeV3MTPModel": ("bailing_moe_v3_mtp", "BailingMoeV3MTPModel"),
+     "ErnieMTPModel": ("ernie_mtp", "ErnieMTP"),
+     "ExaoneMoeMTP": ("exaone_moe_mtp", "ExaoneMoeMTP"),
+     "Exaone4_5_MTP": ("exaone4_5_mtp", "Exaone4_5_MTP"),

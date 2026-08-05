@@ -1,0 +1,20 @@
+diff --git a/vllm_ascend/ops/fused_moe/moe_stage_contracts.py b/vllm_ascend/ops/fused_moe/moe_stage_contracts.py
+index 72a82b1c1..69324f488 100644
+--- a/vllm_ascend/ops/fused_moe/moe_stage_contracts.py
++++ b/vllm_ascend/ops/fused_moe/moe_stage_contracts.py
+@@ -66,6 +66,7 @@ class MoEFusedExpertsInput:
+     routing: MoERoutingParams
+     quant: MoEQuantParams
+     activation: str = "silu"
++    gemm1_clamp_limit: float | None = None
+     need_trans: bool = False
+     dynamic_eplb: bool = False
+     swiglu_limit: int = 0
+@@ -138,6 +139,7 @@ class MoEMlpComputeInput:
+     quant: MoEQuantParams
+     fusion: bool
+     activation: str = "silu"
++    gemm1_clamp_limit: float | None = None
+     need_trans: bool = False
+     dynamic_eplb: bool = False
+     swiglu_limit: int = 0
