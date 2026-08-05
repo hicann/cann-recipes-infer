@@ -1524,11 +1524,6 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
         ) * (-self.A_log.float().exp())
         g = g.view(batch_size, self.num_v_heads)
 
-        if self.num_v_heads // self.num_k_heads > 1:
-            repeat_factor = self.num_v_heads // self.num_k_heads
-            query = query.repeat_interleave(repeat_factor, dim=1)
-            key = key.repeat_interleave(repeat_factor, dim=1)
-
         query = F.normalize(query, p=2, dim=-1)
         key = F.normalize(key, p=2, dim=-1)
 
@@ -1862,9 +1857,9 @@ class Qwen3_5MoeAttention(nn.Module):
         q_rot = torch_npu.npu_rotary_mul(q_rot, cos, sin, rotary_mode='half')
         k_rot = torch_npu.npu_rotary_mul(k_rot, cos, sin, rotary_mode='half')
 
-        query_states = torch.cat([q_rot, q_pass], dim=-1).view(bsz, q_len, -1)
-        key_states = torch.cat([k_rot, k_pass], dim=-1).view(bsz, q_len, -1)
-        value_states = value_states.view(bsz, q_len, -1)
+        query_states = torch.cat([q_rot, q_pass], dim=-1).view(bsz, q_len, -1).contiguous()
+        key_states = torch.cat([k_rot, k_pass], dim=-1).view(bsz, q_len, -1).contiguous()
+        value_states = value_states.view(bsz, q_len, -1).contiguous()
 
         k_cache, v_cache = self.k_cache, self.v_cache
         if not k_cache.numel() or not v_cache.numel():
