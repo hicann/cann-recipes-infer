@@ -27,7 +27,7 @@
 
 - **内存效率**：通过分块管理避免为每个请求预分配完整序列长度的内存
 - **并发支持**：多请求共享有限的 NPU 内存资源
-- **灵活适配**：支持多种注意力机制（Full Attention、Sliding Window Attention）
+- **灵活适配**：支持多种注意力机制和状态缓存（Full Attention、Sliding Window Attention、Mamba Attention类循环状态）
 
 #### 1.2 模块目录结构
 
@@ -62,8 +62,10 @@ graph TD
     A[Scheduler / ExecutionEngine] --> B[KVCacheManager]
     B --> C1[FullAttentionManager]
     B --> C2[SlidingWindowManager]
+    B --> C3[MambaManager]
     C1 --> D1[BlockPool]
     C2 --> D2[BlockPool]
+    C3 --> D3[BlockPool]
 ```
 
 #### 2.2 第一层：KVCacheManager
@@ -81,18 +83,18 @@ graph TD
 
 其核心接口包括：
 
-- `allocate_slots(request_id, computed_tokens, num_new_tokens, lookahead_tokens=0)`
+- `allocate_slots(request_id, computed_tokens, num_new_tokens, lookahead_tokens=0, reserved_tokens=0)`
 - `get_block_ids(request_id)`
 - `free(request_id)`
 - `get_block_sizes() -> Dict[str, int]`：返回每个 manager key 对应的 `block_size`。
 - `get_block_table_max_lens(max_model_len) -> Dict[str, int]`：返回每个 manager key 对应的 block table 最大宽度。
-- `format_usage() -> str`：返回**逐 manager key** 的 `used/total` 汇总字符串，例如 `"FullAttention:16:12/100,SlidingWindow:32:8/100"`；由 `Scheduler._log_step` 调用，用于在每步状态日志中暴露各 cache 分组的 KV 压力。
+- `format_usage() -> str`：返回**逐 manager key** 的 `used/total` 汇总字符串，例如 `"FullAttention:12/100,SlidingWindow:8/100"`；由 `Scheduler._log_step` 调用，用于在每步状态日志中暴露各 cache 分组的 KV 压力。
 - `get_contiguous_buf_infos() -> (data_ptrs, data_lens, item_lens, attn_types, block_sizes)`：把 paged-attention 管理的所有物理 cache tensor 扁平化导出，供 PD KV 传输使用——按 `layer_idx` 升序、再按层内 `cache` 原始定义序遍历，仅导出 `needs_block=True` 的 cache。返回五个等长 list：`data_ptrs`（每个 tensor 的 `data_ptr()`）、`data_lens`（每个 tensor 总字节数）、`item_lens`（每块字节数 = `block_size × num_head × dim × element_size`）、`attn_types`（每项的 manager key，用于在对端按 manager key 查 block id）、`block_sizes`（每项 cache 实际使用的 block size）。Prefill 与 Decode 各自独立调用，返回顺序由模型配置决定，两端必然对齐。`attn_type="Mamba"` 的 cache 暂不支持 PD 传输。
 
 其中 `allocate_slots` 的关键点是”两阶段处理”（具体实现可见：[块分配核心流程](#3-块分配核心流程allocate_slots)）：
 
 1. 预检查阶段。
-   对每个 Manager 先执行旧块回收，再计算本次需要的新块数量；若任一 Manager 空闲块不足，则整体返回失败。
+   对每个 Manager 先执行旧块回收，再按该 Manager 自身的准入策略计算本次需要的新块数量并检查容量；若任一 Manager 检查失败，则整体返回失败。
 2. 分配阶段。
    只有当所有 Manager 都满足条件时，才逐个执行真实分配，避免部分分配导致资源不一致。
 
@@ -116,8 +118,8 @@ graph TD
 
 通用接口包括：
 
-1. `get_num_blocks_to_allocate`
-   计算某个请求当前需要新增多少 block。
+1. `pre_allocate_blocks(request_id, num_tokens, reserved_tokens=0)`
+   计算某个请求当前需要新增多少 block，并按当前 Manager 的准入策略判断容量能否满足本次申请；返回 `(need_block_num, status)`，不执行真实分配。基类实现会扣除 `reserved_tokens` 对应的准入预留，不同 cache 类型可以重写该方法实现自己的预分配校验策略。
 2. `allocate_new_blocks`
    从 `BlockPool` 获取真实 block，并写入 `req_to_blocks`。
 3. `remove_skipped_blocks`
@@ -131,10 +133,12 @@ graph TD
    计算可跳过分配的 token 数。基类抛出 `NotImplementedError`，子类必须实现此方法：
    - `FullAttentionManager`：始终返回 0，全注意力机制无需跳过任何 token。
    - `SlidingWindowManager`：返回 `max(0, num_computed_tokens - sliding_window + 1)`，滑窗外的历史 token 可被跳过。
+   - `MambaManager`：始终返回 0，Mamba Cache 会直接复用分配的 Cache，无需回收。
 6. `validate_and_build_kwargs(group_entries)`【静态方法】
    验证并构建 manager 实例化所需的类型特定参数。基类抛出 `NotImplementedError`，子类必须实现此方法：
-   - `FullAttentionManager`：无需额外参数，返回空字典 `{}`。
+   - `FullAttentionManager`：校验同组 cache 的 `compress_ratio` 一致，并返回该参数。
    - `SlidingWindowManager`：从 `CacheEntry` 中提取并校验 `sliding_window` 参数。
+   - `MambaManager`：从 `MambaCacheEntry` 中提取并校验 `next_n` 参数。
 
 根据管理**注册表**，可以选择Attention类对应的 cache 管理策略：
 
@@ -142,18 +146,20 @@ graph TD
 ATTN_TYPE_MANAGER_MAP = {
     "FullAttention": FullAttentionManager,
     "SlidingWindow": SlidingWindowManager,
+    "Mamba": MambaManager,
 }
 ```
-目前已实现两类具体的**派生类型**：
+目前已实现三类具体的**派生类型**：
 
 | 类名 | 说明 | 定义位置 |
 |------|------|----------|
 | `FullAttentionManager` | 全注意力，块随序列增长线性追加 | [single_type_kv_cache_manager.py](../../executor/core/kv_cache/single_type_kv_cache_manager.py) |
 | `SlidingWindowManager` | 滑动窗口注意力，支持过期块回收 | [single_type_kv_cache_manager.py](../../executor/core/kv_cache/single_type_kv_cache_manager.py) |
+| `MambaManager` | Mamba 循环状态，每请求使用固定数量的状态块 | [single_type_kv_cache_manager.py](../../executor/core/kv_cache/single_type_kv_cache_manager.py) |
 
 ##### 2.3.1 FullAttentionManager
 
-`FullAttentionManager` 直接复用基类逻辑，特点是：
+`FullAttentionManager` 复用基类的 `pre_allocate_blocks()` 和 `allocate_new_blocks()`，特点是：
 
 1. 逻辑 block 数量等于 `ceil(num_tokens / block_size)`。
 2. 请求随着 token 增长持续追加物理内存块 block。
@@ -161,7 +167,7 @@ ATTN_TYPE_MANAGER_MAP = {
 需实现的抽象方法：
 
 - `get_num_skipped_tokens(_num_computed_tokens)`：返回 0，全注意力机制无需跳过任何 token。
-- `validate_and_build_kwargs(_group_entries)`：返回空字典 `{}`，无额外参数。
+- `validate_and_build_kwargs(group_entries)`：校验同组 cache 的 `compress_ratio` 完全一致并返回该参数。
 
 
 ##### 2.3.2 SlidingWindowManager
@@ -177,12 +183,30 @@ ATTN_TYPE_MANAGER_MAP = {
 `SlidingWindowManager` 额外实现了：
 
 - `_get_logical_block_layout(num_tokens)`
-- `get_num_blocks_to_allocate(...)`
+- `pre_allocate_blocks(...)`
 - `allocate_new_blocks(...)`
 - `get_num_skipped_tokens(num_computed_tokens)`：返回 `max(0, num_computed_tokens - sliding_window + 1)`。
 - `validate_and_build_kwargs(group_entries)`【静态方法】：提取并校验 `sliding_window` 参数。
 
 这使得滑窗类 attention 可以兼顾“逻辑位置连续”与“物理存储压缩”。
+
+##### 2.3.3 MambaManager
+
+`MambaManager` 管理的是每个请求的固定尺寸循环状态，而不是随 token 数线性增长的 KV block。
+
+其关键设计点如下：
+
+1. 请求首次分配时只申请 1 个状态块，供 prefill 使用。
+2. 请求已经持有状态块后，目标块数变为 `1 + next_n`，为 decode 及 [MTP](mtp_design.md) 草稿步补足状态块。
+3. `pre_allocate_blocks()` 不根据 `num_tokens` 计算块数；`num_tokens` 仅用于非负校验，实际块数只取决于请求是否已持有状态块和 `next_n`。
+
+`MambaManager` 额外实现了：
+
+- `pre_allocate_blocks(...)`：计算固定状态块数并与当前空闲块数比较，不使用 `reserved_tokens`。
+- `get_num_skipped_tokens()`：始终返回 0，不执行 token 窗口回收。
+- `validate_and_build_kwargs()`：校验同组 `MambaCacheEntry.next_n` 一致。
+
+模型侧的元数据和使用限制见 [Mamba 适配规则](#511-确定每个-cache-的-attn_type)。
 
 #### 2.4 第三层：BlockPool
 
@@ -213,51 +237,57 @@ ATTN_TYPE_MANAGER_MAP = {
 
 ### 3. 块分配核心流程：allocate_slots
 
-`allocate_slots` 是整个 KV cache 管理链路里的核心入口，它的设计重点是逐请求地进行不同 attention type 的块分配。调度层只需要关心当前请求是否还能继续推进，而 `KVCacheManager` 负责把这一请求广播到所有 `SingleTypeKVCacheManager`，分别计算所需块数、回收可跳过块，并在真正分配前完成一次整体可分配性检查。
+`allocate_slots()` 是 KV cache 分配的统一入口。它协调所有 `SingleTypeKVCacheManager` 完成预检查，并在全部检查通过后统一分配 block。
 
 #### 3.1 输入参数含义
 
-`KVCacheManager.allocate_slots(request_id, computed_tokens, num_new_tokens, lookahead_tokens=0)` 中各入参的含义为：
+`KVCacheManager.allocate_slots(request_id, computed_tokens, num_new_tokens, lookahead_tokens=0, reserved_tokens=0)` 的参数如下：
 
 - `request_id`：请求唯一标识。
-- `computed_tokens`：当前请求已经计算完成的 token 数。
-- `num_new_tokens`：本轮需要继续为该请求预留 slot 的新增 token 数。
-- `lookahead_tokens`：在 `num_new_tokens` 之外额外预留的 token 数，用于 speculative decoding 等需要提前占位的场景。
+- `computed_tokens`：请求已完成计算的 token 数。
+- `num_new_tokens`：本轮新增的 token 数。
+- `lookahead_tokens`：额外预留的 token 数，用于 speculative decoding 等提前占位场景。
+- `reserved_tokens`：在线 PD decode 准入时，为每个已有请求预留的 decode token 数。默认值为 0，目前仅 `FullAttentionManager` 使用该参数。
 
-函数内部首先构造两个关键量：
+函数内部计算以下两个值：
 
 1. `total_computed_tokens = min(computed_tokens, max_model_len)`
-   表示当前已经实际计算过并纳入 Cache 管理的token数，可用于判断 skipped block 的 token 数。
+   已纳入 cache 管理的 token 数，用于回收失效 block。
 2. `num_tokens_need_slot = min(computed_tokens + num_new_tokens + lookahead_tokens, max_model_len)`
-   表示本次分配后需要 block 覆盖到的总 token 范围。
+   本轮分配后需要 block 覆盖的 token 总数。
 
 #### 3.2 两阶段实现流程
 
-##### 3.2.1 预检查阶段
+##### 3.2.1 预分配检查阶段
 
-预检查阶段是整个分配逻辑最关键的部分，它确保分配前先收敛状态。对`KVCacheManager` 中每个 `SingleTypeKVCacheManager`，依次执行：
+对 `KVCacheManager` 中每个 `SingleTypeKVCacheManager`，依次执行：
 
 1. `remove_skipped_blocks(request_id, total_computed_tokens)`
-   如果该 attention type 存在可以释放的无用内存块，则先回收这部分 block。
-2. `get_num_blocks_to_allocate(request_id, num_tokens_need_slot)`
-   根据 `num_tokens_need_slot` 和当前请求已持有的 block 数，计算本轮还需新增多少 block。通用逻辑可以表示为：
-   ```text
-   required_block_num = ceil(num_tokens_need_slot / block_size)
-   existing_block_num = len(req_to_blocks.get(request_id, []))
-   block_num_to_allocate = max(0, required_block_num - existing_block_num)
-   ```
-3. `get_num_free_blocks()`
-   查看 `BlookPool` 中空闲块的数量。
+   回收已移出有效注意力范围的 block。
+2. `pre_allocate_blocks(request_id, num_tokens_need_slot, reserved_tokens)`
+   计算本轮需要新增的 block 数，并按当前 Manager 自身的准入策略检查容量，返回 `(need_block_num, status)`。
 
-若任何一个 manager 的空闲块数少于需要新增的块数，则顶层立刻返回 `False`，该请求在本次迭代中不会发生任何新的 block 分配。
+若任一 manager 返回 `status=False`，`allocate_slots()` 立即返回 `False`，且不执行本轮 block 分配。
+
+
+在线 PD 分离推理中，decode 端在新请求进入 transfer/running 流水线前，将配置项 `num_reserved_decode_tokens`（默认 64）作为 `reserved_tokens` 传入。`FullAttentionManager` 继承复用基类的处理逻辑，按已有请求数预留 block：
+
+```text
+reserved_block = ceil(reserved_tokens / block_size) * len(req_to_blocks)
+status = need_block_num <= free_block_num - reserved_block
+```
+
+该预留机制可防止新请求占满 KV cache，确保已准入请求仍有空间继续 decode。`SlidingWindowManager` 和 `MambaManager` 当前不使用 `reserved_tokens`。
 
 ##### 3.2.2 分配阶段
 
-只有全部 manager 都通过预检查，才进入分配阶段，此时 `KVCacheManager` 会再次遍历 managers，从 `BlockPool` 申请块并更新 request 对应的 block table。：
+全部 manager 通过预检查后，`KVCacheManager` 将各 Manager 返回的 `need_block_num` 作为 `allocate_new_blocks()` 的 `block_num_to_allocate` 实参执行分配：
 
 ```text
 allocate_new_blocks(request_id, block_num_to_allocate, num_tokens_need_slot)
 ```
+
+所有 manager 分配完成后，`allocate_slots()` 返回 `True`。
 
 #### 3.3 allocate_slots 时序图
 
@@ -269,22 +299,21 @@ sequenceDiagram
     participant M as SingleTypeManager
     participant P as BlockPool
 
-    S->>K: allocate_slots(request_id, computed_tokens, num_new_tokens, lookahead_tokens)
+    S->>K: allocate_slots(request_id, computed_tokens, num_new_tokens, lookahead_tokens, reserved_tokens)
     K->>K: 计算 total_computed_tokens / num_tokens_need_slot
     loop Phase 1: 对每个 manager 做预检查
         K->>M: remove_skipped_blocks(request_id, total_computed_tokens)
         M->>P: free_blocks(removed_blocks)
-        K->>M: get_num_blocks_to_allocate(request_id, num_tokens_need_slot)
-        M-->>K: block_num_to_allocate
-        K->>M: get_num_free_blocks()
-        M-->>K: free_block_num
+        K->>M: pre_allocate_blocks(request_id, num_tokens_need_slot, reserved_tokens)
+        M->>P: get_num_free_blocks()
+        M-->>K: need_block_num, status
     end
-    alt 任一 manager 空闲块不足(block_num_to_allocate < free_block_num)
+    alt 任一 manager 返回 status=False
         K-->>S: False
-    else 所有 manager 空闲块充足
+    else 所有 manager 返回 status=True
         loop Phase 2: 对每个 manager 提交分配
-            K->>M: allocate_new_blocks(request_id, block_num_to_allocate, num_tokens_need_slot)
-            M->>P: get_new_blocks(block_num_to_allocate)
+            K->>M: allocate_new_blocks(request_id, block_num_to_allocate=need_block_num, num_tokens=num_tokens_need_slot)
+            M->>P: get_new_blocks(need_block_num)
             P-->>M: new_blocks
             M->>M: 更新 req_to_blocks
         end
@@ -362,8 +391,9 @@ graph TD
 它会先按 cache 的 `attn_type` 区分固定 block 与非固定 block 类型，再按 `cache.group_key` 汇总 `block_size` 和每块字节数，最终返回 `Dict[manager_key, block_num]`：
 
 **1. 固定 block 数的 `attn_type`**
-   这类 `attn_type` 需要的 cache 数据不随着请求总长度线性增长，例如 `SlidingWindow` 只需要窗口长度的 cache，因此只给其分配固定大小的 block。代码中通过 `FIXED_BLOCK_ATTN_TYPES` 对这类 `attn_type` 进行标识。
-   当前典型例子是 `SlidingWindow`。对其 `block_num` 的计算思路是按 `manager_key` 先为单个请求估算“窗口内最多需要保留多少真实 block”，再乘以最大并发数 `batch_size_per_dp_rank`。具体计算为：
+   这类 `attn_type` 需要的 cache 数据不随着请求总长度线性增长。当前 `FIXED_BLOCK_ATTN_TYPES = {"SlidingWindow", "Mamba"}`：`SlidingWindow` 只保留窗口范围内的 cache；`Mamba` 保存每个请求固定尺寸的循环状态。
+   **SlidingWindow**：
+   `SlidingWindow` 的 `block_num` 计算思路是按 `manager_key` 先为单个请求估算“窗口内最多需要保留多少真实 block”，再乘以最大并发数 `batch_size_per_dp_rank`。具体计算为：
    ```text
    fixed_block_num =
        max_concurrency *
@@ -373,6 +403,14 @@ graph TD
    - sliding_window + 2 * next_n 是用于每个请求在一次迭代内最多会使用的 cache 大小，2 * next_n 为 [MTP 场景](mtp_design.md)下，主模型与小模型共同需要额外使用的 cache 空间；
    - 1 个用于每个请求覆盖滑动窗口跨 block 边界时的额外保留需求；
    - 最后的 1 个用于 `null_block` 占位。
+
+   **Mamba**：
+   `Mamba` 的每个并发请求最多需要 `1 + next_n` 个状态块，因此：
+   ```text
+   fixed_block_num = max_concurrency * (1 + next_n) + 1
+   state_memory_bytes = fixed_block_num * prod(shape) * dtype_size
+   ```
+   `prod(shape)` 是一个 `MambaCacheEntry` 状态块的元素数，最后的 `+1` 同样用于 `null_block`。所有 Mamba cache entry 的 `state_memory_bytes` 会累计到固定块缓存的总预留内存中。
 
 **2. 非固定 block 数的 `attn_type`**
    这类 `attn_type` 需要的 cache 数据随着请求总长度线性增长，例如 `FullAttention`，MLA、MHA、GQA等全注意力都属于`FullAttention`。
@@ -396,7 +434,7 @@ graph TD
       ```
       其中每个 manager 的第一个 block 会作为 `null_block` 占位，不参与真实 cache 存储。不同 manager 可使用不同 `block_size`，因此同一个 `max_tokens` 会折算出不同的 block 数。
 
-整体上，`calculate_block_num()` 的顺序是：先为固定 block 类 cache 预留内存，再用剩余内存估算非固定 block 类 cache 的 block 数；这样可以避免 SWA 这类必须预留的 cache 挤占后续计算时出现不确定性。
+整体上，`calculate_block_num()` 的顺序是：先为固定 block 类 cache 预留内存，再用剩余内存估算非固定 block 类 cache 的 block 数；这样可以避免 SWA、Mamba 这类必须预留的 cache 挤占后续计算时出现不确定性。
 分组内一致性由代码显式校验：共享同一个 manager key 的 cache 必须共享同一个 `block_size`；如果同一 attention type 下需要不同 `block_size`，必须使用不同 `manager_key`。
 
 ##### 4.2.2 构建 block_table 与 slot_mapping
@@ -559,13 +597,13 @@ self.block_size = infer_config.scheduler_config.block_size
 
 | 函数名 | 说明 |
 |-------|------|
-| `get_num_blocks_to_allocate(request_id, num_tokens)` | 计算本次需要新增多少 block |
+| `pre_allocate_blocks(request_id, num_tokens, reserved_tokens=0)` | 计算本次需要新增多少 block，并返回 `(need_block_num, status)`；若沿用基类实现，则自动带有每请求 decode 预留准入逻辑，预留量来自 `num_reserved_decode_tokens` |
 | `allocate_new_blocks(request_id, block_num_to_allocate, num_tokens)` | 执行真实 block 分配，更新 `req_to_blocks` |
 | `get_num_skipped_tokens(num_computed_tokens)` | 计算可跳过分配的 token 数 |
 | `remove_skipped_blocks(request_id, total_computed_tokens)` | 【可选】重写，用于特殊回收机制 |
 | `validate_and_build_kwargs(group_entries)` | 【静态方法】用于从 `CacheEntry` 提取和校验类型特定参数 |
 
-**参考实现**：[single_type_kv_cache_manager.py](../../executor/core/kv_cache/single_type_kv_cache_manager.py) 的 `FullAttentionManager`、`SlidingWindowManager`
+**参考实现**：[single_type_kv_cache_manager.py](../../executor/core/kv_cache/single_type_kv_cache_manager.py) 的 `FullAttentionManager`、`SlidingWindowManager`、`MambaManager`
 
 ##### 5.3.2 注册到 `ATTN_TYPE_MANAGER_MAP`
 
@@ -575,6 +613,7 @@ self.block_size = infer_config.scheduler_config.block_size
 ATTN_TYPE_MANAGER_MAP: Dict[str, Type[SingleTypeKVCacheManager]] = {
     "FullAttention": FullAttentionManager,
     "SlidingWindow": SlidingWindowManager,
+    "Mamba": MambaManager,
     "NewAttentionType": NewAttentionManager,  # 新增
 }
 ```
@@ -588,7 +627,7 @@ ATTN_TYPE_MANAGER_MAP: Dict[str, Type[SingleTypeKVCacheManager]] = {
 ##### 5.4.1 判断是否属于固定 block 类型
 
 判断新增的 Manager 属于哪一种类型：
-- 固定 block 类型：block 数不随序列长度增长（如 SlidingWindow）
+- 固定 block 类型：block 数不随序列长度增长（如 SlidingWindow、Mamba）
 - 非固定类型：block 数随序列长度线性增长（如 FullAttention）
 
 ##### 5.4.2 固定 block 类型：扩展 `calculate_fixed_block_memory_bytes()`
@@ -596,7 +635,7 @@ ATTN_TYPE_MANAGER_MAP: Dict[str, Type[SingleTypeKVCacheManager]] = {
 若新增固定 block 类型，首先在[cache_utils.py](../../executor/core/kv_cache/cache_utils.py) 的 `FIXED_BLOCK_ATTN_TYPES`中新增该 `attn_type`：
 
 ```python
-FIXED_BLOCK_ATTN_TYPES = {"SlidingWindow", "NewFixedBlockType"}  # 新增
+FIXED_BLOCK_ATTN_TYPES = {"SlidingWindow", "Mamba", "NewFixedBlockType"}  # 新增
 ```
 
 然后需要在[cache_utils.py](../../executor/core/kv_cache/cache_utils.py) 的 `calculate_fixed_block_memory_bytes()`函数中补充计算逻辑：

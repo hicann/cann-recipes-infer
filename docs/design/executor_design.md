@@ -243,10 +243,10 @@ KV cache 采用 paged attention 三层结构，定义在 `executor/core/kv_cache
 | 层 | 职责 |
 |------|------|
 | `KVCacheManager` | 请求级总协调器，对接 Scheduler 的 slot 申请；跨 attention type 做一致性预检查后再分配 |
-| `SingleTypeKVCacheManager` | 单一 attention type（Full / Sliding Window）的逻辑块管理：决定每请求所需 block、回收旧块、维护 block table |
+| `SingleTypeKVCacheManager` | 单一 attention type（Full / Sliding Window / Mamba）的逻辑块管理：决定每请求所需 block、回收旧块、维护 block table |
 | `BlockPool` | 物理 block 池：发放与回收 block id |
 
-调度层通过 `manager.allocate_slots(request_id, computed_tokens, num_new_tokens, lookahead_tokens=0)` 申请 Block；模型读写时按 `block_table` / `slot_mapping` 索引到具体物理 Block。
+调度层通过 `manager.allocate_slots(request_id, computed_tokens, num_new_tokens, lookahead_tokens=0, reserved_tokens=0)` 申请 Block；模型读写时按 `block_table` / `slot_mapping` 索引到具体物理 Block。
 
 详见 [kv_cache_design.md](kv_cache_design.md)。
 

@@ -28,8 +28,8 @@ from .single_type_kv_cache_manager import ATTN_TYPE_MANAGER_MAP, MambaManager
 
 
 # Cache types with fixed block count (independent of seq_len),
-# e.g., sliding window attention. Distinguished from paged attention types
-# where block count scales with sequence length.
+# e.g., sliding-window attention and Mamba state caches. Distinguished
+# from paged attention types where block count scales with sequence length.
 FIXED_BLOCK_ATTN_TYPES = {"SlidingWindow", "Mamba"}
 SUPPORTED_CACHE_LAYOUTS = {"BnBsND", "BnNBsD"}
 
