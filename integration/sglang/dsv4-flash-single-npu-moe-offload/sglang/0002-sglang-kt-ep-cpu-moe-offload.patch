@@ -22,14 +22,15 @@ index 9f72f3570..52b55e1e4 100644
      SGLANG_OTLP_EXPORTER_MAX_EXPORT_BATCH_SIZE = EnvInt(64)
      SGLANG_NATIVE_MOVE_KV_CACHE = EnvBool(False)
 diff --git a/python/sglang/srt/layers/moe/kt_ep_wrapper.py b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
-index 128853931..7f01eb238 100644
+index 128853931..237bdb104 100644
 --- a/python/sglang/srt/layers/moe/kt_ep_wrapper.py
 +++ b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
-@@ -7,14 +7,26 @@ for any MoE quantization method. It coordinates parallel execution of GPU expert
+@@ -7,14 +7,28 @@ for any MoE quantization method. It coordinates parallel execution of GPU expert
  (using any quantization method) and CPU experts (using AMX/AVX instructions).
  """
  
 +import logging
++import os
  from dataclasses import dataclass
 -from typing import TYPE_CHECKING, Optional
 +from typing import TYPE_CHECKING, Optional, Set, Tuple
@@ -50,11 +51,12 @@ index 128853931..7f01eb238 100644
 +    get_layer_gpu_experts_mask,
 +    get_layer_logical_to_gpu_index,
 +)
++from sglang.srt.layers.moe.kt_stream_prefill import maybe_streaming_forward
 +
  
  if TYPE_CHECKING:
      from sglang.srt.layers.moe import MoeRunnerConfig
-@@ -32,6 +44,72 @@ except ImportError:
+@@ -32,6 +46,111 @@ except ImportError:
      KTRANSFORMERS_AVAILABLE = False
  
  
@@ -92,6 +94,45 @@ index 128853931..7f01eb238 100644
 +    _npu_report_subscribed.add(key)
 +
 +
++# KT_SIDE_STREAM=1 (experiment): run the CPU-MoE host callback on a dedicated
++# side stream so the GPU-experts GroupedMatmul on the compute stream overlaps
++# with the callback round trip / CPU MoE window, instead of being stream-order
++# blocked behind it. fork/join events express the dependency:
++#   compute: ...router... fork_ev ------------------- GPU experts -- wait(join_ev) -- merge
++#   side:                   wait(fork_ev) D2H + host callback  join_ev
++# Isolated microbenchmarks measured the fork/join machinery at ~6us/layer under
++# graph replay and ~96% ideal hiding of min(callback, GPU work). Gain scales
++# inversely with the off_cpu floor (judge by TPOT floor/p10, not off_cpu, which
++# is invariant to overlap). One shared side stream; events created fresh per
++# capture and kept alive for the lifetime of the captured graph.
++_KT_SIDE_STREAM = os.environ.get("KT_SIDE_STREAM", "") == "1"
++_kt_side_stream = None
++
++
++def _get_kt_side_stream():
++    global _kt_side_stream
++    if _kt_side_stream is None:
++        _kt_side_stream = torch.npu.Stream()
++    return _kt_side_stream
++
++
++# KT_SHARED_EXPERTS_STREAM=1 (experiment): run shared experts on their own
++# stream, concurrent with the whole routed-experts span (which contains the
++# CPU-MoE callback window). Sibling-fork topology (both side streams fork
++# directly from the main stream); unlike SGLANG_NPU_USE_MULTI_STREAM's
++# fork-from-fork nesting, this replays under NPUGraph. Used by
++# DeepseekV2MoE.forward_normal.
++KT_SHARED_EXPERTS_STREAM = os.environ.get("KT_SHARED_EXPERTS_STREAM", "") == "1"
++_kt_shared_stream = None
++
++
++def get_kt_shared_experts_stream():
++    global _kt_shared_stream
++    if _kt_shared_stream is None:
++        _kt_shared_stream = torch.npu.Stream()
++    return _kt_shared_stream
++
++
 +@torch.no_grad()
 +def _kt_npu_graph_host_forward(args) -> None:
 +    """Host callback: run CPU MoE on pinned buffers (used during NPUGraph capture)."""
@@ -105,8 +146,8 @@ index 128853931..7f01eb238 100644
 +    Supported placeholders:
 +
 +    - ``{layer_idx}`` — named, recommended (e.g. ``.../dsv4_layer{layer_idx}.gguf``).
-+    - A single anonymous ``{}`` — filled with the integer ``layer_idx`` (e.g. handoff
-+      ``.../dsv4_layer{}.gguf``).
++    - A single anonymous ``{}`` — filled with the integer ``layer_idx``
++      (e.g. ``.../dsv4_layer{}.gguf``).
 +
 +    If there is no placeholder, the path is returned unchanged (one shared weight path).
 +    """
@@ -127,7 +168,7 @@ index 128853931..7f01eb238 100644
  @dataclass
  class KTConfig:
      """Configuration for KTransformers heterogeneous computing CPU part.
-@@ -56,6 +134,8 @@ class KTConfig:
+@@ -56,6 +175,8 @@ class KTConfig:
      max_deferred_experts_per_token: int
      method: str
      num_layers: Optional[int] = None
@@ -136,7 +177,7 @@ index 128853931..7f01eb238 100644
  
  
  def create_kt_config_from_server_args(
-@@ -76,15 +156,20 @@ def create_kt_config_from_server_args(
+@@ -76,15 +197,20 @@ def create_kt_config_from_server_args(
      # Try to get num_layers from model config
      num_layers = None
      try:
@@ -159,7 +200,7 @@ index 128853931..7f01eb238 100644
          cpuinfer_threads=server_args.kt_cpuinfer,
          threadpool_count=server_args.kt_threadpool_count,
          weight_path=server_args.kt_weight_path,
-@@ -92,26 +177,38 @@ def create_kt_config_from_server_args(
+@@ -92,26 +218,38 @@ def create_kt_config_from_server_args(
          method=server_args.kt_method,
          max_deferred_experts_per_token=server_args.kt_max_deferred_experts_per_token,
          num_layers=num_layers,
@@ -214,7 +255,7 @@ index 128853931..7f01eb238 100644
  
  
  class KTEPWrapperMethod(FusedMoEMethodBase):
-@@ -151,6 +248,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+@@ -151,6 +289,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
  
          self.gpu_method = gpu_method
          self.kt_config = kt_config
@@ -223,7 +264,7 @@ index 128853931..7f01eb238 100644
          self.num_gpu_experts = kt_config.num_gpu_experts
          self.override_num_local_experts = True
          self.gpu_method.num_gpu_experts = self.num_gpu_experts
-@@ -216,16 +315,24 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+@@ -216,16 +356,24 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
          # 2. Initialize KT wrapper for CPU experts
          # CPU experts: num_gpu_experts to num_experts-1
          if self.tp_rank == 0:
@@ -250,8 +291,22 @@ index 128853931..7f01eb238 100644
                  chunked_prefill_size=self.kt_config.chunked_prefill_size,
                  method=self.kt_config.method,
                  max_deferred_experts_per_token=layer_max_deferred,
-@@ -243,7 +350,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+@@ -237,13 +385,20 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+         Args:
+             layer: The MoE layer module
+         """
+-        # 1. Process GPU weights
++        # 1. Process GPU weights (NZ-cast the 32 resident experts)
+         if hasattr(self.gpu_method, "process_weights_after_loading"):
+             self.gpu_method.process_weights_after_loading(layer)
  
++        # Reserve the streaming HBM slot now (model-load time, before KV-pool sizing) so the
++        # KV pool auto-accounts for it; also registers this layer for the dynamic decode-
++        # resident pool. No-op unless KT_PREFILL_STREAM=1. See kt_stream_prefill.
++        from sglang.srt.layers.moe.kt_stream_prefill import maybe_reserve_slot
++
++        maybe_reserve_slot(self, layer.w13_weight.device, layer)
++
          # 2. Load CPU weights using KT wrapper
          if self.tp_rank == 0 and self.wrapper is not None:
 -            torch.cuda.synchronize()
@@ -259,7 +314,7 @@ index 128853931..7f01eb238 100644
  
              # Get expert location metadata for CPU expert mapping
              from sglang.srt.eplb.expert_location_dispatch import (
-@@ -257,6 +364,45 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+@@ -257,6 +412,49 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
              )
              self.wrapper.load_weights(physical_to_logical_map_cpu)
  
@@ -296,6 +351,10 @@ index 128853931..7f01eb238 100644
 +                device = layer.w13_weight.device
 +                if device.type == "npu":
 +                    _ensure_npu_subscribe_report(kt_current_stream(device))
++                    # The side-stream variant launches the host callback on the
++                    # side stream — pre-subscribe it too, for the same reason.
++                    if _KT_SIDE_STREAM:
++                        _ensure_npu_subscribe_report(_get_kt_side_stream())
 +            except Exception as exc:  # pragma: no cover - hardening only
 +                logger.warning(
 +                    "[KT] pre-capture ACL report subscribe failed (non-fatal): %s",
@@ -305,7 +364,7 @@ index 128853931..7f01eb238 100644
      def create_moe_runner(
          self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"
      ):
-@@ -299,16 +445,17 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+@@ -299,16 +497,17 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
  
          # Submit forward task to CPU (non-blocking)
          self.wrapper.submit_forward(
@@ -325,7 +384,7 @@ index 128853931..7f01eb238 100644
  
          Returns:
              CPU expert computation results
-@@ -316,9 +463,28 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+@@ -316,9 +515,28 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
          if self.tp_rank != 0 or self.wrapper is None:
              return torch.zeros_like(x)
  
@@ -357,28 +416,63 @@ index 128853931..7f01eb238 100644
          )
  
      def apply(
-@@ -345,33 +511,69 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+@@ -345,33 +563,103 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
          x = dispatch_output.hidden_states
          topk_output = dispatch_output.topk_output
  
 -        # Step 1: Submit CPU expert computation (non-blocking)
 -        if self.tp_rank == 0:
-+        use_npu_graph = (
-+            self.tp_rank == 0
-+            and self.wrapper is not None
-+            and _npu_use_graph_host_callback(x.device)
-+        )
-+
-+        # Step 1: Submit CPU expert computation (non-blocking, or graph host callback)
-+        if use_npu_graph:
-+            self._submit_cpu_npu_graph(dispatch_output, x)
-+        elif self.tp_rank == 0:
-             self.submit(layer, dispatch_output)
+-            self.submit(layer, dispatch_output)
++        layer_idx = self.kt_config.layer_idx
  
 -        # Step 2: Prepare GPU computation by masking CPU expert IDs
 -        # CPU expert IDs (>= num_gpu_experts) are set to -1 so GPU kernel skips them
 -        topk_ids = topk_output.topk_ids
 -        masked_topk_ids = mask_cpu_expert_ids(topk_ids, self.num_gpu_experts)
++        # Streaming-prefill bypass (env-gated): long prefill streams all 256 experts on NPU.
++        # Returns None when not applicable -> falls through to the hybrid path below (untouched).
++        _stream_out = maybe_streaming_forward(self, layer_idx, x, topk_output)
++        if _stream_out is not None:
++            return _stream_out
+ 
+-        # Create modified dispatch output for GPU computation
+-        masked_topk_output = topk_output._replace(topk_ids=masked_topk_ids)
+-        masked_dispatch_output = dispatch_output._replace(
+-            topk_output=masked_topk_output
++        use_npu_graph = (
++            self.tp_rank == 0
++            and self.wrapper is not None
++            and _npu_use_graph_host_callback(x.device)
+         )
+ 
+-        # Step 3: Execute GPU expert computation (any quantization method)
+-        # This runs in parallel with CPU computation
+-        gpu_combine_input = self.gpu_method.apply(layer, masked_dispatch_output)
++        # Step 1: Submit CPU expert computation (non-blocking, or graph host callback)
++        pending_join = None
++        if use_npu_graph:
++            if _KT_SIDE_STREAM:
++                comp_stream = kt_current_stream(x.device)
++                side_stream = _get_kt_side_stream()
++                fork_ev = torch.npu.Event()
++                join_ev = torch.npu.Event()
++                # Keep event objects alive as long as the captured graph: the
++                # graph's record/wait nodes reference them.
++                if not hasattr(self, "_kt_side_events"):
++                    self._kt_side_events = []
++                self._kt_side_events.append((fork_ev, join_ev))
++                fork_ev.record(comp_stream)
++                side_stream.wait_event(fork_ev)
++                with torch.npu.stream(side_stream):
++                    # D2H input copies + _launch_host_func all enqueue on the
++                    # side stream (kt_current_stream resolves to it here).
++                    self._submit_cpu_npu_graph(dispatch_output, x)
++                pending_join = (join_ev, side_stream, comp_stream)
++            else:
++                self._submit_cpu_npu_graph(dispatch_output, x)
++        elif self.tp_rank == 0:
++            self.submit(layer, dispatch_output)
++
 +        # Step 2 & 3: GPU expert computation — only if we actually have GPU experts.
 +        #
 +        # In all-CPU mode (``--kt-num-gpu-experts 0``) the underlying quant
@@ -401,12 +495,7 @@ index 128853931..7f01eb238 100644
 +                self.gpu_experts_mask,
 +                self.logical_to_gpu_index,
 +            )
- 
--        # Create modified dispatch output for GPU computation
--        masked_topk_output = topk_output._replace(topk_ids=masked_topk_ids)
--        masked_dispatch_output = dispatch_output._replace(
--            topk_output=masked_topk_output
--        )
++
 +            masked_topk_output = topk_output._replace(
 +                topk_ids=masked_topk_ids,
 +                topk_weights=masked_topk_weights,
@@ -414,10 +503,7 @@ index 128853931..7f01eb238 100644
 +            masked_dispatch_output = dispatch_output._replace(
 +                topk_output=masked_topk_output
 +            )
- 
--        # Step 3: Execute GPU expert computation (any quantization method)
--        # This runs in parallel with CPU computation
--        gpu_combine_input = self.gpu_method.apply(layer, masked_dispatch_output)
++
 +            gpu_combine_input = self.gpu_method.apply(layer, masked_dispatch_output)
 +            output = gpu_combine_input.hidden_states
 +        else:
@@ -427,6 +513,13 @@ index 128853931..7f01eb238 100644
 -        output = gpu_combine_input.hidden_states
          if self.tp_rank == 0:
 -            cpu_output = self.sync(x)
++            if pending_join is not None:
++                join_ev, side_stream, comp_stream = pending_join
++                # Compute stream resumes only after the side stream's host
++                # callback has returned (CPU output buffers are then valid for
++                # the H2D copy inside ``sync``).
++                join_ev.record(side_stream)
++                comp_stream.wait_event(join_ev)
 +            cpu_output = self.sync(x, cpu_already_synced=use_npu_graph)
              output = output + cpu_output
  
@@ -798,6 +891,77 @@ index 1e674d05b..e1ab2bfa0 100644
                  self.result_queue.append((batch.copy(), batch_result))
              else:
                  batch_result = None
+diff --git a/python/sglang/srt/models/deepseek_v2.py b/python/sglang/srt/models/deepseek_v2.py
+index 7f71c837e..767b2df29 100644
+--- a/python/sglang/srt/models/deepseek_v2.py
++++ b/python/sglang/srt/models/deepseek_v2.py
+@@ -93,7 +93,11 @@ from sglang.srt.layers.moe import (
+ )
+ from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
+ from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+-from sglang.srt.layers.moe.kt_ep_wrapper import KTEPWrapperMethod
++from sglang.srt.layers.moe.kt_ep_wrapper import (
++    KT_SHARED_EXPERTS_STREAM,
++    KTEPWrapperMethod,
++    get_kt_shared_experts_stream,
++)
+ from sglang.srt.layers.moe.token_dispatcher.base import (
+     BaseDispatcher,
+     CombineInput,
+@@ -669,13 +673,40 @@ class DeepseekV2MoE(nn.Module):
+             if server_args.enable_eplb
+             else None
+         )
++        kt_shared_join = None
+         if hidden_states.shape[0] > 0:
+             if (
+                 not self._fuse_shared_experts_inside_sbo
+             ):  # TODO: check if it supports mtp
+-                shared_output = self._forward_shared_experts(
+-                    hidden_states, gemm_output_zero_allocator
+-                )
++                if (
++                    KT_SHARED_EXPERTS_STREAM
++                    and hidden_states.device.type == "npu"
++                    and hasattr(self, "shared_experts")
++                ):
++                    # Shared experts on a sibling side stream, concurrent with
++                    # gate/topk/experts below — including the KT CPU-MoE
++                    # callback window inside experts(). Events are kept alive
++                    # on self for the lifetime of any captured graph.
++                    main_stream = torch.cuda.current_stream()
++                    shared_stream = get_kt_shared_experts_stream()
++                    fork_ev = torch.cuda.Event()
++                    join_ev = torch.cuda.Event()
++                    if not hasattr(self, "_kt_shared_events"):
++                        self._kt_shared_events = []
++                    self._kt_shared_events.append((fork_ev, join_ev))
++                    fork_ev.record(main_stream)
++                    shared_stream.wait_event(fork_ev)
++                    with torch.cuda.stream(shared_stream):
++                        shared_output = self._forward_shared_experts(
++                            hidden_states, gemm_output_zero_allocator
++                        )
++                        shared_output.record_stream(shared_stream)
++                    join_ev.record(shared_stream)
++                    kt_shared_join = (join_ev, main_stream)
++                else:
++                    shared_output = self._forward_shared_experts(
++                        hidden_states, gemm_output_zero_allocator
++                    )
+             # router_logits: (num_tokens, n_experts)
+             router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
+             topk_output = self.topk(
+@@ -730,6 +761,9 @@ class DeepseekV2MoE(nn.Module):
+             # fused in biased_grouped_topk so we can skip here
+             final_hidden_states *= self.routed_scaling_factor
+         if shared_output is not None:
++            if kt_shared_join is not None:
++                join_ev, main_stream = kt_shared_join
++                main_stream.wait_event(join_ev)
+             final_hidden_states += shared_output
+         if (
+             self.tp_size > 1
 diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
 index 753d18c21..35ce41cd0 100644
 --- a/python/sglang/srt/server_args.py
@@ -835,10 +999,10 @@ index 753d18c21..35ce41cd0 100644
              "--kt-max-deferred-experts-per-token",
 diff --git a/python/sglang/srt/utils/kt_accel.py b/python/sglang/srt/utils/kt_accel.py
 new file mode 100644
-index 000000000..9cd84e51c
+index 000000000..d7bbc9cd4
 --- /dev/null
 +++ b/python/sglang/srt/utils/kt_accel.py
-@@ -0,0 +1,71 @@
+@@ -0,0 +1,70 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""CUDA / Ascend NPU helpers for KT EP hybrid paths in ``kt_ep_wrapper``.
 +
@@ -858,7 +1022,6 @@ index 000000000..9cd84e51c
 +    if device.type == "cuda":
 +        return torch.cuda
 +    if device.type == "npu":
-+        # Side-effect import: registers the NPU backend so torch.npu becomes available; do not remove (F401 expected).
 +        import torch_npu  # noqa: F401
 +
 +        return torch.npu
@@ -910,3 +1073,117 @@ index 000000000..9cd84e51c
 +    if device.type != "cuda" or not torch.cuda.is_available():
 +        return
 +    torch.cuda.cudart().cudaHostRegister(cpu_tensor.data_ptr(), nbytes, 0)
+diff --git a/test/manual/ascend/test_kt_cleanup_equiv.py b/test/manual/ascend/test_kt_cleanup_equiv.py
+new file mode 100644
+index 000000000..195369789
+--- /dev/null
++++ b/test/manual/ascend/test_kt_cleanup_equiv.py
+@@ -0,0 +1,108 @@
++# SPDX-License-Identifier: Apache-2.0
++"""NPU-free regression locks for the KT clean-code pass (single-card 910C DSV4-Flash).
++
++These tests pin the *pure-tensor* behaviour of the KT streaming-prefill helpers that the
++clean-up either relies on (when deleting the diagnostic ``KT_DYN_FORCE_*`` branches) or
++de-duplicates (when making ``_apply_dynamic_residency`` reuse ``_pick_resident_top`` /
++``_set_resident_masks`` instead of re-implementing them inline). They run on CPU with no
++NPU and no CANN — ``kt_stream_prefill`` is loaded straight from its file so importing it
++pulls in no ``torch_npu`` (all NPU imports in that module are lazy, inside functions).
++
++Run:  python -m pytest test/manual/ascend/test_kt_cleanup_equiv.py -q
++  or:  python test/manual/ascend/test_kt_cleanup_equiv.py
++"""
++import importlib.util
++import os
++import pathlib
++import types
++import unittest
++
++import torch
++
++
++def _load_kt_stream_prefill():
++    """Import kt_stream_prefill by file path (no sglang package chain, no NPU)."""
++    here = pathlib.Path(__file__).resolve()
++    rel = pathlib.Path("python/sglang/srt/layers/moe/kt_stream_prefill.py")
++    for base in here.parents:
++        cand = base / rel
++        if cand.exists():
++            spec = importlib.util.spec_from_file_location("kt_stream_prefill_under_test", cand)
++            mod = importlib.util.module_from_spec(spec)
++            spec.loader.exec_module(mod)
++            return mod
++    raise FileNotFoundError(f"could not locate {rel} above {here}")
++
++
++class _FakeWrap:
++    """Minimal stand-in for a KTEPWrapperMethod: the tensors _set_resident_masks writes."""
++
++    def __init__(self, E, K):
++        self.gpu_experts_mask = torch.zeros(E, dtype=torch.bool)
++        self.logical_to_gpu_index = torch.full((E,), -1, dtype=torch.int64)
++        # C++-side pinned bool mask lives under `.wrapper`; use a tiny namespace with its own tensor.
++        self.wrapper = types.SimpleNamespace(gpu_experts_mask=torch.zeros(E, dtype=torch.bool))
++
++
++class KTCleanupEquivTest(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        # The diagnostic force-set env vars are read at call time; clear them so we test the
++        # production (default top-K) behaviour that the clean-up preserves.
++        for k in ("KT_DYN_FORCE_SET", "KT_DYN_FORCE_PREFIX", "KT_DYN_SKIP_WEIGHTS"):
++            os.environ.pop(k, None)
++        cls.ksp = _load_kt_stream_prefill()
++
++    def test_pick_resident_top_is_sorted_topk(self):
++        """Production selection == top-K by activation, returned ascending. This is the invariant
++        that must survive deleting the KT_DYN_FORCE_* diagnostic branches from _pick_resident_top."""
++        torch.manual_seed(0)
++        E = 256
++        for K in (1, 8, 32, 64):
++            for _ in range(20):
++                counts = torch.randint(0, 1000, (E,), dtype=torch.int64)
++                got = self.ksp._pick_resident_top(counts, K)
++                ref = counts.topk(K).indices.sort().values
++                self.assertTrue(torch.equal(got, ref), f"K={K}: {got} != {ref}")
++                # ascending + within range + no dup
++                self.assertTrue(torch.equal(got, got.sort().values))
++                self.assertEqual(got.unique().numel(), K)
++                self.assertTrue(int(got.min()) >= 0 and int(got.max()) < E)
++
++    def test_set_resident_masks_structures(self):
++        """_set_resident_masks writes exactly: mask True on the resident set, l2g = resident->slot
++        (ascending), -1 elsewhere, and mirrors the mask to the C++-side pinned tensor."""
++        torch.manual_seed(1)
++        E, K = 256, 32
++        for _ in range(20):
++            top = torch.randperm(E)[:K].sort().values
++            wrap = _FakeWrap(E, K)
++            self.ksp._set_resident_masks(wrap, top, K, E)
++
++            exp_mask = torch.zeros(E, dtype=torch.bool)
++            exp_mask[top] = True
++            exp_l2g = torch.full((E,), -1, dtype=torch.int64)
++            exp_l2g[top] = torch.arange(K, dtype=torch.int64)
++
++            self.assertTrue(torch.equal(wrap.gpu_experts_mask, exp_mask))
++            self.assertTrue(torch.equal(wrap.logical_to_gpu_index, exp_l2g))
++            self.assertTrue(torch.equal(wrap.wrapper.gpu_experts_mask, exp_mask))
++            self.assertEqual(int(wrap.gpu_experts_mask.sum()), K)
++            self.assertEqual(int((wrap.logical_to_gpu_index >= 0).sum()), K)
++
++    def test_pick_then_set_roundtrip(self):
++        """The two helpers compose the way both the inline-depool and W8A8 post-pass paths use them:
++        pick top-K from counts, install as the resident set."""
++        torch.manual_seed(2)
++        E, K = 256, 32
++        counts = torch.randint(0, 1000, (E,), dtype=torch.int64)
++        top = self.ksp._pick_resident_top(counts, K)
++        wrap = _FakeWrap(E, K)
++        self.ksp._set_resident_masks(wrap, top.cpu(), K, E)
++        # every resident logical id maps to a distinct slot in [0,K)
++        slots = wrap.logical_to_gpu_index[top]
++        self.assertTrue(torch.equal(slots.sort().values, torch.arange(K, dtype=torch.int64)))
++
++
++if __name__ == "__main__":
++    unittest.main(verbosity=2)

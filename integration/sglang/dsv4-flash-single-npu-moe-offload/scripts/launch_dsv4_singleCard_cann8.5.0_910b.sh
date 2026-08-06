@@ -12,20 +12,21 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# 起 DeepSeek-V4-Flash 单卡推理容器（参考脚本，按需改下面几个可配置项）。
-# 镜像：910B -> lmsysorg/sglang:deepseek-v4-npu-910b ；A3 -> lmsysorg/sglang:deepseek-v4-npu-a3
+# Start the DeepSeek-V4-Flash single-card inference container (reference script; adjust the
+# configurable items below for your host).
+# Images: 910B -> lmsysorg/sglang:deepseek-v4-npu-910b, A3 -> lmsysorg/sglang:deepseek-v4-npu-a3
 set -euo pipefail
 
-# ===== 可配置（按你的环境改）=====
+# ===== Configurable (adjust for your environment) =====
 IMAGE="${IMAGE:-lmsysorg/sglang:deepseek-v4-npu-910b}"
 NAME="${NAME:-dsv4_singlecard}"
-WORKSPACE="${WORKSPACE:?宿主机代码目录（放本工程），将挂到容器 /workspace/code}"
-MODEL_DIR="${MODEL_DIR:?宿主机权重目录（含 W8A8 + MXFP4 两份权重），将挂到 /workspace/models}"
-SERVICE_PORT="${SERVICE_PORT:-8020}"            # 容器内服务端口，映射到宿主同号端口
+WORKSPACE="${WORKSPACE:?host directory holding this project, mounted at /workspace/code}"
+MODEL_DIR="${MODEL_DIR:?host weight directory (both the W8A8 and MXFP4 copies), mounted at /workspace/models}"
+SERVICE_PORT="${SERVICE_PORT:-8020}"            # in-container service port, published on the same host port
 SHM_SIZE="${SHM_SIZE:-16g}"
-NPU_VISIBLE_DEVICES="${NPU_VISIBLE_DEVICES:-auto}"   # auto=挂所有 davinci 卡；或指定 "0,3"
+NPU_VISIBLE_DEVICES="${NPU_VISIBLE_DEVICES:-auto}"   # auto = mount every davinci device; or list them, e.g. "0,3"
 
-# ===== NPU 设备发现 =====
+# ===== NPU device discovery =====
 DEVICES=()
 for d in /dev/davinci_manager /dev/devmm_svm /dev/hisi_hdc; do
   [[ -e "$d" ]] && DEVICES+=(--device "$d")
@@ -40,7 +41,7 @@ else
 fi
 for d in "${DLIST[@]}"; do DEVICES+=(--device "$d"); done
 
-# ===== 驱动 + 数据挂载 =====
+# ===== Driver and data mounts =====
 MOUNTS=(
   -v /usr/local/sbin:/usr/local/sbin
   -v /usr/local/dcmi:/usr/local/dcmi
@@ -62,4 +63,5 @@ docker run --rm -it \
   --shm-size "${SHM_SIZE}" \
   -p "${SERVICE_PORT}:${SERVICE_PORT}" \
   "${IMAGE}" bash
-# 进容器后按 docs/integration/sglang/dsv4-flash-single-npu-moe-offload/dsv4_flash_single_card_inference_guide.md 继续（装 libhwloc → 拉代码 → 打补丁 → 编译 → 转 GGUF → 拉起）。
+# Once inside the container follow docs/integration/sglang/dsv4-flash-single-npu-moe-offload/dsv4_flash_single_card_inference_guide.md
+# (install libhwloc -> clone -> apply patches -> build -> convert GGUF -> launch).

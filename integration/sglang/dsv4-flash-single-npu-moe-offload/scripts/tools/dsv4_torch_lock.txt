@@ -1,0 +1,9 @@
+# pip constraints: pin the torch family already in place so no sglang dependency can move it.
+# Usage:  pip install ... -c tools/dsv4_torch_lock.txt
+# If a dependency insists on a newer torch, pip reports the conflict here instead of silently
+# upgrading -- that is the point at which to stop and look.
+# These versions are the combination verified on A3 with CANN 9.0.0.
+torch==2.8.0+cpu
+torch_npu==2.8.0.post4
+torchvision==0.23.0
+torchaudio==2.11.0+cpu

@@ -168,10 +168,15 @@ def main() -> int:
     _setup_logging()
     ap = argparse.ArgumentParser()
     ap.add_argument("--gguf", type=Path, default=None, help="Converted layer GGUF (layer_test)")
-    ap.add_argument("--model-dir", type=Path, default=Path("/workspace/models/DeepSeekV4/DeepSeek-V4-Flash"))
+    ap.add_argument("--model-dir", type=Path, default=None,
+                    help="Native MXFP4 checkpoint dir (required together with --gguf)")
     ap.add_argument("--layer-idx", type=int, default=16)
     ap.add_argument("--n-experts-check", type=int, default=8)
     args = ap.parse_args()
+
+    if args.gguf is not None and args.model_dir is None:
+        ap.error("--gguf also requires --model-dir (the native MXFP4 checkpoint directory, "
+                 "used for the element-wise comparison)")
 
     rc = unit_test()
     if rc != 0:

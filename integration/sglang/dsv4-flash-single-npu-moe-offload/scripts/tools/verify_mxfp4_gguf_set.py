@@ -14,27 +14,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-MXFP4 GGUF 全集校验（开源交付的验收入口）。三级校验，逐级加强：
+Validate the full MXFP4 GGUF set. Three levels, each stronger than the last:
 
-  L1 完整性（秒级，无依赖）：43 层文件齐全 + 每层大小精确等于期望值。
-     批量/并发转换被中断会留下截断文件（实测踩过：layer9 被写成 576B），
-     大小不对 = 必须重转该层。
-  L2 指纹（分钟级，无依赖）：sha256 与发布清单逐层比对。
-     转换是字节级确定性的（同一 checkpoint + 本仓库 gguf-py 重转 → byte-identical，
-     已验证），所以指纹不匹配 = 转换环境/输入有差异，不要带病上线。
-  L3 数值（需原生 checkpoint 在场）：调 verify_mxfp4_layer.py 抽样若干层做
-     GGUF 反量化 vs 原生反量化的逐元素 bit-exact 对账（无损 repack 的最强证明）。
+  L1 completeness (seconds, no dependencies): all 43 layer files present and each exactly the
+     expected size. An interrupted batch/parallel conversion leaves truncated files (one run
+     left layer9 at 576 B), so a wrong size means that layer must be reconverted.
+  L2 fingerprint (minutes, no dependencies): compare each layer's sha256 against the published
+     manifest. Conversion is byte-deterministic (reconverting the same checkpoint with this
+     repo's gguf-py is byte-identical, verified), so a mismatch means the conversion input or
+     environment differed and the set should not be deployed.
+  L3 numerical (requires the native checkpoint): calls verify_mxfp4_layer.py on a sample of
+     layers to compare GGUF dequantisation against native dequantisation element by element,
+     bit-exact -- the strongest evidence that the repack is lossless.
 
-用法::
+Usage::
 
-  # L1+L2（推荐的部署前标准动作；清单随仓库发布在 tools/mxfp4_gguf_sha256.txt）
+  # L1+L2, the recommended pre-deployment check; the manifest ships as tools/mxfp4_gguf_sha256.txt
   python3 tools/verify_mxfp4_gguf_set.py --dir /path/to/cache \
       --sha256-manifest tools/mxfp4_gguf_sha256.txt
 
-  # 只做 L1（赶时间/磁盘慢）
+  # L1 only (in a hurry, or slow disk)
   python3 tools/verify_mxfp4_gguf_set.py --dir /path/to/cache --skip-sha256
 
-  # 加 L3 深度抽查（需 --model-dir 指向原生 MXFP4 checkpoint）
+  # add the L3 deep sample (--model-dir must point at the native MXFP4 checkpoint)
   python3 tools/verify_mxfp4_gguf_set.py --dir /path/to/cache \
       --sha256-manifest tools/mxfp4_gguf_sha256.txt \
       --deep 3 --model-dir /path/to/DeepSeek-V4-Flash
@@ -51,7 +53,8 @@ from pathlib import Path
 
 logger = logging.getLogger("kt.tools.verify_mxfp4_gguf_set")
 
-# DSv4-Flash 形状下单层 GGUF 的精确字节数（256 专家 × (2×[2048,4096]+[4096,2048]) MXFP4 + header）
+# Exact byte size of one GGUF layer at DSv4-Flash shapes (256 experts x (2x[2048,4096] +
+# [4096,2048]) MXFP4, plus the header)
 EXPECTED_SIZE = 3_422_552_640
 LAYERS = list(range(43))
 
@@ -76,15 +79,18 @@ def _sha256_file(path: Path) -> tuple[str, str]:
 def main() -> int:
     _setup_logging()
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--dir", type=Path, required=True, help="存放 dsv4_layer{L}_mxfp4.gguf 的目录")
+    ap.add_argument("--dir", type=Path, required=True, help="directory holding the dsv4_layer{L}_mxfp4.gguf files")
     ap.add_argument("--name-tpl", type=str, default="dsv4_layer{L}_mxfp4.gguf")
     ap.add_argument("--expected-size", type=int, default=EXPECTED_SIZE)
     ap.add_argument("--sha256-manifest", type=Path, default=None,
-                    help="发布的 sha256 清单（`sha256sum` 格式）；不传且未 --skip-sha256 时仅告警")
+                    help="published sha256 manifest (`sha256sum` format); without it, and "
+                         "without --skip-sha256, L2 only warns")
     ap.add_argument("--skip-sha256", action="store_true")
-    ap.add_argument("--jobs", type=int, default=8, help="sha256 并行度")
-    ap.add_argument("--deep", type=int, default=0, help="L3 逐元素抽查层数（0 关闭；均匀抽样）")
-    ap.add_argument("--model-dir", type=Path, default=None, help="L3 需要：原生 MXFP4 checkpoint 目录")
+    ap.add_argument("--jobs", type=int, default=8, help="sha256 parallelism")
+    ap.add_argument("--deep", type=int, default=0,
+                    help="number of layers for the L3 element-wise sample (0 disables; sampled evenly)")
+    ap.add_argument("--model-dir", type=Path, default=None,
+                    help="required by L3: the native MXFP4 checkpoint directory")
     args = ap.parse_args()
 
     d = args.dir.expanduser().resolve()
@@ -162,7 +168,8 @@ def main() -> int:
                     logger.info((r.stdout + r.stderr)[-800:])
                     fail = True
 
-    logger.info(f"\nRESULT: {'FAIL — 见上方明细，修复后重跑' if fail else 'PASS — 权重集可部署'}")
+    verdict = "FAIL - see the details above, fix and rerun" if fail else "PASS - the weight set is deployable"
+    logger.info(f"\nRESULT: {verdict}")
     return 1 if fail else 0
 
 

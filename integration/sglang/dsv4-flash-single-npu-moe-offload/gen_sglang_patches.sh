@@ -27,21 +27,32 @@ gen() { local out="$1"; shift
   printf "  %-52s %5s lines\n" "$out" "$(wc -l < "$OUT/$out")"; }
 
 echo "Generating sglang patches (base=$BASE):"
-# 0001 — NPU KV / triton-ascend fallback to torch-equivalent (clean: auto-detect, no env)
+# 0001 — NPU KV / triton-ascend fallback to torch-equivalent (auto-detect, no env switch)
 gen 0001-sglang-npu-kv-triton-fallback.patch \
   python/sglang/srt/hardware_backend/npu/allocator_npu.py \
   python/sglang/srt/mem_cache/common.py \
   python/sglang/srt/hardware_backend/npu/attention/ascend_backend.py \
   python/sglang/srt/layers/moe/fused_moe_triton/layer.py
-# 0002 — KT EP wrapper (CPU MoE offload) + hot-expert masks + scheduler/accel/args
+# 0002 — KT EP wrapper (CPU MoE offload) + expert placement + scheduler/accel/args
 gen 0002-sglang-kt-ep-cpu-moe-offload.patch \
   python/sglang/srt/layers/moe/kt_ep_wrapper.py \
   python/sglang/srt/layers/moe/kt_expert_masks.py \
   python/sglang/srt/managers/scheduler.py \
   python/sglang/srt/utils/kt_accel.py \
   python/sglang/srt/environ.py \
-  python/sglang/srt/server_args.py
-# 0003 — packaging (Ascend/NPU build config)
-gen 0003-sglang-packaging.patch \
+  python/sglang/srt/server_args.py \
+  python/sglang/srt/models/deepseek_v2.py \
+  test/manual/ascend/test_kt_cleanup_equiv.py
+# 0003 — streaming prefill + depool (AscendC MXFP4 op) + dynamic-resident + GGUF dedup
+gen 0003-sglang-streaming-prefill-depool.patch \
+  python/sglang/srt/layers/moe/kt_stream_prefill.py
+# 0004 — NSA compressor mode (CANN 8.5.0 / 9.0.0 compat) + NPU memory pools
+gen 0004-sglang-nsa-compressor-and-mem-pools.patch \
+  python/sglang/srt/hardware_backend/npu/nsa_compressor_mode.py \
+  python/sglang/srt/layers/attention/nsa/nsa_indexer.py \
+  python/sglang/srt/hardware_backend/npu/memory_pool_npu.py \
+  python/sglang/srt/hardware_backend/npu/hybrid_swa_c4_c128_memory_pool.py
+# 0005 — packaging (Ascend/NPU build config)
+gen 0005-sglang-packaging.patch \
   python/pyproject.toml python/pyproject_npu.toml
 echo "Done."

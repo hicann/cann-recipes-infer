@@ -13,19 +13,21 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""CPU MoE 数值对账（MXFP4）：KTMoEWrapper(LLAMAFILE, MXFP4 GGUF) vs torch 参考。
+"""Numerical check of the CPU MoE (MXFP4): KTMoEWrapper(LLAMAFILE, MXFP4 GGUF) vs a torch reference.
 
-参考权重直接 dequant **同一份原生 MXFP4 权重**（不是 W8A8），cand 与 ref 用完全相同的母权重，
-唯一数值损失源是 kernel 内部把激活量化到 Q8_0（ggml_vec_dot_mxfp4_q8_0 的 vec_dot_type=Q8_0），
-因此阈值 cosine >= 0.999。
+The reference dequantises the SAME native MXFP4 weights (not the W8A8 copy), so candidate and
+reference share one parent weight and the only source of numerical loss is the kernel quantising
+activations to Q8_0 (vec_dot_type=Q8_0 in ggml_vec_dot_mxfp4_q8_0). Hence the cosine >= 0.999
+threshold.
 
-dequant 语义见 ``verify_mxfp4_layer.dequant_native``：value = FP4_TABLE[nibble] *
-2^(e-127)，byte i -> Kpos 2i(lo),2i+1(hi)（原生 consecutive 排布，与转换器一致）。
+Dequantisation semantics are in ``verify_mxfp4_layer.dequant_native``: value = FP4_TABLE[nibble]
+* 2^(e-127), with byte i mapping to Kpos 2i (lo) and 2i+1 (hi) -- the native consecutive layout,
+matching the converter.
 
-用法::
+Usage::
   python tools/cpu_moe_reference_check_mxfp4.py \
-    --model-dir <原生 MXFP4 模型目录> \
-    --gguf <GGUF 缓存目录>/dsv4_layer16_mxfp4.gguf \
+    --model-dir <native MXFP4 model directory> \
+    --gguf <GGUF cache directory>/dsv4_layer16_mxfp4.gguf \
     --layer-idx 16 --batch 4 --seed 1
 """
 from __future__ import annotations
@@ -86,10 +88,11 @@ def _setup_logging() -> None:
     logging.basicConfig(level=logging.INFO, format="%(message)s", handlers=[out, err])
 
 
-# --- 通用 helper（pin_memory patch / reference forward / cosine / device·stream）---
+# --- helpers: pin_memory patch / reference forward / cosine / device and stream ---
 def _ensure_pin_memory_or_patch() -> None:
-    """探测 host pin_memory 分配器；不可用则把 torch.empty 的 pin_memory=True 降级为 False
-    （KTMoEWrapper 会请求 pin memory，但本离线对账不真正需要 pin）。"""
+    """Probe the host pin_memory allocator and, when it is unavailable, downgrade torch.empty's
+    pin_memory=True to False. KTMoEWrapper asks for pinned memory, but this offline check does
+    not actually need it."""
     try:
         _ = torch.empty(1, dtype=torch.bool, device="cpu", pin_memory=True)
         return
@@ -106,13 +109,13 @@ def _ensure_pin_memory_or_patch() -> None:
         return _orig_empty(*args, **kwargs)
 
     torch.empty = _empty_no_pin  # type: ignore[assignment]
-    logger.error("[warn] pin_memory allocator 不可用，已把 pin_memory=True 降级为 False。")
+    logger.error("[warn] pin_memory allocator unavailable; downgraded pin_memory=True to False.")
 
 
 def reference_moe_forward(hidden, topk_ids, topk_weights, experts: Experts):
-    """Pure-PyTorch DSv4 MoE forward (fp32 累加，慢但精确)。
+    """Pure-PyTorch DSv4 MoE forward (fp32 accumulation: slow but exact).
 
-    experts.w1/.w3=(E,I,H)、experts.w2=(E,H,I)。每 token i 对每个 topk k：
+    experts.w1/.w3=(E,I,H), experts.w2=(E,H,I). For each token i and each topk k:
     out_i += weight * (SiLU(h@w1[e].T) * (h@w3[e].T)) @ w2[e].T。
     """
     w1, w3, w2 = experts
@@ -139,7 +142,8 @@ def cosine_sim(a, b):
 
 
 def _resolve_device_and_stream(want: str, npu_id: int):
-    """为 cpu_infer 选 device + 匹配 stream handle（非 cpu 设备 handle=0 会让 CPU 任务不触发→输出全零）。"""
+    """Pick the device and matching stream handle for cpu_infer. On a non-CPU device a handle of 0
+    leaves the CPU task untriggered and the output all zeros."""
     if want == "cuda":
         if not torch.cuda.is_available():
             raise RuntimeError("--device cuda but torch.cuda.is_available()=False")
@@ -147,7 +151,7 @@ def _resolve_device_and_stream(want: str, npu_id: int):
         return device, int(torch.cuda.current_stream(device).cuda_stream)
     if want == "npu":
         if torch_npu is None:
-            raise RuntimeError("--device npu but `import torch_npu` failed（torch/torch_npu 版本须一致）。")
+            raise RuntimeError("--device npu but `import torch_npu` failed (torch and torch_npu versions must match).")
         if not torch.npu.is_available():
             raise RuntimeError("--device npu but torch.npu.is_available()=False")
         device = torch.device("npu", npu_id)
@@ -193,7 +197,8 @@ def reference_moe_forward_dict(hidden, topk_ids, topk_weights, experts: Experts)
 def main() -> int:
     _setup_logging()
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--model-dir", type=Path, default=Path("/workspace/models/DeepSeekV4/DeepSeek-V4-Flash"))
+    ap.add_argument("--model-dir", type=Path, required=True,
+                    help="Native MXFP4 model dir (HuggingFace DeepSeek-V4-Flash)")
     ap.add_argument("--gguf", type=Path, required=True)
     ap.add_argument("--layer-idx", type=int, required=True)
     ap.add_argument("--num-experts", type=int, default=256)
@@ -214,13 +219,13 @@ def main() -> int:
     model_dir = args.model_dir.expanduser().resolve()
     gguf_file = args.gguf.expanduser().resolve()
     if not gguf_file.is_file():
-        logger.error(f"ERROR: GGUF 不存在: {gguf_file}")
+        logger.error(f"ERROR: GGUF not found: {gguf_file}")
         return 2
 
     device, stream_handle = _resolve_device_and_stream(args.device, args.npu_id)
     logger.info(f"[env] device={device} stream_handle={stream_handle}")
     if stream_handle == 0 and device.type != "cpu":
-        logger.error("ERROR: stream_handle=0 非 cpu device → task 不触发")
+        logger.error("ERROR: stream_handle=0 on a non-CPU device; the task will not be triggered")
         return 2
 
     torch.manual_seed(args.seed)
@@ -237,7 +242,7 @@ def main() -> int:
     try:
         from kt_kernel import KTMoEWrapper
     except ImportError as e:
-        logger.error(f"ERROR: import kt_kernel 失败: {e}")
+        logger.error(f"ERROR: importing kt_kernel failed: {e}")
         return 2
 
     gpu_mask = torch.zeros(args.num_experts, dtype=torch.bool)
@@ -281,10 +286,10 @@ def main() -> int:
     max_abs = float((a - b).abs().max().item())
     max_rel = max_abs / (float(b.abs().max().item()) + 1e-12)
 
-    logger.info("\n=== 数值对账 (MXFP4) ===")
-    logger.info(f"  cosine_sim   = {cos:.6f}     (期望 >= {args.cos_min:.4f})")
+    logger.info("\n=== Numerical comparison (MXFP4) ===")
+    logger.info(f"  cosine_sim   = {cos:.6f}     (expected >= {args.cos_min:.4f})")
     logger.info(f"  max_abs_err  = {max_abs:.4e}")
-    logger.info(f"  max_rel_err  = {max_rel:.4%}   (期望 <= {args.rel_tol:.2%})")
+    logger.info(f"  max_rel_err  = {max_rel:.4%}   (expected <= {args.rel_tol:.2%})")
     logger.info(f"  ref  L2/max  = {b.norm():.4e} / {b.abs().max():.4e}")
     logger.info(f"  cand L2/max  = {a.norm():.4e} / {a.abs().max():.4e}")
     logger.info(f"  finite(cand) = {cand_finite}")
@@ -294,9 +299,10 @@ def main() -> int:
 
     mismatch = (not cand_finite) or math.isnan(cos) or cos < args.cos_min or max_rel > args.rel_tol
     if mismatch:
-        logger.error("RESULT: FAIL — MXFP4 CPU MoE 与参考不一致（kernel/转换器/nibble 序 之一有误）。")
+        logger.error("RESULT: FAIL - the MXFP4 CPU MoE disagrees with the reference "
+                     "(kernel, converter or nibble order is wrong).")
         return 1
-    logger.info("RESULT: PASS — MXFP4 kernel 数值正确（唯一损失源为激活 Q8 量化）。")
+    logger.info("RESULT: PASS - the MXFP4 kernel is numerically correct (activation Q8 quantisation is the only loss).")
     return 0
 
 

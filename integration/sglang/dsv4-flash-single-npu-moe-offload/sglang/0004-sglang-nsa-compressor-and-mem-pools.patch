@@ -1,0 +1,345 @@
+diff --git a/python/sglang/srt/hardware_backend/npu/hybrid_swa_c4_c128_memory_pool.py b/python/sglang/srt/hardware_backend/npu/hybrid_swa_c4_c128_memory_pool.py
+index 10920b2df..5f51b48af 100644
+--- a/python/sglang/srt/hardware_backend/npu/hybrid_swa_c4_c128_memory_pool.py
++++ b/python/sglang/srt/hardware_backend/npu/hybrid_swa_c4_c128_memory_pool.py
+@@ -9,6 +9,9 @@ from sglang.srt.hardware_backend.npu.memory_pool_npu import (
+     NPUMHATokenToKVPool,
+     NPUSingleBufferTokenToKVPool,
+ )
++from sglang.srt.hardware_backend.npu.nsa_compressor_mode import (
++    use_single_state_compressor,
++)
+ from sglang.srt.layers.radix_attention import RadixAttention
+ from sglang.srt.mem_cache.allocator import (
+     BaseTokenToKVPoolAllocator,
+@@ -129,11 +132,17 @@ class SWAC4C128KVPool(KVCache):
+         )
+         overlap_size = 2
+         self.state_dtype = torch.float32
++        # Interleaved [kv|score] state layout is required by (and only by) the
++        # public single-state compressor op (CANN 9.0.0+). On the CANN 8.5.0
++        # private split-state image this is False → the pool keeps two separate
++        # kv/score buffers (original fork behavior). See nsa_compressor_mode.
++        _interleave = use_single_state_compressor()
+         self.c4_state_pool = NPUMHATokenToKVPool(
+             size=size_c4_state,
+             dtype=self.state_dtype,
+             layer_num=self.c4_layer_nums,
+             head_dim=head_dim * overlap_size,
++            compress_state_interleave=_interleave,
+             **kwargs_,
+         )
+         self.c4_index_state_pool = NPUMHATokenToKVPool(
+@@ -141,6 +150,7 @@ class SWAC4C128KVPool(KVCache):
+             dtype=self.state_dtype,
+             layer_num=self.c4_layer_nums,
+             head_dim=indexer_head_dim * overlap_size,
++            compress_state_interleave=_interleave,
+             **kwargs_,
+         )
+         self.c128_kv_pool = token_to_kv_pool_class(
+@@ -155,6 +165,7 @@ class SWAC4C128KVPool(KVCache):
+             dtype=self.state_dtype,
+             layer_num=self.c128_layer_nums,
+             head_dim=head_dim,
++            compress_state_interleave=_interleave,
+             **kwargs_,
+         )
+         # {layer_id: (index, is_c4, is_c8)}
+@@ -341,6 +352,18 @@ class SWAC4C128KVPool(KVCache):
+             score_state = score_state[loc]
+         return kv_state, score_state
+ 
++    def get_compress_state_cache(self, layer_id: int, from_indexer: bool = False):
++        # Single contiguous interleaved state_cache ([page_num, page_size, 2*coff*d],
++        # per row [kv | score]) for the compressor/sparse kernels.
++        layer_id_pool, _, is_c128_layer = self.layers_mapping[layer_id]
++        if is_c128_layer:
++            state_pool = self.c128_state_pool
++        else:
++            state_pool = (
++                self.c4_index_state_pool if from_indexer else self.c4_state_pool
++            )
++        return state_pool.get_compress_state_cache(layer_id_pool)
++
+     def get_compress_dequant_scale_buffer(
+         self, layer_id: int, from_indexer: bool = False, loc: torch.Tensor = None
+     ):
+diff --git a/python/sglang/srt/hardware_backend/npu/memory_pool_npu.py b/python/sglang/srt/hardware_backend/npu/memory_pool_npu.py
+index 9c1519b2c..45a3341c0 100644
+--- a/python/sglang/srt/hardware_backend/npu/memory_pool_npu.py
++++ b/python/sglang/srt/hardware_backend/npu/memory_pool_npu.py
+@@ -31,8 +31,16 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
+         end_layer: Optional[int] = None,
+         enable_alt_stream: bool = True,
+         enable_kv_cache_copy: bool = False,
++        compress_state_interleave: bool = False,
+     ):
+         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
++        # When True, k/score are stored INTERLEAVED per row in one buffer:
++        # [page_num, page_size, 2, head_num, head_dim] -> state_cache view
++        # [page_num, page_size, 2*head_num*head_dim] = [kv(coff*d) | score(coff*d)],
++        # which is the layout the ops-transformer `compressor`/sparse kernels expect
++        # (stateOffset = page*stride + row*2*coff*d + stateIdx*coff*d). k/v are strided
++        # views for reads; writes go through the interleaved path in set_kv_buffer.
++        self.compress_state_interleave = compress_state_interleave
+         super().__init__(
+             size=size,
+             page_size=page_size,
+@@ -54,6 +62,27 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
+             # The padded slot 0 is used for writing dummy outputs from padded tokens.
+             # Continuous memory improves the efficiency of Ascend`s transmission backend,
+             # while other backends remain unchanged.
++            if self.compress_state_interleave:
++                # Interleave dim (size 2: kv / score) sits just before head dims so that
++                # per-layer reshape to [page_num, page_size, 2*head_num*head_dim] is
++                # contiguous (= [kv | score] per row), matching the compressor kernel.
++                self.kv_buffer = torch.zeros(
++                    (
++                        self.layer_num,
++                        self.size // self.page_size + 1,
++                        self.page_size,
++                        2,
++                        self.head_num,
++                        self.head_dim,
++                    ),
++                    dtype=self.store_dtype,
++                    device=self.device,
++                )
++                # Strided views into the interleaved buffer (correct for reads).
++                self.k_buffer = self.kv_buffer[:, :, :, 0]
++                self.v_buffer = self.kv_buffer[:, :, :, 1]
++                return
++
+             self.kv_buffer = torch.zeros(
+                 (
+                     2,
+@@ -145,6 +174,16 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
+             cache_v = cache_v.view(self.store_dtype)
+ 
+         assert loc.numel() == cache_k.shape[0], f"{loc.numel()=} vs {cache_k.shape[0]=}"
++        if self.compress_state_interleave:
++            # Write kv -> [..., 0, :, :] and score -> [..., 1, :, :] of the interleaved
++            # buffer at slot positions `loc`. reshape_and_cache/scatter assume contiguous
++            # caches, so do an explicit indexed write into the contiguous interleaved buf.
++            buf_l = self.kv_buffer[layer_id - self.start_layer]
++            flat = buf_l.view(-1, 2, self.head_num, self.head_dim)
++            loc = loc.to(torch.long).view(-1)
++            flat[loc, 0] = cache_k.reshape(-1, self.head_num, self.head_dim)
++            flat[loc, 1] = cache_v.reshape(-1, self.head_num, self.head_dim)
++            return
+         if self.use_fia:
+             k_buffer_layer = self.k_buffer[layer_id - self.start_layer]
+             v_buffer_layer = self.v_buffer[layer_id - self.start_layer]
+@@ -173,6 +212,15 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
+                 slot_indices=loc,
+             )
+ 
++    def get_compress_state_cache(self, layer_id: int):
++        # Contiguous interleaved state_cache for the compressor/sparse kernels:
++        # [page_num, page_size, 2*head_num*head_dim] (per row: [kv(coff*d) | score(coff*d)]).
++        assert self.compress_state_interleave
++        buf_l = self.kv_buffer[layer_id - self.start_layer]
++        return buf_l.reshape(
++            buf_l.shape[0], self.page_size, 2 * self.head_num * self.head_dim
++        )
++
+ 
+ class NPUMLATokenToKVPool(MLATokenToKVPool):
+ 
+diff --git a/python/sglang/srt/hardware_backend/npu/nsa_compressor_mode.py b/python/sglang/srt/hardware_backend/npu/nsa_compressor_mode.py
+new file mode 100644
+index 000000000..1c7fabcb5
+--- /dev/null
++++ b/python/sglang/srt/hardware_backend/npu/nsa_compressor_mode.py
+@@ -0,0 +1,42 @@
++"""Select the NSA compressor calling convention (single-state vs split-state).
++
++Two mutually-exclusive ``torch.ops.custom.compressor`` ABIs exist across CANN
++versions, and this branch (dsv4_one_card_dev) must run on both images. The
++convention is chosen **purely by an environment variable** (no autodetection):
++
++  ``KT_NSA_COMPRESSOR_MODE`` = ``split`` (default) | ``single``
++
++  * ``split``  — CANN 8.5.0 **private** 19-arg ``compressor(kv_state,
++                 score_state, kv_block_table, score_block_table, ...)`` over TWO
++                 separate paged buffers. This is the ORIGINAL fork behavior and
++                 the **default**, so the legacy 8.5.0 repro image is never
++                 broken by pulling this branch.
++  * ``single`` — CANN 9.0.0+ **public** 18-arg ``compressor(state_cache,
++                 state_block_table, ...)`` over ONE interleaved ``[kv | score]``
++                 paged buffer. Set this explicitly on 9.0.0 boxes.
++
++The two are incompatible (buffer layout + kwarg names differ), hence the hard
++switch instead of a runtime fallback.
++"""
++
++import functools
++import os
++
++_SINGLE = {"single", "1", "true", "public", "9", "9.0.0"}
++_SPLIT = {"split", "0", "false", "private", "8", "8.5.0", ""}
++
++
++@functools.lru_cache(maxsize=1)
++def use_single_state_compressor() -> bool:
++    """True → public 18-arg single-state op; False → private 19-arg split-state.
++
++    Controlled only by ``KT_NSA_COMPRESSOR_MODE`` (default ``split``).
++    """
++    mode = os.environ.get("KT_NSA_COMPRESSOR_MODE", "split").strip().lower()
++    if mode in _SINGLE:
++        return True
++    if mode in _SPLIT:
++        return False
++    raise ValueError(
++        f"KT_NSA_COMPRESSOR_MODE must be one of single|split, got {mode!r}"
++    )
+diff --git a/python/sglang/srt/layers/attention/nsa/nsa_indexer.py b/python/sglang/srt/layers/attention/nsa/nsa_indexer.py
+index 9af0d5a81..eb2874212 100644
+--- a/python/sglang/srt/layers/attention/nsa/nsa_indexer.py
++++ b/python/sglang/srt/layers/attention/nsa/nsa_indexer.py
+@@ -53,6 +53,9 @@ from sglang.srt.distributed import (
+     get_attn_context_model_parallel_world_size,
+ )
+ from sglang.srt.distributed.parallel_state import get_pp_group
++from sglang.srt.hardware_backend.npu.nsa_compressor_mode import (
++    use_single_state_compressor,
++)
+ from sglang.srt.layers import deep_gemm_wrapper
+ from sglang.srt.layers.attention.nsa.utils import (
+     cp_all_gather_rerange_output,
+@@ -451,50 +454,92 @@ class Compressor(nn.Module):
+                 forward_batch.attn_backend.forward_metadata.c128_state_page_table
+             )
+ 
+-        kv_state, score_state = (
+-            forward_batch.token_to_kv_pool.get_compress_state_buffer(
+-                self.layer_id, self.from_indexer
+-            )
+-        )  # [page_num, page_size, 1, (1+overlap)*dim]
+-        kv_state = kv_state.squeeze(-2).view(
+-            -1, forward_batch.token_to_kv_pool.page_size, kv_state.shape[-1]
+-        )
+-        score_state = score_state.squeeze(-2).view(
+-            -1, forward_batch.token_to_kv_pool.page_size, score_state.shape[-1]
+-        )
+-
+         coff = 1 + overlap
+-        assert kv_state.dtype == torch.float32
+-        assert (
+-            kv_state.shape[-1] == coff * d
+-        ), f"slot_dim={kv_state.shape[-1]} != (1+overlap)*dim={coff * d}"
+-
+         start_pos = forward_batch.attn_backend.forward_metadata.start_pos
+         seqused = forward_batch.attn_backend.forward_metadata.seqused
+-        cmpr_input_kwargs = {
+-            "x": x,
+-            "wkv": self.wkv.weight,
+-            "wgate": self.wgate.weight,
+-            "kv_state": kv_state,
+-            "score_state": score_state,
+-            "ape": self.ape,
+-            "norm_weight": self.norm.weight.to(torch.bfloat16),
+-            "rope_cos": cos,
+-            "rope_sin": sin,
+-            "kv_block_table": page_table,
+-            "score_block_table": page_table,
+-            "cu_seqlens": cu_seqlens,  # only required for tnd
+-            "seqused": seqused,  # None: use all
+-            "start_pos": start_pos,  # does not accept None
+-            "rope_head_dim": self.rope_head_dim,
+-            "cmp_ratio": ratio,
+-            "coff": coff,
+-            "norm_eps": self.norm.variance_epsilon,
+-            "rotary_mode": 2,  # 1: halRf; 2: interleave
+-        }
+-        kv = torch.ops.custom.compressor(**cmpr_input_kwargs)[
+-            0
+-        ]  # (kv_compressed_tokens, self.head_dim)
++
++        if use_single_state_compressor():
++            # CANN 9.0.0+ public op: kv/score INTERLEAVED in one state_cache
++            # ([page_num, page_size, 2*coff*d], per row [kv(coff*d) | score(coff*d)]),
++            # exactly the layout the single-`state_cache` kernel expects
++            # (stateOffset = page*stride + row*2*coff*d + stateIdx*coff*d).
++            state_cache = forward_batch.token_to_kv_pool.get_compress_state_cache(
++                self.layer_id, self.from_indexer
++            )  # [page_num, page_size, 2*(1+overlap)*dim]
++            assert state_cache.dtype == torch.float32
++            assert (
++                state_cache.shape[-1] == 2 * coff * d
++            ), f"interleaved slot_dim={state_cache.shape[-1]} != 2*(1+overlap)*dim={2 * coff * d}"
++            cmpr_input_kwargs = {
++                "x": x,
++                "wkv": self.wkv.weight,
++                "wgate": self.wgate.weight,
++                "state_cache": state_cache,
++                "ape": self.ape,
++                # Public compressor kernel requires fp32 norm_weight / rope sin & cos
++                # (dtype support list is normWeight/ropeSin/ropeCos = DT_FLOAT).
++                "norm_weight": self.norm.weight.to(torch.float32),
++                "rope_cos": cos.to(torch.float32),
++                "rope_sin": sin.to(torch.float32),
++                "rope_head_dim": self.rope_head_dim,
++                "cmp_ratio": ratio,
++                "state_block_table": page_table,
++                "cu_seqlens": cu_seqlens,  # fork passes it in both prefill & decode
++                # golden passes seqused only in prefill; decode uses all (None).
++                # cu_seqlens=None crashes the public op in decode/TND, so keep that;
++                # this seqused gating is accuracy-neutral (~70% single run) but more
++                # faithful to the reference. See dsv4-910c-accuracy-regression memory.
++                "seqused": seqused if is_prefill else None,  # None: use all
++                "start_pos": start_pos,  # does not accept None
++                "coff": coff,
++                "norm_eps": self.norm.variance_epsilon,
++                "rotary_mode": 2,  # 1: half; 2: interleave
++            }
++            # Public binding returns a single Tensor [kv_compressed_tokens, head_dim]
++            # (schema `-> (Tensor)`); do NOT index [0]. Matches cann-recipes.
++            kv = torch.ops.custom.compressor(**cmpr_input_kwargs)
++        else:
++            # CANN 8.5.0 private op: TWO separate paged buffers (original fork),
++            # 19-arg split-state signature. Preserved for the old repro image.
++            kv_state, score_state = (
++                forward_batch.token_to_kv_pool.get_compress_state_buffer(
++                    self.layer_id, self.from_indexer
++                )
++            )  # [page_num, page_size, 1, (1+overlap)*dim]
++            kv_state = kv_state.squeeze(-2).view(
++                -1, forward_batch.token_to_kv_pool.page_size, kv_state.shape[-1]
++            )
++            score_state = score_state.squeeze(-2).view(
++                -1, forward_batch.token_to_kv_pool.page_size, score_state.shape[-1]
++            )
++            assert kv_state.dtype == torch.float32
++            assert (
++                kv_state.shape[-1] == coff * d
++            ), f"slot_dim={kv_state.shape[-1]} != (1+overlap)*dim={coff * d}"
++            cmpr_input_kwargs = {
++                "x": x,
++                "wkv": self.wkv.weight,
++                "wgate": self.wgate.weight,
++                "kv_state": kv_state,
++                "score_state": score_state,
++                "ape": self.ape,
++                "norm_weight": self.norm.weight.to(torch.bfloat16),
++                "rope_cos": cos,
++                "rope_sin": sin,
++                "kv_block_table": page_table,
++                "score_block_table": page_table,
++                "cu_seqlens": cu_seqlens,  # only required for tnd
++                "seqused": seqused,  # None: use all
++                "start_pos": start_pos,  # does not accept None
++                "rope_head_dim": self.rope_head_dim,
++                "cmp_ratio": ratio,
++                "coff": coff,
++                "norm_eps": self.norm.variance_epsilon,
++                "rotary_mode": 2,  # 1: halRf; 2: interleave
++            }
++            kv = torch.ops.custom.compressor(**cmpr_input_kwargs)[
++                0
++            ]  # (kv_compressed_tokens, self.head_dim)
+ 
+         if ratio == 4:
+             loc = forward_batch.attn_backend.forward_metadata.c4_loc

@@ -21,6 +21,7 @@
 
 ## 📰 最新动态
 
+- [2026/08] DeepSeek-V4-Flash 模型在昇腾 910B/A3 上已支持 **单卡推理部署**：attention 与热专家基于NPU计算，其余 MoE 专家 offload 到 Kunpeng CPU 并以原生 MXFP4 计算，decode 约 19–22.5 tok/s。**支持CANNLab lite-infer-and-train镜像部署**。
 - [2026/08] BaiLing-V3 模型在昇腾 Atlas A2/A3系列上已 **0day 支持推理部署**
 - [2026/07] daVinci-MagiHuman模型在昇腾Atlas A2/A3系列上已支持推理部署
 - [2026/07] Kimi K3 模型在昇腾 950PR/DT 系列上已 **0day 支持推理部署**
@@ -101,6 +102,7 @@ cann-recipes-infer 仓库旨在针对 LLM 与多模态模型推理业务中的�
 
 | 模型实践 | 简介 |
 |-----|-----|
+|[DeepSeek-V4-Flash 单卡](integration/sglang/dsv4-flash-single-npu-moe-offload/README.md#快速开始)|在 Atlas A3 单卡环境中完成 DeepSeek-V4-Flash 推理，MoE 专家 offload 到 Kunpeng CPU，针对CANNLab一站式开发平台场景提供从未定制的 CANN 9.0.0 镜像起分阶段安装依赖与自定义算子的启动流程，帮助用户快速上手完成一次端到端 NPU 推理体验。|
 |[SANA-Video](models/sana-video/README.md#cannlab一站式开发平台的快速启动)|基于PyTorch框架，在Atlas A2/A3环境中完成SANA-Video单卡文生视频推理，针对CANNLab一站式开发平台场景提供简化的启动流程，帮助用户快速上手完成一次端到端 NPU 推理体验。|
 |[HunyuanVideo](models/hunyuan-video/README.md#cannlab一站式开发平台的快速启动)|基于PyTorch框架，在Atlas A2/A3环境中完成HunyuanVideo单卡文生视频推理，针对CANNLab一站式开发平台场景提供简化的启动流程，帮助用户快速上手完成一次端到端 NPU 推理体验。|
 |[Wan2.2-I2V](models/wan2.2-i2v/README.md#cannlab一站式开发平台的快速启动)|基于PyTorch框架，在Atlas A2/A3环境中完成Wan2.2-I2V单卡图生视频推理，针对CANNLab一站式开发平台场景提供简化的启动流程，帮助用户快速上手完成一次端到端 NPU 推理体验。|
@@ -154,6 +156,7 @@ bash infer.sh
 | [Kimi-K3](models/kimi_k3/README.md)                     |基于Transformers库，在昇腾950PR/DT环境中完成Kimi-K3混合注意力MoE模型的推理部署，KDA接入框架Mamba Cache，Routed Expert采用原生MXFP4权重与动态MXFP8激活，使能图模式编译与多流并行等优化特性。
 | [GLM-5.2](models/glm_5_2/README.md)                     |基于Transformers库，沿用 DSA + MoE + MTP 结构，新增 IndexShare（跨层 top-k 复用），支持 W8A8 量化与 KV Offload 长序列部署。
 | [DeepSeek-V4](models/deepseek_v4/README.md)             |支持Atlas A3和950PR/DT多代际昇腾芯片，兼具1M长序列推理能力与超低交互时延表现，为DeepSeek模型支持Agentic应用提供计算底座，满足千行百业灵活要求。
+| [DeepSeek-V4-Flash 单卡（NPU + CPU MoE offload）](integration/sglang/dsv4-flash-single-npu-moe-offload/README.md) |基于SGLang框架，在**单张**Atlas A3（或910B）+ Kunpeng CPU上完成DeepSeek-V4-Flash推理：attention/shared/router/热专家走NPU W8A8，其余专家offload到CPU并以原生MXFP4计算，使能动态热专家常驻、长序列流式prefill、AscendC MXFP4算子在线转换、CPU↔NPU多流overlap等优化，A3实测decode约19–22.5 tok/s。端到端部署步骤见[使用指南](docs/integration/sglang/dsv4-flash-single-npu-moe-offload/dsv4_flash_single_card_inference_guide.md)。
 | [Qwen3.5](models/qwen3_5/README.md)                 |基于Transformers库，在Atlas A3环境中完成Qwen3.5模型文生文通路适配优化，支持TP/EP并行部署，使能融合算子、图模式编译等优化特性。
 | [HunyuanVideo](models/hunyuan-video/README.md)          |基于xDiT框架，在Atlas A2环境中采用了Ulysses序列并行和RingAttention序列并行策略，同时适配了FBCache和TeaCache加速。
 | [Qwen Dense (Qwen3-8B / Qwen2.5-7B-Instruct)](models/qwen/README.md)|基于Transformers库，在Atlas A2/A3环境中完成Qwen2/Qwen3 Dense模型推理适配，通过config自动识别模型变体，使能融合算子、图模式编译、Packed Sequence（TND格式）、Page Attention等优化特性。

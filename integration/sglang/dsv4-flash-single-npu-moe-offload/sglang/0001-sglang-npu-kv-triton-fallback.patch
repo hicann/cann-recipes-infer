@@ -1,22 +1,29 @@
 diff --git a/python/sglang/srt/hardware_backend/npu/allocator_npu.py b/python/sglang/srt/hardware_backend/npu/allocator_npu.py
-index c7a9f8c1d..30da384f4 100644
+index c7a9f8c1d..80910c12e 100644
 --- a/python/sglang/srt/hardware_backend/npu/allocator_npu.py
 +++ b/python/sglang/srt/hardware_backend/npu/allocator_npu.py
-@@ -15,6 +15,39 @@ if TYPE_CHECKING:
+@@ -1,4 +1,5 @@
+ import logging
++import os
+ from typing import TYPE_CHECKING
+ 
+ import torch
+@@ -15,6 +16,40 @@ if TYPE_CHECKING:
      from sglang.srt.mem_cache.memory_pool import KVCache
  
  
 +# ---------------------------------------------------------------------------
 +# Triton availability probe (single-card NPU + KT downstream patch)
 +# ---------------------------------------------------------------------------
-+# 上游 `sgl_kernel_npu.mem_cache.allocator.alloc_extend_kernel` 是个 ``@triton.jit``
-+# 内核，需要 triton-ascend 后端注册到 ``triton.runtime.driver``。在我们这台 NPU
-+# docker 里 ``triton 3.7`` 与 ``triton-ascend 3.2`` 是版本错配（ascend/compiler.py
-+# 引用了 upstream 已删除的 ``AttrsDescriptor``），后端注册失败，调用就会抛
-+# ``RuntimeError: 0 active drivers ([])``；而本文件已经自带的 ``alloc_extend_naive``
-+# 是纯 PyTorch 等价实现，bs 较小时性能差异可以忽略。我们在 import 期做一次性探测，
-+# 失败则把后续 prefill 全部切到 naive 分支（triton×ascend 版本错配下这是常态，
-+# 自动回退即可，无需任何开关）。
++# Upstream `sgl_kernel_npu.mem_cache.allocator.alloc_extend_kernel` is a ``@triton.jit`` kernel and
++# needs the triton-ascend backend registered with ``triton.runtime.driver``. When ``triton 3.7`` and
++# ``triton-ascend 3.2`` are mismatched (ascend/compiler.py references ``AttrsDescriptor``, which
++# upstream removed), backend registration fails and any call raises
++# ``RuntimeError: 0 active drivers ([])``. This file already carries ``alloc_extend_naive``, a pure
++# PyTorch equivalent whose performance difference is negligible at small batch sizes. So the driver
++# is probed once at import time and, if it is unusable, every later prefill takes the naive branch.
++# A triton/ascend version mismatch is common, and detecting it automatically avoids needing a
++# switch for it.
 +def _detect_triton_driver_available() -> bool:
 +    try:
 +        # triton ships no type stubs; this is the availability probe whose failure falls back to the
@@ -42,7 +49,7 @@ index c7a9f8c1d..30da384f4 100644
  class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
      def __init__(
          self,
-@@ -56,7 +89,7 @@ class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
+@@ -56,7 +91,7 @@ class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
              )
              return None
  
@@ -52,15 +59,16 @@ index c7a9f8c1d..30da384f4 100644
  
              out_indices = torch.empty(
 diff --git a/python/sglang/srt/hardware_backend/npu/attention/ascend_backend.py b/python/sglang/srt/hardware_backend/npu/attention/ascend_backend.py
-index 430bee910..b10fa5f1e 100644
+index 430bee910..dbedcb118 100644
 --- a/python/sglang/srt/hardware_backend/npu/attention/ascend_backend.py
 +++ b/python/sglang/srt/hardware_backend/npu/attention/ascend_backend.py
-@@ -1603,7 +1603,9 @@ class AscendAttnBackend(AttentionBackend):
+@@ -1603,7 +1603,10 @@ class AscendAttnBackend(AttentionBackend):
                      metadata = self.forward_metadata.kernel_metadata[
                          f"c{compress_ratio}a_metadata"
                      ]
 -                    q = q.squeeze(0)
-+                    # q 来自 deepseek_v4.forward_normal_prepare → [T, N, D]；T=1 时 squeeze(0) 会变成 [N,D]，head_num=0。
++                    # q comes from deepseek_v4.forward_normal_prepare as [T, N, D]; at T=1 a
++                    # squeeze(0) would collapse it to [N, D] and leave head_num=0.
 +                    if q.dim() == 4:
 +                        q = q.squeeze(0)
                      attn_kwargs = {
@@ -85,26 +93,27 @@ index 01e9c16f6..d9fe2ef36 100644
          self._weight_loader_impl(
              param=param,
 diff --git a/python/sglang/srt/mem_cache/common.py b/python/sglang/srt/mem_cache/common.py
-index a35458426..d41a7cfdf 100644
+index a35458426..d1ee91159 100644
 --- a/python/sglang/srt/mem_cache/common.py
 +++ b/python/sglang/srt/mem_cache/common.py
-@@ -35,6 +35,102 @@ MAMBA_STATE_PER_REQ_NO_CACHE = 1
+@@ -35,6 +35,103 @@ MAMBA_STATE_PER_REQ_NO_CACHE = 1
  logger = logging.getLogger(__name__)
  
  
 +# ---------------------------------------------------------------------------
 +# NPU + KT downstream patch:
 +# ---------------------------------------------------------------------------
-+# 在我们的 NPU docker 里 ``triton 3.7`` 与 ``triton-ascend 3.2`` 版本错配，
-+# 任何 ``@triton.jit`` kernel 在调用时都会抛 ``0 active drivers ([])``。基线
-+# 已经为 attention backend == "ascend" 在 ``support_triton`` 里把 ascend 标
-+# 成 False，但本文件里 ``write_multi_cache_indices`` / ``get_last_loc`` 等公
-+# 共函数并没全部去判这个旗子（应该是 oversight，因为 baseline 8 卡机器上
-+# triton 装得是好的），到了 NPU 单卡 prefill 就会炸。
++# When ``triton 3.7`` and ``triton-ascend 3.2`` are mismatched, calling any ``@triton.jit`` kernel
++# raises ``0 active drivers ([])``. The baseline already marks ascend as False in
++# ``support_triton`` for attention backend == "ascend", but the shared helpers in this file
++# (``write_multi_cache_indices``, ``get_last_loc`` and others) do not all consult that flag --
++# an oversight, since triton installs correctly on the 8-card baseline machines -- so a
++# single-card NPU prefill fails here.
 +#
-+# 这里加一次性 driver 探测；探到不可用，则把所有调用点切到 torch 等价路径
-+# （纯 PyTorch、bs=1/2 单卡场景性能可接受，且数值完全等价）。该探测和
-+# ``hardware_backend/npu/allocator_npu.py`` 里那个用的是同样的逻辑，保持一致。
++# A one-shot driver probe is added here; when the driver is unusable every call site takes the
++# torch-equivalent path, which is pure PyTorch, numerically identical, and fast enough at the
++# bs=1/2 single-card sizes. The probe is deliberately the same logic as the one in
++# ``hardware_backend/npu/allocator_npu.py``.
 +def _detect_triton_driver_available() -> bool:
 +    try:
 +        # triton ships no type stubs; this is the availability probe whose failure falls back to the
@@ -191,7 +200,7 @@ index a35458426..d41a7cfdf 100644
  @triton.jit
  def write_req_to_token_pool_triton(
      req_to_token_ptr,  # [max_batch, max_context_len]
-@@ -154,7 +250,7 @@ def write_cache_indices(
+@@ -154,7 +251,7 @@ def write_cache_indices(
      prefix_tensors: list[torch.Tensor],
      req_to_token_pool: ReqToTokenPool,
  ):
@@ -200,14 +209,14 @@ index a35458426..d41a7cfdf 100644
          prefix_pointers = torch.tensor(
              [t.data_ptr() for t in prefix_tensors],
              device=req_to_token_pool.device,
-@@ -203,6 +299,66 @@ def write_multi_cache_indices(
+@@ -203,6 +300,66 @@ def write_multi_cache_indices(
      prefix_tensors: list[torch.Tensor],
      req_to_token_pool: ReqToTokenPool,
  ):
 +    if not _TRITON_DRIVER_AVAILABLE:
-+        # NPU pure-PyTorch path. 与 write_cache_indices 的 else 分支一脉相承，
-+        # 把每条 triton kernel 调用替换成 torch 等价实现。bs 在我们单卡场景下
-+        # 通常 == 1，性能可接受。
++        # NPU pure-PyTorch path, following the same approach as the else branch of
++        # write_cache_indices: each triton kernel call is replaced by its torch equivalent. bs is
++        # typically 1 in the single-card case, so the performance is acceptable.
 +        _write_req_to_token_pool_torch(
 +            req_to_token_pool.req_to_token,
 +            req_pool_indices_tensor,
@@ -267,7 +276,7 @@ index a35458426..d41a7cfdf 100644
      prefix_pointers = torch.tensor(
          [t.data_ptr() for t in prefix_tensors],
          device=req_to_token_pool.device,
-@@ -280,7 +436,10 @@ def get_last_loc(
+@@ -280,7 +437,10 @@ def get_last_loc(
      req_pool_indices_tensor: torch.Tensor,
      prefix_lens_tensor: torch.Tensor,
  ) -> torch.Tensor:

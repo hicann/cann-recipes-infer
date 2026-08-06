@@ -14,20 +14,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-多进程批量：将 DeepSeek-V4-Flash 原生 MXFP4 的多个 MoE 层分别转为独立 GGUF。
+Batch-convert several DeepSeek-V4-Flash native MXFP4 MoE layers into separate GGUF files.
 
-每层专家独占一个 safetensors shard（见 handoff §3），所以单层转换只读一个文件，
-层间用 ProcessPoolExecutor 并行。输出 ``{output_dir}/{prefix}{L}{suffix}.gguf``
-（默认 ``dsv4_layer{L}_mxfp4.gguf``）。无损 nibble repack，详见
+Each layer's experts occupy their own safetensors shard, so converting one layer reads exactly
+one file and layers run in parallel through a ProcessPoolExecutor. Output goes to
+``{output_dir}/{prefix}{L}{suffix}.gguf`` (default ``dsv4_layer{L}_mxfp4.gguf``). The nibble
+repack is lossless; see
 ``convert_mxfp4_layer_to_gguf.py``。
 
-容量：MXFP4 ~3.42 GiB/layer ×43 = ~147 GiB（Q8_0 是 ~295 GiB，正好一半）。
+Capacity: MXFP4 is ~3.42 GiB/layer x 43 = ~147 GiB (half of Q8_0's ~295 GiB).
 
-示例（全量 43 层）::
+Example (all 43 layers)::
 
   /usr/local/python3.11.14/bin/python3 tools/batch_convert_mxfp4_layers_mp.py \\
-    --input /workspace/models/DeepSeekV4/DeepSeek-V4-Flash \\
-    --output-dir /workspace/models/cache \\
+    --input /path/to/DeepSeek-V4-Flash \\
+    --output-dir /path/to/gguf_cache \\
     --layer-start 0 --layer-end 42 --jobs 4 --skip-existing --verify-sample 3
 """
 from __future__ import annotations
@@ -103,10 +104,10 @@ def _verify_sample_paths(paths: list[Path]) -> None:
 def main() -> int:
     _setup_logging()
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--input", type=Path, required=True, help="原生 MXFP4 模型目录（含 index.json）")
+    ap.add_argument("--input", type=Path, required=True, help="native MXFP4 model directory (contains index.json)")
     ap.add_argument("--output-dir", type=Path, required=True)
     ap.add_argument("--layer-start", type=int, default=0)
-    ap.add_argument("--layer-end", type=int, default=42, help="含端点")
+    ap.add_argument("--layer-end", type=int, default=42, help="inclusive")
     ap.add_argument("--jobs", type=int, default=4)
     ap.add_argument("--python", type=Path, default=Path(sys.executable))
     ap.add_argument("--num-experts", type=int, default=256)
@@ -114,7 +115,8 @@ def main() -> int:
     ap.add_argument("--moe-intermediate-size", type=int, default=2048)
     ap.add_argument("--name-prefix", type=str, default="dsv4_layer")
     ap.add_argument("--name-suffix", type=str, default="_mxfp4")
-    ap.add_argument("--skip-existing", action="store_true", help="目标 >=3GiB（接近完整层大小）才跳过")
+    ap.add_argument("--skip-existing", action="store_true",
+                    help="skip only when the target is >=3GiB, i.e. close to a full layer")
     ap.add_argument("--verify-sample", type=int, default=3)
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
@@ -122,11 +124,12 @@ def main() -> int:
     model_dir = args.input.expanduser().resolve()
     out_dir = args.output_dir.expanduser().resolve()
     if not model_dir.is_dir():
-        logger.error(f"ERROR: --input 不是目录: {model_dir}")
+        logger.error(f"ERROR: --input is not a directory: {model_dir}")
         return 2
     out_dir.mkdir(parents=True, exist_ok=True)
-    # 完整 MXFP4 层约 3.42 GiB；阈值设 3 GiB，截断/不完整文件(<3GiB)不会被当"已完成"跳过。
-    # 配合 convert 的原子写（.tmp+rename），最终文件名只会是完整文件。
+    # A complete MXFP4 layer is ~3.42 GiB. The 3 GiB threshold keeps truncated or partial files
+    # (<3GiB) from being treated as "already done", and the converter's atomic write (.tmp +
+    # rename) guarantees the final filename only ever names a complete file.
     min_skip = 3 << 30
     py = str(args.python.expanduser())
 
@@ -141,7 +144,7 @@ def main() -> int:
         tasks.append((py, str(model_dir), lid, str(outp), dims))
 
     if not tasks:
-        logger.info("[batch] 无待转换任务（均 skip）")
+        logger.info("[batch] nothing to convert (everything was skipped)")
     else:
         logger.info(f"[batch] model={model_dir} layers={args.layer_start}..{args.layer_end} "
                     f"pending={len(tasks)} jobs={args.jobs}")
@@ -162,7 +165,7 @@ def main() -> int:
                 else:
                     logger.info(f"[batch] layer {layer_idx} OK")
         if failed:
-            logger.error(f"[batch] 失败 {len(failed)} 层: {failed[:10]}")
+            logger.error(f"[batch] {len(failed)} layer(s) failed: {failed[:10]}")
             return 1
 
     if args.verify_sample > 0:
@@ -173,7 +176,7 @@ def main() -> int:
         logger.info(f"[batch] verify-sample k={k} layers={sample}")
         _verify_sample_paths(paths)
 
-    logger.info("[batch] 全部结束。")
+    logger.info("[batch] finished.")
     return 0
 
 

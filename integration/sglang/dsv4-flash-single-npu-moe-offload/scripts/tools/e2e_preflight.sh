@@ -12,13 +12,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# 整网 e2e 启动前预检（GGUF 层文件 + kt_kernel_ext 路径）。
+# Pre-flight check before starting the full pipeline (per-layer GGUF files + kt_kernel_ext path).
 #
-# 用法：
+# Usage:
 #   bash tools/e2e_preflight.sh
 #   GGUF_DIR=/path/cache GGUF_SUFFIX=_mxfp4 bash tools/e2e_preflight.sh
 #
-# 退出码：0=通过，1=有缺失/路径不对。
+# Exit code: 0 = pass, 1 = something is missing or points at the wrong path.
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -26,20 +26,29 @@ REPO="${REPO:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 # shellcheck source=tools/ensure_kt_kernel.sh
 source "${SCRIPT_DIR}/ensure_kt_kernel.sh"
 ensure_kt_kernel "$REPO"
-# GGUF_DIR 必填：不硬编码环境特定路径（红线 R5）。指向 MXFP4 GGUF 所在目录。
+# GGUF_DIR is required: environment-specific paths are never hardcoded. Point it at the directory
+# holding the MXFP4 GGUF files.
 if [[ -z "${GGUF_DIR:-}" ]]; then
-  echo "[preflight] ERROR: 未设置 GGUF_DIR（MXFP4 GGUF 所在目录），例如：" >&2
+  echo "[preflight] ERROR: GGUF_DIR is not set (directory holding the MXFP4 GGUF files), e.g." >&2
   echo "[preflight]   GGUF_DIR=/your/cache bash $0" >&2
   exit 1
 fi
 GGUF_PREFIX="${GGUF_PREFIX:-dsv4_layer}"
-# 批量 convert 默认输出 _mxfp4 后缀 → dsv4_layer3_mxfp4.gguf（与 batch_convert / verify / sha256 清单一致）。
+# The batch converter writes the _mxfp4 suffix by default -> dsv4_layer3_mxfp4.gguf, matching
+# batch_convert / verify / the sha256 manifest.
 GGUF_SUFFIX="${GGUF_SUFFIX:-_mxfp4}"
 LAYER_START="${LAYER_START:-0}"
 LAYER_END="${LAYER_END:-42}"
-MIN_GIB="${MIN_GIB:-3}"  # MXFP4 单层约 3.42 GiB（截断/缺失更小）；Q8_0 请设 MIN_GIB=6，BF16 设 12
+MIN_GIB="${MIN_GIB:-3}"  # one MXFP4 layer is ~3.42 GiB (truncated ones are smaller); use 6 for Q8_0, 12 for BF16
 
-PYBIN="${PYTHON_BIN:-${PYBIN:-/usr/local/python3.11.14/bin/python3.11}}"
+# Shares resolve_python_bin with launch_ds4flash_npu.sh and asks for the same module list, so the
+# preflight validates the very interpreter the server will use. kt_kernel is deliberately NOT in
+# that list: it is what the preflight reports on, and including it would turn a load failure
+# (a missing libhwloc, say) into "no interpreter found" and hide the real cause.
+# shellcheck source=tools/python_env.sh
+source "${SCRIPT_DIR}/python_env.sh"
+PYBIN="${PYBIN:-$(resolve_python_bin preflight numpy torch torch_npu sglang)}" || exit 1
+echo "[preflight] PYBIN=${PYBIN}"
 
 echo "[preflight] REPO=$REPO"
 echo "[preflight] GGUF: ${GGUF_DIR}/${GGUF_PREFIX}{L}${GGUF_SUFFIX}.gguf  layers ${LAYER_START}-${LAYER_END}"
@@ -61,7 +70,7 @@ for L in $(seq "$LAYER_START" "$LAYER_END"); do
 done
 if (( missing > 0 )); then
   echo "[preflight] FAIL: ${missing} layer file(s) missing or too small."
-  echo "[preflight] 批量转换: $PYBIN $REPO/tools/batch_convert_mxfp4_layers_mp.py --input ... --output-dir $GGUF_DIR --layer-start $LAYER_START --layer-end $LAYER_END --skip-existing"
+  echo "[preflight] Batch convert with: $PYBIN $REPO/tools/batch_convert_mxfp4_layers_mp.py --input ... --output-dir $GGUF_DIR --layer-start $LAYER_START --layer-end $LAYER_END --skip-existing"
   exit 1
 fi
 echo "[preflight] OK: all $((LAYER_END - LAYER_START + 1)) GGUF files present (>= ${MIN_GIB} GiB each)."
@@ -70,9 +79,9 @@ echo "[preflight] kt_kernel_ext:"
 "$PYBIN" -c "from kt_kernel import kt_kernel_ext; print('  ', kt_kernel_ext.__file__)"
 so_path=$("$PYBIN" -c "from kt_kernel import kt_kernel_ext; print(kt_kernel_ext.__file__)")
 if [[ "$so_path" == *"${REPO}/kt-kernel/python/"* || "$so_path" == *"${REPO}/kt-kernel/kt_kernel/"* ]]; then
-  echo "[preflight] OK: kt_kernel_ext 在仓库 kt-kernel 包内"
+  echo "[preflight] OK: kt_kernel_ext resolves inside the repo's kt-kernel package"
 else
-  echo "[preflight] WARN: .so 不在 ${REPO}/kt-kernel/{python,kt_kernel}/ 下（见手册 §2.4）"
+  echo "[preflight] WARN: the .so is not under ${REPO}/kt-kernel/{python,kt_kernel}/ (see guide 4.1)"
 fi
 shopt -s nullglob
 build_so_candidates=(/tmp/kt_kernel_build/kt_kernel_ext.cpython-*-linux-gnu.so)
@@ -84,9 +93,9 @@ if (( ${#build_so_candidates[@]} > 0 )); then
     [[ "$cand" -nt "$bso" ]] && bso="$cand"
   done
   if [[ -f "$bso" && "$so_path" -ef "$bso" ]]; then
-    echo "[preflight] OK: 已加载 /tmp/kt_kernel_build 同 inode（或已 cp 到 python/）"
+    echo "[preflight] OK: the loaded .so is the same inode as /tmp/kt_kernel_build (or already copied into python/)"
   elif [[ -f "$bso" ]]; then
-    echo "[preflight] HINT: build 目录有更新 .so，请执行:"
+    echo "[preflight] HINT: the build directory has a newer .so, run:"
     echo "  cp -f $bso ${REPO}/kt-kernel/python/"
   fi
 fi

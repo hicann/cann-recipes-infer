@@ -1,5 +1,5 @@
 diff --git a/kt-kernel/CMakeLists.txt b/kt-kernel/CMakeLists.txt
-index fb5ca3b..885b129 100644
+index fb5ca3b..7e7a934 100644
 --- a/kt-kernel/CMakeLists.txt
 +++ b/kt-kernel/CMakeLists.txt
 @@ -16,7 +16,16 @@ option(LLAMA_AVX512_FANCY_SIMD "llama: enable AVX512-VL, AVX512-BW, AVX512-DQ, A
@@ -19,7 +19,25 @@ index fb5ca3b..885b129 100644
  option(KTRANSFORMERS_CPU_USE_KML "ktransformers: CPU use KML" OFF)
  option(KTRANSFORMERS_CPU_USE_AMX_AVX512 "ktransformers: CPU use AMX or AVX512" OFF)
  option(KTRANSFORMERS_CPU_USE_AMX "ktransformers: CPU use AMX" OFF)
-@@ -196,18 +205,26 @@ if(CMAKE_OSX_ARCHITECTURES STREQUAL "arm64" OR CMAKE_GENERATOR_PLATFORM_LWR STRE
+@@ -49,8 +58,15 @@ if(USE_CONDA_TOOLCHAIN)
+     set(CMAKE_C_COMPILER   ${CONDA_CC}  CACHE FILEPATH "C compiler" FORCE)
+     set(CMAKE_CXX_COMPILER ${CONDA_CXX} CACHE FILEPATH "C++ compiler" FORCE)
+ else()
+-    # Prefer system compilers explicitly to avoid accidentally picking conda wrappers from PATH
+-    if(EXISTS "/usr/bin/gcc" AND EXISTS "/usr/bin/g++")
++    # Prefer system compilers explicitly to avoid accidentally picking conda wrappers from PATH.
++    # Honor an explicit CC/CXX first: some boxes (e.g. newer Kunpeng/910C hosts on Ubuntu 20.04)
++    # default /usr/bin/gcc to gcc-9, which is too old for -std=gnu++20 and the +bf16/+i8mm
++    # -march modifiers this CPU actually supports. Pass CC=gcc-13 CXX=g++-13 to use a newer gcc.
++    if(DEFINED ENV{CC} AND DEFINED ENV{CXX})
++        set(CMAKE_C_COMPILER   "$ENV{CC}"  CACHE FILEPATH "C compiler" FORCE)
++        set(CMAKE_CXX_COMPILER "$ENV{CXX}" CACHE FILEPATH "C++ compiler" FORCE)
++        message(STATUS "Honoring explicit CC=$ENV{CC} CXX=$ENV{CXX}")
++    elseif(EXISTS "/usr/bin/gcc" AND EXISTS "/usr/bin/g++")
+         set(CMAKE_C_COMPILER   "/usr/bin/gcc" CACHE FILEPATH "C compiler" FORCE)
+         set(CMAKE_CXX_COMPILER "/usr/bin/g++" CACHE FILEPATH "C++ compiler" FORCE)
+     endif()
+@@ -196,18 +212,26 @@ if(CMAKE_OSX_ARCHITECTURES STREQUAL "arm64" OR CMAKE_GENERATOR_PLATFORM_LWR STRE
              # Raspberry Pi 3, 4, Zero 2 (32-bit)
              list(APPEND ARCH_FLAGS -mno-unaligned-access)
          endif()
@@ -58,7 +76,7 @@ index fb5ca3b..885b129 100644
      endif()
  elseif(CMAKE_OSX_ARCHITECTURES STREQUAL "x86_64" OR CMAKE_GENERATOR_PLATFORM_LWR MATCHES "^(x86_64|i686|amd64|x64|win32)$" OR
      (NOT CMAKE_OSX_ARCHITECTURES AND NOT CMAKE_GENERATOR_PLATFORM_LWR AND
-@@ -458,6 +475,29 @@ elseif(KTRANSFORMERS_USE_MUSA)
+@@ -458,6 +482,29 @@ elseif(KTRANSFORMERS_USE_MUSA)
          message(STATUS "MUSA Toolkit found")
          add_compile_definitions(KTRANSFORMERS_USE_MUSA=1)
      endif()
@@ -88,7 +106,7 @@ index fb5ca3b..885b129 100644
  elseif(KTRANSFORMERS_CPU_USE_KML)
      message(STATUS "KML CPU detected")
  else()
-@@ -642,6 +682,10 @@ if(NOT HOST_IS_X86 AND KTRANSFORMERS_CPU_USE_KML)
+@@ -642,6 +689,10 @@ if(NOT HOST_IS_X86 AND KTRANSFORMERS_CPU_USE_KML)
      target_compile_definitions(${PROJECT_NAME} PRIVATE CPU_USE_KML)
  endif()
  target_link_libraries(${PROJECT_NAME} PRIVATE llama PkgConfig::HWLOC OpenMP::OpenMP_CXX)
@@ -559,27 +577,29 @@ index 06a7d8c..4503527 100755
    # Manual mode - validate user configuration (no exports)
    if [ -z "$CPUINFER_CPU_INSTRUCT" ] || [ -z "$CPUINFER_ENABLE_AMX" ]; then
 diff --git a/kt-kernel/pyproject.toml b/kt-kernel/pyproject.toml
-index f877dda..356978a 100644
+index f877dda..d246422 100644
 --- a/kt-kernel/pyproject.toml
 +++ b/kt-kernel/pyproject.toml
-@@ -20,11 +20,12 @@ classifiers = [
+@@ -20,11 +20,14 @@ classifiers = [
  ]
  requires-python = ">=3.11"
  dependencies = [
 -  # Core dependencies
 -  "torch==2.9.1",
-+  # Core: Ascend 环境 torch_npu 2.8.x 固定要求 torch==2.8.0，勿锁到 2.9.x（会触发 libtorch_npu.so undefined symbol）
++  # Core: on Ascend, torch_npu 2.8.x requires exactly torch==2.8.0. Do not pin to 2.9.x, which
++  # makes libtorch_npu.so fail with undefined symbols.
 +  "torch>=2.8.0,<2.9.0",
    "safetensors>=0.4.0",
    "numpy>=1.24.0",
 -  "triton>=2.0.0",
-+  # Triton 主要为 x86 GPU 路径；aarch64 + NPU 推理通常不需要，且会拉数百 MB 与 torch 强绑定 wheel
++  # Triton mainly serves the x86 GPU path. aarch64 + NPU inference does not need it, and it pulls
++  # in hundreds of MB of wheels tightly coupled to torch.
 +  "triton>=2.0.0; platform_machine == 'x86_64' or platform_machine == 'AMD64'",
    "gguf>=0.17.0",
    # CLI dependencies
    "typer>=0.9.0",
 diff --git a/kt-kernel/requirements.txt b/kt-kernel/requirements.txt
-index d2b31e2..c5f4db9 100644
+index d2b31e2..a6348ad 100644
 --- a/kt-kernel/requirements.txt
 +++ b/kt-kernel/requirements.txt
 @@ -2,9 +2,9 @@
@@ -588,7 +608,7 @@ index d2b31e2..c5f4db9 100644
  
 -# Core dependencies (minimum versions)
 -torch==2.9.1
-+# aarch64 / 通用：与 torch_npu 对齐时用 torch 2.8.x；仅 x86_64 安装 triton
++# aarch64 / generic: use torch 2.8.x to match torch_npu; install triton on x86_64 only
 +torch>=2.8.0,<2.9.0
  safetensors>=0.4.0
  numpy>=1.24.0
