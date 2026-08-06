@@ -128,9 +128,11 @@ source ${cann_path}/bin/setenv.bash
   bash infer.sh
   ```
 
-## KV Offload 启用（长序列，需自定义算子）
+## KV Offload 启用（长序列、大 batch_size 场景，需自定义算子）
 
 GLM-5.2 的 KV offload（`enable_offload: True`）把全量 MLA KV 卸载到 host swapped memory，decode 时按 DSA top-k 把命中 block gather 回 device，面向长上下文（全量 KV 放不下 HBM）场景。开启 `shared_indexer_offload: True` 时，模型会利用 GLM-5.2 的 IndexShare 特性复用同一组 top-k 规划，减少共享层重复的命中判断和缓存管理开销，并将常驻池回填与 SFA、MoE 计算并行。该路径释放 HBM 以支持更长上下文或更大 batch；`enlarge_pool_size: True` 会把设备侧常驻 token 池从 8K 扩大到 16K，进一步提高命中率并减少 host 到 device 的 KV 搬运。
+
+KV offload 方案设计详见[KV offload 技术文档](../../docs/models/glm_5_2/glm_5_2_offload_guide.md)。
 
 KV offload 依赖**仓内自定义 AscendC 算子**（非 torch_npu 内置），须先编译安装：
 

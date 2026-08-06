@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1035" height="402" viewBox="0 0 1035 402" role="img" aria-labelledby="title desc">
+  <title id="title">热点 KV 池</title>
+  <desc id="desc">设备侧热点 KV 池复用选中 KV，并与主机端完整 KV Cache 交互。</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#8b8b8b"/></marker>
+    <style>text{font-family:Arial,'PingFang SC','Microsoft YaHei',sans-serif;fill:#171717}.label{font-size:20px}.box{stroke:#bfd7ff;stroke-width:2;fill:#f2f7ff}.host{stroke:#ffcaa9;stroke-width:2;fill:#fff4ee}.thin{stroke:#888;stroke-width:2;fill:none}.divider{stroke:#d97706;stroke-width:2;stroke-dasharray:8 7}</style>
+  </defs>
+  <rect width="1035" height="402" fill="white"/>
+  <text x="36" y="256" class="label">设备侧内存</text><text x="36" y="306" class="label">主机侧内存</text>
+  <line x1="26" y1="273" x2="1008" y2="273" class="divider"/>
+  <rect x="448" y="24" width="164" height="43" class="box"/><text x="530" y="52" text-anchor="middle" font-size="18">Selected KV (2K)</text>
+  <rect x="334" y="177" width="391" height="43" class="box"/><text x="529.5" y="205" text-anchor="middle" font-size="19">Hot KV Pool (8K/16K)</text>
+  <rect x="178" y="330" width="703" height="43" class="host"/><text x="529.5" y="358" text-anchor="middle" font-size="19">Full KV</text>
+  <line x1="484" y1="175" x2="484" y2="71" class="thin" marker-end="url(#arrow)"/><line x1="507" y1="175" x2="507" y2="71" class="thin" marker-end="url(#arrow)"/>
+  <line x1="556" y1="69" x2="556" y2="174" class="thin" marker-end="url(#arrow)"/><line x1="484" y1="222" x2="484" y2="328" class="thin"/>
+</svg>
