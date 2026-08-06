@@ -139,7 +139,7 @@ class KimiLinearConfig(PretrainedConfig):
         max_position_embeddings: int = 4096,
         routed_expert_hidden_size: Optional[int] = None,
         topk_method: str = "noaux_tc",
-        enable_attn_res_two_phase: bool = False,
+        attn_res_mode: str = "original",
         **kwargs,
     ) -> None:
         runner_settings = kwargs.pop("runner_settings", None)
@@ -193,14 +193,12 @@ class KimiLinearConfig(PretrainedConfig):
             max_position_embeddings=max_position_embeddings,
             routed_expert_hidden_size=routed_expert_hidden_size,
             topk_method=topk_method,
-            enable_attn_res_two_phase=enable_attn_res_two_phase,
+            attn_res_mode=attn_res_mode,
         )
 
         custom_params = _get_custom_params(runner_settings)
-        if "enable_attn_res_two_phase" in custom_params:
-            values["enable_attn_res_two_phase"] = bool(
-                custom_params["enable_attn_res_two_phase"]
-            )
+        if "attn_res_mode" in custom_params:
+            values["attn_res_mode"] = custom_params["attn_res_mode"]
 
         for key in ("quantization_config", "compression_config"):
             if key in kwargs:

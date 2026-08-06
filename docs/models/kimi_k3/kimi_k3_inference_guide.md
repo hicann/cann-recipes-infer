@@ -114,8 +114,8 @@ $$
 #### 原实现与两阶段优化
 
 - **Kimi 原实现**：AttnRes 随 Decoder Layer 逐层更新，将有效块间历史状态与当前 block 表示进行深度 Softmax 聚合，生成 Attention 与 FFN/MoE 输入；核心聚合由 `KimiDecoderLayer.forward` 中的 `_apply_attn_res` 完成。
-- **两阶段优化**：`KimiLinearModel._forward_attn_res_block` 将 block 内复用的块间历史状态计算前移，批量生成统计量，并在层内通过 Online Softmax 合入动态 partial。该路径与 Kimi 原实现数学等价，由 `enable_attn_res_two_phase` 控制，默认关闭；Output AttnRes 保持原实现。
-- **后续规划**：进一步融合 Phase 1 的批量计算与 Phase 2 的 Online Softmax 合并，减少中间张量读写和算子调度开销。
+- **两阶段优化**：`KimiLinearModel._forward_attn_res_block` 将 block 内复用的块间历史状态计算前移，批量生成统计量，并在层内通过 Online Softmax 合入动态 partial。该路径与 Kimi 原实现数学等价，由 `attn_res_mode: two_phase` 启用；Output AttnRes 保持原实现。
+- **融合算子**：`attn_res_mode: fused` 保持相同的两阶段调度，Phase 1/Phase 2 分别调用 `block_attn_res_prepare` 和 `block_attn_res_update`。默认值为 `original`。
 
 ### 混合注意力：KDA 与 Gated MLA
 

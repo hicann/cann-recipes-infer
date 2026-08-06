@@ -57,6 +57,10 @@ from module.linear import (
 from module.quantization import QuantizeMethodBase
 from module.quantization.mxfp4 import W4A8MxFp4MoEGMMMethod
 from module.quantization.utils.quant_utils import reshape_mx_scale
+from ops.cannbot_dsl import (
+    block_attn_res_prepare as _block_attn_res_prepare_impl,
+    block_attn_res_update as _block_attn_res_update_impl,
+)
 
 from .configuration_kimi_k3 import KimiLinearConfig
 import cann_ops_transformer.ops
@@ -2009,7 +2013,7 @@ def _apply_attn_res(
     )
     scores = scores.masked_fill(~valid_mask.unsqueeze(0), float("-inf"))
     probabilities = scores.softmax(dim=-1).unsqueeze(1)
-    return torch.matmul(probabilities, values_float).squeeze(1).to(values.dtype)
+    return torch.matmul(probabilities, values_float).squeeze(1).to(prefix_sum.dtype)
 
 
 class AttnResPhase1Stats(NamedTuple):
@@ -2020,49 +2024,37 @@ class AttnResPhase1Stats(NamedTuple):
     inter_exp_sum: torch.Tensor
 
 
+class AttnResPhase2Slot(NamedTuple):
+    """Query and historical statistics selected for one AttnRes slot."""
+
+    effective_query: torch.Tensor
+    inter_numerator: torch.Tensor
+    inter_max: torch.Tensor
+    inter_exp_sum: torch.Tensor
+
+
 def _prepare_attn_res_phase1(
     block_residual: torch.Tensor,
-    valid_blocks: int,
-    projs: Tuple[nn.Linear, ...],
-    norms: Tuple[KimiRMSNorm, ...],
+    effective_queries: torch.Tensor,
+    valid_blocks: torch.Tensor,
+    epsilon: torch.Tensor,
 ) -> AttnResPhase1Stats:
-    """Batch historical statistics for every Attention and MLP slot."""
-    if not 0 < valid_blocks <= block_residual.shape[1]:
-        raise ValueError(
-            f"valid_blocks={valid_blocks} is outside fixed buffer depth "
-            f"{block_residual.shape[1]}"
-        )
-    if not projs or len(projs) != len(norms):
-        raise ValueError("AttnRes projs and norms must have the same non-zero length")
-
-    values_float = block_residual[:, :valid_blocks].float()
-    epsilon = norms[0].variance_epsilon
-    if any(norm.variance_epsilon != epsilon for norm in norms):
-        raise ValueError("all AttnRes norms in one block must use the same epsilon")
-
-    # Apply affine weights to the queries so historical sources require only
-    # one non-affine RMSNorm, avoiding a [slots, tokens, depth, hidden] tensor.
-    inv_rms = torch.rsqrt(
-        values_float.square().mean(dim=-1) + epsilon
-    )
-    effective_queries = torch.stack(
-        [
-            norm.weight.float() * proj.weight.squeeze(0).float()
-            for proj, norm in zip(projs, norms)
-        ]
-    )
-    # Apply the scalar RMS factor after the dot product. This is mathematically
-    # equivalent and avoids materializing normalized_values [tokens, depth, hidden].
-    # [tokens, depth, hidden] @ [hidden, slots]
-    # -> [tokens, depth, slots] -> [slots, tokens, depth]
+    """Prepare FP32 Online Softmax statistics for every slot in one block."""
+    values_float = block_residual.float()
+    inv_rms = torch.rsqrt(values_float.square().mean(dim=-1) + epsilon)
     inter_logits = torch.matmul(
         values_float, effective_queries.transpose(0, 1)
     ).permute(2, 0, 1) * inv_rms.unsqueeze(0)
+    valid_mask = (
+        torch.arange(block_residual.shape[1], device=block_residual.device)
+        < valid_blocks
+    )
+    inter_logits = inter_logits.masked_fill(
+        ~valid_mask.view(1, 1, -1), float("-inf")
+    )
     inter_max = inter_logits.max(dim=2).values
     inter_exp = torch.exp(inter_logits - inter_max.unsqueeze(2))
     inter_exp_sum = inter_exp.sum(dim=2)
-    # [tokens, slots, depth] @ [tokens, depth, hidden]
-    # -> [tokens, slots, hidden] -> [slots, tokens, hidden]
     inter_numerator = torch.matmul(
         inter_exp.permute(1, 0, 2), values_float
     ).permute(1, 0, 2)
@@ -2073,30 +2065,29 @@ def _prepare_attn_res_phase1(
     )
 
 
-def _merge_attn_res_partial(
+def _update_attn_res_phase2(
     partial_block: torch.Tensor,
-    proj: nn.Linear,
-    norm: KimiRMSNorm,
-    phase1: AttnResPhase1Stats,
-    slot: int,
+    partial_delta: torch.Tensor,
+    slot: AttnResPhase2Slot,
+    epsilon: torch.Tensor,
 ) -> torch.Tensor:
-    """Merge the current partial into one slot with Online Softmax."""
+    """Update partial in place, then merge one selected slot with Online Softmax."""
+    partial_updated = (partial_block.float() + partial_delta.float()).to(
+        partial_block.dtype
+    )
+    partial_block.copy_(partial_updated)
     partial_float = partial_block.float()
-    score_weight = norm.weight.float() * proj.weight.squeeze(0).float()
-    weighted_key = torch_npu.npu_rms_norm(
-        partial_float, score_weight, norm.variance_epsilon
-    )[0]
-    input_logit = weighted_key.sum(dim=-1)
+    input_logit = (
+        torch.matmul(partial_float, slot.effective_query)
+        * torch.rsqrt(partial_float.square().mean(dim=-1) + epsilon)
+    )
 
-    inter_max = phase1.inter_max[slot]
-    inter_exp_sum = phase1.inter_exp_sum[slot]
-    inter_numerator = phase1.inter_numerator[slot]
-    merged_max = torch.maximum(inter_max, input_logit)
-    inter_scale = torch.exp(inter_max - merged_max)
+    merged_max = torch.maximum(slot.inter_max, input_logit)
+    inter_scale = torch.exp(slot.inter_max - merged_max)
     input_scale = torch.exp(input_logit - merged_max)
-    merged_exp_sum = inter_scale * inter_exp_sum + input_scale
+    merged_exp_sum = inter_scale * slot.inter_exp_sum + input_scale
     merged_numerator = (
-        inter_scale.unsqueeze(-1) * inter_numerator
+        inter_scale.unsqueeze(-1) * slot.inter_numerator
         + input_scale.unsqueeze(-1) * partial_float
     )
     return (
@@ -2257,7 +2248,12 @@ class KimiLinearModel(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
-        self.enable_attn_res_two_phase = config.enable_attn_res_two_phase
+        self.attn_res_mode = (
+            config.attn_res_mode
+            if config.attn_res_mode in ("original", "fused")
+            else "two_phase"
+        )
+        logger.info("Kimi K3 AttnRes mode: %s", self.attn_res_mode)
         parallel = None if infer_config is None else infer_config.parallel_config
         self.attn_tp_size = 1 if parallel is None else parallel.attn_tp_size
         # Prefill shards packed tokens; Decode shards requests (DP-TP-DP).
@@ -2336,6 +2332,11 @@ class KimiLinearModel(nn.Module):
         else:
             self.max_attn_res_tokens = None
         self.block_residual_buffer: Optional[torch.Tensor] = None
+        self.register_buffer(
+            "attn_res_effective_queries", None, persistent=False
+        )
+        self.register_buffer("attn_res_valid_blocks", None, persistent=False)
+        self.register_buffer("attn_res_epsilon", None, persistent=False)
         self.output_attn_res_norm = KimiRMSNorm(
             config.hidden_size,
             config.rms_norm_eps,
@@ -2364,21 +2365,63 @@ class KimiLinearModel(nn.Module):
             device=device,
         )
         torch._dynamo.mark_static(self.block_residual_buffer)
+        if self.attn_res_mode != "original":
+            self.attn_res_valid_blocks = torch.arange(
+                1,
+                self.max_attn_res_blocks + 1,
+                dtype=torch.int64,
+                device=device,
+            )
+            self.attn_res_epsilon = torch.tensor(
+                self.config.rms_norm_eps,
+                dtype=torch.float32,
+                device=device,
+            )
         return self.block_residual_buffer
 
+    def prepare_attn_res_effective_queries(self) -> None:
+        """Precompute q * RMSNorm gain once after checkpoint loading."""
+        if self.attn_res_mode == "original":
+            return
+        first_weight = self.layers[0].self_attention_res_norm.weight
+        effective_queries = torch.empty(
+            2 * len(self.layers),
+            self.config.hidden_size,
+            dtype=torch.float32,
+            device=first_weight.device,
+        )
+        for layer_idx, layer in enumerate(self.layers):
+            effective_queries[2 * layer_idx].copy_(
+                (
+                    layer.self_attention_res_norm.weight.float()
+                    * layer.self_attention_res_proj.weight.squeeze(0).float()
+                ).detach()
+            )
+            effective_queries[2 * layer_idx + 1].copy_(
+                (
+                    layer.mlp_res_norm.weight.float()
+                    * layer.mlp_res_proj.weight.squeeze(0).float()
+                ).detach()
+            )
+        self.attn_res_effective_queries = effective_queries
+
     def _get_block_residual(self, tokens: int, like: torch.Tensor) -> torch.Tensor:
+        target_dtype = (
+            torch.float32 if self.attn_res_mode == "fused" else like.dtype
+        )
         buffer = self.block_residual_buffer
-        if buffer is None or buffer.dtype != like.dtype or buffer.device != like.device:
+        if buffer is None:
             # Only taken on the first forward (eager prefill), never inside the
             # decode graph.
-            buffer = self.init_block_residual(like.device, like.dtype)
+            buffer = self.init_block_residual(like.device, target_dtype)
         if tokens > buffer.shape[0]:
             raise RuntimeError(
                 f"AttnRes buffer holds {buffer.shape[0]} tokens but this step needs "
                 f"{tokens}; raise scheduler_config.max_prefill_tokens"
             )
         block_residual = buffer[:tokens]
-        block_residual.zero_()
+        if self.attn_res_mode != "fused":
+            block_residual.zero_()
         return block_residual
 
     def _embed(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -2426,8 +2469,8 @@ class KimiLinearModel(nn.Module):
                 hidden_states = hidden_states.clone()
         tokens = hidden_states.shape[0]
         block_residual = self._get_block_residual(tokens, hidden_states)
-        if self.enable_attn_res_two_phase:
-            hidden_states = self._forward_attn_res_two_phase(
+        if self.attn_res_mode != "original":
+            hidden_states = self._forward_attn_res(
                 hidden_states,
                 block_residual,
                 forward_metadata,
@@ -2467,7 +2510,7 @@ class KimiLinearModel(nn.Module):
             hidden_states = gathered_states
         return hidden_states
 
-    def _forward_attn_res_two_phase(
+    def _forward_attn_res(
         self,
         hidden_states: torch.Tensor,
         block_residual: torch.Tensor,
@@ -2475,7 +2518,7 @@ class KimiLinearModel(nn.Module):
         query_start_loc: Optional[torch.Tensor],
         query_boundaries: Optional[list[int]],
     ) -> torch.Tensor:
-        """Iterate over blocks and run the two-phase function once per block."""
+        """Run all AttnRes blocks with the selected two-phase backend."""
         block_size = self.config.attn_res_block_size
         for block_idx, start in enumerate(range(0, len(self.layers), block_size)):
             hidden_states = self._forward_attn_res_block(
@@ -2490,6 +2533,57 @@ class KimiLinearModel(nn.Module):
             )
         return hidden_states
 
+    def _run_attn_res_phase1(
+        self,
+        block_residual: torch.Tensor,
+        effective_queries: torch.Tensor,
+        valid_blocks: torch.Tensor,
+        epsilon: torch.Tensor,
+    ) -> AttnResPhase1Stats:
+        if self.attn_res_mode == "two_phase":
+            return _prepare_attn_res_phase1(
+                block_residual,
+                effective_queries,
+                valid_blocks,
+                epsilon,
+            )
+        inter_numerator, inter_max, inter_exp_sum = _block_attn_res_prepare_impl(
+            block_residual,
+            effective_queries,
+            valid_blocks,
+            eps=epsilon,
+        )
+        return AttnResPhase1Stats(
+            inter_numerator=inter_numerator,
+            inter_max=inter_max,
+            inter_exp_sum=inter_exp_sum,
+        )
+
+    def _run_attn_res_phase2(
+        self,
+        partial_block: torch.Tensor,
+        partial_delta: torch.Tensor,
+        slot: AttnResPhase2Slot,
+        epsilon: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.attn_res_mode == "two_phase":
+            output = _update_attn_res_phase2(
+                partial_block,
+                partial_delta,
+                slot,
+                epsilon,
+            )
+            return output, partial_block
+        return _block_attn_res_update_impl(
+            partial_block,
+            partial_delta,
+            slot.effective_query,
+            slot.inter_max,
+            slot.inter_exp_sum,
+            slot.inter_numerator,
+            epsilon,
+        )
+
     def _forward_attn_res_block(
         self,
         start_layer_idx: int,
@@ -2501,76 +2595,101 @@ class KimiLinearModel(nn.Module):
         query_start_loc: Optional[torch.Tensor],
         query_boundaries: Optional[list[int]],
     ) -> torch.Tensor:
-        """Process one AttnRes block using the existing KimiDecoderLayer."""
-        block_residual[:, block_idx].copy_(hidden_states)
-        valid_blocks = block_idx + 1
+        """Process one block with an unfused or fused two-phase backend."""
+        effective_queries = self.attn_res_effective_queries
+        valid_blocks_table = self.attn_res_valid_blocks
+        epsilon = self.attn_res_epsilon
+
+        if self.attn_res_mode == "fused":
+            block_indices = (
+                torch.arange(
+                    block_residual.shape[0], device=block_residual.device
+                )
+                * block_residual.shape[1]
+                + block_idx
+            )
+            block_update = hidden_states
+            if block_update.dtype != block_residual.dtype:
+                block_update = block_update.to(block_residual.dtype)
+            torch_npu.npu_scatter_nd_update_(
+                block_residual.view(-1, block_residual.shape[-1]),
+                block_indices.view(-1, 1),
+                block_update,
+            )
+        else:
+            block_residual[:, block_idx].copy_(hidden_states)
+        valid_blocks = valid_blocks_table[block_idx]
         block_layers = tuple(
             self.layers[layer_idx]
             for layer_idx in range(start_layer_idx, end_layer_idx)
         )
-
-        phase1_projs = tuple(
-            proj
-            for layer in block_layers
-            for proj in (
-                layer.self_attention_res_proj,
-                layer.mlp_res_proj,
-            )
-        )
-        phase1_norms = tuple(
-            norm
-            for layer in block_layers
-            for norm in (
-                layer.self_attention_res_norm,
-                layer.mlp_res_norm,
-            )
-        )
-        phase1 = _prepare_attn_res_phase1(
+        block_queries = effective_queries[
+            2 * start_layer_idx: 2 * end_layer_idx
+        ].contiguous()
+        phase1 = self._run_attn_res_phase1(
             block_residual,
+            block_queries,
             valid_blocks,
-            phase1_projs,
-            phase1_norms,
+            epsilon,
         )
 
-        partial_block = None
+        partial_dtype = (
+            torch.float32
+            if self.attn_res_mode == "fused"
+            else hidden_states.dtype
+        )
+        partial_block = torch.zeros_like(hidden_states, dtype=partial_dtype)
+        previous_mlp_delta = None
         for layer_offset, layer in enumerate(block_layers):
             attention_slot = 2 * layer_offset
             mlp_slot = attention_slot + 1
-            if partial_block is None:
+            if previous_mlp_delta is None:
                 attention_input = (
                     phase1.inter_numerator[attention_slot]
                     / phase1.inter_exp_sum[attention_slot].unsqueeze(-1)
                 ).to(hidden_states.dtype)
             else:
-                attention_input = _merge_attn_res_partial(
-                    partial_block,
-                    layer.self_attention_res_proj,
-                    layer.self_attention_res_norm,
-                    phase1,
-                    attention_slot,
+                attention_stats = AttnResPhase2Slot(
+                    effective_query=block_queries[attention_slot],
+                    inter_numerator=phase1.inter_numerator[attention_slot],
+                    inter_max=phase1.inter_max[attention_slot],
+                    inter_exp_sum=phase1.inter_exp_sum[attention_slot],
                 )
+                attention_input, partial_block = self._run_attn_res_phase2(
+                    partial_block,
+                    previous_mlp_delta.contiguous(),
+                    attention_stats,
+                    epsilon,
+                )
+                attention_input = attention_input.to(hidden_states.dtype)
             attention_output = layer.forward_attention(
                 attention_input,
                 forward_metadata,
                 query_start_loc,
                 query_boundaries,
             )
-            partial_block = (
-                attention_output
-                if partial_block is None
-                else partial_block + attention_output
+            mlp_stats = AttnResPhase2Slot(
+                effective_query=block_queries[mlp_slot],
+                inter_numerator=phase1.inter_numerator[mlp_slot],
+                inter_max=phase1.inter_max[mlp_slot],
+                inter_exp_sum=phase1.inter_exp_sum[mlp_slot],
+            )
+            mlp_input, partial_block = self._run_attn_res_phase2(
+                partial_block,
+                attention_output.contiguous(),
+                mlp_stats,
+                epsilon,
+            )
+            mlp_input = mlp_input.to(hidden_states.dtype)
+            previous_mlp_delta = layer.forward_mlp(
+                mlp_input,
+                forward_metadata,
+                self._shared_stream,
             )
 
-            mlp_input = _merge_attn_res_partial(
-                partial_block,
-                layer.mlp_res_proj,
-                layer.mlp_res_norm,
-                phase1,
-                mlp_slot,
-            )
-            mlp_output = layer.forward_mlp(mlp_input, forward_metadata, self._shared_stream)
-            partial_block = partial_block + mlp_output
-        return partial_block
+        if previous_mlp_delta is not None:
+            partial_block.add_(previous_mlp_delta)
+        return partial_block.to(hidden_states.dtype)
 
 
 class KimiLinearForCausalLM(nn.Module):
@@ -3057,6 +3176,7 @@ class KimiLinearForCausalLM(nn.Module):
                 quant_method, "process_weights_after_loading"
             ):
                 quant_method.process_weights_after_loading(module, is_nz=is_nz)
+        self.model.prepare_attn_res_effective_queries()
 
     def _split_kv_b_proj(self) -> None:
         """Split Prefill-TP and Decode-DP KV-B layouts for absorbed MLA."""
