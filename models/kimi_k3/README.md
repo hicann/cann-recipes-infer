@@ -83,6 +83,7 @@ parallel_config:
 | --- | --- | --- | --- |
 | `enable_attn_res_two_phase` | bool | `False` | 启用 AttnRes 两阶段等价计算，复用 block anchor 统计以减少重复计算。当前 YAML 设置为 `False`。 |
 | `enable_multi_streams` | bool | `True` | 启用多流并行。Decode 将 Shared Expert 放入独立流，与 Routed Expert 的分发、计算和聚合重叠，并在两路结果相加前同步；Prefill 保持主流执行。当前 YAML 设置为 `True`。 |
+| `moe_chunk_max_len` | int | `65536` | Prefill MoE 路由缓冲的 gathered-token 上限；超过时管线内部循环分块以控制峰值内存。设为 `0` 或负数可禁用分块。 |
 
 当前 YAML 的主要数据与调度参数如下：
 

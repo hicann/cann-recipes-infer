@@ -15,7 +15,7 @@
 
 """Top-level coordinator for paged-attention KV cache managers."""
 
-from typing import List, Optional, Sequence, Tuple, Dict
+from typing import Collection, List, Optional, Sequence, Tuple, Dict
 
 from .cache_info import ModelCacheInfo
 from .single_type_kv_cache_manager import SingleTypeKVCacheManager
@@ -44,6 +44,7 @@ class KVCacheManager:
         num_new_tokens: int,
         lookahead_tokens: int = 0,
         reserved_tokens: int = 0,
+        manager_keys: Optional[Collection[str]] = None,
     ) -> bool:
         """Coordinate slot allocation across all KV cache types."""
         if num_new_tokens < 0:
@@ -54,8 +55,14 @@ class KVCacheManager:
             self.max_model_len,
         )
 
+        # Non-owner ranks skip request-owned attention blocks but keep Mamba state.
+        selected_managers = [
+            manager for manager in self.single_type_managers
+            if manager_keys is None or manager.manager_key in manager_keys
+        ]
+
         block_num_to_allocate_per_manager: List[int] = []
-        for manager in self.single_type_managers:
+        for manager in selected_managers:
             manager.remove_skipped_blocks(
                 request_id=request_id,
                 total_computed_tokens=total_computed_tokens,
@@ -70,7 +77,7 @@ class KVCacheManager:
             block_num_to_allocate_per_manager.append(need_block_num)
 
         for manager, block_num_to_allocate in zip(
-            self.single_type_managers,
+            selected_managers,
             block_num_to_allocate_per_manager,
         ):
             manager.allocate_new_blocks(
@@ -79,6 +86,14 @@ class KVCacheManager:
                 num_tokens=num_tokens_need_slot,
             )
         return True
+
+    def get_request_owner_manager_keys(self, is_owner: bool) -> set[str]:
+        """Keep all owner caches and only Mamba state on non-owner ranks."""
+        return {
+            manager.manager_key
+            for manager in self.single_type_managers
+            if is_owner or manager.attn_type == "Mamba"
+        }
 
     def get_block_ids(self, request_id: int) -> Dict:
         """Return all blocks associated with a request."""

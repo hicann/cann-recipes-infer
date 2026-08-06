@@ -241,6 +241,7 @@ class ParallelConfig:
         global_rank: Global rank of this process (default: 0)
         local_rank: Local rank on the node (default: 0)
         attn_tp_size: Tensor parallelism size for attention (default: 1)
+        offline_prefill_dp_group_size: Number of ranks sharing an offline Prefill batch (default: 1)
         moe_tp_size: Tensor parallelism size for MoE (default: 1)
         embed_tp_size: Tensor parallelism size for embedding (default: 1)
         lmhead_tp_size: Tensor parallelism size for LM head (default: 1)
@@ -257,6 +258,7 @@ class ParallelConfig:
 
     attn_tp_size: int = 1
     attn_dp_size: int = 1  # This will be calculated based on world_size and attn_tp_size
+    offline_prefill_dp_group_size: int = 1
     cp_prefill_dp_size: int = 1  # This will be calculated based on world_size, attn_tp_size and cp_size
     embed_tp_size: int = 1
     embed_dp_size: int = 1  # This will be calculated based on world_size and embed_tp_size
@@ -278,6 +280,9 @@ class ParallelConfig:
             local_rank=local_rank,
             world_size=parallel_config_dict.get("world_size", 1),
             attn_tp_size=parallel_config_dict.get("attn_tp_size", 1),
+            offline_prefill_dp_group_size=parallel_config_dict.get(
+                "offline_prefill_dp_group_size", 1
+            ),
             moe_tp_size=parallel_config_dict.get("moe_tp_size", 1),
             embed_tp_size=parallel_config_dict.get("embed_tp_size", 1),
             lmhead_tp_size=parallel_config_dict.get("lmhead_tp_size", 1),
@@ -305,6 +310,15 @@ class ParallelConfig:
 
         if self.world_size % self.attn_tp_size != 0:
             raise ValueError(f"world_size={self.world_size} not divisible by attn_tp_size={self.attn_tp_size}")
+        if (
+            self.offline_prefill_dp_group_size <= 0
+            or self.world_size % self.offline_prefill_dp_group_size != 0
+        ):
+            raise ValueError(
+                "offline_prefill_dp_group_size="
+                f"{self.offline_prefill_dp_group_size} must be positive and divide "
+                f"world_size={self.world_size}"
+            )
         if self.world_size % self.moe_tp_size != 0:
             raise ValueError(f"world_size={self.world_size} not divisible by moe_tp_size={self.moe_tp_size}")
         if self.world_size % self.embed_tp_size != 0:
@@ -461,6 +475,16 @@ class InferenceConfig:
             attn_dp_size = infer_config._update_afd_parallel_config()
         infer_config.scheduler_config.batch_size_per_dp_rank = \
             infer_config.scheduler_config.batch_size // attn_dp_size
+        owner_group_size = infer_config.parallel_config.offline_prefill_dp_group_size
+        if (
+            owner_group_size > 1
+            and infer_config.scheduler_config.batch_size_per_dp_rank % owner_group_size != 0
+        ):
+            raise ValueError(
+                "batch_size_per_dp_rank must be divisible by offline_prefill_dp_group_size: "
+                f"batch_size_per_dp_rank={infer_config.scheduler_config.batch_size_per_dp_rank}, "
+                f"offline_prefill_dp_group_size={owner_group_size}"
+            )
 
         if infer_config.scheduler_config.max_prefill_tokens == 0:
             prefill_batch_size = infer_config.scheduler_config.batch_size_per_dp_rank

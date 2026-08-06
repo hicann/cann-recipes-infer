@@ -264,6 +264,7 @@ class Scheduler:
         max_prefill_tokens = self.config.max_prefill_tokens
         parallel_config = engine.infer_config.parallel_config
         enable_offline_cp = self.mode == 'offline' and parallel_config.cp_size > 1
+        cache_owner_group_size = self._offline_cache_owner_group_size(engine)
 
         # Strict FIFO: only consider the queue head. If the head request
         # cannot fit in the current prefill batch budget, stop scheduling
@@ -283,20 +284,34 @@ class Scheduler:
             ):
                 break
 
+            request_index = request_offset + len(selected)
             if enable_offline_cp:
-                request.cp_rank = (request_offset + len(selected)) % parallel_config.cp_size
+                request.cp_rank = request_index % parallel_config.cp_size
+            elif cache_owner_group_size > 1:
+                # Match persistent cache ownership to contiguous Decode request shards.
+                requests_per_owner = (
+                    self.config.batch_size_per_dp_rank
+                    // cache_owner_group_size
+                )
+                request.cp_rank = (
+                    request_index // requests_per_owner
+                ) % cache_owner_group_size
+
+            manager_keys = self._offline_cache_manager_keys(engine, request)
 
             if (
                 engine.kvcache_manager
-                and self._needs_prefill_kv_allocation(engine, request)
                 and not engine.kvcache_manager.allocate_slots(
-                    request.request_id, request.computed_len, request.input_ids.shape[-1]
+                    request.request_id,
+                    request.computed_len,
+                    request.input_ids.shape[-1],
+                    manager_keys=manager_keys,
                 )
             ):
                 if enable_offline_cp:
                     raise RuntimeError(
                         "CP offline prefill requires all CP ranks to schedule the same request batch, "
-                        "but the owner rank failed to allocate KV cache slots. "
+                        "but one rank failed to allocate its required cache slots. "
                         f"request_id={request.request_id}, cp_rank={request.cp_rank}, "
                         f"global_rank={parallel_config.global_rank}"
                     )
@@ -317,12 +332,28 @@ class Scheduler:
 
         return batch
 
-    def _needs_prefill_kv_allocation(self, engine: ExecutionEngine, request: Request) -> bool:
+    def _offline_cache_owner_group_size(self, engine: ExecutionEngine) -> int:
+        if self.mode != 'offline':
+            return 1
+
         parallel_config = engine.infer_config.parallel_config
-        if self.mode != 'offline' or parallel_config.cp_size <= 1:
-            return True
-        current_cp_rank = parallel_config.global_rank % parallel_config.cp_size
-        return request.cp_rank == current_cp_rank
+        if parallel_config.cp_size > 1:
+            return parallel_config.cp_size
+        if engine.kvcache_manager is None:
+            return 1
+        return parallel_config.offline_prefill_dp_group_size
+
+    def _offline_cache_manager_keys(self, engine: ExecutionEngine, request: Request):
+        if self.mode != 'offline' or engine.kvcache_manager is None:
+            return None
+
+        group_size = self._offline_cache_owner_group_size(engine)
+        if group_size <= 1:
+            return None
+
+        current_rank = engine.infer_config.parallel_config.global_rank % group_size
+        is_owner = request.cp_rank == current_rank
+        return engine.kvcache_manager.get_request_owner_manager_keys(is_owner)
 
     def _prepare_request_prompt(self, request: Request) -> None:
         if request.input_ids.numel() > 0:
@@ -372,10 +403,12 @@ class Scheduler:
         selected: List[Request] = []
         for req in running:
             # Offline mode requires that all requests in the running list are used for inference.
+            manager_keys = self._offline_cache_manager_keys(engine, req)
             if engine.kvcache_manager and not engine.kvcache_manager.allocate_slots(
                 req.request_id, computed_tokens=req.computed_len + 1,
                 num_new_tokens=1 + engine.next_n,
-                lookahead_tokens=max(engine.next_n - 1, 0)
+                lookahead_tokens=max(engine.next_n - 1, 0),
+                manager_keys=manager_keys,
             ):
                 continue
             selected.append(req)

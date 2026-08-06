@@ -201,9 +201,8 @@ class ExecutionEngine:
     def _init_cache_manager(self, cache_info: ModelCacheInfo):
         validate_cache_info(cache_info)
         # Mamba entries carry their own next_n, so check the model agrees with the
-        # speculation depth the engine was configured with. CP is rejected up front:
-        # a recurrent state has no defined split across CP ranks, and non-owner ranks
-        # skip prefill allocation, so their state block table would come up empty.
+        # speculation depth the engine was configured with. CP is rejected up front
+        # because a recurrent state has no defined split and merge across CP ranks.
         cp_size = self.infer_config.parallel_config.cp_size
         for layer_info in cache_info.layer_infos:
             for cache in layer_info.caches:

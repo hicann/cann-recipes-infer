@@ -10,6 +10,7 @@ model_config:
   custom_params:
     enable_attn_res_two_phase: False
     enable_multi_streams: True
+    moe_chunk_max_len: 65536
 
 data_config:
   dataset: "default"
@@ -18,6 +19,7 @@ data_config:
 parallel_config:
   world_size: 32
   attn_tp_size: 32
+  offline_prefill_dp_group_size: 32
   moe_tp_size: 1
   embed_tp_size: 32
   lmhead_tp_size: 32

@@ -162,7 +162,7 @@ class Request:
         valid_output_len: Length of valid output tokens when hitting EOS or max_new_tokens.
         eos_output_len: Output length through the first EOS token. This records
             EOS inside a multi-token MTP step without making finish decisions.
-        cp_rank: Phase1 CP owner rank that stores persistent KV and runs decode for this request.
+        cp_rank: Group-local rank that owns this request's partitioned persistent cache.
     """
     request_id: int
     prompt: "str | List[dict]"
@@ -387,7 +387,7 @@ class Batch:
                             request.eos_output_len = old_output_len + token_idx + 1
                             break
                 next_tokens_by_request[request.request_id] = request_next_tokens
-            
+
             if logprobs_tensors is not None:
                 request_logprobs = logprobs_tensors.filter(output_idx, accepted_num)
                 request.output_logprobs += request_logprobs

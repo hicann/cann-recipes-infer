@@ -262,6 +262,7 @@ def calculate_block_num(
     paged_manager_keys = set()
     paged_block_sizes_by_key: Dict[str, int] = {}
     paged_block_bytes_by_key: Dict[str, int] = {}
+    cache_partition_sizes_by_key: Dict[str, int] = {}
     has_fixed_block_cache = False
     per_token_bytes = 0
 
@@ -287,6 +288,12 @@ def calculate_block_num(
                 cache.cache_dim_numel() * cache.num_head * dtype_itemsize(cache.dtype) // cache.compress_ratio
             )
             paged_block_sizes_by_key[group_key] = block_size
+            cache_partition_sizes_by_key[group_key] = (
+                infer_config.parallel_config.offline_prefill_dp_group_size
+                if infer_config.parallel_config.offline_prefill_dp_group_size > 1
+                and cache.attn_type == "FullAttention"
+                else 1
+            )
             paged_manager_keys.add(group_key)
             if CacheAllocator(cache.allocator) == CacheAllocator.HBM:
                 paged_block_bytes_by_key[group_key] = (
@@ -313,7 +320,11 @@ def calculate_block_num(
         for manager_key in paged_manager_keys:
             paged_block_size = paged_block_sizes_by_key[manager_key]
             block_num = int((offline_max_len + paged_block_size - 1) / paged_block_size)
-            block_num = block_num * infer_config.scheduler_config.batch_size_per_dp_rank
+            local_concurrency = (
+                infer_config.scheduler_config.batch_size_per_dp_rank
+                // cache_partition_sizes_by_key[manager_key]
+            )
+            block_num = block_num * local_concurrency
             # The extra one block is allocated for the null block.
             block_num_by_type[manager_key] = block_num + 1
 
