@@ -52,10 +52,20 @@
 - [GPT-OSS-20B权重](https://huggingface.co/openai/gpt-oss-20b/tree/main)
 - [GPT-OSS-120B权重](https://huggingface.co/openai/gpt-oss-120b/tree/main)
 
-开发者可以根据模型任务进行选择，并将原始权重下载至本地路径，例如：`/data/models/gpt-oss-20b-bf16`。
+开发者可以根据模型任务进行选择，并将原始权重下载至本地路径，例如：`/data/models/gpt-oss-20b-mxfp4`。
 
-> 注意：原始权重为mxfp4格式，本推理脚本仅支持bf16格式，可参考[官方代码](https://github.com/openai/gpt-oss/blob/main/gpt_oss/torch/weights.py)自行转换。
 
+## 转换权重
+
+> **注意** 原始权重为mxfp4格式，本推理脚本仅支持bf16格式，本样例提供[权重转换脚本](./converter/convert.py)，将mxfp4权重还原为 BF16 精度，并分片存储在本地，供本样例一键使用，按照本样例的环境配置，对GPT-OSS-20B实测有效，以下是使用方法
+
+1. 将原始权重目录与转换输出目录作为入参，运行转换程序
+   ```shell
+   cd cann-recipes-infer/models/gpt_oss
+   python3 converter/convert.py --input /path/to/your/original/mxfp4/weights --output /path/to/your/output/bf16/weights 
+   ```
+
+>转换完成后，输出目录里会包含本框架推理所需要的全部文件，可直接作为后续输入
 
 ## 推理执行
 
