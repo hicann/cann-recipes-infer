@@ -11,7 +11,7 @@ cann-recipes-infer 提供 Kimi K3 在昇腾 950PR/DT 4机 32卡集群上的实�
 - **Block AttnRes**：Attention 与 FFN 各自对跨层表示计算 Softmax 权重，在naive实现的基础上recipes提供两阶段计算策略实现。
 - **Stable LatentMoE 与 SiTU**：Routed Expert 在 3584 维 latent 空间计算，Shared Expert 保持 7168 维主干路径，二者均使用 SiTU 激活，recipes提供Routed Expert  EP部署以及Shared Expert TP部署的参考实现，并支持原生MXFP4/MXFP8 Expert 计算。
 - **混合并行策略**：recipes采用 Embedding TP、Attention DP/TP、Dense TP、Routed Expert EP、Prefill SP 与 Decode DP部署策略，兼顾模型内存约束/推理性能。
-- **融合算子接入**：recipes接入多个KDA/MLA/MoE融合算子，进一步加速推理性能。
+- **KDA 融合算子**：Prefill 接入 flash_kda 融合算子，将 L2 归一化、gate 激活与 beta sigmoid 融合进算子内部；Decode 接入 fused_recurrent_kda 融合算子，实现逐 token 递推的 L2 norm/gate/beta 全融合，减少 Python 侧预处理开销与中间张量读写。
 
 ## Outline
 
@@ -22,6 +22,7 @@ cann-recipes-infer 提供 Kimi K3 在昇腾 950PR/DT 4机 32卡集群上的实�
 - [并行策略](#并行策略)
 - [量化策略](#量化策略)
 - [npugraph_ex 图模式](#npugraph_ex-图模式)
+- [KDA 融合算子](#kda-融合算子)
 - [Future Plan](#future-plan)
 
 ## 模型结构
@@ -236,9 +237,53 @@ Kimi K3 的 Routed Expert `w13/w2` 使用 MXFP4 权重和动态 MXFP8 激活，�
 
 `npugraph_ex` 用于捕获 Kimi K3 的 Decode 阶段。Prefill 保持 eager，用于处理变长 packed sequence 并建立初始 Cache。Decode 使用固定 token 数、固定 Cache 地址和固定 AttnRes slots 进行 capture/replay。
 
+## KDA 融合算子
+
+KDA 的 Prefill 与 Decode 阶段分别接入不同的融合算子，将 L2 归一化、gate 激活和 beta sigmoid 等预处理操作融合进 NPU 算子内部，减少中间张量读写和 Python 侧算子调度开销。两个开关分别控制 Prefill 与 Decode 路径：
+
+| 开关 | 默认值 | 作用 |
+|:---|:---|:---|
+| `enable_flash_kda` | `True` | Prefill 阶段选择 flash_kda 融合算子或 torch 参考实现 |
+| `enable_fused_recurrent_kda` | `True` | Decode 阶段选择 fused_recurrent_kda 融合算子或 gdr 算子 |
+
+### Prefill：flash_kda 融合算子
+
+Prefill 阶段按请求分块计算 chunk KDA，每块大小 64 token。`enable_flash_kda=True` 时调用 flash_kda 算子，`False` 时回退到纯 Python 参考实现（`_torch_chunk_kda`）。当 `gate_lower_bound is None`（softplus gate 形式）时，flash_kda 不支持该 gate 公式，自动退到 torch 参考实现。
+
+**融合范围对比：**
+
+| 操作 | flash_kda（融合算子） | torch 参考实现 |
+|:---|:---|:---|
+| L2 normalization | 算子内部融合，eps=1e-6 | Python 侧 `_l2_normalize` |
+| gate 激活 | 算子内部计算 `lower_bound * sigmoid(exp(A_log) * (g + dt_bias))` | Python 侧同公式 |
+| beta sigmoid | 算子内部 `1/(1+exp(-beta))` | Python 侧 `.sigmoid()` |
+| chunk 分块循环 | 算子内部 | Python for 循环 |
+
+**入参约定：** flash_kda 接收 raw bf16 Q/K/g/beta（未经预处理），dtype 要求为 bfloat16；`initial_state`/`A_log`/`dt_bias` 为 fp32。算子内部完成 L2 norm 后将 Q/K 转为 fp32 计算，输出 state 为 fp32 `[B, H, D, D]`，output 为 bf16 `[B, S, H, D]`。
+
+**Padding 策略：** 当请求 token 数不是 64 的整数倍时，对 Q/K/V pad 零值（L2 norm 后仍为零，output 贡献为零），对 g/beta pad `-inf`（`sigmoid(-inf)=0`，gate 激活为零使 state 不衰减，beta 为零使 delta 不更新 state），确保 pad token 对递推状态无副作用。计算完成后裁剪 `output[:, :tokens]` 去除 pad 部分。
+
+### Decode：fused_recurrent_kda 融合算子
+
+Decode 阶段逐 token 递推更新 KDA SSM State。`enable_fused_recurrent_kda=True` 且 `gate_lower_bound is not None` 时调用 fused_recurrent_kda 算子，否则回退到 `npu_recurrent_gated_delta_rule`（gdr）算子。
+
+**融合范围对比：**
+
+| 操作 | fused_recurrent_kda（融合算子） | gdr（基线算子） |
+|:---|:---|:---|
+| L2 normalization | 算子内部融合，eps=1e-6 | Python 侧 `_l2_normalize` |
+| gate 激活 | 算子内部 `lower_bound * sigmoid(exp(A_log) * (g + dt_bias))` | Python 侧 forward 中预计算 |
+| beta sigmoid | 算子内部 `1/(1+exp(-beta))` | Python 侧 `.sigmoid()` |
+| 输入 dtype | raw bf16 BSND 4D | 预处理后 bf16 TND 3D |
+| state 更新 | 原地更新 `recurrent_state_cache` | 同 |
+| 返回值 | `(state, out)` tuple，state 丢弃 | 单值 `out` |
+
+**入参约定：** fused_recurrent_kda 接收 raw bf16 Q/K/g/beta，layout 为 BSND `[B, S, H, D]`；beta 需补尾维至 `[B, S, H, 1]`；`A_log`/`dt_bias` 为 fp32；`lower_bound` 为 float（范围 `[-5, 0]`）。`ssm_state_indices` 必须传入（值为动态分配的 block id，不能使用默认 `arange`），`num_accepted_tokens` 传 `None`（标准 decode seq=1 时默认 `ones(batch)` 与实际值一致）。
+
+**State 布局：** 两条路径的 state 布局一致，均为 `[pool, H, Dv, Dk]` fp32，行索引对应 value 维度（Dv），列索引对应 key 维度（Dk）。fused_recurrent_kda 返回的 state 与传入的 `recurrent_state_cache` 是同一 tensor 对象（原地更新），因此返回的 state 直接丢弃，无需额外写回 cache。
+
 ## Future Plan
 
-- **KDA 融合算子**：提供 Chunk KDA 融合算子，进一步提升 TTFT 性能。
 - **AttnRes 融合算子**：围绕两阶段实现，分别融合 Phase 1 的 anchor 打分与统计归约、Phase 2 的 partial 打分与 Online Softmax 合并，减少中间张量读写与调度开销。
 - **权重 Prefetch**：针对 Routed Expert GMM 与大线性层的访存瓶颈，评估 MXFP4 专家权重预取收益。
 - **MegaMoE支持**：面向 896 expert MoE 大EP 多专家部署场景，支持MegaKernel融合，进一步提升性能与推理稳定性。

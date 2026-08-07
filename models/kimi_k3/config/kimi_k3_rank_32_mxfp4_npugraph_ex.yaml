@@ -11,8 +11,9 @@ model_config:
   custom_params:
     attn_res_mode: "original"
     enable_multi_streams: True
-    enable_flash_kda: True
     moe_chunk_max_len: 65536
+    enable_flash_kda: True
+    enable_fused_recurrent_kda: False
 
 data_config:
   dataset: "default"

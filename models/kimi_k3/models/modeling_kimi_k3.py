@@ -63,6 +63,14 @@ from ops.cannbot_dsl import (
 )
 
 from .configuration_kimi_k3 import KimiLinearConfig
+
+try:
+    from ops.cannbot_dsl.flash_kda import flash_kda as _flash_kda_impl
+    from ops.cannbot_dsl.fused_recurrent_kda import fused_recurrent_kda_op as _recurrent_kda_impl
+except ImportError:
+    _flash_kda_impl = None
+    _recurrent_kda_impl = None
+
 import cann_ops_transformer.ops
 
 logger = logging.getLogger(__name__)
@@ -75,6 +83,20 @@ _MOE_GATING_MAX_EXPERTS = 2048
 _KV_CACHE_NZ_DIM = 16
 
 _KDA_CHUNK_SIZE = 64
+
+
+class KdaInputs(NamedTuple):
+    query: torch.Tensor
+    key: torch.Tensor
+    value: torch.Tensor
+    raw_gate: torch.Tensor
+    raw_beta: torch.Tensor
+
+
+class KdaGateParams(NamedTuple):
+    a_log: torch.Tensor
+    dt_bias: torch.Tensor
+    lower_bound: Optional[float]
 
 # Default gathered-token ceiling for the MoE prefill routing buffers.
 _DEFAULT_MOE_CHUNK_MAX_LEN = 65536
@@ -1070,6 +1092,12 @@ class KimiDeltaAttention(nn.Module):
             0 if self.attn_tp_size == 1 else comm_manager.get_rank("attn_tp_group")
         )
         quant_config = getattr(config, "quant_config", None)
+        self.use_flash_kda = infer_config.model_config.custom_params.get("enable_flash_kda", True)
+        if self.use_flash_kda and _flash_kda_impl is None:
+            raise ImportError("enable_flash_kda=True but ops.cannbot_dsl.flash_kda is not available")
+        self.use_fused_recurrent_kda = infer_config.model_config.custom_params.get("enable_fused_recurrent_kda", True)
+        if self.use_fused_recurrent_kda and _recurrent_kda_impl is None:
+            raise ImportError("enable_fused_recurrent_kda=True but fused_recurrent_kda is not available")
         # Between layers, Prefill holds a token-SP shard while Decode holds a
         # request-DP shard. Attention gathers either layout for head TP and
         # reduce-scatters the projected result back to the owning ranks.
@@ -1112,10 +1140,10 @@ class KimiDeltaAttention(nn.Module):
         )
         kernel_size = linear["short_conv_kernel_size"]
         self.qkv_conv1d = KimiShortConvolution(self.qkv_projection_size, kernel_size)
-        # The real checkpoint stores A_log with shape [head_dim]. Treat it as
-        # the per-channel base decay so the recurrence matches the weight contract.
+        # The checkpoint stores 96 logical per-head values followed by 32 zero
+        # padding values. load_weights removes the padding and shards the heads.
         self.A_log = nn.Parameter(
-            torch.log(torch.empty(self.head_dim, dtype=torch.float32).uniform_(1, 16))
+            torch.log(torch.empty(self.num_heads, dtype=torch.float32).uniform_(1, 16))
         )
         # The low-rank legs of the decay and gate projections land in head_dim,
         # which attn_tp does not split, so they stay replicated.
@@ -1240,33 +1268,111 @@ class KimiDeltaAttention(nn.Module):
         # Mamba table has one column containing the main model's state.
         return block_table[:batch, 0].to(torch.int32)
 
-    def _torch_chunk_kda_eager(
+    def _chunk_kda_dispatch(
         self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        decay: torch.Tensor,
-        beta: torch.Tensor,
+        inputs: KdaInputs,
+        gate_params: KdaGateParams,
         initial_state: torch.Tensor,
         query_boundaries: list[int],
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Run chunk KDA independently for every packed request."""
+        # Prefill: dispatch to flash_kda or torch reference by use_flash_kda.
+        # Returns: output [tokens, H, D] bf16, final_state [batch, H, D, D] fp32.
+        if self.use_flash_kda and gate_params.lower_bound is not None:
+            return self._prefill_flash_kda(
+                inputs, gate_params, initial_state, query_boundaries,
+            )
+        return self._prefill_torch_kda(
+            inputs, gate_params, initial_state, query_boundaries,
+        )
+
+    def _slice_request_inputs(
+        self,
+        inputs: KdaInputs,
+        start: int,
+        end: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        query, key, value, raw_gate, raw_beta = inputs
+        return (
+            query[start:end].unsqueeze(0),
+            key[start:end].unsqueeze(0),
+            value[start:end].unsqueeze(0),
+            raw_gate[start:end].unsqueeze(0),
+            raw_beta[start:end].unsqueeze(0),
+        )
+
+    def _prefill_flash_kda(
+        self,
+        inputs: KdaInputs,
+        gate_params: KdaGateParams,
+        initial_state: torch.Tensor,
+        query_boundaries: list[int],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Prefill flash_kda: fuses L2 norm + gate activation + beta sigmoid, per-request chunked.
+        # Returns: output [tokens, H, D] bf16, final_state [batch, H, D, D] fp32.
         outputs = []
         final_states = []
         for request, (start, end) in enumerate(
             zip(query_boundaries, query_boundaries[1:])
         ):
+            q, k, v, g, b = self._slice_request_inputs(inputs, start, end)
+            tokens, key_dim = q.shape[1], q.shape[3]
+            pad_len = (-tokens) % _KDA_CHUNK_SIZE
+            if pad_len:
+                q, k, v = (
+                    F.pad(t, (0, 0, 0, 0, 0, pad_len)) for t in (q, k, v)
+                )
+                g = F.pad(g, (0, 0, 0, 0, 0, pad_len), value=float('-inf'))
+                b = F.pad(b, (0, 0, 0, pad_len), value=float('-inf'))
+            q, k, v, g, b = (t.contiguous() for t in (q, k, v, g, b))
+            output, state = _flash_kda_impl(
+                q, k, v, g=g, beta=b,
+                scale=1.0 / math.sqrt(key_dim),
+                initial_state=initial_state[request:request + 1],
+                A_log=gate_params.a_log,
+                dt_bias=gate_params.dt_bias,
+                lower_bound=gate_params.lower_bound,
+                layout_qkv="BSND",
+            )
+            if pad_len:
+                output = output[:, :tokens].contiguous()
+            outputs.append(output.squeeze(0))
+            final_states.append(state.squeeze(0))
+        return torch.cat(outputs), torch.stack(final_states)
+
+    def _prefill_torch_kda(
+        self,
+        inputs: KdaInputs,
+        gate_params: KdaGateParams,
+        initial_state: torch.Tensor,
+        query_boundaries: list[int],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Prefill torch reference: Python-side L2 norm + gate/beta activation, pure Python chunk loop.
+        # Returns: output [tokens, H, D] bf16, final_state [batch, H, D, D] fp32.
+        outputs = []
+        final_states = []
+        gate_scale = gate_params.a_log.exp().view(-1, 1)
+        for request, (start, end) in enumerate(
+            zip(query_boundaries, query_boundaries[1:])
+        ):
+            q_src, k_src, v_src, gate_raw, beta_raw = self._slice_request_inputs(inputs, start, end)
+            gate_raw = gate_raw.float()
+            beta_raw = beta_raw.float()
+            gate_input = gate_raw + gate_params.dt_bias
+            if gate_params.lower_bound is not None:
+                g = float(gate_params.lower_bound) * torch.sigmoid(gate_scale * gate_input)
+            else:
+                g = -gate_scale * _softplus(gate_input)
+            b = beta_raw.sigmoid()
+            torch_initial_state = initial_state[
+                request:request + 1
+            ].transpose(-1, -2).contiguous()
             output, state = _torch_chunk_kda(
-                query[start:end].unsqueeze(0),
-                key[start:end].unsqueeze(0),
-                value[start:end].unsqueeze(0),
-                decay[start:end].unsqueeze(0),
-                beta[start:end].unsqueeze(0),
-                initial_state[request : request + 1],
+                q_src, k_src, v_src, g, b, torch_initial_state,
                 self.kda_transition_mask,
                 self.kda_attention_mask,
                 self.kda_identity,
             )
+            state = state.transpose(-1, -2).contiguous()
             outputs.append(output.squeeze(0))
             final_states.append(state.squeeze(0))
         return torch.cat(outputs), torch.stack(final_states)
@@ -1347,24 +1453,9 @@ class KimiDeltaAttention(nn.Module):
 
         shape = (*input_states.shape[:-1], self.num_heads, self.head_dim)
         q, k, v = q.view(shape), k.view(shape), v.view(shape)
-        raw_decay = self.f_b_proj(self.f_a_proj(input_states)).view(shape).float()
+        raw_decay = self.f_b_proj(self.f_a_proj(input_states)).view(shape)
+        raw_beta = self.b_proj(input_states)
         dt_bias = self.dt_bias.view(self.num_heads, self.head_dim)
-        gate_input = raw_decay + dt_bias
-        gate_scale = self.A_log.float().exp()
-        if self.gate_lower_bound is not None:
-            # FLA switches the gate activation entirely when chunk_kda /
-            # fused_recurrent_kda are called with safe_gate=True, which is what
-            # the checkpoint's gate_lower_bound=-5.0 selects. The bound is not
-            # applied to the softplus form -- it multiplies a sigmoid, which
-            # lands in (lower_bound, 0) by construction. exp(A_log) also moves:
-            # it scales the sigmoid's input, so it sets the gate's sharpness
-            # rather than the magnitude of the decay.
-            decay = float(self.gate_lower_bound) * torch.sigmoid(
-                gate_scale * gate_input
-            )
-        else:
-            decay = -gate_scale * _softplus(gate_input)
-        beta = self.b_proj(input_states).float().sigmoid()
 
         if forward_metadata.is_prefill:
             initial_state = torch.zeros(
@@ -1372,18 +1463,35 @@ class KimiDeltaAttention(nn.Module):
                 self.head_dim, self.head_dim,
                 dtype=torch.float32, device=q.device,
             )
-            output, state = self._torch_chunk_kda_eager(
-                q, k, v, decay, beta, initial_state, query_boundaries
+            output, state = self._chunk_kda_dispatch(
+                KdaInputs(q, k, v, raw_decay, raw_beta),
+                KdaGateParams(self.A_log, dt_bias, self.gate_lower_bound),
+                initial_state, query_boundaries,
             )
-            # The Torch reference stores [Dk, Dv], while the fused operator's
-            # resident state contract is [Dv, Dk].
-            operator_state = state.transpose(-1, -2).contiguous()
-            self.update_mamba_cache(state_ids, operator_state)
+            self.update_mamba_cache(state_ids, state)
             output = _pad_kda_output(output, sp_pad_len)
         else:
-            output = self._decode_recurrent_kda(
-                q, k, v, decay, beta, forward_metadata
-            )
+            if self.use_fused_recurrent_kda:
+                output = self._decode_fused_kda(
+                    KdaInputs(q, k, v, raw_decay, raw_beta),
+                    KdaGateParams(self.A_log, dt_bias, self.gate_lower_bound),
+                    forward_metadata,
+                )
+            else:
+                gate_input = raw_decay + dt_bias
+                gate_scale = self.A_log.float().exp().view(self.num_heads, 1)
+                use_safe_gate = self.gate_lower_bound is not None
+                if use_safe_gate:
+                    decay = float(self.gate_lower_bound) * torch.sigmoid(
+                        gate_scale * gate_input
+                    )
+                else:
+                    decay = -gate_scale * _softplus(gate_input)
+                beta = raw_beta.float().sigmoid()
+                output = self._decode_gdr(
+                    KdaInputs(q, k, v, decay, beta),
+                    forward_metadata,
+                )
             output = output.reshape(tokens, *output.shape[2:])
         return gate, output
 
@@ -1403,26 +1511,54 @@ class KimiDeltaAttention(nn.Module):
             )
         torch_npu.npu_scatter_nd_update_(cache, indices.view(-1, 1), values)
 
-    def _decode_recurrent_kda(
+    def _decode_fused_kda(
         self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        decay: torch.Tensor,
-        beta: torch.Tensor,
+        inputs: KdaInputs,
+        gate_params: KdaGateParams,
         forward_metadata: ForwardMetaData,
     ) -> torch.Tensor:
-        """Run channel-wise KDA decode with the fused recurrent operator.
+        # Decode fused_recurrent_kda: fuses L2 norm + gate activation + beta sigmoid, per-token recurrent.
+        # State updates recurrent_state_cache in-place, returns out [B, S, H, D] bf16.
+        query, key, value, raw_gate, raw_beta = inputs
+        batch, seq, num_heads, key_dim = query.shape
+        scale = 1 / math.sqrt(key_dim)
+        state_ids = self._state_block_ids(forward_metadata, batch)
+        ssm_state_indices = state_ids.repeat_interleave(seq).to(torch.int32)
+        q = query.contiguous()
+        k = key.contiguous()
+        v = value.contiguous()
+        g = raw_gate.contiguous()
+        b = raw_beta.unsqueeze(-1).contiguous()
+        out = _recurrent_kda_impl(
+            q, k, v,
+            state=self.recurrent_state_cache,
+            beta=b,
+            g=g,
+            scale=scale,
+            A_log=gate_params.a_log,
+            dt_bias=gate_params.dt_bias,
+            lower_bound=gate_params.lower_bound,
+            layout_qkv="BSND",
+            ssm_state_indices=ssm_state_indices,
+            num_accepted_tokens=None,
+        )
+        return out
 
-        Model tensors use ``[B,S,H,D]`` and are packed to the operator's TND
-        layout. The resident state uses the ``[BlockNum,H,Dv,Dk]`` layout and
-        FP32 dtype Shared with Prefill.
-        """
+    def _decode_gdr(
+        self,
+        inputs: KdaInputs,
+        forward_metadata: ForwardMetaData,
+    ) -> torch.Tensor:
+        # Decode gdr: Python-side L2 norm + gate/beta activation, calls npu_recurrent_gated_delta_rule.
+        # State updates recurrent_state_cache in-place, returns out [B, S, H, D] bf16.
+        # inputs carries already-activated decay and sigmoid'd beta for the gdr path.
+        query, key, value, decay, beta = inputs
         batch, seq, num_heads, key_dim = query.shape
         value_dim = value.shape[-1]
         tokens = batch * seq
-        # The operator consumes packed TND tensors, where T is the sum of the
-        # per-request sequence lengths.
+        scale = 1 / math.sqrt(key_dim)
+        state_ids = self._state_block_ids(forward_metadata, batch)
+        ssm_state_indices = state_ids.repeat_interleave(seq).to(torch.int32)
         q = _l2_normalize(query).reshape(tokens, num_heads, key_dim).to(
             torch.bfloat16
         )
@@ -1431,16 +1567,7 @@ class KimiDeltaAttention(nn.Module):
         )
         v = value.reshape(tokens, num_heads, value_dim).to(torch.bfloat16)
         b = beta.reshape(tokens, num_heads).to(torch.bfloat16)
-        # KDA decays each key channel independently, corresponding to gk rather
-        # than the scalar-per-head g input used by Gated DeltaNet.
         gk = decay.reshape(tokens, num_heads, key_dim).float()
-        scale = 1 / math.sqrt(query.shape[-1])
-        state_ids = self._state_block_ids(forward_metadata, batch)
-        actual_seq_lengths = forward_metadata.actual_seq_lengths_q.to(
-            device=q.device, dtype=torch.int32
-        )
-        ssm_state_indices = state_ids.repeat_interleave(seq).to(torch.int32)
-
         core_attn_out = torch_npu.npu_recurrent_gated_delta_rule(
             q,
             k,
@@ -1448,7 +1575,9 @@ class KimiDeltaAttention(nn.Module):
             self.recurrent_state_cache,
             beta=b,
             scale=scale,
-            actual_seq_lengths=actual_seq_lengths,
+            actual_seq_lengths=forward_metadata.actual_seq_lengths_q.to(
+                device=q.device, dtype=torch.int32
+            ),
             ssm_state_indices=ssm_state_indices,
             num_accepted_tokens=None,
             g=None,
@@ -2967,13 +3096,9 @@ class KimiLinearForCausalLM(nn.Module):
             logits = torch.cat(gathered, dim=-1)
         return logits
 
-    # dt_bias is the only bare attention parameter sharded across attn_tp.
-    # The checkpoint stores it whole; each rank keeps its own head slice. Every
-    # projection is a framework parallel layer and shards inside its own
-    # weight_loader instead.
-    #
-    # A_log and o_norm.weight are deliberately absent: both are [head_dim], and
-    # head_dim is not what attn_tp splits.
+    # dt_bias is sharded across attn_tp by its flattened head-major dimension.
+    # A_log needs separate handling because the checkpoint appends 32 padding
+    # entries after the logical heads.
     _ATTN_TP_SHARD_DIM = {
         "self_attn.dt_bias": 0,
     }
@@ -3038,19 +3163,9 @@ class KimiLinearForCausalLM(nn.Module):
         def store(param_name: str, tensor: torch.Tensor) -> None:
             param = params[param_name]
             if param.shape != tensor.shape:
-                hint = ""
-                if param_name.endswith("self_attn.A_log"):
-                    # A_log is built as [head_dim]. If a [num_heads] tensor lands
-                    # here the [head_dim] choice is wrong -- flip the A_log
-                    # construction and the gate_scale view in KimiDeltaAttention
-                    # together.
-                    hint = (
-                        " -- A_log broadcast axis is unresolved; see the "
-                        "construction comment in KimiDeltaAttention.__init__"
-                    )
                 raise ValueError(
                     f"{param_name}: checkpoint gives {tuple(tensor.shape)}, "
-                    f"parameter is {tuple(param.shape)}{hint}"
+                    f"parameter is {tuple(param.shape)}"
                 )
             param.data.copy_(tensor.to(dtype=param.dtype))
             loaded.add(param_name)
@@ -3144,6 +3259,15 @@ class KimiLinearForCausalLM(nn.Module):
 
             if name not in params:
                 raise ValueError(f"checkpoint tensor has no parameter: {name}")
+
+            if name.endswith("self_attn.A_log"):
+                num_heads = self.config.linear_attn_config["num_heads"]
+                local_heads = num_heads // tp_size
+                tensor = tensor.narrow(
+                    0, tp_rank * local_heads, local_heads
+                )
+                store(name, tensor)
+                continue
 
             for source_suffix, decode_suffix in (
                 (".q_b_proj.weight", ".q_b_proj_decode.weight"),
