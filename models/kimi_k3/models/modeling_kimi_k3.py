@@ -990,6 +990,11 @@ class KimiShortConvolution(nn.Module):
         # in FP32 even when the surrounding projections are BF16.
         self.weight = nn.Parameter(torch.empty(hidden_size, 1, kernel_size, dtype=torch.bfloat16))
         nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        self.register_buffer("_conv_weight", None, persistent=False)
+
+    def build_conv_weight(self) -> None:
+        with torch.no_grad():
+            self._conv_weight = self.weight.squeeze(1).transpose(0, 1).contiguous()
 
     def forward(
         self,
@@ -999,7 +1004,6 @@ class KimiShortConvolution(nn.Module):
         is_prefill: bool,
         query_start_loc: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor]:
-        conv_weight = self.weight.squeeze(1).transpose(0,1).contiguous()
         if is_prefill:
             has_initial_state = torch.zeros(
                 size=[query_start_loc.shape[0] - 1],
@@ -1010,7 +1014,7 @@ class KimiShortConvolution(nn.Module):
                 x=x,
                 conv_states=cache,
                 cache_indices=block_table,
-                weight=conv_weight,
+                weight=self._conv_weight,
                 bias=None,
                 query_start_loc=query_start_loc,
                 has_initial_state=has_initial_state,
@@ -1020,7 +1024,7 @@ class KimiShortConvolution(nn.Module):
                 x=x,
                 conv_state=cache,
                 conv_state_indices=block_table,
-                weight=conv_weight,
+                weight=self._conv_weight,
                 bias=None,
             )
         return y
@@ -1722,16 +1726,10 @@ class KimiMLAAttention(nn.Module):
         nope = self.qk_nope_head_dim
         num_heads = query.shape[1]
         query_t = query.reshape(tokens, num_heads, self.q_head_dim)
-        # NoPE: nothing is rotated. The split just hands FA the same 192-wide
-        # QK dot product in two segments (see the __init__ note).
-        query_nope = query_t[..., :nope].contiguous()
-        # The cache write de-interleaves the key rope half even under an
-        # identity rotation; the same permutation on the query is orthogonal,
-        # so the QK dot comes out unchanged.
-        query_rope = query_t[..., nope:]
+        query_nope, query_rope = torch.split(query_t, [nope, self.qk_rope_head_dim], dim=-1)
         query_rope = torch.cat(
             (query_rope[..., 0::2], query_rope[..., 1::2]), dim=-1
-        ).contiguous()
+        )
 
         slot_mapping = forward_metadata.slot_mapping[self.attn_type]
         if slot_mapping.numel() != tokens:
@@ -3170,6 +3168,9 @@ class KimiLinearForCausalLM(nn.Module):
         self._split_kv_b_proj()
         for module_name, module in self.named_modules():
             if "kv_b_proj" in module_name:
+                continue
+            if isinstance(module, KimiShortConvolution):
+                module.build_conv_weight()
                 continue
             quant_method = getattr(module, "quant_method", None)
             if quant_method is not None and hasattr(

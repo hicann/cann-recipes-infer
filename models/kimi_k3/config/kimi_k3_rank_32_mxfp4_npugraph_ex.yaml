@@ -5,6 +5,7 @@ model_config:
   model_path: "/data/models/kimi_k3"
   exe_mode: "npugraph_ex"
   enable_profiler: False
+  enable_static_kernel: True          # npugraph_ex only: compile operators to static kernels
   enable_weight_nz: False
   with_ckpt: True
   custom_params:
