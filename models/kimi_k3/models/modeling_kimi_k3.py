@@ -1669,6 +1669,11 @@ class KimiMLAAttention(nn.Module):
                 )
             ]
 
+        self.enable_multi_streams = infer_config.model_config.custom_params.get("enable_multi_streams", False)
+        self.exe_mode = None if infer_config is None else infer_config.model_config.exe_mode
+        self.npu_events_kv = tuple(create_event(self.exe_mode, self.enable_multi_streams) for i in range(2))
+        self.npu_events_mla_gate = tuple(create_event(self.exe_mode, self.enable_multi_streams) for i in range(2))
+
     def _write_latent_cache(
         self,
         compressed: torch.Tensor,
@@ -1678,29 +1683,21 @@ class KimiMLAAttention(nn.Module):
         """RMSNorm this step's latent and scatter it into the paged blocks.
 
         Writes the NZ layout the absorbed decode reads back. K3 is NoPE, so the
-        rotation is disabled with cos=1 / sin=0; the operator still de-interleaves
-        the rope half, which the query preparation matches on the query side.
-        ``is_output_kv`` also returns this step's own ``(rope, nope)`` for
-        prefill to expand.
+        extra 64 key channels are cached without rotation or permutation.
         """
-        tokens = compressed.shape[0]
-        latent = compressed.view(
-            tokens, 1, 1, self.kv_lora_rank + self.qk_rope_head_dim
+        k_nope, k_rope = torch.split(
+            compressed, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
         )
-        cos = compressed.new_ones(tokens, 1, 1, self.qk_rope_head_dim)
-        sin = compressed.new_zeros(tokens, 1, 1, self.qk_rope_head_dim)
-        return torch_npu.npu_kv_rmsnorm_rope_cache_v2(
-            latent,
-            self.kv_a_layernorm.weight,
-            cos,
-            sin,
+        k_nope = self.kv_a_layernorm(k_nope)
+        block_num, block_size = self.nope_cache.shape[:2]
+        torch_npu.npu_scatter_pa_kv_cache(
+            k_nope.unsqueeze(1),
+            k_rope.unsqueeze(1),
+            self.nope_cache.view(block_num, self.kv_lora_rank // _KV_CACHE_NZ_DIM, block_size, _KV_CACHE_NZ_DIM),
+            self.rope_cache.view(block_num, self.qk_rope_head_dim // _KV_CACHE_NZ_DIM, block_size, _KV_CACHE_NZ_DIM),
             slot_mapping.view(-1),
-            self.rope_cache,
-            self.nope_cache,
-            epsilon=self.kv_a_layernorm.variance_epsilon,
-            cache_mode="PA_NZ",
-            is_output_kv=is_output_kv,
         )
+        return (k_rope, k_nope) if is_output_kv else None
 
     def _prepare_attention_inputs(
         self,
@@ -1716,29 +1713,32 @@ class KimiMLAAttention(nn.Module):
         token order, so they line up 1:1 with ``slot_mapping`` whatever the
         per-request lengths are.
         """
+        query_nope, query_rope = self._prepare_query_inputs(query)
         tokens = query.shape[0]
-        nope = self.qk_nope_head_dim
-        num_heads = query.shape[1]
-        query_t = query.reshape(tokens, num_heads, self.q_head_dim)
-        query_nope, query_rope = torch.split(query_t, [nope, self.qk_rope_head_dim], dim=-1)
-        query_rope = torch.cat(
-            (query_rope[..., 0::2], query_rope[..., 1::2]), dim=-1
-        )
+        slot_mapping = self._get_slot_mapping(forward_metadata, tokens)
+        current_kv = self._write_latent_cache(compressed, slot_mapping, is_output_kv=is_output_kv)
 
+        block_table = forward_metadata.block_table[self.attn_type]
+        return query_nope, query_rope, current_kv, block_table
+
+    def _prepare_query_inputs(
+            self, query: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Split the NoPE query into the two segments consumed by MLA FA."""
+        tokens = query.shape[0]
+        num_heads = query.shape[1]
+        query_t = query.view(tokens, num_heads, self.q_head_dim)
+        query_nope, query_rope = torch.split(query_t, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+        return query_nope, query_rope
+
+    def _get_slot_mapping(self, forward_metadata: ForwardMetaData, tokens: int) -> torch.Tensor:
         slot_mapping = forward_metadata.slot_mapping[self.attn_type]
         if slot_mapping.numel() != tokens:
             raise RuntimeError(
                 f"slot_mapping has {slot_mapping.numel()} entries but this step "
                 f"packs {tokens} tokens"
             )
-        current_kv = self._write_latent_cache(
-            compressed, slot_mapping, is_output_kv=is_output_kv
-        )
-
-        block_table = forward_metadata.block_table[self.attn_type]
-        if block_table is None:
-            raise RuntimeError("block_table[FullAttention] is None in the paged path")
-        return query_nope, query_rope, current_kv, block_table
+        return slot_mapping
 
     def _forward_prefill(
         self,
@@ -1760,19 +1760,17 @@ class KimiMLAAttention(nn.Module):
         )
 
     def _forward_decode(
-        self,
-        query: torch.Tensor,
-        compressed: torch.Tensor,
-        forward_metadata: ForwardMetaData,
-    ) -> torch.Tensor:
+            self,
+            query: torch.Tensor,
+            forward_metadata: ForwardMetaData,
+            hidden_states: torch.Tensor,
+            main_stream: torch.npu.Stream,
+            kv_stream: Optional[torch.npu.Stream],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Attend against the cached latent with kv_b_proj absorbed in."""
         tokens = query.shape[0]
-        query_nope, query_rope, _, block_table = self._prepare_attention_inputs(
-            query,
-            compressed,
-            forward_metadata,
-            is_output_kv=False,
-        )
+        query_nope, query_rope = self._prepare_query_inputs(query)
+        block_table = forward_metadata.block_table[self.attn_type]
 
         # TND packed layout: q lengths are cumulative, kv lengths are the actual
         # per-request cache occupancy (PageAttention convention).
@@ -1802,6 +1800,9 @@ class KimiMLAAttention(nn.Module):
             block_table,
             actual_seq_qlen,
             actual_seq_kvlen,
+            hidden_states,
+            main_stream,
+            kv_stream,
         )
 
     def _prefill_attention(
@@ -1853,7 +1854,10 @@ class KimiMLAAttention(nn.Module):
         block_table: torch.Tensor,
         actual_seq_qlen,
         actual_seq_kvlen,
-    ) -> torch.Tensor:
+        hidden_states: torch.Tensor,
+        main_stream: torch.npu.Stream,
+        kv_stream: Optional[torch.npu.Stream],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Attend against the cached latent with kv_b_proj absorbed in."""
         # W_UK folds into the query: [T, N, qk_nope] x [N, qk_nope, kv_lora]
         query_latent = torch_npu.npu_transpose_batchmatmul(
@@ -1866,11 +1870,17 @@ class KimiMLAAttention(nn.Module):
             perm_y=(1, 0, 2),
         ).view(tokens, self.total_num_heads, self.kv_lora_rank)
 
+        if self.use_output_gate:
+            record_stream(self.enable_multi_streams, hidden_states, kv_stream, self.exe_mode)
+            record_event(self.enable_multi_streams, self.npu_events_mla_gate, 0, self.exe_mode)
+            gate = self._forward_mla_gate(main_stream, hidden_states, kv_stream)
+
         nope_nz, rope_nz = self._nz_cache_views()
         pad = self.decode_num_heads - self.total_num_heads
         if pad:
             query_latent = F.pad(query_latent, (0, 0, 0, pad))
             query_rope = F.pad(query_rope, (0, 0, 0, pad))
+        wait_event(self.enable_multi_streams, self.npu_events_kv, 1, self.exe_mode)
         # One query token per request, so no mask is needed.
         output, _ = torch_npu.npu_fused_infer_attention_score_v2(
             query_latent,
@@ -1891,7 +1901,7 @@ class KimiMLAAttention(nn.Module):
         )
         # TND_NTD names the output layout: [N, T, kv_lora_rank]. W_UV maps the
         # unpadded heads back to [T, N, v_head_dim].
-        return torch_npu.npu_transpose_batchmatmul(
+        output = torch_npu.npu_transpose_batchmatmul(
             output[: self.total_num_heads],
             self.kv_b_proj_decode_w_v,
             bias=None,
@@ -1900,6 +1910,7 @@ class KimiMLAAttention(nn.Module):
             perm_x2=(0, 1, 2),
             perm_y=(1, 0, 2),
         ).reshape(tokens, self.total_num_heads * self.v_head_dim)
+        return output, gate
 
     def _nz_cache_views(self) -> tuple[torch.Tensor, torch.Tensor]:
         """View the latent blocks in the NZ layout the absorbed FA expects."""
@@ -1910,10 +1921,43 @@ class KimiMLAAttention(nn.Module):
             self.rope_cache.view(blocks, 1, self.qk_rope_head_dim // nz, block_size, nz),
         )
 
+    def _forward_mla_gate(
+            self,
+            main_stream: torch.npu.Stream,
+            hidden_states: torch.Tensor,
+            kv_stream: Optional[torch.npu.Stream] = None
+    ) -> torch.Tensor:
+        with npu_stream_switch(self.enable_multi_streams, kv_stream, exe_mode=self.exe_mode):
+            wait_event(self.enable_multi_streams, self.npu_events_mla_gate, 0, self.exe_mode)
+            gate = torch.sigmoid(self.g_proj(hidden_states).float()).to(hidden_states.dtype)
+            record_event(self.enable_multi_streams, self.npu_events_mla_gate, 1, self.exe_mode)
+        record_stream(self.enable_multi_streams, gate, main_stream, self.exe_mode)
+        return gate
+
+    def _forward_kv_attention(
+            self,
+            tokens: int,
+            hidden_states: torch.Tensor,
+            forward_metadata: ForwardMetaData,
+            kv_stream: Optional[torch.npu.Stream] = None,
+    ) -> None:
+        slot_mapping = self._get_slot_mapping(forward_metadata, tokens)
+        record_stream(
+            self.enable_multi_streams, slot_mapping, kv_stream, self.exe_mode
+        )
+        with npu_stream_switch(self.enable_multi_streams, kv_stream, exe_mode=self.exe_mode):
+            wait_event(self.enable_multi_streams, self.npu_events_kv, 0, self.exe_mode)
+            compressed = self.kv_a_proj_with_mqa(hidden_states)
+            self._write_latent_cache(
+                compressed, slot_mapping, is_output_kv=False
+            )
+            record_event(self.enable_multi_streams, self.npu_events_kv, 1, self.exe_mode)
+
     def forward(
-        self,
-        hidden_states: torch.Tensor,
-        forward_metadata: ForwardMetaData,
+            self,
+            hidden_states: torch.Tensor,
+            forward_metadata: ForwardMetaData,
+            kv_stream: Optional[torch.npu.Stream] = None
     ) -> torch.Tensor:
         is_prefill = forward_metadata.is_prefill
         if is_prefill and self.attn_tp_size > 1:
@@ -1921,11 +1965,10 @@ class KimiMLAAttention(nn.Module):
                 hidden_states, self.attn_tp_group, self.attn_tp_size
             )
         tokens = hidden_states.shape[0]
-        normalized_q = (
-            self.q_a_layernorm(self.q_a_proj(hidden_states))
-            if self.q_lora_rank is not None
-            else None
-        )
+
+        main_stream = torch.npu.current_stream()
+        gate = None
+        normalized_q = self.q_a_layernorm(self.q_a_proj(hidden_states))
         if is_prefill:
             query = (
                 self.q_b_proj(normalized_q)
@@ -1940,8 +1983,10 @@ class KimiMLAAttention(nn.Module):
                 if self.q_lora_rank is not None
                 else self.q_proj_decode(hidden_states)
             ).view(tokens, self.total_num_heads, self.q_head_dim)
-            compressed = self.kv_a_proj_with_mqa(hidden_states)
-            output = self._forward_decode(query, compressed, forward_metadata)
+            record_stream(self.enable_multi_streams, hidden_states, kv_stream, self.exe_mode)
+            record_event(self.enable_multi_streams, self.npu_events_kv, 0, self.exe_mode)
+            self._forward_kv_attention(tokens, hidden_states, forward_metadata, kv_stream)
+            output, gate = self._forward_decode(query, forward_metadata, hidden_states, main_stream, kv_stream)
             if self.attn_tp_size > 1:
                 full_output = output.new_empty(
                     output.shape[0] * self.attn_tp_size, output.shape[1]
@@ -1963,7 +2008,10 @@ class KimiMLAAttention(nn.Module):
                 hidden_states = full_hidden
 
         if self.use_output_gate:
-            gate = torch.sigmoid(self.g_proj(hidden_states).float()).to(output.dtype)
+            if not is_prefill:
+                wait_event(self.enable_multi_streams, self.npu_events_mla_gate, 1, self.exe_mode)
+            else:
+                gate = torch.sigmoid(self.g_proj(hidden_states).float()).to(hidden_states.dtype)
             output = output * gate
         output = self.o_proj(output)
         if self.attn_tp_size > 1:
@@ -1994,9 +2042,7 @@ def _apply_attn_res(
     values = torch.cat((block_residual, prefix_sum.unsqueeze(1)), dim=1)
     values_float = values.float()
     score_weight = norm.weight.float() * proj.weight.squeeze(0).float()
-    weighted_keys = torch_npu.npu_rms_norm(
-        values_float, score_weight, norm.variance_epsilon
-    )[0]
+    weighted_keys = torch_npu.npu_rms_norm(values_float, score_weight, norm.variance_epsilon)[0]
     scores = weighted_keys.sum(dim=-1)
     max_blocks = block_residual.shape[1]
     valid_mask = torch.arange(max_blocks, device=values.device) < valid_blocks
@@ -2152,11 +2198,12 @@ class KimiDecoderLayer(nn.Module):
         self.mlp_res_proj = nn.Linear(config.hidden_size, 1, bias=False)
 
     def forward_attention(
-        self,
-        hidden_states: torch.Tensor,
-        forward_metadata: ForwardMetaData = None,
-        query_start_loc: Optional[torch.Tensor] = None,
-        query_boundaries: Optional[list[int]] = None,
+            self,
+            hidden_states: torch.Tensor,
+            forward_metadata: ForwardMetaData = None,
+            query_start_loc: Optional[torch.Tensor] = None,
+            query_boundaries: Optional[list[int]] = None,
+            kv_stream: Optional[torch.npu.Stream] = None
     ) -> torch.Tensor:
         """Run the attention delta for the selected attention type."""
         normalized_states = self.input_layernorm(hidden_states)
@@ -2172,7 +2219,7 @@ class KimiDecoderLayer(nn.Module):
             if forward_metadata.is_prefill
             else forward_metadata._kimi_mla_decode_metadata
         )
-        return self.self_attn(normalized_states, mla_metadata)
+        return self.self_attn(normalized_states, mla_metadata, kv_stream)
 
     def forward_mlp(
         self,
@@ -2189,13 +2236,14 @@ class KimiDecoderLayer(nn.Module):
         return self.mlp(hidden_states)
 
     def forward(
-        self,
-        hidden_states: torch.Tensor,
-        block_residual: torch.Tensor,
-        forward_metadata: ForwardMetaData = None,
-        query_start_loc: Optional[torch.Tensor] = None,
-        query_boundaries: Optional[list[int]] = None,
-        shared_stream: Optional[torch.npu.Stream] = None,
+            self,
+            hidden_states: torch.Tensor,
+            block_residual: torch.Tensor,
+            forward_metadata: ForwardMetaData = None,
+            query_start_loc: Optional[torch.Tensor] = None,
+            query_boundaries: Optional[list[int]] = None,
+            shared_stream: Optional[torch.npu.Stream] = None,
+            kv_stream: Optional[torch.npu.Stream] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         prefix_sum = hidden_states
         if self.completed_blocks > 0:
@@ -2209,7 +2257,16 @@ class KimiDecoderLayer(nn.Module):
         if self.starts_new_block:
             if self.block_slot >= block_residual.shape[1]:
                 raise RuntimeError("AttnRes fixed buffer is smaller than the layer table")
-            block_residual[:, self.block_slot].copy_(prefix_sum)
+            block_indices = (
+                    torch.arange(block_residual.shape[0], device=block_residual.device)
+                    * block_residual.shape[1]
+                    + self.block_slot
+            )
+            torch_npu.npu_scatter_nd_update_(
+                block_residual.view(-1, block_residual.shape[-1]),
+                block_indices.view(-1, 1),
+                prefix_sum,
+            )
             prefix_sum = None
 
         attention_output = self.forward_attention(
@@ -2217,6 +2274,7 @@ class KimiDecoderLayer(nn.Module):
             forward_metadata,
             query_start_loc,
             query_boundaries,
+            kv_stream
         )
         prefix_sum = attention_output if prefix_sum is None else prefix_sum + attention_output
         mlp_input = _apply_attn_res(
@@ -2284,6 +2342,7 @@ class KimiLinearModel(nn.Module):
         enable_multi_streams =  infer_config.model_config.custom_params.get("enable_multi_streams", False)
         exe_mode = infer_config.model_config.exe_mode
         self._shared_stream = create_stream('shared', exe_mode) if enable_multi_streams else None
+        self._kv_stream = create_stream('kv', exe_mode) if enable_multi_streams else None
 
         self.layers = nn.ModuleList([
             KimiDecoderLayer(
@@ -2478,6 +2537,7 @@ class KimiLinearModel(nn.Module):
                     query_start_loc,
                     query_boundaries,
                     self._shared_stream,
+                    self._kv_stream
                 )
         # AttnRes and final norm run on the rank-owned shard. The final gather
         # restores the full prefill stream or decode request batch for lm_head.
@@ -2592,24 +2652,23 @@ class KimiLinearModel(nn.Module):
         valid_blocks_table = self.attn_res_valid_blocks
         epsilon = self.attn_res_epsilon
 
-        if self.attn_res_mode == "fused":
-            block_indices = (
-                torch.arange(
-                    block_residual.shape[0], device=block_residual.device
-                )
-                * block_residual.shape[1]
-                + block_idx
+
+        block_indices = (
+            torch.arange(
+                block_residual.shape[0], device=block_residual.device
             )
-            block_update = hidden_states
-            if block_update.dtype != block_residual.dtype:
-                block_update = block_update.to(block_residual.dtype)
-            torch_npu.npu_scatter_nd_update_(
-                block_residual.view(-1, block_residual.shape[-1]),
-                block_indices.view(-1, 1),
-                block_update,
-            )
-        else:
-            block_residual[:, block_idx].copy_(hidden_states)
+            * block_residual.shape[1]
+            + block_idx
+        )
+        block_update = hidden_states
+        if block_update.dtype != block_residual.dtype:
+            block_update = block_update.to(block_residual.dtype)
+        torch_npu.npu_scatter_nd_update_(
+            block_residual.view(-1, block_residual.shape[-1]),
+            block_indices.view(-1, 1),
+            block_update,
+        )
+
         valid_blocks = valid_blocks_table[block_idx]
         block_layers = tuple(
             self.layers[layer_idx]
@@ -2659,6 +2718,7 @@ class KimiLinearModel(nn.Module):
                 forward_metadata,
                 query_start_loc,
                 query_boundaries,
+                self._kv_stream
             )
             mlp_stats = AttnResPhase2Slot(
                 effective_query=block_queries[mlp_slot],
