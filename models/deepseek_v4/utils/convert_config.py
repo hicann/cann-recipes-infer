@@ -25,7 +25,8 @@ from argparse import ArgumentParser
 NUM_BITS_4 = 4
 NUM_BITS_8 = 8
 
-def generate_ignore_item(num_layers, compress_ratios, is_fp=False):
+
+def generate_ignore_item(num_layers, compress_ratios, is_fp=False, hif=False):
     """
     Generate a list of layer names to be ignored during quantization.
     """
@@ -36,13 +37,13 @@ def generate_ignore_item(num_layers, compress_ratios, is_fp=False):
             ignore.append(f"layers.{i}.attn.wq_a")
             ignore.append(f"layers.{i}.attn.wkv")
             ignore.append(f"layers.{i}.attn.wo_a")
-        if ratio == 4: # model have compress ratios [1, 4, 128]
+        if ratio == 4 and not hif: # model have compress ratios [1, 4, 128]
             ignore.append(f"layers.{i}.attn.indexer.weights_proj")
             ignore.append(f"layers.{i}.attn.indexer.compressor.wgate")
             ignore.append(f"layers.{i}.attn.indexer.compressor.wkv")
             ignore.append(f"layers.{i}.attn.compressor.wgate")
             ignore.append(f"layers.{i}.attn.compressor.wkv")
-        if ratio == 128: # model have compress ratios [1, 4, 128]
+        if ratio == 128 and not hif: # model have compress ratios [1, 4, 128]
             ignore.append(f"layers.{i}.attn.compressor.wgate")
             ignore.append(f"layers.{i}.attn.compressor.wkv")
     if not is_fp:
@@ -54,11 +55,15 @@ def generate_ignore_item(num_layers, compress_ratios, is_fp=False):
     return ignore
 
 
-def generate_quant_group(a_num_bits=8, w_num_bits=8, qtype="float", activation_use_clip=False, is_mx=False):
+def generate_quant_group(a_num_bits=8, w_num_bits=8, qtype="float", activation_use_clip=False,
+                         is_mx=False, hif=False, input_strategy="token"):
     input_group_size = None
     weight_group_size = None
     weight_block_size = None
-    if qtype == "int":
+    if hif:
+        activation_quant_strategy = input_strategy
+        weight_quant_strategy = "channel"
+    elif qtype == "int":
         activation_quant_strategy = "token"
         weight_quant_strategy = "channel"
     elif qtype == "float":
@@ -84,7 +89,7 @@ def generate_quant_group(a_num_bits=8, w_num_bits=8, qtype="float", activation_u
     return quant_group
 
 
-def generate_quant_config(cache_scheme, ignores, w4a8=False, is_fp=False, is_mx=False):
+def generate_quant_config(cache_scheme, ignores, w4a8=False, is_fp=False, is_mx=False, hif=False):
     """
     Generate a quantization configuration dictionary based on the specified parameters.
     """
@@ -99,22 +104,27 @@ def generate_quant_config(cache_scheme, ignores, w4a8=False, is_fp=False, is_mx=
                     "quantization_status": "compressed"}
     quant_config.update(cache_scheme)
     qtype = "float" if is_fp else "int"
+    # HiF8 quantizes the Linear group with per-tensor activation
+    linear_input_strategy = "tensor" if hif else "group"
     quant_config["config_groups"]["group_0"].update(
-        generate_quant_group(a_num_bits=NUM_BITS_8, w_num_bits=NUM_BITS_8, qtype=qtype, is_mx=is_mx)
+        generate_quant_group(a_num_bits=NUM_BITS_8, w_num_bits=NUM_BITS_8, qtype=qtype,
+                             is_mx=is_mx, hif=hif, input_strategy=linear_input_strategy)
         )
     if w4a8:
         quant_config["config_groups"]["group_1"].update(
             generate_quant_group(
-                a_num_bits=NUM_BITS_8, 
-                w_num_bits=NUM_BITS_4, 
-                qtype=qtype, 
+                a_num_bits=NUM_BITS_8,
+                w_num_bits=NUM_BITS_4,
+                qtype=qtype,
                 is_mx=is_fp,  # only support mxfp4 for w4a8 with float type
                 )
             )
+    if hif:
+        quant_config["weight_block_size"] = [128, 128]
     return quant_config
 
 
-def main(fp8_path):
+def main(fp8_path, hif=False):
     config_file = os.path.join(fp8_path, 'config.json')
     with open(config_file, "r") as f:
         config = json.load(f)
@@ -128,9 +138,9 @@ def main(fp8_path):
     if 'quantization_config' in config:
         config.pop('quantization_config')
 
-    quant_ignore_layers = generate_ignore_item(num_layers, compress_ratios, is_fp=True)
+    quant_ignore_layers = generate_ignore_item(num_layers, compress_ratios, is_fp=True, hif=hif)
     quantization_config = generate_quant_config(
-        cache_scheme, quant_ignore_layers, w4a8=True, is_fp=True)
+        cache_scheme, quant_ignore_layers, w4a8=True, is_fp=True, hif=hif)
     config['quantization_config'] = quantization_config
     config['quantization_config']["quant_method"] = "compressed-tensors"
     config['quantization_config']["quantization_status"] = "compressed"
@@ -142,5 +152,7 @@ def main(fp8_path):
 if __name__ == "__main__":
     parser = ArgumentParser()
     parser.add_argument("--input_fp8_hf_path", type=str, required=True)
+    parser.add_argument("--hif", action="store_true",
+                        help="generate a HiF8 quant config instead of the default MXFP4 config")
     args = parser.parse_args()
-    main(args.input_fp8_hf_path)
+    main(args.input_fp8_hf_path, hif=args.hif)

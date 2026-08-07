@@ -102,7 +102,7 @@ class AttnMetaData(nn.Module):
 
     def init_cache_dim(self):
         cache_dim = self.config.head_dim
-        if "float" in self.kv_cache_quant_mode:
+        if "float" in self.kv_cache_quant_mode and self.kv_cache_quant_mode != "hifloat8":
             rope_dim = self.config.qk_rope_head_dim
             nope_dim = self.config.head_dim - rope_dim
             # when FA FP8 quant is enabled, nope_cache, rope_cache, and scales
@@ -119,13 +119,13 @@ class AttnMetaData(nn.Module):
         cmp_kv_dtype = torch.float8_e4m3fn if (
             self.platform_version == PlatformVersion.ASCEND_950 and use_fused_kernel_compressor
         ) else torch.bfloat16
-        if "float" in self.kv_cache_quant_mode:
+        if self.kv_cache_quant_mode == "hifloat8":
+            cmp_kv_dtype = self.cache_dtype_map[self.kv_cache_quant_mode]
+        elif "float" in self.kv_cache_quant_mode:
             cmp_kv_dtype = torch.float8_e4m3fn
         return cmp_kv_dtype
 
     def get_kv_cache_dtype(self):
-        if self.kv_cache_quant_mode == "hifloat8":
-            return torch.float8_e4m3fn
         return self.cache_dtype_map[self.kv_cache_quant_mode]
 
     def create_cache(self, block_num, dim, dtype, device):
@@ -532,6 +532,8 @@ class AttnMetaData(nn.Module):
                 "seq_used_q": actual_seq_lengths_q.to(torch.int32),
                 "kernel_metadata": {}
             }
+        if self.kv_cache_quant_mode == "hifloat8":
+            self.precompute_cmp_seqlens(attn_metadata)
         if not self.is_mtp:
             self.get_cmp_metadata(attn_metadata, is_prefill)
         attn_metadata["shared_expert_stream"] = self.shared_expert_stream
@@ -556,6 +558,19 @@ class AttnMetaData(nn.Module):
             )
 
         return attn_metadata
+
+    def precompute_cmp_seqlens(self, attn_metadata):
+        # seqused_cmp / cmp_residual per compress ratio only depend on actual_seq_k, so compute them
+        # once here (default stream, at metadata build time) instead of on the metadata_stream
+        actual_seq_k = attn_metadata["actual_seq_k"]
+        cmp_seqlens = {}
+        for ratio in set(self.config.compress_ratios):
+            if ratio == 1:
+                cmp_seqlens[ratio] = (actual_seq_k, None)
+            else:
+                cmp_seqlens[ratio] = ((actual_seq_k // ratio).to(torch.int32),
+                                      (actual_seq_k % ratio).to(torch.int32))
+        attn_metadata["cmp_seqlens"] = cmp_seqlens
 
     def get_cp_metadata(self, input_ids, is_prefill, attn_metadata, cp_metadata, is_mtp):
         attn_metadata_ori = attn_metadata
@@ -711,6 +726,8 @@ class AttnMetaData(nn.Module):
                 "actual_seq_q": actual_seq_q.to(torch.int32),
                 "cu_seq_lens_q": cu_seq_lens_q.to(torch.int32),
             })
+            if self.kv_cache_quant_mode == "hifloat8":
+                self.precompute_cmp_seqlens(attn_metadata[zigzag_flag])
 
         if is_mtp:
             return attn_metadata

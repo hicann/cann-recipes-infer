@@ -38,6 +38,8 @@ from convert_config import generate_quant_config, generate_ignore_item
 
 NUM_BITS_4 = 4
 NUM_BITS_8 = 8
+COMPRESS_RATIO_C4A = 4
+COMPRESS_RATIO_C128A = 128
 DBL_MAX = 1.79769e308
 
 
@@ -198,7 +200,7 @@ def int_weight_quant(tensor: torch.Tensor, bits=8, weight_clip_factor=None):
     return quantized.to(torch.int8), scale.to(torch.float32), None
 
 
-def generate_quant_layers(num_layers, num_experts, compress_ratios, w4a8=False, is_mx=False):
+def generate_quant_layers(num_layers, num_experts, compress_ratios, w4a8=False, is_mx=False, hif=False):
     quant_layers = {}
     moe_bit = NUM_BITS_4 if w4a8 else NUM_BITS_8
     se_bit = NUM_BITS_8
@@ -218,8 +220,17 @@ def generate_quant_layers(num_layers, num_experts, compress_ratios, w4a8=False, 
             quant_layers[f"layers.{i}.attn.wo_a"] = attn_bit
         quant_layers[f"layers.{i}.attn.wq_b"] = attn_bit
         quant_layers[f"layers.{i}.attn.wo_b"] = attn_bit
-        if ratio == NUM_BITS_4:
+        if ratio == COMPRESS_RATIO_C4A:
             quant_layers[f"layers.{i}.attn.indexer.wq_b"] = attn_bit
+            if hif:  # hif8 also quantizes the compressor / weights_proj linears
+                quant_layers[f"layers.{i}.attn.compressor.wkv"] = attn_bit
+                quant_layers[f"layers.{i}.attn.compressor.wgate"] = attn_bit
+                quant_layers[f"layers.{i}.attn.indexer.weights_proj"] = attn_bit
+                quant_layers[f"layers.{i}.attn.indexer.compressor.wkv"] = attn_bit
+                quant_layers[f"layers.{i}.attn.indexer.compressor.wgate"] = attn_bit
+        elif ratio == COMPRESS_RATIO_C128A and hif:
+            quant_layers[f"layers.{i}.attn.compressor.wkv"] = attn_bit
+            quant_layers[f"layers.{i}.attn.compressor.wgate"] = attn_bit
     for j in range(num_experts):
         for n in mlp_linears:
             quant_layers[f"mtp.0.ffn.experts.{j}.{n}"] = moe_bit
@@ -330,11 +341,11 @@ def main(fp8_path, output_path, quant_type, quant_param_path=None):
         else:
             if 'quantization_config' in config:
                 config.pop('quantization_config')
-            quant_ignore_layers = generate_ignore_item(num_layers, compress_ratios, is_fp=mx)
+            quant_ignore_layers = generate_ignore_item(num_layers, compress_ratios, is_fp=mx, hif=hif)
             quantization_config = generate_quant_config(
-                cache_scheme, quant_ignore_layers, w4a8=w4a8, is_fp=mx, is_mx=mx)
+                cache_scheme, quant_ignore_layers, w4a8=w4a8, is_fp=mx, is_mx=mx, hif=hif)
             config['quantization_config'] = quantization_config
-    quant_layers = generate_quant_layers(num_layers, num_experts, compress_ratios, w4a8=w4a8, is_mx=mx)
+    quant_layers = generate_quant_layers(num_layers, num_experts, compress_ratios, w4a8=w4a8, is_mx=mx, hif=hif)
     # Cache for loaded safetensor files
     loaded_files = {}
 
@@ -397,7 +408,10 @@ def main(fp8_path, output_path, quant_type, quant_param_path=None):
                 if new_weight_name in list(quant_layers.keys()):
                     bit = quant_layers[new_weight_name]
                     if mx:
-                        if hif and bit != NUM_BITS_4:
+                        # In hif mode the MoE shared experts stay MXFP8 (like plain mx mode),
+                        # only the other 8-bit linears (attn / mtp) use HiF8.
+                        is_shared_expert = "shared_experts" in new_weight_name
+                        if hif and bit != NUM_BITS_4 and not is_shared_expert:
                             quant_weight, scale_inv = hif8_weight_quant(weight, bit)
                         else:
                             quant_weight, scale_inv = quantize_mx(weight, bit, real_quant=True)
@@ -418,7 +432,8 @@ def main(fp8_path, output_path, quant_type, quant_param_path=None):
                             bias_name = weight_name.replace(".weight", ".bias")
                             new_state_dict[bias_name] = bias
                             new_weight_map[bias_name] = file_name
-                    new_scale_name = weight_name.replace('.weight', '.scale')
+                    # new_weight_name is the ".weight"-stripped prefix; avoids str.replace corrupting "weights_proj".
+                    new_scale_name = f"{new_weight_name}.scale"
 
                     new_state_dict[weight_name] = quant_weight
                     new_state_dict[new_scale_name] = scale_inv
@@ -454,7 +469,7 @@ if __name__ == "__main__":
     parser.add_argument("--input_fp8_hf_path", type=str, required=True)
     parser.add_argument("--output_hf_path", type=str, required=True)
     parser.add_argument("--quant_type", type=str, default="w8a8-int",
-                        choices=["w8a8-int", "w4a8-int", "bfloat16", "w4a8-mx"])
+                        choices=["w8a8-int", "w4a8-int", "bfloat16", "w4a8-mx", "w4a8-mx-hif"])
     parser.add_argument("--quant_param_path", type=str, default=None)
     args = parser.parse_args()
 

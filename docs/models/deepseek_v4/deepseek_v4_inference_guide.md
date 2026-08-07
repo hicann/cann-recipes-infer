@@ -268,7 +268,7 @@ W4A8：W4指权重使用静态Per-Channel Int4量化，A8指数据使用动态Pe
 
 MLAProlog KV Cache的量化策略使用了动态存8算16。在超长序列情况下，C8 KV Cache内存优化2倍。LI通过A8C8获取计算收益，降低LI计算时延，同步优化TTFT和TPOT。
 
-#### Hybrid HiF8-MXFP8-MXFP4 (推荐DeepSeekV4-Flash模型使用)
+#### Hybrid HiF8-MXFP8-MXFP4 (推荐DeepSeekV4-Flash/Pro模型使用)
 
 本实践同时也支持 Hybrid HiF8-MXFP8-MXFP4，整体量化策略如下：
 
@@ -276,18 +276,17 @@ MLAProlog KV Cache的量化策略使用了动态存8算16。在超长序列情�
   <img src="./figures/quant_hif8.jpg" width="70%" alt="quant_hif8">
 </p>
 
-- MLAProlog：`q_a_proj`, `q_b_proj`, `kv_proj`使用HiF8 Per-Tensor量化；KV Cache采用C8伪量化；
-- IndexerProlog：`q_b_proj`, `indexer_q`, Indexer Cache使用HiF8 Per-Tensor量化；`indexer_weight`不量化；
+- MLAProlog：`q_a_proj`, `q_b_proj`, `kv_proj`使用HiF W8A8量化；KV Cache使用HiF A8量化；
+- IndexerProlog：`q_b_proj`, `indexer_weight`使用HiF W8A8量化；`indexer_q`, Indexer Cache使用HiF A8量化；
 - LightningIndexer: `batch_matmul`使用HiF8计算；
-- Compressor: Linear不量化；
-- MLAEpilog：`o_a_proj`和`o_b_proj`使用HiF8 Per-Tensor量化；
-- MoE：路由专家的Linear使用W4A8量化，共享专家的Linear使用W8A8量化；
+- Compressor: `wkv`, `wgate`使用HiF W8A8量化；
+- MLAEpilog：`o_a_proj`和`o_b_proj`使用HiF W8A8量化；
+- MoE：路由专家的Linear使用MXFP W4A8量化，共享专家的Linear使用MXFP W8A8量化；
 - LMHead：不量化。
 
 > 注：
-> HiF8：表示采用静态Per-Tensor HiF8量化，Scale格式为FP32；
-> MoE W4A8/W8A8：与Hybrid MXFP8-MXFP4中MoE的量化策略保持一致；
-> KV Cache C8：表示KV Cache使用动态Per-Group-64 FP8量化，Scale格式为E8M0。
+> HiF W8A8：A8表示激活值采用Per-Tensor HiF8量化，W8表示权重采用离线Per-Channel HiF8量化，Scale格式为FP32；
+> MoE MXFP W4A8/W8A8：与Hybrid MXFP8-MXFP4中MoE的量化策略保持一致；
 
 
 ## 多流并行优化
@@ -392,6 +391,11 @@ DeepSeek-V4 Pro Decode不同Batch Size和序列长度的性能Benchmark测试如
 | 3072 | 64  | 1   | Hybrid MXFP8-MXFP4    | 8192     | 27.79      | 1727.24|
 | 16   | 16  | 3   | Hybrid MXFP8-MXFP4    | 131072   | 19.46      | 51.38  |
 | 64   | 16  | 3   | Hybrid MXFP8-MXFP4    | 131072   | 21.23      | 188.42 |
+| 16   | 16  | 3   | Hybrid HiF8-MXFP8-MXFP4    | 8192     | 16.33      | 61.24   |
+| 64   | 16  | 3   | Hybrid HiF8-MXFP8-MXFP4    | 8192     | 17.23      | 232.22 |
+| 128  | 16  | 3   | Hybrid HiF8-MXFP8-MXFP4    | 8192     | 18.68      | 428.16 |
+| 16   | 16  | 3   | Hybrid HiF8-MXFP8-MXFP4    | 131072   | 16.55      | 60.44  |
+| 64   | 16  | 3   | Hybrid HiF8-MXFP8-MXFP4    | 131072   | 18.22      | 219.57 |
 
 > 注：性能数据基于MTP投机与强制EPLB配置采集，MTP3场景下平均3个Draft Token中Accepted Token个数为1.44，MTP1场景下平均1个Draft Token中Accepted Token个数为0.7，用户可按照数据集实际接受率自行折算benchmark性能。
 

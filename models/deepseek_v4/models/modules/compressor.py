@@ -82,19 +82,26 @@ class Compressor(nn.Module):
         self.wkv = ReplicatedLinear(self.dim,
                                     coff * self.head_dim,
                                     params_dtype=torch.bfloat16,
-                                    quant_config=None,
+                                    quant_config=config.quant_config \
+                                        if self.mm_quant_mode == "w8a8hifloat8" else None,
                                     prefix=f"{prefix}.wkv")
         self.wgate = ReplicatedLinear(self.dim,
                                       coff * self.head_dim,
                                       params_dtype=torch.bfloat16,
-                                      quant_config=None,
+                                      quant_config=config.quant_config \
+                                        if self.mm_quant_mode == "w8a8hifloat8" else None,
                                       prefix=f"{prefix}.wgate")
 
         self.norm = DeepseekV3RMSNorm(self.head_dim, config.rms_norm_eps)
 
+        if self.mm_quant_mode == "w8a8hifloat8":
+            self.register_buffer("x_descale", torch.ones(1, dtype=torch.float32), persistent=False)
+
         self.hadamard_matrix = get_had_pow2(self.head_dim)
         self.kv_cache_quant_mode = config.quant_config.kv_cache_quant_mode \
             if config.quant_config is not None else "unquant"
+        if self.kv_cache_quant_mode in ("float8", "hifloat8"):
+            import cann_ops_transformer
 
         self.cp_size = self.infer_config.parallel_config.cp_size
         self.global_rank = kwargs.get("global_rank")
@@ -223,13 +230,15 @@ class Compressor(nn.Module):
                 )
                 return kv, None
             elif self.li_cache_quant_mode == "hifloat8":
+                # indexer_compress_epilog (IndexerQuantCache) only accepts int32 slot_mapping
+                if cmp_slot_mapping.dtype != torch.int32:
+                    cmp_slot_mapping = cmp_slot_mapping.to(torch.int32)
                 torch.ops.custom.indexer_compress_epilog(
                     x=kv,
                     slot_mapping=cmp_slot_mapping,
                     indexer_compress_cache=li_cmp_cache,
                     indexer_compress_scale=scale_cache,
-                    quant_mode=1,
-                    round_scale=True
+                    quant_mode=2,  # 2: HIFLOAT_QUANT_MODE
                 )
                 return kv, None
             else:
@@ -245,13 +254,17 @@ class Compressor(nn.Module):
                 return quantized_kv, k_scale
         else:
             sfa_cmp_cache = cache_getter("sfa_cmp_kv")
-            if self.kv_cache_quant_mode == "float8" or self.kv_cache_quant_mode == "hifloat8":
-                import cann_ops_transformer
+            if self.kv_cache_quant_mode in ("float8", "hifloat8"):
+                if self.kv_cache_quant_mode == "hifloat8":
+                    quant_mode = "hifloat8_fp4"
+                else:
+                    quant_mode = "fp8_bf16"
+                cache = sfa_cmp_cache.view(torch.uint8) if sfa_cmp_cache.dtype != torch.uint8 else sfa_cmp_cache
                 torch.ops.cann_ops_transformer.kv_compress_epilog(
                     x=kv if is_prefill else kv.view(-1, self.head_dim),
                     slot_mapping=cmp_slot_mapping if is_prefill else cmp_slot_mapping.view(-1),
-                    cache=sfa_cmp_cache.view(torch.uint8),
-                    quant_mode="fp8_bf16"
+                    cache=cache,
+                    quant_mode=quant_mode,
                 )
             else:
                 torch.ops.custom.scatter_nd_update_asc(sfa_cmp_cache.view(-1, sfa_cmp_cache.shape[-1]),
@@ -330,7 +343,6 @@ class Compressor(nn.Module):
             "wkv": self.wkv.weight,
             "wgate": self.wgate.weight,
             "ape": self.ape,
-            "norm_weight": self.norm.weight.to(torch.float32),
             "rope_cos": rope_cos,
             "rope_sin": rope_sin,
             "state_block_table": state_block_table,
@@ -354,7 +366,25 @@ class Compressor(nn.Module):
                 "state_cache": self.get_runtime_cache("sfa_kv_state", attn_metadata_ori, is_prefill).flatten(-3),
             })
         # (T, self.head_dim) in prefill stage, while (B, S, self.head_dim) in decode stage
-        kv = torch.ops.custom.compressor(**cmpr_input_kwargs)
+        if self.mm_quant_mode == 'w8a8hifloat8':
+            quant_keys = ("x", "wkv", "wgate", "ape", "state_block_table", "seqused",
+                          "start_pos", "cmp_ratio", "coff", "cache_mode", "state_cache")
+            quant_kwargs = {k: cmpr_input_kwargs[k] for k in quant_keys}
+            if is_prefill:
+                quant_kwargs["cu_seqlens"] = cmpr_input_kwargs["cu_seqlens"]
+            quant_kwargs["x_descale"] = self.x_descale
+            quant_kwargs["wkv_descale"] = self.wkv.weight_scale.reshape(-1)
+            quant_kwargs["wgate_descale"] = self.wgate.weight_scale.reshape(-1)
+            quant_kwargs["quant_mode"] = 1
+            kv = torch.ops.custom.quant_compressor(**quant_kwargs)
+            kv = torch_npu.npu_rms_norm(kv, self.norm.weight.to(torch.float32), self.norm.variance_epsilon)[0]
+            torch.ops.custom.inplace_partial_rotary_mul(
+                kv.view(-1, 1, 1, self.head_dim), cos, sin,
+                rotary_mode="interleave",
+                partial_slice=[self.nope_head_dim, self.head_dim])
+        else:
+            cmpr_input_kwargs["norm_weight"] = self.norm.weight.to(torch.float32)
+            kv = torch.ops.custom.compressor(**cmpr_input_kwargs)
         return kv
 
     def forward(
