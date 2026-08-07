@@ -928,6 +928,12 @@ def _sp_pad_metadata(metadata: ForwardMetaData, pad_len: int) -> ForwardMetaData
             metadata.actual_seq_lengths_cu_kv,
             metadata.actual_seq_lengths_cu_kv[-1:] + pad_len,
         )),
+        actual_seq_lengths_cu_list_kv=(
+            None
+            if metadata.actual_seq_lengths_cu_list_kv is None
+            else [*metadata.actual_seq_lengths_cu_list_kv,
+                  metadata.actual_seq_lengths_cu_list_kv[-1] + pad_len]
+        ),
         slot_mapping=slot_mapping,
         block_table=block_table,
     )
@@ -1322,20 +1328,6 @@ class KimiDeltaAttention(nn.Module):
             batch = forward_metadata.actual_seq_lengths_q.shape[0]
         tokens = hidden_states.shape[0]
         state_ids = self._state_block_ids(forward_metadata, batch)
-        if forward_metadata.is_prefill:
-            # Blocks are recycled through the pool, so a freshly assigned block
-            # still holds the previous owner's state. Zeroing is the fresh-request
-            # initial condition: a zeroed convolution history equals the left
-            # zero pad, and a zeroed recurrent state equals initial_state=None.
-            # Only this batch's blocks are touched, keeping concurrent requests
-            # independent.
-            #
-            # Chunked prefill would re-zero on the second chunk and lose the
-            # first chunk's state; ForwardMetaData carries no computed-token
-            # count to distinguish them, and _to_bsh already refuses the
-            # variable-length batches chunking produces.
-            self.conv_state_cache.index_fill_(0, state_ids, 0)
-            self.recurrent_state_cache.index_fill_(0, state_ids, 0)
 
         input_states = (
             hidden_states
@@ -1375,9 +1367,11 @@ class KimiDeltaAttention(nn.Module):
         beta = self.b_proj(input_states).float().sigmoid()
 
         if forward_metadata.is_prefill:
-            initial_state = self.recurrent_state_cache.index_select(
-                0, state_ids.to(dtype=torch.long)
-            ).transpose(-1, -2).contiguous()
+            initial_state = torch.zeros(
+                len(query_boundaries) - 1, self.num_heads,
+                self.head_dim, self.head_dim,
+                dtype=torch.float32, device=q.device,
+            )
             output, state = self._torch_chunk_kda_eager(
                 q, k, v, decay, beta, initial_state, query_boundaries
             )
@@ -1832,7 +1826,7 @@ class KimiMLAAttention(nn.Module):
         key_rope = k_rope.view(1, tokens, self.qk_rope_head_dim).repeat(
             self.num_heads, 1, 1
         )
-        cu_kvlen = forward_metadata.actual_seq_lengths_cu_kv
+        cu_kvlen = forward_metadata.actual_seq_lengths_cu_list_kv
         output, _ = torch_npu.npu_fused_infer_attention_score(
             query_nope.transpose(0, 1),
             key_nope,
@@ -2853,6 +2847,11 @@ class KimiLinearForCausalLM(nn.Module):
             query_start_loc = torch.cat(
                 (cu_q.new_zeros(1), cu_q)
             ).to(torch.int32)
+            cu_q_list = cu_q.tolist()
+            model_inputs["forward_metadata"] = replace(
+                metadata,
+                actual_seq_lengths_cu_list_kv=cu_q_list,
+            )
             model_inputs["query_start_loc"] = query_start_loc
             model_inputs["query_boundaries"] = query_start_loc.tolist()
         else:
