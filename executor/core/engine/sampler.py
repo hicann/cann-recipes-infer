@@ -266,6 +266,15 @@ class Sampler:
         Returns:
             Tuple of (next_tokens, logprobs_tensors)
         """
+        if logits.shape[0] == 0:
+            token_logits = logits[:, -1:, :] if batch.is_prefill else logits
+            next_tokens = torch.empty(
+                token_logits.shape[:-1],
+                dtype=torch.long,
+                device=logits.device,
+            )
+            return next_tokens, None
+
         logits = logits.clone()
         sampling_data = self.build_sampling_params_from_requests(batch, logits)
         next_tokens, processed_logprobs = self._sample_tokens(batch, logits, sampling_data)
