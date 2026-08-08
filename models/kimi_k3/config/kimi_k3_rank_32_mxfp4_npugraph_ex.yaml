@@ -13,7 +13,7 @@ model_config:
     enable_multi_streams: True
     moe_chunk_max_len: 65536
     enable_flash_kda: True
-    enable_fused_recurrent_kda: False
+    enable_fused_recurrent_kda: True
 
 data_config:
   dataset: "default"

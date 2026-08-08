@@ -1328,7 +1328,7 @@ class KimiDeltaAttention(nn.Module):
                 q, k, v, g=g, beta=b,
                 scale=1.0 / math.sqrt(key_dim),
                 initial_state=initial_state[request:request + 1],
-                A_log=gate_params.a_log,
+                A_log=gate_params.a_log.data,
                 dt_bias=gate_params.dt_bias,
                 lower_bound=gate_params.lower_bound,
                 layout_qkv="BSND",
@@ -1519,23 +1519,19 @@ class KimiDeltaAttention(nn.Module):
     ) -> torch.Tensor:
         # Decode fused_recurrent_kda: fuses L2 norm + gate activation + beta sigmoid, per-token recurrent.
         # State updates recurrent_state_cache in-place, returns out [B, S, H, D] bf16.
-        query, key, value, raw_gate, raw_beta = inputs
+        query, key, value, g, raw_beta = inputs
         batch, seq, num_heads, key_dim = query.shape
         scale = 1 / math.sqrt(key_dim)
         state_ids = self._state_block_ids(forward_metadata, batch)
-        ssm_state_indices = state_ids.repeat_interleave(seq).to(torch.int32)
-        q = query.contiguous()
-        k = key.contiguous()
-        v = value.contiguous()
-        g = raw_gate.contiguous()
-        b = raw_beta.unsqueeze(-1).contiguous()
+        ssm_state_indices = state_ids.repeat_interleave(seq)
+        b = raw_beta.unsqueeze(-1)
         out = _recurrent_kda_impl(
-            q, k, v,
+            query, key, value,
             state=self.recurrent_state_cache,
             beta=b,
             g=g,
             scale=scale,
-            A_log=gate_params.a_log,
+            A_log=gate_params.a_log.data,
             dt_bias=gate_params.dt_bias,
             lower_bound=gate_params.lower_bound,
             layout_qkv="BSND",
@@ -1558,7 +1554,7 @@ class KimiDeltaAttention(nn.Module):
         tokens = batch * seq
         scale = 1 / math.sqrt(key_dim)
         state_ids = self._state_block_ids(forward_metadata, batch)
-        ssm_state_indices = state_ids.repeat_interleave(seq).to(torch.int32)
+        ssm_state_indices = state_ids.repeat_interleave(seq)
         q = _l2_normalize(query).reshape(tokens, num_heads, key_dim).to(
             torch.bfloat16
         )

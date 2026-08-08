@@ -1,8 +1,3 @@
-"""Per-D-reference-stable physical-64 FlashKDA.
-
-Uses the default Stage1 dataflow while retaining its packed64 inverse.
-Stage1 uses per-D target-row references when constructing lower QKT/KKT tiles.
-"""
 # Copyright (c) 2026 Huawei Technologies Co., Ltd.
 # This program is free software, you can redistribute it and/or modify it under the terms and conditions of
 # CANN Open Software License Agreement Version 2.0 (the "License").
@@ -15,6 +10,8 @@ Stage1 uses per-D target-row references when constructing lower QKT/KKT tiles.
 
 import dataclasses
 import os
+import threading
+from collections import OrderedDict
 from typing import NamedTuple, Optional, Tuple
 
 os.environ.setdefault("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
@@ -64,7 +61,6 @@ from cannbotdsl.raw_reg import (
     vsqrt,
 )
 from cannbotdsl.raw_reg import vselect as vselect_raw
-from cannbotdsl.runtime import from_torch_npu
 from cannbotdsl.sync import (
     cube_fill_l1_zero,
     cube_raw_l1_to_l0a,
@@ -269,6 +265,78 @@ def allocate_stage1_workspace(
         identity16=constants.identity16,
         lower_mask_tiles=constants.lower_mask_tiles,
     )
+
+
+@dataclasses.dataclass
+class _ExecutionBuffers:
+    workspace: StageOneWorkspace
+    qk_exchange: torch.Tensor
+    launch_lock: threading.Lock = dataclasses.field(default_factory=threading.Lock)
+
+
+class _ExecutionCache:
+    """Bounded cache of stream-private internal FlashKDA buffers."""
+
+    def __init__(self, max_entries: int = 16):
+        self._max_entries = max_entries
+        self._entries = OrderedDict()
+        self._lock = threading.Lock()
+
+    @property
+    def size(self):
+        return len(self._entries)
+
+    @staticmethod
+    def _stream_identity(ref):
+        device = ref.device
+        if device.type not in {"npu", "privateuseone"}:
+            return device.type, device.index, None
+        device_index = ref.get_device() if hasattr(ref, "get_device") else device.index
+        stream = torch.npu.current_stream(device_index)
+        stream_id = getattr(stream, "npu_stream", stream)
+        return device.type, device_index, int(stream_id)
+
+    def get_or_create(
+        self,
+        *,
+        ref,
+        batch: int,
+        value_heads: int,
+        eff_group: int,
+        dim: int,
+        block_num: int,
+        key_heads: Optional[int] = None,
+        seq_len: Optional[int] = None,
+        layout_qkv: str = "BNSD",
+    ):
+        key_heads = value_heads if key_heads is None else key_heads
+        seq_len = eff_group * CHUNK_SIZE if seq_len is None else seq_len
+        key = (
+            *self._stream_identity(ref), batch, key_heads, value_heads,
+            seq_len, dim, eff_group, block_num, layout_qkv,
+        )
+        with self._lock:
+            cached = self._entries.pop(key, None)
+            if cached is None:
+                cached = _ExecutionBuffers(
+                    workspace=allocate_stage1_workspace(batch, value_heads, eff_group, dim, ref=ref),
+                    qk_exchange=allocate_qk_exchange_workspace(active_block_num=block_num, ref=ref),
+                )
+            self._entries[key] = cached
+            while len(self._entries) > self._max_entries:
+                self._entries.popitem(last=False)
+            return cached
+
+    def clear(self):
+        with self._lock:
+            self._entries.clear()
+
+
+_EXECUTION_CACHE = _ExecutionCache()
+
+
+def clear_execution_cache():
+    _EXECUTION_CACHE.clear()
 
 
 ELEM_BYTES = 4
@@ -909,33 +977,25 @@ class StageOneVector:
         k_chunk = tile_view(gm_K[batch_idx, qk_head_idx, None, None], (CHUNK_SIZE, SUPPORTED_HEAD_DIM), (chunk_idx, Int64(0)))
 
         if self.subblock_idx == Int64(0):
-            q_write = self.ub_q.acquire()
-            mem_copy(q_write, q_chunk)
-            self.ub_q.commit(q_write)
+            mem_copy(self.ub_q, q_chunk)
             vec_sync_notify(PIPE.MTE2, PIPE.V, MTE2_TO_V_EVENT_ID)
             vec_sync_wait(PIPE.MTE2, PIPE.V, MTE2_TO_V_EVENT_ID)
-            q_read = self.ub_q.wait()
-            self.normalize_full_d_bf16(q_read)
+            self.normalize_full_d_bf16(self.ub_q)
             with vf(outputs=[self.ub_q_bf16]):
-                mem_copy(self.ub_q_bf16, local_slice(q_read, (CHUNK_SIZE, D_HALF), stride=(SUPPORTED_HEAD_DIM, 1), offset=0))
+                mem_copy(self.ub_q_bf16, local_slice(self.ub_q, (CHUNK_SIZE, D_HALF), stride=(SUPPORTED_HEAD_DIM, 1), offset=0))
             with vf(outputs=[self.ub_qk_exchange]):
-                cast(self.ub_qk_exchange, local_slice(q_read, (CHUNK_SIZE, D_HALF), stride=(SUPPORTED_HEAD_DIM, 1), offset=D_HALF * 2))
-            self.ub_q.release(q_read)
+                cast(self.ub_qk_exchange, local_slice(self.ub_q, (CHUNK_SIZE, D_HALF), stride=(SUPPORTED_HEAD_DIM, 1), offset=D_HALF * 2))
             self.publish_normalized_qk_half(q_to_k, self.ub_qk_exchange)
         else:
-            k_write = self.ub_k.acquire()
-            mem_copy(k_write, k_chunk)
-            self.ub_k.commit(k_write)
+            mem_copy(self.ub_k, k_chunk)
             vec_sync_all()
             vec_sync_notify(PIPE.MTE2, PIPE.V, MTE2_TO_V_SUBBLOCK1_EVENT_ID)
             vec_sync_wait(PIPE.MTE2, PIPE.V, MTE2_TO_V_SUBBLOCK1_EVENT_ID)
-            k_read = self.ub_k.wait()
-            self.normalize_full_d_bf16(k_read)
+            self.normalize_full_d_bf16(self.ub_k)
             with vf(outputs=[self.ub_k_bf16]):
-                mem_copy(self.ub_k_bf16, local_slice(k_read, (CHUNK_SIZE, D_HALF), stride=(SUPPORTED_HEAD_DIM, 1), offset=D_HALF * 2))
+                mem_copy(self.ub_k_bf16, local_slice(self.ub_k, (CHUNK_SIZE, D_HALF), stride=(SUPPORTED_HEAD_DIM, 1), offset=D_HALF * 2))
             with vf(outputs=[self.ub_qk_exchange]):
-                cast(self.ub_qk_exchange, local_slice(k_read, (CHUNK_SIZE, D_HALF), stride=(SUPPORTED_HEAD_DIM, 1), offset=0))
-            self.ub_k.release(k_read)
+                cast(self.ub_qk_exchange, local_slice(self.ub_k, (CHUNK_SIZE, D_HALF), stride=(SUPPORTED_HEAD_DIM, 1), offset=0))
             self.publish_normalized_qk_half(k_to_q, self.ub_qk_exchange)
 
         return q_to_k, k_to_q
@@ -978,62 +1038,37 @@ class StageOneVector:
         g_chunk = tile_view(gm_g[batch_idx, head_idx, None, None], (CHUNK_SIZE, D_HALF), (chunk_idx, self.subblock_idx))
         bias_half = tile_view(gm_dt_bias[head_idx, None], (D_HALF,), (self.subblock_idx,))
         alpha = tile_view(gm_A_log, (1,), (head_idx,))
-        g_write = self.ub_g_raw.acquire()
-        bias_write = self.ub_dt_bias.acquire()
-        alpha_write = self.ub_alpha.acquire()
-        mem_copy(g_write, g_chunk)
-        mem_copy(bias_write, bias_half)
-        mem_copy(alpha_write, alpha)
-        self.ub_g_raw.commit(g_write)
-        self.ub_dt_bias.commit(bias_write)
-        self.ub_alpha.commit(alpha_write)
+        mem_copy(self.ub_g_raw, g_chunk)
+        mem_copy(self.ub_dt_bias, bias_half)
+        mem_copy(self.ub_alpha, alpha)
         vec_sync_notify(PIPE.MTE2, PIPE.V, MTE2_TO_V_EVENT_ID)
         vec_sync_wait(PIPE.MTE2, PIPE.V, MTE2_TO_V_EVENT_ID)
-        g_read = self.ub_g_raw.wait()
-        bias_read = self.ub_dt_bias.wait()
-        alpha_read = self.ub_alpha.wait()
-        gate_write = self.ub_gate_activated.acquire()
         with vf(mode="raw"):
             lane_mask, _ = update_mask(D_HALF, elem_bits=32)
             bound = vdup_scalar(lower_bound, dtypes.float32, mask=lane_mask)
             one = vdup_scalar(1.0, dtypes.float32, mask=lane_mask)
-            alpha_exp = vexp(vload_brc(alpha_read, 0), mask=lane_mask)
+            alpha_exp = vexp(vload_brc(self.ub_alpha, 0), mask=lane_mask)
             neg_exp_a = vmuls(alpha_exp, -1.0, mask=lane_mask)
             for row in dsl_range(Int64(0), Int64(CHUNK_SIZE), Int64(1), unroll=4):
                 offset = row * Int64(D_HALF)
-                raw_g = vcast(vload_unpack(g_read, offset, mode=UnpackMode.B16_TO_B32), dtypes.float32, mask=lane_mask)
-                gate_logit = vmul(neg_exp_a, vadd(raw_g, vload(bias_read, 0), mask=lane_mask), mask=lane_mask)
+                raw_g = vcast(vload_unpack(self.ub_g_raw, offset, mode=UnpackMode.B16_TO_B32), dtypes.float32, mask=lane_mask)
+                gate_logit = vmul(neg_exp_a, vadd(raw_g, vload(self.ub_dt_bias, 0), mask=lane_mask), mask=lane_mask)
                 gate = vdiv(bound, vadd(one, vexp(gate_logit, mask=lane_mask), mask=lane_mask), mask=lane_mask)
-                vstore(gate_write, offset, gate, lane_mask)
+                vstore(self.ub_gate_activated, offset, gate, lane_mask)
             vmem_bar("vst_vld")
-        self.ub_g_raw.release(g_read)
-        self.ub_dt_bias.release(bias_read)
-        self.ub_alpha.release(alpha_read)
-        self.ub_gate_activated.commit(gate_write)
         vec_sync_all()
-        gate_read = self.ub_gate_activated.wait()
-        g_cumsum_write = self.ub_g_cumsum.acquire()
-        cumsum(g_cumsum_write, gate_read, axis=0)
-        self.ub_gate_activated.release(gate_read)
-        self.ub_g_cumsum.commit(g_cumsum_write)
-        return self.ub_g_cumsum.wait()
-
-    def release_gate_cumsum(self, g_cumsum_read):
-        self.ub_g_cumsum.release(g_cumsum_read)
+        cumsum(self.ub_g_cumsum, self.ub_gate_activated, axis=0)
+        return self.ub_g_cumsum
 
     @jit
     def activate_raw_beta(self, gm_beta, batch_idx, head_idx, chunk_idx):
         """Apply sigmoid to one raw BF16 beta-logit chunk."""
         beta_chunk = tile_view(gm_beta[batch_idx, head_idx, None, None], (CHUNK_SIZE, 1), (chunk_idx, Int64(0)))
-        beta_write = self.ub_beta_raw.acquire()
-        mem_copy(beta_write, beta_chunk)
-        self.ub_beta_raw.commit(beta_write)
+        mem_copy(self.ub_beta_raw, beta_chunk)
         vec_sync_notify(PIPE.MTE2, PIPE.V, MTE2_TO_V_EVENT_ID)
         vec_sync_wait(PIPE.MTE2, PIPE.V, MTE2_TO_V_EVENT_ID)
-        beta_read = self.ub_beta_raw.wait()
         with vf(outputs=[self.ub_beta]):
-            cast(self.ub_beta, beta_read)
-        self.ub_beta_raw.release(beta_read)
+            cast(self.ub_beta, local_slice(self.ub_beta_raw, (CHUNK_SIZE, 1), offset=0))
         with vf(mode="raw"):
             lane_mask, _ = update_mask(VL, elem_bits=32)
             one = vdup_scalar(1.0, dtypes.float32, mask=lane_mask)
@@ -1069,9 +1104,7 @@ class StageOneVector:
         """Construct the two C3 operands from one full S by D-half vector tile."""
         raw_k_snapshot = self.ub_raw_k[buffer_parity]
         v_half = tile_view(gm_V[batch_idx, head_idx, None, None], (CHUNK_SIZE, D_HALF), (chunk_idx, self.subblock_idx))
-        v_write = self.ub_v_raw.acquire()
-        self._copy_bf16_gm_half_tile_to_ub(v_half, v_write, cols=D_HALF)
-        self.ub_v_raw.commit(v_write)
+        self._copy_bf16_gm_half_tile_to_ub(v_half, self.ub_v_raw, cols=D_HALF)
         vec_sync_notify(PIPE.MTE2, PIPE.V, MTE2_TO_V_V_STAGING_EVENT_ID)
 
         cast_write = self.ub_cast_bf16
@@ -1093,16 +1126,14 @@ class StageOneVector:
         self._store_dhalf_nz_ub_to_full_l1(self.l1_K_decayed_beta_for_W, self.ub_bf16_nz)
 
         vec_sync_wait(PIPE.MTE2, PIPE.V, MTE2_TO_V_V_STAGING_EVENT_ID)
-        v_read = self.ub_v_raw.wait()
         cast_write = self.ub_cast_bf16
         with vf(mode="raw"):
             row_mask, _ = update_mask(VL, elem_bits=32)
             for row in dsl_range(Int64(0), Int64(CHUNK_SIZE), Int64(1), unroll=4):
                 offset = row * Int64(D_HALF)
                 beta = vload_brc(beta_slot, row)
-                v_value = vcast(vload_unpack(v_read, offset, mode=UnpackMode.B16_TO_B32), dtypes.float32, mask=row_mask)
+                v_value = vcast(vload_unpack(self.ub_v_raw, offset, mode=UnpackMode.B16_TO_B32), dtypes.float32, mask=row_mask)
                 vstore_pack(cast_write, offset, vcast(vmul(v_value, beta, mask=row_mask), dtypes.bfloat16, mask=row_mask), row_mask, mode="b32_to_b16")
-        self.ub_v_raw.release(v_read)
         cast_read = self.ub_cast_bf16
         with vf(outputs=[self.ub_bf16_nz]):
             mem_copy(self.ub_bf16_nz, cast_read, engine=self.ub2l1)
@@ -1428,7 +1459,6 @@ def _run_stage1_body(
             matmul.mm_per_d_kkt(3, 3)
             matmul.mm_per_d_mqk(3, 3)
 
-            vector.release_gate_cumsum(gate_cumsum_dhalf)
             vector.activate_raw_beta(gm_beta_brc, batch_index, value_head_index, chunk_index)
             matmul.finish_per_d_matrices(vector.ub_kkt, vector.ub_mqk)
 
@@ -2118,7 +2148,6 @@ def flash_kda(
     bn_total = batch * n_v
     group = int(os.environ.get("KDA_GROUP") or get_group_config_bn(bn_total))
     eff_group = min(seq_len // CHUNK_SIZE, group)
-    ws = allocate_stage1_workspace(batch, n_v, eff_group, dim, ref=q)
     if layout_qkv == "BSND":
         out_physical = torch.empty(batch, seq_len, n_v, dim, dtype=LOW_DTYPE, device=q.device)
         out = out_physical.transpose(1, 2)
@@ -2150,7 +2179,6 @@ def flash_kda(
     # FlashKDA 恒 layout_qkv="BNSD"：BSND 由 host 转置 + _dynamic_sequence_tensor 的 stride 表达，
     # 不走 run 内的 const_expr swap；fake 张量按实际 layout_qkv 编码 stride。
     block_num = _device_block_num(q)
-    qk_exchange = allocate_qk_exchange_workspace(active_block_num=block_num, ref=q)
     _kernel_key = (
         n_kv,
         n_v,
@@ -2209,12 +2237,24 @@ def flash_kda(
             dtypes.float32,
         )
         _DYNAMIC_KERNEL_CACHE[_kernel_key] = fn
-    fn(
-        from_torch_npu(k), from_torch_npu(v), from_torch_npu(q), from_torch_npu(beta),
-        from_torch_npu(g), from_torch_npu(qk_exchange), from_torch_npu(A_log), from_torch_npu(dt_bias), from_torch_npu(ws.K_restored), from_torch_npu(ws.gamma_C),
-        from_torch_npu(ws.Q_decayed), from_torch_npu(ws.W), from_torch_npu(ws.Mqk),
-        from_torch_npu(ws.U_pre), from_torch_npu(out), from_torch_npu(initial_state),
-        from_torch_npu(final_state), from_torch_npu(ws.lower_mask_tiles),
-        from_torch_npu(ws.identity16), bn_total, seq_len, bn_total, 1, scale_value, float(lower_bound),
+    execution = _EXECUTION_CACHE.get_or_create(
+        ref=q,
+        batch=batch,
+        key_heads=n_kv,
+        value_heads=n_v,
+        seq_len=seq_len,
+        eff_group=eff_group,
+        dim=dim,
+        block_num=block_num,
+        layout_qkv=layout_qkv,
     )
+    ws = execution.workspace
+    with execution.launch_lock:
+        fn(
+            k, v, q, beta, g, execution.qk_exchange, A_log, dt_bias,
+            ws.K_restored, ws.gamma_C, ws.Q_decayed, ws.W, ws.Mqk,
+            ws.U_pre, out, initial_state, final_state, ws.lower_mask_tiles,
+            ws.identity16, bn_total, seq_len, bn_total, 1, scale_value,
+            float(lower_bound),
+        )
     return out_physical, final_state

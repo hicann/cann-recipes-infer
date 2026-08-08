@@ -26,7 +26,6 @@ from cannbotdsl.integer import Int64
 from cannbotdsl.jit_runner import jit
 from cannbotdsl.kernel_launcher import kernel
 from cannbotdsl.math import cast
-from cannbotdsl.runtime import from_torch_npu
 from cannbotdsl.tensor import _layout_op_wrapper, idx2crd, local_slice, make_layout, mem_copy, tile_view
 from cannbotdsl.typing.types import MemLoc, Tensor
 from cannbotdsl.vf import vf
@@ -123,11 +122,11 @@ class FusedRecurrentKDAVector:
         self.row_block = row_block
         self.dk = dk
         self.state_is_bf16 = state_dtype == dtypes.bfloat16
-        value_width = row_block + VL
+        value_width = max(row_block, VL)
         self.state = Channel(MemLoc.UB, shape=(row_block, dk), dtype=dtypes.float32, depth=2)
         self.key = Buffer(MemLoc.UB, (1, dk), dtypes.float32)
         self.query = Buffer(MemLoc.UB, (1, dk), dtypes.float32)
-        self.decay = Channel(MemLoc.UB, shape=(1, dk), dtype=dtypes.float32, depth=1)
+        self.decay = Buffer(MemLoc.UB, (1, dk), dtypes.float32)
         self.ub_value = Buffer(MemLoc.UB, (1, value_width), dtypes.float32)
         self.ub_beta = Buffer(MemLoc.UB, (1, VL), dtypes.float32)
         self.out = Buffer(MemLoc.UB, (1, row_block), dtypes.float32)
@@ -152,37 +151,25 @@ class FusedRecurrentKDAVector:
         self.a_log = Channel(MemLoc.UB, shape=(1,), dtype=dtypes.float32, depth=2)
 
     def load_state(self, gm_state_tile):
-        state_write = self.state.acquire()
         if self.state_is_bf16:
-            state_bf16_write = self.state_bf16.acquire()
-            mem_copy(state_bf16_write, gm_state_tile)
-            self.state_bf16.commit(state_bf16_write)
-            self.state_bf16_read = self.state_bf16.wait()
-            with vf(outputs=[state_write]):
-                cast(state_write, self.state_bf16_read)
+            mem_copy(self.state_bf16, gm_state_tile)
+            with vf(outputs=[self.state]):
+                cast(self.state, self.state_bf16)
         else:
-            mem_copy(state_write, gm_state_tile)
-        self.state.commit(state_write)
-        self.state_read = self.state.wait()
+            mem_copy(self.state, gm_state_tile)
 
     def load_qk(self, raw_key_gm, raw_query_gm):
-        raw_query_write = self.raw_query.acquire()
-        raw_key_write = self.raw_key.acquire()
-        mem_copy(raw_query_write, raw_query_gm)
-        mem_copy(raw_key_write, raw_key_gm)
-        self.raw_query.commit(raw_query_write)
-        self.raw_key.commit(raw_key_write)
-        self.raw_query_read = self.raw_query.wait()
-        self.raw_key_read = self.raw_key.wait()
+        mem_copy(self.raw_query, raw_query_gm)
+        mem_copy(self.raw_key, raw_key_gm)
 
     @jit
     def normalize_qk(self, scale_value: float):
         with vf(mode="raw"):
             full, _ = update_mask(VL, elem_bits=32)
-            query_raw_pre = vload_unpack(self.raw_query_read, 0, mode=UnpackMode.B16_TO_B32)
-            query_raw_post = vload_unpack(self.raw_query_read, VL, mode=UnpackMode.B16_TO_B32)
-            key_raw_pre = vload_unpack(self.raw_key_read, 0, mode=UnpackMode.B16_TO_B32)
-            key_raw_post = vload_unpack(self.raw_key_read, VL, mode=UnpackMode.B16_TO_B32)
+            query_raw_pre = vload_unpack(self.raw_query, 0, mode=UnpackMode.B16_TO_B32)
+            query_raw_post = vload_unpack(self.raw_query, VL, mode=UnpackMode.B16_TO_B32)
+            key_raw_pre = vload_unpack(self.raw_key, 0, mode=UnpackMode.B16_TO_B32)
+            key_raw_post = vload_unpack(self.raw_key, VL, mode=UnpackMode.B16_TO_B32)
             query_pre = vcast(query_raw_pre, dtypes.float32, mask=full)
             query_post = vcast(query_raw_post, dtypes.float32, mask=full)
             key_pre = vcast(key_raw_pre, dtypes.float32, mask=full)
@@ -239,46 +226,28 @@ class FusedRecurrentKDAVector:
             vstore(self.query, VL, scaled_query_post, full)
             vstore(self.key, 0, normalized_key_pre, full)
             vstore(self.key, VL, normalized_key_post, full)
-        self.raw_query.release(self.raw_query_read)
-        self.raw_key.release(self.raw_key_read)
 
     def load_g_beta_value(self, raw_g_gm, value_gm, raw_beta_gm, a_log_gm, dt_bias_gm):
-        raw_g_write = self.raw_g.acquire()
-        raw_beta_write = self.raw_beta.acquire()
-        value_write = self.value.acquire()
-        self.decay_write = self.decay.acquire()
-        a_log_write = self.a_log.acquire()
-        dt_bias_write = self.dt_bias.acquire()
-        mem_copy(raw_g_write, raw_g_gm)
-        mem_copy(local_slice(raw_beta_write, (1, 1), offset=0), raw_beta_gm)
-        mem_copy(local_slice(value_write, (1, self.row_block), offset=0), value_gm)
-        mem_copy(a_log_write, a_log_gm)
-        mem_copy(dt_bias_write, dt_bias_gm)
-        self.raw_g.commit(raw_g_write)
-        self.raw_beta.commit(raw_beta_write)
-        self.value.commit(value_write)
-        self.a_log.commit(a_log_write)
-        self.dt_bias.commit(dt_bias_write)
-        self.raw_g_read = self.raw_g.wait()
-        self.raw_beta_read = self.raw_beta.wait()
-        self.value_read = self.value.wait()
-        self.a_log_read = self.a_log.wait()
-        self.dt_bias_read = self.dt_bias.wait()
+        mem_copy(self.raw_g, raw_g_gm)
+        mem_copy(local_slice(self.raw_beta, (1, 1), offset=0), raw_beta_gm)
+        mem_copy(local_slice(self.value, (1, self.row_block), offset=0), value_gm)
+        mem_copy(self.a_log, a_log_gm)
+        mem_copy(self.dt_bias, dt_bias_gm)
 
     @jit
     def activate_g_beta(self, lower_bound: float):
         with vf(mode="raw"):
             full, _ = update_mask(VL, elem_bits=32)
             one = vdup_scalar(1.0, dtypes.float32)
-            a_log = vload_brc(self.a_log_read, 0)
+            a_log = vload_brc(self.a_log, 0)
             alpha = vexp(a_log, mask=full)
             negative_alpha = vneg(alpha, mask=full)
-            raw_gate_pre = vload_unpack(self.raw_g_read, 0, mode=UnpackMode.B16_TO_B32)
-            raw_gate_post = vload_unpack(self.raw_g_read, VL, mode=UnpackMode.B16_TO_B32)
+            raw_gate_pre = vload_unpack(self.raw_g, 0, mode=UnpackMode.B16_TO_B32)
+            raw_gate_post = vload_unpack(self.raw_g, VL, mode=UnpackMode.B16_TO_B32)
             gate_value_pre = vcast(raw_gate_pre, dtypes.float32, mask=full)
             gate_value_post = vcast(raw_gate_post, dtypes.float32, mask=full)
-            dt_bias_pre = vload(self.dt_bias_read, 0)
-            dt_bias_post = vload(self.dt_bias_read, VL)
+            dt_bias_pre = vload(self.dt_bias, 0)
+            dt_bias_post = vload(self.dt_bias, VL)
             gate_input_pre = vadd(gate_value_pre, dt_bias_pre, mask=full)
             gate_input_post = vadd(gate_value_post, dt_bias_post, mask=full)
             gate_pre = vmul(negative_alpha, gate_input_pre, mask=full)
@@ -291,33 +260,25 @@ class FusedRecurrentKDAVector:
             gate_sigmoid_post = vdiv(one, gate_denom_post, mask=full)
             activated_gate_pre = vmuls(gate_sigmoid_pre, lower_bound, mask=full)
             activated_gate_post = vmuls(gate_sigmoid_post, lower_bound, mask=full)
-            vstore(self.decay_write, 0, activated_gate_pre, full)
-            vstore(self.decay_write, VL, activated_gate_post, full)
+            vstore(self.decay, 0, activated_gate_pre, full)
+            vstore(self.decay, VL, activated_gate_post, full)
 
-            raw_beta_value = vload_unpack(self.raw_beta_read, 0, mode=UnpackMode.B16_TO_B32)
+            raw_beta_value = vload_unpack(self.raw_beta, 0, mode=UnpackMode.B16_TO_B32)
             beta_logit = vcast(raw_beta_value, dtypes.float32, mask=full)
             beta_neg_logit = vneg(beta_logit, mask=full)
             beta_exp = vexp(beta_neg_logit, mask=full)
             beta_denom = vadds(beta_exp, 1.0, mask=full)
             activated_beta = vdiv(one, beta_denom, mask=full)
             vstore(self.ub_beta, 0, activated_beta, full)
-            value_raw = vload_unpack(self.value_read, 0, mode=UnpackMode.B16_TO_B32)
+            value_raw = vload_unpack(self.value, 0, mode=UnpackMode.B16_TO_B32)
             value_f32 = vcast(value_raw, dtypes.float32, mask=full)
             vstore(self.ub_value, 0, value_f32, full)
-
-        self.raw_g.release(self.raw_g_read)
-        self.raw_beta.release(self.raw_beta_read)
-        self.value.release(self.value_read)
-        self.a_log.release(self.a_log_read)
-        self.dt_bias.release(self.dt_bias_read)
-        self.decay.commit(self.decay_write)
-        self.decay_read = self.decay.wait()
 
     @jit
     def recur_step(self):
         row_block, dk = self.row_block, self.dk
-        state, out = self.state_read, self.out
-        key, query, decay = self.key, self.query, self.decay_read
+        state, out = self.state, self.out
+        key, query, decay = self.key, self.query, self.decay
         value_real, beta = self.value_real, self.beta
         state_key_sums, delta_row = self.state_key_sums, self.delta_row
 
@@ -382,25 +343,17 @@ class FusedRecurrentKDAVector:
                 vstore_first(out, dv, output_sum)
 
     def store_output(self, gm_out_tile):
-        out_write = self.output.acquire()
-        with vf(outputs=[out_write]):
-            cast(out_write, self.out)
-        self.output.commit(out_write)
-        output_read = self.output.wait()
-        mem_copy(gm_out_tile, output_read)
-        self.output.release(output_read)
+        with vf(outputs=[self.output]):
+            cast(self.output, self.out)
+        mem_copy(gm_out_tile, self.output)
 
     def store_state(self, gm_state_tile):
         if self.state_is_bf16:
-            state_bf16_write = self.state_bf16_output.acquire()
-            with vf(outputs=[state_bf16_write]):
-                cast(state_bf16_write, self.state_read)
-            self.state_bf16_output.commit(state_bf16_write)
-            state_bf16_read = self.state_bf16_output.wait()
-            mem_copy(gm_state_tile, state_bf16_read)
-            self.state_bf16_output.release(state_bf16_read)
+            with vf(outputs=[self.state_bf16_output]):
+                cast(self.state_bf16_output, self.state)
+            mem_copy(gm_state_tile, self.state_bf16_output)
         else:
-            mem_copy(gm_state_tile, self.state_read)
+            mem_copy(gm_state_tile, self.state)
 
 
 @kernel
@@ -471,15 +424,11 @@ class fused_recurrent_kda_kernel:
                                             tile_view(gm_dt_bias, (1, head_dim), (value_head, 0)),)
                     vector.activate_g_beta(self.lower_bound)
                     vector.recur_step()
-                    vector.decay.release(vector.decay_read)
                     vector.store_output(tile_view(gm_out[batch_index, value_head, None, None],
                                         (1, row_block),(token, row_index)))
                     snapshot_state_index = gm_ssm[base + token]
                     vector.store_state(tile_view(gm_final_state[snapshot_state_index, value_head, None, None],
                                        (row_block, head_dim),(row_index, 0)))
-                vector.state.release(vector.state_read)
-                if vector.state_is_bf16:
-                    vector.state_bf16.release(vector.state_bf16_read)
 
 
 class FusedRecurrentKDA:
@@ -658,10 +607,10 @@ def fused_recurrent_kda_functional(
         fn = op.run.compile(*compile_args, dtypes.int64)
         _DYNAMIC_KERNEL_CACHE[cache_key] = fn
     fn(
-        from_torch_npu(key), from_torch_npu(query), from_torch_npu(g), from_torch_npu(value),
-        from_torch_npu(beta), from_torch_npu(A_log), from_torch_npu(dt_bias), from_torch_npu(out),
-        from_torch_npu(state), from_torch_npu(final_state), from_torch_npu(ssm_i64),
-        from_torch_npu(na_i64), seq_len,
+        key, query, g, value,
+        beta, A_log, dt_bias, out,
+        state, final_state, ssm_i64,
+        na_i64, seq_len,
     )
     return final_state, out
 
