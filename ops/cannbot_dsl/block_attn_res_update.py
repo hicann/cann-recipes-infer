@@ -20,6 +20,9 @@ The Phase-1 state uses the paper's stable representation ``(o_tilde, m, l)``.
 For the partial candidate, ``m2=score``, ``l2=1`` and ``o2=partial_block``.
 """
 
+from dataclasses import dataclass
+from functools import lru_cache
+
 import cannbotdsl
 import torch
 
@@ -36,6 +39,7 @@ from cannbotdsl.integer import Int64
 from cannbotdsl.jit_runner import jit
 from cannbotdsl.kernel_launcher import kernel
 from cannbotdsl.raw_reg import (
+    PackMode,
     UnpackMode,
     full_mask,
     update_mask,
@@ -56,8 +60,8 @@ from cannbotdsl.raw_reg import (
     vreduce_sum,
     vsqrt,
     vstore,
+    vstore_pack,
 )
-from cannbotdsl.runtime import from_torch_npu
 from cannbotdsl.tensor import local_slice, mem_copy, tile_view
 from cannbotdsl.typing.types import MemLoc, Tensor
 from cannbotdsl.vf import vf
@@ -65,16 +69,66 @@ from cannbotdsl.vf import vf
 
 VL = 64
 DEFAULT_BLOCK_NUM = 64
+MAX_D = 8192
 
 _TORCH_TO_DSL = {
     torch.bfloat16: BFloat16,
     torch.float16: Float16,
 }
 _COMPILED_KERNEL_CACHE: dict[tuple[object, ...], object] = {}
+UB_BYTES = 240 * 1024
+
+
+@dataclass(frozen=True, slots=True)
+class UpdateStaticShape:
+    """Static dimensions and dtype shared by launch planning and compilation."""
+
+    tokens: int
+    d: int
+    delta_dtype: torch.dtype
+
+
+@dataclass(frozen=True, slots=True)
+class UpdateLaunchPlan:
+    """Named compile/launch configuration for one static Update shape."""
+
+    shape: UpdateStaticShape
+    block_num: int
+    pipeline_rows: bool
+    epsilon: float
+
+
+@dataclass(frozen=True, slots=True)
+class UpdateInputs:
+    """Related whole-network inputs validated and launched as one named group."""
+
+    partial_block: torch.Tensor
+    partial_delta: torch.Tensor
+    effective_query: torch.Tensor
+    inter_max: torch.Tensor
+    inter_exp_sum: torch.Tensor
+    inter_numerator: torch.Tensor
+    epsilon: float
 
 
 def _ceil_div(a: int, b: int) -> int:
     return (a + b - 1) // b
+
+
+def _require(condition: bool, message: str) -> None:
+    """Raise a stable input-contract error."""
+    if not condition:
+        raise ValueError(message)
+
+
+def _use_row_pipeline(tokens: int, d: int, block_num: int) -> bool:
+    """Whether two input rows fit in UB and each core owns useful next work."""
+    w = _ceil_div(int(d), VL) * VL
+    # depth-1: four fp32 vectors + one 16-bit delta + one 16-bit h output.
+    single_bytes = 20 * w + VL * 4
+    # The pipeline adds a second partial/delta/inter/stats input slot.
+    pipelined_bytes = single_bytes + 10 * w + VL * 4
+    return int(tokens) > int(block_num) and pipelined_bytes <= UB_BYTES
 
 
 def _launch_block_num(tokens: int) -> int:
@@ -82,11 +136,15 @@ def _launch_block_num(tokens: int) -> int:
     return max(1, min(DEFAULT_BLOCK_NUM, int(tokens)))
 
 
+# This VF callback is expanded by ``compile_function``. Its Buffer/scalar
+# operands must remain flattened because dataclasses cannot cross the DSL
+# kernel-region ABI boundary.
+# pylint: disable=too-many-arguments,too-many-positional-arguments
 def _block_attn_res_update_body(
         partial_ub, delta_ub, inter_ub, query_ub,
         stats_ub, partial_out_ub, h_out_ub,
-        num_seg, d, avg, epsilon):
-    """fp32 partial plus bf16/fp16 delta; all arithmetic/output is fp32."""
+        num_seg, d, avg, epsilon, h_dtype):
+    """Compute in fp32, then cast the normalized h output to delta dtype."""
     with vf(mode="raw"):
         full = full_mask(32)
 
@@ -134,6 +192,11 @@ def _block_attn_res_update_body(
             partial_scale,
             mask=full,
         )
+        # merged_sum is a scalar broadcast across D.  Compute its reciprocal
+        # once and reuse it for every segment instead of issuing one vector
+        # divide per segment.
+        one = vdup_scalar(1.0, Float32, mask=full)
+        inv_merged_sum = vdiv(one, merged_sum, mask=full)
 
         for seg in range(Int64(0), Int64(num_seg)):
             off = seg * VL
@@ -145,47 +208,64 @@ def _block_attn_res_update_body(
                 vmul(partial, partial_scale, mask=mask),
                 mask=mask,
             )
-            merged = vdiv(numerator, merged_sum, mask=mask)
-            vstore(h_out_ub, off, merged, mask)
+            merged = vmul(numerator, inv_merged_sum, mask=mask)
+            vstore_pack(
+                h_out_ub,
+                off,
+                vcast(merged, h_dtype, mask=mask),
+                mask,
+                mode=PackMode.B32_TO_B16,
+            )
         vmem_bar(mode="vst_vld")
 
 
 _block_attn_res_update_body = compile_function(
     _block_attn_res_update_body, enable_preprocessor=True,
 ).function
+# pylint: enable=too-many-arguments,too-many-positional-arguments
 
 
+# The vector object is instantiated inside a DSL kernel, so Buffer handles and
+# GM operands remain explicit primitives rather than Python containers.
+# pylint: disable=too-many-arguments,too-many-positional-arguments
 class BlockAttnResUpdateVector:
     """Per-core UB state for the fused Phase-2 update."""
 
-    def __init__(self, d: int, delta_dtype=Float16):
+    def __init__(self, d: int, delta_dtype=Float16,
+                 pipeline_rows: bool = False):
         self.d = int(d)
         self.delta_dtype = delta_dtype
         self.w = _ceil_div(self.d, VL) * VL
         self.num_seg = _ceil_div(self.d, VL)
         self.avg = 1.0 / self.d
+        self.pipeline_rows = bool(pipeline_rows)
+        input_depth = 2 if self.pipeline_rows else 1
 
         self.partial_ub = Channel(
-            MemLoc.UB, shape=(1, self.w), dtype=Float32, depth=1,
+            MemLoc.UB, shape=(1, self.w), dtype=Float32,
+            depth=input_depth,
         )
         self.delta_ub = Channel(
-            MemLoc.UB, shape=(1, self.w), dtype=delta_dtype, depth=1,
+            MemLoc.UB, shape=(1, self.w), dtype=delta_dtype,
+            depth=input_depth,
         )
         self.inter_ub = Channel(
-            MemLoc.UB, shape=(1, self.w), dtype=Float32, depth=1,
+            MemLoc.UB, shape=(1, self.w), dtype=Float32,
+            depth=input_depth,
         )
         self.query_ub = Channel(
             MemLoc.UB, shape=(1, self.w), dtype=Float32, depth=1,
         )
         # m and l occupy separate 32-byte aligned regions.
         self.stats_ub = Channel(
-            MemLoc.UB, shape=(1, VL), dtype=Float32, depth=1,
+            MemLoc.UB, shape=(1, VL), dtype=Float32,
+            depth=input_depth,
         )
         self.partial_out_ub = Channel(
             MemLoc.UB, shape=(1, self.w), dtype=Float32, depth=1,
         )
         self.h_out_ub = Channel(
-            MemLoc.UB, shape=(1, self.w), dtype=Float32, depth=1,
+            MemLoc.UB, shape=(1, self.w), dtype=delta_dtype, depth=1,
         )
     def load_query(self, gm_effective_query):
         slot = self.query_ub.acquire()
@@ -246,7 +326,7 @@ class BlockAttnResUpdateVector:
         _block_attn_res_update_body(
             partial_cur, delta_cur, inter_cur, query_cur,
             stats_cur, partial_out_slot, h_out_slot,
-            self.num_seg, self.d, self.avg, epsilon,
+            self.num_seg, self.d, self.avg, epsilon, self.delta_dtype,
         )
 
         self.partial_ub.release(partial_cur)
@@ -270,24 +350,30 @@ class BlockAttnResUpdateVector:
             local_slice(h_cur, (1, self.d), offset=0),
         )
         self.h_out_ub.release(h_cur)
+# pylint: enable=too-many-arguments,too-many-positional-arguments
 
 
+# Kernel entry operands mirror the flattened CANNBotDSL Tensor ABI.
+# pylint: disable=too-many-arguments,too-many-positional-arguments
 @kernel
-class block_attn_res_update_kernel:
+class BlockAttnResUpdateKernel:
     """Fused K3 Phase-2 update; each core owns a contiguous token range."""
 
-    def __init__(self, num_tokens: int, d: int, delta_dtype=Float16):
+    def __init__(self, num_tokens: int, d: int, epsilon: float,
+                 delta_dtype=Float16, pipeline_rows: bool = False):
         self.num_tokens = int(num_tokens)
         self.d = int(d)
+        self.epsilon = float(epsilon)
         self.delta_dtype = delta_dtype
+        self.pipeline_rows = bool(pipeline_rows)
 
     def __call__(self, gm_partial: Tensor, gm_delta: Tensor,
                  gm_effective_query: Tensor,
                  gm_inter_max: Tensor, gm_inter_sum: Tensor,
-                 gm_inter_numerator: Tensor, gm_epsilon: Tensor,
+                 gm_inter_numerator: Tensor,
                  gm_h: Tensor, gm_partial_out: Tensor):
         vector = BlockAttnResUpdateVector(
-            self.d, self.delta_dtype,
+            self.d, self.delta_dtype, self.pipeline_rows,
         )
         block_idx = get_block_idx()
         block_num = get_block_num()
@@ -301,191 +387,256 @@ class block_attn_res_update_kernel:
         if row_end > num_tokens:
             row_end = num_tokens
 
-        epsilon = gm_epsilon[(Int64(0),)]
-
         if block_idx < logical:
             vector.load_query(gm_effective_query)
             query_cur = vector.query_ub.wait()
-            for row in range(row_start, row_end):
+            if self.pipeline_rows:
                 vector.load_row(
                     gm_partial, gm_delta, gm_inter_numerator,
-                    gm_inter_max, gm_inter_sum, row,
+                    gm_inter_max, gm_inter_sum, row_start,
                 )
-                vector.compute_row(query_cur, epsilon)
-                vector.store_row(gm_h, gm_partial_out, row)
+                for row in range(row_start, row_end):
+                    next_row = row + Int64(1)
+                    if next_row < row_end:
+                        # Preload row+1 into the second FIFO slot while the
+                        # Vector pipe consumes row.
+                        vector.load_row(
+                            gm_partial, gm_delta, gm_inter_numerator,
+                            gm_inter_max, gm_inter_sum, next_row,
+                        )
+                    vector.compute_row(query_cur, self.epsilon)
+                    vector.store_row(gm_h, gm_partial_out, row)
+            else:
+                for row in range(row_start, row_end):
+                    vector.load_row(
+                        gm_partial, gm_delta, gm_inter_numerator,
+                        gm_inter_max, gm_inter_sum, row,
+                    )
+                    vector.compute_row(query_cur, self.epsilon)
+                    vector.store_row(gm_h, gm_partial_out, row)
             vector.query_ub.release(query_cur)
+# pylint: enable=too-many-arguments,too-many-positional-arguments
 
 
 class BlockAttnResUpdate:
-    def __init__(self, num_tokens: int, d: int, delta_dtype=Float16,
-                 block_num: int = DEFAULT_BLOCK_NUM):
-        self.num_tokens = int(num_tokens)
-        self.d = int(d)
-        self.delta_dtype = delta_dtype
-        self.block_num = int(block_num)
+    def __init__(self, plan: UpdateLaunchPlan):
+        shape = plan.shape
+        self.num_tokens = int(shape.tokens)
+        self.d = int(shape.d)
+        self.epsilon = float(plan.epsilon)
+        self.delta_dtype = _TORCH_TO_DSL[shape.delta_dtype]
+        self.block_num = int(plan.block_num)
+        self.pipeline_rows = bool(plan.pipeline_rows)
 
+    # The JIT entry signature is the compiled kernel's flattened Tensor ABI.
+    # pylint: disable=too-many-arguments,too-many-positional-arguments
     @jit
     def run(self, gm_partial, gm_delta, gm_effective_query,
-            gm_inter_max, gm_inter_sum, gm_inter_numerator, gm_epsilon,
+            gm_inter_max, gm_inter_sum, gm_inter_numerator,
             gm_h, gm_partial_out):
-        op = block_attn_res_update_kernel(
-            self.num_tokens, self.d, self.delta_dtype,
+        op = BlockAttnResUpdateKernel(
+            self.num_tokens, self.d, self.epsilon,
+            self.delta_dtype, self.pipeline_rows,
         )
         op[self.block_num](
             gm_partial, gm_delta, gm_effective_query,
-            gm_inter_max, gm_inter_sum, gm_inter_numerator, gm_epsilon,
+            gm_inter_max, gm_inter_sum, gm_inter_numerator,
             gm_h, gm_partial_out,
         )
 
+    # pylint: enable=too-many-arguments,too-many-positional-arguments
 
-def _compiled_update_kernel(
-    tokens: int,
-    d: int,
-    delta_dtype: torch.dtype,
-    block_num: int,
-):
+
+def _compiled_update_kernel(plan: UpdateLaunchPlan):
     """Compile once per static Update shape and reuse it across all slots."""
-    key = (int(tokens), int(d), delta_dtype, int(block_num))
+    shape = plan.shape
+    key = (
+        shape,
+        int(plan.block_num),
+        bool(plan.pipeline_rows),
+        float(plan.epsilon),
+    )
     compiled = _COMPILED_KERNEL_CACHE.get(key)
     if compiled is not None:
         return compiled
 
-    op = BlockAttnResUpdate(
-        tokens, d, delta_dtype=_TORCH_TO_DSL[delta_dtype], block_num=block_num,
-    )
+    op = BlockAttnResUpdate(plan)
     fake = cannbotdsl.TensorSpec
     compiled = op.run.compile(
-        fake((tokens, d), dtypes.float32),
-        fake((tokens, d), _TORCH_TO_DSL[delta_dtype]),
-        fake((1, d), dtypes.float32),
-        fake((tokens, 1), dtypes.float32),
-        fake((tokens, 1), dtypes.float32),
-        fake((tokens, d), dtypes.float32),
-        fake((1,), dtypes.float32),
-        fake((tokens, d), dtypes.float32),
-        fake((tokens, d), dtypes.float32),
+        fake((shape.tokens, shape.d), dtypes.float32),
+        fake(
+            (shape.tokens, shape.d),
+            _TORCH_TO_DSL[shape.delta_dtype],
+        ),
+        fake((1, shape.d), dtypes.float32),
+        fake((shape.tokens, 1), dtypes.float32),
+        fake((shape.tokens, 1), dtypes.float32),
+        fake((shape.tokens, shape.d), dtypes.float32),
+        fake(
+            (shape.tokens, shape.d),
+            _TORCH_TO_DSL[shape.delta_dtype],
+        ),
+        fake((shape.tokens, shape.d), dtypes.float32),
     )
     _COMPILED_KERNEL_CACHE[key] = compiled
     return compiled
 
 
+@lru_cache(maxsize=None)
+def _update_launch_plan(
+    shape: UpdateStaticShape,
+    epsilon: float,
+):
+    """Cache static core count, pipeline choice, and compiled callable."""
+    block_num = _launch_block_num(shape.tokens)
+    pipeline_rows = _use_row_pipeline(shape.tokens, shape.d, block_num)
+    plan = UpdateLaunchPlan(
+        shape=shape,
+        block_num=block_num,
+        pipeline_rows=pipeline_rows,
+        epsilon=float(epsilon),
+    )
+    return _compiled_update_kernel(plan)
+
+
 def _block_attn_res_update_eager(
-    partial_block: torch.Tensor,
-    partial_delta: torch.Tensor,
-    effective_query: torch.Tensor,
-    inter_max: torch.Tensor,
-    inter_exp_sum: torch.Tensor,
-    inter_numerator: torch.Tensor,
-    epsilon: float | torch.Tensor = 1e-6,
+    inputs: UpdateInputs,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fused equivalent of K3 ``_update_attn_res_online_softmax``.
 
     Args:
-        partial_block: read-only ``[tokens,D]`` fp32 accumulated residual.
-        partial_delta: ``[tokens,D]`` bf16/fp16 delta on the same device.
-        effective_query: externally sliced ``[D]`` fp32 query for this slot.
-        inter_max/inter_exp_sum: externally sliced ``[tokens]`` fp32 Phase-1
-            statistics for this slot.
-        inter_numerator: externally sliced ``[tokens,D]`` fp32 Phase-1
-            numerator.
-        epsilon: positive Python float or scalar fp32 tensor.
+        inputs: Named group containing the partial state, delta, selected query,
+            Phase-1 statistics/numerator, and positive Python epsilon.
     Returns:
-        ``(h, partial_blocks)``; both are ``[tokens,D]`` fp32. The second
-        output is ``partial_block + partial_delta.float()``.
+        ``(h, partial_blocks)``. ``h`` is ``[tokens,D]`` and follows
+        ``partial_delta.dtype``; ``partial_blocks`` remains fp32 and equals
+        ``partial_block + partial_delta.float()``.
     """
-    assert partial_block.dtype == torch.float32, \
-        f"partial_block 必须为 fp32,实际 {partial_block.dtype}"
-    assert partial_block.dim() == 2 and int(partial_block.shape[1]) >= 1, \
-        "partial_block 必须为 [tokens,D] 且 D>=1"
-    assert partial_delta.dtype in (torch.bfloat16, torch.float16), \
-        f"partial_delta 必须为 bf16/fp16,实际 {partial_delta.dtype}"
-    assert tuple(partial_delta.shape) == tuple(partial_block.shape), \
-        "partial_delta 必须与 partial_block 同 shape"
-    assert partial_block.is_contiguous() and partial_delta.is_contiguous(), \
-        "partial_block / partial_delta 必须 contiguous"
-    assert partial_block.device == partial_delta.device, \
-        "partial_block / partial_delta 必须同 device"
+    partial_block = inputs.partial_block
+    partial_delta = inputs.partial_delta
+    effective_query = inputs.effective_query
+    inter_max = inputs.inter_max
+    inter_exp_sum = inputs.inter_exp_sum
+    inter_numerator = inputs.inter_numerator
+    epsilon = inputs.epsilon
+    _require(
+        partial_block.dtype == torch.float32,
+        f"partial_block 必须为 fp32,实际 {partial_block.dtype}",
+    )
+    _require(
+        partial_block.dim() == 2 and int(partial_block.shape[1]) >= 1,
+        "partial_block 必须为 [tokens,D] 且 D>=1",
+    )
+    _require(
+        partial_delta.dtype in (torch.bfloat16, torch.float16),
+        f"partial_delta 必须为 bf16/fp16,实际 {partial_delta.dtype}",
+    )
+    _require(
+        tuple(partial_delta.shape) == tuple(partial_block.shape),
+        "partial_delta 必须与 partial_block 同 shape",
+    )
+    _require(
+        partial_block.is_contiguous() and partial_delta.is_contiguous(),
+        "partial_block / partial_delta 必须 contiguous",
+    )
+    _require(
+        partial_block.device == partial_delta.device,
+        "partial_block / partial_delta 必须同 device",
+    )
 
     tokens, d = (int(size) for size in partial_block.shape)
-    assert effective_query.dtype == torch.float32 \
-        and effective_query.dim() == 1 \
-        and int(effective_query.shape[0]) == d, \
-        f"effective_query 必须为 [{d}] fp32"
-    assert effective_query.is_contiguous() \
-        and effective_query.device == partial_block.device, \
-        "effective_query 必须 contiguous 且与 partial_block 同 device"
+    _require(d <= MAX_D, f"D={d} 超过当前上限 {MAX_D}")
+    _require(
+        effective_query.dtype == torch.float32
+        and effective_query.dim() == 1
+        and int(effective_query.shape[0]) == d,
+        f"effective_query 必须为 [{d}] fp32",
+    )
+    _require(
+        effective_query.is_contiguous()
+        and effective_query.device == partial_block.device,
+        "effective_query 必须 contiguous 且与 partial_block 同 device",
+    )
 
     stats_shape = (tokens,)
     for name, value in (
         ("inter_max", inter_max),
         ("inter_exp_sum", inter_exp_sum),
     ):
-        assert value.dtype == torch.float32 \
-            and tuple(value.shape) == stats_shape, \
-            f"{name} 必须为 [tokens] fp32"
-        assert value.is_contiguous() and value.device == partial_block.device, \
-            f"{name} 必须 contiguous 且与 partial_block 同 device"
+        _require(
+            value.dtype == torch.float32
+            and tuple(value.shape) == stats_shape,
+            f"{name} 必须为 [tokens] fp32",
+        )
+        _require(
+            value.is_contiguous() and value.device == partial_block.device,
+            f"{name} 必须 contiguous 且与 partial_block 同 device",
+        )
 
-    assert inter_numerator.dtype == torch.float32, \
-        "inter_numerator 必须为 fp32"
-    assert tuple(inter_numerator.shape) == (tokens, d), \
-        "inter_numerator 必须为 [tokens,D]"
-    assert inter_numerator.is_contiguous() \
-        and inter_numerator.device == partial_block.device, \
-        "inter_numerator 必须 contiguous 且与 partial_block 同 device"
+    _require(
+        inter_numerator.dtype == torch.float32,
+        "inter_numerator 必须为 fp32",
+    )
+    _require(
+        tuple(inter_numerator.shape) == (tokens, d),
+        "inter_numerator 必须为 [tokens,D]",
+    )
+    _require(
+        inter_numerator.is_contiguous()
+        and inter_numerator.device == partial_block.device,
+        "inter_numerator 必须 contiguous 且与 partial_block 同 device",
+    )
 
-    if isinstance(epsilon, torch.Tensor):
-        assert epsilon.dtype == torch.float32 and epsilon.numel() == 1, \
-            "Tensor epsilon 必须为标量 fp32 Tensor"
-        assert epsilon.is_contiguous() and epsilon.device == partial_block.device, \
-            "Tensor epsilon 必须 contiguous 且与 partial_block 同 device"
-        epsilon_tensor = epsilon.reshape(1)
-    else:
-        assert isinstance(epsilon, (float, int)) and float(epsilon) > 0.0, \
-            "epsilon 必须为正 float 或标量 fp32 Tensor"
-        epsilon_tensor = None
+    _require(
+        isinstance(epsilon, (float, int)) and float(epsilon) > 0.0,
+        "epsilon 必须为正 Python float",
+    )
+    epsilon_value = float(epsilon)
 
-    h = torch.empty_like(partial_block)
+    h = torch.empty(
+        partial_block.shape,
+        dtype=partial_delta.dtype,
+        device=partial_block.device,
+    )
     partial_blocks = torch.empty_like(partial_block)
 
     if tokens == 0:
         return h, partial_blocks
 
-    if epsilon_tensor is None:
-        epsilon_tensor = torch.tensor(
-            float(epsilon), dtype=torch.float32,
-            device=partial_block.device,
-        ).reshape(1)
-
-    block_num = _launch_block_num(tokens)
-    compiled = _compiled_update_kernel(
-        tokens, d, partial_delta.dtype, block_num,
+    static_shape = UpdateStaticShape(
+        tokens=tokens,
+        d=d,
+        delta_dtype=partial_delta.dtype,
     )
+    compiled = _update_launch_plan(static_shape, epsilon_value)
     compiled(
-        from_torch_npu(partial_block.reshape(tokens, d)),
-        from_torch_npu(partial_delta.reshape(tokens, d)),
-        from_torch_npu(effective_query.reshape(1, d)),
-        from_torch_npu(inter_max.reshape(tokens, 1)),
-        from_torch_npu(inter_exp_sum.reshape(tokens, 1)),
-        from_torch_npu(inter_numerator.reshape(tokens, d)),
-        from_torch_npu(epsilon_tensor),
-        from_torch_npu(h.reshape(tokens, d)),
-        from_torch_npu(partial_blocks.reshape(tokens, d)),
+        partial_block,
+        partial_delta,
+        effective_query.reshape(1, d),
+        inter_max.reshape(tokens, 1),
+        inter_exp_sum.reshape(tokens, 1),
+        inter_numerator,
+        h,
+        partial_blocks,
     )
     return h, partial_blocks
 
 
-# The eager launcher below materializes CANNBotDSL runtime tensors from raw
-# NPU pointers.  Keep that pointer work outside TorchDynamo by representing the
-# functional whole-network call as one dispatcher node.
+# Keep the CANNBotDSL provider call outside TorchDynamo by representing the
+# functional whole-network call as one dispatcher node. CANNBotDSL 0.3 accepts
+# provider-owned Torch tensors directly and owns Host ABI/stream resolution.
 _UPDATE_TORCH_LIBRARY = torch.library.Library("cannbot_attn_res", "FRAGMENT")
 _UPDATE_TORCH_LIBRARY.define(
     "block_attn_res_update(Tensor partial_block, Tensor partial_delta, "
     "Tensor effective_query, Tensor inter_max, Tensor inter_exp_sum, "
-    "Tensor inter_numerator, Tensor epsilon) -> (Tensor, Tensor)"
+    "Tensor inter_numerator, float epsilon=1e-6) -> (Tensor, Tensor)"
 )
 
 
+# Dispatcher implementations and the public function must exactly match the
+# stable seven-input whole-network schema. Internally they immediately create
+# ``UpdateInputs`` so the related values are handled as one named group.
+# pylint: disable=too-many-arguments,too-many-positional-arguments
 @torch.library.impl(_UPDATE_TORCH_LIBRARY, "block_attn_res_update", "Meta")
 def _block_attn_res_update_meta(
     partial_block: torch.Tensor,
@@ -494,10 +645,9 @@ def _block_attn_res_update_meta(
     inter_max: torch.Tensor,
     inter_exp_sum: torch.Tensor,
     inter_numerator: torch.Tensor,
-    epsilon: torch.Tensor,
+    epsilon: float = 1e-6,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     del (
-        partial_delta,
         effective_query,
         inter_max,
         inter_exp_sum,
@@ -505,7 +655,7 @@ def _block_attn_res_update_meta(
         epsilon,
     )
     return (
-        partial_block.new_empty(partial_block.shape),
+        partial_delta.new_empty(partial_block.shape),
         partial_block.new_empty(partial_block.shape),
     )
 
@@ -520,16 +670,18 @@ def _block_attn_res_update_npu(
     inter_max: torch.Tensor,
     inter_exp_sum: torch.Tensor,
     inter_numerator: torch.Tensor,
-    epsilon: torch.Tensor,
+    epsilon: float = 1e-6,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     return _block_attn_res_update_eager(
-        partial_block,
-        partial_delta,
-        effective_query,
-        inter_max,
-        inter_exp_sum,
-        inter_numerator,
-        epsilon,
+        UpdateInputs(
+            partial_block=partial_block,
+            partial_delta=partial_delta,
+            effective_query=effective_query,
+            inter_max=inter_max,
+            inter_exp_sum=inter_exp_sum,
+            inter_numerator=inter_numerator,
+            epsilon=epsilon,
+        )
     )
 
 
@@ -540,27 +692,27 @@ def block_attn_res_update(
     inter_max: torch.Tensor,
     inter_exp_sum: torch.Tensor,
     inter_numerator: torch.Tensor,
-    epsilon: float | torch.Tensor = 1e-6,
+    epsilon: float = 1e-6,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Graph-safe public entry for the fused online-softmax update."""
+    _require(
+        isinstance(epsilon, (float, int)) and float(epsilon) > 0.0,
+        "epsilon 必须为正 Python float",
+    )
+    epsilon_value = float(epsilon)
     if partial_block.device.type != "npu":
         return _block_attn_res_update_eager(
-            partial_block,
-            partial_delta,
-            effective_query,
-            inter_max,
-            inter_exp_sum,
-            inter_numerator,
-            epsilon,
+            UpdateInputs(
+                partial_block=partial_block,
+                partial_delta=partial_delta,
+                effective_query=effective_query,
+                inter_max=inter_max,
+                inter_exp_sum=inter_exp_sum,
+                inter_numerator=inter_numerator,
+                epsilon=epsilon_value,
+            )
         )
 
-    if isinstance(epsilon, torch.Tensor):
-        epsilon_tensor = epsilon.reshape(1)
-    else:
-        epsilon_tensor = torch.scalar_tensor(
-            float(epsilon), dtype=torch.float32,
-            device=partial_block.device,
-        ).reshape(1)
     return torch.ops.cannbot_attn_res.block_attn_res_update.default(
         partial_block,
         partial_delta,
@@ -568,5 +720,6 @@ def block_attn_res_update(
         inter_max,
         inter_exp_sum,
         inter_numerator,
-        epsilon_tensor,
+        epsilon_value,
     )
+# pylint: enable=too-many-arguments,too-many-positional-arguments

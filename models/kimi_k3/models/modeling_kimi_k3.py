@@ -2728,7 +2728,7 @@ class KimiLinearModel(nn.Module):
             block_residual,
             effective_queries,
             valid_blocks,
-            eps=epsilon,
+            eps=self.config.rms_norm_eps,
         )
         return AttnResPhase1Stats(
             inter_numerator=inter_numerator,
@@ -2758,7 +2758,7 @@ class KimiLinearModel(nn.Module):
             slot.inter_max,
             slot.inter_exp_sum,
             slot.inter_numerator,
-            epsilon,
+            self.config.rms_norm_eps,
         )
 
     def _forward_attn_res_block(
