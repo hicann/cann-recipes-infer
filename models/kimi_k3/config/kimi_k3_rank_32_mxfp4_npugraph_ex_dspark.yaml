@@ -1,5 +1,6 @@
 model_name: "kimi_k3"
 model_path: "/data/models/kimi_k3"
+draft_model_path: "/data/models/kimi_k3_dspark"
 exe_mode: "npugraph_ex"
 world_size: 32
 
@@ -11,19 +12,17 @@ model_config:
   enable_cache_compile: False
   enable_weight_nz: False
   platform_version: "950"
-  draft_model_type: "none"
-  next_n: 0
+  draft_model_type: "dspark"
+  next_n: 7
   skip_warm_up: True
   prefill_mini_batch_size: 1
   pa_block_size: 128
   custom_params:
-    attn_res_mode: "fused"
+    attn_res_mode: "original"
     enable_multi_streams: True
+    moe_chunk_max_len: 65536
     enable_flash_kda: True
-    enable_fused_recurrent_kda: True
-    moe_chunk_max_len: 12800
-    enable_mega_moe: True
-    enable_moe_bf16_mode: True
+    enable_fused_recurrent_kda: False
 
 data_config:
   dataset: "default"

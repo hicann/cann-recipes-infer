@@ -2,7 +2,7 @@
 
 Kimi K3 采用 2.8T 参数的混合注意力 MoE 架构，交错使用 Kimi Delta Attention（KDA）与 Gated MLA，并引入 Attention Residuals（AttnRes）和 Stable LatentMoE，模型原生支持 1M 上下文。KDA 维护固定大小的序列状态，AttnRes 沿网络深度聚合历史表示，Stable LatentMoE 在 latent 空间执行 Routed Expert 计算。
 
-cann-recipes-infer 提供 Kimi K3 在昇腾 950PR/DT 4机 32卡集群上的实现参考，采用 Embedding TP、Attention DP/TP、Dense TP、Prefill SP、Decode DP 与 Routed Expert EP 的组合部署策略。KDA、MLA 与 MoE 均接入融合算子，Mamba Cache 负责 `conv_state` 与 KDA ssm state 的存储分配及请求映射；Stable LatentMoE 支持原生 MXFP4 权重、动态 MXFP8 激活及 Decode Shared Expert 多流。AttnRes 两阶段优化与 Decode `npugraph_ex` 可按需启用。
+cann-recipes-infer 提供 Kimi K3 在昇腾 950PR/DT 4机 32卡集群上的离线实现参考，采用 Embedding TP、Attention DP/TP、Dense TP、Prefill SP、Decode DP 与 Routed Expert EP 的组合部署策略。KDA、MLA 与 MoE 均接入融合算子；模型目录内的 `CacheData` 和 `AttnMetaData` 负责 `conv_state`、KDA SSM State、MLA latent cache 及请求映射。Stable LatentMoE 支持原生 MXFP4 权重、动态 MXFP8 激活及 Decode Shared Expert 多流。AttnRes 两阶段优化与 Decode `npugraph_ex` 可按需启用。
 
 完整运行方法见[模型 README](../../../models/kimi_k3/README.md)。
 
@@ -137,7 +137,7 @@ KDA 的长期状态大小与序列长度无关；每个请求、每个 KDA 层�
 
 `qkv_proj` 按通道生成 Q/K/V。融合 QKV ShortConv 在 Prefill 调用 [`causal_conv1d_fn`](https://gitcode.com/cann/ops-transformer/blob/master/torch_extension/cann_ops_transformer/docs/zh/causal_conv1d_fn.md)，在 Decode 调用 [`causal_conv1d_update`](https://gitcode.com/cann/ops-transformer/blob/master/torch_extension/cann_ops_transformer/docs/zh/causal_conv1d_update.md)，完成逐通道因果卷积与 SiLU 后再拆分三路。三组通道使用各自的卷积权重，共同维护一份拼接的 `conv_state`。
 
-`conv_state` 与 KDA SSM State 分别注册为 `MambaCacheEntry`，由框架统一分配并维护请求到状态块的映射。Prefill 清零对应状态行，`causal_conv1d_fn` 更新 `conv_state`，Torch chunk KDA 按请求计算并写回 KDA SSM State；Decode 复用相同 block id，通过 `causal_conv1d_update` 与 [`npu_recurrent_gated_delta_rule`](https://gitcode.com/Ascend/op-plugin/blob/master/docs/zh/custom_APIs/torch_npu/torch_npu-npu_recurrent_gated_delta_rule.md) 分别原地推进两类状态。
+离线样例由 `models/kimi_k3/models/modules/attention_data.py` 为每层分配 `conv_state` 与 KDA SSM State，并在本地 metadata 字典中维护固定请求到状态行的映射。Prefill 通过 `causal_conv1d_fn` 更新 `conv_state`，Torch chunk KDA 按请求计算并写回 KDA SSM State；Decode 复用相同 state id，通过 `causal_conv1d_update` 与 [`npu_recurrent_gated_delta_rule`](https://gitcode.com/Ascend/op-plugin/blob/master/docs/zh/custom_APIs/torch_npu/torch_npu-npu_recurrent_gated_delta_rule.md) 分别原地推进两类状态。
 
 #### Gated MLA
 
@@ -147,7 +147,7 @@ Gated MLA 沿用 MLA 的 Q/KV 低秩投影，并在 Attention 输出后增加逐
   <img src="./figures/gated_mla_architecture.svg" width="90%" alt="Kimi K3 Gated MLA architecture and paged cache flow">
 </p>
 
-Recipes 提供 Prefill native、Decode absorb 的实现参考。Prefill 和 Decode 均通过 `npu_kv_rmsnorm_rope_cache_v2`（接口说明参考 [`npu_kv_rmsnorm_rope_cache`](https://gitcode.com/Ascend/op-plugin/blob/26.1.0/docs/context/torch_npu-npu_kv_rmsnorm_rope_cache.md)）融合 KV latent 的 RMSNorm，并依据 `slot_mapping` 将归一化后的 latent 与额外 K 特征写入两份 Paged Cache。
+Recipes 提供 Prefill native、Decode absorb 的实现参考。本地 `CacheData` 为每个 MLA 层分配 `nope_cache` 与 `rope_cache`；`AttnMetaData` 根据固定 batch、rank 和 step 位置生成 `block_table` 与 `slot_mapping`，模型完成 KV latent 的 RMSNorm 后将其写入两份 Paged Cache。
 
 Prefill 通过 `kv_b_proj` 将本轮 latent 临时展开为 per-head K/V，并调用 `npu_fused_infer_attention_score`，以 `NTD_TND` 布局和 `sparse_mode=3` 完成变长序列的 causal Attention。Decode 将 KV up-projection 的 K 矩阵吸收到 Query 侧，再调用 [`npu_fused_infer_attention_score_v2`](https://gitcode.com/Ascend/op-plugin/blob/26.1.0/docs/zh/custom_APIs/torch_npu/torch_npu-npu_fused_infer_attention_score_v2.md)，直接读取 NZ 布局的 latent Paged Cache 完成 absorb Attention；随后通过吸收后的 V 投影将算子输出还原到各 Attention head 的 value 空间。
 
