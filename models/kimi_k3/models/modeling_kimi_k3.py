@@ -2609,9 +2609,6 @@ class KimiLinearModel(nn.Module):
         # Row count is the rank-local token shard, which differs by phase:
         #   prefill: ceil(max_prefill_tokens / attn_tp_size)
         #   decode : ceil(batch_size_per_dp_rank * (next_n + 1) / attn_tp_size)
-        # Take the max of the two.  The decode slice length is a compile-time
-        # constant (fixed batch, fixed next_n), so slicing introduces no new
-        # dynamic shape in the decode graph.
         if infer_config is not None:
             scheduler = infer_config.scheduler_config
             prefill_tokens = (
@@ -2623,12 +2620,15 @@ class KimiLinearModel(nn.Module):
             decode_tokens = (
                 decode_tokens + self.attn_tp_size - 1
             ) // self.attn_tp_size
+            self.decode_attn_res_tokens = max(decode_tokens, 1)
             self.max_attn_res_tokens = max(
                 prefill_tokens, decode_tokens, 1
             )
         else:
+            self.decode_attn_res_tokens = None
             self.max_attn_res_tokens = None
         self.block_residual_buffer: Optional[torch.Tensor] = None
+        self.decode_block_residual_buffer: Optional[torch.Tensor] = None
         self.register_buffer(
             "attn_res_effective_queries", None, persistent=False
         )
@@ -2662,6 +2662,15 @@ class KimiLinearModel(nn.Module):
             device=device,
         )
         torch._dynamo.mark_static(self.block_residual_buffer)
+        if self.attn_res_mode == "fused":
+            self.decode_block_residual_buffer = torch.zeros(
+                self.decode_attn_res_tokens,
+                self.max_attn_res_blocks,
+                self.config.hidden_size,
+                dtype=dtype,
+                device=device,
+            )
+            torch._dynamo.mark_static(self.decode_block_residual_buffer)
         if self.attn_res_mode != "original":
             self.attn_res_valid_blocks = torch.arange(
                 1,
@@ -2766,7 +2775,10 @@ class KimiLinearModel(nn.Module):
                 # Materialize the shard so that storage can die before layer 0.
                 hidden_states = hidden_states.clone()
         tokens = hidden_states.shape[0]
-        block_residual = self._get_block_residual(tokens, hidden_states)
+        if self.attn_res_mode == "fused" and not forward_metadata["is_prefill"]:
+            block_residual = self.decode_block_residual_buffer
+        else:
+            block_residual = self._get_block_residual(tokens, hidden_states)
         collected_target_hidden = []
         if self.attn_res_mode != "original":
             hidden_states, collected_target_hidden = self._forward_attn_res(

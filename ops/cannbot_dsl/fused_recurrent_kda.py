@@ -482,7 +482,7 @@ def fused_recurrent_kda_functional(
     ssm_state_indices: Optional[torch.Tensor] = None,
     num_accepted_tokens: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Run raw-input recurrent KDA decode with an immutable input state pool.
+    """Run raw-input recurrent KDA decode and update ``state`` in place.
 
     Q/K, g, and beta are bf16 raw inputs.  The final kernel normalizes Q/K
     with epsilon ``1e-6``, activates gates with ``A_log``, ``dt_bias``, and
@@ -553,7 +553,9 @@ def fused_recurrent_kda_functional(
     assert row_block in (16, 32, 64) and dim % row_block == 0, \
         f"KDA_ROW_BLOCK must divide D and be one of 16, 32, 64, got {row_block}"
     state_dtype = dtypes.bfloat16 if state.dtype == torch.bfloat16 else dtypes.float32
-    final_state = state.clone()
+    initial_state = state
+    final_state = state
+    state_block_num = int(state.shape[0])
     block_num = _device_block_num(query)
     if layout_qkv == "BSND":
         out = torch.zeros(batch, seq_len, num_value_heads, dim, dtype=torch.bfloat16, device=device)
@@ -564,10 +566,13 @@ def fused_recurrent_kda_functional(
     if layout_qkv == "BSND":
         static_layout = tuple(
             (tuple(tensor.shape), tuple(tensor.stride()))
-            for tensor in (key, query, g, value, beta, A_log, dt_bias, out, state, final_state, ssm_i64, na_i64)
+            for tensor in (
+                key, query, g, value, beta, A_log, dt_bias, out,
+                initial_state, final_state, ssm_i64, na_i64,
+            )
         )
     cache_key = (
-        num_kv_heads, num_value_heads, layout_qkv, row_block, state_dtype, block_num,
+        num_kv_heads, num_value_heads, layout_qkv, row_block, state_dtype, block_num, state_block_num,
         scale_value, float(lower_bound), static_layout,
     )
     fn = _DYNAMIC_KERNEL_CACHE.get(cache_key)
@@ -585,7 +590,7 @@ def fused_recurrent_kda_functional(
                 _static_tensor_spec(dtypes.bfloat16, g), _static_tensor_spec(dtypes.bfloat16, value),
                 _static_tensor_spec(dtypes.bfloat16, beta), _static_tensor_spec(dtypes.float32, A_log),
                 _static_tensor_spec(dtypes.float32, dt_bias), _static_tensor_spec(dtypes.bfloat16, out),
-                _static_tensor_spec(state_dtype, state), _static_tensor_spec(state_dtype, final_state),
+                _static_tensor_spec(state_dtype, initial_state), _static_tensor_spec(state_dtype, final_state),
                 _static_tensor_spec(dtypes.int64, ssm_i64),
                 _static_tensor_spec(dtypes.int64, na_i64),
             )
@@ -599,8 +604,8 @@ def fused_recurrent_kda_functional(
                 tensor_spec((num_value_heads,), dtypes.float32),
                 tensor_spec((num_value_heads, dim), dtypes.float32),
                 _dynamic_sequence_tensor(dtypes.bfloat16, compile_batch, compile_seq, num_value_heads, dim, layout_qkv),
-                tensor_spec((compile_batch * compile_seq, num_value_heads, dim, dim), state_dtype),
-                tensor_spec((compile_batch * compile_seq, num_value_heads, dim, dim), state_dtype),
+                tensor_spec((state_block_num, num_value_heads, dim, dim), state_dtype),
+                tensor_spec((state_block_num, num_value_heads, dim, dim), state_dtype),
                 tensor_spec((compile_batch * compile_seq,), dtypes.int64),
                 tensor_spec((compile_batch,), dtypes.int64),
             )
@@ -609,10 +614,10 @@ def fused_recurrent_kda_functional(
     fn(
         key, query, g, value,
         beta, A_log, dt_bias, out,
-        state, final_state, ssm_i64,
+        initial_state, final_state, ssm_i64,
         na_i64, seq_len,
     )
-    return final_state, out
+    return state, out
 
 
 def fused_recurrent_kda(
@@ -632,13 +637,12 @@ def fused_recurrent_kda(
     num_accepted_tokens: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Run raw-input recurrent KDA decode and update ``state`` in place."""
-    final_state, output = fused_recurrent_kda_functional(
+    _, output = fused_recurrent_kda_functional(
         query, key, value, state, beta, g, scale, A_log, dt_bias,
         lower_bound, layout_qkv,
         ssm_state_indices=ssm_state_indices,
         num_accepted_tokens=num_accepted_tokens,
     )
-    state.copy_(final_state)
     return state, output
 
 
@@ -749,7 +753,7 @@ def _fused_recurrent_kda_functional_privateuse1(
     ssm_state_indices=None,
     num_accepted_tokens=None,
 ):
-    final_state, output = fused_recurrent_kda_functional(
+    _, output = fused_recurrent_kda_functional(
         query,
         key,
         value,
@@ -764,7 +768,7 @@ def _fused_recurrent_kda_functional_privateuse1(
         ssm_state_indices=ssm_state_indices,
         num_accepted_tokens=num_accepted_tokens,
     )
-    return output, final_state
+    return output, state
 
 
 fused_recurrent_kda_op = torch.ops.cannbotdsl_fused_recurrent_kda.fused_recurrent_kda
