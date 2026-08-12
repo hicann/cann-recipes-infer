@@ -18,7 +18,7 @@ model_config:
   prefill_mini_batch_size: 1
   pa_block_size: 128
   custom_params:
-    attn_res_mode: "original"
+    attn_res_mode: "fused"
     enable_multi_streams: True
     moe_chunk_max_len: 65536
     enable_flash_kda: True
@@ -34,8 +34,8 @@ data_config:
 parallel_config:
   attn_tp_size: 32
   moe_tp_size: 1
-  embed_tp_size: 32
-  lmhead_tp_size: 32
-  dense_tp_size: 32
+  embed_tp_size: 16
+  lmhead_tp_size: 8
+  dense_tp_size: 8
   oproj_tp_size: 32
   cp_size: 1

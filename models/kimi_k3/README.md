@@ -36,9 +36,9 @@ data_config:
 parallel_config:
   attn_tp_size: 32
   moe_tp_size: 1
-  embed_tp_size: 32
-  lmhead_tp_size: 32
-  dense_tp_size: 32
+  embed_tp_size: 16
+  lmhead_tp_size: 8
+  dense_tp_size: 8
   oproj_tp_size: 32
 ```
 
@@ -59,10 +59,10 @@ parallel_config:
 每个 Prefill mini cycle 都由完整 Attention TP 通信组参与：prompt token 在 `attn_tp_size` 个 rank 间做 Sequence Parallel，Attention 在 head 维做 TP。KDA state 根据完整 Decode batch 中的 request index 直接写入对应 state row；MLA latent 只由该请求的 Decode owner rank 写入其本地 paged blocks。所有 cycle 共用同一组预分配 cache tensor，完成后直接以完整 batch 切换到 request-DP + Attention TP Decode，不发生 cache 合并、拷贝或重新分配。
 | 参数名 | 类型 | 默认值 | 含义 |
 | --- | --- | --- | --- |
-| `attn_res_mode` | str | `original` | AttnRes 后端：`original` 使用原实现，`two_phase` 使用 PyTorch 两阶段实现，`fused` 使用融合算子。当前 YAML 设置为 `original`。 |
+| `attn_res_mode` | str | `fused` | AttnRes 后端：`original` 使用原实现，`two_phase` 使用 PyTorch 两阶段实现，`fused` 使用融合算子。当前 YAML 设置为 `fused`。 |
 | `enable_multi_streams` | bool | `True` | 启用多流并行。Decode 将 Shared Expert 放入独立流，与 Routed Expert 的分发、计算和聚合重叠，并在两路结果相加前同步；Prefill 保持主流执行。当前 YAML 设置为 `True`。 |
 | `moe_chunk_max_len` | int | `65536` | Prefill MoE 路由缓冲的 gathered-token 上限；超过时管线内部循环分块以控制峰值内存。设为 `0` 或负数可禁用分块。 |
-| `enable_mega_moe` | bool | `False` | Prefill MoE使能MegaMoe融合算子，开启后，chunkmoe功能将关闭，moe_chunk_max_len不生效。 |
+| `enable_mega_moe` | bool | `False` | Prefill MoE 使用 MegaMoE 融合算子；仍按 `moe_chunk_max_len` 分块，每个 chunk 独立调用 MegaMoE。 |
 | `enable_moe_bf16_mode` | bool | `True` | 开启后，MoE中的finalise_routing与SiTU将使用BF16精度进行运算，但MoeGating将总是保持FP32的计算精度。 |
 
 `enable_online_split_weight` 仅表示启动时从完整 checkpoint 按 rank 加载权重，不代表支持在线请求调度。
@@ -84,7 +84,7 @@ bash infer.sh
 YAML_FILE_NAME=kimi_k3_rank_32_mxfp4_npugraph_ex_dspark.yaml bash infer.sh
 ```
 
-DSpark 配置要求 `draft_model_type=dspark`、`next_n` 与草稿 checkpoint 的 `block_size` 一致、`dense_tp_size=attn_tp_size`，并使用 16 或 128 的 `pa_block_size`。`attn_res_mode` 默认保持 `original`，也支持 `two_phase` 和 `fused`。主模型和草稿模型的 cache 独立分配，Decode target hidden 保持 request-owner 本地化，warmup 后两组 cache 均原地清零。正式推理结束后会打印平均 acceptance length、acceptance length 分布，以及每个 draft position 的 acceptance rate。
+DSpark 配置要求 `draft_model_type=dspark`、`next_n` 与草稿 checkpoint 的 `block_size` 一致，并使用 16 或 128 的 `pa_block_size`。32P 示例将 KDA Attention 和 MLA `g_proj/o_proj` 保持 TP32，同时使用 Dense/LMHead/DSpark TP8 和 Embed TP16；Decode target hidden、DSpark 层间 hidden 与 LMHead logits 均保持 request-owner 本地化。`temperature=0` 时只交换每个 vocab shard 的最大值与全局 token id 候选，不物化完整词表。`attn_res_mode` 默认保持 `original`，也支持 `two_phase` 和 `fused`。主模型和草稿模型的 cache 独立分配，warmup 后两组 cache 均原地清零。正式推理结束后会打印平均 acceptance length、acceptance length 分布，以及每个 draft position 的 acceptance rate。
 
 ## 已知限制
 

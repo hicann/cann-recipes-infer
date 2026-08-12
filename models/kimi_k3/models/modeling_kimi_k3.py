@@ -58,7 +58,14 @@ from ops.cannbot_dsl import (
 )
 
 from .configuration_kimi_k3 import KimiLinearConfig
-from .modules import AttnMetaData
+from .modules import (
+    AttnMetaData,
+    all_gather_first_dim,
+    distributed_argmax,
+    dp_to_tp_all_to_all,
+    reduce_scatter_first_dim,
+    vocab_tp_to_owner,
+)
 
 try:
     from ops.cannbot_dsl.flash_kda import flash_kda as _flash_kda_impl
@@ -217,20 +224,19 @@ class KdaGateParams(NamedTuple):
 
 
 def _moe_chunk_plan(local_tokens: int, moe_ep_size: int, moe_chunk_max_len: int) -> list[int]:
-    """Return per-chunk local-token counts that keep gathered tokens <= moe_chunk_max_len.
+    """Return per-chunk local-token counts within the routing buffer budget.
 
     Each rank holds an equal-length SP shard of ``local_tokens``, so chunking
-    each shard by the same boundaries keeps AllGather / ReduceScatter
-    boundaries aligned across the EP group.  Every chunk gathers
-    ``local_chunk * moe_ep_size`` tokens; the first chunk size is the largest
-    one that respects the budget, and the remainder becomes the tail chunk.
+    each shard by the same boundaries keeps double-routing collectives aligned
+    across the EP group. The first chunk size is the largest one that respects
+    the configured global routing budget, and the remainder is the tail chunk.
     """
     if moe_chunk_max_len <= 0 or moe_ep_size <= 0:
         return [local_tokens]
     gathered_total = local_tokens * moe_ep_size
     if gathered_total <= moe_chunk_max_len:
         return [local_tokens]
-    # Chunk evenly: each rank gets the same local count so AG/RS stay aligned.
+    # Every rank uses the same local count so double-routing calls stay aligned.
     max_local_per_chunk = moe_chunk_max_len // moe_ep_size
     full_chunks = local_tokens // max_local_per_chunk
     remainder = local_tokens % max_local_per_chunk
@@ -395,28 +401,6 @@ def _activation(config: KimiLinearConfig, enable_moe_bf16_mode):
     return None
 
 
-def _sp_all_gather(shard: torch.Tensor, group, world: int) -> torch.Tensor:
-    """Gather a dim-0 shard back to the full stream in rank order.
-
-    Rank r's shard lands at position r, so contiguous ``[r*shard, (r+1)*shard)``
-    slices reassemble in order -- what KDA needs to see whole sequences.
-    """
-    full = shard.new_empty(shard.shape[0] * world, *shard.shape[1:])
-    dist.all_gather_into_tensor(full, shard.contiguous(), group=group)
-    return full
-
-
-def _sp_reduce_scatter(full: torch.Tensor, group, world: int) -> torch.Tensor:
-    """Sum a full-stream partial across the group, keep this rank's shard.
-
-    Rank r receives the reduced value for tokens ``[r*shard, (r+1)*shard)`` --
-    the slice of the all_reduce it replaces, up to reduction order.
-    """
-    shard = full.new_empty(full.shape[0] // world, *full.shape[1:])
-    dist.reduce_scatter_tensor(shard, full.contiguous(), group=group)
-    return shard
-
-
 def _unpad_kda_input(
     hidden_states: torch.Tensor, pad_len: int
 ) -> torch.Tensor:
@@ -497,20 +481,17 @@ class KimiMLP(nn.Module):
         self.situ = _activation(config, enable_moe_bf16_mode)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.tp_size > 1:
-            # Every rank holds a different token slice but the same column
-            # shards, so the tokens must be whole before the projections.
-            x = _sp_all_gather(x, self.tp_group, self.tp_size)
+        # Every rank holds a different token slice but the same column shards,
+        # so the tokens must be whole before the projections.
+        x = all_gather_first_dim(x, self.tp_group, self.tp_size)
         gate_up = self.gate_up_proj(x)
         if self.situ is not None:
             activated = self.situ(gate_up)
         else:
             activated = F.silu(gate_up[..., : gate_up.shape[-1] // 2]) * gate_up[..., gate_up.shape[-1] // 2 :]
         output = self.down_proj(activated)
-        if self.tp_size > 1:
-            # Sum the row-parallel partials and scatter the tokens back.
-            output = _sp_reduce_scatter(output, self.tp_group, self.tp_size)
-        return output
+        # Sum the row-parallel partials and scatter the tokens back.
+        return reduce_scatter_first_dim(output, self.tp_group, self.tp_size)
 
 
 def _mxfp4_expert_quantization(config: KimiLinearConfig) -> bool:
@@ -811,7 +792,7 @@ class KimiSparseMoeBlock(nn.Module):
             raise ValueError(
                 f"moe_chunk_max_len ({self.moe_chunk_max_len}) must be >= "
                 f"moe_ep_size ({self.moe_ep_size}), otherwise every per-chunk "
-                f"all-gather would exceed the configured gathered-token budget."
+                f"double routing would exceed the configured token budget."
             )
 
         if self.num_experts % self.moe_ep_size:
@@ -826,7 +807,7 @@ class KimiSparseMoeBlock(nn.Module):
         self.prefill_func = (
             self._moe_mega_w4a8
             if self.enable_mega_moe and self.moe_ep_size > 1
-            else self._moe_ag_w4a8_one_chunk
+            else self.moe_infer_double_routing
         )
         self.local_expert_count = self.num_experts // self.moe_ep_size
         self.local_expert_start = self.moe_ep_rank * self.local_expert_count
@@ -924,7 +905,7 @@ class KimiSparseMoeBlock(nn.Module):
         return moe_output
 
     def _moe_prefill(self, routed_states, topk_idx, topk_weight, moe_ctx):
-        """Prefill EP, MXFP4 experts: AllGather + local experts + ReduceScatter.
+        """Prefill EP, MXFP4 experts: double routing or MegaMoE.
 
         Quantizes the activation to MXFP8 BEFORE routing so x and its per-token
         MX scale route together, and the experts receive that scale rather than
@@ -935,8 +916,8 @@ class KimiSparseMoeBlock(nn.Module):
         When the gathered batch exceeds ``self.moe_chunk_max_len``, the
         pipeline is run in chunks to bound the peak expanded_x and
         finalize-table allocations.  Chunk boundaries are identical on every
-        rank in the EP group, so AllGather / ReduceScatter semantics are
-        preserved and the per-chunk outputs concatenate to the full result.
+        rank in the EP group, so collective ordering is preserved and the
+        per-chunk outputs concatenate to the full result.
         """
         plan = _moe_chunk_plan(
             routed_states.shape[0], self.moe_ep_size, self.moe_chunk_max_len
@@ -946,7 +927,7 @@ class KimiSparseMoeBlock(nn.Module):
 
         # Verify all EP ranks computed the same chunk count
         # An SP-pad imbalance would give this rank a different plan, causing
-        # the per-chunk all-gathers to deadlock with no error.  The MAX-reduce
+        # the per-chunk collectives to deadlock with no error. The MAX-reduce
         # turns that into a clean RuntimeError so the cluster can be reset.
         if self.moe_ep_size > 1:
             plan_len = torch.tensor([len(plan)], dtype=torch.int32,
@@ -980,8 +961,8 @@ class KimiSparseMoeBlock(nn.Module):
         """Run routed experts through the MegaMoE dispatch/compute/combine path.
 
         Dispatch + GMM1 + SiTU + GMM2 + Combine are completed by a single mega_moe
-        operator, replacing the AG -> init_routing -> GMM -> finalize -> RS
-        pipeline used by Prefill and the MC2 dispatch/combine pipeline used by Decode.
+        operator, replacing the double-routing pipeline used by Prefill and the
+        MC2 dispatch/combine pipeline used by Decode.
 
         sym_buffer is allocated once by KimiLinearForCausalLM after communication-domain
         registration, passed through MoEContext, and reused throughout inference.
@@ -1010,65 +991,116 @@ class KimiSparseMoeBlock(nn.Module):
         )
         return y
 
-    def _moe_ag_w4a8_one_chunk(self, routed_states, topk_idx, topk_weight, moe_ctx):
-        """Run one chunk through the AG -> route -> GMM -> finalize -> RS pipeline.
+    def dispatch_double_routing(self, tokens_per_expert, expanded_x, pertoken_scale):
+        """Dispatch expanded tokens and scales to their expert-owner ranks."""
+        group = self.moe_ep_group
+        owner_counts = torch.empty_like(tokens_per_expert)
+        dist.all_to_all_single(owner_counts, tokens_per_expert, group=group)
+        count_matrix = torch.stack((owner_counts, tokens_per_expert), dim=0)
+        count_matrix = count_matrix.view(2, self.moe_ep_size, -1).sum(-1)
+        count_lists = count_matrix.cpu().tolist()
+        output_splits = count_lists[0]
+        input_splits = count_lists[1]
 
-        ``routed_states`` is this rank's token slice of one chunk (a
-        continuous slice of the SP shard, same length on every rank in the EP
-        group).  Returns the same number of tokens as input.
-        """
-        _ = moe_ctx  # unused; kept for the prefill_func callable protocol as a placeholder
+        owner_x = expanded_x.new_empty(sum(output_splits), expanded_x.shape[-1])
+        dist.all_to_all_single(
+            owner_x,
+            expanded_x,
+            output_split_sizes=output_splits,
+            input_split_sizes=input_splits,
+            group=group,
+        )
+        owner_scale = pertoken_scale.new_empty(
+            sum(output_splits), *pertoken_scale.shape[1:]
+        )
+        dist.all_to_all_single(
+            owner_scale,
+            pertoken_scale,
+            output_split_sizes=output_splits,
+            input_split_sizes=input_splits,
+            group=group,
+        )
+        return owner_counts, owner_x, owner_scale, input_splits, output_splits
+
+    def forward_expert(self, owner_x, owner_counts, owner_scale):
+        """Re-route owner inputs, run local experts, then restore source order."""
+        ordered_x, ordered_scale, unsort_idx, local_counts = torch_npu.npu_moe_re_routing(
+            owner_x,
+            owner_counts.view(self.moe_ep_size, -1),
+            per_token_scales=owner_scale,
+        )
+
+        ordered = self.experts(
+            ordered_x,
+            local_counts,
+            group_list_type=1,
+            pertoken_scale=ordered_scale,
+        )
+        owner_output = torch.index_select(
+            ordered, 0, unsort_idx.float().argsort().int()
+        )
+        return owner_output
+
+    def forward_combine_double_routing(
+        self, owner_output, expanded_x, input_splits, output_splits
+    ):
+        """Return expert outputs to the source ranks in expanded-token order."""
+        local_output = owner_output.new_empty(expanded_x.shape)
+        dist.all_to_all_single(
+            local_output,
+            owner_output,
+            output_split_sizes=input_splits,
+            input_split_sizes=output_splits,
+            group=self.moe_ep_group,
+        )
+        return local_output
+
+    def moe_infer_double_routing(
+        self, routed_states, topk_idx, topk_weight, moe_ctx
+    ):
+        """Run one Prefill chunk through the V3.2-style double-routing path."""
+        _ = moe_ctx
         if self.enable_moe_bf16_mode:
             topk_weight = topk_weight.bfloat16()
-        group = self.moe_ep_group
-        local_tokens, h = routed_states.shape
-        total = local_tokens * self.moe_ep_size
-
-        x_q, scale = torch_npu.npu_dynamic_mx_quant(routed_states, dst_type=torch.float8_e4m3fn)
-        x = x_q.new_empty([total, h])
-        dist.all_gather_into_tensor(x, x_q.contiguous(), group=group)
-        s = scale.new_empty([total, *scale.shape[1:]])
-        dist.all_gather_into_tensor(s, scale.contiguous(), group=group)
-        ids_ag = topk_idx.new_empty([total, topk_idx.shape[1]], dtype=torch.int32)
-        dist.all_gather_into_tensor(ids_ag, topk_idx.to(torch.int32), group=group)
-        w_ag = topk_weight.new_empty([total, topk_weight.shape[1]])
-        dist.all_gather_into_tensor(w_ag, topk_weight.contiguous(), group=group)
-
+        local_tokens = routed_states.shape[0]
+        x_q, scale = torch_npu.npu_dynamic_mx_quant(
+            routed_states, dst_type=torch.float8_e4m3fn
+        )
         routing_kwargs = dict(
-            expert_idx=ids_ag,
-            active_num=ids_ag.shape[0] * ids_ag.shape[1],
+            expert_idx=topk_idx.to(torch.int32),
+            active_num=topk_idx.shape[0] * topk_idx.shape[1],
             expert_num=self.num_experts,
             expert_tokens_num_type=1,
             expert_tokens_num_flag=True,
-            active_expert_range=[
-                self.local_expert_start,
-                self.local_expert_start + self.local_expert_count,
-            ],
+            active_expert_range=[0, self.num_experts],
             quant_mode=-1,
         )
         expanded_x, row_idx, tokens_per_expert, _ = torch_npu.npu_moe_init_routing_v2(
-            x.view(torch.bfloat16), **routing_kwargs
+            x_q.view(torch.bfloat16), **routing_kwargs
         )
-        expanded_x = expanded_x.view(x.dtype)
+        expanded_x = expanded_x.view(x_q.dtype)
         exp_scale, _, _, _ = torch_npu.npu_moe_init_routing_v2(
-            s.reshape(total, -1).to(torch.bfloat16), **routing_kwargs
+            scale.reshape(local_tokens, -1).to(torch.bfloat16), **routing_kwargs
         )
         pertoken_scale = exp_scale.to(scale.dtype).view(-1, *scale.shape[1:])
-
-        ordered = self.experts(
-            expanded_x, tokens_per_expert, group_list_type=1,
-            pertoken_scale=pertoken_scale,
+        owner_counts, owner_x, owner_scale, input_splits, output_splits = (
+            self.dispatch_double_routing(
+                tokens_per_expert, expanded_x, pertoken_scale
+            )
+        )
+        owner_output = self.forward_expert(owner_x, owner_counts, owner_scale)
+        local_output = self.forward_combine_double_routing(
+            owner_output, expanded_x, input_splits, output_splits
         )
         hidden = torch_npu.npu_moe_finalize_routing(
-            ordered.float() if not self.enable_moe_bf16_mode else ordered,
+            local_output.float() if not self.enable_moe_bf16_mode else local_output,
             skip1=None, skip2=None, bias=None,
-            scales=w_ag.float() if not self.enable_moe_bf16_mode else w_ag,
-            expanded_src_to_dst_row=row_idx, export_for_source_row=ids_ag,
+            scales=topk_weight.float() if not self.enable_moe_bf16_mode else topk_weight,
+            expanded_src_to_dst_row=row_idx,
+            export_for_source_row=None,
             drop_pad_mode=2,
         )
-        rs = routed_states.new_empty([local_tokens, hidden.shape[1]])
-        dist.reduce_scatter_tensor(rs, hidden.to(routed_states.dtype), group=group)
-        return rs
+        return hidden.to(routed_states.dtype)
 
     def _moe_mc2_decode(self, routed_states, topk_idx, topk_weight):
         """Decode EP via MC2 dispatch/combine.
@@ -1225,9 +1257,6 @@ class KimiShortConvolution(nn.Module):
                 has_initial_state=has_initial_state,
             )
         else:
-            original_shape = x.shape
-            if x.ndim == 3:
-                x = x.view(-1, x.shape[-1])
             y = torch.ops.cann_ops_transformer.causal_conv1d_update(
                 x=x,
                 conv_state=cache,
@@ -1237,8 +1266,6 @@ class KimiShortConvolution(nn.Module):
                 query_start_loc=query_start_loc,
                 num_accepted_tokens=num_accepted_tokens,
             )
-            if len(original_shape) == 3:
-                y = y.view(original_shape)
         return y
 
 
@@ -1261,11 +1288,6 @@ class KimiDeltaAttention(nn.Module):
         # so they are built from total_num_heads; num_heads is this rank's share
         # and drives the forward pass, the convolutions and the state cache.
         self.total_num_heads = linear["num_heads"]
-        if self.total_num_heads % self.attn_tp_size:
-            raise RuntimeError(
-                f"KDA num_heads={self.total_num_heads} must be divisible by "
-                f"attn_tp_size={self.attn_tp_size}"
-            )
         self.num_heads = self.total_num_heads // self.attn_tp_size
         self.attn_tp_group = (
             None
@@ -1405,15 +1427,10 @@ class KimiDeltaAttention(nn.Module):
         self.attn_type = "Mamba"
 
     def _state_block_ids(
-        self, forward_metadata: ForwardMetaData, batch: int, cache_kind: str = "KDAConv"
+        self, forward_metadata: ForwardMetaData, cache_kind: str = "KDAConv"
     ) -> torch.Tensor:
         """Resolve the speculative KDA cache blocks for this step."""
         block_table = forward_metadata["block_table"][cache_kind]
-        if block_table.shape[0] != batch:
-            raise RuntimeError(
-                f"layer {self.layer_idx}: Mamba block_table must cover exactly "
-                f"{batch} requests, got {block_table.shape[0]}"
-            )
         if cache_kind == "KDARecurrent":
             return block_table
         return block_table[:, 0]
@@ -1556,20 +1573,12 @@ class KimiDeltaAttention(nn.Module):
         query_start_loc: Optional[torch.Tensor],
         query_boundaries: Optional[list[int]],
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if self.attn_tp_size > 1:
-            # Prefill reconstructs the token stream; Decode reconstructs the
-            # request batch for attention TP. Decode is DP-TP-DP, not SP. The
-            # global ForwardMetaData already describes this reconstructed input.
-            gathered_states = hidden_states.new_empty(
-                hidden_states.shape[0] * self.attn_tp_size,
-                hidden_states.shape[1],
-            )
-            dist.all_gather_into_tensor(
-                gathered_states,
-                hidden_states.contiguous(),
-                group=self.attn_tp_group,
-            )
-            hidden_states = gathered_states
+        # Prefill reconstructs the token stream; Decode reconstructs the
+        # request batch for attention TP. Decode is DP-TP-DP, not SP. The
+        # global ForwardMetaData already describes this reconstructed input.
+        hidden_states = all_gather_first_dim(
+            hidden_states, self.attn_tp_group, self.attn_tp_size
+        )
         # g_proj needs the gathered hidden, but its output is only the local
         # head shard. Compute it here so forward need not retain the much wider
         # gathered tensor until output projection.
@@ -1586,7 +1595,7 @@ class KimiDeltaAttention(nn.Module):
         else:
             batch = forward_metadata["actual_seq_lengths_q"].shape[0]
         tokens = hidden_states.shape[0]
-        state_ids = self._state_block_ids(forward_metadata, batch, "KDAConv")
+        state_ids = self._state_block_ids(forward_metadata, "KDAConv")
 
         input_states = (
             hidden_states
@@ -1624,7 +1633,7 @@ class KimiDeltaAttention(nn.Module):
                 initial_state, query_boundaries,
             )
             recurrent_state_ids = self._state_block_ids(
-                forward_metadata, batch, "KDARecurrent"
+                forward_metadata, "KDARecurrent"
             )[:, 0]
             self.update_mamba_cache(
                 recurrent_state_ids, state, layer_cache["recurrent_state"]
@@ -1663,13 +1672,6 @@ class KimiDeltaAttention(nn.Module):
         indices = indices.view(-1)
         if values.device != cache.device or values.dtype != cache.dtype:
             values = values.to(device=cache.device, dtype=cache.dtype)
-        if values.shape[0] > indices.numel():
-            values = values[:indices.numel()]
-        elif values.shape[0] != indices.numel():
-            raise RuntimeError(
-                f"Cache row copy expects values first dimension ({values.shape[0]}) "
-                f"to match number of indices ({indices.numel()})."
-            )
         torch_npu.npu_scatter_nd_update_(cache, indices.view(-1, 1), values)
 
     def _decode_fused_kda(
@@ -1765,15 +1767,9 @@ class KimiDeltaAttention(nn.Module):
         gate = gate.view(output.shape)
         output = self.o_norm(output) * torch.sigmoid(gate.float()).to(output.dtype)
         output = self.o_proj(output.view(output.shape[0], -1))
-        if self.attn_tp_size > 1:
-            local_output = output.new_empty(
-                output.shape[0] // self.attn_tp_size, output.shape[1]
-            )
-            dist.reduce_scatter_tensor(
-                local_output, output, group=self.attn_tp_group
-            )
-            output = local_output
-        return output
+        return reduce_scatter_first_dim(
+            output, self.attn_tp_group, self.attn_tp_size
+        )
 
 
 class KimiMLAAttention(nn.Module):
@@ -1793,20 +1789,11 @@ class KimiMLAAttention(nn.Module):
         # so they are built from total_num_heads; num_heads is this rank's share
         # and drives the forward pass and the cache geometry.
         self.total_num_heads = config.num_attention_heads
-        if self.total_num_heads % self.attn_tp_size:
-            raise RuntimeError(
-                f"num_attention_heads={self.total_num_heads} must be divisible by "
-                f"attn_tp_size={self.attn_tp_size}"
-            )
         self.num_heads = self.total_num_heads // self.attn_tp_size
         self.attn_tp_rank = (
             0 if self.attn_tp_size == 1 else comm_manager.get_rank("attn_tp_group")
         )
         quant_config = getattr(config, "quant_config", None)
-        # The decode MLA operator only takes a power-of-two query head count,
-        # which 96 heads never leave, so the absorbed decode rounds up and drops
-        # the padded heads.
-        self.decode_num_heads = 1 << (self.total_num_heads - 1).bit_length()
         self.attn_tp_group = (
             None
             if self.attn_tp_size == 1
@@ -1819,14 +1806,11 @@ class KimiMLAAttention(nn.Module):
         self.qk_nope_head_dim = config.qk_nope_head_dim
         self.qk_rope_head_dim = config.qk_rope_head_dim
         self.v_head_dim = config.v_head_dim
+        self.o_proj_channel_width = (
+            self.total_num_heads * self.v_head_dim // self.attn_tp_size
+        )
         self.q_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         self.scaling = self.q_head_dim ** -0.5
-        # npugraph_ex decode must hand FA host-side List[int] lengths; see
-        # _forward_decode for why the Tensor form breaks dynamo.
-        self.enable_npugraph_ex = (
-            infer_config is not None
-            and infer_config.model_config.exe_mode == "npugraph_ex"
-        )
         if self.q_lora_rank is not None:
             self.q_a_proj = ReplicatedLinear(
                 config.hidden_size,
@@ -1976,20 +1960,10 @@ class KimiMLAAttention(nn.Module):
             self, query: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Split the NoPE query into the two segments consumed by MLA FA."""
-        tokens = query.shape[0]
-        num_heads = query.shape[1]
+        tokens, num_heads = query.shape[:2]
         query_t = query.view(tokens, num_heads, self.q_head_dim)
         query_nope, query_rope = torch.split(query_t, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         return query_nope, query_rope
-
-    def _get_slot_mapping(self, forward_metadata: ForwardMetaData, tokens: int) -> torch.Tensor:
-        slot_mapping = forward_metadata["slot_mapping"][self.attn_type]
-        if slot_mapping.numel() != tokens:
-            raise RuntimeError(
-                f"slot_mapping has {slot_mapping.numel()} entries but this step "
-                f"packs {tokens} tokens"
-            )
-        return slot_mapping
 
     def _forward_prefill(
         self,
@@ -2031,26 +2005,8 @@ class KimiMLAAttention(nn.Module):
         query_nope, query_rope = self._prepare_query_inputs(query)
         block_table = forward_metadata["block_table"][self.attn_type]
 
-        # TND packed layout: q lengths are cumulative, kv lengths are the actual
-        # per-request cache occupancy (PageAttention convention).
-        #
-        # The FA v2 schema types these as SymInt[].  Handing it a device Tensor
-        # makes dynamo insert aten._local_scalar_dense to convert, which is
-        # Unsupported under fullgraph=True -- npugraph_ex then fails at compile
-        # time (eager silently pays a D2H sync instead).  So npugraph_ex decode
-        # takes the host List[int] fields.
-        if self.enable_npugraph_ex:
-            actual_seq_qlen = forward_metadata["actual_seq_lengths_cu_list_q"]
-            actual_seq_kvlen = forward_metadata["actual_seq_lengths_list_kv"]
-            if actual_seq_qlen is None or actual_seq_kvlen is None:
-                raise RuntimeError(
-                    "npugraph_ex decode requires host list length fields, but "
-                    "forward_metadata.actual_seq_lengths_cu_list_q / "
-                    "actual_seq_lengths_list_kv are None"
-                )
-        else:
-            actual_seq_qlen = forward_metadata["actual_seq_lengths_cu_q"]
-            actual_seq_kvlen = forward_metadata["actual_seq_lengths_kv"]
+        actual_seq_qlen = forward_metadata["actual_seq_lengths_cu_list_q"]
+        actual_seq_kvlen = forward_metadata["actual_seq_lengths_list_kv"]
 
         return self._decode_attention(
             query_nope,
@@ -2169,25 +2125,12 @@ class KimiMLAAttention(nn.Module):
         """View the latent blocks in the NZ layout the absorbed FA expects."""
         nope_cache = layer_cache["nope_cache"]
         rope_cache = layer_cache["rope_cache"]
-        blocks, block_size = nope_cache.shape[0], nope_cache.shape[1]
+        blocks, block_size = nope_cache.shape[:2]
         nz = _KV_CACHE_NZ_DIM
         return (
             nope_cache.view(blocks, 1, self.kv_lora_rank // nz, block_size, nz),
             rope_cache.view(blocks, 1, self.qk_rope_head_dim // nz, block_size, nz),
         )
-
-    def _forward_mla_gate(
-            self,
-            main_stream: torch.npu.Stream,
-            hidden_states: torch.Tensor,
-            kv_stream: Optional[torch.npu.Stream] = None
-    ) -> torch.Tensor:
-        with npu_stream_switch(self.enable_multi_streams, kv_stream, exe_mode=self.exe_mode):
-            wait_event(self.enable_multi_streams, self.npu_events_mla_gate, 0, self.exe_mode)
-            gate = torch.sigmoid(self.g_proj(hidden_states).float()).to(hidden_states.dtype)
-            record_event(self.enable_multi_streams, self.npu_events_mla_gate, 1, self.exe_mode)
-        record_stream(self.enable_multi_streams, gate, main_stream, self.exe_mode)
-        return gate
 
     def _forward_kv_attention(
             self,
@@ -2197,7 +2140,7 @@ class KimiMLAAttention(nn.Module):
             layer_cache: dict,
             kv_stream: Optional[torch.npu.Stream] = None,
     ) -> None:
-        slot_mapping = self._get_slot_mapping(forward_metadata, tokens)
+        slot_mapping = forward_metadata["slot_mapping"][self.attn_type]
         record_stream(
             self.enable_multi_streams, slot_mapping, kv_stream, self.exe_mode
         )
@@ -2217,8 +2160,8 @@ class KimiMLAAttention(nn.Module):
             kv_stream: Optional[torch.npu.Stream] = None
     ) -> torch.Tensor:
         is_prefill = forward_metadata["is_prefill"]
-        if is_prefill and self.attn_tp_size > 1:
-            hidden_states = _sp_all_gather(
+        if is_prefill:
+            hidden_states = all_gather_first_dim(
                 hidden_states, self.attn_tp_group, self.attn_tp_size
             )
         tokens = hidden_states.shape[0]
@@ -2250,25 +2193,13 @@ class KimiMLAAttention(nn.Module):
             output = self._forward_decode(
                 query, forward_metadata, layer_cache, kv_stream
             )
-            if self.attn_tp_size > 1:
-                full_output = output.new_empty(
-                    output.shape[0] * self.attn_tp_size, output.shape[1]
-                )
-                dist.all_gather_into_tensor(
-                    full_output, output.contiguous(), group=self.attn_tp_group
-                )
-                local_width = full_output.shape[-1] // self.attn_tp_size
-                output = full_output.narrow(
-                    -1, self.attn_tp_rank * local_width, local_width
-                )
-                full_hidden = hidden_states.new_empty(
-                    hidden_states.shape[0] * self.attn_tp_size,
-                    hidden_states.shape[1],
-                )
-                dist.all_gather_into_tensor(
-                    full_hidden, hidden_states.contiguous(), group=self.attn_tp_group
-                )
-                hidden_states = full_hidden
+            output = dp_to_tp_all_to_all(
+                output,
+                self.attn_tp_group,
+                self.attn_tp_size,
+                forward_metadata["oproj_output_rows"],
+                self.o_proj_channel_width,
+            )
 
         if self.use_output_gate:
             if not is_prefill:
@@ -2281,28 +2212,43 @@ class KimiMLAAttention(nn.Module):
                     0,
                     self.exe_mode,
                 )
-                gate = self._forward_mla_gate(
-                    main_stream, hidden_states, kv_stream
-                )
+                with npu_stream_switch(
+                    self.enable_multi_streams, kv_stream, exe_mode=self.exe_mode
+                ):
+                    wait_event(
+                        self.enable_multi_streams,
+                        self.npu_events_mla_gate,
+                        0,
+                        self.exe_mode,
+                    )
+                    full_hidden = all_gather_first_dim(
+                        hidden_states, self.attn_tp_group, self.attn_tp_size
+                    )
+                    gate = torch.sigmoid(
+                        self.g_proj(full_hidden).float()
+                    ).to(hidden_states.dtype)
+                    record_event(
+                        self.enable_multi_streams,
+                        self.npu_events_mla_gate,
+                        1,
+                        self.exe_mode,
+                    )
                 wait_event(
                     self.enable_multi_streams,
                     self.npu_events_mla_gate,
                     1,
                     self.exe_mode,
                 )
+                record_stream(
+                    self.enable_multi_streams, gate, main_stream, self.exe_mode
+                )
             else:
                 gate = torch.sigmoid(self.g_proj(hidden_states).float()).to(hidden_states.dtype)
             output = output * gate
         output = self.o_proj(output)
-        if self.attn_tp_size > 1:
-            local_output = output.new_empty(
-                output.shape[0] // self.attn_tp_size, output.shape[1]
-            )
-            dist.reduce_scatter_tensor(
-                local_output, output.contiguous(), group=self.attn_tp_group
-            )
-            output = local_output
-        return output
+        return reduce_scatter_first_dim(
+            output, self.attn_tp_group, self.attn_tp_size
+        )
 
 
 def _apply_attn_res(
@@ -2854,8 +2800,7 @@ class KimiLinearModel(nn.Module):
                             attention_input,
                         )
                     )
-        # AttnRes and final norm run on the rank-owned shard. The final gather
-        # restores the full prefill stream or decode request batch for lm_head.
+        # AttnRes and final norm run on the rank-owned shard.
         hidden_states = _apply_attn_res(
             hidden_states,
             block_residual,
@@ -2876,17 +2821,29 @@ class KimiLinearModel(nn.Module):
                 ],
                 dim=-1,
             )
-        if self.attn_tp_size > 1:
-            gathered_states = hidden_states.new_empty(
-                hidden_states.shape[0] * self.attn_tp_size,
-                hidden_states.shape[1],
-            )
-            dist.all_gather_into_tensor(
-                gathered_states,
-                hidden_states.contiguous(),
-                group=self.attn_tp_group,
-            )
-            hidden_states = gathered_states
+        if forward_metadata["is_prefill"]:
+            segment_ends = forward_metadata["segment_end_indices"]
+            if self.attn_tp_size > 1:
+                local_tokens = hidden_states.shape[0]
+                shard_start = self.attn_tp_rank * local_tokens
+                local_mask = (segment_ends >= shard_start) & (
+                    segment_ends < shard_start + local_tokens
+                )
+                local_rows = torch.nonzero(local_mask, as_tuple=False).view(-1)
+                local_indices = segment_ends[local_mask] - shard_start
+                last_hidden = hidden_states.new_zeros(
+                    segment_ends.shape[0], hidden_states.shape[-1]
+                )
+                if local_rows.numel() > 0:
+                    last_hidden.index_copy_(
+                        0,
+                        local_rows,
+                        hidden_states.index_select(0, local_indices),
+                    )
+                dist.all_reduce(last_hidden, group=self.attn_tp_group)
+                hidden_states = last_hidden
+            else:
+                hidden_states = hidden_states.index_select(0, segment_ends)
         return hidden_states, target_hidden_states
 
     def _forward_attn_res(
@@ -3333,26 +3290,47 @@ class KimiLinearForCausalLM(nn.Module):
             query_boundaries=query_boundaries,
         )
         prev_hidden_states = hidden_states
-        if is_prefill:
-            # One logit per request: the last token of each packed segment. The
-            # metadata here is the unpadded one -- the model padded its own
-            # copy -- so a sequence-parallel pad segment drops out.
-            hidden_states = hidden_states.index_select(
-                0, forward_metadata["segment_end_indices"]
-            )
         # The engine samples from [requests, steps, vocab] (execution_engine
         # slices logits[:, -1:, :] on prefill), so the packed layout stops at
         # this boundary. One step per request either way: prefill just reduced
         # to its last token, and decode carries one token per request.
-        batch_size = forward_metadata["actual_seq_lengths_q"].shape[0]
+        batch_size = (
+            forward_metadata["actual_seq_lengths_q"].shape[0]
+            if is_prefill
+            else hidden_states.shape[0]
+            // (self.infer_config.model_config.next_n + 1)
+        )
+        self.temperature = self.infer_config.data_config.temperature
         hidden_states = hidden_states.view(batch_size, -1, hidden_states.shape[-1])
+        if not is_prefill:
+            hidden_states = all_gather_first_dim(
+                hidden_states, self.lmhead_tp_group, self.lmhead_tp_size
+            )
         logits = self.lm_head(hidden_states)
-        if self.lmhead_tp_size > 1:
+        if self.temperature <= 0:
+            token_ids = distributed_argmax(
+                logits,
+                self.lmhead_tp_group,
+                self.lmhead_tp_rank,
+                self.lmhead_tp_size,
+                owner_local=not is_prefill,
+            ).unsqueeze(-1)
+            if self.uses_dspark_draft:
+                return token_ids, {
+                    "prev_hidden_states": prev_hidden_states,
+                    "target_hidden_states": target_hidden_states,
+                }
+            return token_ids
+        if self.lmhead_tp_size > 1 and is_prefill:
             # ColumnParallelLinear gives this rank vocab/lmhead_tp logits; gather
             # the shards across the group and concat back to the full vocab.
             gathered = [torch.empty_like(logits) for _ in range(self.lmhead_tp_size)]
             dist.all_gather(gathered, logits.contiguous(), group=self.lmhead_tp_group)
             logits = torch.cat(gathered, dim=-1)
+        elif self.lmhead_tp_size > 1:
+            logits = vocab_tp_to_owner(
+                logits, self.lmhead_tp_group, self.lmhead_tp_size
+            )
         if self.uses_dspark_draft:
             return logits, {
                 "prev_hidden_states": prev_hidden_states,
@@ -3681,10 +3659,6 @@ class KimiLinearForCausalLM(nn.Module):
             raise RuntimeError(
                 "next_n must be 0 without a draft model and positive for DSpark"
             )
-        if parallel.attn_tp_size not in (1, parallel.world_size):
-            raise RuntimeError(
-                "K3 supports attention TP over the full world only"
-            )
         if parallel.moe_tp_size != 1:
             raise RuntimeError("K3 requires moe_tp_size=1")
         if parallel.shared_tp_size != 1:
@@ -3692,11 +3666,6 @@ class KimiLinearForCausalLM(nn.Module):
                 "K3 sizes the shared expert with dense_tp_size; shared_tp_size must be 1"
             )
         if parallel.dense_tp_size > 1:
-            if parallel.dense_tp_size != parallel.attn_tp_size:
-                raise RuntimeError(
-                    "dense_tp_size must equal attn_tp_size: the dense MLP "
-                    "gathers the token shard attention scattered"
-                )
             shared_width = (
                 0
                 if self.config.num_shared_experts is None
@@ -3717,12 +3686,6 @@ class KimiLinearForCausalLM(nn.Module):
         ):
             if self.config.vocab_size % size:
                 raise RuntimeError(f"vocab_size must be divisible by {label}={size}")
-        if parallel.o_proj_tp_size != parallel.attn_tp_size:
-            raise RuntimeError(
-                "K3 requires o_proj_tp_size=attn_tp_size"
-            )
-        if self.config.num_attention_heads % parallel.attn_tp_size:
-            raise RuntimeError("num_attention_heads must be divisible by attn_tp_size")
         if self.config.num_experts % parallel.moe_ep_size:
             raise RuntimeError("num_experts must be divisible by moe_ep_size")
         block_size = self.infer_config.scheduler_config.block_size
@@ -3731,31 +3694,8 @@ class KimiLinearForCausalLM(nn.Module):
                 f"the NZ latent cache needs block_size divisible by "
                 f"{_KV_CACHE_NZ_DIM}, got {block_size}"
             )
-        if block_size < parallel.attn_tp_size:
-            # The sequence-parallel pad addresses its slots as offsets into the
-            # null block, so it has to fit inside one block: pad_len is at most
-            # attn_tp - 1, and a shorter block would spill into block 1, which
-            # is the first one handed to a real request.
-            raise RuntimeError(
-                f"block_size ({block_size}) must be at least attn_tp_size "
-                f"({parallel.attn_tp_size})"
-            )
         if parallel.moe_ep_size > 1 and not _mxfp4_expert_quantization(self.config):
             raise RuntimeError("MoE expert parallelism requires MXFP4 experts")
-        if parallel.attn_tp_size > 1:
-            decode_batch = self.infer_config.scheduler_config.batch_size_per_dp_rank
-            if decode_batch % parallel.attn_tp_size:
-                raise RuntimeError(
-                    f"decode DP-TP-DP needs batch_size_per_dp_rank={decode_batch} "
-                    f"divisible by attn_tp_size={parallel.attn_tp_size}"
-                )
-            # Prefill token SP and Decode request DP use the same residual shard;
-            # its attention TP and MoE EP groups must therefore contain the same
-            # ranks (attn_tp==ep==world in the supported deployment).
-            if parallel.attn_tp_size != parallel.moe_ep_size:
-                raise RuntimeError(
-                    "parallel residual layout requires attn_tp_size == moe_ep_size"
-                )
 
 
 __all__ = [

@@ -528,6 +528,9 @@ class AttnMetaData:
             "slot_mapping": {"FullAttention": local_slots},
             "mla_owner_token_indices": None,
             "mla_decode_metadata": None,
+            "oproj_output_rows": (
+                self.mla_batch_per_rank * q_len * self.attn_tp_size
+            ),
             "num_accepted_tokens": recurrent_count,
             "conv_num_accepted_tokens": conv_count,
             "ssm_state_indices": ssm_state_indices,

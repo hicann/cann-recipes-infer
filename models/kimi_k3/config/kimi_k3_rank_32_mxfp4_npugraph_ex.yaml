@@ -35,8 +35,8 @@ data_config:
 parallel_config:
   attn_tp_size: 32
   moe_tp_size: 1
-  embed_tp_size: 32
-  lmhead_tp_size: 32
-  dense_tp_size: 32
+  embed_tp_size: 16
+  lmhead_tp_size: 8
+  dense_tp_size: 8
   oproj_tp_size: 32
   cp_size: 1

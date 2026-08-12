@@ -13,10 +13,22 @@ from .attention_data import (
     build_paged_slot_mapping,
     gather_sp_shards_to_owner,
 )
+from .parallel_utils import (
+    all_gather_first_dim,
+    distributed_argmax,
+    dp_to_tp_all_to_all,
+    reduce_scatter_first_dim,
+    vocab_tp_to_owner,
+)
 
 __all__ = [
     "AttnMetaData",
     "CacheData",
     "build_paged_slot_mapping",
     "gather_sp_shards_to_owner",
+    "all_gather_first_dim",
+    "distributed_argmax",
+    "dp_to_tp_all_to_all",
+    "reduce_scatter_first_dim",
+    "vocab_tp_to_owner",
 ]

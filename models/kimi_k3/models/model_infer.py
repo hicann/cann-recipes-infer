@@ -48,6 +48,9 @@ class DSparkAcceptanceStats:
 
 
 class KimiK3Infer:
+    DECODE_STARTUP_SKIP_ROUNDS = 10
+    DECODE_PROFILE_ACTIVE_ROUNDS = 10
+
     def __init__(self, runner_settings: dict, model_runner, draft_model_runner=None):
         self.runner_settings = runner_settings
         self.model_runner = model_runner
@@ -153,11 +156,25 @@ class KimiK3Infer:
             content_ids = content_ids[:-min(overflow, len(content_ids))]
 
     def sample(self, logits: torch.Tensor) -> torch.Tensor:
+        if not logits.is_floating_point():
+            return logits[:, -1, :].to(torch.long)
         logits = logits[:, -1, :]
         if self.temperature <= 0:
             return logits.argmax(dim=-1, keepdim=True)
         probs = torch.softmax(logits / max(self.temperature, 1e-5), dim=-1, dtype=torch.float32)
         return probs.div_(torch.empty_like(probs).exponential_(1)).argmax(dim=-1, keepdim=True)
+
+    def _gather_owner_rows(self, local_rows: torch.Tensor) -> torch.Tensor:
+        """Gather small owner-local control tensors, never logits/probabilities."""
+        if self.attn_tp_size <= 1 or local_rows.shape[0] == self.batch_size:
+            return local_rows
+        gathered = local_rows.new_empty(
+            self.batch_size, *local_rows.shape[1:]
+        )
+        dist.all_gather_into_tensor(
+            gathered, local_rows.contiguous(), group=self.attn_tp_group
+        )
+        return gathered
 
     def _tokenize(self, prompts):
         if len(prompts) != self.batch_size:
@@ -217,8 +234,8 @@ class KimiK3Infer:
         self._decode_profiler_context = self.model_runner.define_profiler(
             enable_profiler=True,
             profile_save_path=self._profile_path("decode"),
-            active=10,
-            skip_first=10,
+            active=self.DECODE_PROFILE_ACTIVE_ROUNDS,
+            skip_first=self.DECODE_STARTUP_SKIP_ROUNDS,
         )
         self._decode_profiler = self._decode_profiler_context.__enter__()
 
@@ -237,6 +254,14 @@ class KimiK3Infer:
     def _step_decode_profiler(self):
         if self._decode_profiler is not None:
             self._decode_profiler.step()
+
+    def _decode_timing_skip_rounds(self):
+        # Profiler skip_first rounds also serve as startup stabilization. Its
+        # active rounds carry instrumentation overhead and are excluded too.
+        skipped = self.DECODE_STARTUP_SKIP_ROUNDS
+        if self.enable_profiler:
+            skipped += self.DECODE_PROFILE_ACTIVE_ROUNDS
+        return skipped
 
     def _run_model(self, model_inputs, is_prefill, warm_up):
         if not is_prefill:
@@ -282,6 +307,7 @@ class KimiK3Infer:
 
     def _post_process(self, input_dict, logits):
         next_tokens = self.sample(logits)
+        next_tokens = self._gather_owner_rows(next_tokens)
         self._append_tokens(input_dict, next_tokens)
         input_dict["input_ids"] = next_tokens.view(-1)
         if input_dict["is_prefill"]:
@@ -321,6 +347,32 @@ class KimiK3Infer:
         cycle_input = self.process_mini_batch_inputs(input_dict, cycle_idx)
         model_inputs = self._model_inputs(cycle_input)
         model_inputs["forward_metadata"]["prefill_cycle_idx"] = cycle_idx
+
+        def run_prefill_cycle():
+            logits, aux, elapsed = self._run_model(
+                model_inputs, is_prefill=True, warm_up=warm_up
+            )
+            if self.uses_dspark:
+                if aux is None or aux.get("target_hidden_states") is None:
+                    raise RuntimeError(
+                        "DSpark requires target hidden states from Main Prefill"
+                    )
+                request_start = cycle_idx * self.mini_batch
+                request_ids = list(
+                    range(request_start, request_start + self.mini_batch)
+                )
+                elapsed += self._route_prefill_target_hidden(
+                    aux["target_hidden_states"],
+                    request_ids,
+                    [
+                        int(input_dict["input_lens"][idx].item())
+                        for idx in request_ids
+                    ],
+                    cycle_idx=cycle_idx,
+                    warm_up=warm_up,
+                )
+            return logits, aux, elapsed
+
         profile_this_cycle = (
             self.enable_profiler
             and not warm_up
@@ -333,14 +385,10 @@ class KimiK3Infer:
                 active=1,
                 skip_first=0,
             ) as profiler:
-                logits, aux, elapsed = self._run_model(
-                    model_inputs, is_prefill=True, warm_up=warm_up
-                )
+                logits, aux, elapsed = run_prefill_cycle()
                 profiler.step()
         else:
-            logits, aux, elapsed = self._run_model(
-                model_inputs, is_prefill=True, warm_up=warm_up
-            )
+            logits, aux, elapsed = run_prefill_cycle()
         next_tokens = self.sample(logits)
         self._append_tokens(
             input_dict,
@@ -380,20 +428,31 @@ class KimiK3Infer:
     def _log_acceptance_stats(
         self, stats: DSparkAcceptanceStats, average_round_time=None
     ):
+        if dist.is_initialized():
+            totals = torch.tensor(
+                [stats.total_accepted_tokens, stats.verify_count],
+                dtype=torch.int64,
+                device=self.device,
+            )
+            dist.all_reduce(totals, group=self.attn_tp_group)
+            total_accepted_tokens, verify_count = totals.tolist()
+        else:
+            total_accepted_tokens = stats.total_accepted_tokens
+            verify_count = stats.verify_count
         fallback_rank = int(os.getenv("LOCAL_RANK", "0")) + int(
             os.getenv("RANK_OFFSET", "0")
         )
         global_rank = int(os.getenv("RANK", os.getenv("RANK_ID", str(fallback_rank))))
         if global_rank != 0:
             return
-        total_spec_tokens = stats.verify_count * self.next_n
+        total_spec_tokens = verify_count * self.next_n
         accept_length = (
-            stats.total_accepted_tokens / stats.verify_count + 1
-            if stats.verify_count
+            total_accepted_tokens / verify_count + 1
+            if verify_count
             else 0.0
         )
         accept_rate = (
-            stats.total_accepted_tokens / total_spec_tokens
+            total_accepted_tokens / total_spec_tokens
             if total_spec_tokens
             else 0.0
         )
@@ -437,21 +496,13 @@ class KimiK3Infer:
             )
 
         decode_steps = min(2, self.max_new_tokens - 1) if warm_up else self.max_new_tokens - 1
-        decode_times = []
         for _ in range(max(decode_steps, 0)):
             decode_inputs = self._model_inputs(input_dict)
-            logits, _, elapsed = self._run_model(decode_inputs, is_prefill=False, warm_up=warm_up)
-            decode_times.append(elapsed)
+            logits, _, _ = self._run_model(decode_inputs, is_prefill=False, warm_up=warm_up)
             self._post_process(input_dict, logits)
             self._step_decode_profiler()
 
         if not warm_up:
-            if decode_times:
-                logging.info(
-                    "%s decode average inference time cost is %.2f ms",
-                    self.model_runner.model_name,
-                    sum(decode_times) / len(decode_times) * 1000,
-                )
             self._log_outputs(input_dict)
         return input_dict
 
@@ -471,8 +522,15 @@ class KimiK3Infer:
         return torch.tensor(active, dtype=torch.bool, device=self.device)
 
     def _route_prefill_target_hidden(
-        self, target_hidden_states, request_ids, input_lens
+        self,
+        target_hidden_states,
+        request_ids,
+        input_lens,
+        cycle_idx,
+        warm_up=False,
     ):
+        torch.npu.synchronize()
+        start = time.time()
         context_states = self.draft_model.prepare_target_hidden_states(
             target_hidden_states
         )
@@ -503,21 +561,49 @@ class KimiK3Infer:
                 positions = torch.arange(
                     input_len, dtype=torch.long, device=self.device
                 ).view(1, -1)
-                self.draft_model.propose(
-                    {
-                        "is_prefill": True,
-                        "target_hidden_positions": positions,
-                        "block_table": self.attn_metadata.mla_block_table[
-                            owner_row : owner_row + 1
-                        ],
-                        "slot_block_table": self.attn_metadata.mla_slot_block_table[
-                            owner_row : owner_row + 1
-                        ],
-                        "cache_data": self._dspark_input["draft_cache_data"],
-                    },
-                    self._dspark_input["input_ids"].new_zeros((1, 1)),
-                    prompt_context.unsqueeze(0),
-                )
+                with torch.no_grad():
+                    self.draft_model.propose(
+                        {
+                            "is_prefill": True,
+                            "target_hidden_positions": positions,
+                            "block_table": self.attn_metadata.mla_block_table[
+                                owner_row : owner_row + 1
+                            ],
+                            "slot_block_table": self.attn_metadata.mla_slot_block_table[
+                                owner_row : owner_row + 1
+                            ],
+                            "cache_data": self._dspark_input["draft_cache_data"],
+                        },
+                        self._dspark_input["input_ids"].new_zeros((1, 1)),
+                        prompt_context.unsqueeze(0),
+                    )
+        torch.npu.synchronize()
+        elapsed = time.time() - start
+        stage = (
+            f"prefill minibatch {cycle_idx}"
+            if self.prefill_cycles > 1
+            else "prefill"
+        )
+        warm_prefix = "[warm up] " if warm_up else ""
+        logging.info(
+            "[DSpark] %s%s [%s] inference time cost %.2f ms",
+            self.draft_model_runner.model_name,
+            warm_prefix,
+            stage,
+            elapsed * 1000,
+        )
+        return elapsed
+
+    @staticmethod
+    def _speculative_round_times(decode_times, draft_times, skip_rounds=0):
+        # The first main-model Decode bootstraps the anchor before DSpark has
+        # proposed anything. A trailing proposal may likewise remain unverified.
+        round_count = min(max(len(decode_times) - 1, 0), len(draft_times))
+        first_round = min(max(skip_rounds, 0), round_count)
+        return (
+            decode_times[first_round + 1 : round_count + 1],
+            draft_times[first_round:round_count],
+        )
 
     def _dspark_propose(
         self, input_dict, anchor_tokens, target_hidden, context_positions, warm_up=False
@@ -554,18 +640,21 @@ class KimiK3Infer:
             elapsed * 1000,
         )
         spec_tokens = proposal["spec_tokens"]
-        draft_probs = torch.softmax(
-            proposal["logits"].float()
-            / (max(self.temperature, 1e-5) if self.temperature > 0 else 1.0),
-            dim=-1,
+        draft_probs = (
+            None
+            if self.temperature <= 0
+            else torch.softmax(
+                proposal["logits"].float() / max(self.temperature, 1e-5), dim=-1
+            )
         )
-        for request_idx in range(self.batch_size):
+        for local_idx in range(self.local_batch):
             eos_seen = False
             for draft_idx in range(self.next_n):
                 if eos_seen:
-                    spec_tokens[request_idx, draft_idx] = self.pad_token_id
-                    draft_probs[request_idx, draft_idx].zero_()
-                elif int(spec_tokens[request_idx, draft_idx].item()) in self.eos_ids:
+                    spec_tokens[local_idx, draft_idx] = self.pad_token_id
+                    if draft_probs is not None:
+                        draft_probs[local_idx, draft_idx].zero_()
+                elif int(spec_tokens[local_idx, draft_idx].item()) in self.eos_ids:
                     eos_seen = True
         return spec_tokens, draft_probs, elapsed
 
@@ -585,17 +674,29 @@ class KimiK3Infer:
         draft_probs,
         acceptance_stats=None,
     ):
-        target_probs = torch.softmax(
-            target_logits.float()
-            / (max(self.temperature, 1e-5) if self.temperature > 0 else 1.0),
-            dim=-1,
+        target_probs = (
+            None
+            if self.temperature <= 0
+            else torch.softmax(
+                target_logits.float() / max(self.temperature, 1e-5), dim=-1
+            )
         )
         active = input_dict["active_mask"]
-        counts = torch.ones(self.batch_size, dtype=torch.int32, device=self.device)
-        anchors = target_logits.new_full(
-            (self.batch_size, 1), self.pad_token_id, dtype=torch.long
+        local_counts = torch.ones(
+            self.local_batch, dtype=torch.int32, device=self.device
         )
-        for request_idx in range(self.batch_size):
+        local_anchors = target_logits.new_full(
+            (self.local_batch, 1), self.pad_token_id, dtype=torch.long
+        )
+        committed_tokens = target_logits.new_full(
+            (self.local_batch, self.next_n + 1),
+            self.pad_token_id,
+            dtype=torch.long,
+        )
+        committed_lengths = local_counts.new_zeros(self.local_batch)
+        local_start = self.attn_tp_rank * self.local_batch
+        for local_idx in range(self.local_batch):
+            request_idx = local_start + local_idx
             if not bool(active[request_idx].item()):
                 continue
             remaining = self.max_new_tokens - self._generated_count(input_dict, request_idx)
@@ -604,12 +705,13 @@ class KimiK3Infer:
             accepted_drafts = 0
             stopped = False
             for draft_idx in range(max_drafts):
-                token = int(spec_tokens[request_idx, draft_idx].item())
-                target = target_probs[request_idx, draft_idx]
+                token = int(spec_tokens[local_idx, draft_idx].item())
                 if self.temperature <= 0:
-                    accepted = token == int(target.argmax().item())
+                    target_token = int(target_logits[local_idx, draft_idx, 0].item())
+                    accepted = token == target_token
                 else:
-                    draft_p = float(draft_probs[request_idx, draft_idx, token].item())
+                    target = target_probs[local_idx, draft_idx]
+                    draft_p = float(draft_probs[local_idx, draft_idx, token].item())
                     target_p = float(target[token].item())
                     ratio = min(1.0, target_p / max(draft_p, 1e-12))
                     accepted = float(torch.rand((), device=self.device).item()) < ratio
@@ -621,11 +723,11 @@ class KimiK3Infer:
                         break
                     continue
                 if self.temperature <= 0:
-                    committed.append(int(target.argmax().item()))
+                    committed.append(target_token)
                     stopped = True
                     break
                 replacement_probs = torch.clamp(
-                    target - draft_probs[request_idx, draft_idx], min=0
+                    target - draft_probs[local_idx, draft_idx], min=0
                 )
                 if float(replacement_probs.sum().item()) <= 0:
                     replacement_probs = target
@@ -636,22 +738,39 @@ class KimiK3Infer:
             if acceptance_stats is not None:
                 acceptance_stats.total_accepted_tokens += accepted_drafts
                 acceptance_stats.verify_count += 1
-            counts[request_idx] = accepted_drafts + 1
+            local_counts[local_idx] = accepted_drafts + 1
             if not stopped and remaining > len(committed):
-                bonus = self._sample_distribution(
-                    target_probs[request_idx, accepted_drafts]
+                bonus = (
+                    int(target_logits[local_idx, accepted_drafts, 0].item())
+                    if self.temperature <= 0
+                    else self._sample_distribution(
+                        target_probs[local_idx, accepted_drafts]
+                    )
                 )
                 committed.append(bonus)
             if committed:
                 token_tensor = torch.tensor(
                     committed, dtype=torch.long, device=self.device
                 )
-                input_dict["generate_ids"][request_idx] = torch.cat(
-                    (input_dict["generate_ids"][request_idx], token_tensor)
-                )
-                anchors[request_idx, 0] = token_tensor[-1]
+                committed_tokens[local_idx, : token_tensor.numel()] = token_tensor
+                committed_lengths[local_idx] = token_tensor.numel()
+                local_anchors[local_idx, 0] = token_tensor[-1]
             else:
-                anchors[request_idx, 0] = input_dict["generate_ids"][request_idx][-1]
+                local_anchors[local_idx, 0] = input_dict["generate_ids"][request_idx][-1]
+
+        anchors = self._gather_owner_rows(local_anchors)
+        counts = self._gather_owner_rows(local_counts)
+        all_tokens = self._gather_owner_rows(committed_tokens)
+        all_lengths = self._gather_owner_rows(committed_lengths)
+        for request_idx in range(self.batch_size):
+            length = int(all_lengths[request_idx].item())
+            if length:
+                input_dict["generate_ids"][request_idx] = torch.cat(
+                    (
+                        input_dict["generate_ids"][request_idx],
+                        all_tokens[request_idx, :length],
+                    )
+                )
         return anchors, counts
 
     def _committed_context(self, input_dict, target_hidden, counts, old_kv_len):
@@ -696,21 +815,21 @@ class KimiK3Infer:
         cycle_next_tokens = []
         prefill_times = []
         for cycle_idx in range(self.prefill_cycles):
-            next_tokens, aux, elapsed = self.prefill_infer_single_cycle(
+            next_tokens, _, elapsed = self.prefill_infer_single_cycle(
                 input_dict, cycle_idx, warm_up=warm_up
-            )
-            if aux is None or aux.get("target_hidden_states") is None:
-                raise RuntimeError("DSpark requires target hidden states from Main Prefill")
-            request_start = cycle_idx * self.mini_batch
-            request_ids = list(range(request_start, request_start + self.mini_batch))
-            self._route_prefill_target_hidden(
-                aux["target_hidden_states"],
-                request_ids,
-                [int(input_dict["input_lens"][idx].item()) for idx in request_ids],
             )
             cycle_next_tokens.append(next_tokens)
             prefill_times.append(elapsed)
         self.merge_multi_cycle_res(input_dict, cycle_next_tokens)
+
+        if not warm_up and prefill_times:
+            logging.info(
+                "%s and DSpark prefill average inference time cost is %.2f ms "
+                "over %d cycle(s)",
+                self.model_runner.model_name,
+                sum(prefill_times) / len(prefill_times) * 1000,
+                self.prefill_cycles,
+            )
         input_dict["num_accepted_tokens"] = torch.ones(
             self.batch_size, dtype=torch.int32, device=self.device
         )
@@ -740,6 +859,7 @@ class KimiK3Infer:
         )
         decode_times = [elapsed]
         sampled_anchors = self.sample(logits[:, :1])
+        sampled_anchors = self._gather_owner_rows(sampled_anchors)
         anchors = sampled_anchors.new_full(
             sampled_anchors.shape, self.pad_token_id
         )
@@ -784,7 +904,9 @@ class KimiK3Infer:
             )
             if not bool(input_dict["active_mask"].any().item()):
                 break
-            verify_inputs = torch.cat((anchors, state.spec_tokens), dim=1)
+            verify_inputs = torch.cat(
+                (anchors, self._gather_owner_rows(state.spec_tokens)), dim=1
+            )
             verify_inputs[~input_dict["active_mask"]] = self.pad_token_id
             input_dict["input_ids"] = verify_inputs
             input_dict["num_accepted_tokens"] = state.num_accepted_tokens
@@ -828,30 +950,35 @@ class KimiK3Infer:
             draft_times.append(elapsed)
 
         if not warm_up:
-            if prefill_times:
-                logging.info(
-                    "%s prefill average inference time cost is %.2f ms over %d cycle(s)",
-                    self.model_runner.model_name,
-                    sum(prefill_times) / len(prefill_times) * 1000,
-                    self.prefill_cycles,
-                )
-            if decode_times:
+            skipped_rounds = self._decode_timing_skip_rounds()
+            verify_round_times, draft_round_times = self._speculative_round_times(
+                decode_times, draft_times, skip_rounds=skipped_rounds
+            )
+            if verify_round_times:
                 logging.info(
                     "[Verify] %s model average inference time cost is %.2f ms",
                     self.model_runner.model_name,
-                    sum(decode_times) / len(decode_times) * 1000,
+                    sum(verify_round_times) / len(verify_round_times) * 1000,
                 )
-            if draft_times:
+            if draft_round_times:
                 logging.info(
                     "[DSpark] %s model average inference time cost is %.2f ms",
                     self.draft_model_runner.model_name,
-                    sum(draft_times) / len(draft_times) * 1000,
+                    sum(draft_round_times) / len(draft_round_times) * 1000,
                 )
             average_round_time = (
-                (sum(decode_times) + sum(draft_times)) / len(decode_times)
-                if decode_times
+                (sum(verify_round_times) + sum(draft_round_times))
+                / len(verify_round_times)
+                if verify_round_times
                 else None
             )
+            if average_round_time is not None:
+                logging.info(
+                    "%s main and DSpark model average inference time cost is "
+                    "%.2f ms",
+                    self.model_runner.model_name,
+                    average_round_time * 1000,
+                )
             self._log_acceptance_stats(acceptance_stats, average_round_time)
             self._log_outputs(input_dict)
         return input_dict

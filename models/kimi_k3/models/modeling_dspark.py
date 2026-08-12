@@ -35,7 +35,13 @@ from transformers.utils import logging
 
 from executor.model_loader.weight_utils import default_weight_loader
 from .modeling_kimi_k3 import _offline_infer_config
-from .modules import build_paged_slot_mapping
+from .modules import (
+    all_gather_first_dim,
+    build_paged_slot_mapping,
+    distributed_argmax,
+    reduce_scatter_first_dim,
+    vocab_tp_to_owner,
+)
 from module.linear import (
     ColumnParallelLinear,
     ReplicatedLinear,
@@ -48,6 +54,9 @@ logger = logging.get_logger(__name__)
 InferenceConfig = object
 CommManager = object
 
+_DSPARK_TP_SIZE = 8
+_DSPARK_TP_GROUP = "dspark_tp_group"
+
 
 def _max_dspark_seq_len(infer_config: InferenceConfig) -> int:
     return (
@@ -55,22 +64,6 @@ def _max_dspark_seq_len(infer_config: InferenceConfig) -> int:
         + infer_config.data_config.max_new_tokens
         + infer_config.model_config.next_n
     )
-
-
-def _all_gather_last_dim(tensor: torch.Tensor, group, size: int) -> torch.Tensor:
-    if size <= 1:
-        return tensor
-    shards = [torch.empty_like(tensor) for _ in range(size)]
-    dist.all_gather(shards, tensor.contiguous(), group=group)
-    return torch.cat(shards, dim=-1)
-
-
-def _all_gather_first_dim(tensor: torch.Tensor, group, size: int) -> torch.Tensor:
-    if size <= 1:
-        return tensor
-    gathered = tensor.new_empty(tensor.shape[0] * size, *tensor.shape[1:])
-    dist.all_gather_into_tensor(gathered, tensor.contiguous(), group=group)
-    return gathered
 
 
 class K3DSparkRMSNorm(nn.Module):
@@ -214,13 +207,9 @@ class K3DSparkMLP(nn.Module):
         prefix: str,
     ):
         super().__init__()
-        self.tp_size = infer_config.parallel_config.dense_tp_size
-        self.tp_rank = (
-            comm_manager.get_rank("dense_tp_group") if self.tp_size > 1 else 0
-        )
-        self.tp_group = (
-            comm_manager.get_group("dense_tp_group") if self.tp_size > 1 else None
-        )
+        self.tp_size = _DSPARK_TP_SIZE
+        self.tp_rank = comm_manager.get_rank(_DSPARK_TP_GROUP)
+        self.tp_group = comm_manager.get_group(_DSPARK_TP_GROUP)
         common = dict(
             bias=False,
             tp_size=self.tp_size,
@@ -253,12 +242,17 @@ class K3DSparkMLP(nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # Gather the DP request shards only for the TP8 MLP, then scatter the
+        # row-parallel partial sum back to the original request owners.
+        hidden_states = all_gather_first_dim(
+            hidden_states, self.tp_group, self.tp_size
+        )
         hidden_states = self.down_proj(
             F.silu(self.gate_proj(hidden_states)) * self.up_proj(hidden_states)
         )
-        if self.tp_size > 1:
-            dist.all_reduce(hidden_states, group=self.tp_group)
-        return hidden_states
+        return reduce_scatter_first_dim(
+            hidden_states, self.tp_group, self.tp_size
+        )
 
 
 class K3DSparkAttention(nn.Module):
@@ -276,13 +270,6 @@ class K3DSparkAttention(nn.Module):
         self.total_num_heads = int(config.num_attention_heads)
         self.num_kv_heads = int(config.num_key_value_heads)
         self.head_dim = int(config.head_dim)
-        self.tp_size = int(infer_config.parallel_config.attn_tp_size)
-        self.tp_rank = (
-            comm_manager.get_rank("attn_tp_group") if self.tp_size > 1 else 0
-        )
-        self.tp_group = (
-            comm_manager.get_group("attn_tp_group") if self.tp_size > 1 else None
-        )
         self.block_size = int(infer_config.scheduler_config.block_size)
         self.softmax_scale = self.head_dim ** -0.5
         common = dict(
@@ -310,13 +297,10 @@ class K3DSparkAttention(nn.Module):
             prefix=f"{prefix}.v_proj",
             **common,
         )
-        self.o_proj = RowParallelLinear(
+        self.o_proj = ReplicatedLinear(
             self.total_num_heads * self.head_dim,
             self.hidden_size,
             bias=False,
-            tp_size=self.tp_size,
-            tp_rank=self.tp_rank,
-            input_is_parallel=True,
             params_dtype=torch.bfloat16,
             quant_config=None,
             prefix=f"{prefix}.o_proj",
@@ -424,12 +408,7 @@ class K3DSparkAttention(nn.Module):
         layer_cache: Dict[str, torch.Tensor],
     ) -> torch.Tensor:
 
-        batch_size, draft_len = hidden_states.shape[:2]
-        local_batch = context_states.shape[0]
-        request_start = self.tp_rank * local_batch
-        request_end = request_start + local_batch
-        request_slice = slice(request_start, request_end)
-        hidden_states = hidden_states[request_slice]
+        local_batch, draft_len = hidden_states.shape[:2]
         query, draft_key, draft_value = self._project_noise_qkv(
             hidden_states, draft_cos_sin
         )
@@ -483,20 +462,9 @@ class K3DSparkAttention(nn.Module):
         output = attn_output.reshape(
             local_batch, draft_len, self.total_num_heads * self.head_dim
         )
-        if self.tp_size > 1:
-            gathered_output = output.new_empty(
-                batch_size, draft_len, output.shape[-1]
-            )
-            dist.all_gather_into_tensor(
-                gathered_output, output.contiguous(), group=self.tp_group
-            )
-            local_width = gathered_output.shape[-1] // self.tp_size
-            output = gathered_output.narrow(
-                -1, self.tp_rank * local_width, local_width
-            )
+        # FIA returns all heads for this rank's owner-local requests. Project
+        # locally and keep the request-DP shard between decoder submodules.
         output = self.o_proj(output)
-        if self.tp_size > 1:
-            dist.all_reduce(output, group=self.tp_group)
         return output
 
 
@@ -609,14 +577,18 @@ class K3DSparkModel(nn.Module):
         self.rotary_emb = K3DSparkRotaryEmbedding(config, self.max_cache_len)
 
     def embed(self, input_ids: torch.Tensor) -> torch.Tensor:
-        if self.embed_tp_size <= 1:
-            return self.embed_tokens(input_ids)
+        # The checkpoint has no draft embedding, so this boundary must use the
+        # shared target TP group while returning a request-DP shard.
+        input_ids = all_gather_first_dim(
+            input_ids, self.embed_tp_group, self.embed_tp_size
+        )
         vocab_per_rank = self.config.vocab_size // self.embed_tp_size
         local_ids = input_ids - self.embed_tp_rank * vocab_per_rank
         mask = (local_ids >= 0) & (local_ids < vocab_per_rank)
         hidden_states = self.embed_tokens(local_ids * mask) * mask.unsqueeze(-1)
-        dist.all_reduce(hidden_states, group=self.embed_tp_group)
-        return hidden_states
+        return reduce_scatter_first_dim(
+            hidden_states, self.embed_tp_group, self.embed_tp_size
+        )
 
     def forward(
         self,
@@ -690,61 +662,49 @@ class K3DSparkMarkovHead(nn.Module):
     ):
         super().__init__()
         self.vocab_size = config.vocab_size
-        self.embed_tp_size = infer_config.parallel_config.embed_tp_size
-        self.lmhead_tp_size = infer_config.parallel_config.lmhead_tp_size
-        self.embed_tp_rank = (
-            comm_manager.get_rank("embed_tp_group")
-            if self.embed_tp_size > 1
-            else 0
-        )
-        self.lmhead_tp_rank = (
-            comm_manager.get_rank("lmhead_tp_group")
-            if self.lmhead_tp_size > 1
-            else 0
-        )
-        self.embed_tp_group = (
-            comm_manager.get_group("embed_tp_group")
-            if self.embed_tp_size > 1
-            else None
-        )
-        self.lmhead_tp_group = (
-            comm_manager.get_group("lmhead_tp_group")
-            if self.lmhead_tp_size > 1
-            else None
-        )
+        self.tp_size = _DSPARK_TP_SIZE
+        self.tp_rank = comm_manager.get_rank(_DSPARK_TP_GROUP)
+        self.tp_group = comm_manager.get_group(_DSPARK_TP_GROUP)
         self.markov_w1 = VocabParallelEmbedding(
             self.vocab_size,
             config.markov_rank,
             config.pad_token_id,
             torch.bfloat16,
-            tp_size=self.embed_tp_size,
-            tp_rank=self.embed_tp_rank,
+            tp_size=self.tp_size,
+            tp_rank=self.tp_rank,
         )
         self.markov_w2 = ColumnParallelLinear(
             config.markov_rank,
             self.vocab_size,
             bias=False,
-            tp_size=self.lmhead_tp_size,
-            tp_rank=self.lmhead_tp_rank,
+            tp_size=self.tp_size,
+            tp_rank=self.tp_rank,
             params_dtype=torch.bfloat16,
             quant_config=None,
             prefix=f"{prefix}.markov_w2",
         )
 
     def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
-        if self.embed_tp_size > 1:
-            vocab_per_rank = self.vocab_size // self.embed_tp_size
-            local_ids = token_ids - self.embed_tp_rank * vocab_per_rank
-            mask = (local_ids >= 0) & (local_ids < vocab_per_rank)
-            markov_embed = self.markov_w1(local_ids * mask) * mask.unsqueeze(-1)
-            dist.all_reduce(markov_embed, group=self.embed_tp_group)
-        else:
-            markov_embed = self.markov_w1(token_ids)
+        token_ids = all_gather_first_dim(token_ids, self.tp_group, self.tp_size)
+        vocab_per_rank = self.vocab_size // self.tp_size
+        local_ids = token_ids - self.tp_rank * vocab_per_rank
+        mask = (local_ids >= 0) & (local_ids < vocab_per_rank)
+        markov_embed = self.markov_w1(local_ids * mask) * mask.unsqueeze(-1)
+        dist.all_reduce(markov_embed, group=self.tp_group)
         logits = self.markov_w2(markov_embed)
-        logits = _all_gather_last_dim(
-            logits, self.lmhead_tp_group, self.lmhead_tp_size
+        logits = vocab_tp_to_owner(
+            logits, self.tp_group, self.tp_size
         )
         return logits
+
+    def forward_shard(self, token_ids: torch.Tensor) -> torch.Tensor:
+        token_ids = all_gather_first_dim(token_ids, self.tp_group, self.tp_size)
+        vocab_per_rank = self.vocab_size // self.tp_size
+        local_ids = token_ids - self.tp_rank * vocab_per_rank
+        mask = (local_ids >= 0) & (local_ids < vocab_per_rank)
+        markov_embed = self.markov_w1(local_ids * mask) * mask.unsqueeze(-1)
+        dist.all_reduce(markov_embed, group=self.tp_group)
+        return self.markov_w2(markov_embed)
 
 
 class K3DSparkForCausalLM(nn.Module):
@@ -769,8 +729,24 @@ class K3DSparkForCausalLM(nn.Module):
         self.runner_settings = runner_settings
         self.infer_config = infer_config
         self.comm_manager = comm_manager
+        world_size = int(infer_config.parallel_config.world_size)
+        if world_size % _DSPARK_TP_SIZE:
+            raise RuntimeError(
+                f"DSpark world_size={world_size} must be divisible by "
+                f"tp_size={_DSPARK_TP_SIZE}"
+            )
+        if comm_manager is None:
+            raise RuntimeError("DSpark TP8 requires a communication manager")
+        comm_manager.register_group(
+            name=_DSPARK_TP_GROUP,
+            group_num=world_size // _DSPARK_TP_SIZE,
+            group_size=_DSPARK_TP_SIZE,
+        )
+        self.dspark_tp_size = _DSPARK_TP_SIZE
+        self.dspark_tp_rank = comm_manager.get_rank(_DSPARK_TP_GROUP)
+        self.dspark_tp_group = comm_manager.get_group(_DSPARK_TP_GROUP)
         # DSpark receives target hidden states through the target model's
-        # attention-TP shard and restores the request axis before packing.
+        # attention-TP request-DP shard and keeps that ownership internally.
         self.attn_tp_size = infer_config.parallel_config.attn_tp_size
         self.attn_tp_group = (
             comm_manager.get_group("attn_tp_group")
@@ -828,16 +804,25 @@ class K3DSparkForCausalLM(nn.Module):
             raise RuntimeError("DSpark GQA head counts and head_dim must be positive")
         if num_heads % num_kv_heads:
             raise RuntimeError("num_attention_heads must be divisible by num_key_value_heads")
-        if (num_heads * head_dim) % int(parallel.attn_tp_size):
-            raise RuntimeError("DSpark attention width must be divisible by attn_tp_size")
-        if int(parallel.dense_tp_size) != int(parallel.attn_tp_size):
-            raise RuntimeError("dense_tp_size must equal attn_tp_size for DSpark")
-        if self.config.intermediate_size % parallel.dense_tp_size:
-            raise RuntimeError("intermediate_size must be divisible by dense_tp_size")
+        if self.config.intermediate_size % self.dspark_tp_size:
+            raise RuntimeError("intermediate_size must be divisible by DSpark tp_size")
+        if self.config.vocab_size % self.dspark_tp_size:
+            raise RuntimeError("vocab_size must be divisible by DSpark tp_size")
         if self.config.vocab_size % parallel.embed_tp_size:
             raise RuntimeError("vocab_size must be divisible by embed_tp_size")
         if self.config.vocab_size % parallel.lmhead_tp_size:
             raise RuntimeError("vocab_size must be divisible by lmhead_tp_size")
+        decode_batch_size = int(
+            self.infer_config.scheduler_config.batch_size_per_dp_rank
+        )
+        if decode_batch_size % int(parallel.attn_tp_size):
+            raise RuntimeError(
+                "decode batch size must be divisible by target attn_tp_size"
+            )
+        if decode_batch_size % self.dspark_tp_size:
+            raise RuntimeError(
+                "decode batch size must be divisible by DSpark tp_size"
+            )
         if self.config.num_hidden_layers <= 0:
             raise RuntimeError("DSpark requires a positive layer count")
         if bool(getattr(self.config, "attention_bias", False)):
@@ -860,7 +845,7 @@ class K3DSparkForCausalLM(nn.Module):
         if self.lm_head is None:
             raise RuntimeError("DSpark lm_head has not been shared from the target model")
         logits = self.lm_head(hidden_states)
-        return _all_gather_last_dim(
+        return vocab_tp_to_owner(
             logits, self.lmhead_tp_group, self.lmhead_tp_size
         )
 
@@ -896,12 +881,9 @@ class K3DSparkForCausalLM(nn.Module):
         sample_noise: Optional[torch.Tensor] = None,
     ):
         main_next_tokens = main_next_tokens[:, 0]
-        main_next_tokens = _all_gather_first_dim(
-            main_next_tokens, self.attn_tp_group, self.attn_tp_size
-        )
-        batch_size = main_next_tokens.shape[0]
+        local_batch = main_next_tokens.shape[0]
         draft_input_ids = main_next_tokens.new_full(
-            (batch_size, self.next_n), self.mask_token_id
+            (local_batch, self.next_n), self.mask_token_id
         )
         draft_input_ids[:, 0] = main_next_tokens
 
@@ -917,18 +899,36 @@ class K3DSparkForCausalLM(nn.Module):
             actual_seq_kvlen,
             cache_data,
         )
-        logits = self._full_vocab_logits(lm_hidden).float()
+        lm_hidden = all_gather_first_dim(
+            lm_hidden, self.lmhead_tp_group, self.lmhead_tp_size
+        )
+        if self.temperature <= 0:
+            logits = self.lm_head(lm_hidden).float()
+        else:
+            logits = self._full_vocab_logits(lm_hidden).float()
+        batch_size = main_next_tokens.shape[0]
         output_ids = main_next_tokens.new_empty(batch_size, self.next_n + 1)
         output_ids[:, 0] = main_next_tokens
         for step in range(self.next_n):
-            markov_bias = self.markov_head(output_ids[:, step])
-            logits[:, step].add_(markov_bias.float())
-            noise = None if sample_noise is None else sample_noise[:, step]
-            output_ids[:, step + 1] = self.sample(logits[:, step], noise)
+            if self.temperature <= 0:
+                markov_bias = self.markov_head.forward_shard(output_ids[:, step])
+                step_logits = logits[:, step] + markov_bias.float()
+                output_ids[:, step + 1] = distributed_argmax(
+                    step_logits,
+                    self.dspark_tp_group,
+                    self.dspark_tp_rank,
+                    self.dspark_tp_size,
+                    owner_local=True,
+                )
+            else:
+                markov_bias = self.markov_head(output_ids[:, step])
+                logits[:, step].add_(markov_bias.float())
+                noise = None if sample_noise is None else sample_noise[:, step]
+                output_ids[:, step + 1] = self.sample(logits[:, step], noise)
 
         return (
             output_ids[:, 1:],
-            logits,
+            output_ids[:, 1:].unsqueeze(-1) if self.temperature <= 0 else logits,
             cached_len + self.next_n,
             cached_len,
         )
@@ -1001,7 +1001,7 @@ class K3DSparkForCausalLM(nn.Module):
         sample_noise = None
         if self.temperature > 0:
             sample_noise = torch.empty(
-                decode_batch_size,
+                local_batch,
                 self.next_n,
                 self.config.vocab_size,
                 device=target_hidden_states.device,
