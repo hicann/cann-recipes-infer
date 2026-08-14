@@ -695,7 +695,6 @@ class Attention(nn.Module):
         # enable_global_multi_streams: global multistream, to wait for attention kernel metadata
         self.enable_global_multi_streams = \
             self.infer_config.model_config.custom_params.get("enable_multi_streams", False)
-        self.enable_npugraph_ex = self.infer_config.model_config.exe_mode == "npugraph_ex"
         # enable_multi_streams: multistream within current class
         self.enable_multi_streams = self.enable_global_multi_streams and not self.enable_pypto
         self.platform_version = self.infer_config.model_config.platform_version
@@ -1280,7 +1279,7 @@ class Attention(nn.Module):
     ):
         cos_sin = attn_metadata["cos_sin"]
         cos, sin = cos_sin["c1a"] if self.compress_ratio == 1 else cos_sin["comp"]
-        enable_multi_streams = self.enable_multi_streams and self.enable_npugraph_ex
+        enable_multi_streams = self.enable_multi_streams
         enable_limit_core = self.enable_limit_core and not is_prefill
 
         kv_aic_num = self.total_aic_num // 2 # half of total corenums to support parallelism with q_b qbmm
@@ -2217,9 +2216,6 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
         dynamo_feat = enable_cache_compile or enable_superkernel
         if exe_mode == "eager" and dynamo_feat:
             raise ValueError(f"{exe_mode=} does not support cache compile or superkernel!")
-        if exe_mode == "eager" and enable_multi_streams:
-            logger.info(
-                "When using eager execution mode, enable-multi-streams only takes effect during the prefill phase.")
         if enable_limit_core and not enable_multi_streams:
             raise ValueError(f"{enable_limit_core=} only if enable_multi_streams!")
         if enable_limit_core and platform_version != PlatformVersion.A3:
