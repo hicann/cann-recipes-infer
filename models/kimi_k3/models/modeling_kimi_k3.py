@@ -52,10 +52,6 @@ from module.linear import (
 from module.quantization import QuantizeMethodBase
 from module.quantization.mxfp4 import W4A8MxFp4MoEGMMMethod
 from module.quantization.utils.quant_utils import reshape_mx_scale
-from ops.cannbot_dsl import (
-    block_attn_res_prepare as _block_attn_res_prepare_impl,
-    block_attn_res_update as _block_attn_res_update_impl,
-)
 
 from .configuration_kimi_k3 import KimiLinearConfig
 from .modules import (
@@ -72,9 +68,16 @@ try:
     from ops.cannbot_dsl.fused_recurrent_kda import (
         fused_recurrent_kda_op as _recurrent_kda_impl,
     )
+    from ops.cannbot_dsl import (
+        block_attn_res_prepare as _block_attn_res_prepare_impl,
+        block_attn_res_update as _block_attn_res_update_impl,
+    )
+
 except ImportError:
     _flash_kda_impl = None
     _recurrent_kda_impl = None
+    _block_attn_res_prepare_impl = None
+    _block_attn_res_update_impl = None
 
 logger = logging.getLogger(__name__)
 
@@ -985,9 +988,11 @@ class KimiSparseMoeBlock(nn.Module):
             weight1_type=torch_npu.float4_e2m1fn_x2,
             weight2_type=torch_npu.float4_e2m1fn_x2,
             sym_buffer=sym_buf,
-            activation="situ",
-            activation_beta=self.experts.situ.beta,
-            activation_alpha=self.experts.situ.linear_beta
+            activation="situglu",
+            activation_params={
+                "beta": self.experts.situ.beta,
+                "linear_beta": self.experts.situ.linear_beta,
+            },
         )
         return y
 
@@ -1257,6 +1262,11 @@ class KimiShortConvolution(nn.Module):
                 has_initial_state=has_initial_state,
             )
         else:
+            q_len = x.shape[1] if x.dim() == 3 else 1
+            flatten_decode = q_len > 1
+            original_shape = x.shape if flatten_decode else None
+            if flatten_decode:
+                x = x.view(-1, x.shape[-1])
             y = torch.ops.cann_ops_transformer.causal_conv1d_update(
                 x=x,
                 conv_state=cache,
@@ -1266,6 +1276,8 @@ class KimiShortConvolution(nn.Module):
                 query_start_loc=query_start_loc,
                 num_accepted_tokens=num_accepted_tokens,
             )
+            if flatten_decode:
+                y = y.view(original_shape)
         return y
 
 
@@ -3112,6 +3124,7 @@ class KimiLinearForCausalLM(nn.Module):
         self.block_size = self.infer_config.scheduler_config.block_size
         self.attn_metadata = AttnMetaData(config, runner_settings)
         self.exe_mode = self.infer_config.model_config.exe_mode
+        self.temperature = self.infer_config.data_config.temperature
         self._bound_cache_data: Optional[tuple[dict, ...]] = None
 
     def bind_cache_data(self, cache_data: tuple[dict, ...]) -> None:
@@ -3312,7 +3325,6 @@ class KimiLinearForCausalLM(nn.Module):
             else hidden_states.shape[0]
             // (self.infer_config.model_config.next_n + 1)
         )
-        self.temperature = self.infer_config.data_config.temperature
         hidden_states = hidden_states.view(batch_size, -1, hidden_states.shape[-1])
         if not is_prefill:
             hidden_states = all_gather_first_dim(
