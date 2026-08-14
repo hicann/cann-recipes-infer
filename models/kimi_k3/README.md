@@ -15,23 +15,109 @@
 
 昇腾 950PR/DT 系列产品。
 
-## 配置
+## 环境准备
 
-修改 `config/kimi_k3_rank_32_mxfp4_npugraph_ex.yaml` 中顶层的 `model_path`，使其指向包含模型配置、权重索引、权重和 tokenizer 文件的 Kimi K3 checkpoint。
+1. 安装 CANN 软件包。
 
-当前配置使用 32 卡 Attention TP 与 Expert Parallel：
+   本样例的编译执行依赖 CANN 开发套件包（toolkit）与昇腾 950 对应的二进制算子包（ops）。支持9.2.0版本cann包，下载选择[weekly版本](https://www.hiascend.com/cann/download)， 并参考链接中的指导方式完成安装。
+
+   Kimi K3 使用 KDA、MLA 和 MoE 相关昇腾算子，建议所有节点使用相同的 CANN、驱动和固件版本。当前实现面向昇腾 950PR/DT，不支持在其他产品上直接运行。
+
+2. 安装 Ascend Extension for PyTorch（torch_npu）。
+
+   `torch_npu` 为 PyTorch 在 NPU 上运行提供适配。请安装与当前 CANN 和 Python 版本匹配的 `torch_npu`、PyTorch 及其依赖；本目录的依赖版本记录在 `models/kimi_k3/requirements.txt` 中。安装[torch_npu](https://pypi.org/project/torch-npu/2.10.0.post4/)时，按照链接中的指导方法完成安装，建议安装对应python版本为3.12。或者通过命令行完成安装：
+    ```bash
+   # 推荐2.10.0版本
+   pip install torch==2.10.0
+   pip install torch_npu==2.10.0.post4
+   ```
+
+3. 安装cannbot-dsl算子依赖包
+
+    cannbot-dsl是cann的高性能融合算子包，执行kimi-k3需要安装cannbot-dsl依赖。
+    ```bash
+   pip install cannbot-dsl
+   ```
+
+3. 下载项目源码并安装 Python 依赖。
+
+   ```bash
+   # 下载项目源码
+   git clone https://gitcode.com/cann/cann-recipes-infer.git
+   cd cann-recipes-infer
+
+   # Kimi K3 依赖，仅支持项目 requirements.txt 声明的 Python/依赖版本
+   pip3 install -r ./models/kimi_k3/requirements.txt
+   ```
+
+4. 配置样例运行环境。
+
+   修改 `models/kimi_k3/set_env.sh` 中的如下字段：
+
+   - `IPs`：配置所有节点的 IP，按 rank id 排序，多个节点的 IP 以空格分隔，例如：`('xxx.xxx.xxx.xxx' 'xxx.xxx.xxx.xxx')`。
+   - `cann_path`：CANN 软件包安装路径，例如 `/home/code/Ascend/cann/`。
+
+
+
+## 快速启动
+
+以下步骤适用于已完成上述环境准备的昇腾 950PR/DT 多卡离线推理场景。
+
+### 准备权重
+
+从 [ModelScope Kimi-K3 模型页面](https://www.modelscope.cn/models/moonshotai/Kimi-K3/files) 下载模型权重，并将完整 checkpoint 上传到各节点可访问的相同路径。在配置文件中填写该路径：
 
 ```yaml
-world_size: 32
+# models/kimi_k3/config/kimi_k3_rank_32_mxfp4_npugraph_ex.yaml or models/kimi_k3/config/kimi_k3_rank_32_mxfp4_npugraph_ex_dspark.yaml (example)
+model_path: "/data/models/kimi_k3"
+```
+
+当前实现直接加载 Kimi K3 原生 MXFP4 权重，不提供本目录内的权重转换脚本。
+
+### 下载数据集
+  从[链接](https://huggingface.co/datasets/xinrongzhang2022/InfiniteBench/blob/main/longbook_qa_eng.jsonl)中下载长序列输入数据集longbook_qa_eng，并上传到各个节点上新建的路径`dataset/InfiniteBench`下。
+  ```shell
+  mkdir -p dataset/InfiniteBench
+  ```
+
+### 修改配置
+
+默认配置文件为 `config/kimi_k3_rank_32_mxfp4_npugraph_ex.yaml`，当前配置使用 32 卡 Attention TP 与 Expert Parallel：
+
+```yaml
+model_name: "kimi_k3"
+model_path: "/data/models/kimi_k3"
 exe_mode: "npugraph_ex"
+world_size: 32
 
 model_config:
+  with_ckpt: True
+  enable_online_split_weight: True
+  enable_profiler: False
+  enable_static_kernel: True
+  enable_cache_compile: False
+  enable_weight_nz: False
+  platform_version: "950"
+  draft_model_type: "none"
+  next_n: 0
+  skip_warm_up: True
   prefill_mini_batch_size: 1
+  pa_block_size: 128
+  custom_params:
+    attn_res_mode: "fused"
+    enable_multi_streams: True
+    enable_flash_kda: True
+    enable_fused_recurrent_kda: True
+    moe_chunk_max_len: 12800
+    enable_mega_moe: True
+    enable_moe_bf16_mode: True
 
 data_config:
+  dataset: "default"
   input_max_len: 128
   max_new_tokens: 128
   batch_size: 32
+  temperature: 1.0
 
 parallel_config:
   attn_tp_size: 32
@@ -40,6 +126,7 @@ parallel_config:
   lmhead_tp_size: 8
   dense_tp_size: 8
   oproj_tp_size: 32
+  cp_size: 1
 ```
 
 离线实现要求：
@@ -57,34 +144,52 @@ parallel_config:
 - `enable_profiler=True` 时，Prefill 采集中间的一个 mini cycle；Decode 跳过前 10 个 step 后采集 10 个 step。两阶段分别写入 `prof/prefill` 和 `prof/decode`，且不依赖 warm-up 是否启用。
 
 每个 Prefill mini cycle 都由完整 Attention TP 通信组参与：prompt token 在 `attn_tp_size` 个 rank 间做 Sequence Parallel，Attention 在 head 维做 TP。KDA state 根据完整 Decode batch 中的 request index 直接写入对应 state row；MLA latent 只由该请求的 Decode owner rank 写入其本地 paged blocks。所有 cycle 共用同一组预分配 cache tensor，完成后直接以完整 batch 切换到 request-DP + Attention TP Decode，不发生 cache 合并、拷贝或重新分配。
-| 参数名 | 类型 | 默认值 | 含义 |
+
+参数开关说明：
+
+| 参数名 | 类型 | YAML 值 | 含义 |
 | --- | --- | --- | --- |
-| `attn_res_mode` | str | `fused` | AttnRes 后端：`original` 使用原实现，`two_phase` 使用 PyTorch 两阶段实现，`fused` 使用融合算子。当前 YAML 设置为 `fused`。 |
-| `enable_multi_streams` | bool | `True` | 启用多流并行。Decode 将 Shared Expert 放入独立流，与 Routed Expert 的分发、计算和聚合重叠，并在两路结果相加前同步；Prefill 保持主流执行。当前 YAML 设置为 `True`。 |
-| `moe_chunk_max_len` | int | `65536` | Prefill MoE 路由缓冲的 gathered-token 上限；超过时管线内部循环分块以控制峰值内存。设为 `0` 或负数可禁用分块。 |
-| `enable_mega_moe` | bool | `False` | Prefill MoE 使用 MegaMoE 融合算子；仍按 `moe_chunk_max_len` 分块，每个 chunk 独立调用 MegaMoE。 |
-| `enable_moe_bf16_mode` | bool | `True` | 开启后，MoE中的finalise_routing与SiTU将使用BF16精度进行运算，但MoeGating将总是保持FP32的计算精度。 |
+| `exe_mode` | str | `npugraph_ex` | 执行模式，可选 `eager`、`npugraph_ex`。 |
+| `enable_online_split_weight` | bool | `True` | 启动时按 rank 从完整 checkpoint 切分加载权重。 |
+| `enable_profiler` | bool | `False` | 是否采集 Prefill/Decode 性能数据。 |
+| `enable_static_kernel` | bool | `True` | 启用静态 kernel 优化路径。 |
+| `enable_cache_compile` | bool | `False` | 是否启用算子编译缓存。 |
+| `enable_weight_nz` | bool | `False` | 是否按 NZ 格式加载权重，需匹配权重格式和平台。 |
+| `draft_model_type` | str | `none` | Dspark开关；`none` 为普通 Decode，`dspark` 启用 DSpark 投机推理。 |
+| `next_n` | int | `0` | DSpark 投机推理 token 数；`none` 时必须为 `0`。 |
+| `skip_warm_up` | bool | `True` | 是否跳过 warm-up；开启后首次正式推理包含图编译开销。 |
+| `attn_res_mode` | str | `fused` | AttnRes 后端，可选 `original`、`two_phase`、`fused`。 |
+| `enable_multi_streams` | bool | `True` | Decode 使用多流重叠 Shared Expert 与 Routed Expert。 |
+| `enable_flash_kda` | bool | `True` | 是否启用 Prefill `flash_kda` 融合算子，关闭为python小算子实现。 |
+| `enable_fused_recurrent_kda` | bool | `True` | 是否启用 Decode `fused_recurrent_kda`，关闭为GDR融合算子实现。 |
+| `enable_mega_moe` | bool | `True` | 是否启用 MegaMoE 融合算子。 |
+| `enable_moe_bf16_mode` | bool | `True` | MoE 路由后处理和 SiTU 是否使用 BF16。 |
 
 `enable_online_split_weight` 仅表示启动时从完整 checkpoint 按 rank 加载权重，不代表支持在线请求调度。
 
-## 启动
+### 拉起多卡推理
 
-按仓库要求配置各节点的通信信息后，在每个节点进入模型目录执行：
+拉起推理在每个节点执行：
 
-```bash
+进入模型目录执行封装脚本：
+
+```shell
 cd /home/code/cann-recipes-infer/models/kimi_k3
 bash infer.sh
 ```
 
-启动脚本默认读取 `config/kimi_k3_rank_32_mxfp4_npugraph_ex.yaml`。默认 prompt 来自仓库 `dataset/default_prompt.json`。程序默认跳过 warm-up 并直接执行正式推理；设置 `model_config.skip_warm_up=False` 后，会先用同一固定 batch 执行 warm-up，再原地清空本地 cache，最后执行正式推理。
+启动脚本需要修改`YAML_FILE_NAME`参数，选取`models/kimi_k3/config`目录下的yaml文件，修改示例`export YAML_FILE_NAME=kimi_k3_rank_32_mxfp4_npugraph_ex.yaml`。默认 prompt 来自仓库 `dataset/default_prompt.json`，如果序列长度超过128，必须更换其他数据集。如需验证其他数据集，需要修改yaml文件中`dataset`字段参数，以InfiniteBench为例，下载好的数据集文件在`/data/InfiniteBench`目录下，将yaml文件中的`dataset`字段修改为`"InfiniteBench"`。可以在yaml文件中设置warm-up开关选择是否跳过warm-up阶段；设置 `skip_warm_up=False` 后，会先用同一固定 batch 执行 warm-up，再原地清空本地 cache，最后执行正式推理。
 
-启用 DSpark 时，修改 `config/kimi_k3_rank_32_mxfp4_npugraph_ex_dspark.yaml` 的 `model_path` 和 `draft_model_path`，并执行：
+启用 DSpark 时，从 [ModelScope Kimi-K3-DSpark 模型页面](https://www.modelscope.cn/models/skyai/sglang-Kimi-K3-DSpark/files) 下载 DSpark 模型权重，修改 `config/kimi_k3_rank_32_mxfp4_npugraph_ex_dspark.yaml` 中主模型的 `model_path` 和 DSpark 模型的 `draft_model_path`，并在每个节点执行：
 
-```bash
-YAML_FILE_NAME=kimi_k3_rank_32_mxfp4_npugraph_ex_dspark.yaml bash infer.sh
+```shell
+cd /home/code/cann-recipes-infer/models/kimi_k3
+YAML_FILE_NAME=kimi_k3_rank_32_mxfp4_npugraph_ex_dspark.yaml（修改models/kimi_k3/infer.sh）
+bash infer.sh
 ```
 
-DSpark 配置要求 `draft_model_type=dspark`、`next_n` 与草稿 checkpoint 的 `block_size` 一致，并使用 16 或 128 的 `pa_block_size`。32P 示例将 KDA Attention 和 MLA `g_proj/o_proj` 保持 TP32，同时使用 Dense/LMHead/DSpark TP8 和 Embed TP16；Decode target hidden、DSpark 层间 hidden 与 LMHead logits 均保持 request-owner 本地化。`temperature=0` 时只交换每个 vocab shard 的最大值与全局 token id 候选，不物化完整词表。`attn_res_mode` 默认保持 `original`，也支持 `two_phase` 和 `fused`。主模型和草稿模型的 cache 独立分配，warmup 后两组 cache 均原地清零。正式推理结束后会打印平均 acceptance length、acceptance length 分布，以及每个 draft position 的 acceptance rate。
+32P 示例将 KDA Attention 和 MLA `g_proj/o_proj` 保持 TP32，同时使用 Dense/LMHead/DSpark TP8 和 Embed TP16；Decode target hidden、DSpark 层间 hidden 与 LMHead logits 均保持 request-owner 本地化。`attn_res_mode` 默认保持 `original`，也支持 `two_phase` 和 `fused`。主模型和草稿模型的 cache 独立分配，warmup 后两组 cache 均原地清零。正式推理结束后会打印平均 acceptance length、acceptance length 分布，以及每个 draft position 的 acceptance rate。
+
 
 ## 已知限制
 
