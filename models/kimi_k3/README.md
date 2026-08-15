@@ -1,13 +1,13 @@
-# Kimi K3 离线推理样例
+# Kimi K3 模型在 NPU 上的推理实现
 
 ## 概述
 
-本目录提供 Kimi K3 在昇腾 NPU 上的固定批次离线推理实现，不接入统一执行器的 online/offline 调度流程。模型仍复用仓库的算子、量化和基础线性层，但以下运行态数据均由模型目录本地维护：
+本目录提供 Kimi K3 在昇腾 NPU 上的推理实现与部署配置。模型复用仓库的算子、量化和基础线性层，运行态数据由模型目录统一维护：
 
 - `models/modules/attention_data.py` 分配 KDA state cache 与 MLA paged latent cache，并构造每个 Prefill/Decode step 的 attention metadata 字典。
 - `models/model_infer.py` 管理 Prefill、普通逐 token Decode，以及 DSpark Proposal/Verify、Rejection Sampling 和跨轮状态。
 - `runner_kimi_k3.py` 负责主模型、可选 DSpark 模型与 tokenizer 加载、共享模块以及两个 Decode 图的编译。
-- `infer.py` 校验并派生离线配置，执行 warmup、清空本地 cache 后运行正式推理。
+- `infer.py` 负责校验运行配置，执行 warmup、清空本地 cache 后启动推理。
 
 模型架构、KDA、AttnRes、Stable LatentMoE、并行策略及量化方案详见 [Kimi K3 昇腾 NPU 推理优化实践](../../docs/models/kimi_k3/kimi_k3_inference_guide.md)。
 
@@ -32,14 +32,14 @@
    pip install torch_npu==2.10.0.post4
    ```
 
-3. 安装cannbot-dsl算子依赖包
+3. 安装 CANNBot-DSL 算子依赖包
 
-    cannbot-dsl是cann的高性能融合算子包，执行kimi-k3需要安装cannbot-dsl依赖。
+    CANNBot-DSL 提供 Kimi K3 所需的高性能融合算子，算子编译依赖 `ninja==1.13.0`，该版本已列入 `requirements.txt`。
     ```bash
    pip install cannbot-dsl
    ```
 
-3. 下载项目源码并安装 Python 依赖。
+4. 下载项目源码并安装 Python 依赖。
 
    ```bash
    # 下载项目源码
@@ -50,7 +50,7 @@
    pip3 install -r ./models/kimi_k3/requirements.txt
    ```
 
-4. 配置样例运行环境。
+5. 配置样例运行环境。
 
    修改 `models/kimi_k3/set_env.sh` 中的如下字段：
 
@@ -61,7 +61,7 @@
 
 ## 快速启动
 
-以下步骤适用于已完成上述环境准备的昇腾 950PR/DT 多卡离线推理场景。
+以下步骤适用于已完成上述环境准备的昇腾 950PR/DT 多卡推理场景。
 
 ### 准备权重
 
@@ -113,11 +113,11 @@ model_config:
     enable_moe_bf16_mode: True
 
 data_config:
-  dataset: "default"
-  input_max_len: 128
-  max_new_tokens: 128
+  dataset: "InfiniteBench"
+  input_max_len: 16384
+  max_new_tokens: 256
   batch_size: 32
-  temperature: 1.0
+  temperature: 0.0
 
 parallel_config:
   attn_tp_size: 32
@@ -129,7 +129,7 @@ parallel_config:
   cp_size: 1
 ```
 
-离线实现要求：
+当前实现要求：
 
 - `batch_size` 固定，且必须能被 `attn_tp_size` 整除。
 - `attn_tp_size` 为 `1` 或覆盖完整 `world_size`；当前配置使用完整 32 卡 TP。
@@ -158,7 +158,7 @@ parallel_config:
 | `draft_model_type` | str | `none` | Dspark开关；`none` 为普通 Decode，`dspark` 启用 DSpark 投机推理。 |
 | `next_n` | int | `0` | DSpark 投机推理 token 数；`none` 时必须为 `0`。 |
 | `skip_warm_up` | bool | `True` | 是否跳过 warm-up；开启后首次正式推理包含图编译开销。 |
-| `attn_res_mode` | str | `fused` | AttnRes 后端，可选 `original`、`two_phase`、`fused`。 |
+| `attn_res_mode` | str | `original` | AttnRes 后端，可选 `original`、`two_phase`、`fused`；推荐使用 `fused`。 |
 | `enable_multi_streams` | bool | `True` | Decode 使用多流重叠 Shared Expert 与 Routed Expert。 |
 | `enable_flash_kda` | bool | `True` | 是否启用 Prefill `flash_kda` 融合算子，关闭为python小算子实现。 |
 | `enable_fused_recurrent_kda` | bool | `True` | 是否启用 Decode `fused_recurrent_kda`，关闭为GDR融合算子实现。 |
@@ -178,21 +178,21 @@ cd /home/code/cann-recipes-infer/models/kimi_k3
 bash infer.sh
 ```
 
-启动脚本需要修改`YAML_FILE_NAME`参数，选取`models/kimi_k3/config`目录下的yaml文件，修改示例`export YAML_FILE_NAME=kimi_k3_rank_32_mxfp4_npugraph_ex.yaml`。默认 prompt 来自仓库 `dataset/default_prompt.json`，如果序列长度超过128，必须更换其他数据集。如需验证其他数据集，需要修改yaml文件中`dataset`字段参数，以InfiniteBench为例，下载好的数据集文件在`/data/InfiniteBench`目录下，将yaml文件中的`dataset`字段修改为`"InfiniteBench"`。可以在yaml文件中设置warm-up开关选择是否跳过warm-up阶段；设置 `skip_warm_up=False` 后，会先用同一固定 batch 执行 warm-up，再原地清空本地 cache，最后执行正式推理。
+启动脚本需要修改`YAML_FILE_NAME`参数，选取`models/kimi_k3/config`目录下的yaml文件，修改示例`export YAML_FILE_NAME=kimi_k3_rank_32_mxfp4_npugraph_ex.yaml`。当前示例默认使用 `InfiniteBench`，数据文件需提前放在各节点的`dataset/InfiniteBench`目录下；如需使用短 prompt 示例，可将yaml文件中的`dataset`字段改为`"default"`，并相应调整`input_max_len`和`max_new_tokens`。可以在yaml文件中设置warm-up开关选择是否跳过warm-up阶段；设置 `skip_warm_up=False` 后，会先用同一固定 batch 执行 warm-up，再原地清空本地 cache，最后执行正式推理。
 
-启用 DSpark 时，从 [ModelScope Kimi-K3-DSpark 模型页面](https://www.modelscope.cn/models/skyai/sglang-Kimi-K3-DSpark/files) 下载 DSpark 模型权重，修改 `config/kimi_k3_rank_32_mxfp4_npugraph_ex_dspark.yaml` 中主模型的 `model_path` 和 DSpark 模型的 `draft_model_path`，并在每个节点执行：
+启用 DSpark 时，从 Hugging Face 的 [`RadixArk/Kimi-K3-DSpark`](https://huggingface.co/RadixArk/Kimi-K3-DSpark) 下载草稿模型权重，修改 `config/kimi_k3_rank_32_mxfp4_npugraph_ex_dspark.yaml` 中主模型的 `model_path` 和 DSpark 模型的 `draft_model_path`，并在每个节点执行：
 
 ```shell
 cd /home/code/cann-recipes-infer/models/kimi_k3
-YAML_FILE_NAME=kimi_k3_rank_32_mxfp4_npugraph_ex_dspark.yaml（修改models/kimi_k3/infer.sh）
+export YAML_FILE_NAME=kimi_k3_rank_32_mxfp4_npugraph_ex_dspark.yaml
 bash infer.sh
 ```
 
-32P 示例将 KDA Attention 和 MLA `g_proj/o_proj` 保持 TP32，同时使用 Dense/LMHead/DSpark TP8 和 Embed TP16；Decode target hidden、DSpark 层间 hidden 与 LMHead logits 均保持 request-owner 本地化。`attn_res_mode` 默认保持 `original`，也支持 `two_phase` 和 `fused`。主模型和草稿模型的 cache 独立分配，warmup 后两组 cache 均原地清零。正式推理结束后会打印平均 acceptance length、acceptance length 分布，以及每个 draft position 的 acceptance rate。
+32P 示例将 KDA Attention 和 MLA `g_proj/o_proj` 保持 TP32，同时使用 Dense/LMHead/DSpark TP8 和 Embed TP16；Decode target hidden、DSpark 层间 hidden 与 LMHead logits 均保持 request-owner 本地化。该示例配置使用 `attn_res_mode: fused`，也支持 `original` 和 `two_phase` 回退路径；当前 DSpark 示例配置启用 `enable_fused_recurrent_kda`，因此 Decode/Verify 中的 KDA 使用 `fused_recurrent_kda` 融合算子。主模型和草稿模型的 cache 独立分配，warmup 后两组 cache 均原地清零。正式推理结束后会打印平均 acceptance length、acceptance length 分布，以及每个 draft position 的 acceptance rate。
 
 
 ## 已知限制
 
-- 仅支持固定批次离线生成；Prefill mini batch 是静态多 cycle，不支持在线请求加入、退出或动态调度。
+- 当前支持固定批次生成；Prefill mini batch 是静态多 cycle，不支持在线请求加入、退出或动态调度。
 - 不支持 chunked Prefill、MTP、PD 分离和 Context Parallel；投机推理仅支持显式配置的 DSpark。
 - 不创建或依赖统一执行器的 `CacheInfo`、`ForwardMetaData` 与 scheduler step 状态。

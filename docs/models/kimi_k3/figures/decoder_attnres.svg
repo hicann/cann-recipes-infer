@@ -1,129 +1,113 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1680 700" width="1680" height="700" preserveAspectRatio="xMidYMid meet" role="img" aria-labelledby="title desc">
-  <title id="title">Kimi K3 Block AttnRes two-phase computation</title>
-  <desc id="desc">Phase one batches the attention between every sublayer query and the historical block states, producing independent Softmax statistics for the Attention and FFN/MoE AttnRes slots. Phase two processes the current block sequentially and uses Online Softmax to merge the dynamic partial into each slot's statistics. Attention and FFN/MoE outputs accumulate into the current block partial.</desc>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 560" width="1600" height="560" preserveAspectRatio="xMidYMid meet" role="img" aria-labelledby="title desc">
+  <title id="title">Kimi K3 Attention Residual Fusion</title>
+  <desc id="desc">High-level Kimi K3 fused two-phase Attention Residual flow. Phase 1 prepares stable softmax statistics from historical block states for every Attention and MLP slot. Phase 2 updates the current partial residual with a sublayer delta and merges it with the historical statistics through online softmax. Attention and MLP computation remain outside the fusion operators.</desc>
   <defs>
     <style>
-      svg {
-        background: #fff;
-        color: #1c1c1e;
-        font-family: "MiSans VF", -apple-system, BlinkMacSystemFont, "Segoe UI",
-          system-ui, Roboto, Arial, "PingFang SC", "Source Han Sans SC",
-          "Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
-      }
-      .box { stroke: #1c1c1e; stroke-width: 1.35; }
-      .panel { fill: #fff; stroke: #1c1c1e; stroke-width: 1.15; stroke-dasharray: 7 5; }
-      .anchor { fill: #fff8f8; }
-      .phase { fill: #f6d3ce; }
-      .stats { fill: #f3f3f4; }
-      .combine { fill: #f2f3c1; }
-      .norm { fill: #f3f3f4; }
-      .attn { fill: #c8dcf5; }
-      .ffn { fill: #cbe7cf; }
-      .partial { fill: #fff; }
-      .update { fill: #fff8f8; }
-      .section { fill: #6e6e73; font-size: 16px; font-weight: 650; letter-spacing: 1.2px; dominant-baseline: central; }
-      .label { fill: #1c1c1e; font-size: 20px; font-weight: 600; text-anchor: middle; dominant-baseline: central; }
-      .label-small { fill: #1c1c1e; font-size: 17px; text-anchor: middle; dominant-baseline: central; }
-      .meta { fill: #6e6e73; font-size: 15px; text-anchor: middle; dominant-baseline: central; }
-      .math { font-family: KaTeX_Math, "Times New Roman", serif; font-style: italic; }
-      .alpha { fill: #b92622; font-family: KaTeX_Math, "Times New Roman", serif; font-size: 23px; font-style: italic; }
-      .flow { fill: none; stroke: #1c1c1e; stroke-width: 1.65; stroke-linecap: round; stroke-linejoin: round; }
-      .stats-flow { fill: none; stroke: #824b50; stroke-width: 1.55; stroke-dasharray: 5 4; stroke-linecap: round; stroke-linejoin: round; }
+      svg { background: #ffffff; color: #202124; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; }
+      .panel { fill: #ffffff; stroke: #242424; stroke-width: 1.8; }
+      .fusion { fill: #fff8ed; stroke: #a75c2b; stroke-width: 2.3; }
+      .input { fill: #f6d8d1; stroke: #242424; stroke-width: 1.4; }
+      .compute { fill: #d4e5f8; stroke: #242424; stroke-width: 1.4; }
+      .merge { fill: #f0efbd; stroke: #242424; stroke-width: 1.4; }
+      .state { fill: #eeeeef; stroke: #242424; stroke-width: 1.4; }
+      .io { fill: #ffffff; stroke: #242424; stroke-width: 1.4; }
+      .title { font-size: 25px; font-weight: 700; text-anchor: middle; dominant-baseline: central; }
+      .section { font-size: 19px; font-weight: 700; dominant-baseline: central; }
+      .label { font-size: 17px; font-weight: 650; text-anchor: middle; dominant-baseline: central; }
+      .small { font-size: 14px; font-weight: 500; text-anchor: middle; dominant-baseline: central; }
+      .subhead { font-size: 14px; font-weight: 650; fill: #a75c2b; dominant-baseline: central; }
+      .flow { fill: none; stroke: #242424; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+      .dashed { fill: none; stroke: #777777; stroke-width: 1.6; stroke-dasharray: 7 6; stroke-linecap: round; stroke-linejoin: round; }
     </style>
-    <marker id="arrow-dark" markerUnits="userSpaceOnUse" markerWidth="9" markerHeight="8" refX="8.2" refY="4" orient="auto">
-      <path d="M0.6,0.6 L8.4,4 L0.6,7.4 z" fill="#1c1c1e"/>
+    <marker id="arrow" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0,0 L10,4 L0,8 z" fill="#242424"/>
     </marker>
-    <marker id="arrow-stats" markerUnits="userSpaceOnUse" markerWidth="9" markerHeight="8" refX="8.2" refY="4" orient="auto">
-      <path d="M0.6,0.6 L8.4,4 L0.6,7.4 z" fill="#824b50"/>
+    <marker id="arrow-gray" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0,0 L10,4 L0,8 z" fill="#777777"/>
     </marker>
   </defs>
 
-  <rect width="1680" height="700" fill="#fff"/>
+  <rect width="1600" height="560" fill="#ffffff"/>
+  <text x="800" y="30" class="title">Kimi K3 Attention Residual Fusion</text>
 
-  <!-- Phase 1 -->
-  <rect x="35" y="30" width="1610" height="225" rx="12" class="panel"/>
-  <text x="64" y="61" class="section">PHASE 1 · BATCHED INTER-BLOCK ATTENTION</text>
-  <text x="1616" y="61" class="meta" style="text-anchor:end">once at the current block entry</text>
+  <!-- Inputs shared by the two phases. -->
+  <rect x="25" y="65" width="330" height="420" rx="12" class="panel"/>
+  <text x="50" y="92" class="section">Block-level inputs</text>
 
-  <rect x="72" y="104" width="168" height="78" rx="8" class="box partial"/>
-  <text x="156" y="129" class="label-small">Block entry</text>
-  <text x="156" y="158" class="label"><tspan class="math">b</tspan><tspan>n</tspan></text>
-  <path d="M240 143 H284" class="flow" marker-end="url(#arrow-dark)"/>
+  <rect x="60" y="125" width="260" height="80" rx="8" class="input"/>
+  <text x="190" y="153" class="label">historical block states</text>
+  <text x="190" y="180" class="small">FP32 block_residual buffer</text>
 
-  <rect x="295" y="83" width="338" height="120" rx="9" class="box anchor"/>
-  <text x="464" y="107" class="label-small">Historical block states</text>
-  <rect x="327" y="127" width="48" height="35" rx="5" class="box partial"/>
-  <rect x="390" y="127" width="48" height="35" rx="5" class="box partial"/>
-  <rect x="552" y="127" width="48" height="35" rx="5" class="box partial"/>
-  <text x="351" y="145" class="label-small"><tspan class="math">b</tspan><tspan>₀</tspan></text>
-  <text x="414" y="145" class="label-small"><tspan class="math">b</tspan><tspan>₁</tspan></text>
-  <text x="495" y="145" class="meta">···</text>
-  <text x="576" y="145" class="label-small"><tspan class="math">b</tspan><tspan>ₙ₋₁</tspan></text>
-  <text x="464" y="184" class="meta">[<tspan class="math">b</tspan><tspan>₀, ..., </tspan><tspan class="math">b</tspan><tspan>ₙ₋₁]</tspan></text>
+  <rect x="60" y="245" width="260" height="95" rx="8" class="input"/>
+  <text x="190" y="273" class="label">effective queries</text>
+  <text x="190" y="300" class="small">RMSNorm gain * projection weight</text>
+  <text x="190" y="323" class="small">Attention + MLP slots</text>
 
-  <path d="M633 143 H707" class="flow" marker-end="url(#arrow-dark)"/>
-  <rect x="718" y="94" width="304" height="98" rx="9" class="box phase"/>
-  <text x="870" y="124" class="label">Batched inter-block attention</text>
-  <text x="870" y="158" class="label-small">all Attention and FFN/MoE queries</text>
+  <rect x="85" y="390" width="210" height="55" rx="8" class="state"/>
+  <text x="190" y="417" class="label">valid blocks + epsilon</text>
 
-  <path d="M1022 143 H1120" class="flow" marker-end="url(#arrow-dark)"/>
-  <rect x="1131" y="94" width="374" height="98" rx="9" class="box stats"/>
-  <text x="1318" y="124" class="label">Per-slot Softmax statistics</text>
-  <text x="1318" y="159" class="label-small">(<tspan class="math">m</tspan><tspan>ₛ, </tspan><tspan class="math">Z</tspan><tspan>ₛ, </tspan><tspan class="math">N</tspan><tspan>ₛ)</tspan></text>
+  <!-- Phase 1 fusion. -->
+  <rect x="390" y="65" width="350" height="420" rx="12" class="fusion"/>
+  <text x="415" y="92" class="section">Phase 1: prepare</text>
 
-  <!-- Phase 2 -->
-  <rect x="35" y="285" width="1610" height="380" rx="12" class="panel"/>
-  <text x="64" y="316" class="section">PHASE 2 · SEQUENTIAL INTRA-BLOCK COMPUTATION</text>
-  <text x="1616" y="316" class="meta" style="text-anchor:end">Online Softmax merge</text>
+  <rect x="430" y="125" width="270" height="170" rx="9" class="compute"/>
+  <text x="565" y="158" class="label">block_attn_res_prepare</text>
+  <text x="565" y="198" class="small">RMS-normalized depth scoring</text>
+  <text x="565" y="228" class="small">stable Softmax over history</text>
+  <text x="565" y="258" class="small">all sublayer slots in one launch</text>
 
-  <!-- Per-slot statistics dependencies -->
-  <path d="M1238 192 V337 H320 V364" class="stats-flow" marker-end="url(#arrow-stats)"/>
-  <path d="M1402 192 V474 H915 V499" class="stats-flow" marker-end="url(#arrow-stats)"/>
+  <rect x="455" y="345" width="220" height="90" rx="8" class="state"/>
+  <text x="565" y="374" class="label">historical statistics</text>
+  <text x="565" y="401" class="small">numerator N, max m, exp_sum Z</text>
+  <text x="565" y="424" class="small">first Attention uses N / Z directly</text>
 
-  <!-- Attention half -->
-  <rect x="74" y="376" width="126" height="70" rx="35" class="box partial"/>
-  <text x="137" y="399" class="label-small">block partial <tspan class="math">p</tspan></text>
-  <text x="137" y="426" class="meta">∅ at block start</text>
-  <path d="M200 411 H234" class="flow" marker-end="url(#arrow-dark)"/>
+  <path d="M320 165 H430" class="flow" marker-end="url(#arrow)"/>
+  <path d="M320 292 H370 V220 H430" class="flow" marker-end="url(#arrow)"/>
+  <path d="M295 417 H370 V270 H430" class="flow" marker-end="url(#arrow)"/>
+  <path d="M565 295 V345" class="flow" marker-end="url(#arrow)"/>
 
-  <rect x="245" y="365" width="170" height="90" rx="9" class="box combine"/>
-  <text x="330" y="394" class="meta">Online Softmax</text>
-  <text x="330" y="426" class="label-small">Attention (<tspan class="alpha">α_A</tspan>)</text>
-  <path d="M415 410 H449" class="flow" marker-end="url(#arrow-dark)"/>
+  <!-- Phase 2 fusion. -->
+  <rect x="775" y="65" width="450" height="420" rx="12" class="fusion"/>
+  <text x="800" y="92" class="section">Phase 2: update</text>
+  <text x="1200" y="92" class="subhead" text-anchor="end">once per Attention / MLP slot</text>
 
-  <rect x="460" y="376" width="132" height="70" rx="8" class="box norm"/>
-  <text x="526" y="401" class="label-small">Input</text>
-  <text x="526" y="426" class="label-small">RMSNorm</text>
-  <path d="M592 411 H626" class="flow" marker-end="url(#arrow-dark)"/>
+  <rect x="825" y="125" width="350" height="205" rx="9" class="merge"/>
+  <text x="1000" y="158" class="label">block_attn_res_update</text>
+  <text x="1000" y="198" class="small">partial += previous sublayer delta (FP32)</text>
+  <text x="1000" y="228" class="small">RMS-normalized score for current partial</text>
+  <text x="1000" y="258" class="small">online-Softmax merge with (N, m, Z)</text>
+  <text x="1000" y="298" class="small">returns AttnRes input + updated partial</text>
 
-  <rect x="637" y="365" width="174" height="90" rx="9" class="box attn"/>
-  <text x="724" y="399" class="label">Attention</text>
-  <text x="724" y="431" class="label-small">delta <tspan class="math">a</tspan></text>
-  <path d="M811 410 H845" class="flow" marker-end="url(#arrow-dark)"/>
+  <rect x="870" y="385" width="260" height="60" rx="8" class="state"/>
+  <text x="1000" y="407" class="label">running partial residual</text>
+  <text x="1000" y="430" class="small">FP32; becomes block output</text>
 
-  <rect x="856" y="365" width="204" height="90" rx="9" class="box update"/>
-  <text x="958" y="396" class="label-small">Update partial</text>
-  <text x="958" y="429" class="label"><tspan class="math">p</tspan><tspan> ← </tspan><tspan class="math">a</tspan><tspan> / </tspan><tspan class="math">p</tspan><tspan> + </tspan><tspan class="math">a</tspan></text>
+  <!-- Phase 1 statistics feed Phase 2 without crossing the dynamic loop. -->
+  <path d="M675 390 H755 V180 H825" class="flow" marker-end="url(#arrow)"/>
+  <path d="M955 330 V385" class="flow" marker-end="url(#arrow)"/>
+  <path d="M1045 385 V330" class="flow" marker-end="url(#arrow)"/>
 
-  <!-- FFN half -->
-  <path d="M958 455 V499" class="flow" marker-end="url(#arrow-dark)"/>
-  <rect x="830" y="510" width="170" height="90" rx="9" class="box combine"/>
-  <text x="915" y="539" class="meta">Online Softmax</text>
-  <text x="915" y="571" class="label-small">FFN/MoE (<tspan class="alpha">α_F</tspan>)</text>
-  <path d="M1000 555 H1034" class="flow" marker-end="url(#arrow-dark)"/>
+  <!-- Effective queries are reused by Phase 2 for the current slot. -->
+  <path d="M320 292 H365 V515 H755 V245 H825" class="dashed" marker-end="url(#arrow-gray)"/>
 
-  <rect x="1045" y="520" width="140" height="70" rx="8" class="box norm"/>
-  <text x="1115" y="545" class="label-small">Post-attn</text>
-  <text x="1115" y="570" class="label-small">RMSNorm</text>
-  <path d="M1185 555 H1219" class="flow" marker-end="url(#arrow-dark)"/>
+  <!-- Attention / MLP remain outside the fusion kernels. -->
+  <rect x="1260" y="65" width="315" height="420" rx="12" class="panel"/>
+  <text x="1285" y="92" class="section">Sequential layer execution</text>
 
-  <rect x="1230" y="510" width="160" height="90" rx="9" class="box ffn"/>
-  <text x="1310" y="543" class="label">FFN / MoE</text>
-  <text x="1310" y="576" class="label-small">delta <tspan class="math">f</tspan></text>
-  <path d="M1390 555 H1424" class="flow" marker-end="url(#arrow-dark)"/>
+  <rect x="1300" y="130" width="235" height="70" rx="8" class="io"/>
+  <text x="1417.5" y="156" class="label">AttnRes output</text>
+  <text x="1417.5" y="181" class="small">Attention or MLP input</text>
+  <path d="M1175 205 H1300" class="flow" marker-end="url(#arrow)"/>
 
-  <rect x="1435" y="510" width="160" height="90" rx="9" class="box update"/>
-  <text x="1515" y="543" class="label-small">Update partial</text>
-  <text x="1515" y="576" class="label"><tspan class="math">p</tspan><tspan> ← </tspan><tspan class="math">p</tspan><tspan> + </tspan><tspan class="math">f</tspan></text>
-  <text x="1515" y="625" class="meta">next layer · block output</text>
+  <rect x="1300" y="255" width="235" height="90" rx="8" class="compute"/>
+  <text x="1417.5" y="286" class="label">Attention / FFN / MoE</text>
+  <text x="1417.5" y="317" class="small">sublayer computation is not fused</text>
+  <path d="M1417.5 200 V255" class="flow" marker-end="url(#arrow)"/>
+
+  <rect x="1330" y="395" width="175" height="55" rx="8" class="input"/>
+  <text x="1417.5" y="422" class="label">sublayer delta</text>
+  <path d="M1417.5 345 V395" class="flow" marker-end="url(#arrow)"/>
+
+  <!-- The produced delta feeds the next slot's Phase 2 update. -->
+  <path d="M1330 422 H1245 V500 H800 V285 H825" class="dashed" marker-end="url(#arrow-gray)"/>
 </svg>
