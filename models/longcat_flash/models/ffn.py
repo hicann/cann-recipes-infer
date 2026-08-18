@@ -37,6 +37,7 @@ from transformers.utils import logging
 from executor.utils import superkernel_scope, npu_prefetch
 from executor.utils.stream_utils import npu_stream_switch
 from module.fuse_moe_gmm import FusedMoEGMM
+from module.utils import get_moe_num_chunks
 from executor.model_loader.weight_utils import default_weight_loader
 from executor.core.config import InferenceConfig, CommManager
 from module.quantization import QuantizeMethodBase
@@ -158,7 +159,8 @@ class LongcatFlashFFN(LongcatFlashMoE):
         self.gmm2_prefetch_size = self.hidden_size * self.intermediate_size * dtype_bit // \
                                 self.moe_tp_size * self.experts.experts_per_rank
 
-    def forward(self, hidden_states, is_prefill=False, cur_topk_list=None):
+    def forward(self, hidden_states, is_prefill=False, cur_topk_list=None,
+                prefill_moe_global_chunks=None):
         recv_tensor = torch.empty_like(hidden_states)
         dist.recv(recv_tensor, src=self.global_rank + self.ffn_world_size, tag=self.recv_tag)
 
@@ -180,7 +182,8 @@ class LongcatFlashFFN(LongcatFlashMoE):
         topk_indices = topk_indices.to(torch.int32)
 
         if is_prefill:
-            result = self.moe_infer_double_routing(recv_tensor, topk_indices, topk_weights)
+            result = self.moe_infer_double_routing(
+                recv_tensor, topk_indices, topk_weights, prefill_moe_global_chunks)
             dist.send(result, dst=self.global_rank + self.ffn_world_size, tag=self.send_tag)
             return result
         else:
@@ -205,8 +208,14 @@ class FFNDecoderLayer(GradientCheckpointingLayer):
         self.mlp = LongcatFlashFFN(
             config, self.infer_config, self.comm_manager, layer_idx, prefix=f"{prefix}.mlp", **kwargs)
 
-    def forward(self, hidden_states, is_prefill=False, cur_topk_list=None):
-        return self.mlp(hidden_states, is_prefill, cur_topk_list=cur_topk_list)
+    def forward(self, hidden_states, is_prefill=False, cur_topk_list=None,
+                prefill_moe_global_chunks=None):
+        return self.mlp(
+            hidden_states,
+            is_prefill,
+            cur_topk_list=cur_topk_list,
+            prefill_moe_global_chunks=prefill_moe_global_chunks,
+        )
 
 
 class FFNModel(PreTrainedModel):
@@ -222,6 +231,7 @@ class FFNModel(PreTrainedModel):
         self.enable_prefetch = custom_params.get("enable_prefetch", False)
         enable_multi_streams = custom_params.get("enable_multi_streams", 0)
         enable_npugraph_ex = self.infer_config.model_config.exe_mode == "npugraph_ex"
+        self.moe_ep_size = self.infer_config.parallel_config.moe_ep_size
         self.moe_layer_num = config.num_hidden_layers
 
         self.layers = nn.ModuleList(
@@ -240,6 +250,13 @@ class FFNModel(PreTrainedModel):
         # Initialize weights and apply final processing
         self.post_init()
 
+    def get_prefill_moe_global_chunks(self, hidden_states, is_prefill):
+        if not is_prefill:
+            return None
+        moe_chunk_max_len = self.infer_config.model_config.custom_params.get("moe_chunk_max_len", 65536)
+        moe_ep_group = self.comm_manager.get_group("moe_ep_group") if self.moe_ep_size > 1 else None
+        return get_moe_num_chunks(hidden_states, moe_chunk_max_len, moe_ep_group)
+
     def forward(
         self,
         hidden_states: Optional[torch.Tensor],
@@ -247,9 +264,15 @@ class FFNModel(PreTrainedModel):
         cur_topk_list: Optional[torch.Tensor] = None,
         **kwargs,
     ):
+        prefill_moe_global_chunks = self.get_prefill_moe_global_chunks(hidden_states, is_prefill)
         for i in range(self.moe_layer_num):
             if is_prefill:
-                hidden_states = self.layers[i](hidden_states, is_prefill, cur_topk_list=cur_topk_list)
+                hidden_states = self.layers[i](
+                    hidden_states,
+                    is_prefill,
+                    cur_topk_list=cur_topk_list,
+                    prefill_moe_global_chunks=prefill_moe_global_chunks,
+                )
             else:
                 with superkernel_scope(self.enable_superkernel, f"scope_{i}_moe", ""):
                     hidden_states, gmm2_out, gmm2_event = self.layers[

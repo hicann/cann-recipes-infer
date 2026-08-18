@@ -220,16 +220,9 @@ function set_hccl()
     export HCCL_IF_IP=$LOCAL_HOST
     export HCCL_IF_BASE_PORT=23456
 
-    micro_batch_mode=$(python3 -c "import yaml; \
-        print(yaml.safe_load(open('$YAML')).get('model_config').get('micro_batch_mode', 0))")
-
     # 910c needs enable HCCL aiv
     if [ "$platform_version" != "950" ]; then
          export HCCL_OP_EXPANSION_MODE=AIV
-    fi
-
-    if [[ ${micro_batch_mode} -eq 1 ]]; then
-        unset HCCL_OP_EXPANSION_MODE
     fi
 
     export HCCL_CONNECT_TIMEOUT=1200
@@ -338,5 +331,3 @@ function check_result()
         echo "CASE" ${CASE_NAME} "found ERROR, plz check."
     fi
 }
-
-

@@ -65,6 +65,7 @@ from module.linear import (
     VocabParallelEmbedding
     )
 from module.fuse_moe_gmm import FusedMoEGMM
+from module.utils import get_moe_num_chunks, split_moe_tensors
 from module.quantization.utils.quant_utils import reshape_mx_scale
 from module.quantization import QuantizeMethodBase
 from module.quantization.compressed_tensors.compressed_tensors import CompressedTensorsConfig
@@ -180,7 +181,7 @@ class DeepseekV3SharedExpert(nn.Module):
             dst_type=torch.float8_e4m3fn,
             round_scale=True if "mx" in self.mm_quant_mode or "hif" in self.mm_quant_mode else False,
             quant_mode=1 if "mx" in self.mm_quant_mode or "hif" in self.mm_quant_mode else 0,
-            clamp_limit=self.swiglu_limit, 
+            clamp_limit=self.swiglu_limit,
             )
         wait_event(enable_decode_stream, shared_expert_event, 0)
         return self.down_proj(intermediate_hidden_states, pergroup_scale)
@@ -214,7 +215,6 @@ class DeepseekV3MoE(nn.Module):
         self.intermediate_size = config.moe_intermediate_size
         self.moe_tp_size = self.infer_config.parallel_config.moe_tp_size
         self.moe_ep_size = self.infer_config.parallel_config.moe_ep_size
-        self.moe_chunk_max_len = self.infer_config.model_config.custom_params.get("moe_chunk_max_len", 65536)
         self.platform_version = self.infer_config.model_config.platform_version
         self.exe_mode = self.infer_config.model_config.exe_mode
         self.enable_multi_streams = self.infer_config.model_config.custom_params.get("enable_multi_streams", False)
@@ -303,23 +303,6 @@ class DeepseekV3MoE(nn.Module):
     def _reset_parameters(self) -> None:
         pass
 
-    def _split_tensors(self, bs_qlen, x, topk_ids, topk_weight, hidden_states_share):
-        if bs_qlen > self.moe_chunk_max_len:  # need to chunk moe seq_len dim to avoid OOM
-            num_chunks = (bs_qlen + self.moe_chunk_max_len - 1) // self.moe_chunk_max_len
-            x_list = x.chunk(num_chunks, dim=0)
-            topk_ids_list = topk_ids.chunk(num_chunks, dim=0)
-            topk_weight_list = topk_weight.chunk(num_chunks, dim=0)
-            if hidden_states_share is None:
-                hidden_states_share_list = [None] * num_chunks
-            else:
-                hidden_states_share_list = hidden_states_share.chunk(num_chunks, dim=0)
-        else:
-            x_list = [x]
-            topk_ids_list = [topk_ids]
-            topk_weight_list = [topk_weight]
-            hidden_states_share_list = [hidden_states_share]
-        return x_list, topk_ids_list, topk_weight_list, hidden_states_share_list
-
     def set_mc2_kwargs(self):
         global_rank = dist.get_rank()
         moe_ep_group_name = self.comm_manager.get_group_name("moe_ep_group_mc2")
@@ -363,7 +346,8 @@ class DeepseekV3MoE(nn.Module):
         if self.platform_version != PlatformVersion.ASCEND_950:
             self.dispatch_kwargs["comm_alg"] = "fullmesh_v2"
 
-    def forward(self, hidden_states, is_prefill=False, cur_topk_list=None, input_ids=None, shared_expert_stream=None):
+    def forward(self, hidden_states, is_prefill=False, cur_topk_list=None, input_ids=None, shared_expert_stream=None,
+                prefill_moe_global_chunks=None):
         _, h = hidden_states.shape
         if is_prefill:
             if self.n_shared_experts > 0:
@@ -387,7 +371,7 @@ class DeepseekV3MoE(nn.Module):
         # MOE EP
         if is_prefill:
             return self.moe_infer_double_routing(
-                hidden_states, topk_idx, topk_weight, hidden_states_share)
+                hidden_states, topk_idx, topk_weight, hidden_states_share, prefill_moe_global_chunks)
         else:
             return self.moe_infer_dispatch_combine(hidden_states, topk_idx, topk_weight, shared_expert_stream)
 
@@ -527,7 +511,7 @@ class DeepseekV3MoE(nn.Module):
             gathered_pertoken_scale = gathered_pertoken_scale.view(torch.float8_e8m0fnu)
         return tokens_per_expert_group, gathered_tokens, gathered_pertoken_scale, input_splits, output_splits
 
-    def moe_infer_double_routing(self, x, topk_ids, topk_weight, hidden_states_share):
+    def moe_infer_double_routing(self, x, topk_ids, topk_weight, hidden_states_share, prefill_moe_global_chunks=None):
         """
         pure ep strategy, for prefill stage mainly, only support eager mode
         """
@@ -567,9 +551,10 @@ class DeepseekV3MoE(nn.Module):
 
         enable_smooth_scale = "w8a8" in self.gmm_quant_mode and "float8" not in self.gmm_quant_mode
         hidden_states_list = []
+        # EP-aligned chunk count, pre-computed once at the forward entry to avoid per-layer sync.
+        global_num_chunks = prefill_moe_global_chunks
         for hidden_states, topk_ids, topk_weight, hidden_states_share in zip(
-                *self._split_tensors(num_tokens, x, topk_ids, topk_weight, hidden_states_share)):
-            sequence_length = hidden_states.shape[0]
+                *split_moe_tensors(x, topk_ids, topk_weight, hidden_states_share, num_chunks=global_num_chunks)):
             expanded_x, expanded_row_idx, tokens_per_expert, pertoken_scale = moe_init_routing(
                 hidden_states,
                 expert_idx=topk_ids,
@@ -597,9 +582,11 @@ class DeepseekV3MoE(nn.Module):
                 expanded_src_to_dst_row=expanded_row_idx,
                 export_for_source_row=None, drop_pad_mode=2
             )
-            hidden_states = hidden_states.view(sequence_length, self.hidden_dim)
-            hidden_states_list.append(hidden_states)
+            if hidden_states.shape[0] > 0:
+                hidden_states_list.append(hidden_states)
 
+        if len(hidden_states_list) == 0:
+            return x.new_empty(0, h)
         hidden_states = torch.cat(hidden_states_list, dim=0) if len(hidden_states_list) > 1 else hidden_states_list[0]
 
         return hidden_states.view(num_tokens, h)
@@ -1701,6 +1688,7 @@ class DeepseekV3DecoderLayer(nn.Module):
         is_prefill: Optional[bool] = False,
         cur_topk_list: Optional[torch.Tensor] = None,
         input_ids: Optional[torch.Tensor] = None,
+        prefill_moe_global_chunks: Optional[int] = None,
         **kwargs,
     ) -> Tuple[torch.FloatTensor]:
         residual = hidden_states
@@ -1732,6 +1720,7 @@ class DeepseekV3DecoderLayer(nn.Module):
             cur_topk_list=cur_topk_list,
             input_ids=input_ids,
             shared_expert_stream=attn_metadata.get('shared_expert_stream', None),
+            prefill_moe_global_chunks=prefill_moe_global_chunks,
         )
         hidden_states = OpKernel.hc_post(hidden_states, residual, post, comb)
 
@@ -1975,6 +1964,15 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
             cos_sin = self._cast_cos_sin_bf16(cos_sin)
         return cos_sin
 
+    def get_prefill_moe_global_chunks(self, hidden_states, is_prefill):
+        if not is_prefill:
+            return None
+        moe_chunk_max_len = self.infer_config.model_config.custom_params.get("moe_chunk_max_len", 65536)
+        moe_ep_group = None
+        if self.moe_ep_size > 1:
+            moe_ep_group = self.comm_manager.get_group("moe_ep_group")
+        return get_moe_num_chunks(hidden_states, moe_chunk_max_len, moe_ep_group)
+
     @add_start_docstrings_to_model_forward(DEEPSEEKV3_INPUTS_DOCSTRING)
     def forward(
         self,
@@ -2003,6 +2001,7 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
             attn_metadata.update({'cos_sin': cos_sin})
 
         residual = None
+        prefill_moe_global_chunks = self.get_prefill_moe_global_chunks(hidden_states, is_prefill)
 
         label = f'decode_layer'
         if self.enable_multi_streams:
@@ -2022,6 +2021,7 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
                     is_prefill=is_prefill,
                     cur_topk_list=cur_topk_list,
                     input_ids=input_ids,
+                    prefill_moe_global_chunks=prefill_moe_global_chunks,
                 )
         hidden_states = self.hc_head(hidden_states, self.hc_head_fn, self.hc_head_scale, self.hc_head_base)
         hidden_states = self.norm(hidden_states)
@@ -2062,8 +2062,11 @@ class DeepseekV3ModelMTPLayer(DeepseekV3Model):
         cur_topk_list: Optional[torch.Tensor] = None,
         mtp_layer_idx: Optional[int] = 0,
         input_ids: Optional[torch.Tensor] = None,
+        prefill_moe_global_chunks: Optional[int] = None,
         **kwargs,
     ) -> torch.Tensor:
+        if prefill_moe_global_chunks is None:
+            prefill_moe_global_chunks = self.get_prefill_moe_global_chunks(hidden_states, is_prefill)
         # mhc
         hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
         hidden_states = self.layers[str(self.mtp_start_layer_idx + mtp_layer_idx)](
@@ -2073,6 +2076,7 @@ class DeepseekV3ModelMTPLayer(DeepseekV3Model):
             is_prefill=is_prefill,
             cur_topk_list=cur_topk_list,
             input_ids=input_ids,
+            prefill_moe_global_chunks=prefill_moe_global_chunks,
         )
         hidden_states = self.hc_head(hidden_states, self.hc_head_fn, self.hc_head_scale, self.hc_head_base)
         return hidden_states
@@ -2202,9 +2206,16 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
         platform_version = model_config.platform_version
         enable_superkernel = custom_params.get("enable_superkernel", False)
         enable_pypto = custom_params.get("enable_pypto", False)
+        moe_chunk_max_len = custom_params.get("moe_chunk_max_len", 65536)
         next_n = model_config.next_n
         with_ckpt = model_config.with_ckpt
 
+        if (
+            isinstance(moe_chunk_max_len, bool)
+            or not isinstance(moe_chunk_max_len, int)
+            or moe_chunk_max_len <= 0
+        ):
+            raise ValueError(f"{moe_chunk_max_len=} should be a positive integer.")
         if not with_ckpt and not model_config.force_eplb:
             raise ValueError(f"{model_config.force_eplb=} must be True if {with_ckpt =}!")
 
@@ -2423,7 +2434,7 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
             group_size=self.lmhead_tp_size,
             platform_version=platform_version,
         )
-        
+
         self.comm_manager.register_group(
             name="moe_tp_group",
             group_num=self.moe_dp_size,

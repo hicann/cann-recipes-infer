@@ -27,7 +27,6 @@ import torch.nn.functional as F
 from torch import nn
 import torch.distributed as dist
 
-import custom_ops
 import torch_npu
 
 from transformers.modeling_utils import PreTrainedModel
@@ -58,6 +57,7 @@ from module.linear import (
     VocabParallelEmbedding
     )
 from module.fuse_moe_gmm import FusedMoEGMM
+from module.utils import get_moe_num_chunks, split_moe_tensors
 from module.quantization import QuantizeMethodBase
 from module.quantization.compressed_tensors.compressed_tensors_moe_gmm import (
     CompressedTensorW8A8Int8MoEGMMMethod,
@@ -618,7 +618,7 @@ class GlmMoeDsaMoE(nn.Module):
         enable_smooth_scale = "w8a8" in self.gmm_quant_mode and "float8" not in self.gmm_quant_mode
         # Run prefill MoE chunk by chunk to reduce routing/GMM peak memory.
         for hidden_states, topk_ids, topk_weight, hidden_states_share in zip(
-                *self._split_tensors(x, topk_ids, topk_weight, hidden_states_share, global_num_chunks)):
+                *split_moe_tensors(x, topk_ids, topk_weight, hidden_states_share, num_chunks=global_num_chunks)):
             expanded_x, expanded_row_idx, tokens_per_expert, pertoken_scale = torch_npu.npu_moe_init_routing_v2(
                 hidden_states,
                 expert_idx=topk_ids,
@@ -652,22 +652,6 @@ class GlmMoeDsaMoE(nn.Module):
         if len(hidden_states_list) == 0:
             return x.new_empty(0, h)
         return torch.cat(hidden_states_list, dim=0) if len(hidden_states_list) > 1 else hidden_states_list[0]
-
-    def _split_tensors(self, x, topk_ids, topk_weight, hidden_states_share, target_num_chunks):
-        """Split prefill MoE along the token dimension to cap routing/GMM peak memory.
-
-        Use torch.tensor_split to guarantee returning target_num_chunks chunks, automatically
-        distributing tokens evenly or padding with empty chunks when token_num < target.
-        Works correctly even when x.shape[0] == 0 (returns target empty chunks).
-        """
-        x_list = list(torch.tensor_split(x, target_num_chunks, dim=0))
-        topk_ids_list = list(torch.tensor_split(topk_ids, target_num_chunks, dim=0))
-        topk_weight_list = list(torch.tensor_split(topk_weight, target_num_chunks, dim=0))
-        if hidden_states_share is None:
-            hidden_states_share_list = [None] * target_num_chunks
-        else:
-            hidden_states_share_list = list(torch.tensor_split(hidden_states_share, target_num_chunks, dim=0))
-        return x_list, topk_ids_list, topk_weight_list, hidden_states_share_list
 
     def moe_infer_dispatch_combine(self, x, topk_ids, topk_weight, hidden_states_share):
         """
@@ -1803,6 +1787,7 @@ class GlmMoeDsaModel(GlmMoeDsaPreTrainedModel):
         self.dense_tp_size = parallel_config.dense_tp_size
         self.cp_size = parallel_config.cp_size
         self.moe_ep_size = parallel_config.moe_ep_size
+        self.moe_tp_size = parallel_config.moe_tp_size
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.vocab_size_per_rank = self.vocab_size // self.embed_tp_size
@@ -1911,21 +1896,14 @@ class GlmMoeDsaModel(GlmMoeDsaPreTrainedModel):
         dist.all_reduce(max_token_num, op=dist.ReduceOp.MAX, group=self.comm_manager.get_group("dense_tp_group"))
         return int(max_token_num.item())
 
-    def get_prefill_moe_global_chunks(self, hidden_states):
-        """Pre-compute the global MoE chunk count once at the forward entry.
-
-        All MoE layers share the same token count within a forward pass, so computing the
-        EP-group-aligned chunk count here (a single all_reduce + device-to-host sync) avoids
-        repeating that sync in every MoE layer.
-        """
+    def get_prefill_moe_global_chunks(self, hidden_states, is_prefill):
+        if not is_prefill:
+            return None
         moe_chunk_max_len = self.infer_config.model_config.custom_params.get("moe_chunk_max_len", 65536)
-        local_token_num = hidden_states.shape[0]
-        local_num_chunks = (local_token_num + moe_chunk_max_len - 1) // moe_chunk_max_len
-        if self.moe_ep_size == 1:
-            return local_num_chunks
-        max_num_chunks = torch.tensor([local_num_chunks], dtype=torch.int32, device=hidden_states.device)
-        dist.all_reduce(max_num_chunks, op=dist.ReduceOp.MAX, group=self.comm_manager.get_group("moe_ep_group"))
-        return int(max_num_chunks.item())
+        moe_ep_group = None
+        if self.moe_ep_size > 1 and self.moe_tp_size == 1:
+            moe_ep_group = self.comm_manager.get_group("moe_ep_group")
+        return get_moe_num_chunks(hidden_states, moe_chunk_max_len, moe_ep_group)
 
     def select_prefill_cp_local_inputs(self, input_ids, position_ids, slot_mapping, cp_metadata, is_prefill):
         if not (is_prefill and cp_metadata is not None and cp_metadata.enabled):
@@ -1968,11 +1946,10 @@ class GlmMoeDsaModel(GlmMoeDsaPreTrainedModel):
 
         prefill_oproj_padded_tokens = None
         prefill_dense_padded_tokens = None
-        prefill_moe_global_chunks = None
+        prefill_moe_global_chunks = self.get_prefill_moe_global_chunks(hidden_states, is_prefill)
         if is_prefill:
             prefill_oproj_padded_tokens = self.get_prefill_oproj_padded_tokens(hidden_states)
             prefill_dense_padded_tokens = self.get_prefill_dense_padded_tokens(hidden_states)
-            prefill_moe_global_chunks = self.get_prefill_moe_global_chunks(hidden_states)
         residual = None
 
         label = f'decode_layer'
@@ -2044,11 +2021,10 @@ class GlmMoeDsaModelMTPLayer(GlmMoeDsaModel):
     ) -> torch.Tensor:
         prefill_oproj_padded_tokens = None
         prefill_dense_padded_tokens = None
-        prefill_moe_global_chunks = None
+        prefill_moe_global_chunks = self.get_prefill_moe_global_chunks(hidden_states, is_prefill)
         if is_prefill:
             prefill_oproj_padded_tokens = self.get_prefill_oproj_padded_tokens(hidden_states)
             prefill_dense_padded_tokens = self.get_prefill_dense_padded_tokens(hidden_states)
-            prefill_moe_global_chunks = self.get_prefill_moe_global_chunks(hidden_states)
         return self.layers[str(self.mtp_start_layer_idx + mtp_layer_idx)](
             hidden_states,
             kv_len,
@@ -2217,6 +2193,8 @@ class GlmMoeDsaForCausalLM(GlmMoeDsaPreTrainedModel):
             raise ValueError(f"{moe_chunk_max_len=} should be a positive integer.")
         if self.attn_tp_size != 1:
             raise ValueError(f"GLM-5 only supports attn_tp_size == 1, got {self.attn_tp_size}.")
+        if enable_offload and model_config.platform_version.is_ascend_950():
+            raise ValueError("GLM-5 KVCache offload is not supported on Ascend 950.")
         if enable_offload and disaggregation_mode != "NONE":
             raise ValueError(
                 "GLM-5 KVCache offload currently supports offline mode only; "
@@ -2227,6 +2205,8 @@ class GlmMoeDsaForCausalLM(GlmMoeDsaPreTrainedModel):
                 "GLM-5 KVCache offload only supports unquant and int8 KV cache; "
                 f"got kv_cache_quant_mode={self.kv_cache_quant_mode!r}."
             )
+        if enable_offload:
+            import custom_ops
         graph_only_feat_enabled = enable_multi_streams or enable_superkernel or enable_cache_compile
         if exe_mode == "eager" and graph_only_feat_enabled:
             raise ValueError(

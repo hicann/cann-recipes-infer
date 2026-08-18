@@ -54,6 +54,7 @@ from module.linear import (
     ReplicatedLinear,
 )
 from module.fuse_moe_gmm import FusedMoEGMM
+from module.utils import get_moe_num_chunks, split_moe_tensors
 from module.quantization.mxfp4 import W4A8MxFp4MoEGMMMethod
 
 from .configuration_hy_v3 import HYV3Config
@@ -93,6 +94,39 @@ def _sp_enabled(infer_config):
         return bool(infer_config.model_config.custom_params.get("enable_sp", False))
     except Exception:
         return False
+
+
+def _use_moe_ag_dispatch(config: HYV3Config, infer_config: InferenceConfig) -> bool:
+    parallel_config = infer_config.parallel_config
+    attn_tp_size = parallel_config.attn_tp_size
+    attn_dp_size = parallel_config.attn_dp_size
+    moe_ep_size = parallel_config.moe_ep_size
+    sp_on = _sp_enabled(infer_config) and attn_tp_size > 1
+
+    # AG (AllGather) prefill dispatch precondition -- a true predicate, not the
+    # sp_ep_aligned proxy. AG broadcasts every token to all ep cards, routes the
+    # local experts, then ReduceScatter back. It is correct AND cheaper than a
+    # targeted AllToAll only when all three hold:
+    #   1. partitioned_over_ep: each ep card holds a non-overlapping 1/ep token
+    #      shard (not a TP replica). attn_tp>1 -> via SP token-shard when
+    #      attn_tp==ep; attn_tp==1 -> via attn_dp batch-shard when attn_dp==ep
+    #      (no such config today, encoded for correctness).
+    #   2. attn_tp==ep: the ep gather group coincides with the token-shard group.
+    #   3. top_k>ep: each token routes to > ep experts, so it lands on ~all ep
+    #      cards anyway -> full-token broadcast is not wasteful vs a device-host
+    #      synced AllToAll (wiki moe-comm-overlap: allgather = full-token-to-every
+    #      -card, simple; alltoall = per-expert split, smaller comm but needs
+    #      device->host sync). top_k<ep favours AllToAll.
+    if attn_tp_size > 1:
+        partitioned_over_ep = sp_on and attn_tp_size == moe_ep_size
+    else:
+        partitioned_over_ep = attn_dp_size == moe_ep_size
+    return (
+        moe_ep_size > 1
+        and partitioned_over_ep
+        and attn_tp_size == moe_ep_size
+        and config.num_experts_per_tok > moe_ep_size
+    )
 
 
 def _sp_transport_quant(x, gmm_quant_mode, target_linear=None):
@@ -991,30 +1025,7 @@ class HYV3MoE(nn.Module):
         sp_on = self.enable_sp and self.attn_tp_size > 1
         self.sp_ep_aligned = sp_on and (self.attn_tp_size == self.moe_ep_size)
 
-        # AG (AllGather) prefill dispatch precondition -- a true predicate, not the
-        # sp_ep_aligned proxy. AG broadcasts every token to all ep cards, routes the
-        # local experts, then ReduceScatter back. It is correct AND cheaper than a
-        # targeted AllToAll only when all three hold:
-        #   1. partitioned_over_ep: each ep card holds a non-overlapping 1/ep token
-        #      shard (not a TP replica). attn_tp>1 -> via SP token-shard when
-        #      attn_tp==ep; attn_tp==1 -> via attn_dp batch-shard when attn_dp==ep
-        #      (no such config today, encoded for correctness).
-        #   2. attn_tp==ep: the ep gather group coincides with the token-shard group.
-        #   3. top_k>ep: each token routes to > ep experts, so it lands on ~all ep
-        #      cards anyway -> full-token broadcast is not wasteful vs a device-host
-        #      synced AllToAll (wiki moe-comm-overlap: allgather = full-token-to-every
-        #      -card, simple; alltoall = per-expert split, smaller comm but needs
-        #      device->host sync). top_k<ep favours AllToAll.
-        if self.attn_tp_size > 1:
-            partitioned_over_ep = sp_on and (self.attn_tp_size == self.moe_ep_size)
-        else:
-            partitioned_over_ep = self.attn_dp_size == self.moe_ep_size
-        self.moe_ag_dispatch = (
-            self.moe_ep_size > 1
-            and partitioned_over_ep
-            and (self.attn_tp_size == self.moe_ep_size)
-            and (self.top_k > self.moe_ep_size)
-        )
+        self.moe_ag_dispatch = _use_moe_ag_dispatch(config, infer_config)
 
         ep_rank = comm_manager.get_rank("moe_ep_group") if self.moe_ep_size > 1 else 0
         tp_rank = comm_manager.get_rank("moe_tp_group") if self.moe_tp_size > 1 else 0
@@ -1027,14 +1038,6 @@ class HYV3MoE(nn.Module):
             self.shared_mlp_stream = create_stream("11", self.exe_mode)
         self.npu_events = tuple(
             create_event(self.exe_mode, self.enable_multi_streams) for _ in range(2)
-        )
-        # Maximum token count per MoE chunk during prefill.
-        # Splits the expert dispatch/combine along the sequence dimension to
-        # bound peak memory of the expanded_x / gathered_tokens intermediates
-        # (each ~ hidden * top_k per token).  Default 65536: effectively no
-        # chunking for typical prefill lengths; set to e.g. 4096 to reduce peak.
-        self.moe_chunk_max_len = infer_config.model_config.custom_params.get(
-            "moe_chunk_max_len", 65536
         )
 
         # Router: replicated (all ranks have full router)
@@ -1070,7 +1073,8 @@ class HYV3MoE(nn.Module):
             enable_swiglu_group_quant=True,
         )
 
-    def forward(self, hidden_states: torch.Tensor, is_prefill: bool = False) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, is_prefill: bool = False,
+                prefill_moe_global_chunks: Optional[int] = None) -> torch.Tensor:
         # sp_ep_aligned feeds (fp32-for-gate, bf16-for-experts); gate keeps fp32 precision.
         if self.sp_ep_aligned and isinstance(hidden_states, (tuple, list)):
             hidden_states_fp32, hidden_states_bf16 = hidden_states
@@ -1119,17 +1123,21 @@ class HYV3MoE(nn.Module):
             # Split expert dispatch/combine along the token dim to bound
             # peak memory of expanded_x / gathered_tokens intermediates.
             routed_output_list = []
+            # EP-aligned chunk count, pre-computed once at the forward entry to avoid per-layer sync.
+            global_num_chunks = prefill_moe_global_chunks
             for chunk_x, chunk_ids, chunk_weights in zip(
-                *self._split_tensors(num_tokens, hidden_states_flat,
-                                     top_k_index, top_k_weights)
-            ):
+                *split_moe_tensors(hidden_states_flat, top_k_index, top_k_weights, num_chunks=global_num_chunks)):
                 if self.moe_ep_size > 1:
                     chunk_out = self._moe_ep_manual(chunk_x, chunk_ids, chunk_weights)
                 else:
                     chunk_out = self._moe_local_or_tp(chunk_x, chunk_ids, chunk_weights)
-                routed_output_list.append(chunk_out)
-            routed_output = (torch.cat(routed_output_list, dim=0)
-                             if len(routed_output_list) > 1 else routed_output_list[0])
+                if chunk_out.shape[0] > 0:
+                    routed_output_list.append(chunk_out)
+            if len(routed_output_list) == 0:
+                routed_output = hidden_states_flat.new_empty(0, hidden_states_flat.shape[-1])
+            else:
+                routed_output = (torch.cat(routed_output_list, dim=0)
+                                 if len(routed_output_list) > 1 else routed_output_list[0])
         elif self.moe_ep_size > 1 and self.moe_tp_size == 1:
             routed_output = self._moe_ep_mc2_decode(
                 hidden_states_flat, top_k_index, top_k_weights
@@ -1183,25 +1191,6 @@ class HYV3MoE(nn.Module):
             )
             record_event(enable_multi_streams, self.npu_events, 1, exe_mode=self.exe_mode)
         return shared_output
-
-    def _split_tensors(self, num_tokens, hidden_states_flat, topk_ids, topk_weight):
-        """Chunk MoE inputs along the token dimension to bound peak memory.
-
-        When num_tokens > self.moe_chunk_max_len, splits each tensor into
-        ceil(num_tokens / moe_chunk_max_len) chunks so that each chunk's
-        expanded_x / gathered_tokens intermediate stays within a predictable
-        size (~ moe_chunk_max_len * top_k * hidden_dim).
-        """
-        if num_tokens > self.moe_chunk_max_len:
-            num_chunks = (num_tokens + self.moe_chunk_max_len - 1) // self.moe_chunk_max_len
-            x_list = hidden_states_flat.chunk(num_chunks, dim=0)
-            topk_ids_list = topk_ids.chunk(num_chunks, dim=0)
-            topk_weight_list = topk_weight.chunk(num_chunks, dim=0)
-        else:
-            x_list = [hidden_states_flat]
-            topk_ids_list = [topk_ids]
-            topk_weight_list = [topk_weight]
-        return x_list, topk_ids_list, topk_weight_list
 
     def _moe_local_or_tp(self, hidden_states_flat, topk_ids, topk_weight):
         """Route tokens to local experts and run the common GMM expert kernel."""
@@ -1527,6 +1516,7 @@ class HYV3DecoderLayer(nn.Module):
         qkv_fused_slot_mapping: Optional[torch.Tensor] = None,
         prefill_fa_actual_seq_qlen: Optional[list] = None,
         prefill_fa_actual_seq_kvlen: Optional[list] = None,
+        prefill_moe_global_chunks: Optional[int] = None,
         **kwargs,
     ):
         is_prefill = forward_metadata.is_prefill if forward_metadata else False
@@ -1589,11 +1579,13 @@ class HYV3DecoderLayer(nn.Module):
             hidden_fp32, hidden_bf16, _, residual = torch_npu.npu_add_rms_norm_cast(
                 hidden_states, residual, self.post_attention_layernorm.weight,
                 self.post_attention_layernorm.variance_epsilon)
-            hidden_states = self.mlp((hidden_fp32, hidden_bf16), is_prefill=is_prefill)
+            hidden_states = self.mlp((hidden_fp32, hidden_bf16), is_prefill=is_prefill,
+                                     prefill_moe_global_chunks=prefill_moe_global_chunks)
         else:
             hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
             if isinstance(self.mlp, HYV3MoE):
-                hidden_states = self.mlp(hidden_states, is_prefill=is_prefill)
+                hidden_states = self.mlp(hidden_states, is_prefill=is_prefill,
+                                         prefill_moe_global_chunks=prefill_moe_global_chunks)
             else:
                 hidden_states = self.mlp(
                     hidden_states,
@@ -1638,7 +1630,9 @@ class HYV3Model(nn.Module):
         self.attn_dp_size = infer_config.parallel_config.attn_dp_size
         self.dense_tp_size = infer_config.parallel_config.dense_tp_size
         self.moe_ep_size = infer_config.parallel_config.moe_ep_size
+        self.moe_chunk_max_len = infer_config.model_config.custom_params.get("moe_chunk_max_len", 65536)
         self.enable_sp = _sp_enabled(infer_config)
+        self.moe_ag_dispatch = _use_moe_ag_dispatch(config, infer_config)
         sp_on = self.enable_sp and self.attn_tp_size > 1
         _qc = getattr(config, "quant_config", None)
         _gmm = _qc.gmm_quant_mode if _qc is not None else "w16a16"
@@ -1761,6 +1755,12 @@ class HYV3Model(nn.Module):
             raise RuntimeError("FA prefill q and kv sequence length metadata must have the same batch size")
         return actual_seq_qlen, actual_seq_kvlen
 
+    def get_prefill_moe_global_chunks(self, hidden_states, is_prefill):
+        if not is_prefill or self.moe_ag_dispatch:
+            return None
+        moe_ep_group = self.comm_manager.get_group("moe_ep_group") if self.moe_ep_size > 1 else None
+        return get_moe_num_chunks(hidden_states, self.moe_chunk_max_len, moe_ep_group)
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -1871,6 +1871,7 @@ class HYV3Model(nn.Module):
             )
 
         residual = None
+        prefill_moe_global_chunks = self.get_prefill_moe_global_chunks(hidden_states, is_prefill)
         for decoder_layer in self.layers:
             layer_outputs = decoder_layer(
                 hidden_states,
@@ -1886,6 +1887,7 @@ class HYV3Model(nn.Module):
                 qkv_fused_slot_mapping=qkv_fused_slot_mapping,
                 prefill_fa_actual_seq_qlen=prefill_fa_actual_seq_qlen,
                 prefill_fa_actual_seq_kvlen=prefill_fa_actual_seq_kvlen,
+                prefill_moe_global_chunks=prefill_moe_global_chunks,
                 **kwargs,
             )
             residual, hidden_states = layer_outputs
@@ -2328,8 +2330,10 @@ class HYV3ModelMTPLayer(HYV3Model):
         self.attn_dp_size = infer_config.parallel_config.attn_dp_size
         self.dense_tp_size = infer_config.parallel_config.dense_tp_size
         self.moe_ep_size = infer_config.parallel_config.moe_ep_size
+        self.moe_chunk_max_len = infer_config.model_config.custom_params.get("moe_chunk_max_len", 65536)
         self.next_n = infer_config.model_config.next_n if infer_config is not None else 0
         self.enable_sp = _sp_enabled(infer_config)
+        self.moe_ag_dispatch = _use_moe_ag_dispatch(config, infer_config)
         sp_on = self.enable_sp and self.attn_tp_size > 1
         # DP-TP-DP decode tier: mirror HYV3Model so _dp_decode_active works on the
         # MTP draft head too (its layers already carry sp_quant per-layer).
@@ -2520,6 +2524,7 @@ class HYV3ModelMTP(HYV3ForCausalLM):
             )
 
         residual = None
+        prefill_moe_global_chunks = m.get_prefill_moe_global_chunks(hidden_states, is_prefill)
         # Iterate the materialized nextn-layer list; iterating ModuleDict.values()
         # inside the graph-captured forward trips dynamo (deepseek MTP style).
         for layer in m.mtp_layers:
@@ -2531,7 +2536,8 @@ class HYV3ModelMTP(HYV3ForCausalLM):
                                             qkv_fused_actual_seq_lens=qkv_fused_actual_seq_lens,
                                             qkv_fused_slot_mapping=qkv_fused_slot_mapping,
                                             prefill_fa_actual_seq_qlen=prefill_fa_actual_seq_qlen,
-                                            prefill_fa_actual_seq_kvlen=prefill_fa_actual_seq_kvlen)
+                                            prefill_fa_actual_seq_kvlen=prefill_fa_actual_seq_kvlen,
+                                            prefill_moe_global_chunks=prefill_moe_global_chunks)
         hidden_states, _ = self.final_layernorm(hidden_states, residual)
 
         cu_q = forward_metadata.actual_seq_lengths_cu_q

@@ -15,7 +15,7 @@
 - `input_truncated_len`: 最大输入序列长度（默认 256），如果prompt超过这一长度会被截断。
 - `temperature`: 采样温度（默认 0.0）。设置为 0 时使用 greedy decoding；值越大，采样随机性越强。
 - `top_p`: 采样参数-top_p（默认 1.0）。
-- `top_k`: 采样参数-top_k（默认 0）。 
+- `top_k`: 采样参数-top_k（默认 0）。
 - `seed`: 采样参数-seed（默认 None）。
 
 ### 2.2 ModelConfig (模型配置)
@@ -29,6 +29,7 @@
 - `exe_mode`: 执行模式，可选 eager, ge_graph, npugraph_ex（默认 "eager"）。
 - `enable_static_kernel`: 指定npugraph_ex是否开启静态kernel（默认 False）。
 - `enable_cache_compile`: 是否启用缓存编译（默认 False）。
+- `enable_dynamic_graph`: 在 npugraph_ex 图模式下是否使能动态图编译（默认 True），在 eager 和 ge_graph 模式下无效。
 - `force_eplb`: 是否为 MoE 模型开启强制的专家负载均衡（默认 False）。
 - `enable_profiler`: 是否启用性能分析器（默认 False）。
 - `enable_weight_nz`: 是否启用权重 NZ 格式（默认 True）。

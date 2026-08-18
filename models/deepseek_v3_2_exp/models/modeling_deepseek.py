@@ -121,7 +121,7 @@ class DeepseekV3DenseMLP(nn.Module):
 
     def forward(self, x, is_prefill=False, prefill_dense_padded_tokens: Optional[int] = None):
         # input_DP + attention_TP + moe_EP
-        if is_prefill and self.dense_tp_size > 1 and self.moe_ep_size > 1:
+        if self.dense_tp_size > 1 and self.moe_ep_size > 1:
             token_num = x.shape[0]
             padded_token_num = prefill_dense_padded_tokens if prefill_dense_padded_tokens is not None else token_num
             if padded_token_num > token_num:
@@ -141,7 +141,7 @@ class DeepseekV3DenseMLP(nn.Module):
         else:
             down_proj = self.forward_normal(x)
 
-        if is_prefill and self.dense_tp_size > 1 and self.moe_ep_size > 1:
+        if self.dense_tp_size > 1 and self.moe_ep_size > 1:
             mlp_res = down_proj.new_empty(padded_token_num, down_proj.shape[-1])
             dist.reduce_scatter_tensor(mlp_res, down_proj, group=self.comm_manager.get_group("dense_tp_group"))
             down_proj = mlp_res[:token_num]
@@ -978,7 +978,6 @@ class DeepseekIndexerAttention(nn.Module):
         self.indexer = Indexer(self.config, self.infer_config, self.comm_manager, layer_idx,
                                prefix=f"{prefix}.indexer", **kwargs)
         self.attn_func = self.apply_attention_fusion
-        self.select_block_count = config.index_topk
         self.exe_mode = model_config.exe_mode
         self.global_rank = kwargs.get("global_rank")
         self.enable_multi_streams = custom_params.get("enable_multi_streams", False)
