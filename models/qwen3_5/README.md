@@ -18,8 +18,8 @@ Qwen3.5-MoE模型是Qwen3.5系列中的混合专家模型。本样例基于trans
 
    本样例的编译执行依赖CANN开发套件包（toolkit）与CANN二进制算子包（ops），支持的CANN软件版本为`CANN 9.1.0`。
 
-   Atlas A3系列产品请从[软件包下载地址](https://ascend.devcloud.huaweicloud.com/artifactory/cann-run-mirror/software/master/)下载`Ascend-cann-toolkit_${version}_linux-${arch}.run`与`Ascend-cann-A3-ops_${version}_linux-${arch}.run`软件包。
-   Atlas 950系列产品请从[软件包下载地址](https://www.hiascend.com/developer/download/community/result?module=cann&cann=9.1.0-beta.1)下载`Ascend-cann-toolkit_${version}_linux-${arch}.run`与`Ascend-cann-950-ops_${version}_linux-${arch}.run`软件包。下载完成后请参考[CANN安装文档](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/910beta1/softwareinst/instg/instg_0000.html?OS=Debian&InstallType=local)进行安装。
+   Atlas A3系列产品请从[软件包下载地址](https://www.hiascend.com/developer/download/community/result?module=cann&cann=9.1.0)下载`Ascend-cann-toolkit_${version}_linux-${arch}.run`与`Ascend-cann-A3-ops_${version}_linux-${arch}.run`软件包。
+   Atlas 950系列产品请从[软件包下载地址](https://www.hiascend.com/developer/download/community/result?module=cann&cann=9.1.0)下载`Ascend-cann-toolkit_${version}_linux-${arch}.run`与`Ascend-cann-950-ops_${version}_linux-${arch}.run`软件包。下载完成后请参考[CANN安装文档](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/910/softwareinst/instg/instg_0008.html?OS=openEuler&InstallType=local)进行安装。
 
    - `${version}`表示CANN包版本号，如`9.1.0`。
    - `${arch}`表示CPU架构，如`aarch64`、`x86_64`。

@@ -15,15 +15,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import itertools
 import json
 import math
 import os
 import logging
 from collections.abc import Callable
-from contextlib import AbstractContextManager, ExitStack, nullcontext
-from dataclasses import dataclass, replace
-from typing import List, Optional, Tuple, Union, Iterable, Any
+from contextlib import nullcontext
+from dataclasses import dataclass
+from typing import List, Optional, Iterable
 
 import torch
 import torch_npu
@@ -34,17 +33,11 @@ from torch.types import _dtype
 import torchair
 
 from transformers.cache_utils import Cache
-from transformers.masking_utils import create_causal_mask
-from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_outputs import (
     BaseModelOutputWithPast,
-    BaseModelOutputWithPooling,
     ModelOutput,
-    MoeCausalLMOutputWithPast,
-    MoeModelOutputWithPast,
 )
-from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 
 from executor.core.config import InferenceConfig, CommManager
 from executor.model_loader.weight_utils import default_weight_loader
@@ -64,7 +57,7 @@ from module.quantization import get_quant_config
 from module.quantization.mxfp8 import BLOCK_K, MxFp8Config, MxFp8LinearMethod, MxFp8MoEGMMMethod
 from module.utils import set_weight_attrs
 
-from .configuration_qwen3_5_moe import Qwen3_5MoeConfig, Qwen3_5MoeTextConfig, Qwen3_5MoeVisionConfig
+from .configuration_qwen3_5_moe import Qwen3_5MoeConfig, Qwen3_5MoeTextConfig
 
 logger = logging.getLogger(__name__)
 
@@ -341,6 +334,17 @@ def _validate_qwen3_5_mm_all_reduce_base_support(infer_config: InferenceConfig) 
         raise ValueError(
             f"The received model config platform_version is {_PLATFORM_VERSION}.\n"
             "Qwen3.5 enable_mm_all_reduce_base is only supported on Atlas 950."
+        )
+
+
+def _validate_qwen3_5_moe_parallel_support(infer_config: InferenceConfig) -> None:
+    parallel_config = infer_config.parallel_config
+    if parallel_config.moe_tp_size > 1 and parallel_config.moe_ep_size > 1:
+        raise ValueError(
+            "Qwen3.5 MoE does not support mixed tensor parallelism and expert parallelism: "
+            f"got moe_tp_size={parallel_config.moe_tp_size}, "
+            f"moe_ep_size={parallel_config.moe_ep_size}. "
+            "Set moe_tp_size=1 for pure EP or moe_tp_size=world_size for pure TP."
         )
 
 
@@ -1420,11 +1424,6 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
             a.float() + self.dt_bias
         )
 
-        if self.num_v_heads // self.num_k_heads > 1:
-            repeat_factor = self.num_v_heads // self.num_k_heads
-            query = query.repeat_interleave(repeat_factor, dim=-2)
-            key = key.repeat_interleave(repeat_factor, dim=-2)
-
         query = F.normalize(query, p=2, dim=-1)
         key = F.normalize(key, p=2, dim=-1)
         scale = 1.0 / (self.head_k_dim ** 0.5)
@@ -1679,43 +1678,6 @@ def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
     return q_embed, k_embed
 
 
-def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """
-    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
-    num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
-    """
-    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
-    if n_rep == 1:
-        return hidden_states
-    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
-    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
-
-
-def eager_attention_forward(
-    module: nn.Module,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    attention_mask: torch.Tensor | None,
-    scaling: float,
-    dropout: float = 0.0,
-    **kwargs,
-):
-    key_states = repeat_kv(key, module.num_key_value_groups)
-    value_states = repeat_kv(value, module.num_key_value_groups)
-
-    attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
-    if attention_mask is not None:
-        attn_weights = attn_weights + attention_mask
-
-    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
-    attn_weights = nn.functional.dropout(attn_weights, p=dropout, training=module.training)
-    attn_output = torch.matmul(attn_weights, value_states)
-    attn_output = attn_output.transpose(1, 2).contiguous()
-
-    return attn_output, attn_weights
-
-
 class Qwen3_5MoeAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
@@ -1736,15 +1698,11 @@ class Qwen3_5MoeAttention(nn.Module):
         self.enable_mm_all_reduce_base = infer_config.model_config.custom_params.get("enable_mm_all_reduce_base", False)
         self.comm_manager = comm_manager
         self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
-        self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
         self.num_heads = config.num_attention_heads
         self.num_heads_per_rank = self.num_heads // self.attn_tp_size
         self.num_key_value_heads = config.num_key_value_heads
         self.num_key_value_heads_per_rank = max(self.num_key_value_heads // self.attn_tp_size, 1)
         self.scale_fa = 1.0 / math.sqrt(self.head_dim)
-        self.scaling = self.head_dim**-0.5
-        self.attention_dropout = config.attention_dropout
-        self.is_causal = True
         self.attn_intermediate_size = self.num_heads * self.head_dim
         self.attn_intermediate_size_per_rank = self.num_heads_per_rank * self.head_dim
         self.enable_gegraph = infer_config.model_config.exe_mode == "ge_graph"
@@ -1991,7 +1949,6 @@ class Qwen3_5MoeMLP(nn.Module):
         used_mm_all_reduce_base = down_proj is not None
         if down_proj is None:
             down_proj = self.down_proj(x, dynamic_scale=swiglu_scale)
-        # down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
         if self.shared_tp_size > 1 and not used_mm_all_reduce_base:
             qwen3_5_all_reduce(down_proj, group=self.comm_manager.get_group("shared_tp_group"))
         return down_proj
@@ -2022,41 +1979,6 @@ class Qwen3_5MoeExperts(FusedMoEGMM):
             prefix=prefix,
         )
 
-    def _map_global_expert_id(self, expert_id: int) -> int | None:
-        if self.moe_ep_size <= 1:
-            return expert_id
-
-        local_start = self.moe_ep_rank * self.experts_per_rank
-        local_end = local_start + self.experts_per_rank
-        if expert_id < local_start or expert_id >= local_end:
-            return None
-        return expert_id - local_start
-
-    def weight_loader(
-        self,
-        param: torch.nn.Parameter,
-        loaded_weight: torch.Tensor,
-        weight_name: str,
-        shard_id: str,
-        expert_id: int,
-    ) -> None:
-        local_expert_id = self._map_global_expert_id(expert_id)
-        if local_expert_id is None:
-            return
-
-        if self.moe_ep_size <= 1:
-            super().weight_loader(param, loaded_weight, weight_name, shard_id, local_expert_id)
-            return
-
-        original_ep_size = self.ep_size
-        try:
-            # FusedMoEGMM only slices experts for ep>1,tp=1. Convert to a local expert id here so mixed tp+ep
-            # ranks load the same tensor-parallel shard while keeping only their local expert block.
-            self.ep_size = 1
-            super().weight_loader(param, loaded_weight, weight_name, shard_id, local_expert_id)
-        finally:
-            self.ep_size = original_ep_size
-
 
 class Qwen3_5MoeTopKRouter(nn.Module):
     def __init__(self, config):
@@ -2069,13 +1991,6 @@ class Qwen3_5MoeTopKRouter(nn.Module):
     def forward(self, hidden_states):
         hidden_states = hidden_states.reshape(-1, self.hidden_dim)
         router_logits = F.linear(hidden_states, self.weight)  # (seq_len, num_experts)
-
-        # router_logits = torch.nn.functional.softmax(router_logits, dtype=torch.float, dim=-1)
-        # router_top_value, router_indices = torch.topk(router_logits, self.top_k, dim=-1)  # (seq_len, top_k)
-        # router_top_value /= router_top_value.sum(dim=-1, keepdim=True)
-        # router_top_value = router_top_value.to(router_logits.dtype)
-        # router_scores = router_top_value
-        # return router_logits, router_scores, router_indices
 
         topk_weight, topk_idx, _ = torch_npu.npu_moe_gating_top_k_softmax(
             router_logits.to(torch.float32), None, k=self.top_k
@@ -2644,33 +2559,6 @@ class Qwen3_5MoeModelOutputWithPast(ModelOutput):
     router_logits: tuple[torch.FloatTensor] | None = None
 
 
-@dataclass
-class Qwen3_5MoeCausalLMOutputWithPast(ModelOutput):
-    r"""
-    loss (`torch.FloatTensor` of shape `(1,)`, *optional*, returned when `labels` is provided):
-        Language modeling loss (for next-token prediction).
-    logits (`torch.FloatTensor` of shape `(batch_size, sequence_length, config.vocab_size)`):
-        Prediction scores of the language modeling head (scores for each vocabulary token before SoftMax).
-    past_key_values (`Cache`, *optional*, returned when `use_cache=True` is passed or when `config.use_cache=True`):
-        It is a [`~cache_utils.Cache`] instance. For more details, see our
-        [kv cache guide](https://huggingface.co/docs/transformers/en/kv_cache).
-
-        Contains pre-computed hidden-states (key and values in the self-attention blocks) that can be used (see
-        `past_key_values` input) to speed up sequential decoding.
-    rope_deltas (`torch.LongTensor` of shape `(batch_size, )`, *optional*):
-        The rope index difference between sequence length and multimodal rope.
-    """
-
-    loss: torch.FloatTensor | None = None
-    logits: torch.FloatTensor | None = None
-    past_key_values: Cache | None = None
-    hidden_states: tuple[torch.FloatTensor] | None = None
-    attentions: tuple[torch.FloatTensor] | None = None
-    rope_deltas: torch.LongTensor | None = None
-    router_logits: tuple[torch.FloatTensor] | None = None
-    aux_loss: torch.FloatTensor | None = None
-
-
 class Qwen3_5MoeTextModel(nn.Module):
     def __init__(self, config: Qwen3_5MoeTextConfig, infer_config: InferenceConfig, comm_manager: CommManager):
         super().__init__()
@@ -2776,12 +2664,12 @@ class Qwen3_5MoeTextModel(nn.Module):
 
 class Qwen3_5MoeForCausalLM(nn.Module):
     def __init__(self, config, infer_config, comm_manager, prefix: str = ""):
-    # def __init__(self, config):
         super().__init__()
         _get_platform_version(infer_config)
         _init_qwen3_5_quant_config(config, infer_config)
         _validate_qwen3_5_quantization_support(config, infer_config)
         _validate_qwen3_5_mm_all_reduce_base_support(infer_config)
+        _validate_qwen3_5_moe_parallel_support(infer_config)
         _configure_qwen3_5_npugraph(infer_config)
         self.config = config
         self.infer_config = infer_config
