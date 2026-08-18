@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 import json
 import math
 import os
@@ -1244,6 +1245,61 @@ MEMORY_LAYOUT = {
 }
 
 
+@dataclass(frozen=True)
+class AttentionProcessConfig:
+    mode: str
+    pre_attn_layout: object
+    post_attn_layout: object
+    sequence_dim: int
+    cu_seqlens_q: object = None
+    cu_seqlens_kv: object = None
+
+
+@dataclass(frozen=True)
+class AttentionPaddingInfo:
+    pad_shape: object = None
+    cat_dim: object = None
+
+
+def preprocess_attention(q, k, v, config):
+    q = config.pre_attn_layout(q)
+    k = config.pre_attn_layout(k)
+    v = config.pre_attn_layout(v)
+
+    pad_shape = None
+    cat_dim = None
+    if config.cu_seqlens_q is not None:
+        q_full_shape = q.shape
+        if config.sequence_dim == 2:
+            q = q[:, :, :config.cu_seqlens_q[1], :]
+            k = k[:, :, :config.cu_seqlens_kv[1], :]
+            v = v[:, :, :config.cu_seqlens_kv[1], :]
+        elif config.sequence_dim == 1:
+            q = q[:, :config.cu_seqlens_q[1], ...]
+            k = k[:, :config.cu_seqlens_kv[1], ...]
+            v = v[:, :config.cu_seqlens_kv[1], ...]
+        else:
+            raise ValueError(f"Unsupported attention sequence dimension: {config.sequence_dim}")
+
+        cat_dim = config.sequence_dim
+        pad_shape = list(q.shape)
+        pad_shape[cat_dim] = q_full_shape[cat_dim] - q.shape[cat_dim]
+
+    if config.mode in ("flash", "sparse"):
+        q = q.contiguous()
+        k = k.contiguous()
+        v = v.contiguous()
+
+    return q, k, v, AttentionPaddingInfo(pad_shape, cat_dim)
+
+
+def postprocess_attention(x, config, padding):
+    if padding.pad_shape is not None and padding.pad_shape[padding.cat_dim] > 0:
+        attn_pad = x.new_zeros(padding.pad_shape)
+        x = torch.cat([x, attn_pad], dim=padding.cat_dim)
+    return config.post_attn_layout(x)
+
+
 def get_cu_seqlens(text_mask, img_len):
     """Calculate cu_seqlens_q, cu_seqlens_kv using text_mask and img_len
 
@@ -1605,26 +1661,33 @@ class HunyuanVideoTopKAdapter(TopKPredictor):
             img_token_len_k: Optional[int] = None,
             sink_frame_len_q: Optional[int] = None,
             sink_frame_len_k: Optional[int] = None,):
-        pre_attn_layout, post_attn_layout = MEMORY_LAYOUT["BNSD"]
         b, s, n, d = q.shape
-        q, k, v = pre_attn_layout(q), pre_attn_layout(k), pre_attn_layout(v)
+        if (cu_seqlens_q is None) != (cu_seqlens_kv is None):
+            raise ValueError("TopK sparse attention requires both cu_seqlens_q and cu_seqlens_kv, or neither.")
+
+        pre_attn_layout, post_attn_layout = MEMORY_LAYOUT["BNSD"]
+        process_config = AttentionProcessConfig(
+            mode="sparse",
+            pre_attn_layout=pre_attn_layout,
+            post_attn_layout=post_attn_layout,
+            sequence_dim=2,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_kv=cu_seqlens_kv,
+        )
+        q, k, v, padding = preprocess_attention(q, k, v, process_config)
         scale = softmax_scale if softmax_scale is not None else 1.0 / math.sqrt(d)
-        if cu_seqlens_q is None or cu_seqlens_kv is None:
-            if cu_seqlens_q is not None or cu_seqlens_kv is not None:
-                raise ValueError("TopK sparse attention requires both cu_seqlens_q and cu_seqlens_kv, or neither.")
+        if cu_seqlens_q is None:
             x = torch_npu.npu_fused_infer_attention_score(
                 q, k, v,
                 num_heads=n,
                 input_layout="BNSD",
                 scale=scale,
             )[0]
-            x = post_attn_layout(x)
+            x = postprocess_attention(x, process_config, padding)
             if return_bshd:
                 return x
             return x.reshape(b, s, -1)
-        q1 = q[:, :, :cu_seqlens_q[1], :].contiguous()
-        k1 = k[:, :, :cu_seqlens_kv[1], :].contiguous()
-        v1 = v[:, :, :cu_seqlens_kv[1], :].contiguous()
+        q1, k1, v1 = q, k, v
         if ulysses_world_size > 1:
             qkv1 = torch.cat([q1, k1, v1], dim=1).contiguous()
             qkv1 = self._apply_local_seq_remap_tensor(
@@ -1697,19 +1760,7 @@ class HunyuanVideoTopKAdapter(TopKPredictor):
                 ulysses_world_size=ulysses_world_size,
                 reverse=True,
             )
-        if cu_seqlens_q[1] < s:
-            attn2 = torch_npu.npu_fused_infer_attention_score(
-                q[:, :, cu_seqlens_q[1]:, :],
-                k[:, :, cu_seqlens_kv[1]:, :],
-                v[:, :, cu_seqlens_kv[1]:, :],
-                num_heads=n,
-                input_layout="BNSD",
-                scale=scale,
-            )[0]
-            x = torch.cat([attn1, attn2], dim=2)
-        else:
-            x = attn1
-        x = post_attn_layout(x)
+        x = postprocess_attention(attn1, process_config, padding)
         if return_bshd:
             return x
         out = x.reshape(b, s, -1)
@@ -2077,17 +2128,25 @@ class HunyuanVideoSVGAdapter(SVGPredictor):
             softmax_scale: Optional[float] = None,
             joint_q_local_bnsd: Optional[torch.Tensor] = None,
             ):
-        pre_attn_layout, post_attn_layout = MEMORY_LAYOUT["BNSD"]
-
         frame_num = self.frame_num
         frame_size = (q.shape[1] - self.context_length) // frame_num
 
         b, s, n, d = q.shape
-        q, k, v = pre_attn_layout(q), pre_attn_layout(k), pre_attn_layout(v)
+        if (cu_seqlens_q is None) != (cu_seqlens_kv is None):
+            raise ValueError("SVG sparse attention requires both cu_seqlens_q and cu_seqlens_kv, or neither.")
+
+        pre_attn_layout, post_attn_layout = MEMORY_LAYOUT["BNSD"]
+        process_config = AttentionProcessConfig(
+            mode="sparse",
+            pre_attn_layout=pre_attn_layout,
+            post_attn_layout=post_attn_layout,
+            sequence_dim=2,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_kv=cu_seqlens_kv,
+        )
+        q, k, v, padding = preprocess_attention(q, k, v, process_config)
         scale = softmax_scale if softmax_scale is not None else 1.0 / math.sqrt(d)
-        if cu_seqlens_q is None or cu_seqlens_kv is None:
-            if cu_seqlens_q is not None or cu_seqlens_kv is not None:
-                raise ValueError("SVG sparse attention requires both cu_seqlens_q and cu_seqlens_kv, or neither.")
+        if cu_seqlens_q is None:
             x = torch_npu.npu_fused_infer_attention_score(
                 q, k, v,
                 num_heads=n,
@@ -2097,9 +2156,7 @@ class HunyuanVideoSVGAdapter(SVGPredictor):
         else:
             actseqlen = [cu_seqlens_q[1]] * b
             actseqlenkv = [cu_seqlens_kv[1]] * b
-            q1 = q[:, :, :cu_seqlens_q[1], :].contiguous()
-            k1 = k[:, :, :cu_seqlens_kv[1], :].contiguous()
-            v1 = v[:, :, :cu_seqlens_kv[1], :].contiguous()
+            q1, k1, v1 = q, k, v
             qkv1 = torch.cat([q1, k1, v1], dim=1).contiguous()
             qkv1 = self._apply_local_seq_remap_tensor(
                 qkv1,
@@ -2164,19 +2221,8 @@ class HunyuanVideoSVGAdapter(SVGPredictor):
                 ulysses_world_size=ulysses_world_size,
                 reverse=True,
             )
-            if cu_seqlens_q[1] < s:
-                attn2 = torch_npu.npu_fused_infer_attention_score(
-                    q[:, :, cu_seqlens_q[1]:, :],
-                    k[:, :, cu_seqlens_kv[1]:, :],
-                    v[:, :, cu_seqlens_kv[1]:, :],
-                    num_heads=n,
-                    input_layout="BNSD",
-                    scale=scale,
-                )[0]
-                x = torch.cat([attn1, attn2], dim=2)
-            else:
-                x = attn1
-        x = post_attn_layout(x)
+            x = attn1
+        x = postprocess_attention(x, process_config, padding)
         if return_bshd:
             return x
         out = x.reshape(b, s, -1)

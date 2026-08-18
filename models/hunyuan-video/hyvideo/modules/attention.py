@@ -52,6 +52,7 @@ class AttentionProcessConfig:
     mode: str
     pre_attn_layout: object
     post_attn_layout: object
+    sequence_dim: int
     cu_seqlens_q: object = None
     cu_seqlens_kv: object = None
 
@@ -96,23 +97,23 @@ def preprocess_attention(q, k, v, config):
     pad_shape = None
     cat_dim = None
     if config.cu_seqlens_q is not None:
-        if config.mode in ("torch", "flash"):
-            q_full_shape = q.shape
+        q_full_shape = q.shape
+        if config.sequence_dim == 2:
             q = q[:, :, :config.cu_seqlens_q[1], :]
             k = k[:, :, :config.cu_seqlens_kv[1], :]
             v = v[:, :, :config.cu_seqlens_kv[1], :]
-            cat_dim = 2
-        else:
-            q_full_shape = q.shape
+        elif config.sequence_dim == 1:
             q = q[:, :config.cu_seqlens_q[1], ...]
             k = k[:, :config.cu_seqlens_kv[1], ...]
             v = v[:, :config.cu_seqlens_kv[1], ...]
-            cat_dim = 1
+        else:
+            raise ValueError(f"Unsupported attention sequence dimension: {config.sequence_dim}")
 
+        cat_dim = config.sequence_dim
         pad_shape = list(q.shape)
         pad_shape[cat_dim] = q_full_shape[cat_dim] - q.shape[cat_dim]
 
-    if config.mode in ("flash"):
+    if config.mode in ("flash", ):
         q = q.contiguous()
         k = k.contiguous()
         v = v.contiguous()
@@ -165,17 +166,28 @@ def attention(
     """
     if mode == "torch":
         pre_attn_layout, post_attn_layout = MEMORY_LAYOUT["BNSD"]
+        sequence_dim = 2
     elif mode == "flash":
         pre_attn_layout, post_attn_layout = MEMORY_LAYOUT["BNSD"]
+        sequence_dim = 2
     elif mode == 'mxfp8':
         pre_attn_layout, post_attn_layout = MEMORY_LAYOUT["BSND"]
+        sequence_dim = 1
     elif mode == "vanilla":
         pre_attn_layout, post_attn_layout = MEMORY_LAYOUT["BSND"]
+        sequence_dim = 1
+    else:
+        raise NotImplementedError(f"Unsupported attention mode: {mode}")
     
     b, s, n, d = q.shape
 
     process_config = AttentionProcessConfig(
-        mode, pre_attn_layout, post_attn_layout, cu_seqlens_q, cu_seqlens_kv
+        mode=mode,
+        pre_attn_layout=pre_attn_layout,
+        post_attn_layout=post_attn_layout,
+        sequence_dim=sequence_dim,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_kv=cu_seqlens_kv,
     )
     q, k, v, padding = preprocess_attention(q, k, v, process_config)
 
@@ -255,7 +267,10 @@ def parallel_attention(
 
     pre_attn_layout, post_attn_layout = MEMORY_LAYOUT["BSND"]
     process_config = AttentionProcessConfig(
-        "parallel", pre_attn_layout, post_attn_layout
+        mode="parallel",
+        pre_attn_layout=pre_attn_layout,
+        post_attn_layout=post_attn_layout,
+        sequence_dim=1,
     )
 
     attn_prefix = hybrid_seq_parallel_attn(
@@ -295,7 +310,10 @@ def parallel_sparse_attention(
 
     pre_attn_layout, post_attn_layout = MEMORY_LAYOUT["BSND"]
     process_config = AttentionProcessConfig(
-        "sparse", pre_attn_layout, post_attn_layout
+        mode="sparse",
+        pre_attn_layout=pre_attn_layout,
+        post_attn_layout=post_attn_layout,
+        sequence_dim=1,
     )
 
     q_img, k_img, v_img = q[:, :img_q_len, :, :], k[:, :img_kv_len, :, :], v[:, :img_kv_len, :, :]
