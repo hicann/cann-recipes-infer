@@ -21,6 +21,7 @@ import csv
 import json
 import os
 import logging
+import subprocess
 from pathlib import Path
 
 import yaml
@@ -34,7 +35,12 @@ CHOICES = ("A", "B", "C", "D")
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Qwen3.5 MMLU benchmark")
-    parser.add_argument("--yaml_file_path", type=str, required=True, help="Inference yaml path")
+    parser.add_argument(
+        "--yaml-path",
+        type=str,
+        default=str(Path(__file__).resolve().with_name("qwen3_5_35b_mmlu_test.yaml")),
+        help="Inference yaml path",
+    )
     parser.add_argument("--mmlu-dir", type=str, default=os.getenv("MMLU_DIR", ""), help="MMLU data directory")
     parser.add_argument("--split", type=str, default=os.getenv("MMLU_SPLIT", "test"), choices=["test", "val"])
     parser.add_argument("--ntrain", type=int, default=int(os.getenv("MMLU_NTRAIN", "5")))
@@ -46,12 +52,34 @@ def parse_args():
         default=int(os.getenv("MMLU_MAX_EXAMPLES_PER_SUBJECT", "0")),
     )
     parser.add_argument(
-        "--output-path",
-        type=str,
-        default=os.getenv("MMLU_OUTPUT_PATH", ""),
-        help="Optional json output path for rank0",
+        "--output-name",
+        default=os.getenv("MMLU_OUTPUT_NAME", "mmlu_eval_results.json"),
     )
     return parser.parse_args()
+
+
+def launch(args) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    script_dir = Path(__file__).resolve().parent
+    yaml_path = Path(args.yaml_path) if args.yaml_path else script_dir / "qwen3_5_35b_mmlu_test.yaml"
+    if not yaml_path.is_absolute():
+        yaml_path = repo_root / yaml_path
+    output_path = Path(args.output_name) if args.output_name else script_dir / args.output_name
+    if not output_path.is_absolute():
+        output_path = repo_root / output_path
+    env = os.environ.copy()
+    env.update({
+        "BENCHMARK_ENTRY": str(Path(__file__).resolve()),
+        "MMLU_DIR": args.mmlu_dir,
+        "MMLU_SPLIT": args.split,
+        "MMLU_NTRAIN": str(args.ntrain),
+        "MMLU_MAX_SUBJECTS": str(args.max_subjects),
+        "MMLU_MAX_PROMPTS": str(args.max_prompts),
+        "MMLU_MAX_EXAMPLES_PER_SUBJECT": str(args.max_examples_per_subject),
+        "MMLU_OUTPUT_PATH": str(output_path),
+    })
+    infer_script = repo_root / "models/qwen3_5/benchmark/run_infer.sh"
+    subprocess.run([str(infer_script), str(yaml_path)], cwd=repo_root, env=env, check=True)
 
 
 def read_csv_rows(path: Path) -> list[list[str]]:
@@ -73,7 +101,7 @@ def build_prompt(dev_rows: list[list[str]], test_row: list[str], subject: str, n
     return prompt
 
 
-def render_chat_prompt(prompt: str, tokenizer) -> str:
+def render_chat_prompt(prompt: str) -> list[dict[str, str]]:
     return [{"role": "user", "content": prompt}]
 
 
@@ -87,7 +115,7 @@ def build_rendered_prompt_for_eval(
 ):
     effective_ntrain = ntrain
     prompt = build_prompt(dev_rows, test_row, subject, effective_ntrain)
-    chat_messages = render_chat_prompt(prompt, tokenizer)
+    chat_messages = render_chat_prompt(prompt)
     rendered_prompt = tokenizer.apply_chat_template(
         chat_messages,
         tokenize=False,
@@ -98,7 +126,7 @@ def build_rendered_prompt_for_eval(
     if input_max_len > 0 and rendered_len > input_max_len and effective_ntrain > 2:
         effective_ntrain = 2
         prompt = build_prompt(dev_rows, test_row, subject, effective_ntrain)
-        chat_messages = render_chat_prompt(prompt, tokenizer)
+        chat_messages = render_chat_prompt(prompt)
         rendered_prompt = tokenizer.apply_chat_template(
             chat_messages,
             tokenize=False,
@@ -119,35 +147,30 @@ def extract_choice(text: str) -> str:
     return stripped[:1]
 
 
-def load_config(yaml_file_path: str, global_rank: int, local_rank: int) -> InferenceConfig:
-    with open(yaml_file_path, "r", encoding="utf-8") as f:
+def load_config(yaml_path: str, global_rank: int, local_rank: int) -> InferenceConfig:
+    with open(yaml_path, "r", encoding="utf-8") as f:
         yaml_dict = yaml.safe_load(f)
     config = InferenceConfig.from_dict(yaml_dict, global_rank=global_rank, local_rank=local_rank)
     if config.model_config.output_path == "":
-        config.model_config.output_path = os.path.dirname(yaml_file_path)
-    if (
-        config.scheduler_config.batch_size_per_dp_rank == 0
-        and config.parallel_config.attn_tp_size == 1
-    ):
-        non_attn_tp_sizes = (
-            config.parallel_config.moe_tp_size,
-            config.parallel_config.embed_tp_size,
-            config.parallel_config.lmhead_tp_size,
-            config.parallel_config.shared_tp_size,
-            config.parallel_config.o_proj_tp_size,
+        config.model_config.output_path = os.path.join(
+            os.getenv("WORK_DIR", "."), os.getenv("RES_PATH", "")
         )
-        if any(size > 1 for size in non_attn_tp_sizes) or config.parallel_config.moe_ep_size > 1:
-            config.scheduler_config.batch_size_per_dp_rank = config.scheduler_config.batch_size
     return config
 
 
 def main():
     args = parse_args()
+    if "LOCAL_RANK" not in os.environ:
+        if not args.mmlu_dir:
+            raise SystemExit("--mmlu-dir is required in launcher mode")
+        launch(args)
+        return
     local_rank = int(os.getenv("LOCAL_RANK", "0"))
     rank_offset = int(os.getenv("RANK_OFFSET", "0"))
     global_rank = local_rank + rank_offset
 
-    config = load_config(args.yaml_file_path, global_rank=global_rank, local_rank=local_rank)
+    config = load_config(args.yaml_path, global_rank=global_rank, local_rank=local_rank)
+
     llm = OfflineInference(config)
 
     data_dir = Path(args.mmlu_dir)
@@ -240,12 +263,10 @@ def main():
     logger.info(f"正确: {total_correct} / 总数: {total_num}")
     logger.info("=" * 60)
 
-    if args.output_path:
-        output_path = Path(args.output_path)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        with output_path.open("w", encoding="utf-8") as f:
-            json.dump({"summary": summary, "details": details}, f, ensure_ascii=False, indent=2)
-        logger.info(f"Saved results to {output_path}")
+    output_path = Path(__file__).resolve().with_name(args.output_name)
+    with output_path.open("w", encoding="utf-8") as f:
+        json.dump({"summary": summary, "details": details}, f, ensure_ascii=False, indent=2)
+    logger.info(f"Saved results to {output_path}")
 
 
 if __name__ == "__main__":

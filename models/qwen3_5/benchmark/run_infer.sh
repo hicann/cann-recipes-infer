@@ -1,3 +1,4 @@
+#!/usr/bin/env bash
 # coding=utf-8
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 #
@@ -17,10 +18,8 @@ set -eo pipefail
 
 SCRIPT_PATH=$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
 QWEN_ROOT=$(cd "${SCRIPT_PATH}/.." &>/dev/null && pwd)
-SET_ENV_ABS_PATH="${QWEN_ROOT}/../../executor/scripts/set_env.sh"
-FUNCTION_ABS_PATH="${QWEN_ROOT}/../../executor/scripts/function.sh"
-SET_ENV_ABS_PATH=$(realpath "${SET_ENV_ABS_PATH}")
-FUNCTION_ABS_PATH=$(realpath "${FUNCTION_ABS_PATH}")
+SET_ENV_ABS_PATH=$(realpath "${QWEN_ROOT}/../../executor/scripts/set_env.sh")
+FUNCTION_ABS_PATH=$(realpath "${QWEN_ROOT}/../../executor/scripts/function.sh")
 
 YAML_PATH="${1:-${SCRIPT_PATH}/qwen3_5_35b_mmlu_test.yaml}"
 ENTRY_PATH="${BENCHMARK_ENTRY:-}"
@@ -50,10 +49,10 @@ function launch_infer_task()
         fi
         if [ "${i}" -eq 0 ] && [[ ${LAUNCH_MODE:-0} -ne 1 ]]; then
             taskset -c "${cmdopt}" python3 "${infer_entry}" \
-                --yaml_file_path="${YAML}" 2>&1 | tee "${WORK_DIR}/${RES_PATH}/log_${LOCAL_RANK}.log" &
+                --yaml-path="${YAML}" 2>&1 | tee "${WORK_DIR}/${RES_PATH}/log_${LOCAL_RANK}.log" &
         else
             taskset -c "${cmdopt}" python3 "${infer_entry}" \
-                --yaml_file_path="${YAML}" &> "${WORK_DIR}/${RES_PATH}/log_${LOCAL_RANK}.log" &
+                --yaml-path="${YAML}" &> "${WORK_DIR}/${RES_PATH}/log_${LOCAL_RANK}.log" &
         fi
     done
     wait

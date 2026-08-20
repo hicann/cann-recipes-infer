@@ -183,10 +183,10 @@ bash executor/scripts/infer.sh --model qwen3_5 --yaml qwen3_5_35b_ep8.yaml
 
 ```bash
 cd cann-recipes-infer
-python3 models/qwen3_5/benchmark/run_mmlu_benchmark.py \
+source executor/scripts/set_env.sh
+python3 models/qwen3_5/benchmark/evaluate_mmlu.py \
   --mmlu-dir /data/MMLU/data \
   --yaml-path models/qwen3_5/benchmark/qwen3_5_35b_mmlu_test.yaml \
-  --visible-devices 0,1 \
   --output-name mmlu_eval_results.json
 ```
 
@@ -197,7 +197,6 @@ python3 models/qwen3_5/benchmark/run_mmlu_benchmark.py \
 - `--max-subjects`：限制评测科目数量，默认`0`表示不限制。
 - `--max-prompts`：限制总评测题目数量，默认`0`表示不限制。
 - `--max-examples-per-subject`：限制每个科目的题目数量，默认`0`表示不限制。
-- `--visible-devices`：评测使用的NPU卡号，默认读取环境变量`ASCEND_RT_VISIBLE_DEVICES`，未设置时使用`0,1`。
 - `--output-name`：rank 0保存的评测结果文件名，默认`mmlu_eval_results.json`。
 
 评测结果默认保存到`models/qwen3_5/benchmark/${output-name}`，内容包含总准确率、分科目准确率和逐题预测详情。注意，开启`HCCL_OP_EXPANSION_MODE=AIV`可能会引入不确定计算，导致测评结果出现波动，如有需要请关闭该功能。
