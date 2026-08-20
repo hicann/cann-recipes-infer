@@ -97,6 +97,52 @@ def split_moe_tensors(
     )
 
 
+def build_force_eplb_topk(
+    *,
+    local_moe_tokens: int,
+    num_experts: int,
+    num_experts_per_tok: int,
+    moe_ep_size: int,
+    moe_tp_size: int,
+    global_rank: int,
+    is_prefill: bool,
+    device: torch.device,
+) -> torch.Tensor:
+    """Build Force EPLB expert ids from an already resolved local MoE token count."""
+    if local_moe_tokens < 0:
+        raise ValueError(f"local_moe_tokens must be non-negative, got {local_moe_tokens}")
+    if moe_ep_size <= 0:
+        raise ValueError(f"moe_ep_size must be positive, got {moe_ep_size}")
+    if num_experts % moe_ep_size != 0:
+        raise ValueError(
+            f"num_experts ({num_experts}) must be divisible by moe_ep_size ({moe_ep_size})"
+        )
+
+    expanded_tokens = local_moe_tokens * num_experts_per_tok
+    experts_per_rank = num_experts // moe_ep_size
+
+    if is_prefill:
+        expert_ids = [(idx + global_rank) % num_experts for idx in range(expanded_tokens)]
+        topk_width = num_experts_per_tok
+    elif moe_tp_size > 1:
+        expert_ids = []
+        for ep_rank in range(moe_ep_size):
+            expert_start = ep_rank * experts_per_rank
+            expert_ids.extend(range(expert_start, expert_start + expanded_tokens))
+        topk_width = moe_ep_size * num_experts_per_tok
+    else:
+        expanded_offset = expanded_tokens * global_rank + global_rank
+        expert_ids = []
+        for idx in range(expanded_tokens):
+            offset = expanded_offset + idx
+            ep_rank = offset % moe_ep_size
+            local_expert = offset // moe_ep_size % experts_per_rank
+            expert_ids.append(local_expert + ep_rank * experts_per_rank)
+        topk_width = num_experts_per_tok
+
+    return torch.tensor(expert_ids, dtype=torch.int32, device=device).view(local_moe_tokens, topk_width)
+
+
 def to_transpose_nz(tensor, transpose_contigous: bool = False):
     if transpose_contigous:
         tensor.data = tensor.data.transpose(-2, -1).contiguous()

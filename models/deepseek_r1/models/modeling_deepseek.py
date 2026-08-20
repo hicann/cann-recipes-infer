@@ -68,7 +68,7 @@ from module.linear import (
     VocabParallelEmbedding
     )
 from module.fuse_moe_gmm import FusedMoEGMM
-from module.utils import get_moe_num_chunks, split_moe_tensors
+from module.utils import build_force_eplb_topk, get_moe_num_chunks, split_moe_tensors
 from module.quantization import QuantizeMethodBase
 from module.quantization.compressed_tensors.compressed_tensors_moe_gmm import CompressedTensorW8A8Int8MoEGMMMethod
 from .configuration_deepseek import DeepseekV3Config
@@ -2281,12 +2281,13 @@ class DeepseekV3ForCausalLM(nn.Module):
         self.kv_cache_quant_mode = config.quant_config.kv_cache_quant_mode \
             if config.quant_config is not None else "unquant"
         self.micro_batch_mode = MicroBatchMode(self.infer_config.model_config.custom_params.get("micro_batch_mode", 0))
+        self.next_n = self.infer_config.model_config.next_n
         self.get_parallel_settings()
         self.init_parallel_comm_group()
         self.num_experts = config.n_routed_experts
         self.num_experts_per_tok = config.num_experts_per_tok
         self.force_eplb = self.infer_config.model_config.force_eplb
-        self.next_n = self.infer_config.model_config.next_n
+        self.decode_force_eplb_topk: Optional[torch.Tensor] = None
         self.enable_o_proj_alltoall = self.infer_config.model_config.custom_params.get('enable_o_proj_alltoall', False)
         self.hidden_size = config.hidden_size
         self.local_rank = int(os.getenv("LOCAL_RANK", "0"))
@@ -2399,7 +2400,10 @@ class DeepseekV3ForCausalLM(nn.Module):
 
         if self.moe_ep_size > 1 and self.moe_tp_size == 1:
             moe_ep_mc2_buffer_size = calc_moe_hccl_buffer_size(
-                self.infer_config, self.config, is_full_mesh_v2=True
+                self.infer_config,
+                self.config,
+                is_full_mesh_v2=True,
+                max_local_moe_tokens=self.get_decode_local_moe_tokens(),
             )
             self.comm_manager.register_group(
                 name="moe_ep_group_mc2",
@@ -2423,6 +2427,50 @@ class DeepseekV3ForCausalLM(nn.Module):
         self.embed_dp_size = self.infer_config.parallel_config.embed_dp_size
         self.dense_tp_size = self.infer_config.parallel_config.dense_tp_size
         self.is_sp = self.attn_tp_size > 1 and self.moe_ep_size > 1
+
+    def get_decode_local_moe_tokens(self) -> int:
+        """Return physical token rows entering MoE in one fixed-shape Decode forward.
+
+        The result covers both normal Decode and MTP Decode. Each request
+        contributes ``next_n + 1`` physical token rows in the latter case.
+        """
+        batch_size = self.infer_config.scheduler_config.batch_size_per_dp_rank
+        return batch_size * (self.next_n + 1)
+
+    def preprocess_model_inputs(self, model_inputs: Dict, is_prefill=False, is_mtp=False, **kwargs):
+        cur_topk_list = model_inputs.get("cur_topk_list")
+        if cur_topk_list is None or is_prefill:
+            return model_inputs
+
+        # DeepSeek-R1/Kimi-K2 Decode keeps token rows replicated after Attention
+        # AllReduce, so the framework's TP+DP token division does not apply.
+        needs_override = (
+            self.attn_tp_size > 1
+            and self.attn_dp_size > 1
+            and self.moe_tp_size == 1
+            and self.moe_ep_size > 1
+        )
+        if not needs_override:
+            return model_inputs
+
+        if self.decode_force_eplb_topk is None:
+            local_moe_tokens = self.get_decode_local_moe_tokens()
+            if cur_topk_list.shape[0] == local_moe_tokens:
+                return model_inputs
+            self.decode_force_eplb_topk = build_force_eplb_topk(
+                local_moe_tokens=local_moe_tokens,
+                num_experts=self.num_experts,
+                num_experts_per_tok=self.num_experts_per_tok,
+                moe_ep_size=self.moe_ep_size,
+                moe_tp_size=self.moe_tp_size,
+                global_rank=self.global_rank,
+                is_prefill=False,
+                device=model_inputs["input_ids"].device,
+            )
+
+        model_inputs = dict(model_inputs)
+        model_inputs["cur_topk_list"] = self.decode_force_eplb_topk
+        return model_inputs
 
     def forward_lm_head(self, outputs, is_prefill=True, actual_seq_lengths_q=None, decode_batch_size=None):
         # outputs: [T, H] token-first

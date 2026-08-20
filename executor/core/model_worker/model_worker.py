@@ -459,7 +459,9 @@ class ModelWorker:
             step_prefill = tokens_per_rank_prefill * num_experts_per_tok
             cur_topk_list_prefill = [
                 (i + self.global_rank) % num_experts for i in range(step_prefill)]
-            cur_topk_list = torch.tensor(cur_topk_list_prefill, dtype=torch.int).view(tokens_per_rank_prefill, -1).npu()
+            cur_topk_list = torch.tensor(
+                cur_topk_list_prefill, dtype=torch.int, device=self.device
+            ).view(tokens_per_rank_prefill, num_experts_per_tok)
         else:
             # In the TP+DP path, the model slices input tokens by TP rank before MoE.
             # Force EPLB topk is generated before model forward, so use the token count
@@ -475,7 +477,9 @@ class ModelWorker:
                     expert_start = offset * experts_per_rank
                     expert_end = expert_start + expanded_tokens
                     cur_topk_list_decode = cur_topk_list_decode + [i for i in range(expert_start, expert_end)]
-                cur_topk_list = torch.tensor(cur_topk_list_decode, dtype=torch.int).view(total_tokens, -1).npu()
+                cur_topk_list = torch.tensor(
+                    cur_topk_list_decode, dtype=torch.int, device=self.device
+                ).view(total_tokens, self.moe_ep_size * num_experts_per_tok)
             else:
                 # Non-TP mode: round-robin allocation across EP ranks
                 expanded_tokens = total_tokens * num_experts_per_tok
@@ -489,5 +493,7 @@ class ModelWorker:
                     row = (expanded_offset + idx) // self.moe_ep_size % step_gap
                     expert_idx = row + col * step_gap
                     cur_topk_list_decode.append(expert_idx)
-                cur_topk_list = torch.tensor(cur_topk_list_decode, dtype=torch.int).view(total_tokens, -1).npu()
+                cur_topk_list = torch.tensor(
+                    cur_topk_list_decode, dtype=torch.int, device=self.device
+                ).view(total_tokens, num_experts_per_tok)
         return cur_topk_list

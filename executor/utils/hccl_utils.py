@@ -193,10 +193,21 @@ def init_comm_group(
 def calc_moe_hccl_buffer_size(
         runner_settings,
         config,
-        is_full_mesh_v2=False):
+        is_full_mesh_v2=False,
+        max_local_moe_tokens: Optional[int] = None):
     """
     calc hccl buffer size (MB) for MoE Dispatch and Combine ops.
     runner_settings accepts either legacy runner_settings dict or refactored InferenceConfig.
+
+    Args:
+        runner_settings: Legacy runner settings or the refactored InferenceConfig.
+        config: Model configuration containing MoE and hidden-size metadata.
+        is_full_mesh_v2: Whether to use the fullmesh_v2 buffer formula.
+        max_local_moe_tokens: Maximum number of physical token rows entering
+            MoE on one rank. The value must already include speculative Decode
+            rows such as ``next_n + 1``. If omitted, the legacy
+            ``batch_size // world_size * spec_len`` calculation is used.
+
     formula:
       not full_mesh_v2:
         (localMoeExpertNum * maxBs * ep_worldsize * align512(ceil480(align32(2*h)+44)) +
@@ -239,7 +250,17 @@ def calc_moe_hccl_buffer_size(
     top_k = config.num_experts_per_tok
     shared_expert_rank_num = 0 # route and share on same card = 0
 
-    bs_per_rank = batch_size // world_size * spec_len
+    # max_local_moe_tokens is the final per-rank token-row upper bound and
+    # already includes speculative Decode rows when MTP is enabled.
+    if max_local_moe_tokens is not None:
+        if max_local_moe_tokens <= 0:
+            raise ValueError(
+                f"max_local_moe_tokens must be positive, got {max_local_moe_tokens}"
+            )
+        bs_per_rank = max_local_moe_tokens
+    else:
+        bs_per_rank = batch_size // world_size * spec_len
+
     if not is_full_mesh_v2:
         token_need_size_dispatch = align_up(align_up(2 * hidden_size, UB_ALIGN) +
                                  SCALE_EXPAND_IDX_BUFFER, WIN_ADDR_ALIGN)
@@ -257,7 +278,10 @@ def calc_moe_hccl_buffer_size(
     else:
         hccl_buffer_size = moe_buffer_size
 
-    logger.info(f"batch_size:{batch_size} world_size:{world_size} moe_ep_size:{moe_ep_size}")
+    logger.info(
+        f"batch_size:{batch_size} world_size:{world_size} moe_ep_size:{moe_ep_size} "
+        f"max_local_moe_tokens:{max_local_moe_tokens}"
+    )
     logger.info(f"experts_per_rank:{experts_per_rank} hidden_size:{hidden_size} spec_len:{spec_len}")
     logger.info(f"dispatch_size:{dispatch_size} combine_size:{combine_size}")
     logger.info(f"hccl_buffer_size:{hccl_buffer_size} (MB) moe_buffer_size:{moe_buffer_size} (MB)")

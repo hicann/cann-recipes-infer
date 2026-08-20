@@ -2031,7 +2031,10 @@ class HYV3ForCausalLM(nn.Module):
             )
             if self.moe_tp_size == 1:
                 moe_ep_mc2_buffer_size = calc_moe_hccl_buffer_size(
-                    self.infer_config, self.config, is_full_mesh_v2=True
+                    self.infer_config,
+                    self.config,
+                    is_full_mesh_v2=True,
+                    max_local_moe_tokens=self.get_decode_local_moe_tokens(),
                 )
                 self.comm_manager.register_group(
                     name="moe_ep_group_mc2",
@@ -2043,6 +2046,36 @@ class HYV3ForCausalLM(nn.Module):
                     hccl_buffer_size=moe_ep_mc2_buffer_size,
                     group_type=None,
                 )
+
+    def get_decode_local_moe_tokens(self) -> int:
+        """Return the maximum physical Decode token rows entering MoE on one rank.
+
+        The scheduler pads each DP rank to a fixed request batch. Each request
+        contributes ``next_n + 1`` token rows when MTP is enabled.
+        """
+        batch_size = self.infer_config.scheduler_config.batch_size_per_dp_rank
+        spec_len = self.next_n + 1
+
+        quant_config = getattr(self.config, "quant_config", None)
+        gmm_quant_mode = quant_config.gmm_quant_mode if quant_config is not None else "w16a16"
+        # Match HYV3Model.sp_quant: only MXFP4/FP8 TP transport can enable
+        # Decode request sharding before MoE.
+        decode_request_sharding_enabled = (
+            self.enable_sp
+            and self.attn_tp_size > 1
+            and gmm_quant_mode in ("w4a8mxfloat4", "w4a8mx", "w8a8float8")
+        )
+        # Match HYV3Model._dp_decode_active(). Equal TP splits require the
+        # per-DP-rank request batch to be a positive multiple of attn_tp_size.
+        decode_request_sharding = (
+            decode_request_sharding_enabled
+            and batch_size >= self.attn_tp_size
+            and batch_size % self.attn_tp_size == 0
+        )
+        if decode_request_sharding:
+            batch_size = batch_size // self.attn_tp_size
+
+        return batch_size * spec_len
 
     def init_cache(self, device):
         """Allocate BSH-format KV cache tensors on each attention layer.
