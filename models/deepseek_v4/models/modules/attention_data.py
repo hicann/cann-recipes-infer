@@ -171,6 +171,14 @@ class AttnMetaData(nn.Module):
         block_table_offset = block_table_offset.repeat(1, repeat_num)[:, :block_table_len]
 
         block_table = torch.zeros((batch_size_per_rank, block_table_len), dtype=torch.int32, device="npu")
+        if ratio == 128:
+            # When compression ratio is 128, the c128a scheme uses a single block
+            # to store the compressed remainder data. Therefore, only the last
+            # valid block of each sequence needs to be marked in block_table.
+            actual_block_end_pos = \
+                        ((actual_seq_len - 1) // self.block_size).view(batch_size_per_rank, 1)
+            block_table[:, actual_block_end_pos] = 1
+            return block_table
         actual_block_start_pos = ((actual_seq_len - compressed_len - 1) // self.block_size).\
             view(batch_size_per_rank, 1).repeat(1, block_table_len)
         block_table = torch.where(

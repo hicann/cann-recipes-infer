@@ -208,7 +208,7 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         total_block_num = ceil(num_tokens / self.block_size)
         last_token_idx = num_tokens - 1
         last_block_idx = last_token_idx // self.block_size
-        first_valid_token_idx = max(0, num_tokens - self.sliding_window)
+        first_valid_token_idx = max(0, last_token_idx - self.sliding_window)
         first_valid_block_idx = first_valid_token_idx // self.block_size
         valid_block_num = last_block_idx - first_valid_block_idx + 1
         return total_block_num, first_valid_block_idx, valid_block_num
