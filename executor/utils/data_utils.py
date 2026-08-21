@@ -126,7 +126,7 @@ def tokenizer_in_loop(tokenizer, prompts, input_max_len=32, section_size=1024):
 def build_dataset_input(tokenizer, prompts, input_max_len, max_new_tokens=32, is_chat=False):
     # Provide system prompt for the text; the default is aritcle continuation, which can be modified as needed.
     prefix = "Please read a part of the book below, and then give me the summary.\n[start of the book]\n"
-    suffix = "\n[end of the book]\n\n" + \
+    suffix = "[end of the book]\n\n" + \
             "Now you have read it. Please summarize it for me. " + \
             f"First, tell me the title and the author, and then tell the story in {max_new_tokens} words.\n\n "
     if is_chat:

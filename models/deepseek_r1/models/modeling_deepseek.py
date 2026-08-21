@@ -1079,7 +1079,7 @@ class DeepseekV3Attention(nn.Module):
             next_tokens=0
         )
 
-        if self.enable_o_proj_alltoall:
+        if self.enable_o_proj_alltoall and self.attn_tp_size > 1:
             attn_output_ata = attn_output.new_empty(*attn_output.shape)
             dist.all_to_all_single(attn_output_ata, attn_output, group=self.attn_tp_group)
             attn_output_ata = attn_output_ata.reshape(self.attn_tp_size, -1, \
