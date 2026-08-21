@@ -1,0 +1,32 @@
+model_config:
+  model_name: "bailing_2_5"
+  model_path: "/data/models/bailing_2_5"
+  with_ckpt: True                        # [False, True]
+  exe_mode: "npugraph_ex"                # ["eager", "npugraph_ex"]
+  platform_version: "950"
+  enable_static_kernel: False
+  enable_cache_compile: False
+  enable_profiler: False
+  enable_weight_nz: False
+  force_eplb: False
+  custom_params:
+    enable_multi_streams: True           # MoE 共享专家多流
+
+data_config:
+  dataset: "InfiniteBench"
+  input_truncated_len: 4096
+
+parallel_config:
+  world_size: 8
+  attn_tp_size: 8
+  o_proj_tp_size: 8                      # 必须等于 attn_tp_size
+  moe_tp_size: 1
+  dense_tp_size: 8
+  embed_tp_size: 8
+  lmhead_tp_size: 8
+
+scheduler_config:
+  block_size: 128
+  batch_size: 32
+  max_new_tokens: 1500
+  max_prefill_tokens: 8192

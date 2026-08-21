@@ -25,6 +25,7 @@
 - [2026/08] BaiLing-V3 模型在昇腾 Atlas A2/A3系列上已 **0day 支持推理部署**
 - [2026/07] daVinci-MagiHuman模型在昇腾Atlas A2/A3系列上已支持推理部署
 - [2026/07] Kimi K3 模型在昇腾 950PR/DT 系列上已 **0day 支持推理部署**
+- [2026/07] Ling-2.5 模型在昇腾 950DT 系列上已支持推理部署
 - [2026/07] Hy3 模型在 Atlas A3 系列和昇腾 950PR/DT 系列上已 **0day 支持推理部署**
 - [2026/06] GLM-5.2模型在昇腾Atlas A3系列上已支持推理部署
 - [2026/06] HunyuanVideo 模型在昇腾 950PR/DT 系列上支持 **mxfp8 a8w8 量化** 和 Flash Attention mxfp8 激活值量化
@@ -154,6 +155,7 @@ bash infer.sh
 |------|------|
 | [daVinci-MagiHuman](models/davinci-magihuman/README.md)                     |基于Transformers库，在Atlas A2/A3环境中完成daVinci-MagiHuman模型部署，使能融合算子等优化特性。
 | [Kimi-K3](models/kimi_k3/README.md)                     |基于Transformers库，在昇腾950PR/DT环境中完成Kimi-K3混合注意力MoE模型的推理部署，KDA接入框架Mamba Cache，Routed Expert采用原生MXFP4权重与动态MXFP8激活，使能图模式编译与多流并行等优化特性。
+| [Ling-2.5](models/bailing_2_5/README.md)                |基于Transformers库，在昇腾950DT环境中完成Ling-2.5混合注意力MoE模型的推理部署，GLA线性注意力与MLA全注意力按层交替，Linear采用MXFP w8a8量化、MoE路由专家采用MXFP w4a8量化，使能图模式编译与多流并行等优化特性。
 | [GLM-5.2](models/glm_5_2/README.md)                     |基于Transformers库，沿用 DSA + MoE + MTP 结构，新增 IndexShare（跨层 top-k 复用），支持 W8A8 量化与 KV Offload 长序列部署。
 | [DeepSeek-V4](models/deepseek_v4/README.md)             |支持Atlas A3和950PR/DT多代际昇腾芯片，兼具1M长序列推理能力与超低交互时延表现，为DeepSeek模型支持Agentic应用提供计算底座，满足千行百业灵活要求。
 | [DeepSeek-V4-Flash 单卡（NPU + CPU MoE offload）](integration/sglang/dsv4-flash-single-npu-moe-offload/README.md) |基于SGLang框架，在**单张**Atlas A3（或910B）+ Kunpeng CPU上完成DeepSeek-V4-Flash推理：attention/shared/router/热专家走NPU W8A8，其余专家offload到CPU并以原生MXFP4计算，使能动态热专家常驻、长序列流式prefill、AscendC MXFP4算子在线转换、CPU↔NPU多流overlap等优化，A3实测decode约19–22.5 tok/s。端到端部署步骤见[使用指南](docs/integration/sglang/dsv4-flash-single-npu-moe-offload/dsv4_flash_single_card_inference_guide.md)。

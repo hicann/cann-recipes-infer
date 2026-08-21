@@ -19,6 +19,10 @@
 import importlib
 
 _specs: dict[str, list[tuple[str, str]]] = {
+    "bailing_2_5": [
+        ("models.bailing_2_5.models.modeling_bailing_moe_v2_5", "BailingMoeV25ForCausalLM"),
+        ("models.bailing_2_5.models.configuration_bailing_moe_v2_5", "BailingMoeV25Config"),
+    ],
     "deepseek_r1": [
         ("models.deepseek_r1.models.modeling_deepseek", "DeepseekV3ForCausalLM"),
         ("models.deepseek_r1.models.modeling_deepseek", "DeepseekV3ModelMTP"),
