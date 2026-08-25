@@ -16,15 +16,14 @@ Qwen3.5-MoE模型是Qwen3.5系列中的混合专家模型。本样例基于trans
 
 1. 安装CANN软件包。
 
-   本样例的编译执行依赖CANN开发套件包（toolkit）与CANN二进制算子包（ops），支持的CANN软件版本为`CANN 9.1.0`。
+   本样例的编译执行依赖CANN开发套件包（toolkit）与CANN二进制算子包（ops）。Atlas A3系列产品支持`CANN 9.1.0`，Atlas 950系列产品支持`CANN 9.2.0-beta.1`。
 
    Atlas A3系列产品请从[软件包下载地址](https://www.hiascend.com/developer/download/community/result?module=cann&cann=9.1.0)下载`Ascend-cann-toolkit_${version}_linux-${arch}.run`与`Ascend-cann-A3-ops_${version}_linux-${arch}.run`软件包。
-   Atlas 950系列产品请从[软件包下载地址](https://www.hiascend.com/developer/download/community/result?module=cann&cann=9.1.0)下载`Ascend-cann-toolkit_${version}_linux-${arch}.run`与`Ascend-cann-950-ops_${version}_linux-${arch}.run`软件包。下载完成后请参考[CANN安装文档](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/910/softwareinst/instg/instg_0008.html?OS=openEuler&InstallType=local)进行安装。
 
-   - `${version}`表示CANN包版本号，如`9.1.0`。
+   Atlas 950系列产品请从[软件包下载地址](https://www.hiascend.com/developer/download/community/result?module=cann&cann=9.2.0-beta.1)下载`Ascend-cann-toolkit_${version}_linux-${arch}.run`与`Ascend-cann-950-ops_${version}_linux-${arch}.run`软件包。下载完成后请参考[CANN安装文档](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/latest/softwareinst/instg/instg_0000.html?OS=Debian&InstallType=local)进行安装。
+
+   - `${version}`表示CANN包版本号，Atlas A3系列产品使用`9.1.0`，Atlas 950系列产品使用`9.2.0-beta.1`。
    - `${arch}`表示CPU架构，如`aarch64`、`x86_64`。
-
-   注意：本样例涉及ChunkGDR (npu_chunk_gated_delta_rule) 融合算子使能，该融合算子当前仅支持Atlas A3系列产品，Atlas 950系列产品暂不支持。代码中已包含平台自动判断逻辑，会根据运行环境决定是否调用该融合算子；若当前环境不支持，则自动回退到非融合实现。若使用CANN 9.0.0之前的版本，会导致该算子不可用。
 
 2. 安装Ascend Extension for PyTorch（torch_npu）。
 
@@ -84,6 +83,8 @@ YAML文件中的`model_path`默认指向`/data/models`目录下的权重路径�
 - `qwen3_5_397b_tp16.yaml`：Qwen3.5-397B-A17B，TP16配置。
 - `mxfp8/qwen3_5_35b_mxfp8_tp4.yaml`：Qwen3.5-35B-A3B 在线MXFP8，TP4配置。
 
+> 说明：Qwen3.5 MoE当前仅支持纯EP（`moe_tp_size=1`，此时`moe_ep_size=world_size`）或纯TP（`moe_tp_size=world_size`，此时`moe_ep_size=1`），不支持EP与TP混合并行。`moe_ep_size`由框架根据`world_size // moe_tp_size`自动计算，无需在YAML中配置。
+
 > 说明：FP8/MXFP8量化样例当前仅支持Atlas 950，YAML中`platform_version`需设置为`"950"`。A3暂不支持Qwen3.5 FP8/MXFP8；MXFP8在Atlas 950上暂不支持`ge_graph`模式，建议使用`eager`或按实际验证选择`npugraph_ex`。
 > FP8权重可直接复用BF16/TP配置，仅需将YAML中的`model_path`替换为FP8权重路径。FP8权重通常会在`config.json`中携带量化配置，不需要单独维护一份FP8 YAML。
 
@@ -99,7 +100,6 @@ YAML文件中的`model_path`默认指向`/data/models`目录下的权重路径�
 | `online_mxfp8_quant_layers` | list[str] | `["linear", "gmm"]` | 指定在线MXFP8量化的层类型，可配置为`linear`、`gmm`。 |
 | `online_mxfp8_ignored_layers` | list[str] | `["lm_head"]` | 指定在线MXFP8量化时跳过的层，默认不量化`lm_head`。 |
 | `enable_mm_all_reduce_base` | bool | `false` | 启用`npu_mm_all_reduce_base`融合TP场景下的MatMul和AllReduce计算；仅Atlas 950平台可用。 |
-| `enable_gdn_solve_triangular` | bool | `false` | 在Qwen3.5 GatedDeltaNet chunk rule中使用`solve_triangular`计算。 |
 
 ### 2. 准备输入prompt
 

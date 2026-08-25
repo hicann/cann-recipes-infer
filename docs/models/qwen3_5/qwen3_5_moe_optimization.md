@@ -141,7 +141,7 @@ return torch_npu.npu_moe_distribute_combine_v2(**combine_args)
 
 ## TP和EP优化
 
-Qwen3.5-MoE样例通过`parallel_config`分别控制不同模块的并行策略。`attn_tp_size`控制full attention和linear attention的张量并行，`moe_tp_size`控制MoE专家内部矩阵的张量并行，`moe_ep_size = world_size // moe_tp_size`用于控制专家并行规模。Embedding、LM Head、dense MLP和`o_proj`也分别提供独立TP配置，便于根据模型结构和卡数做更细粒度切分。
+Qwen3.5-MoE样例通过`parallel_config`分别控制不同模块的并行策略。`attn_tp_size`控制full attention和linear attention的张量并行，`moe_tp_size`控制MoE专家内部矩阵的张量并行，`moe_ep_size = world_size // moe_tp_size`用于控制专家并行规模。当前仅支持纯EP（`moe_tp_size=1`，`moe_ep_size=world_size`）或纯TP（`moe_tp_size=world_size`，`moe_ep_size=1`），混合EP+TP配置会在模型初始化时被拦截。Embedding、LM Head、dense MLP和`o_proj`也分别提供独立TP配置，便于根据模型结构和卡数做更细粒度切分。
 
 ### Attention TP优化
 
@@ -230,31 +230,6 @@ if self.exe_mode in ["ge_graph", "npugraph_ex"]:
 ```
 
 对于固定配置反复启动的推理任务，可以通过`enable_cache_compile`开启图编译缓存，减少后续启动时的编译等待时间。
-
-## 计算逻辑优化
-
-### Gated DeltaNet三角求解优化
-
-Qwen3.5-MoE的linear attention层使用Gated DeltaNet。Prefill阶段的chunk计算需要构造块内递推关系，原始实现通过`for`循环逐行更新下三角注意力矩阵：
-
-```python
-for i in range(1, chunk_size):
-    row = attn[..., i, :i].clone()
-    sub = attn[..., :i, :i].clone()
-    attn[..., i, :i] = row + (row.unsqueeze(-1) * sub).sum(-2)
-```
-
-当前样例在`torch_chunk_gated_delta_rule`中增加`torch.linalg.solve_triangular`路径，将逐行循环更新改为三角矩阵求解：
-
-```python
-attn = torch.linalg.solve_triangular(
-    torch.eye(chunk_size, device=attn.device, dtype=attn.dtype) - attn,
-    attn,
-    upper=False,
-)
-```
-
-该优化通过`enable_gdn_solve_triangular`控制，仅在使用PyTorch chunk Gated DeltaNet路径时生效。对于Qwen3.5-35B模型2p场景，可以降低Prefill阶段GDN块内递推计算开销。
 
 ## 矩阵融合优化
 
