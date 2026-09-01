@@ -20,7 +20,7 @@
 | 平台 | 产品型号 | 配置 |
 | --- | --- | --- |
 | Atlas A3 | Atlas A3 系列产品 | `ci_a3/hy3_rank16_bf16_mtp.yaml` |
-| Atlas A5 | Ascend 950PR/DT 系列产品 | `ci_950/hy3_rank4_mxfp4_mtp.yaml` |
+| Atlas A5 | Ascend 950PR/DT 系列产品 | `ci_950/hy3_rank4_mxfp8_mtp.yaml` |
 | Atlas A5 | Ascend 950PR/DT 系列产品 | `ci_950/hy3_rank4_fp8_mtp.yaml` |
 
 基础软件版本：
@@ -174,34 +174,20 @@ modelscope download --model Tencent-Hunyuan/Hy3-FP8 --local_dir /data/models/Hy3
   ```
 
   >入参介绍：`model`：原始权重路径；`model_name`：AMCT 内部模型适配器名称，HY3 使用 `hy_v3`；`device`：权重转换使用的 NPU 设备；`granularity`：转换粒度，HY3 tensorwise 权重转换使用 `tensor`；`quant_target`：量化目标模块；`quant_dtype`：量化数据类型；`bit_config`：量化位宽配置文件；`output_dir`：转换后输出的权重路径。
-  
-  混合精度的yaml文件没有上传至`amct`仓库，请用户在`amct_pytorch/configs/`路径下创建`mxfp_moe_w4a8_attn_w8a8.yaml`，文件配置如下：
-  
-   ```shell
-   w_bits: 8
-   a_bits: 8
-
-   moe:
-     routed:
-       w_bits: 4
-       a_bits: 8
-     shared:
-       w_bits: 8
-       a_bits: 8
-  ```
 
   权重转换拉起示例：
 
   ```shell
   python3 amct_pytorch/cli/llm/deploy.py \
+      --trust_remote_code \
       --model ./Hy3-BF16 \
       --model_name hy_v3 \
       --device npu:0 \
       --granularity tensor \
-      --quant_target moe attn-linear \
+      --quant_target moe attn-linear mlp \
       --quant_dtype mxfp \
-      --bit_config amct_pytorch/configs/mxfp_moe_w4a8_attn_w8a8.yaml \
-      --output_dir ./output
+      --bit_config amct_pytorch/configs/w8a8.yaml \
+      --output_dir /data/models/Hy3-MXFP8
   ```
 
 
@@ -214,7 +200,7 @@ modelscope download --model Tencent-Hunyuan/Hy3-FP8 --local_dir /data/models/Hy3
 | 平台 | YAML 文件 | 默认 `model_path` | 精度/特性 | 说明 |
 | --- | --- | --- | --- | --- |
 | A3 | `ci_a3/hy3_rank16_bf16_mtp.yaml` | `/data/models/Hy3-BF16` | BF16 + MTP | 8卡 16rank，`next_n=1` |
-| A5/950 | `ci_950/hy3_rank4_mxfp4_mtp.yaml` | `/data/models/Hy3-MXFP4` | MXFP8 + MXFP4 + MTP | 4卡，`next_n=1` |
+| A5/950 | `ci_950/hy3_rank4_mxfp8_mtp.yaml` | `/data/models/Hy3-MXFP8` | MXFP8 + MTP | 4卡，`next_n=1` |
 | A5/950 | `ci_950/hy3_rank4_fp8_mtp.yaml` | `/data/models/Hy3-FP8` | FP8 + MTP | 4卡，`next_n=1` |
 
 > 说明：A5/950 配置当前面向量化权重，快速启动阶段只下载 BF16 权重；量化权重准备方式见[转换权重](#转换权重)章节。
@@ -245,7 +231,7 @@ A5/950 MXFP8+MXFP4 + MTP 示例。该命令仅在已准备对应量化权重，�
 ```bash
 cd /home/code/cann-recipes-infer/models/hy3
 export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3
-bash ../../executor/scripts/infer.sh --model hy3 --yaml ci_950/hy3_rank4_mxfp4_mtp.yaml
+bash ../../executor/scripts/infer.sh --model hy3 --yaml ci_950/hy3_rank4_mxfp8_mtp.yaml
 ```
 
 A5/950 FP8 + MTP 示例。该命令仅在已准备 FP8 权重，并将 YAML 中的 `model_path` 修改为真实路径后执行：
