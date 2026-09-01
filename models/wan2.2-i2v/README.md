@@ -1,5 +1,5 @@
-# 在昇腾Atlas A2/A3环境上适配Wan2.2-I2V模型的推理
-Wan2.2-I2V模型是一款多模态视频生成模型，提供了图生视频功能。本项目旨在提供 Wan2.2-I2V 模型的 Atlas A2 适配版本，为开发者开展相关 NPU 迁移工作提供参考。
+# 在昇腾Atlas A2/A3/950环境上适配Wan2.2-I2V模型的推理
+Wan2.2-I2V模型是一款多模态视频生成模型，提供了图生视频功能。本项目旨在提供 Wan2.2-I2V 模型的 Atlas A2/A3/950 适配版本，为开发者开展相关 NPU 迁移工作提供参考。
 
 本项目基于NPU主要完成以下优化点，具体内容可至[NPU Wan2.2-I2V模型推理优化实践](https://gitcode.com/cann/cann-recipes-infer/blob/master/docs/models/wan2.2-i2v/wan2.2-i2v_optimization.md)查看：
 
@@ -13,30 +13,74 @@ Wan2.2-I2V模型是一款多模态视频生成模型，提供了图生视频功�
 
 
 ## 执行样例
-本样例支持支持Atlas A2/A3环境的单卡/多卡推理。
+本样例支持Atlas A2/A3/950环境的单卡/多卡推理。
 > 使用CANNLab一站式开发平台的用户可直接跳转[CANNLab一站式开发平台的快速启动](#cannlab一站式开发平台的快速启动)章节。
 
 ### CANN环境准备
 
-1. 安装CANN软件包
+#### 1. 安装CANN软件包
 
-   本样例的编译执行依赖CANN开发套件包与CANN二进制算子包，支持的CANN软件版本为`CANN 8.5.0`。
-  
-   请从[软件包下载地址](https://www.hiascend.com/developer/download/community/result?module=cann&cann=8.5.0)下载`Ascend-cann-toolkit_${version}_linux-${arch}.run`和`Ascend-cann-${soc}-ops_${version}_linux-${arch}.run`软件包，并参考[CANN安装文档](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/850/softwareinst/instg/instg_0000.html?Mode=PmIns&InstallType=netconda&OS=Debian)进行安装。
-   
-   - `${soc}`表示芯片版本，如910b、A3。
-   - `${version}`表示CANN包版本号，如8.5.0。
-   - `${arch}`表示CPU架构，如aarch64、x86_64。
+本样例的编译执行依赖CANN开发套件包与CANN二进制算子包，不同硬件版本要求不一致：
+- 昇腾Atlas A2/A3环境：支持的CANN软件版本>=`CANN 8.5.0`
+- 昇腾Atlas 950环境：支持的CANN软件版本>=`CANN 9.0.0`
 
-2. 安装Ascend Extension for PyTorch（torch_npu）。
+可选择：手动安装或直接使用cann两种方式
+**a. cann镜像**
+请登陆[cann镜像地址](https://www.hiascend.com/developer/ascendhub/detail/17da20d1c2b6493cb38765adeba85884)，点击**镜像下载**，根据芯片，cann版本，系统架构选择对应镜像，比如`8.5.0-910b-ubuntu22.04-py3.11` 或者 `9.0.1-950-ubuntu22.04-py3.12`，点击**立即下载**按指导进行docker pull。 完成镜像拉取后，使用如下指令开启镜像：
+```
+docker run -u root -itd --name cann_recipes_infer_image --ulimit nproc=65535:65535 --ipc=host \
+--device=/dev/davinci0 \
+--device=/dev/davinci1 \
+--device=/dev/davinci2 \
+--device=/dev/davinci3 \
+--device=/dev/davinci4 \
+--device=/dev/davinci5 \
+--device=/dev/davinci6 \
+--device=/dev/davinci7 \
+--device=/dev/davinci_manager --device=/dev/devmm_svm \
+--device=/dev/hisi_hdc \
+-v your_develop_path:your_develop_path \
+-v /etc/localtime:/etc/localtime \
+-v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
+-v /etc/ascend_install.info:/etc/ascend_install.info -v /var/log/npu/:/usr/slog \
+-v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi -v /sys/fs/cgroup:/sys/fs/cgroup:ro \
+-v /usr/local/dcmi:/usr/local/dcmi -v /usr/local/sbin:/usr/local/sbin \
+-v /etc/hccn.conf:/etc/hccn.conf -v /root/.pip:/root/.pip -v /etc/hosts:/etc/hosts \
+-v /usr/bin/hostname:/usr/bin/hostname \
+--net=host \
+--shm-size=128g \
+--privileged \
+swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:${version}-${soc}-${os}-py${python_version}-devel /bin/bash
+```
+注意：需要将权重路径和源码路径挂载到容器里。以上示例挂载 8 个 NPU 设备，并挂载源码与权重目录。
 
-   Ascend Extension for PyTorch（torch_npu）为支撑PyTorch框架运行在NPU上的适配插件，本样例支持的Ascend Extension for PyTorch版本为`v7.3.0`，PyTorch版本为`2.7.1`。
+**b. 手动安装**
+请下载Ascend-cann-toolkit_${version}_linux-${arch}.run`和`Ascend-cann-${soc}-ops_${version}_linux-${arch}.run`软件包：
+- 昇腾Atlas A2/A3环境：支持的CANN软件版本>=`CANN 8.5.0`, [下载地址](https://www.hiascend.com/developer/download/community/result?module=cann&cann=8.5.0)
+- 昇腾Atlas 950环境：支持的CANN软件版本>=`CANN 9.0.0`,[下载地址](https://www.hiascend.com/developer/download/community/result?module=cann&cann=9.0.0)
 
-   请从[软件包下载地址](https://gitcode.com/Ascend/pytorch/releases/v7.3.0-pytorch2.7.1)下载`torch_npu-2.7.1.post2-cp311-cp311-manylinux_2_28_${arch}.whl`安装包，并参考[torch_npu安装文档](https://www.hiascend.com/document/detail/zh/Pytorch/730/configandinstg/instg/docs/zh/installation_guide/installation_via_binary_package.md)进行安装。
+安装步骤请按硬件对应的软件版本参考文档：
+- 昇腾Atlas A2/A3环境：[CANN 8.5.0安装文档](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/850/softwareinst/instg/instg_0000.html?Mode=PmIns&InstallType=netconda&OS=Debian)
+- 昇腾Atlas 950环境：[CANN 9.0.0安装文档](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/900/softwareinst/instg/instg_0090.html?OS=Ubuntu&InstallType=localpack)
 
-    - `${arch}`表示CPU架构，如aarch64、x86_64。
+其中：
+- `${soc}`表示芯片版本，如910b、A3、950。
+- `${version}`表示CANN包版本号，如8.5.0，9.0.0。
+- `${arch}`表示CPU架构，如aarch64、x86_64。
+- `${os}`表示操作系统版本，如ubuntu22.04。
+- `${python_version}`表示Python版本，如3.11、3.12。
 
 
+#### 2. 安装Ascend Extension for PyTorch（torch_npu）。
+
+Ascend Extension for PyTorch（torch_npu）为支撑PyTorch框架运行在NPU上的适配插件，按硬件选择相关版本
+
+- A2/A3 ： Ascend Extension for PyTorch版本为`v7.3.0`，PyTorch版本为`2.7.1`。
+- 950 ： Ascend Extension for PyTorch版本为`v26.0.0`，PyTorch版本为`2.7.1`。
+
+按照上述版本，根据当前环境的系统架构（x86_64 or AArch64）和Python版本（建议3.12），参考对应的安装文档：
+- A2/A3：[torch_npu v7.3.0安装文档](https://www.hiascend.com/document/detail/zh/Pytorch/730/configandinstg/instg/docs/zh/installation_guide/installation_via_binary_package.md)
+- 950：[torch_npu v26.0.0安装文档](https://www.hiascend.com/document/detail/zh/Pytorch/2600/configandinstg/instg/docs/zh/installation_guide/installation_via_binary_package.md)
 
 ### 依赖安装
 
@@ -223,12 +267,12 @@ bash infer_platform.sh
 
 ## 性能数据
 
-本样例的多卡端到端推理性能如下表所示（Ulysses=8，Ring_size=1，CFG_size=1)：
+本样例在 Atlas A2 和 Atlas 950 上的端到端推理性能如下表所示（Ulysses=8，Ring_size=1，CFG_size=1）：
 
-| 规格 | Atlas 800I A2 - 8卡 / s |
-|--|:--:|
-| 832 x 480 x 61 | 102.54 |
-| 1280 x 720 x 81 | 418.01 |
+| 规格 | Atlas 800I A2 - 8卡 / s | Atlas 950 - 8卡 / s |
+|--|:--:|:--:|
+| 832 x 480 x 61 | 102.54 | 52.24 |
+| 1280 x 720 x 81 | 418.01 | 303.17 |
 
 ## 附录
 
@@ -259,4 +303,3 @@ bash infer_platform.sh
 | `prompt` | 文本提示词 |
 | `base_seed` | 随机种子 |
 | `convert_model_dtype` | 单卡场景将模型权重转换至推理精度，降低显存占用 |
- 

@@ -21,11 +21,17 @@ import logging
 import torch
 import torch_npu
 import torch.nn as nn
+import torch.nn.functional as F
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 from wan.modules.attention import attention
 from module.dit_cache import cache_manager
 
+
+try:
+    DEVICE_NAME = torch.npu.get_device_name()
+except Exception:
+    DEVICE_NAME = ""
 
 __all__ = ['WanModel']
 
@@ -110,9 +116,15 @@ class WanLayerNorm(nn.LayerNorm):
         Args:
             x(Tensor): Shape [B, L, C]
         """
-        return torch_npu.npu_layer_norm_eval(
-            x, normalized_shape=[self.dim], weight=self.weight, bias=self.bias, eps=self.eps
-        )
+
+        if "950" in DEVICE_NAME:
+            return F.layer_norm(
+                x, normalized_shape=[self.dim], weight=self.weight, bias=self.bias, eps=self.eps
+            )
+        else:
+            return torch_npu.npu_layer_norm_eval(
+                x, normalized_shape=[self.dim], weight=self.weight, bias=self.bias, eps=self.eps
+            )
 
 
 class FusedLayerNormModulate(nn.Module):
@@ -125,13 +137,27 @@ class FusedLayerNormModulate(nn.Module):
     def forward(self, x, scale, shift):
         r"""
         Args:
-            x(Tensor)
+            x(Tensor): Shape [B, L, C]
+            scale(Tensor): Shape [B, L, C], per-element modulation scale
+            shift(Tensor): Shape [B, L, C], per-element modulation shift
         """
-        weight = 1.0 + scale
-        bias = shift
-        return torch_npu.npu_layer_norm_eval(
-            x, normalized_shape=[self.dim], weight=weight, bias=bias, eps=self.eps
-        )
+        if "950" in DEVICE_NAME:
+            # Since the shape of weights is [XX, self.dim]  not [self.dim], F.layer_norm cannot perform affine
+            # F.layer_norm without affine params does pure normalization firstly
+            # Then apply per-element modulation: * (1 + scale) + shift
+            # This is equivalent to npu_layer_norm_eval(x, weight=1+scale, bias=shift)
+            x_norm = F.layer_norm(
+                x, normalized_shape=[self.dim], weight=None, bias=None, eps=self.eps
+            )
+            scale = scale.to(x_norm.dtype)
+            shift = shift.to(x_norm.dtype)
+            return x_norm * (1 + scale) + shift
+        else:
+            weight = 1.0 + scale
+            bias = shift
+            return torch_npu.npu_layer_norm_eval(
+                x, normalized_shape=[self.dim], weight=weight, bias=bias, eps=self.eps
+            )
 
 
 class WanSelfAttention(nn.Module):
