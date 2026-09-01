@@ -25,4 +25,4 @@ parallel_config:
 
 scheduler_config:
   max_new_tokens: 1
-  batch_size: 1        
+  batch_size: 1

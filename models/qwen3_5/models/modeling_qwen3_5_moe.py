@@ -21,7 +21,7 @@ import os
 import logging
 from collections.abc import Callable
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import List, Optional, Iterable
 
 import torch
@@ -82,6 +82,105 @@ def qwen3_5_all_reduce(tensor: torch.Tensor, group) -> None:
         tensor.copy_(tensor_fp32.to(tensor.dtype))
     else:
         dist.all_reduce(tensor, group=group)
+
+
+def _qwen3_5_token_shard_supported(infer_config: InferenceConfig) -> bool:
+    """Return whether the configured parallel layout supports token sharding."""
+    parallel_config = infer_config.parallel_config
+    return (
+        parallel_config.attn_tp_size > 1
+        and parallel_config.moe_tp_size == 1
+        and parallel_config.moe_ep_size == parallel_config.attn_tp_size
+        and parallel_config.shared_tp_size == 1
+        and not infer_config.model_config.custom_params.get("enable_mm_all_reduce_base", False)
+    )
+
+
+def qwen3_5_attention_reduce(
+    output: torch.Tensor,
+    attn_tp_size: int,
+    group,
+    enable_token_shard: bool = False,
+):
+    """Keep token-sharded activations for EP-only attention/TP layouts."""
+    token_shard_active = (
+        attn_tp_size > 1
+        and enable_token_shard
+        and output.shape[0] % attn_tp_size == 0
+    )
+    if token_shard_active:
+        local_shape = (
+            output.shape[0] // attn_tp_size,
+            output.shape[1],
+        )
+        if qwen3_5_use_aiv_all_reduce and output.dtype == torch.bfloat16:
+            output_fp32 = output.to(torch.float32)
+            local_output_fp32 = output_fp32.new_empty(*local_shape)
+            dist.reduce_scatter_tensor(
+                local_output_fp32,
+                output_fp32,
+                group=group,
+            )
+            return local_output_fp32.to(output.dtype)
+
+        local_output = output.new_empty(*local_shape)
+        dist.reduce_scatter_tensor(local_output, output, group=group)
+        return local_output
+    qwen3_5_all_reduce(output, group=group)
+    return output
+
+
+def _build_qwen3_5_pad_prefill_metadata(forward_metadata, pad_len):
+    """Add a dummy request so FA sees matching padded Q and KV lengths."""
+    def append_length(value, length):
+        if value is None:
+            return None
+        if isinstance(value, torch.Tensor):
+            return torch.cat([value, value.new_tensor([length])])
+        return [*value, length]
+
+    def append_cumulative(value, length):
+        if value is None:
+            return None
+        last = value[-1].item() if isinstance(value, torch.Tensor) else value[-1]
+        return append_length(value, last + length)
+
+    padded_actual_q = append_length(forward_metadata.actual_seq_lengths_q, pad_len)
+    padded_actual_kv = append_length(forward_metadata.actual_seq_lengths_kv, pad_len)
+    padded_cu_q = append_cumulative(forward_metadata.actual_seq_lengths_cu_q, pad_len)
+    padded_cu_kv = append_cumulative(forward_metadata.actual_seq_lengths_cu_kv, pad_len)
+    padded_list_q = append_length(forward_metadata.actual_seq_lengths_list_q, pad_len)
+    padded_list_kv = append_length(forward_metadata.actual_seq_lengths_list_kv, pad_len)
+    padded_cu_list_q = append_cumulative(forward_metadata.actual_seq_lengths_cu_list_q, pad_len)
+    padded_cu_list_kv = append_cumulative(forward_metadata.actual_seq_lengths_cu_list_kv, pad_len)
+    slot_mapping = forward_metadata.slot_mapping
+    new_slot_mapping = dict(slot_mapping) if slot_mapping else slot_mapping
+    if slot_mapping:
+        for key, mapping in slot_mapping.items():
+            mapping = mapping.reshape(-1)
+            dummy_slots = torch.arange(pad_len, device=mapping.device, dtype=mapping.dtype)
+            new_slot_mapping[key] = torch.cat([mapping, dummy_slots])
+
+    block_table = forward_metadata.block_table
+    new_block_table = dict(block_table) if block_table else block_table
+    if block_table:
+        for key, table in block_table.items():
+            dummy_row = table.new_zeros((1, table.shape[1]))
+            new_block_table[key] = torch.cat([table, dummy_row], dim=0)
+    padded_metadata = replace(
+        forward_metadata,
+        actual_seq_lengths_q=padded_actual_q,
+        actual_seq_lengths_kv=padded_actual_kv,
+        actual_seq_lengths_cu_q=padded_cu_q,
+        actual_seq_lengths_cu_kv=padded_cu_kv,
+        actual_seq_lengths_list_q=padded_list_q,
+        actual_seq_lengths_list_kv=padded_list_kv,
+        actual_seq_lengths_cu_list_q=padded_cu_list_q,
+        actual_seq_lengths_cu_list_kv=padded_cu_list_kv,
+        slot_mapping=new_slot_mapping,
+        block_table=new_block_table,
+    )
+    return padded_metadata
 
 
 def qwen3_5_prefill_mm_all_reduce(
@@ -864,12 +963,14 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
         self.hidden_size = config.hidden_size
         self.infer_config = infer_config
         self.attn_tp_size = infer_config.parallel_config.attn_tp_size
+        self.moe_tp_size = infer_config.parallel_config.moe_tp_size
         self.attn_tp_rank = (
             comm_manager.get_rank("attn_tp_group") if self.attn_tp_size > 1 else 0
         )
         self.enable_mm_all_reduce_base = infer_config.model_config.custom_params.get(
             "enable_mm_all_reduce_base", False
         )
+        self.token_shard_supported = _qwen3_5_token_shard_supported(infer_config)
         self.comm_manager = comm_manager
         if config.linear_num_value_heads % self.attn_tp_size != 0:
             raise ValueError(
@@ -1351,9 +1452,11 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
             used_mm_all_reduce_base = False
 
         if self.attn_tp_size > 1 and not used_mm_all_reduce_base:
-            qwen3_5_all_reduce(
+            output = qwen3_5_attention_reduce(
                 output,
+                attn_tp_size=self.attn_tp_size,
                 group=self.comm_manager.get_group("attn_tp_group"),
+                enable_token_shard=(self.token_shard_supported and forward_metadata.is_prefill),
             )
 
         return output
@@ -1421,8 +1524,11 @@ class Qwen3_5MoeAttention(nn.Module):
         self.layer_idx = layer_idx
         self.exe_mode = infer_config.model_config.exe_mode
         self.attn_tp_size = infer_config.parallel_config.attn_tp_size
+        self.moe_tp_size = infer_config.parallel_config.moe_tp_size
+        self.moe_ep_size = infer_config.parallel_config.moe_ep_size
         self.attn_tp_rank = comm_manager.get_rank("attn_tp_group") if self.attn_tp_size > 1 else 0
         self.enable_mm_all_reduce_base = infer_config.model_config.custom_params.get("enable_mm_all_reduce_base", False)
+        self.token_shard_supported = _qwen3_5_token_shard_supported(infer_config)
         self.comm_manager = comm_manager
         self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
         self.num_heads = config.num_attention_heads
@@ -1645,7 +1751,12 @@ class Qwen3_5MoeAttention(nn.Module):
             attn_output = fused_attn_output
             used_mm_all_reduce_base = True
         if self.attn_tp_size > 1 and not used_mm_all_reduce_base:
-            qwen3_5_all_reduce(attn_output, group=self.comm_manager.get_group("attn_tp_group"))
+            attn_output = qwen3_5_attention_reduce(
+                attn_output,
+                attn_tp_size=self.attn_tp_size,
+                group=self.comm_manager.get_group("attn_tp_group"),
+                    enable_token_shard=(self.token_shard_supported and forward_metadata.is_prefill),
+            )
         return attn_output
 
 
@@ -2264,10 +2375,37 @@ class Qwen3_5MoeDecoderLayer(nn.Module):
         position_ids: torch.LongTensor | None = None,
         past_residual: torch.Tensor | None = None,
         forward_metadata: ForwardMetaData = None,
+        input_is_sharded: bool = False,
         prefill_metadata: LinearAttentionPrefillMetaData | None = None,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # RMSNorm is token-local, so normalize before restoring the full token sequence.
+        # This keeps the residual sharded and avoids transporting it through AllGather.
         hidden_states, hidden_scale, residual = self.input_layernorm(hidden_states, past_residual)
+
+        if input_is_sharded:
+            full_tokens = hidden_states.shape[0] * self.mlp.moe_ep_size
+            group = self.mlp.comm_manager.get_group("attn_tp_group")
+            gathered_hidden_states = hidden_states.new_empty(
+                full_tokens, *hidden_states.shape[1:]
+            )
+            dist.all_gather_into_tensor(
+                gathered_hidden_states,
+                hidden_states.contiguous(),
+                group=group,
+            )
+            hidden_states = gathered_hidden_states
+
+            if hidden_scale is not None:
+                gathered_hidden_scale = hidden_scale.new_empty(
+                    full_tokens, *hidden_scale.shape[1:]
+                )
+                dist.all_gather_into_tensor(
+                    gathered_hidden_scale,
+                    hidden_scale.contiguous(),
+                    group=group,
+                )
+                hidden_scale = gathered_hidden_scale
 
         # Token Mixer
         if self.layer_type == "linear_attention":
@@ -2286,6 +2424,13 @@ class Qwen3_5MoeDecoderLayer(nn.Module):
                 position_embeddings=position_embeddings,
                 forward_metadata=forward_metadata,
                 dynamic_scale=hidden_scale,
+            )
+
+        if hidden_states.shape[0] != residual.shape[0]:
+            raise RuntimeError(
+                "Qwen3.5 hidden_states and residual have inconsistent token lengths: "
+                f"hidden_states.shape[0]={hidden_states.shape[0]}, "
+                f"residual.shape[0]={residual.shape[0]}"
             )
 
         # Fully Connected
@@ -2326,6 +2471,7 @@ class Qwen3_5MoeTextModel(nn.Module):
         self.infer_config = infer_config
         self.comm_manager = comm_manager
         self.embed_tp_size = infer_config.parallel_config.embed_tp_size
+        self.attn_tp_size = infer_config.parallel_config.attn_tp_size
         self.vocab_size_per_rank = config.vocab_size // self.embed_tp_size
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
@@ -2345,6 +2491,7 @@ class Qwen3_5MoeTextModel(nn.Module):
         self.norm = Qwen3_5MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen3_5MoeTextRotaryEmbedding(config=config)
         self.gradient_checkpointing = False
+        self.token_shard_supported = _qwen3_5_token_shard_supported(infer_config)
 
     @staticmethod
     def _prepare_linear_attention_prefill_metadata(
@@ -2402,6 +2549,24 @@ class Qwen3_5MoeTextModel(nn.Module):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
         position_ids = position_ids.view(-1).long()
+        original_forward_metadata = forward_metadata
+        pad_len = 0
+        if forward_metadata.is_prefill and self.token_shard_supported:
+            prompt_tokens = int(forward_metadata.prompt_tokens)
+            padded_tokens = ((prompt_tokens + self.attn_tp_size - 1) // self.attn_tp_size) * self.attn_tp_size
+            pad_len = padded_tokens - prompt_tokens
+            if pad_len:
+                if input_ids is not None and input_ids.shape[0] < padded_tokens:
+                    input_ids = torch.cat([
+                        input_ids,
+                        input_ids.new_zeros(padded_tokens - input_ids.shape[0]),
+                    ])
+                if inputs_embeds is not None and inputs_embeds.shape[0] < padded_tokens:
+                    inputs_embeds = torch.cat([
+                        inputs_embeds,
+                        inputs_embeds.new_zeros((padded_tokens - inputs_embeds.shape[0], *inputs_embeds.shape[1:])),
+                    ])
+                position_ids = torch.cat([position_ids, position_ids.new_zeros(pad_len)])
 
         if inputs_embeds is None:
             if self.embed_tp_size > 1:
@@ -2416,6 +2581,19 @@ class Qwen3_5MoeTextModel(nn.Module):
 
         hidden_states = inputs_embeds
 
+        padded_forward_metadata = forward_metadata
+        if pad_len:
+            padded_forward_metadata = _build_qwen3_5_pad_prefill_metadata(
+                forward_metadata,
+                pad_len,
+            )
+            # Attention/cache paths consume the padded metadata for this pass.
+            forward_metadata = padded_forward_metadata
+
+        # RoPE metadata is packed for the full (possibly padded) prompt; build
+        # it before token sharding so its sequence dimension matches position_ids.
+        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+
         prefill_metadata = (
             self._prepare_linear_attention_prefill_metadata(
                 forward_metadata,
@@ -2425,9 +2603,20 @@ class Qwen3_5MoeTextModel(nn.Module):
             else None
         )
 
-        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        # In Prefill, shard the replicated embedding output across the attention
+        # TP ranks when the token count is evenly divisible. Complete the
+        # vocabulary-TP all-reduce before slicing to keep token positions aligned.
+        token_shard_active = self.token_shard_supported and forward_metadata.is_prefill and (
+            hidden_states.shape[0] % self.attn_tp_size == 0
+        )
+        if token_shard_active:
+            rank = self.comm_manager.get_rank("attn_tp_group")
+            hidden_states = torch.chunk(hidden_states, self.attn_tp_size, dim=0)[rank]
+
         residual = None
 
+        # The first layer receives either the full embedding output or its local
+        # token shard; subsequent layers preserve the same token-shard layout.
         for layer_idx, decoder_layer in enumerate(self.layers[: self.config.num_hidden_layers]):
             residual, hidden_states = decoder_layer(
                 hidden_states,
@@ -2436,13 +2625,28 @@ class Qwen3_5MoeTextModel(nn.Module):
                 past_residual=residual,
                 forward_metadata=forward_metadata,
                 prefill_metadata=prefill_metadata,
+                input_is_sharded=token_shard_active,
                 **kwargs,
             )
 
+        # Final RMSNorm is token-local; keep the residual sharded and gather only
+        # the normalized states needed by the global last-token selection below.
         hidden_states, _, _ = self.norm(hidden_states, residual)
 
+        if token_shard_active:
+            full_hidden_states = hidden_states.new_empty(
+                hidden_states.shape[0] * self.attn_tp_size,
+                *hidden_states.shape[1:],
+            )
+            dist.all_gather_into_tensor(
+                full_hidden_states,
+                hidden_states.contiguous(),
+                group=self.comm_manager.get_group("attn_tp_group"),
+            )
+            hidden_states = full_hidden_states
+
         # TND format: get last token for each sequence using index_select
-        cu_seq_lens_q = forward_metadata.actual_seq_lengths_cu_q if forward_metadata else None
+        cu_seq_lens_q = original_forward_metadata.actual_seq_lengths_cu_q if original_forward_metadata else None
         if cu_seq_lens_q is None:
             raise RuntimeError("actual_seq_lengths_cu_q is required.")
 
