@@ -37,6 +37,10 @@ BLOCK_K = 32
 PACK_FACTOR = 2
 
 
+def _get_swiglu_clamp_limit(swiglu_limit):
+    return swiglu_limit if swiglu_limit is not None else -1.0
+
+
 def transpose_packed_fp4(weight: torch.Tensor) -> torch.Tensor:
     """Convert packed [..., N, K/2] FP4 weights to packed [..., K, N/2]."""
     if weight.dim() < 2:
@@ -164,14 +168,15 @@ class W4A8MxFp4MoEGMMMethod(QuantizeMethodBase):
         )[0]
 
         swiglu_limit = kwargs.get("swiglu_limit", None)
-        enable_custom_ops = kwargs.get("enable_custom_ops", False)
-        if enable_custom_ops:
-            intermediate_h, pertoken_scale , _ = torch.ops.custom.npu_swiglu_group_quant(mm1_mm3,
-                                                                                        dst_type=torch.float8_e4m3fn,
-                                                                                        round_scale=True,
-                                                                                        quant_mode=1,
-                                                                                        clamp_limit=swiglu_limit,
-                                                                                        group_index=expert_tokens)
+        enable_cann_ops_nn = kwargs.get("enable_cann_ops_nn", False)
+        if enable_cann_ops_nn:
+            intermediate_h, pertoken_scale, _ = torch.ops.cann_ops_nn.swiglu_group_quant(
+                mm1_mm3,
+                dst_type=torch.float8_e4m3fn,
+                round_scale=True,
+                quant_mode=1,  # 1: dynamic quantization
+                clamp_limit=_get_swiglu_clamp_limit(swiglu_limit),
+                group_index=expert_tokens)
         else:
             intermediate_h, pertoken_scale = torch_npu.npu_swiglu_mx_quant(
                                                 mm1_mm3,
@@ -508,14 +513,15 @@ class UpGateW4A4DownW4A8MxFp4MoEGMMMethod(W4A8MxFp4MoEGMMMethod):
         )[0]
 
         swiglu_limit = kwargs.get("swiglu_limit", None)
-        enable_custom_ops = kwargs.get("enable_custom_ops", False)
-        if enable_custom_ops:
-            intermediate_h, pertoken_scale , _ = torch.ops.custom.npu_swiglu_group_quant(mm1_mm3,
-                                                                                        dst_type=torch.float8_e4m3fn,
-                                                                                        round_scale=True,
-                                                                                        quant_mode=1,
-                                                                                        clamp_limit=swiglu_limit,
-                                                                                        group_index=expert_tokens)
+        enable_cann_ops_nn = kwargs.get("enable_cann_ops_nn", False)
+        if enable_cann_ops_nn:
+            intermediate_h, pertoken_scale, _ = torch.ops.cann_ops_nn.swiglu_group_quant(
+                mm1_mm3,
+                dst_type=torch.float8_e4m3fn,
+                round_scale=True,
+                quant_mode=1,  # 1: dynamic quantization
+                clamp_limit=_get_swiglu_clamp_limit(swiglu_limit),
+                group_index=expert_tokens)
         else:
             mm1_mm3 = torch_npu.npu_swiglu(mm1_mm3)
             intermediate_h, pertoken_scale = torch_npu.npu_dynamic_mx_quant(mm1_mm3, dst_type=torch.float8_e4m3fn)

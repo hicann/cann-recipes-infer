@@ -33,7 +33,7 @@ from torch.distributed.distributed_c10d import _world
 from functools import lru_cache
 
 import torch_npu
-import custom_ops
+import cann_ops_transformer
 from transformers.modeling_attn_mask_utils import (
     AttentionMaskConverter,
     _prepare_4d_attention_mask,
@@ -62,6 +62,25 @@ except ImportError:
     _torch_fx_available = False
 
 
+# FP8 KV caches use a packed record (nope + rope + scales + padding), stored as raw bytes.
+# Full-quant HiF8 caches are raw HIFLOAT8 records with the model head dimension.
+PACKED_KV_STORAGE_DTYPE = torch.uint8
+PACKED_KV_COMPUTE_DTYPE = torch.float8_e4m3fn
+
+
+def is_packed_kv_layout(kv_cache_quant_mode: str) -> bool:
+    # Only the FP8 record has the extra packed fields and needs a FLOAT8 view.
+    return kv_cache_quant_mode == "float8"
+
+
+def get_kv_cache_dim(head_dim: int, rope_head_dim: int, kv_cache_quant_mode: str) -> int:
+    if not is_packed_kv_layout(kv_cache_quant_mode):
+        return head_dim
+    nope_head_dim = head_dim - rope_head_dim
+    # nope(fp8 1B) + rope(bf16 2B) + scales(bf16 2B per group, group_size=64)
+    return align_up(nope_head_dim + 2 * rope_head_dim + 2 * nope_head_dim // 64, 32)
+
+
 def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor, inverse: bool = False) -> torch.Tensor:
     y = x
     x = torch.view_as_complex(x.float().unflatten(-1, (-1, 2)))
@@ -88,16 +107,24 @@ def partial_rotary_mul_quant(
         cos, sin,
         partial_slice,
         platform_version,
-        origin_shape
+        origin_shape,
+        scale
     ):
     if cos.dtype != tensor.dtype:
         cos = cos.to(tensor.dtype)
         sin = sin.to(tensor.dtype)
-    tensor = torch.ops.custom.partial_rotary_mul_quant(
+    torch.ops.cann_ops_transformer.inplace_partial_rotary_mul(
         tensor, cos, sin,
         rotary_mode="interleave",
         partial_slice=partial_slice,
-        scale=1.0
+    )
+    tensor = torch_npu.npu_quantize(
+        tensor,
+        scale,
+        None,
+        torch_npu.hifloat8,
+        -1,
+        False,
     )
     return tensor.view(origin_shape)
 

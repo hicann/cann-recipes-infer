@@ -417,13 +417,14 @@ class Fp8PerTileMoEGMMMethod(QuantizeMethodBase):
         )[0]
 
         swiglu_limit = kwargs.get("swiglu_limit", None)
-        enable_custom_ops = kwargs.get("enable_custom_ops", False)
-        if enable_custom_ops:
-            intermediate_h, pertoken_scale , _ = torch.ops.custom.npu_swiglu_group_quant(mm1_mm3,
-                                                                                        dst_type=torch.float8_e4m3fn,
-                                                                                        quant_mode=0,
-                                                                                        clamp_limit=swiglu_limit,
-                                                                                        group_index=expert_tokens)
+        enable_cann_ops_nn = kwargs.get("enable_cann_ops_nn", False)
+        if enable_cann_ops_nn:
+            intermediate_h, pertoken_scale, _ = torch.ops.cann_ops_nn.swiglu_group_quant(
+                mm1_mm3,
+                dst_type=torch.float8_e4m3fn,
+                quant_mode=0,  # 0: static quantization
+                clamp_limit=swiglu_limit if swiglu_limit is not None else -1.0,
+                group_index=expert_tokens)
         else:
             mm1_mm3 = torch_npu.npu_swiglu(mm1_mm3)
             intermediate_h, pertoken_scale = torch_npu.npu_dynamic_block_quant(

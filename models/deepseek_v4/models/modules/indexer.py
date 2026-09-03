@@ -33,6 +33,7 @@ import torch.distributed as dist
 
 import torch_npu
 import torchair as tng
+import cann_ops_transformer
 
 from transformers.cache_utils import Cache
 from executor.core.config import InferenceConfig, CommManager
@@ -60,8 +61,6 @@ class Indexer(nn.Module):
             self.layer_idx = 0 # mtp model only has one layer of cache
         self.li_cache_quant_mode = config.quant_config.li_cache_quant_mode \
             if config.quant_config is not None else "unquant"
-        if self.li_cache_quant_mode == "hifloat8":
-            import cann_ops_transformer
         self.mm_quant_mode = (
             config.quant_config.mm_quant_mode
             if config.quant_config is not None
@@ -116,6 +115,10 @@ class Indexer(nn.Module):
             self.register_buffer(
                 "q_scale_ones",
                 torch.ones([1], dtype=torch.float32),
+            )
+        if self.li_cache_quant_mode == "hifloat8":
+            self.register_buffer(
+                "hif8_quant_scale", torch.ones(1, dtype=torch.bfloat16), persistent=False
             )
 
     def get_cache(self, cache_name: str) -> torch.Tensor:
@@ -187,9 +190,10 @@ class Indexer(nn.Module):
                         partial_slice=self.partial_slice,
                         platform_version=self.platform_version,
                         origin_shape=q.shape,
+                        scale=self.hif8_quant_scale,
                     )
                 else:
-                    torch.ops.custom.inplace_partial_rotary_mul(
+                    torch.ops.cann_ops_transformer.inplace_partial_rotary_mul(
                         q.unsqueeze(2), cos, sin,
                         rotary_mode="interleave",
                         partial_slice=self.partial_slice,
@@ -260,62 +264,45 @@ class Indexer(nn.Module):
         weights: torch.Tensor,
         attn_metadata: Dict,
     ):
-        if self.li_cache_quant_mode == "hifloat8":
-            actual_seq_k = attn_metadata["actual_seq_k"]
-            cmp = attn_metadata.get("cmp_seqlens", {}).get(self.compress_ratio)
-            if cmp is None:
-                cmp = ((actual_seq_k // self.compress_ratio).to(torch.int32),
-                       (actual_seq_k % self.compress_ratio).to(torch.int32))
-            seqused_k, cmp_residual_k = cmp
-            if attn_metadata.get("tmp_block_table", None) and not self.is_online:
-                # enable prefill cp on offline mode
-                block_table = attn_metadata["tmp_block_table"]["c4a_cmp_kv"]
-            else:
-                block_table = attn_metadata["block_table"]["c4a_cmp_kv"]
-            li_input_kwargs = {
-                "query": q,
-                "key": k,
-                "weights": weights,
-                "query_dequant_scale": q_scale,
-                "key_dequant_scale": self.q_scale_ones,
-                "cu_seqlens_q": attn_metadata["cu_seq_lens_q"],
-                "seqused_k": seqused_k,
-                "cmp_residual_k": cmp_residual_k,
-                "block_table": block_table,
-                "metadata": attn_metadata["kernel_metadata"]["lightning_indexer_quant"],
-                "quant_mode": 4,  # 4: qk HiF8 per-tensor, scale fp32 (1: fp8-e4m3, 2: int8)
-                "layout_q": "TND",
-                "layout_k": 'PA_BBND',
-                "topk": self.index_topk,
-                "mask_mode": 3,  # 3: rightDownCausal (0: no mask)
-                "cmp_ratio": self.compress_ratio,  # only c4a have li module
-            }
-            topk_idxs, _ = torch.ops.cann_ops_transformer.quant_lightning_indexer(**li_input_kwargs)
+        ratio_key = str(self.compress_ratio)
+        # seqused_k is the valid length in the compressed cache; cmp_residual_k
+        # carries the remainder needed to reconstruct the original sequence length.
+        seq_used_k = attn_metadata["compressed_seq_lens"][ratio_key]
+        cu_seqlens_q = attn_metadata["cu_seq_lens_q"]
+        seq_used_q = attn_metadata["seq_used_q"]
+        block_table_key = f"c{self.compress_ratio}a_cmp_kv"
+        if attn_metadata.get("tmp_block_table", None) and not self.is_online:
+            # enable prefill cp on offline mode
+            block_table = attn_metadata["tmp_block_table"][block_table_key]
         else:
-            actual_seq_q = attn_metadata["actual_seq_q"]
-            actual_seq_k = attn_metadata["actual_seq_k"]
-            if attn_metadata.get("tmp_block_table", None) and not self.is_online:
-                # enable prefill cp on offline mode
-                block_table = attn_metadata["tmp_block_table"]["c4a_cmp_kv"]
-            else:
-                block_table = attn_metadata["block_table"]["c4a_cmp_kv"]
-            li_input_kwargs = {
-                "query": q,
-                "key": k,
-                "weights": weights,
-                "query_dequant_scale": q_scale,
-                "key_dequant_scale": k_scale.squeeze(-2),
-                "actual_seq_lengths_query": actual_seq_q,
-                "actual_seq_lengths_key": actual_seq_k,
-                "block_table": block_table,
-                "layout_key": 'PA_BSND',
-                "sparse_count": self.index_topk,
-                "sparse_mode": 3,
-                "layout_query": "TND",
-                "cmp_ratio": 4, # only c4a have li module
-                "key_quant_mode": 0,
-                "query_quant_mode": 0,
-                "metadata": attn_metadata["kernel_metadata"]["lightning_indexer_quant"]
-            }
-            topk_idxs, _ = torch.ops.custom.npu_quant_lightning_indexer(**li_input_kwargs)
+            block_table = attn_metadata["block_table"][block_table_key]
+        # Lightning Indexer quant modes: 1: FP8 E4M3, 2: INT8, 4: HiFloat8.
+        quant_mode = {"int8": 2, "hifloat8": 4}.get(self.li_cache_quant_mode, 1)
+        if self.li_cache_quant_mode == "hifloat8":
+            k_scale = self.q_scale_ones.to(
+                device=k_scale.device, dtype=k_scale.dtype
+            ).contiguous()
+        else:
+            k_scale = k_scale.squeeze(-2)
+
+        li_input_kwargs = {
+            "query": q,
+            "key": k,
+            "weights": weights,
+            "query_dequant_scale": q_scale,
+            "key_dequant_scale": k_scale,
+            "cu_seqlens_q": cu_seqlens_q,
+            "seqused_q": seq_used_q,
+            "seqused_k": seq_used_k,
+            "cmp_residual_k": attn_metadata["compressed_seq_remainders"][ratio_key],
+            "block_table": block_table,
+            "topk": self.index_topk,
+            "quant_mode": quant_mode,
+            "mask_mode": 3,  # 3: causal mask
+            "layout_q": "TND",
+            "layout_k": "PA_BBND",
+            "cmp_ratio": self.compress_ratio, # only c4a have li module
+            "metadata": attn_metadata["kernel_metadata"]["lightning_indexer_quant"]
+        }
+        topk_idxs, _ = torch.ops.cann_ops_transformer.quant_lightning_indexer(**li_input_kwargs)
         return topk_idxs.view(q.shape[0], -1, self.index_topk)

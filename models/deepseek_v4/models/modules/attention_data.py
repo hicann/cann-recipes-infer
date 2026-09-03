@@ -24,6 +24,7 @@ import torch.nn.functional as F
 import torch.distributed as dist
 from executor.core.config import InferenceConfig, CommManager, PlatformVersion
 from executor.utils import align_up
+from .common_modules import PACKED_KV_STORAGE_DTYPE, get_kv_cache_dim, is_packed_kv_layout
 
 
 def pad_tensor_tnd(ori_tensor, total_len, pad_value):
@@ -101,15 +102,8 @@ class AttnMetaData(nn.Module):
                 self.config.quant_config.gmm_quant_mode.replace("float", "mxfloat")
 
     def init_cache_dim(self):
-        cache_dim = self.config.head_dim
-        if "float" in self.kv_cache_quant_mode and self.kv_cache_quant_mode != "hifloat8":
-            rope_dim = self.config.qk_rope_head_dim
-            nope_dim = self.config.head_dim - rope_dim
-            # when FA FP8 quant is enabled, nope_cache, rope_cache, and scales
-            # are concatenated and passed via the kv input (FP8).
-            # nope(fp8 1B) + rope(bf16 2B) + scales(bf16 2B per group, group_size=64)，align_up(128B)
-            cache_dim = align_up(nope_dim + 2 * rope_dim + 2 * nope_dim // 64, 128)
-        self.cache_dim = cache_dim
+        self.cache_dim = get_kv_cache_dim(
+            self.config.head_dim, self.config.qk_rope_head_dim, self.kv_cache_quant_mode)
 
     def get_cmp_kv_dtype(self):
         use_fused_kernel_compressor = (
@@ -119,13 +113,13 @@ class AttnMetaData(nn.Module):
         cmp_kv_dtype = torch.float8_e4m3fn if (
             self.platform_version == PlatformVersion.ASCEND_950 and use_fused_kernel_compressor
         ) else torch.bfloat16
-        if self.kv_cache_quant_mode == "hifloat8":
-            cmp_kv_dtype = self.cache_dtype_map[self.kv_cache_quant_mode]
-        elif "float" in self.kv_cache_quant_mode:
-            cmp_kv_dtype = torch.float8_e4m3fn
+        if self.kv_cache_quant_mode in ("float8", "hifloat8"):
+            cmp_kv_dtype = PACKED_KV_STORAGE_DTYPE
         return cmp_kv_dtype
 
     def get_kv_cache_dtype(self):
+        if is_packed_kv_layout(self.kv_cache_quant_mode):
+            return PACKED_KV_STORAGE_DTYPE
         return self.cache_dtype_map[self.kv_cache_quant_mode]
 
     def create_cache(self, block_num, dim, dtype, device):
@@ -540,8 +534,6 @@ class AttnMetaData(nn.Module):
                 "seq_used_q": actual_seq_lengths_q.to(torch.int32),
                 "kernel_metadata": {}
             }
-        if self.kv_cache_quant_mode == "hifloat8":
-            self.precompute_cmp_seqlens(attn_metadata)
         if not self.is_mtp:
             self.get_cmp_metadata(attn_metadata, is_prefill)
         attn_metadata["shared_expert_stream"] = self.shared_expert_stream
@@ -564,21 +556,28 @@ class AttnMetaData(nn.Module):
                 metadata_get("cp_metadata"),
                 self.is_mtp,
             )
+            for zigzag_flag in ["prev", "next"]:
+                zigzag_metadata = attn_metadata.get(zigzag_flag)
+                if zigzag_metadata is None:
+                    raise KeyError(f"Missing CP attention metadata for {zigzag_flag}.")
+                self._add_compressed_seq_metadata(zigzag_metadata)
+        else:
+            self._add_compressed_seq_metadata(attn_metadata)
 
         return attn_metadata
 
-    def precompute_cmp_seqlens(self, attn_metadata):
-        # seqused_cmp / cmp_residual per compress ratio only depend on actual_seq_k, so compute them
-        # once here (default stream, at metadata build time) instead of on the metadata_stream
+    def _add_compressed_seq_metadata(self, attn_metadata):
         actual_seq_k = attn_metadata["actual_seq_k"]
-        cmp_seqlens = {}
-        for ratio in set(self.config.compress_ratios):
-            if ratio == 1:
-                cmp_seqlens[ratio] = (actual_seq_k, None)
-            else:
-                cmp_seqlens[ratio] = ((actual_seq_k // ratio).to(torch.int32),
-                                      (actual_seq_k % ratio).to(torch.int32))
-        attn_metadata["cmp_seqlens"] = cmp_seqlens
+        compressed_seq_lens = {}
+        compressed_seq_remainders = {}
+        for ratio in dict.fromkeys(self.config.compress_ratios):
+            if ratio <= 1:
+                continue
+            ratio_key = f"{ratio}"
+            compressed_seq_lens[ratio_key] = actual_seq_k // ratio
+            compressed_seq_remainders[ratio_key] = actual_seq_k % ratio
+        attn_metadata["compressed_seq_lens"] = compressed_seq_lens
+        attn_metadata["compressed_seq_remainders"] = compressed_seq_remainders
 
     def get_cp_metadata(self, input_ids, is_prefill, attn_metadata, cp_metadata, is_mtp):
         attn_metadata_ori = attn_metadata
@@ -728,14 +727,15 @@ class AttnMetaData(nn.Module):
                 device="npu",
             )
             cu_seq_lens_q = torch.cat([torch.zeros(1, dtype=torch.int32, device="npu"), actual_seq_q])
+            seq_used_q = torch.full(
+                [batch_size], cur_segment_len, dtype=torch.int32, device="npu")
             attn_metadata[zigzag_flag].update({
                 "slot_mapping_ori_kv": slot_mapping_ori_kv,
                 "actual_seq_k": actual_seq_k.to(torch.int32),
                 "actual_seq_q": actual_seq_q.to(torch.int32),
                 "cu_seq_lens_q": cu_seq_lens_q.to(torch.int32),
+                "seq_used_q": seq_used_q,
             })
-            if self.kv_cache_quant_mode == "hifloat8":
-                self.precompute_cmp_seqlens(attn_metadata[zigzag_flag])
 
         if is_mtp:
             return attn_metadata
@@ -962,7 +962,7 @@ class AttnMetaData(nn.Module):
 
         res_dict = {
             "cu_seq_lens": cu_seq_lens_dict,
-            "seq_used_q": seq_used_q_dict,
+            "cmp_seq_used_q": seq_used_q_dict,
             "start_pos": start_pos_dict,
             "position_ids_cmp_for_rope": position_ids_cmp_for_rope_dict,
             "slot_mapping_cmp": slot_mapping_cmp_dict, # tnd padding

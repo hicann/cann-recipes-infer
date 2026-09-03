@@ -165,22 +165,21 @@ class CompressedTensorW8A8Int8MoEGMMMethod(QuantizeMethodBase):
         )[0]
 
         swiglu_limit = kwargs.get("swiglu_limit", None)
-        enable_custom_ops = kwargs.get("enable_custom_ops", False)
-        dequant_swiglu_quant_ops = torch_npu.npu_dequant_swiglu_clamp_quant if enable_custom_ops else torch_npu.npu_dequant_swiglu_quant
         swiglu_limit_args = {}
-        if swiglu_limit:
+        if swiglu_limit is not None:
             swiglu_limit_args.update({
-                "swiglu_mode": 1,
+                # 2: contiguous [gate, up] split with the clamped SwiGLU computation.
+                "swiglu_mode": 2,
                 "clamp_limit": swiglu_limit,
                 "glu_alpha": 1,
                 "glu_bias": 0
             })
-        intermediate_h, pertoken_scale = dequant_swiglu_quant_ops(
+        intermediate_h, pertoken_scale = torch_npu.npu_dequant_swiglu_quant(
             mm1_mm3, weight_scale=layer.w13_weight_scale,
             quant_scale=layer.smooth_scale_2,
             group_index=expert_tokens,
             activate_left=True,
-            quant_mode=1,
+            quant_mode=1,  # 1: dynamic quantization
             activation_scale=pertoken_scale,
             **swiglu_limit_args,
             )

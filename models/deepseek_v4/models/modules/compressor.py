@@ -33,8 +33,9 @@ import torch.distributed as dist
 
 import torch_npu
 import torchair as tng
+from cann_ops_transformer import compressor
 from transformers.cache_utils import Cache
-from executor.core.config import InferenceConfig, CommManager
+from executor.core.config import InferenceConfig, CommManager, PlatformVersion
 from executor.utils import npu_stream_switch, get_had_pow2
 from module.linear import ReplicatedLinear
 from .common_modules import DeepseekV3RMSNorm, apply_rotary_emb, rotate_activation
@@ -55,6 +56,7 @@ class Compressor(nn.Module):
         self.head_dim = head_dim # 128 if indexer else 512
         self.rope_head_dim = config.qk_rope_head_dim
         self.nope_head_dim = self.head_dim - config.qk_rope_head_dim
+        self.partial_slice = [self.nope_head_dim, self.head_dim]
         self.compress_ratio = compress_ratio
         self.overlap = compress_ratio == 4
         self.rotate = rotate
@@ -100,8 +102,6 @@ class Compressor(nn.Module):
         self.hadamard_matrix = get_had_pow2(self.head_dim)
         self.kv_cache_quant_mode = config.quant_config.kv_cache_quant_mode \
             if config.quant_config is not None else "unquant"
-        if self.kv_cache_quant_mode in ("float8", "hifloat8"):
-            import cann_ops_transformer
 
         self.cp_size = self.infer_config.parallel_config.cp_size
         self.global_rank = kwargs.get("global_rank")
@@ -218,58 +218,75 @@ class Compressor(nn.Module):
         quantized_kv: Optional[torch.Tensor] = None,
         k_scale: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        scatter = torch_npu.npu_scatter_nd_update_
+        if self.platform_version == PlatformVersion.A3:
+            import custom_ops  # Registers the A3 custom operator binding.
+            scatter = torch.ops.custom.scatter_nd_update_asc
+
         if "index" in self.prefix:
             li_cmp_cache = cache_getter("li_cmp_kv")
             scale_cache = cache_getter("li_key_dequant_scale")
-            if self.li_cache_quant_mode == "float8":
-                torch.ops.custom.indexer_compress_epilog(
-                    x=kv,
-                    slot_mapping=cmp_slot_mapping,
-                    indexer_compress_cache=li_cmp_cache,
-                    indexer_compress_scale=scale_cache
-                )
-                return kv, None
-            elif self.li_cache_quant_mode == "hifloat8":
-                # indexer_compress_epilog (IndexerQuantCache) only accepts int32 slot_mapping
-                if cmp_slot_mapping.dtype != torch.int32:
-                    cmp_slot_mapping = cmp_slot_mapping.to(torch.int32)
-                torch.ops.custom.indexer_compress_epilog(
-                    x=kv,
-                    slot_mapping=cmp_slot_mapping,
-                    indexer_compress_cache=li_cmp_cache,
-                    indexer_compress_scale=scale_cache,
-                    quant_mode=2,  # 2: HIFLOAT_QUANT_MODE
+            if self.li_cache_quant_mode in ("float8", "hifloat8"):
+                quant_cache_kwargs = {
+                    "x": kv,
+                    "slot_mapping": cmp_slot_mapping,
+                    "cache": li_cmp_cache,
+                    "cache_scale": scale_cache,
+                    "quant_mode": "hifloat8" if self.li_cache_quant_mode == "hifloat8" else "fp8",
+                }
+                if self.li_cache_quant_mode == "hifloat8":
+                    quant_cache_kwargs["slot_mapping"] = cmp_slot_mapping.to(
+                        device=li_cmp_cache.device, dtype=torch.int32
+                    ).contiguous()
+                    quant_cache_kwargs["round_scale"] = True
+                torch.ops.cann_ops_transformer.indexer_quant_cache(
+                    **quant_cache_kwargs,
                 )
                 return kv, None
             else:
                 if quantized_kv is None and k_scale is None:
                     quantized_kv, k_scale = torch_npu.npu_dynamic_quant(kv)
                     k_scale = k_scale.to(torch.float16)
-                torch.ops.custom.scatter_nd_update_asc(scale_cache.view(-1, scale_cache.shape[-1]),
-                                                cmp_slot_mapping.view(-1, 1),
-                                                k_scale.view(-1, scale_cache.shape[-1]))
-                torch.ops.custom.scatter_nd_update_asc(li_cmp_cache.view(-1, li_cmp_cache.shape[-1]),
-                                                cmp_slot_mapping.view(-1, 1),
-                                                quantized_kv.view(-1, li_cmp_cache.shape[-1]))
+                scatter(scale_cache.view(-1, scale_cache.shape[-1]),
+                        cmp_slot_mapping.view(-1, 1),
+                        k_scale.view(-1, scale_cache.shape[-1]))
+                scatter(li_cmp_cache.view(-1, li_cmp_cache.shape[-1]),
+                        cmp_slot_mapping.view(-1, 1),
+                        quantized_kv.view(-1, li_cmp_cache.shape[-1]))
                 return quantized_kv, k_scale
         else:
             sfa_cmp_cache = cache_getter("sfa_cmp_kv")
-            if self.kv_cache_quant_mode in ("float8", "hifloat8"):
-                if self.kv_cache_quant_mode == "hifloat8":
-                    quant_mode = "hifloat8_fp4"
-                else:
-                    quant_mode = "fp8_bf16"
-                cache = sfa_cmp_cache.view(torch.uint8) if sfa_cmp_cache.dtype != torch.uint8 else sfa_cmp_cache
+            if self.kv_cache_quant_mode == "hifloat8":
+                cmp_slot_mapping = cmp_slot_mapping.to(
+                    device=sfa_cmp_cache.device, dtype=torch.int32
+                ).contiguous()
+                sfa_cache_scale = torch.empty(
+                    (*sfa_cmp_cache.shape[:-1], 1),
+                    dtype=torch.float32,
+                    device=sfa_cmp_cache.device,
+                )
+                sfa_x = kv.view(-1, self.head_dim)
+                torch.ops.cann_ops_transformer.indexer_quant_cache(
+                    cache=sfa_cmp_cache,
+                    cache_scale=sfa_cache_scale,
+                    x=sfa_x,
+                    slot_mapping=cmp_slot_mapping.view(-1),
+                    quant_mode="hifloat8",
+                    x_scale=1.0,
+                )
+            elif self.kv_cache_quant_mode == "float8":
                 torch.ops.cann_ops_transformer.kv_compress_epilog(
-                    x=kv if is_prefill else kv.view(-1, self.head_dim),
-                    slot_mapping=cmp_slot_mapping if is_prefill else cmp_slot_mapping.view(-1),
-                    cache=cache,
-                    quant_mode=quant_mode,
+                    x=kv.view(-1, self.head_dim),
+                    slot_mapping=cmp_slot_mapping.view(-1),
+                    cache=sfa_cmp_cache,
+                    quant_mode="fp8_bf16"
                 )
             else:
-                torch.ops.custom.scatter_nd_update_asc(sfa_cmp_cache.view(-1, sfa_cmp_cache.shape[-1]),
-                                                cmp_slot_mapping.view(-1, 1),
-                                                kv.view(-1, sfa_cmp_cache.shape[-1]))
+                scatter(
+                    sfa_cmp_cache.view(-1, sfa_cmp_cache.shape[-1]),
+                    cmp_slot_mapping.view(-1, 1),
+                    kv.view(-1, sfa_cmp_cache.shape[-1]),
+                )
             return kv, None
 
     def compressor_epilog(self, kv: torch.Tensor, attn_metadata: Dict, is_prefill: bool):
@@ -316,12 +333,12 @@ class Compressor(nn.Module):
         is_prefill: bool,
         attn_metadata_ori: Dict = None
     ):
+        cos_sin = attn_metadata["cos_sin"]
         if is_prefill and self.cp_size > 1:
-            cos_sin = attn_metadata["cos_sin"]
             offset = attn_metadata["cmp_in_offset"][f"{self.compress_ratio}"]
             x = x[offset:]
             cu_seqlens = attn_metadata["cu_seq_lens"][f"{self.compress_ratio}"]
-            seq_used_q = attn_metadata["seq_used_q"][f"{self.compress_ratio}"]
+            seq_used_q = attn_metadata["cmp_seq_used_q"][f"{self.compress_ratio}"]
             start_pos = attn_metadata["start_pos"][f"{self.compress_ratio}"]
             if not self.is_online:
                 state_block_table = attn_metadata["tmp_block_table"][f"c{self.compress_ratio}a_cmp_state"]
@@ -329,30 +346,21 @@ class Compressor(nn.Module):
                 state_block_table = attn_metadata["block_table"][f"c{self.compress_ratio}a_cmp_state"]
         else:
             attn_metadata_ori = attn_metadata
-            cos_sin = attn_metadata["cos_sin"]
             cu_seqlens = attn_metadata["cu_seq_lens_q"]
             seq_used_q = attn_metadata["seq_used_q"]
             start_pos = attn_metadata["start_pos"]
             state_block_table = attn_metadata["block_table"][f"c{self.compress_ratio}a_cmp_state"]
-        cos, sin = cos_sin[f"c{self.compress_ratio}a"]
         bsz = seq_used_q.shape[0]
-        rope_cos = cos.view(-1, self.rope_head_dim) if is_prefill else cos.view(bsz, -1, self.rope_head_dim)
-        rope_sin = sin.view(-1, self.rope_head_dim) if is_prefill else sin.view(bsz, -1, self.rope_head_dim)
         cmpr_input_kwargs = {
             "x": x.view(-1, self.dim) if is_prefill else x.view(bsz, -1, self.dim),
             "wkv": self.wkv.weight,
             "wgate": self.wgate.weight,
             "ape": self.ape,
-            "rope_cos": rope_cos,
-            "rope_sin": rope_sin,
             "state_block_table": state_block_table,
             "seqused": seq_used_q,
             "start_pos": start_pos,
-            "rope_head_dim": self.rope_head_dim,
             "cmp_ratio": self.compress_ratio,
             "coff": 1 + self.overlap,
-            "norm_eps": self.norm.variance_epsilon,
-            "rotary_mode": 2, # 1: half; 2: interleave
             "cache_mode": 1,  # 1: contiguous buffer; 2: ring buffer
         }
         if is_prefill:   # tnd format in prefill stage while bsnd format in decode stage
@@ -366,25 +374,48 @@ class Compressor(nn.Module):
                 "state_cache": self.get_runtime_cache("sfa_kv_state", attn_metadata_ori, is_prefill).flatten(-3),
             })
         # (T, self.head_dim) in prefill stage, while (B, S, self.head_dim) in decode stage
-        if self.mm_quant_mode == 'w8a8hifloat8':
-            quant_keys = ("x", "wkv", "wgate", "ape", "state_block_table", "seqused",
-                          "start_pos", "cmp_ratio", "coff", "cache_mode", "state_cache")
-            quant_kwargs = {k: cmpr_input_kwargs[k] for k in quant_keys}
+        rope_cos, rope_sin = cos_sin[f"c{self.compress_ratio}a"]
+        if self.mm_quant_mode == "w8a8hifloat8":
+            quant_keys = (
+                "x", "wkv", "wgate", "ape", "state_block_table", "seqused",
+                "start_pos", "cmp_ratio", "coff", "cache_mode", "state_cache",
+            )
+            quant_kwargs = {key: cmpr_input_kwargs.get(key) for key in quant_keys}
             if is_prefill:
-                quant_kwargs["cu_seqlens"] = cmpr_input_kwargs["cu_seqlens"]
-            quant_kwargs["x_descale"] = self.x_descale
-            quant_kwargs["wkv_descale"] = self.wkv.weight_scale.reshape(-1)
-            quant_kwargs["wgate_descale"] = self.wgate.weight_scale.reshape(-1)
-            quant_kwargs["quant_mode"] = 1
-            kv = torch.ops.custom.quant_compressor(**quant_kwargs)
-            kv = torch_npu.npu_rms_norm(kv, self.norm.weight.to(torch.float32), self.norm.variance_epsilon)[0]
-            torch.ops.custom.inplace_partial_rotary_mul(
-                kv.view(-1, 1, 1, self.head_dim), cos, sin,
+                quant_kwargs["cu_seqlens"] = cmpr_input_kwargs.get("cu_seqlens")
+            quant_kwargs.update({
+                "x_descale": self.x_descale,
+                "wkv_descale": self.wkv.weight_scale.reshape(-1),
+                "wgate_descale": self.wgate.weight_scale.reshape(-1),
+                "quant_mode": 1,
+            })
+            kv = torch.ops.cann_ops_transformer.quant_compressor(**quant_kwargs)
+            kv = torch_npu.npu_rms_norm(
+                kv, self.norm.weight, self.norm.variance_epsilon)[0]
+            torch.ops.cann_ops_transformer.inplace_partial_rotary_mul(
+                kv.view(-1, 1, 1, self.head_dim),
+                rope_cos,
+                rope_sin,
                 rotary_mode="interleave",
-                partial_slice=[self.nope_head_dim, self.head_dim])
+                partial_slice=self.partial_slice,
+            )
         else:
-            cmpr_input_kwargs["norm_weight"] = self.norm.weight.to(torch.float32)
-            kv = torch.ops.custom.compressor(**cmpr_input_kwargs)
+            kv = compressor(**cmpr_input_kwargs)
+            kv = torch_npu.npu_rms_norm(
+                kv,
+                self.norm.weight,
+                self.norm.variance_epsilon,
+            )[0]
+            kv_rope_view = kv.view(*((-1, 1) if is_prefill else (bsz, -1)), 1, self.head_dim)
+            rope_cos = rope_cos.view(*((-1, 1) if is_prefill else (bsz, -1)), 1, self.rope_head_dim)
+            rope_sin = rope_sin.view(*((-1, 1) if is_prefill else (bsz, -1)), 1, self.rope_head_dim)
+            torch.ops.cann_ops_transformer.inplace_partial_rotary_mul(
+                kv_rope_view,
+                rope_cos,
+                rope_sin,
+                rotary_mode="interleave",
+                partial_slice=self.partial_slice,
+            )
         return kv
 
     def forward(

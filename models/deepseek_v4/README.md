@@ -1,17 +1,15 @@
 # DeepSeek-V4 Inference on NPU
 ## 概述
-DeepSeek团队发布了最新的模型DeepSeek-V4，本实践基于DeepSeek开源代码进行迁移，并在CANN平台上完成性能优化，支持在昇腾`Atlas A3 Pod`平台和`950PR/DT`平台部署。
+DeepSeek团队发布了最新的模型DeepSeek-V4，本实践基于DeepSeek开源代码进行迁移，并在CANN平台上完成性能优化，支持在昇腾`Atlas A3 Pod`平台和`Ascend 950`平台部署。
 
 - 本实践的优化特性和性能Benchmark可参见[NPU DeepSeek-V4推理优化实践](../../docs/models/deepseek_v4/deepseek_v4_inference_guide.md)。
 
 ---
 
 ## 硬件要求
-产品型号：Atlas A3 Pod 系列
+产品型号：Atlas A3 Pod 系列、Ascend 950 系列
 
-操作系统：Linux ARM
-
-镜像版本：cann9.0_pt2.8.0_ds_aarch_image:v1.2
+操作系统：Linux ARM（Atlas A3 Pod）、Linux x86（Ascend 950）
 
 驱动版本：Ascend HDK 25.5.1
 > npu-smi info 检查Ascend NPU固件和驱动是否正确安装。如果已安装，通过命令`npu-smi info`确认版本是否为`25.5.1`。如果未安装或者版本不是`25.5.1`，请先下载[固件和驱动包](https://www.hiascend.com/hardware/firmware-drivers/community?product=6&model=33&cann=9.0.0-beta.2&driver=Ascend+HDK+25.5.1)，并根据[指导](https://hiascend.com/document/redirect/CannCommunityInstSoftware)自行安装。
@@ -20,28 +18,115 @@ DeepSeek团队发布了最新的模型DeepSeek-V4，本实践基于DeepSeek开�
 
 ## CANNLab一站式开发平台指南
 
-CANNLab一站式开发平台已预置部署运行环境，使用CANNLab一站式开发平台时请以本章节为准，无需执行标准流程中的 docker 相关步骤。
+CANNLab一站式开发平台已预置部署运行环境，使用CANNLab一站式开发平台时请以本章节为准，无需重复执行标准流程中的软件包安装步骤。
 
 - **模型支持**：CANNLab一站式开发平台环境为 Atlas A3 8卡环境，仅支持部署 DeepSeek-V4 Flash。
-- **环境部署**：平台已搭建好运行环境，无需获取 docker 镜像，也无需拉起 docker 容器。
+- **环境部署**：平台已搭建好运行环境，无需重复安装 CANN、PyTorch 和 torch_npu。
 - **CANN 路径**：CANN 安装路径为 `/home/developer/Ascend/cann`，涉及 `cann_path` 的脚本（如权重转换前的 `source` 命令）均需使用此路径。
 - **YAML 配置**：CANNLab一站式开发平台请使用 `ci_a3/deepseek_v4_flash_rank_16_16ep_w8a8_platform.yaml` 作为配置文件。由于CANNLab一站式开发平台和 A3 Pod 硬件核数差异，本实践不支持多流控核，yaml 配置中 `enable_limit_core` 需设置为 `False`。
 
 
-> 以下快速启动章节中各步骤的标准操作适用于非CANNLab一站式开发平台环境，CANNLab一站式开发平台用户请根据上述差异调整对应步骤。
+> 以下环境准备和快速启动章节适用于非CANNLab一站式开发平台环境，CANNLab一站式开发平台用户请根据上述差异调整对应步骤。
+
+---
+
+## 环境准备
+
+### Atlas A3 Docker 部署
+
+A3 使用预置 ARM 镜像，镜像中已包含本实践所需的 PyTorch、torch_npu、torchair 和 CANN 运行环境。从 [A3 ARM 镜像地址](https://cann-ai.obs.cn-north-4.myhuaweicloud.com/cann-quantization/DeepSeek/cann9.2.0.pt2.9.0_dsv4_aarch_a3_image_custom_20260827.tar) 下载 docker 镜像，上传到 A3 服务器的每个节点，并在每个节点执行：
+
+```text
+docker load -i cann9.2.0.pt2.9.0_dsv4_aarch_a3_image_custom_20260827.tar
+```
+
+### 拉起 docker 容器
+
+在各个节点上通过如下脚本拉起容器，默认容器名为 `cann_recipes_infer`。请将权重路径和源码路径挂载到容器中。
+
+```text
+docker run -u root -itd --name cann_recipes_infer --ulimit nproc=65535:65535 --ipc=host \
+    --device=/dev/davinci0     --device=/dev/davinci1 \
+    --device=/dev/davinci2     --device=/dev/davinci3 \
+    --device=/dev/davinci4     --device=/dev/davinci5 \
+    --device=/dev/davinci6     --device=/dev/davinci7 \
+    --device=/dev/davinci8     --device=/dev/davinci9 \
+    --device=/dev/davinci10    --device=/dev/davinci11 \
+    --device=/dev/davinci12    --device=/dev/davinci13 \
+    --device=/dev/davinci14    --device=/dev/davinci15 \
+    --device=/dev/davinci_manager --device=/dev/devmm_svm \
+    --device=/dev/hisi_hdc \
+    -v /home/:/home \
+    -v /data:/data \
+    -v /etc/localtime:/etc/localtime \
+    -v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
+    -v /etc/ascend_install.info:/etc/ascend_install.info -v /var/log/npu/:/usr/slog \
+    -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi -v /sys/fs/cgroup:/sys/fs/cgroup:ro \
+    -v /usr/local/dcmi:/usr/local/dcmi -v /usr/local/sbin:/usr/local/sbin \
+    -v /etc/hccn.conf:/etc/hccn.conf -v /root/.pip:/root/.pip \
+    -v /etc/hosts:/etc/hosts -v /usr/bin/hostname:/usr/bin/hostname \
+    --net=host --shm-size=128g --privileged \
+    cann9.2.0.pt2.9.0_dsv4_aarch_a3_image_custom_20260827:latest /bin/bash
+```
+
+进入容器后，将源码挂载或放置在 `/home/code/cann-recipes-infer`，并按“修改配置”和“拉起多卡推理”章节执行。容器名和镜像 tag 必须与上述命令保持一致。
+
+### Atlas A5 部署
+
+1. 安装 PyTorch 和 Ascend Extension for PyTorch（torch_npu）。
+
+   `torch_npu` 为 PyTorch 在 NPU 上运行提供适配。执行：
+
+   ```shell
+   python -m pip install torch==2.9.0 --index-url https://download.pytorch.org/whl/cpu
+
+   mkdir -p /tmp/torch_npu_290_daily
+   cd /tmp/torch_npu_290_daily
+   wget -O pytorch_v2.9.0_py311.tar.gz \
+     "https://pytorch-package.obs.cn-north-4.myhuaweicloud.com/pta/Daily/v2.9.0/20260903.1/pytorch_v2.9.0_py311.tar.gz"
+   tar -xzf pytorch_v2.9.0_py311.tar.gz
+   python -m pip install --no-deps \
+     ./torch_npu-2.9.0.post7.dev20260903-cp311-cp311-manylinux_2_28_x86_64.whl
+   ```
+
+2. 下载项目源码并安装 Python 依赖。
+
+   ```shell
+   git clone https://gitcode.com/cann/cann-recipes-infer.git
+   cd cann-recipes-infer
+   python -m pip install -r ./models/deepseek_v4/requirements.txt
+   ```
+
+3. 安装 CANN 软件包。
+
+   本实践依赖 CANN 开发套件包（toolkit）和与目标硬件匹配的二进制算子包（ops），支持 CANN 9.2.0。请从 [CANN 下载页面](https://www.hiascend.com/cann/download)选择对应架构的 weekly 版本。下载后，按以下命令依次安装 toolkit 和 ops 软件包：
+
+   ```shell
+   chmod +x Ascend-cann-toolkit_<version>_linux-<arch>.run
+   ./Ascend-cann-toolkit_<version>_linux-<arch>.run --install
+   chmod +x Ascend-cann-kernels-<product>_<version>_linux.run
+   ./Ascend-cann-kernels-<product>_<version>_linux.run --install
+   ```
+
+   多节点部署时，各节点应使用相同的 CANN、驱动和固件版本。
+
+   CANN 安装完成后，根据实际安装路径加载环境变量：
+
+   ```shell
+   cann_path=/usr/local/Ascend/cann
+   source "${cann_path}/bin/setenv.bash"
+   ```
+
+   新建终端后，重新加载 CANN 环境脚本即可。
+
+4. 配置样例运行环境。
+
+   修改 `executor/scripts/set_env.sh` 中的节点 IP 和 CANN 安装路径。其中 `cann_path` 需与实际的 CANN 安装路径保持一致，例如 `/usr/local/Ascend/cann`。
 
 ---
 
 ## 快速启动
 
-### 下载源码
-
-  在各个节点上执行如下命令下载 cann-recipes-infer 源码。
-  ```shell
-  mkdir -p /home/code; cd /home/code/
-  git clone https://gitcode.com/cann/cann-recipes-infer.git
-  cd cann-recipes-infer
-  ```
 ### 下载数据集
   从[链接](https://huggingface.co/datasets/xinrongzhang2022/InfiniteBench/blob/main/longbook_qa_eng.jsonl)中下载长序列输入数据集longbook_qa_eng，并上传到各个节点上新建的路径`dataset/InfiniteBench`下。
   ```shell
@@ -52,48 +137,8 @@ CANNLab一站式开发平台已预置部署运行环境，使用CANNLab一站式
 
   下载[DeepSeek-V4-Flash原始Hybrid FP8-MXFP4权重](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash)或[DeepSeek-V4-Pro原始Hybrid FP8-MXFP4权重](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro)，并上传到各节点的某个固定的路径下，比如`/data/models/deepseek_v4_hybrid_fp8_mxfp4`。
 
-### 获取 docker 镜像
-
-  从[ARM镜像地址](https://cann-ai.obs.cn-north-4.myhuaweicloud.com/cann-quantization/DeepSeek/cann9.0_pt2.8.0_ds_aarch_image_v1.2.tar)中下载 docker 镜像，然后上传到A3服务器的每个节点上，并通过命令导入镜像 `docker load -i cann9.0_pt2.8.0_ds_aarch_image_v1.2.tar`。
-
-### 拉起 docker 容器
-
-  在各个节点上通过如下脚本拉起容器，默认容器名为 cann_recipes_infer。注意：需要将权重路径和源码路径挂载到容器里。
-  ```
-  # A3 容器拉起脚本
-  docker run -u root -itd --name cann_recipes_infer --ulimit nproc=65535:65535 --ipc=host \
-      --device=/dev/davinci0     --device=/dev/davinci1 \
-      --device=/dev/davinci2     --device=/dev/davinci3 \
-      --device=/dev/davinci4     --device=/dev/davinci5 \
-      --device=/dev/davinci6     --device=/dev/davinci7 \
-      --device=/dev/davinci8     --device=/dev/davinci9 \
-      --device=/dev/davinci10    --device=/dev/davinci11 \
-      --device=/dev/davinci12    --device=/dev/davinci13 \
-      --device=/dev/davinci14    --device=/dev/davinci15 \
-      --device=/dev/davinci_manager --device=/dev/devmm_svm \
-      --device=/dev/hisi_hdc \
-      -v /home/:/home \
-      -v /data:/data \
-      -v /etc/localtime:/etc/localtime \
-      -v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
-      -v /etc/ascend_install.info:/etc/ascend_install.info -v /var/log/npu/:/usr/slog \
-      -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi -v /sys/fs/cgroup:/sys/fs/cgroup:ro \
-      -v /usr/local/dcmi:/usr/local/dcmi -v /usr/local/sbin:/usr/local/sbin \
-      -v /etc/hccn.conf:/etc/hccn.conf -v /root/.pip:/root/.pip -v /etc/hosts:/etc/hosts \
-      -v /usr/bin/hostname:/usr/bin/hostname \
-      --net=host \
-      --shm-size=128g \
-      --privileged \
-      cann9.0_pt2.8.0_ds_aarch_image:v1.2 /bin/bash
-  ```
-  在各个节点上通过如下命令进入容器：
-  ```
-  docker attach cann_recipes_infer
-  cd /home/code/cann-recipes-infer/models/deepseek_v4
-  ```
-
 ### 转换权重中的config.json
-  使用原生`Hybrid FP8-MXFP4版本权重`执行推理时需要执行这一步骤，其他场景跳过该步骤。需要进入容器并在各个节点上使用`utils/convert_config.py` 脚本完成权重路径下的config.json转换。
+  使用原生`Hybrid FP8-MXFP4版本权重`执行推理时需要执行这一步骤，其他场景跳过该步骤。在各个节点上进入 `models/deepseek_v4` 目录，使用`utils/convert_config.py` 脚本完成权重路径下的config.json转换。
 
   **注意：** 该步骤不会对权重进行任何处理，仅将新生成的config.json覆盖原始config.json，如需保留原始config.json，请自行备份
 
@@ -114,7 +159,7 @@ CANNLab一站式开发平台已预置部署运行环境，使用CANNLab一站式
 
 ### 转换权重
 
- 原生`Hybrid FP8-MXFP4权重`执行推理时可跳过这一步骤，若需要使用 INT8、Hybrid INT8-INT4、Hybrid MXFP8-MXFP4 或 Hybrid HiF8-MXFP8-MXFP4 权重执行推理，需要进入容器并在各个节点上使用`utils/convert_model.py` 脚本完成 Hybrid FP8-MXFP4 到 INT8/Hybrid INT8-INT4 /Hybrid MXFP8-MXFP4 /Hybrid HiF8-MXFP8-MXFP4 权重转换。
+ 原生`Hybrid FP8-MXFP4权重`执行推理时可跳过这一步骤，若需要使用 INT8、Hybrid INT8-INT4、Hybrid MXFP8-MXFP4 或 Hybrid HiF8-MXFP8-MXFP4 权重执行推理，在各个节点上进入 `models/deepseek_v4` 目录，使用`utils/convert_model.py` 脚本完成 Hybrid FP8-MXFP4 到 INT8/Hybrid INT8-INT4 /Hybrid MXFP8-MXFP4 /Hybrid HiF8-MXFP8-MXFP4 权重转换。
 
   >入参介绍：`input_fp8_hf_path`：原始权重路径；`output_hf_path`：转换后输出的权重路径；`quant_type`：量化模式；`quant_param_path`：量化参数文件夹路径（仅适用于DeepSeek-V4-Pro的Hybrid INT8-INT4量化）
 
@@ -136,10 +181,10 @@ CANNLab一站式开发平台已预置部署运行环境，使用CANNLab一站式
   # 转换为Hybrid INT8-INT4权重，适用于Atlas A3 Pod系列，DeepSeek-V4-Pro模型
   python utils/convert_model.py --input_fp8_hf_path /data/models/deepseek_v4  --output_hf_path /data/models/deepseek_v4_int4_w4a8 --quant_type w4a8-int --quant_param_path /path/to/your_quant_param_folder
 
-  # 转换为Hybrid MXFP8-MXFP4权重，适用于950PR/DT系列
+  # 转换为Hybrid MXFP8-MXFP4权重，适用于Ascend 950系列
   python utils/convert_model.py --input_fp8_hf_path /data/models/deepseek_v4  --output_hf_path /data/models/deepseek_v4_hybrid_mxfp8_mxfp4 --quant_type w4a8-mx
 
-  # 转换为Hybrid HiF8-MXFP8-MXFP4权重，适用于950PR/DT系列
+  # 转换为Hybrid HiF8-MXFP8-MXFP4权重，适用于Ascend 950系列
   python utils/convert_model.py --input_fp8_hf_path /data/models/deepseek_v4  --output_hf_path /data/models/deepseek_v4_hybrid_hif8_mxfp8_mxfp4 --quant_type w4a8-mx-hif
 
   ```
@@ -150,7 +195,7 @@ CANNLab一站式开发平台已预置部署运行环境，使用CANNLab一站式
    - `PREFILL_IPS` / `DECODE_IPS`：在线 PD 模式分别配置 prefill 和 decode 节点 IP。
    - `cann_path`: CANN软件包安装路径，例如`/usr/local/Ascend/cann`。
 - `executor/scripts/infer.sh` 会先加载公共环境脚本 `executor/scripts/set_env.sh`；然后再继续加载模型私有环境脚本 `models/deepseek_v4/set_env.sh`。
-- 在Atlas A3 Pod各个节点上修改 `config/ci_a3` 路径下需要执行的yaml文件中的 `model_config.model_path` 真实路径；在950PR/DT各个节点上修改 `config/ci_950` 路径下需要执行的yaml文件中的 `model_config.model_path` 路径。通用 YAML 配置说明可参见[YAML参数描述](../../docs/common/inference_config_guide.md)。
+- 在Atlas A3 Pod各个节点上修改 `config/ci_a3` 路径下需要执行的yaml文件中的 `model_config.model_path` 真实路径；在Ascend 950各个节点上修改 `config/ci_950` 路径下需要执行的yaml文件中的 `model_config.model_path` 路径。通用 YAML 配置说明可参见[YAML参数描述](../../docs/common/inference_config_guide.md)。
 
 - 在 yaml 配置中，默认采用 `npugraph_ex` 执行方式。这一后端是 NPU 平台全新推出的高性能图计算组件，其基于 CANN 的 AclGraph（对标 CUDAGraph）底层能力，深度融合了一系列 NPU 架构的亲和调度和图优化技术。从落地层面来看，`npugraph_ex` 具备以下显著优势：可快速接入 PyTorch 生态、能无缝集成到 SGLang、vLLM 等主流推理框架中，同时保障极致的运行性能。
 
@@ -189,8 +234,8 @@ bash executor/scripts/infer.sh --model deepseek_v4 --yaml ci_a3/deepseek_v4_flas
 # offline 模式，CANNLab A3
 bash executor/scripts/infer.sh --model deepseek_v4 --yaml ci_a3/deepseek_v4_flash_rank_16_16ep_w8a8_platform.yaml
 
-# offline 模式，950PR/DT
-bash executor/scripts/infer.sh --model deepseek_v4 --yaml ci_950/deepseek_v4_pro_rank_16_16ep.yaml
+# offline 模式，Ascend 950
+bash executor/scripts/infer.sh --model deepseek_v4 --yaml ci_950/deepseek_v4_flash_rank_16_16ep.yaml
 
 # online PD 模式，暂时只支持A3机型
 bash executor/scripts/infer.sh --model deepseek_v4 --mode online --pd-role prefill --p-yaml-name ci_a3/deepseek_v4_pd/prefill.yaml --d-yaml-name ci_a3/deepseek_v4_pd/decode.yaml
@@ -217,8 +262,8 @@ bash executor/scripts/infer.sh
 
 | 平台  | 模型型号             |  推荐量化策略  | 最小部署单元（chips）|
 |-------|---------------------|--------------|--------------|
-| 950PR/DT  | DeepSeek-V4 Flash    | Hybrid MXFP8-MXFP4 |4          |
-| 950PR/DT  | DeepSeek-V4 Flash    | Hybrid HiF8-MXFP8-MXFP4 |4          |
-| 950PR/DT  | DeepSeek-V4 Pro      | Hybrid MXFP8-MXFP4 |16         |
+| Ascend 950  | DeepSeek-V4 Flash    | Hybrid MXFP8-MXFP4 |4          |
+| Ascend 950  | DeepSeek-V4 Flash    | Hybrid HiF8-MXFP8-MXFP4 |4          |
+| Ascend 950  | DeepSeek-V4 Pro      | Hybrid MXFP8-MXFP4 |16         |
 | Atlas A3  | DeepSeek-V4 Flash    | INT8 W8A8 |4          |
 | Atlas A3  | DeepSeek-V4 Pro      | Hybrid INT8-INT4 |32         |

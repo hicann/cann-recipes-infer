@@ -37,7 +37,8 @@ import torch.distributed as dist
 
 import torch_npu
 import torchair as tng
-import custom_ops
+import cann_ops_transformer
+import cann_ops_nn
 from transformers.cache_utils import Cache
 from transformers.utils import (
     add_start_docstrings,
@@ -46,7 +47,7 @@ from transformers.utils import (
 )
 
 from executor.utils import (
-    override, get_init_attn_mask, align_up, calc_moe_hccl_buffer_size,
+    override, get_init_attn_mask, calc_moe_hccl_buffer_size,
     get_decode_mask)
 
 from executor.model_loader.weight_utils import default_weight_loader
@@ -81,7 +82,8 @@ from .modules import (get_window_topk_idxs, get_compress_topk_idxs,
                       one_hot, yarn_get_mscale,
                       DeepseekV3RMSNorm, _init_rope, DEEPSEEKV3_START_DOCSTRING,
                       DEEPSEEKV3_INPUTS_DOCSTRING, DeepseekV3PreTrainedModel, apply_rotary_emb,
-                      partial_rotary_mul_quant, AttnMetaData
+                      partial_rotary_mul_quant, AttnMetaData, PACKED_KV_STORAGE_DTYPE,
+                      PACKED_KV_COMPUTE_DTYPE, get_kv_cache_dim, is_packed_kv_layout
                     )
 from .modules import Indexer, Compressor
 from .modules.registry import OpKernel, auto_import_modules
@@ -157,17 +159,19 @@ class DeepseekV3SharedExpert(nn.Module):
     def forward_w8a8int8(self, x, enable_decode_stream=False, shared_expert_event=None):
         merged_x, pertoken_scale = self.gate_up_proj(x, out_dtype=torch.int32)
         swiglu_limit_args = {}
-        if self.swiglu_limit:
+        if self.swiglu_limit is not None:
             swiglu_limit_args.update({
-                "swiglu_mode": 1,
+                # 2: contiguous [gate, up] split with the clamped SwiGLU computation.
+                "swiglu_mode": 2,
                 "clamp_limit": self.swiglu_limit,
                 "glu_alpha": 1,
                 "glu_bias": 0
             })
-        intermediate_hidden_states, pertoken_scale = torch_npu.npu_dequant_swiglu_clamp_quant(
+        intermediate_hidden_states, pertoken_scale = torch_npu.npu_dequant_swiglu_quant(
             merged_x, weight_scale=self.gate_up_proj.weight_scale,
             quant_scale=self.down_proj.smooth_scales,
-            quant_mode=1, activate_left=True,
+            quant_mode=1,  # 1: dynamic quantization
+            activate_left=True,
             activation_scale=pertoken_scale,
             **swiglu_limit_args
         )
@@ -176,12 +180,16 @@ class DeepseekV3SharedExpert(nn.Module):
 
     def forward_a8float8(self, x, enable_decode_stream=False, shared_expert_event=None):
         merged_x = self.gate_up_proj(x)
-        intermediate_hidden_states, pergroup_scale, _ = torch.ops.custom.npu_swiglu_group_quant(
+        swiglu_limit_args = {}
+        if self.swiglu_limit is not None:
+            swiglu_limit_args["clamp_limit"] = self.swiglu_limit
+        intermediate_hidden_states, pergroup_scale, _ = torch.ops.cann_ops_nn.swiglu_group_quant(
             merged_x,
             dst_type=torch.float8_e4m3fn,
             round_scale=True if "mx" in self.mm_quant_mode or "hif" in self.mm_quant_mode else False,
+            # 1: dynamic quantization; 0: static quantization.
             quant_mode=1 if "mx" in self.mm_quant_mode or "hif" in self.mm_quant_mode else 0,
-            clamp_limit=self.swiglu_limit,
+            **swiglu_limit_args,
             )
         wait_event(enable_decode_stream, shared_expert_event, 0)
         return self.down_proj(intermediate_hidden_states, pergroup_scale)
@@ -251,6 +259,10 @@ class DeepseekV3MoE(nn.Module):
         self.gmm_int_quant = "a8" in self.gmm_quant_mode and "float" not in self.gmm_quant_mode
         self.moe_ffn = self.experts_w4a8int4 if self.gmm_quant_mode == "w4a8int4" else self.experts
         self._init_gate(prefix)
+        self.use_native_gate_topk = (
+            self.scoring_func == "sqrtsoftplus"
+            and self.platform_version == PlatformVersion.A3
+        )
         if config.n_shared_experts is not None:
             self.shared_experts = DeepseekV3SharedExpert(
                 config,
@@ -399,7 +411,7 @@ class DeepseekV3MoE(nn.Module):
             "expert_tokens": tokens_per_local_expert,
             "group_list_type": 1,
             "swiglu_limit": self.swiglu_limit,
-            "enable_custom_ops": True,
+            "enable_cann_ops_nn": True,
         }
 
         if "a16" not in self.gmm_quant_mode:
@@ -443,14 +455,15 @@ class DeepseekV3MoE(nn.Module):
         # To enhance quantization accuracy, a clip kernel has been introduced prior to the dynamic_quant kernel
         swiglu_limit = kwargs.get("swiglu_limit", None)
         swiglu_limit_args = {}
-        if swiglu_limit:
+        if swiglu_limit is not None:
             swiglu_limit_args.update({
-                "swiglu_mode": 1,
+                # 2: contiguous [gate, up] split with the clamped SwiGLU computation.
+                "swiglu_mode": 2,
                 "clamp_limit": swiglu_limit,
                 "glu_alpha": 1,
                 "glu_bias": 0
             })
-        intermediate_h, pertoken_scale = torch_npu.npu_dequant_swiglu_clamp_quant(
+        intermediate_h, pertoken_scale = torch_npu.npu_dequant_swiglu_quant(
             mm1_mm3,
             quant_scale=self.experts.smooth_scale_2,
             group_index=expert_tokens,
@@ -500,8 +513,7 @@ class DeepseekV3MoE(nn.Module):
                 gathered_pertoken_scale = pertoken_scale.new_empty(gathered_tokens.shape[0], pertoken_scale.shape[1])
             elif "mxfloat" in self.gmm_quant_mode:
                 pertoken_scale = pertoken_scale.view(torch.int8)
-                gathered_pertoken_scale = pertoken_scale.new_empty(gathered_tokens.shape[0], pertoken_scale.shape[1], \
-                    pertoken_scale.shape[2])
+                gathered_pertoken_scale = pertoken_scale.new_empty(gathered_tokens.shape[0], *pertoken_scale.shape[1:])
             else:
                 gathered_pertoken_scale = pertoken_scale.new_empty(gathered_tokens.shape[0])
         if "a16" not in self.gmm_quant_mode:
@@ -518,25 +530,24 @@ class DeepseekV3MoE(nn.Module):
         num_tokens, h = x.shape
 
         # -1: non-quant; 1: dynamic quant; 0: static quant(not supported now)
-        # 2: mxfp8 for dst_dtype e5m2; 3: mxfp8 for dst_dtype e4m3; 4: fp8 for dst_dtype e5m2; 5: fp8 for dst_dtype e4m3
+        # 2: MXFP8 E5M2; 3: MXFP8 E4M3; 4: FP8 E5M2; 5: FP8 E4M3; 6: A4 MXFP4
         routing_args = {"quant_mode": -1}
         if self.gmm_quant_mode == "w8a8float8":
-            moe_init_routing = torch_npu.npu_moe_init_routing_group_quant
+            moe_init_routing = torch_npu.npu_moe_init_routing_v2
             routing_args.update({
                 "quant_mode": 5,
                 "row_idx_type": 0,
                 "drop_pad_mode": 0,
-                "group_size": 128, # currently only support 128
             })
         elif "a4mxfloat4" in self.gmm_quant_mode:
-            moe_init_routing = torch_npu.npu_moe_init_routing_group_quant
+            moe_init_routing = torch_npu.npu_moe_init_routing_v2
             routing_args.update({
                 "quant_mode": 6,
                 "row_idx_type": 0,
                 "drop_pad_mode": 0,
             })
         elif "a8mxfloat" in self.gmm_quant_mode:
-            moe_init_routing = torch_npu.npu_moe_init_routing_group_quant
+            moe_init_routing = torch_npu.npu_moe_init_routing_v2
             routing_args.update({
                 "quant_mode": 3,
                 "row_idx_type": 0,
@@ -600,9 +611,12 @@ class DeepseekV3MoE(nn.Module):
         self.set_mc2_kwargs()
 
         # moe dispatch
+        # A3 dispatch_v2 requires contiguous int32 expert IDs. Keep the existing A5 contract unchanged.
+        expert_ids = topk_ids.to(torch.int32).contiguous() \
+            if self.platform_version == PlatformVersion.A3 else topk_ids
         dispatch_args = {
             "x": hidden_states,
-            "expert_ids": topk_ids, # [n*topk]
+            "expert_ids": expert_ids, # [n*topk]
             **self.dispatch_kwargs
         }
         output = torch_npu.npu_moe_distribute_dispatch_v2(**dispatch_args)
@@ -614,7 +628,7 @@ class DeepseekV3MoE(nn.Module):
             "expert_tokens": expert_token_num,
             "group_list_type": 1,
             "swiglu_limit": self.swiglu_limit,
-            "enable_custom_ops": True
+            "enable_cann_ops_nn": True
         }
 
         if "a16" not in self.gmm_quant_mode:
@@ -815,21 +829,25 @@ class Attention(nn.Module):
             else:
                 self.indexer = None
 
-        if self.kv_cache_quant_mode in ("float8", "hifloat8"):
-            import cann_ops_transformer
-        self.sparse_attn_ops = torch.ops.custom.npu_sparse_attn_sharedkv
+        self.sparse_attn_ops = torch.ops.cann_ops_transformer.sparse_flash_mla
         if self.kv_cache_quant_mode == "float8":
-            self.sparse_attn_ops = torch.ops.custom.npu_kv_quant_sparse_attn_sharedkv
+            self.sparse_attn_ops = torch.ops.cann_ops_transformer.mixed_quant_sparse_flash_mla
         elif self.kv_cache_quant_mode == "hifloat8":
             self.sparse_attn_ops = torch.ops.cann_ops_transformer.quant_sparse_flash_mla
-            self.register_buffer(
-                "hif8_descale", torch.ones(1, dtype=torch.float32), persistent=False)
 
         self.cp_size = self.infer_config.parallel_config.cp_size
         self.global_rank = kwargs.get("global_rank")
 
         if self.mm_quant_mode == "w8a8hifloat8":
             self.register_buffer("beta", torch.zeros(self.q_lora_rank, dtype=torch.bfloat16))
+        if self.kv_cache_quant_mode == "hifloat8":
+            self.register_buffer(
+                "hif8_descale", torch.ones(1, dtype=torch.float32), persistent=False
+            )
+        if self.mm_quant_mode == "w8a8hifloat8" or self.kv_cache_quant_mode == "hifloat8":
+            self.register_buffer(
+                "hif8_quant_scale", torch.ones(1, dtype=torch.bfloat16), persistent=False
+            )
 
     def _get_cache_dtype_map(self):
         return {
@@ -840,7 +858,8 @@ class Attention(nn.Module):
         }
 
     def _get_cache_dim_and_cmp_dtype(self):
-        cache_dim = self.config.head_dim
+        cache_dim = get_kv_cache_dim(
+            self.config.head_dim, self.config.qk_rope_head_dim, self.kv_cache_quant_mode)
         use_fused_kernel_compressor = (
             self.infer_config.model_config.custom_params.get("kernel_config", {}).get("compressor", "native")
             == "ascendc"
@@ -849,13 +868,8 @@ class Attention(nn.Module):
             self.platform_version == PlatformVersion.ASCEND_950 and use_fused_kernel_compressor
         ) else torch.bfloat16
 
-        if self.kv_cache_quant_mode == "hifloat8":
-            cmp_kv_dtype = self._get_cache_dtype_map()[self.kv_cache_quant_mode]
-        elif "float" in self.kv_cache_quant_mode:
-            rope_dim = self.config.qk_rope_head_dim
-            nope_dim = self.config.head_dim - rope_dim
-            cache_dim = align_up(nope_dim + 2 * rope_dim + 2 * nope_dim // 64, 128)
-            cmp_kv_dtype = torch.float8_e4m3fn
+        if self.kv_cache_quant_mode in ("float8", "hifloat8"):
+            cmp_kv_dtype = PACKED_KV_STORAGE_DTYPE
         return cache_dim, cmp_kv_dtype
 
     def _make_cache_setter(self, cache_name):
@@ -883,6 +897,8 @@ class Attention(nn.Module):
         cache_dtype = cache_dtype_map[self.kv_cache_quant_mode]
         li_cache_dtype = cache_dtype_map[self.li_cache_quant_mode]
 
+        if is_packed_kv_layout(self.kv_cache_quant_mode):
+            cache_dtype = PACKED_KV_STORAGE_DTYPE
         cache_dim, cmp_kv_dtype = self._get_cache_dim_and_cmp_dtype()
 
         self.win_kv = torch.Tensor([])
@@ -1027,9 +1043,12 @@ class Attention(nn.Module):
                 x = self.q_norm(x)
                 return torch_npu.npu_dynamic_quant(x, smooth_scales=self.wq_b.smooth_scales)
             else:
-                return torch.ops.custom.npu_rms_norm_dynamic_quant(x, self.q_norm.weight, \
-                                                                        smooth_scale=self.wq_b.smooth_scales, \
-                                                                        epsilon=self.eps)
+                return torch.ops.cann_ops_nn.rms_norm_dynamic_quant(
+                    x,
+                    self.q_norm.weight,
+                    smooth_scales=self.wq_b.smooth_scales,
+                    epsilon=self.eps,
+                )
         else:
             return x, None
 
@@ -1140,7 +1159,7 @@ class Attention(nn.Module):
             last_win = torch.cat([second_last_win[-(self.window_size - last_kv_len):], last_win], dim=0)
         last_win_kv = self.wkv(last_win)
         last_win_kv = self.kv_norm(last_win_kv)
-        torch.ops.custom.inplace_partial_rotary_mul(
+        torch.ops.cann_ops_transformer.inplace_partial_rotary_mul(
             last_win_kv.view(-1, 1, 1, self.head_dim), cos, sin,
             rotary_mode="interleave",
             partial_slice=self.partial_slice,
@@ -1209,7 +1228,7 @@ class Attention(nn.Module):
         with npu_stream_switch(enable_multi_streams, attn_metadata.get('mla_stream', None)):
             wait_event(enable_multi_streams, self.mla_events, 1)
             kv = self.kv_norm(kv)
-            torch.ops.custom.inplace_partial_rotary_mul(
+            torch.ops.cann_ops_transformer.inplace_partial_rotary_mul(
                 kv.view(-1, 1, 1, self.head_dim), cos, sin,
                 rotary_mode="interleave",
                 partial_slice=self.partial_slice,
@@ -1225,9 +1244,10 @@ class Attention(nn.Module):
                 partial_slice=self.partial_slice,
                 platform_version=self.platform_version,
                 origin_shape=q.shape,
+                scale=self.hif8_quant_scale,
             )
         else:
-            torch.ops.custom.inplace_partial_rotary_mul(
+            torch.ops.cann_ops_transformer.inplace_partial_rotary_mul(
                 q.unsqueeze(2), cos_q, sin_q,
                 rotary_mode="interleave",
                 partial_slice=self.partial_slice,
@@ -1293,7 +1313,7 @@ class Attention(nn.Module):
             record_event(enable_multi_streams, self.mla_events, 1)
             with limit_core_num(enable_limit_core, kv_aic_num, kv_aic_num * self.aiv_to_aic_ratio): # parallel to wq_b
                 kv = self.kv_norm(kv)
-                torch.ops.custom.inplace_partial_rotary_mul(
+                torch.ops.cann_ops_transformer.inplace_partial_rotary_mul(
                     kv.view(-1, 1, 1, self.head_dim), cos, sin,
                     rotary_mode="interleave",
                     partial_slice=self.partial_slice,
@@ -1318,9 +1338,10 @@ class Attention(nn.Module):
                     partial_slice=self.partial_slice,
                     platform_version=self.platform_version,
                     origin_shape=q.shape,
+                    scale=self.hif8_quant_scale,
                 )
             else:
-                torch.ops.custom.inplace_partial_rotary_mul(
+                torch.ops.cann_ops_transformer.inplace_partial_rotary_mul(
                     q.unsqueeze(2), cos, sin,
                     rotary_mode="interleave",
                     partial_slice=self.partial_slice,
@@ -1360,57 +1381,59 @@ class Attention(nn.Module):
         else:
             cmp_block_table = None
         win_cache = attn_metadata["full_kv_cache"] if is_prefill else self.win_kv
+        cmp_cache = self._get_runtime_cmp_cache(attn_metadata, is_prefill) if self.compress_ratio > 1 else None
+        if self.kv_cache_quant_mode == "float8":
+            # stored as bytes; SAS names this layout FLOAT8_E4M3FN
+            win_cache = win_cache.view(PACKED_KV_COMPUTE_DTYPE)
+            if cmp_cache is not None:
+                cmp_cache = cmp_cache.view(PACKED_KV_COMPUTE_DTYPE)
         win_block_table_str = "full_kv" if is_prefill else "win_kv"
         metadata = attn_metadata["kernel_metadata"][f'c{self.compress_ratio}a_metadata']
+        attn_sinks = self.attn_sink
 
         cu_seqlens_q = attn_metadata["cu_seq_lens_q"]
-        seqused_kv = attn_metadata["actual_seq_k"]
+        seqused_q = attn_metadata["seq_used_q"]
+        seqused_ori_kv = attn_metadata["actual_seq_k"]
 
+        # Sparse MLA mask modes: 0: no mask, 3: right-down causal, 4: sliding window.
         attn_kwargs = {
             "cu_seqlens_q": cu_seqlens_q,
+            "seqused_q": seqused_q,
+            "seqused_ori_kv": seqused_ori_kv,
             "cmp_ratio": self.compress_ratio,
             "ori_mask_mode": 4, # sliding window
-            "cmp_mask_mode": 3, # causal
+            "cmp_mask_mode": 0 if self.platform_version == PlatformVersion.ASCEND_950 and \
+                self.compress_ratio == 1 else 3, # causal
             "ori_win_left": 127,
             "ori_win_right": 0,
             "layout_q": "TND",
-            "layout_kv": "PA_ND",
+            "layout_kv": "PA_BBND",
             "q": q,
             "ori_kv": win_cache,   # get from prefill is full cache, transfer bsnd to bbnd
-            "cmp_kv": self._get_runtime_cmp_cache(attn_metadata, is_prefill) if self.compress_ratio > 1 else None,
+            "cmp_kv": cmp_cache,
             "cmp_sparse_indices": cmp_sparse_indices,  # only for C4A
             "ori_block_table": attn_metadata["block_table"][win_block_table_str],
             "cmp_block_table": cmp_block_table,
-            "sinks": self.attn_sink,
+            "sinks": attn_sinks,
             "metadata": metadata, # get from metadata op for fa tiling
             "softmax_scale": self.softmax_scale,
         }
-        if self.kv_cache_quant_mode == "hifloat8":
-            attn_kwargs["layout_kv"] = "PA_BBND"
-            attn_kwargs["cmp_mask_mode"] = 3 if self.compress_ratio > 1 else 0
-            attn_kwargs["q"] = q if q.dtype == torch.uint8 \
-                else torch_npu.npu_dtype_cast(q, dtype=torch_npu.hifloat8)
-            attn_kwargs["seqused_ori_kv"] = seqused_kv
-            cmp = attn_metadata.get("cmp_seqlens", {}).get(self.compress_ratio)
-            if cmp is None:
-                cmp = ((seqused_kv // self.compress_ratio).to(torch.int32),
-                       (seqused_kv % self.compress_ratio).to(torch.int32)
-                       if self.compress_ratio != 1 else None)
-            seqused_cmp_kv, cmp_residual_kv = cmp
-            attn_kwargs["seqused_cmp_kv"] = seqused_cmp_kv
-            if cmp_residual_kv is not None:
-                attn_kwargs["cmp_residual_kv"] = cmp_residual_kv
-            attn_kwargs["q_descale"] = self.hif8_descale
-            attn_kwargs["ori_kv_descale"] = self.hif8_descale
-            attn_kwargs["cmp_kv_descale"] = self.hif8_descale
-            attn_kwargs["quant_mode"] = 1  # 1: Q/K/V HiF8 per-tensor
-        elif self.kv_cache_quant_mode == "float8":
-            attn_kwargs["seqused_kv"] = seqused_kv
-            attn_kwargs["tile_size"] = 64 # quant per tile size
+        if self.compress_ratio > 1:
+            ratio_key = f"{self.compress_ratio}"
+            attn_kwargs.update({
+                "seqused_cmp_kv": attn_metadata["compressed_seq_lens"][ratio_key],
+                "cmp_residual_kv": attn_metadata["compressed_seq_remainders"][ratio_key],
+            })
+        if self.kv_cache_quant_mode == "float8":
+            attn_kwargs["quant_mode"] = 1
             attn_kwargs["rope_head_dim"] = self.rope_head_dim
-            attn_kwargs["kv_quant_mode"] = 1
-        else:
-            attn_kwargs["seqused_kv"] = seqused_kv
+        elif self.kv_cache_quant_mode == "hifloat8":
+            attn_kwargs.update({
+                "quant_mode": 1,
+                "q_descale": self.hif8_descale,
+                "ori_kv_descale": self.hif8_descale,
+                "cmp_kv_descale": self.hif8_descale if cmp_cache is not None else None,
+            })
         return attn_kwargs
 
     def update_win_kv(
@@ -1419,22 +1442,39 @@ class Attention(nn.Module):
         win_kv_slot_mapping: torch.Tensor,
         win_cache: torch.Tensor,
     ):
-        if self.kv_cache_quant_mode in ("float8", "hifloat8"):
-            if self.kv_cache_quant_mode == "hifloat8":
-                quant_mode = "hifloat8_fp4"
-            else:
-                quant_mode = "fp8_bf16"
-            cache = win_cache.view(torch.uint8) if win_cache.dtype != torch.uint8 else win_cache
+        if self.kv_cache_quant_mode == "hifloat8":
+            win_kv_slot_mapping = win_kv_slot_mapping.to(
+                device=win_cache.device, dtype=torch.int32
+            ).contiguous()
+            win_cache_scale = torch.empty(
+                (*win_cache.shape[:-1], 1), dtype=torch.float32, device=win_cache.device
+            )
+            slot_mapping_i32 = win_kv_slot_mapping.view(-1)
+            torch.ops.cann_ops_transformer.indexer_quant_cache(
+                cache=win_cache,
+                cache_scale=win_cache_scale,
+                x=kv.view(-1, self.head_dim),
+                slot_mapping=slot_mapping_i32,
+                quant_mode="hifloat8",
+                x_scale=1.0,
+            )
+        elif self.kv_cache_quant_mode == "float8":
             torch.ops.cann_ops_transformer.kv_compress_epilog(
                 x=kv.view(-1, self.head_dim),
                 slot_mapping=win_kv_slot_mapping,
-                cache=cache,
-                quant_mode=quant_mode,
+                cache=win_cache,
+                quant_mode="fp8_bf16"
             )
         else:
-            torch.ops.custom.scatter_nd_update_asc(win_cache.view(-1, win_cache.shape[-1]),
-                                            win_kv_slot_mapping.view(-1, 1),
-                                            kv.view(-1, self.head_dim))
+            scatter = torch_npu.npu_scatter_nd_update_
+            if self.platform_version == PlatformVersion.A3:
+                import custom_ops  # Registers the A3 custom operator binding.
+                scatter = torch.ops.custom.scatter_nd_update_asc
+            scatter(
+                win_cache.view(-1, win_cache.shape[-1]),
+                win_kv_slot_mapping.view(-1, 1),
+                kv.view(-1, self.head_dim),
+            )
 
     def sparse_attn(
         self,
@@ -1539,10 +1579,11 @@ class Attention(nn.Module):
                 partial_slice=self.partial_slice,
                 platform_version=self.platform_version,
                 origin_shape=o.shape,
+                scale=self.hif8_quant_scale,
             )
             o = o.view(num_tokens, self.num_groups_per_rank, -1)
         else:
-            torch.ops.custom.inplace_partial_rotary_mul(
+            torch.ops.cann_ops_transformer.inplace_partial_rotary_mul(
                 o.unsqueeze(2), cos, sin,
                 rotary_mode="interleave",
                 partial_slice=self.partial_slice,
@@ -2181,9 +2222,9 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
         # Initialize weights and apply final processing
         self.post_init()
         self.block_size = self.infer_config.scheduler_config.block_size
-        self.sas_metadata_ops = torch.ops.custom.npu_sparse_attn_sharedkv_metadata
+        self.sas_metadata_ops = torch.ops.cann_ops_transformer.sparse_flash_mla_metadata
         if self.kv_cache_quant_mode == "float8":
-            self.sas_metadata_ops = torch.ops.custom.npu_kv_quant_sparse_attn_sharedkv_metadata
+            self.sas_metadata_ops = torch.ops.cann_ops_transformer.mixed_quant_sparse_flash_mla_metadata
         elif self.kv_cache_quant_mode == "hifloat8":
             self.sas_metadata_ops = torch.ops.cann_ops_transformer.quant_sparse_flash_mla_metadata
         self.window_size = config.sliding_window
@@ -2289,6 +2330,9 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
         enable_weight_nz = self.infer_config.model_config.enable_weight_nz
 
         for module_name, module in self.named_modules():
+            if module_name.endswith("compressor.norm"):
+                module.weight.data = module.weight.data.to(torch.float32)
+
             if "wo_a" in module_name:
                 config = self.config
                 head_dim_per_group = config.num_attention_heads * config.head_dim // config.o_groups
@@ -2540,37 +2584,31 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
 
     def calc_sas_metadata(self, attn_metadata, metadata_kwargs):
         metadata_kwargs["cu_seqlens_q"] = attn_metadata['cu_seq_lens_q']
+        metadata_kwargs["seqused_q"] = attn_metadata['seq_used_q']
         actual_seq_k = attn_metadata['actual_seq_k']
-        metadata_kwargs["batch_size"] = actual_seq_k.shape[0]
-        if self.kv_cache_quant_mode == "hifloat8":
-            # Reuse the seqused_cmp / residual precomputed once in build_attn_metadata.
+        metadata_kwargs["seqused_ori_kv"] = actual_seq_k
+        if metadata_kwargs.get("has_cmp_kv", False):
             cmp_ratio = metadata_kwargs["cmp_ratio"]
-            cmp = attn_metadata.get("cmp_seqlens", {}).get(cmp_ratio)
-            if cmp is None:
-                cmp = ((actual_seq_k // cmp_ratio).to(torch.int32),
-                       (actual_seq_k % cmp_ratio).to(torch.int32) if cmp_ratio != 1 else None)
-            metadata_kwargs["seqused_ori_kv"] = actual_seq_k
-            metadata_kwargs["seqused_cmp_kv"] = cmp[0]
-            if cmp[1] is not None:
-                metadata_kwargs["cmp_residual_kv"] = cmp[1]
-        else:
-            metadata_kwargs["seqused_kv"] = actual_seq_k
+            ratio_key = f"{cmp_ratio}"
+            metadata_kwargs.update({
+                "seqused_cmp_kv": attn_metadata["compressed_seq_lens"][ratio_key],
+                "cmp_residual_kv": attn_metadata["compressed_seq_remainders"][ratio_key],
+            })
+        metadata_kwargs["batch_size"] = actual_seq_k.shape[0]
         return self.sas_metadata_ops(**metadata_kwargs)
 
     def calc_li_metadata(self, attn_metadata, metadata_kwargs):
-        if self.li_cache_quant_mode == "hifloat8":
-            actual_seq_k = attn_metadata['actual_seq_k']
-            cmp_ratio = metadata_kwargs["cmp_ratio"]
-            metadata_kwargs["cu_seqlens_q"] = attn_metadata['cu_seq_lens_q']
-            # Reuse the seqused_cmp / residual precomputed once in build_attn_metadata.
-            cmp = attn_metadata.get("cmp_seqlens", {}).get(cmp_ratio)
-            if cmp is None:
-                cmp = ((actual_seq_k // cmp_ratio).to(torch.int32), (actual_seq_k % cmp_ratio).to(torch.int32))
-            metadata_kwargs["seqused_k"], metadata_kwargs["cmp_residual_k"] = cmp
-            return torch.ops.cann_ops_transformer.quant_lightning_indexer_metadata(**metadata_kwargs)
-        metadata_kwargs["actual_seq_lengths_query"] = attn_metadata['actual_seq_q']
-        metadata_kwargs["actual_seq_lengths_key"] = attn_metadata['actual_seq_k']
-        return torch.ops.custom.npu_quant_lightning_indexer_metadata(**metadata_kwargs)
+        metadata_kwargs["cu_seqlens_q"] = attn_metadata['cu_seq_lens_q']
+        metadata_kwargs["seqused_q"] = attn_metadata['seq_used_q']
+        actual_seq_k = attn_metadata['actual_seq_k']
+        cmp_ratio = metadata_kwargs["cmp_ratio"]
+        ratio_key = f"{cmp_ratio}"
+        # seqused_k is the valid length in the compressed cache; cmp_residual_k
+        # carries the remainder needed to reconstruct the original sequence length.
+        metadata_kwargs["seqused_k"] = attn_metadata["compressed_seq_lens"][ratio_key]
+        metadata_kwargs["cmp_residual_k"] = attn_metadata["compressed_seq_remainders"][ratio_key]
+        metadata_kwargs["batch_size"] = actual_seq_k.shape[0]
+        return torch.ops.cann_ops_transformer.quant_lightning_indexer_metadata(**metadata_kwargs)
 
     def generate_metadata(self, attn_metadata, metadata_kwargs, is_prefill, metadata_desc, is_li=False):
         metadata_ops = self.calc_li_metadata if is_li else self.calc_sas_metadata
@@ -2582,65 +2620,55 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
             attn_metadata['kernel_metadata'][metadata_desc] = metadata_ops(attn_metadata, metadata_kwargs)
 
     def init_cache_dim(self):
-        cache_dim = self.config.head_dim
-        if self.kv_cache_quant_mode == "float8":
-            rope_dim = self.config.qk_rope_head_dim
-            nope_dim = self.config.head_dim - rope_dim
-            # when FA FP8 quant is enabled, nope_cache, rope_cache, and scales
-            # are concatenated and passed via the kv input (FP8).
-            # nope(fp8 1B) + rope(bf16 2B) + scales(bf16 2B per group, group_size=64)，align_up(128B)
-            cache_dim = align_up(nope_dim + 2 * rope_dim + 2 * nope_dim // 64, 128)
-        self.cache_dim = cache_dim
+        self.cache_dim = get_kv_cache_dim(
+            self.config.head_dim, self.config.qk_rope_head_dim, self.kv_cache_quant_mode)
 
     def generate_sas_metadata_kwargs(self):
+        # Sparse MLA mask modes: 0: no mask, 3: right-down causal, 4: sliding window.
         sas_metadata_kwargs = {
             "cmp_ratio": 1,
-            "ori_mask_mode": 4, # sliding window
-            "cmp_mask_mode": 3, # causal
+            "ori_mask_mode": 4, # 4: sliding-window mask
+            # A5 accepts mode 0 for C1A; the A3 metadata kernel requires causal mode 3.
+            "cmp_mask_mode": 0 if self.platform_version == PlatformVersion.ASCEND_950 else 3,
             "ori_win_left": 127, # default
             "ori_win_right": 0,
             "layout_q": "TND",
-            "layout_kv": "PA_ND",
+            "layout_kv": "PA_BBND",
             "num_heads_q": self.config.num_attention_heads,
             "num_heads_kv": 1,
-            "head_dim": self.cache_dim,
+            "head_dim": self.config.kv_lora_rank,
             "has_ori_kv": True,
             "has_cmp_kv": False,
         }
         if self.kv_cache_quant_mode == "hifloat8":
-            sas_metadata_kwargs.update({"quant_mode": 1, "layout_kv": "PA_BBND"})  # 1: Q/K/V HiF8 per-tensor
+            sas_metadata_kwargs.update({
+                "quant_mode": 1,  # 1: Q/K/V HiF8 per-tensor
+            })
         elif self.kv_cache_quant_mode == "float8":
             sas_metadata_kwargs.update(
-                {"kv_quant_mode": 1, "tile_size": 64, "rope_head_dim": self.rope_head_dim}
+                {"quant_mode": 1,  # 1: quantized KV-cache mode for mixed sparse MLA
+                 "rope_head_dim": self.rope_head_dim}
             )
         return sas_metadata_kwargs
 
     def generate_li_metadata_kwargs(self):
-        if self.li_cache_quant_mode == "hifloat8":
-            li_metadata_kwargs = {
-                "layout_k": 'PA_BBND',
-                "topk": self.config.index_topk,
-                "mask_mode": 3,  # 3: rightDownCausal (0: no mask)
-                "layout_q": "TND",
-                "cmp_ratio": 4, # only c4a have li module
-                "quant_mode": 4,  # 4: qk HiF8 per-tensor, scale fp32 (1: fp8-e4m3, 2: int8)
-                "num_heads_q": self.config.index_n_heads,
-                "num_heads_k": 1,
-                "head_dim": self.config.index_head_dim,
-            }
-        else:
-            li_metadata_kwargs = {
-                "layout_key": 'PA_BSND',
-                "sparse_count": self.config.index_topk,
-                "sparse_mode": 3,
-                "layout_query": "TND",
-                "cmp_ratio": 4, # only c4a have li module
-                "key_quant_mode": 0,
-                "query_quant_mode": 0,
-                "num_heads_q": self.config.index_n_heads,
-                "num_heads_k": 1,
-                "head_dim": self.config.index_head_dim,
-            }
+        # Lightning Indexer quant modes: 1: FP8 E4M3, 2: INT8, 4: HiFloat8.
+        quant_mode = 1
+        if self.li_cache_quant_mode == "int8":
+            quant_mode = 2
+        elif self.li_cache_quant_mode == "hifloat8":
+            quant_mode = 4
+        li_metadata_kwargs = {
+            "layout_k": "PA_BBND",
+            "topk": self.config.index_topk,
+            "mask_mode": 3,  # 3: causal mask
+            "layout_q": "TND",
+            "cmp_ratio": 4, # only c4a have li module
+            "quant_mode": quant_mode,
+            "num_heads_q": self.config.index_n_heads,
+            "num_heads_k": 1,
+            "head_dim": self.config.index_head_dim,
+        }
         return li_metadata_kwargs
 
     def generate_kernel_metadata(self, attn_metadata, is_prefill, is_mtp=False):
@@ -2648,14 +2676,14 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
         c1a_metadata_kwargs = None
         if self.first_layer_ratio == 1:
             c1a_metadata_kwargs = self.generate_sas_metadata_kwargs()
-            if self.kv_cache_quant_mode == "hifloat8":
-                c1a_metadata_kwargs["cmp_mask_mode"] = 0
 
         c4a_metadata_kwargs = self.generate_sas_metadata_kwargs()
-        c4a_metadata_kwargs.update({"cmp_ratio": 4, "has_cmp_kv": True, "cmp_topk": self.config.index_topk})
+        c4a_metadata_kwargs.update(
+            {"cmp_ratio": 4, "cmp_mask_mode": 3, "has_cmp_kv": True, "cmp_topk": self.config.index_topk}
+        )
 
         c128a_metadata_kwargs = self.generate_sas_metadata_kwargs()
-        c128a_metadata_kwargs.update({"cmp_ratio": 128, "has_cmp_kv": True})
+        c128a_metadata_kwargs.update({"cmp_ratio": 128, "cmp_mask_mode": 3, "has_cmp_kv": True})
 
         enable_metadata_multi_streams = self.enable_multi_streams and not is_prefill
         record_event(enable_metadata_multi_streams, attn_metadata.get('metadata_event'), 0)

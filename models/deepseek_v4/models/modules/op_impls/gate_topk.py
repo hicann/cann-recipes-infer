@@ -23,6 +23,8 @@
 
 import torch
 import torch.nn.functional as F
+import torch_npu
+from executor.core.config import PlatformVersion
 from ..registry import register_op_impl
 
 
@@ -44,12 +46,19 @@ def gate_topk_ascendc(module, logits, input_ids):
             scores, k=module.top_k, dim=-1, sorted=False
         )
     elif module.topk_method == "noaux_tc":
+        # A3 gating_top_k supports norm_type 0/1 only; sqrtsoftplus requires mode 2.
+        if module.use_native_gate_topk:
+            return gate_topk_native(module, logits, input_ids)
         scoring_func_mapping = {
             "softmax": 0,
             "sigmoid": 1,
             "sqrtsoftplus": 2
         }
-        topk_weight, topk_idx, _ = torch.ops.custom.npu_moe_gating_top_k(
+        op = torch_npu.npu_moe_gating_top_k
+        if module.platform_version == PlatformVersion.A3:
+            import custom_ops  # Registers the A3 custom operator binding.
+            op = torch.ops.custom.npu_moe_gating_top_k
+        topk_weight, topk_idx, _ = op(
             logits,
             k=module.top_k,
             bias=module.gate.e_score_correction_bias,

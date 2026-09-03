@@ -21,9 +21,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from dataclasses import dataclass
+
 import torch
 import torch.nn.functional as F
 from ..registry import register_op_impl
+
+
+@dataclass(frozen=True)
+class _HCPreParams:
+    """Parameters shared by the hc_pre preprocessing implementations."""
+
+    hc_fn: torch.Tensor
+    hc_scale: torch.Tensor
+    hc_base: torch.Tensor
+    hc_mult: int
+    hc_sinkhorn_iters: int
+    norm_eps: float
+    hc_eps: float
+
 
 def hc_split_sinkhorn_torch(
         mixes: torch.Tensor,
@@ -52,15 +68,48 @@ def hc_split_sinkhorn_torch(
     return pre, post, comb
 
 
+# A3 custom hc_pre keeps the existing preprocessing and changes only the
+# operator binding.
+def _hc_pre_custom_a3(x: torch.Tensor, params: _HCPreParams):
+    dtype = x.dtype
+    x_float = x.float()
+    flatten_start = 2 if x.dim() == 4 else 1
+    x_flat = x_float.flatten(flatten_start, -1)
+    rsqrt = torch.rsqrt(x_flat.square().mean(-1, keepdim=True) + params.norm_eps)
+    mixes = F.linear(x_flat, params.hc_fn) * rsqrt
+    y, post, comb = torch.ops.custom.npu_hc_pre_sinkhorn(
+        mixes.contiguous(), rsqrt.contiguous(), params.hc_scale, params.hc_base, x.contiguous(),
+        hc_mult=params.hc_mult,
+        hc_sinkhorn_iters=params.hc_sinkhorn_iters,
+        hc_eps=params.hc_eps,
+    )
+    return y.to(dtype), post, comb
+
+
+@register_op_impl(op_type="hc_pre", func_key="hc_pre_ascendc_a3")
+def hc_pre_ascendc_a3(x, *hc_pre_args):
+    import custom_ops  # Registers the A3 custom operator binding.
+    params = _HCPreParams(*hc_pre_args)
+    return _hc_pre_custom_a3(x, params)
+
+
 # hc_pre currently support Native, AscendC and PyPTO version
 @register_op_impl(op_type="hc_pre", func_key="hc_pre_ascendc")
 def hc_pre_ascendc(x, hc_fn, hc_scale, hc_base, hc_mult, hc_sinkhorn_iters, norm_eps, hc_eps):
-    y, post, comb = torch.ops.custom.npu_hc_pre(
-                x, hc_fn, hc_scale, hc_base, hc_mult=hc_mult,
-                hc_sinkhorn_iters=hc_sinkhorn_iters,
-                norm_eps=norm_eps,
-                hc_eps=hc_eps)
-    return y, post, comb
+    x = x.unsqueeze(1)
+    y, post, comb, _, _, _, _, _ = torch.ops.cann_ops_transformer.mhc_pre_sinkhorn(
+        x=x,
+        phi=hc_fn,
+        alpha=hc_scale,
+        bias=hc_base,
+        hcMult=hc_mult,
+        numIters=hc_sinkhorn_iters,
+        hcEps=hc_eps,
+        normEps=norm_eps,
+        outFlag=False,
+    )
+    comb = comb.unflatten(-1, (hc_mult, hc_mult))
+    return y.squeeze(1), post.squeeze(1), comb.squeeze(1)
 
 
 @register_op_impl(op_type="hc_pre", func_key="hc_pre_pypto_a3")
@@ -92,7 +141,7 @@ def hc_pre_native(x, hc_fn, hc_scale, hc_base, hc_mult, hc_sinkhorn_iters, norm_
 # hc_post currently support Native and AscendC version
 @register_op_impl(op_type="hc_post", func_key="hc_post_ascendc")
 def hc_post_ascendc(x, residual, post, comb):
-    y = torch.ops.custom.npu_hc_post(x, residual, post, comb)
+    y = torch.ops.cann_ops_transformer.mhc_post(residual, comb, x, post)
     return y
 
 
