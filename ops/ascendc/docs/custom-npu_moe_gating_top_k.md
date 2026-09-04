@@ -36,7 +36,7 @@
     $$
     groupOut, groupId = TopK(ReduceSum(TopK(Split(normOut, groupCount), k=2, dim=-1), dim=-1),k=kGroup)
     $$
-    
+
     如果指定了input_ids和tid2eid，则根据输入的词表进行hash操作；
     否则根据上一步的groupId获取normOut中对应的元素，将数据再做TopK，得到expertIdxOut的结果：
 
@@ -56,7 +56,7 @@ custom.npu_moe_gating_top_k(Tensor x, int k, *, Tensor? bias=None, Tensor? input
 ```
 
 ## 参数说明
->**说明：**<br> 
+>**说明：**<br>
 >
 >- b（batch size）表示输入样本批量大小、s（sequence length）表示输入样本序列长度、T表示bs合轴后的大小、e表示专家数量、k表示选取Top专家数。
 
@@ -79,22 +79,22 @@ custom.npu_moe_gating_top_k(Tensor x, int k, *, Tensor? bias=None, Tensor? input
 ## 返回值说明
 | 返回值 | 类型 | 描述 |
 |:---|:---|:---|
-| `yOut` | Tensor | 归一化、分组排序和TopK后的结果 |
-| `expertIdxOut` | Tensor | 专家索引，数据类型为int32 |
+| `y` | Tensor | 归一化、分组排序和TopK后的结果 |
+| `expert_idx` | Tensor | 专家索引，数据类型为int32 |
 | `out` | Tensor | 归一化结果（当out_flag=True时有效） |
 
 ## 约束说明
 * renorm仅支持0，表示先进行norm操作，再计算topk。
 * group_select_mode取值0和1，0表示使用最大值对group进行排序, 1表示使用topk2的sum值对group排序。
-* norm_type取值0和1，0表示使用Softmax函数，1表示使用Sigmoid函数，2表示使用Softplus函数。
-* outFlag取值true和false，true表示输出，false表示不输出。
+* norm_type取值0、1和2，0表示使用Softmax函数，1表示使用Sigmoid函数，2表示使用Softplus函数。
+* out_flag取值true和false，true表示输出，false表示不输出。
 * input_ids和tid2eid都不为空表示hash场景，都为空表示topk场景，不允许只有一个为空。
 * k_group和group_count为1时，表示不分组排序。
 * bias的dtype要和x相同。
 * 该接口支持推理场景下使用。
 * 该接口支持aclgraph入图。
 * 该接口与PyTorch配合使用时，需要保证CANN相关包与PyTorch相关包的版本匹配。
-    
+
 ## 调用示例
 
 - 详见 [test_npu_moe_gating_top_k.py](../examples/test_npu_moe_gating_top_k.py)
