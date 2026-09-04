@@ -1,53 +1,153 @@
-From 270f809d6d815bb0143663676f6143f3eb047179 Mon Sep 17 00:00:00 2001
-From: root <root@liteserver-hps-5c19-00001.novalocal>
-Date: Mon, 23 Mar 2026 07:03:05 +0000
-Subject: [PATCH] Enable Quark quantization resolution on Ascend NPU.
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: cann-recipes-infer <cann-recipes-infer@users.noreply.github.com>
+Date: Mon, 20 Jul 2026 13:38:17 +0000
+Subject: [PATCH] Enable MiniMax MXFP4 W4A4 and KV-cache QDQ on Ascend NPU.
 
-This unblocks MXFP4 startup by allowing Quark in platform capability checks and making quant config lookups robust to missing keys.
 ---
- vllm_ascend/ops/layernorm.py                 |  6 ++++--
- vllm_ascend/platform.py                      |  2 +-
- vllm_ascend/quantization/modelslim_config.py | 14 +++++++++-----
- 3 files changed, 14 insertions(+), 8 deletions(-)
+diff --git a/vllm_ascend/ops/fused_moe/moe_mlp.py b/vllm_ascend/ops/fused_moe/moe_mlp.py
+index 7aa3004..7a4bb3c 100644
+--- a/vllm_ascend/ops/fused_moe/moe_mlp.py
++++ b/vllm_ascend/ops/fused_moe/moe_mlp.py
+@@ -327,6 +327,7 @@ def unquant_apply_mlp(
+     group_list_type: int = 1,
+     topk_scales: torch.Tensor | None = None,
+     need_trans: bool = True,
++    w2_input_fn=None,
+ ) -> torch.Tensor:
+     if need_trans:
+         w1 = w1.transpose(1, 2)
+@@ -348,6 +349,9 @@ def unquant_apply_mlp(
+     else:
+         gate_up_out = torch_npu.npu_swiglu(gate_up_out)
 
++    if w2_input_fn is not None:
++        gate_up_out = w2_input_fn(gate_up_out)
++
+     if topk_scales is not None:
+         gate_up_out *= topk_scales
+
+@@ -400,6 +404,7 @@ def unified_apply_mlp(*, mlp_compute_input: MoEMlpComputeInput) -> torch.Tensor:
+             group_list_type=group_list_type,
+             topk_scales=topk_scales,
+             need_trans=need_trans,
++            w2_input_fn=mlp_compute_input.w2_input_fn,
+         )
+
+     assert w1_scale is not None and w2_scale is not None
+diff --git a/vllm_ascend/ops/fused_moe/moe_runtime_args.py b/vllm_ascend/ops/fused_moe/moe_runtime_args.py
+index 573de7f1..9901e5ad 100644
+--- a/vllm_ascend/ops/fused_moe/moe_runtime_args.py
++++ b/vllm_ascend/ops/fused_moe/moe_runtime_args.py
+@@ -57,6 +57,8 @@ dataclass directly.
+
+ from __future__ import annotations
+
++from collections.abc import Callable
++
+ import torch
+
+ import vllm_ascend.ops.fused_moe.moe_stage_params as _stage_params
+@@ -144,6 +146,7 @@ def build_fused_experts_input(
+     w2_scale_bias: torch.Tensor | None = None,
+     w1_offset: torch.Tensor | None = None,
+     w2_offset: torch.Tensor | None = None,
++    w2_input_fn: Callable[[torch.Tensor], torch.Tensor] | None = None,
+ ) -> MoEFusedExpertsInput:
+     return MoEFusedExpertsInput(
+         hidden_states=hidden_states,
+@@ -184,6 +187,7 @@ def build_fused_experts_input(
+                 mxfp_use_bf16=mxfp_use_bf16,
+             ),
+         ),
++        w2_input_fn=w2_input_fn,
+     )
+
+
+@@ -222,6 +226,7 @@ def build_mlp_compute_input(
+         activation=fused_experts_input.activation,
+         need_trans=fused_experts_input.need_trans,
+         dynamic_eplb=fused_experts_input.dynamic_eplb,
++        w2_input_fn=fused_experts_input.w2_input_fn,
+     )
+
+
+diff --git a/vllm_ascend/ops/fused_moe/moe_stage_contracts.py b/vllm_ascend/ops/fused_moe/moe_stage_contracts.py
+index 1e137498..a6644f82 100644
+--- a/vllm_ascend/ops/fused_moe/moe_stage_contracts.py
++++ b/vllm_ascend/ops/fused_moe/moe_stage_contracts.py
+@@ -16,6 +16,7 @@
+ #
+ from __future__ import annotations
+
++from collections.abc import Callable
+ from dataclasses import dataclass
+ from typing import Generic, TypeVar
+
+@@ -68,6 +69,7 @@ class MoEFusedExpertsInput:
+     activation: str = "silu"
+     need_trans: bool = False
+     dynamic_eplb: bool = False
++    w2_input_fn: Callable[[torch.Tensor], torch.Tensor] | None = None
+
+
+ @dataclass(frozen=True, slots=True)
+@@ -138,6 +140,7 @@ class MoEMlpComputeInput:
+     activation: str = "silu"
+     need_trans: bool = False
+     dynamic_eplb: bool = False
++    w2_input_fn: Callable[[torch.Tensor], torch.Tensor] | None = None
+
+
+ __all__ = [
 diff --git a/vllm_ascend/ops/layernorm.py b/vllm_ascend/ops/layernorm.py
-index dd676e8f..b12cc0c8 100644
+index 2c3a8b0f..12724c82 100644
 --- a/vllm_ascend/ops/layernorm.py
 +++ b/vllm_ascend/ops/layernorm.py
-@@ -40,8 +40,10 @@ class AscendRMSNorm(RMSNorm):
-         vllm_config = get_current_vllm_config()
-         self.bias = None
+@@ -40,8 +40,9 @@ class AscendRMSNorm(RMSNorm):
+         self.bias_loaded = False
+
          # quantization with anti_method m4 will generate none-zero norm bias
--        if vllm_config.quant_config is not None and \
--                any("norm.bias" in name for name in vllm_config.quant_config.quant_description.keys()):
-+        quant_description = getattr(vllm_config.quant_config,
-+                                    "quant_description", None)
-+        if quant_description is not None and any("norm.bias" in name
-+                                                 for name in quant_description.keys()):
-             self.bias = torch.nn.Parameter(torch.zeros(hidden_size),
-                                            requires_grad=False)
- 
+-        if vllm_config.quant_config is not None and any(
+-            "norm.bias" in name for name in vllm_config.quant_config.quant_description
++        quant_description = getattr(vllm_config.quant_config, "quant_description", None)
++        if quant_description is not None and any(
++            "norm.bias" in name for name in quant_description
+         ):
+             self.bias = torch.nn.Parameter(torch.zeros(hidden_size), requires_grad=False)
+             self.bias.weight_loader = self._bias_weight_loader
+diff --git a/vllm_ascend/patch/worker/__init__.py b/vllm_ascend/patch/worker/__init__.py
+index 4d2dbfd7..edfcaa60 100644
+--- a/vllm_ascend/patch/worker/__init__.py
++++ b/vllm_ascend/patch/worker/__init__.py
+@@ -30,6 +30,7 @@ import vllm_ascend.patch.worker.patch_bert  # noqa
+ import vllm_ascend.patch.worker.patch_distributed  # noqa
+ import vllm_ascend.patch.worker.patch_minimax_m2  # noqa
+ import vllm_ascend.patch.worker.patch_minimax_m2_linear_attn  # noqa
++import vllm_ascend.patch.worker.patch_minimax_m2_kvcache_mxfp4  # noqa
+ import vllm_ascend.patch.worker.patch_mamba_utils  # noqa
+ import vllm_ascend.patch.worker.patch_multimodal_merge  # noqa
+ import vllm_ascend.patch.worker.patch_gdn_attn  # noqa
 diff --git a/vllm_ascend/platform.py b/vllm_ascend/platform.py
-index a87c790f..efb3724e 100644
+index 85f19eeb..f6410cd1 100644
 --- a/vllm_ascend/platform.py
 +++ b/vllm_ascend/platform.py
-@@ -101,7 +101,7 @@ class NPUPlatform(Platform):
+@@ -100,7 +100,7 @@ class NPUPlatform(Platform):
      device_control_env_var: str = "ASCEND_RT_VISIBLE_DEVICES"
      dispatch_key: str = "PrivateUse1"
- 
+
 -    supported_quantization: list[str] = [ASCEND_QUANTIZATION_METHOD, COMPRESSED_TENSORS_METHOD]
 +    supported_quantization: list[str] = [ASCEND_QUANTIZATION_METHOD, COMPRESSED_TENSORS_METHOD, "quark"]
- 
+
      def is_sleep_mode_available(self) -> bool:
          return True
 diff --git a/vllm_ascend/quantization/modelslim_config.py b/vllm_ascend/quantization/modelslim_config.py
-index 5464cee7..89954478 100644
+index 2e8d6212..334fc534 100644
 --- a/vllm_ascend/quantization/modelslim_config.py
 +++ b/vllm_ascend/quantization/modelslim_config.py
-@@ -357,8 +357,12 @@ class AscendModelSlimConfig(QuantizationConfig):
+@@ -400,8 +400,12 @@ class AscendModelSlimConfig(QuantizationConfig):
+
      @classmethod
-     def override_quantization_method(cls, hf_quant_cfg,
-                                      user_quant) -> Optional[str]:
+     def override_quantization_method(cls, hf_quant_cfg, user_quant) -> str | None:
 -        if hf_quant_cfg is not None:
 -            quant_method = hf_quant_cfg.get("quant_method", None)
 +        if user_quant is not None:
@@ -59,26 +159,193 @@ index 5464cee7..89954478 100644
              if not quant_method and torch.npu.is_available():
                  return ASCEND_QUANTIZATION_METHOD
          return None
-@@ -451,8 +455,8 @@ class AscendModelSlimConfig(QuantizationConfig):
- 
+@@ -497,7 +501,7 @@ class AscendModelSlimConfig(QuantizationConfig):
+
              is_skipped = None
              for shard_prefix in shard_prefixes:
--                is_shard_skipped = self.quant_description[shard_prefix +
--                                                          '.weight'] == "FLOAT"
-+                is_shard_skipped = self.quant_description.get(
-+                    shard_prefix + '.weight', 'FLOAT') == "FLOAT"
- 
+-                is_shard_skipped = self.quant_description[shard_prefix + ".weight"] == "FLOAT"
++                is_shard_skipped = self.quant_description.get(shard_prefix + ".weight", "FLOAT") == "FLOAT"
+
                  if is_skipped is None:
                      is_skipped = is_shard_skipped
-@@ -462,7 +466,7 @@ class AscendModelSlimConfig(QuantizationConfig):
-                         "are quantized. All shards of fused layers "
-                         "to have the same precision.")
-         else:
--            is_skipped = self.quant_description[prefix + '.weight'] == "FLOAT"
-+            is_skipped = self.quant_description.get(prefix + '.weight', 'FLOAT') == "FLOAT"
- 
-         assert is_skipped is not None
-         return is_skipped
--- 
+diff --git a/vllm_ascend/patch/worker/patch_minimax_m2_kvcache_mxfp4.py b/vllm_ascend/patch/worker/patch_minimax_m2_kvcache_mxfp4.py
+new file mode 100644
+new file mode 100644
+index 00000000..a2702452
+--- /dev/null
++++ b/vllm_ascend/patch/worker/patch_minimax_m2_kvcache_mxfp4.py
+@@ -0,0 +1,172 @@
++#
++# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
++# This file is a part of the vllm-ascend project.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++#
++# MiniMax-M2 KV-cache MXFP4 QDQ + block-32 Hadamard rotation on (Q, K).
++#
++# Hook MiniMaxM2Attention.{__init__,forward} (after patch_minimax_m2.py
++# has already replaced them) to:
++#   1. attach a per-layer Hadamard buffer at __init__ time (outside any
++#      compile context, so no dict mutation happens during forward), and
++#   2. rotate Q and K by a block-diagonal Hadamard inside each 32-dim
++#      MXFP4 group (preserves Q@K because H is orthogonal), then QDQ K
++#      and V via per-token MXFP4 (group_size=32 along head_dim) BEFORE
++#      the kv-cache write inside self.attn.
++#
++# The first VLLM_KV_MXFP4_ANCHOR tokens of each sequence are kept at BF16
++# (no QDQ) -- implemented as a static torch.where, so torch.compile can
++# trace through the forward graph.
++#
++# Environment knobs (read once at import; restart the server to change):
++#   VLLM_KV_MXFP4_SKIP        = "1"  -> disable everything (debug)
++#   VLLM_KV_MXFP4_SKIP_QDQ    = "1"  -> only rotate, skip K/V QDQ
++#   VLLM_KV_MXFP4_SKIP_ROTATE = "1"  -> only QDQ, skip rotation
++#   VLLM_KV_MXFP4_ANCHOR      = "32" -> # of leading tokens kept BF16
++#   VLLM_KV_MXFP4_GROUP_SIZE  = "32" -> MXFP4 group size along head_dim
++
++import os
++
++import torch
++
++from vllm.model_executor.models.minimax_m2 import MiniMaxM2Attention
++from vllm.model_executor.layers.quantization.utils.mxfp4_utils import (
++    quant_dequant_mxfp4,
++)
++from vllm_ascend.ops.rotary_embedding import get_cos_and_sin_slice
++
++
++_KV_MXFP4_SKIP = os.getenv("VLLM_KV_MXFP4_SKIP", "0") == "1"
++_KV_MXFP4_SKIP_QDQ = os.getenv("VLLM_KV_MXFP4_SKIP_QDQ", "0") == "1"
++_KV_MXFP4_SKIP_ROTATE = os.getenv("VLLM_KV_MXFP4_SKIP_ROTATE", "0") == "1"
++_KV_MXFP4_ANCHOR = int(os.getenv("VLLM_KV_MXFP4_ANCHOR", "32"))
++_KV_MXFP4_GROUP = int(os.getenv("VLLM_KV_MXFP4_GROUP_SIZE", "32"))
++
++
++def _build_hadamard(n: int) -> torch.Tensor:
++    """Sylvester construction of an n x n normalized Hadamard matrix.
++
++    n must be a power of two. H @ H.T = I, so (Hq) . (Hk) = q . k.
++    """
++    assert n > 0 and (n & (n - 1)) == 0, f"Hadamard size must be 2^k, got {n}"
++    h = torch.ones((1, 1), dtype=torch.float32)
++    while h.shape[0] < n:
++        h = torch.cat(
++            (
++                torch.cat((h, h), dim=1),
++                torch.cat((h, -h), dim=1),
++            ),
++            dim=0,
++        )
++    return h / (n ** 0.5)
++
++
++# Module-level constant CPU Hadamard (FP32). Moved to NPU once per layer
++# at __init__ time below.  Kept in FP32 so the rotation matmul runs at
++# full precision; the result is cast back to the activation dtype (BF16).
++_H_CPU_FP32 = _build_hadamard(_KV_MXFP4_GROUP)
++
++
++def _block_hadamard(x: torch.Tensor, h: torch.Tensor, group: int) -> torch.Tensor:
++    """Apply block-diagonal Hadamard rotation along the last dim in FP32.
++
++    `x` shape: (..., last) with last % group == 0.
++    `h`: FP32 Hadamard buffer on the same device as x, shape (group, group).
++    """
++    orig_dtype = x.dtype
++    last = x.shape[-1]
++    x_view = x.float().view(*x.shape[:-1], last // group, group)
++    return torch.matmul(x_view, h).reshape(*x.shape[:-1], last).to(orig_dtype)
++
++
++def _mxfp4_qdq_with_anchor(
++    x: torch.Tensor, positions: torch.Tensor, anchor: int
++) -> torch.Tensor:
++    """QDQ all tokens via MXFP4, then select between original and QDQ
++    output per-token. Static graph: mask is a tensor compare, no Python
++    branch on tensor values.
++
++    `x` is (T, F); `positions` is (T,).
++    """
++    x_qdq = quant_dequant_mxfp4(x)
++    if anchor <= 0:
++        return x_qdq
++    mask = (positions >= anchor).unsqueeze(-1)
++    return torch.where(mask, x_qdq, x)
++
++
++# --- Patch __init__: attach the Hadamard buffer once per layer ----------
++
++_original_attention_init = MiniMaxM2Attention.__init__
++
++
++def _patched_init(self, *args, **kwargs) -> None:
++    _original_attention_init(self, *args, **kwargs)
++    # Register the Hadamard buffer on the current NPU device so it's
++    # available for matmul during forward (the model is created per-worker
++    # on its target NPU; CPU buffer would mismatch the activation device).
++    # Non-persistent => excluded from state_dict.
++    device = torch.device(f"npu:{torch.npu.current_device()}")
++    self.register_buffer(
++        "_kv_mxfp4_hadamard",
++        _H_CPU_FP32.to(device=device),
++        persistent=False,
++    )
++
++
++MiniMaxM2Attention.__init__ = _patched_init
++
++
++# --- Patch forward: rotation + KV MXFP4 QDQ -----------------------------
++
++_original_attention_forward = MiniMaxM2Attention.forward
++
++
++def _patched_forward(
++    self,
++    positions: torch.Tensor,
++    hidden_states: torch.Tensor,
++) -> torch.Tensor:
++    if _KV_MXFP4_SKIP:
++        return _original_attention_forward(self, positions, hidden_states)
++
++    qkv, _ = self.qkv_proj(hidden_states)
++    cos, sin = get_cos_and_sin_slice()
++    q, k, v = torch.ops.vllm.split_qkv_tp_rmsnorm_rope(
++        input=qkv,
++        q_weight=self.q_norm.weight,
++        k_weight=self.k_norm.weight,
++        q_hidden_size=self.q_size,
++        kv_hidden_size=self.kv_size,
++        head_dim=self.head_dim,
++        rotary_dim=getattr(self.rotary_emb, "rotary_dim", self.head_dim),
++        eps=self.q_norm.variance_epsilon,
++        tp_world=self.q_norm.tp_world,
++        cos=cos,
++        sin=sin,
++    )
++
++    if not _KV_MXFP4_SKIP_ROTATE:
++        # Per-layer pre-allocated Hadamard buffer (registered in __init__).
++        h = self._kv_mxfp4_hadamard
++        q = _block_hadamard(q, h, _KV_MXFP4_GROUP)
++        k = _block_hadamard(k, h, _KV_MXFP4_GROUP)
++
++    if not _KV_MXFP4_SKIP_QDQ:
++        k = _mxfp4_qdq_with_anchor(k, positions, _KV_MXFP4_ANCHOR)
++        v = _mxfp4_qdq_with_anchor(v, positions, _KV_MXFP4_ANCHOR)
++
++    attn_output = self.attn(q, k, v)
++    output, _ = self.o_proj(attn_output)
++    return output
+--
 2.34.1
-

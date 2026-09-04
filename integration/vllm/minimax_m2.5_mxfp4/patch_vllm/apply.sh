@@ -41,7 +41,28 @@ already_applied() {
   git -C "${repo_dir}" apply -p1 --reverse --check "${patch_file}" >/dev/null 2>&1
 }
 
-apply_patch_with_git_am() {
+# Some images ship selected sources with CRLF line endings; normalize so
+# LF-based patches apply cleanly. This is a working-tree-only rewrite.
+normalize_crlf_files() {
+  local repo_dir="$1"
+  shift
+  local rel_path
+  for rel_path in "$@"; do
+    local file_path="${repo_dir}/${rel_path}"
+    if [[ -f "${file_path}" ]] && grep -q $'\r' "${file_path}"; then
+      echo "[NORMALIZE] Strip CRLF: ${rel_path}"
+      python3 - "${file_path}" <<'PY'
+import sys
+from pathlib import Path
+path = Path(sys.argv[1])
+data = path.read_bytes().replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+path.write_bytes(data)
+PY
+    fi
+  done
+}
+
+apply_patch_idempotent() {
   local repo_dir="$1"
   local patch_file="$2"
   local label="$3"
@@ -55,55 +76,22 @@ apply_patch_with_git_am() {
   git -C "${repo_dir}" apply -p1 --check "${patch_file}"
 
   echo "[APPLY] ${label}"
-  git -C "${repo_dir}" am -C1 --ignore-whitespace --3way "${patch_file}"
+  git -C "${repo_dir}" apply -p1 "${patch_file}"
 }
 
-apply_patch_with_git_am "${VLLM_DIR}" "${VLLM_PATCH}" "vllm MXFP4 patch"
-apply_patch_with_git_am "${VLLM_ASCEND_DIR}" "${VLLM_ASCEND_PATCH}" "vllm-ascend FP8/MXFP4 patch"
+normalize_crlf_files "${VLLM_ASCEND_DIR}" \
+  "vllm_ascend/ops/fused_moe/moe_mlp.py"
 
-echo "[PATCH] Applying shm memory ordering fix"
-SHM_FILE="${VLLM_DIR}/vllm/distributed/device_communicators/shm_broadcast.py"
-export SHM_FILE
-python3 - <<'PY'
-import os
-import sys
-
-path = os.environ["SHM_FILE"]
-if not os.path.exists(path):
-    print(f"[WARN] shm file not found: {path}", file=sys.stderr)
-    sys.exit(0)
-
-with open(path, "r", encoding="utf-8") as f:
-    src = f.read()
-
-old = """                    metadata_buffer[i] = 0
-                # mark the block as written
-                metadata_buffer[0] = 1"""
-
-new = """                    metadata_buffer[i] = 0
-                # Ensure buffer data and flag resets are visible before
-                # the written flag (ARM weak memory ordering, vllm PR #32022).
-                memory_fence()
-                # mark the block as written
-                metadata_buffer[0] = 1"""
-
-if new in src:
-    print("[SKIP] shm_broadcast.py already contains memory_fence()")
-    sys.exit(0)
-
-if old not in src:
-    print("[WARN] shm_broadcast.py pattern not found; please check file manually", file=sys.stderr)
-    sys.exit(0)
-
-with open(path, "w", encoding="utf-8") as f:
-    f.write(src.replace(old, new, 1))
-
-print("[OK] Added memory_fence() before metadata_buffer[0] write")
-PY
+apply_patch_idempotent "${VLLM_ASCEND_DIR}" "${VLLM_ASCEND_PATCH}" "vllm-ascend MXFP4 / KV-cache patch"
+apply_patch_idempotent "${VLLM_DIR}" "${VLLM_PATCH}" "vllm MXFP4 patch"
 
 if [[ "${INSTALL_AMD_QUARK}" == "1" ]]; then
-  echo "[INSTALL] python -m pip install amd-quark"
-  python -m pip install amd-quark
+  if python3 -c "import quark" >/dev/null 2>&1; then
+    echo "[SKIP] amd-quark already installed"
+  else
+    echo "[INSTALL] python -m pip install amd-quark"
+    python3 -m pip install amd-quark
+  fi
 else
   echo "[SKIP] INSTALL_AMD_QUARK=${INSTALL_AMD_QUARK}"
 fi
