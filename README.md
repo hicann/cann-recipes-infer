@@ -174,6 +174,12 @@ bash infer.sh
 | [DeepSeek-R1/Kimi-K2](models/deepseek_r1/README.md)     |基于Transformers库，在Atlas A3环境中完成DeepSeek-R1/Kimi-K2模型低时延、高吞吐两种场景的适配优化，在Prefill阶段支持DP或TP+SP并行部署，在Decode阶段沿用大EP并行，同时还结合了融合算子和多流并行等优化特性。
 | [Wan2.2-I2V](models/wan2.2-i2v/README.md)               |基于Transformers库，在Atlas A2环境中完成Wan2.2-I2V模型的适配优化。
 | [DeepSeek-V3.2-Exp](models/deepseek_v3_2_exp/README.md) |基于Transformers库，在Atlas A3环境中Prefill阶段采用了长序列亲和的CP并行策略，Decode阶段沿用大EP并行，同时从整网上设计了新的NPU融合Kernel和多流并行优化，实现了较高的吞吐推理性能。
+| [Hy3](models/hy3/README.md)                             |基于Transformers库，在Atlas A3和Ascend 950PR/DT环境中完成腾讯混元 Hy3（295B MoE，激活约21B/token）模型的NPU推理适配。
+| [Gemma-4](models/gemma_4/README.md)                     |基于Transformers库，在NPU上完成Google开源的多模态稀疏MoE大模型Gemma-4的Language MoE Decoder路径推理优化适配。
+| [LongCat-Flash-Lite](models/longcat_flash_lite/README.md)|基于Transformers库，在NPU上完成基于MLA + Sparse MoE + N-gram Embedding架构的LongCat-Flash-Lite模型适配，覆盖Paged Attention缓存管理、融合算子替换、图模式加速、专家并行、W8A8量化与Decode多流重叠优化。
+| [Step-3.7-Flash](models/step3p7_flash/README.md)        |基于Transformers库，在Atlas A3环境中完成多模态MoE大模型Step-3.7-Flash（视觉编码器+MoE文本主干+3层MTP，约197B参数）的8卡/16 rank推理实现，支持纯文本与图文输入。
+| [Pangu7B](models/pangu_7b/README.md)                    |基于HuggingFace官方实现，在NPU上完成华为开源盘古7B大语言模型的低时延推理适配与优化。
+| [DeepSeek-V4-TileLang/Inductor](models/deepseek_v4_flash_tilelang_and_inductor_af/README.md) |基于TileLang-ascend算子替换与inductor+autofuse融合编译，在昇腾A3 NPU上展示DeepSeek模型的加速效果。
 
 ---
 
