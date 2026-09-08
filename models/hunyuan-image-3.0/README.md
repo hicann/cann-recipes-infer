@@ -181,6 +181,8 @@ bash infer.sh
 - 调用 `torchrun --master_port=<master_port> --nproc_per_node=<world_size> run_image_gen.py <model_args>`。
 
 在 `run_image_gen.py` 中，以循环的形式对 `model.generate_image()` 调用了多次，前面几次可以视为 warmup，多轮推理后的性能趋于稳定，而就精度而言则每次都是一致的。
+- 如果开发者单纯关注精度，可以将`model.generate_image()`的循环次数降低（例如仅跑1轮）；
+- 如果开发者关注稳态性能，可以将`model.generate_image()`的循环次数调高（建议8轮以上）。
 
 本样例测试结果如下：
 

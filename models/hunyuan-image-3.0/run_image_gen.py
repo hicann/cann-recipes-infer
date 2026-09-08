@@ -1,13 +1,8 @@
 # Adapted from
-# https://github.com/Tencent-Hunyuan/HunyuanImage-3.0,
-# Copyright (c) Huawei Technologies Co., Ltd. 2025.
-# Copyright (C) 2025 THL A29 Limited, a Tencent company. All rights reserved.
+# https://github.com/Tencent-Hunyuan/HunyuanImage-3.0/blob/main/run_image_gen.py,
+# Copyright (c) Huawei Technologies Co., Ltd. 2025-2026.
 #
-# This code is based on Tencent-Hunyuan's HunyuanImage-3.0 library and the
-# HunyuanImage-3.0 implementations in this library. It has been modified from
-# its original forms to accommodate minor architectural differences compared
-# to HunyuanImage-3.0 used by Tencent-Hunyuan team that trained the model.
-# ================================================================================
+# 2025 Tencent. All Rights Reserved. The trademark rights of Tencent Hunyuan are owned by Tencent or its affiliate.
 #
 # Licensed under the TENCENT HUNYUAN COMMUNITY LICENSE AGREEMENT (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,18 +15,43 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# ================================================================================
+# ==============================================================================
 
 import argparse
 import os
+import sys
 from pathlib import Path
+import time
+import threading
+import logging
+from loguru import logger
 import torch
 import torch_npu
 from torch_npu.contrib import transfer_to_npu
-from loguru import logger
 import torch.distributed as dist
 from hunyuan_image_3.hunyuan import HunyuanImage3ForCausalMM
 import model_adaptor
+
+
+local_rank = int(os.environ.get('LOCAL_RANK', '0'))
+
+
+class OverwriteHandler(logging.StreamHandler):
+    """A log processor that supports overwriting output on the same line"""
+    def __init__(self, stream=None):
+        super().__init__(stream)
+        self._last_length = 0
+
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            # When new message is short, add spaces to avoid the tail of the previous message remaining on the terminal
+            output = '\r' + msg.ljust(self._last_length)
+            self.stream.write(output)
+            self.stream.flush()
+            self._last_length = len(msg)
+        except Exception:
+            self.handleError(record)
 
 
 def parse_args():
@@ -103,8 +123,45 @@ def setup_distributed():
                                 init_method=f"env://",
                                 world_size=world_size,
                                 rank=rank)
-    local_rank = int(os.environ['LOCAL_RANK'])
     torch.npu.set_device(local_rank)
+
+
+def move_model_to_device(model, device, log_interval=5):
+    handler = OverwriteHandler(sys.stdout)
+    handler.setFormatter(logging.Formatter('%(message)s'))
+    progress_logger = logging.getLogger('progress')
+    progress_logger.setLevel(logging.INFO)
+    progress_logger.addHandler(handler)
+    progress_logger.propagate = False
+
+    finished = threading.Event()
+    started_at = time.monotonic()
+
+    def report_progress():
+        while not finished.wait(log_interval):
+            elapsed = time.monotonic() - started_at
+            if local_rank == 0:
+                progress_logger.info(
+                    f"Still loading weights and transferring model to {device}; elapsed: {elapsed:.0f}s"
+                )
+
+    reporter = threading.Thread(
+        target=report_progress,
+        name="model-transfer-progress",
+        daemon=True,
+    )
+    reporter.start()
+
+    try:
+        logger.info(f"Loading weights and transferring model to {device}...")
+        model = model.to(device)
+        torch.npu.synchronize()
+        elapsed = time.monotonic() - started_at
+        logger.info(f"Model transferred to {device} in {elapsed:.2f}s")
+        return model
+    finally:
+        finished.set()
+        reporter.join()
 
 
 def main(args):
@@ -125,7 +182,6 @@ def main(args):
     setup_distributed()
 
     # get weight path for this rank
-    local_rank = int(os.environ["LOCAL_RANK"])
     if os.environ.get("CFG_PARALLEL") == "1":
         tp_size = int(os.environ["WORLD_SIZE"]) // 2
         weight_index = local_rank % tp_size
@@ -135,7 +191,9 @@ def main(args):
 
     model = HunyuanImage3ForCausalMM.from_pretrained(model_id, **kwargs)
     model.load_tokenizer(args.model_id)
-    model = model.to(torch.device(f"npu:{local_rank}"))
+
+    # Load weights from host to device
+    model = move_model_to_device(model, torch.device(f"npu:{local_rank}"))
 
     for k in range(4):
         image = model.generate_image(
