@@ -30,9 +30,6 @@ from wan.modules.attention import attention
 from module.dit_cache.cache_method import cache_manager
 
 
-__all__ = ['WanModel']
-
-
 def sinusoidal_embedding_1d(dim, position):
     # preprocess
     if dim % 2 != 0:
@@ -67,7 +64,7 @@ def rope_apply(x, grid_sizes, freqs_list):
         x_i = x[i, :s].reshape(1, s, n, c)
         if not x_i.is_contiguous():
             x_i = x_i.contiguous()
-        
+
         cos, sin = freqs_list[i]
 
         if cos.dim() == 3:
@@ -199,7 +196,7 @@ class WanSelfAttention(nn.Module):
         x = self.o(x)
         return x
 
-  
+
 class WanCrossAttention(WanSelfAttention):
 
     def forward(self, x, context, context_lens):
