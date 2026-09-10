@@ -25,7 +25,7 @@ using Value = size_t;
 constexpr int K_MAX_DEVICE_ID = 1023;
 constexpr int K_NUMBER_BASE = 10;
 constexpr int K_SINGLE_PE_COUNT = 1;
-constexpr int K_DEVICE_OFFSET = 0;
+constexpr int K_SINGLE_PE_RANK = 0;
 constexpr uint64_t K_TABLE_SIZE = 1024;
 constexpr uint32_t K_MAX_KEYS_PER_PE = 16;
 constexpr size_t K_KEY_COUNT = 3;
@@ -133,7 +133,7 @@ int RunSinglePeTest(int deviceId, const char* ipPort)
     try {
         std::cout << "test_distributed_embedding: deviceId=" << deviceId
                   << ", ipPort=" << ipPort << '\n';
-        DistEmbeddingOptions options{K_TABLE_SIZE, deviceId, K_SINGLE_PE_COUNT, K_DEVICE_OFFSET,
+        DistEmbeddingOptions options{K_TABLE_SIZE, K_SINGLE_PE_RANK, K_SINGLE_PE_COUNT, deviceId,
                                      K_MAX_KEYS_PER_PE, ipPort};
         container = std::make_unique<DistEmbeddingContainer<Key, Value>>(options);
         shmemInitAttempted = true;

@@ -1,8 +1,8 @@
 /*
  * Two-PE functional test for DistEmbeddingContainer.
  *
- * One process owns each PE. The launcher assigns rank 0 to NPU 5 and rank 1
- * to NPU 6. Each rank inserts keys for both partitions, then searches the
+ * One process owns each PE. The launcher assigns rank 0 and rank 1 to configurable devices
+ * (NPU 0 and NPU 1 by default). Each rank inserts keys for both partitions, then searches the
  * complete key set so both remote puts and remote gets are exercised.
  */
 

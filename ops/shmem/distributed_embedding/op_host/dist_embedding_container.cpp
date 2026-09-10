@@ -5,6 +5,7 @@
  */
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <iostream>
 #include <limits>
@@ -52,6 +53,12 @@ DistEmbeddingContainer<Tkey, Tvalue>::DistEmbeddingContainer(
       stream_(nullptr),
       realCoreNum_(0)
 {
+    // Keep the requested number of entries at or below the configured load
+    // factor by sizing the open-addressed table to ceil(entries / loadFactor).
+    if (tableSize_ != 0) {
+        tableSize_ = static_cast<uint64_t>(std::ceil(
+            static_cast<double>(tableSize_) / static_cast<double>(loadFactor)));
+    }
     unusedKey_ = std::numeric_limits<Tkey>::max();
     unusedValue_ = std::numeric_limits<Tvalue>::max();
     const int memsetRet = memset_s(&defaultFlagUid_, sizeof(defaultFlagUid_), 0, sizeof(defaultFlagUid_));
