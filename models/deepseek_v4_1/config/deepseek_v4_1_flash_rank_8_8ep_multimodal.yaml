@@ -1,0 +1,39 @@
+model_config:
+  model_name: "deepseek_v4_1"
+  model_path: "/data/models/deepseek_v4_1_hybrid_fp8_mxfp4"
+  platform_version: "950"
+  with_ckpt: True
+  exe_mode: "eager"
+  enable_static_kernel: False
+  enable_dynamic_graph: False
+  enable_profiler: False
+  force_eplb: False
+  enable_cache_compile: False
+  custom_params:
+    enable_engram: True
+    enable_multi_streams: False
+    enable_engram_offload: True
+    engram_tp_size: 8
+    kernel_config:
+      hc_pre: native
+      hc_post: native
+
+data_config:
+  dataset: "default_multimodal"
+  input_truncated_len: 2048
+  temperature: 0.0
+
+parallel_config:
+  world_size: 8
+  attn_tp_size: 1
+  dense_tp_size: 1
+  moe_tp_size: 1
+  embed_tp_size: 1
+  lmhead_tp_size: 1
+  o_proj_tp_size: 1
+
+scheduler_config:
+  block_size: 128
+  max_new_tokens: 256
+  max_prefill_tokens: 2048
+  batch_size: 8

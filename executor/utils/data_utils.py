@@ -11,10 +11,12 @@ import json
 import os
 import logging
 import math
+import glob
+from pathlib import Path
+from urllib.parse import urlparse
 from datasets import load_dataset  # requires version == 3.6.0
 
 logger = logging.getLogger(__name__)
-
 
 def load_infinitebench_dataset(data_path):
     prompts = []
@@ -23,6 +25,132 @@ def load_infinitebench_dataset(data_path):
     for d in data:
         prompts.append(d['context'])
     return prompts
+
+MMMU_SUBJECTS = (
+    "Accounting", "Agriculture", "Architecture_and_Engineering", "Art",
+    "Art_Theory", "Basic_Medical_Science", "Biology", "Chemistry",
+    "Clinical_Medicine", "Computer_Science", "Design",
+    "Diagnostics_and_Laboratory_Medicine", "Economics", "Electronics",
+    "Energy_and_Power", "Finance", "Geography", "History", "Literature",
+    "Manage", "Marketing", "Materials", "Math", "Mechanical_Engineering",
+    "Music", "Pharmacy", "Physics", "Psychology", "Public_Health", "Sociology",
+)
+
+def load_mmmu_dataset(data_path, max_samples=0):
+    from PIL import Image
+    import io
+    is_local = os.path.isdir(data_path)
+    tmp_image_dir = (os.path.join(data_path, ".tmp_images") if is_local
+                     else os.path.join(os.getcwd(),".mmmu_tmp_images"))
+    os.makedirs(tmp_image_dir,exist_ok=True)
+
+    prompts = []
+    sample_ids=[]
+    ground_truths=[]
+    skipped_subjects=[]
+    for subject in MMMU_SUBJECTS:
+        try:
+            if is_local:
+                subject_dir = os.path.join(data_path, subject)
+                validation_files = sorted(
+                    glob.glob(
+                        os.path.join(
+                            subject_dir,
+                            "validation-*.parquet",
+                        )
+                    )
+                )
+
+                if not validation_files:
+                    raise FileNotFoundError(
+                        f"validation parquet not found: {subject_dir}"
+                    )
+
+                data = load_dataset(
+                    "parquet",
+                    data_files=validation_files,
+                    split="train",
+                )
+            else:
+                data = load_dataset(
+                    data_path,
+                    subject,
+                    split="validation",
+                    trust_remote_code=True,
+                )
+        except Exception as e:
+            logger.warning("MMMU: skip subject %s (validation split failed to load: %s)", subject, e)
+            skipped_subjects.append(subject)
+            continue
+        for d in data:
+            sample_id = str(d["id"])
+            question = d["question"]
+            options = d.get("options") or ""
+
+            if isinstance(options, list):
+                options = "\n".join(
+                    f"({chr(65 + index)}) {option}"
+                    for index, option in enumerate(options)
+                )
+            answer = d.get("answer") or ""
+            image_urls=[]
+            for i in range(1,8):
+                img=d.get(f"image_{i}")
+                if img is None:
+                    continue
+                if isinstance(img, dict):
+                    if img.get("bytes") is not None:
+                        img = Image.open(io.BytesIO(img["bytes"]))
+                    elif img.get("path"):
+                        img = Image.open(img["path"])
+                    else:
+                        raise ValueError(f"image_{i} of {sample_id} has neither bytes nor path")
+                img_path = os.path.join(tmp_image_dir,f"{sample_id}_img{i}.png")
+                img.save(img_path)
+                image_urls.append(Path(img_path).resolve().as_uri())
+            text = question + (f"\n{options}" if options.strip() else "")
+            content= [{"type":"image_url", "image_url":{"url":url}} for url in image_urls]
+            content.append({"type": "text","text":text})
+            prompts.append([{"role": "user","content":content}])
+            sample_ids.append(sample_id)
+            ground_truths.append(answer)
+            if max_samples > 0 and len(prompts)>= max_samples:
+                break
+        if max_samples > 0 and len(prompts)>= max_samples:
+            break
+    if skipped_subjects:
+        logger.warning(
+            "MMMU: skipped %d/%d subjects: %s",
+            len(skipped_subjects),
+            len(MMMU_SUBJECTS),
+            ", ".join(skipped_subjects),
+        )
+    loaded_subject_count = len(MMMU_SUBJECTS) - len(skipped_subjects)
+    logger.info(
+        "MMMU: loaded %d samples from %d subjects; temporary images: %s",
+        len(prompts),
+        loaded_subject_count,
+        tmp_image_dir,
+    )
+    if not prompts:
+        failed_subjects = ", ".join(skipped_subjects) or "none"
+        raise ValueError(
+            f"MMMU: no samples loaded from {data_path!r}; "
+            f"{len(skipped_subjects)}/{len(MMMU_SUBJECTS)} subjects failed "
+            f"({failed_subjects})"
+        )
+    return prompts,sample_ids,ground_truths
+ 
+def export_mmmu_results(results, sample_ids, ground_truths, output_path, suffix=""):
+    """Write MMMU predictions and references as a JSON array."""
+    mmmu_results=[]
+    for result, sid, gt in zip(results, sample_ids,ground_truths):
+        answer = result.output_text if result.output_text else ""
+        mmmu_results.append({"id": sid, "answer": answer, "ground_truth": gt})
+    res_file = os.path.join(output_path, f"mmmu_results{suffix}.json")
+    with open(res_file, 'w', encoding='utf-8') as f:
+        json.dump(mmmu_results, f, ensure_ascii=False)
+    return res_file
 
 
 def load_longbench_dataset(data_path):
@@ -41,8 +169,27 @@ def load_longbench_dataset(data_path):
     return prompts
 
 
-def generate_default_prompt(dataset_dir):
-    json_path = os.path.join(dataset_dir, "default_prompt.json")
+def _resolve_relative_image_urls(value, prompt_dir):
+    if isinstance(value, list):
+        for item in value:
+            _resolve_relative_image_urls(item, prompt_dir)
+        return
+    if not isinstance(value, dict):
+        return
+
+    if value.get("type") == "image_url":
+        image_url = value.get("image_url")
+        if isinstance(image_url, dict):
+            url = image_url.get("url")
+            if isinstance(url, str) and not urlparse(url).scheme:
+                image_url["url"] = (prompt_dir / url).resolve().as_uri()
+
+    for item in value.values():
+        _resolve_relative_image_urls(item, prompt_dir)
+
+
+def generate_default_prompt(dataset_dir, prompt_filename="default_prompt.json"):
+    json_path = os.path.join(dataset_dir, prompt_filename)
     json_path = os.path.abspath(json_path)
     try:
         with open(json_path, 'r', encoding='utf-8') as file:
@@ -55,6 +202,7 @@ def generate_default_prompt(dataset_dir):
         raise e
     except Exception as e:
         raise e
+    _resolve_relative_image_urls(text, Path(json_path).parent)
     if isinstance(text, list):
         preset_prompts = text
     else:

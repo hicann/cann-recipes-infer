@@ -18,6 +18,7 @@ from .converter import (
     dsa_functionalization, dsa_install, dsa_plan, dsa_serve,
     npu_compressor, npu_quant_compressor, npu_inplace_partial_rotary_mul, npu_rms_norm_dynamic_quant,
     npu_moe_gating_top_k, npu_indexer_compress_epilog, npu_kv_compress_epilog,
+    npu_kv_compress_epilog_v2,
     npu_moe_init_routing_group_quant, npu_hc_post, npu_hc_pre, npu_swiglu_clip_quant,
     npu_swiglu_group_quant, npu_gather_selection_kv_cache, npu_quant_lightning_indexer,
     npu_sparse_attn_sharedkv, npu_quant_lightning_indexer_metadata,

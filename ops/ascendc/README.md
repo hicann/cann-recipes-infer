@@ -38,6 +38,10 @@
   |   ├── kv_compress_epilog                    # 推理kv_compress_epilog算子示例代码
   |   |   ├── op_host                           # 算子信息库、Tiling、InferShape相关实现目录
   |   |   ├── op_kernel                         # 算子Kernel目录
+  |   ├── kv_compress_epilog_v2                 # 推理kv_compress_epilog_v2算子示例代码
+  |   |   ├── op_host                           # 算子信息库、Tiling、InferShape相关实现目录
+  |   |   ├── op_kernel                         # 算子Kernel目录
+  |   |   ├── test                              # Host/Kernel单元测试目录（独立构建）
   |   ├── moe_gating_top_k_hash                 # 推理moe_gating_top_k_hash算子示例代码
   |   |   ├── op_host                           # 算子信息库、Tiling、InferShape相关实现目录
   |   |   ├── op_kernel                         # 算子Kernel目录
@@ -199,6 +203,24 @@ examples用例运行命令如下：
   cd /home/code/cann-recipes-infer/ops/ascendc/examples
   python3 test_npu_swiglu_clip_quant.py
   ```
+
+kv_compress_epilog_v2 样例覆盖 torch eager 直调与 torchair
+ACL Graph 图模式（capture/换值 replay），运行命令如下：
+  ```shell
+  cd /home/code/cann-recipes-infer/ops/ascendc/examples
+  pytest test_npu_kv_compress_epilog_v2.py -v
+  ```
+运行前需先完成「自定义融合算子安装」「torch_ops_extension算子包编译与安装」，
+并 source CANN 环境与 vendor 环境
+（`source <ascend-toolkit>/opp/vendors/customize/bin/set_env.bash`）。
+
+ACLNN 与 GEIR 调用样例为 C++（编译运行命令见各文件头注释）：
+`test_aclnn_kv_compress_epilog_v2.cpp`（两段式调用）、
+`test_geir_kv_compress_epilog_v2.cpp`（GE 构图执行）。
+算子接口与约束说明见 [docs/custom-npu_kv_compress_epilog_v2.md](./docs/custom-npu_kv_compress_epilog_v2.md)；
+Host/Kernel 单元测试位于
+[src/kv_compress_epilog_v2/test](./src/kv_compress_epilog_v2/test)，
+构建运行方式见其 CMakeLists.txt 头注释。
 
 ## 附录
 ### FAQ

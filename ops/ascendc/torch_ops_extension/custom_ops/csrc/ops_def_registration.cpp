@@ -55,7 +55,7 @@ TORCH_LIBRARY(custom, m) {
         "Tensor selection_kv_block_table, Tensor selection_kv_block_status, Tensor selection_topk_indices, "
         "Tensor full_k_rope, Tensor full_kv_cache, Tensor full_kv_block_table, Tensor full_kv_actual_seq, "
         "Tensor full_q_actual_seq, *, int selection_topk_block_size=64) -> (Tensor, Tensor, Tensor, Tensor, Tensor)");
-    m.def("npu_moe_gating_top_k(Tensor x, int k, *, Tensor? bias=None, Tensor? input_ids=None, Tensor? tid2eid=None, int k_group=1, int group_count=1, float routed_scaling_factor=1., float eps=9.9999999999999995e-21, int group_select_mode=0, int renorm=0, int norm_type=0, bool out_flag=False) -> (Tensor, Tensor, Tensor)"); 
+    m.def("npu_moe_gating_top_k(Tensor x, int k, *, Tensor? bias=None, Tensor? input_ids=None, Tensor? tid2eid=None, Tensor? additional_bias=None, Tensor? additional_token_mask=None, int k_group=1, int group_count=1, float routed_scaling_factor=1., float eps=9.9999999999999995e-21, int group_select_mode=0, int renorm=0, int norm_type=0, bool out_flag=False) -> (Tensor, Tensor, Tensor)");
     
     m.def("compressor(Tensor x, Tensor wkv, Tensor wgate, Tensor(a!) state_cache, "
         "Tensor ape, Tensor norm_weight, Tensor rope_sin, Tensor rope_cos, int rope_head_dim, int cmp_ratio, *,"
@@ -78,6 +78,9 @@ TORCH_LIBRARY(custom, m) {
     m.def("npu_hc_pre(Tensor x, Tensor hc_fn, Tensor hc_scale, Tensor hc_base, *,int hc_mult=4, int hc_sinkhorn_iters=20, float norm_eps=1e-6,"
           "float hc_eps=1e-6) -> (Tensor, Tensor, Tensor)");
 
+    m.def("npu_hc_pre_v2(Tensor x, Tensor hc_fn, Tensor hc_scale, Tensor hc_base, Tensor? pre_mix=None, *, int hc_mult=4, int hc_sinkhorn_iters=20, float norm_eps=1e-6,"
+          "float hc_eps=1e-6) -> (Tensor, Tensor, Tensor, Tensor)");
+
     m.def("npu_moe_init_routing_group_quant(Tensor x, Tensor expert_idx, Tensor? scale=None, Tensor? offset=None, int active_num=-1,"
           "int expert_capacity=-1, int expert_num=-1, int drop_pad_mode=-1, int expert_tokens_num_type=-1, bool expert_tokens_num_flag=False,"
           "int quant_mode=-1, SymInt[] active_expert_range, int row_idx_type=-1, int group_size=128) ->(Tensor, Tensor, Tensor, Tensor)");
@@ -94,6 +97,9 @@ TORCH_LIBRARY(custom, m) {
     
     m.def("kv_compress_epilog(Tensor(a!) kv_compress_cache, Tensor x, Tensor slot_mapping, "
           " *, int quant_group_size=64, int quant_mode = 2, bool round_scale_flag=True, float scale=1.0) -> ()");
+    m.def("kv_compress_epilog_v2(Tensor(a!) cache, Tensor x, Tensor slot_mapping, "
+          "*, int quant_group_size=32, str quant_mode=\"mxfp8_bf16\", bool round_scale=True, "
+          "float x_scale=1.0) -> ()");
 
     m.def("npu_sparse_attn_sharedkv(Tensor q, *, Tensor? ori_kv=None, Tensor? cmp_kv=None, Tensor? ori_sparse_indices=None, Tensor? cmp_sparse_indices=None, Tensor? ori_block_table=None, "
         "Tensor? cmp_block_table=None, Tensor? cu_seqlens_q=None, Tensor? cu_seqlens_ori_kv=None, Tensor? cu_seqlens_cmp_kv=None, Tensor? seqused_q=None, Tensor? seqused_kv=None, "

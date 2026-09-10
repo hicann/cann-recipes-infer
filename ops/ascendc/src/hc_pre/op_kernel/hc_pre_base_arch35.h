@@ -1129,15 +1129,47 @@ __aicore__ inline void CopyOut(const LocalTensor<T> &outputTensor, const GlobalT
     DataCopyPad(outputGm, outputTensor, dataCopyParams);
 }
 
+// GM -> UB，UB侧相邻block间隔以32B为单位（用于将行数据加载到与mixesLocal一致的hcMixAlign行距布局）
+template <typename T>
+__aicore__ inline void CopyInWithUbStride(const GlobalTensor<T> &inputGm, const LocalTensor<T> &inputTensor,
+                                          const uint16_t nBurst, const uint32_t copyLen, uint32_t srcStride,
+                                          uint32_t ubDstStrideBlock)
+{
+    DataCopyPadExtParams<T> dataCopyPadExtParams;
+    dataCopyPadExtParams.isPad = false;
+    dataCopyPadExtParams.leftPadding = 0;
+    dataCopyPadExtParams.rightPadding = 0;
+    dataCopyPadExtParams.paddingValue = 0;
+
+    DataCopyExtParams dataCoptExtParams;
+    dataCoptExtParams.blockCount = nBurst;
+    dataCoptExtParams.blockLen = copyLen * sizeof(T);
+    dataCoptExtParams.srcStride = srcStride * sizeof(T);
+    dataCoptExtParams.dstStride = ubDstStrideBlock; // UB侧stride单位为32B
+    DataCopyPad(inputTensor, inputGm, dataCoptExtParams, dataCopyPadExtParams);
+}
+
+// 计算将每行hcMult个float按hcMixAlign行距排布时，UB侧相邻block间需要的32B间隔数
+// (blockLen非32B对齐时UB侧块足迹为ceil32(blockLen)，加上ubDstStrideBlock*32B即为行距)
+__aicore__ inline uint32_t UbRowGapBlocks(uint16_t hcMult, uint16_t hcMix)
+{
+    uint32_t rowPitchBytes = RoundUp<float>(hcMix) * sizeof(float);
+    uint32_t rowFootprintBytes = CeilAlign(static_cast<uint32_t>(hcMult) * sizeof(float), BLOCK_SIZE);
+    return (rowPitchBytes - rowFootprintBytes) / BLOCK_SIZE;
+}
+
+// UB -> UB（对齐搬运，srcStride/dstStride以32B块为单位；用于将hcMixAlign行距的行首hcMult个元素
+// 聚拢到hcMultAlign行距的紧凑布局，配合VECOUT TQue的double buffer异步拷出）
 template <typename T>
 __aicore__ inline void CopyOut(const LocalTensor<T> &outputTensor, const LocalTensor<T> &outputGm,
-                               const uint16_t nBurst, const uint32_t copyLen)
+                               const uint16_t nBurst, const uint32_t copyLen, uint32_t dstStride = 0,
+                               uint32_t srcStride = 0)
 {
     DataCopyParams dataCopyParams;
     dataCopyParams.blockCount = nBurst;
-    dataCopyParams.blockLen = copyLen * sizeof(T) / BLOCK_SIZE;
-    dataCopyParams.srcStride = 0;
-    dataCopyParams.dstStride = 0;
+    dataCopyParams.blockLen = CeilDiv(copyLen * sizeof(T), BLOCK_SIZE);
+    dataCopyParams.srcStride = srcStride;
+    dataCopyParams.dstStride = dstStride;
     DataCopy(outputGm, outputTensor, dataCopyParams);
 }
 

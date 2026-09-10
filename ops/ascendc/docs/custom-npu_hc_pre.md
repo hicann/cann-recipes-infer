@@ -14,6 +14,8 @@ HcPre 是 mHC 结构前处理部分的融合算子，详细计算过程参考[te
 ## 函数原型
 ```
 custom.npu_hc_pre(Tensor x, Tensor hc_fn, Tensor hc_scale, Tensor hc_base, *,int hc_mult=4, int hc_sinkhorn_iters=20, float norm_eps=1e-6, float hc_eps=1e-6) -> (Tensor, Tensor, Tensor)
+
+custom.npu_hc_pre_v2(Tensor x, Tensor hc_fn, Tensor hc_scale, Tensor hc_base, Tensor pre_mix=None, *, int hc_mult=4, int hc_sinkhorn_iters=20, float norm_eps=1e-6, float hc_eps=1e-6) -> (Tensor, Tensor, Tensor, Tensor)
 ```
 
 ## 参数说明
@@ -29,6 +31,8 @@ custom.npu_hc_pre(Tensor x, Tensor hc_fn, Tensor hc_scale, Tensor hc_base, *,int
 -   **hc_scale**（`Tensor`）：必选参数，输入tensor。不支持非连续，数据格式支持ND，数据类型支持`float`，shape为[3]。
 
 -   **hc_base**（`Tensor`）：必选参数，输入tensor。不支持非连续，数据格式支持ND，数据类型支持`float`，shape为[hc_mix]。
+
+-   **pre_mix**（`Tensor`, 可选，仅`npu_hc_pre_v2`支持）：可选输入tensor。不支持非连续，数据格式支持ND，数据类型支持`float32`，shape为[T, hc_mult]或[b, s, hc_mult]。传入时，y的加权求和直接使用pre_mix作为权重（典型用法：填入上一轮hc_pre的输出）；不传入时，y使用本轮内部计算的hc_pre进行加权求和。
 
 - <strong>*</strong> ：代表其之前的参数是位置相关的，必须按照顺序输入，属于必选参数；其之后的参数是键值对赋值，与位置无关，属于可选参数（不传入会使用默认值）。
 
@@ -47,6 +51,8 @@ custom.npu_hc_pre(Tensor x, Tensor hc_fn, Tensor hc_scale, Tensor hc_base, *,int
 -   **post**（`Tensor`）：输出tensor。数据格式支持ND，数据类型支持`float`，shape为[T, hc_mult]或[b, s, hc_mult]。
 
 -   **comb_frag**（`Tensor`）：输出tensor。数据格式支持ND，数据类型支持`float`，shape为[T, hc_mult, hc_mult]或[b, s, hc_mult, hc_mult]。
+
+-   **hc_pre**（`Tensor`，仅`npu_hc_pre_v2`返回）：输出tensor，本轮内部计算的pre结果（sigmoid后的加权系数）。数据格式支持ND，数据类型支持`float32`，shape为[T, hc_mult]或[b, s, hc_mult]，可作为下一轮hc_pre的pre_mix输入。
 
 ## 约束说明
 -  shape 字段取值范围约束

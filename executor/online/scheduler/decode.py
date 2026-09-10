@@ -35,11 +35,14 @@ class DecodeDisaggScheduler(Scheduler):
         kv_cache_manager,
         tp_cpu_group=None,
         input_truncated_len=None,
+        mm_processor=None,
     ):
         super().__init__(
             tokenizer=tokenizer,
             config=config,
             input_truncated_len=input_truncated_len,
+            mm_processor=mm_processor,
+            enable_mm_encode=False,
         )
         self.mode = 'online'
         if getattr(kv_transfer_manager, "attn_cp_size", 1) != 1:
@@ -82,6 +85,7 @@ class DecodeDisaggScheduler(Scheduler):
             self._pending_pd_request = None
             return req_id
         req = self.waiting_queue.pop()
+        req.mm_inputs = None
         request_dict = self._pending_pd_request or {}
         req.bootstrap_room = request_dict.get("bootstrap_room", req.bootstrap_room)
         req.bootstrap_host = request_dict.get("bootstrap_host", req.bootstrap_host)

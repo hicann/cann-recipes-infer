@@ -68,6 +68,8 @@ class OfflineInference:
             tokenizer=self.engine.tokenizer,
             config=self.infer_config.scheduler_config,
             input_truncated_len=self.infer_config.data_config.input_truncated_len,
+            mm_processor=self.engine.mm_processor,
+            enable_mm_encode=self.engine.enable_mm_encode,
         )
 
     def _load_model(self) -> None:
@@ -106,7 +108,8 @@ class OfflineInference:
             A tuple containing:
             - List of GenerationOutput objects, one per prompt.
             - Aggregated MTP statistics dict (None if MTP not enabled).
-            - Batch-level inference time list. Index 0 is prefill time and the rest are decode batches.
+            - Batch-level inference time list: [prefill, decode...] for text-only models,
+              or [encode, prefill, decode...] when MM Encode is enabled.
         """
         if not prompts:
             return [], None, []
@@ -115,6 +118,8 @@ class OfflineInference:
 
         # Reset scheduler for new batch
         self.scheduler.reset()
+        if self.engine.mm_embedding_store is not None:
+            self.engine.mm_embedding_store.clear()
 
         parallel_config = self.infer_config.parallel_config
         enable_cp = parallel_config.cp_size > 1
@@ -167,6 +172,22 @@ class OfflineInference:
                 request_id for request_id in result_request_ids
                 if request_id % parallel_config.cp_size == current_cp_rank
             ]
+
+        use_mm_batch_infer_time = self.engine.enable_mm_encode
+        needs_cp_infer_time_fallback = enable_cp and not result_request_ids
+        batch_infer_time = []
+        if use_mm_batch_infer_time or needs_cp_infer_time_fallback:
+            for request_id in request_ids:
+                finished_request = self.scheduler.finished_requests.get(request_id)
+                if finished_request is not None:
+                    batch_infer_time = finished_request.infer_time
+                    if batch_infer_time and use_mm_batch_infer_time:
+                        batch_infer_time = [
+                            self.scheduler.mm_encode_infer_time,
+                            self.scheduler.prefill_infer_time,
+                            *batch_infer_time[1:],
+                        ]
+                    break
         for request_id in result_request_ids:
             request = self.scheduler.pop_finished_request(request_id)
             if request is None:
@@ -180,6 +201,9 @@ class OfflineInference:
                     finish_reason="error",
                 ))
                 continue
+
+            if not use_mm_batch_infer_time:
+                batch_infer_time = request.infer_time
 
             # Decode only the valid output segment truncated by max output length or EOS.
             valid_output_id_list = self.get_valid_output(request)
@@ -197,10 +221,12 @@ class OfflineInference:
                 finish_reason=request.finish_reason,
             ))
 
-        return results, mtp_stats, request.infer_time
+        return results, mtp_stats, batch_infer_time
 
     def _generate_afd_ffn(self, prompts: List[str]) -> tuple[List[GenerationOutput], Optional[dict], List[float]]:
         self.scheduler.reset()
+        if self.engine.mm_embedding_store is not None:
+            self.engine.mm_embedding_store.clear()
         batch_size = self.scheduler.config.batch_size_per_dp_rank
         prompts = [
             [{"role": "user", "content": p}] if isinstance(p, str) else p

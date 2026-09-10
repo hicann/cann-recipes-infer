@@ -20,7 +20,15 @@ inference. When profiling is disabled, the context manager becomes a no-op.
 """
 
 import os
+from enum import Enum
+
 import torch_npu
+
+
+class ProfilerPhase(Enum):
+    MM_ENCODE = "mm_encode"
+    PREFILL = "prefill"
+    DECODE = "decode"
 
 
 class FakeContextManager:
@@ -73,36 +81,48 @@ def create_profiler(enable_profiler=False, profile_save_path="prof", active=3, r
 class ProfilerManager:
     """
     Profiler manager for profiling using torch_npu.profiler.
-    This class provides a manager for profiling NPU operations during inference. 
+    This class provides a manager for profiling NPU operations during inference.
     """
     def __init__(self, enable_profiler, profile_save_path):
         self.enable_profiler = enable_profiler
         self.profile_save_path = profile_save_path
-        self.status = None
+        self.profiler_status = None
         self.current_profiler = FakeContextManager()
 
-    def set_status(self, is_prefill):
-        if not self.enable_profiler:
+    def check_if_update(self, cur_status: ProfilerPhase) -> bool:
+        """Return whether the requested phase should replace the active profiler."""
+        # Reuse the profiler across consecutive batches in the same phase.
+        if not self.enable_profiler or self.profiler_status == cur_status:
+            return False
+        # Preserve decode-only behavior: profiling must start in an earlier phase.
+        if self.profiler_status is None and cur_status == ProfilerPhase.DECODE:
+            return False
+        # Once decode profiling starts, do not switch to another phase.
+        if self.profiler_status == ProfilerPhase.DECODE:
+            return False
+        return True
+
+    def set_status(self, cur_status: ProfilerPhase):
+        if not isinstance(cur_status, ProfilerPhase):
+            raise TypeError("cur_status must be a ProfilerPhase")
+        if not self.check_if_update(cur_status):
             return
-        if self.status is None and is_prefill:
-            self.status = "prefill"
-            self.current_profiler = create_profiler(
-                enable_profiler=self.enable_profiler,
-                profile_save_path=os.path.join(self.profile_save_path, "prof", "prefill"), 
-                active=1, repeat=1, skip_first=0)
-            self.current_profiler.start()
-        elif self.status == "prefill" and not is_prefill:
-            self.status = "decode"
+        if self.profiler_status is not None:
             self.current_profiler.stop()
-            self.current_profiler = create_profiler(
-                enable_profiler=self.enable_profiler, 
-                profile_save_path=os.path.join(self.profile_save_path, "prof", "decode"))
-            self.current_profiler.start()
-        return
+        profiler_kwargs = {}
+        if cur_status in (ProfilerPhase.MM_ENCODE, ProfilerPhase.PREFILL):
+            profiler_kwargs = {"active": 1, "repeat": 1, "skip_first": 0}
+        self.current_profiler = create_profiler(
+            enable_profiler=True,
+            profile_save_path=os.path.join(self.profile_save_path, "prof", cur_status.value),
+            **profiler_kwargs,
+        )
+        self.current_profiler.start()
+        self.profiler_status = cur_status
 
     def step(self):
         self.current_profiler.step()
-    
+
     def __del__(self):
         if self.enable_profiler:
             self.current_profiler.stop()

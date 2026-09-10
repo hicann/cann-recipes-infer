@@ -370,6 +370,9 @@ class SchedulerConfig:
         batch_size: Global batch size across all ranks (default: 1)
         max_new_tokens: Maximum number of tokens to generate per request (default: 32)
         max_prefill_tokens: Maximum packed prompt tokens per prefill batch (default: 0, disabled)
+        max_mm_encode_tokens: Global multimodal token packing target for one MM Encode step.
+            A value <= 0 disables the target. With multiple Prefill DP replicas,
+            each replica uses this value divided by cp_prefill_dp_size and rounded up.
         batch_size_per_dp_rank: Batch size per rank for distributed inference (default: 1)
         mem_fraction_static: Fraction of device memory reserved for static allocation (default: 0.85)
         block_size: Number of tokens contained in one KV cache block (default: 128)
@@ -391,6 +394,7 @@ class SchedulerConfig:
     block_size: int = 128
     num_reserved_decode_tokens: int = 64
     cp_mini_batch: int = -1
+    max_mm_encode_tokens: int = 0
 
     @classmethod
     def from_dict(cls, scheduler_config_dict: dict) -> "SchedulerConfig":
@@ -399,6 +403,7 @@ class SchedulerConfig:
             batch_size=scheduler_config_dict.get("batch_size", 1),
             max_new_tokens=scheduler_config_dict.get("max_new_tokens", 32),
             max_prefill_tokens=scheduler_config_dict.get("max_prefill_tokens", 0),
+            max_mm_encode_tokens=scheduler_config_dict.get("max_mm_encode_tokens", 0),
             mem_fraction_static=scheduler_config_dict.get("mem_fraction_static", 0.85),
             block_size=scheduler_config_dict.get("block_size", 128),
             num_reserved_decode_tokens=scheduler_config_dict.get(

@@ -52,5 +52,39 @@ def convert_npu_hc_pre(
                "norm_eps": attr.Float(norm_eps),
                "hc_eps": attr.Float(hc_eps),
                },
-        outputs=['y', 'post', 'comb_frag']
+        outputs=["y", "post", "comb_frag"]
+    )
+
+
+# npu_hc_pre_v2：新增 pre_mix 可选输入，总是返回 pre
+@register_fx_node_ge_converter(torch.ops.custom.npu_hc_pre_v2.default)
+def convert_npu_hc_pre_v2(
+    x: Tensor,
+    hc_fn: Tensor,
+    hc_scale: Tensor,
+    hc_base: Tensor,
+    pre_mix: Optional[Tensor] = None,
+    *,
+    hc_mult: int = 4,
+    hc_sinkhorn_iters: int = 20,
+    norm_eps: float = 1e-6,
+    hc_eps: float = 1e-6,
+    meta_outputs: Any = None):
+    inputs = {"x": x,
+              "hc_fn": hc_fn,
+              "hc_scale": hc_scale,
+              "hc_base": hc_base,
+              }
+    if pre_mix is not None:
+        inputs["pre_mix"] = pre_mix
+    outputs = ["y", "post", "comb_frag", "pre"]
+    return torchair.ge.custom_op(
+        "HcPre",
+        inputs=inputs,
+        attrs={"hc_mult": attr.Int(hc_mult),
+               "hc_sinkhorn_iters": attr.Int(hc_sinkhorn_iters),
+               "norm_eps": attr.Float(norm_eps),
+               "hc_eps": attr.Float(hc_eps),
+               },
+        outputs=outputs
     )

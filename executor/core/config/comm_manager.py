@@ -160,13 +160,13 @@ class CommManager:
         # dp_leader_group: ranks where global_rank % group_size == 0
         if dp_size > 1:
             dp_leader_ranks = [i * group_size for i in range(dp_size)]
+            dp_leader_group = dist.new_group(dp_leader_ranks, backend="gloo")
             if global_rank in dp_leader_ranks:
-                dp_leader_group = dist.new_group(dp_leader_ranks, backend="gloo")
+                self._groups["dp_leader_group"] = dp_leader_group
                 self._ranks["dp_leader_group"] = dist.get_rank(dp_leader_group)
             else:
-                dp_leader_group = None
+                self._groups["dp_leader_group"] = None
                 self._ranks["dp_leader_group"] = 0
-            self._groups["dp_leader_group"] = dp_leader_group
             logger.info(f"dp_leader_group initialized: ranks={dp_leader_ranks}")
         else:
             self._groups["dp_leader_group"] = None

@@ -35,11 +35,15 @@ class PrefillDisaggScheduler(Scheduler):
         is_dp_leader=True,
         tp_cpu_group=None,
         input_truncated_len=None,
+        mm_processor=None,
+        enable_mm_encode=False,
     ):
         super().__init__(
             tokenizer=tokenizer,
             config=config,
             input_truncated_len=input_truncated_len,
+            mm_processor=mm_processor,
+            enable_mm_encode=enable_mm_encode,
         )
         self.kv_transfer_manager = kv_transfer_manager
         self.kv_cache_manager = kv_cache_manager
@@ -68,14 +72,18 @@ class PrefillDisaggScheduler(Scheduler):
         self, prompt, request_id=None, sampling_params=None, input_ids=None
     ):
         req_id = super().add_request(prompt, request_id, sampling_params, input_ids)
-        # super() enforced the prompt-length cap: a rejected request lands in
-        # finished_requests (not queued); an admitted one sits at the
-        # waiting_queue tail. Route a rejection through the bootstrap-failure
-        # channel instead of entering the bootstrap queue.
+        # super() enforced the prompt-length cap and put admitted requests in
+        # the configured admission queue. Bootstrap must complete before the
+        # request can enter MM Encode or language Prefill.
         if self.finished_requests.get(req_id) is not None:
             self._pending_pd_request = None
             return req_id
-        req = self.waiting_queue.pop()
+        admission_queue = (
+            self.mm_waiting_queue
+            if self.mm_waiting_queue is not None
+            else self.waiting_queue
+        )
+        req = admission_queue.pop()
         request_dict = self._pending_pd_request or {}
         req.bootstrap_room = request_dict.get("bootstrap_room", req.bootstrap_room)
         req.bootstrap_host = request_dict.get("bootstrap_host", req.bootstrap_host)
@@ -119,8 +127,8 @@ class PrefillDisaggScheduler(Scheduler):
 
         Called on ALL ranks every main-loop iteration BEFORE phase negotiation.
         Uses poll_and_all_reduce (MIN across tp_cpu_group, Gloo-backed CPU
-        collective — safe on Ascend) so a request only moves to waiting_queue
-        when every TP rank's listener has received decode's transfer_info.
+        collective — safe on Ascend) so a request only enters its next compute
+        queue when every TP rank's listener has received decode's transfer_info.
         Plan B guarantees decode sends to every prefill rank (with is_dummy tag
         for non-targets), so the consensus actually converges.
 
@@ -134,7 +142,7 @@ class PrefillDisaggScheduler(Scheduler):
             poll = req.disagg_kv_sender.poll_and_all_reduce(group=self.tp_cpu_group)
             if poll == KVPoll.WaitingForInput:
                 req.disagg_kv_sender.init()
-                self.waiting_queue.append(req)
+                self._enqueue_admitted_request(req)
             elif poll == KVPoll.Failed:
                 logger.warning(
                     "request %s: bootstrap failed (room=%s addr=%s) — marking as error",
@@ -197,7 +205,7 @@ class PrefillDisaggScheduler(Scheduler):
         # Every TP rank must enter forward_batch every iteration — skipping on
         # one rank while others proceed desyncs HCCL collectives → deadlock.
         # Status logging happens inside super().run_step via _log_step override.
-        return super().run_step(engine, phase="prefill")
+        return super().run_step(engine, phase=phase)
 
     def _log_step(self, engine, batch, output) -> None:
         # The base only invokes _log_step after a real forward, so any reach
@@ -210,11 +218,17 @@ class PrefillDisaggScheduler(Scheduler):
         n_inflight = len(self.inflight_queue)
         kv_str = engine.kvcache_manager.format_usage()
         infer_ms = output.get("inference_time", 0.0) * 1000
+        waiting_status = f"waiting={n_waiting}"
+        if self.mm_waiting_queue is not None:
+            waiting_status = (
+                f"mm_waiting={len(self.mm_waiting_queue)} {waiting_status}"
+            )
         logger.info(
             f"[PD-Prefill] step={self._step} "
             f"batch_reqs={len(batch.requests)} batch_tokens={batch.total_tokens} "
             f"kv={kv_str} "
-            f"waiting={n_waiting} bootstrap={n_bootstrap} inflight={n_inflight} "
+            f"{waiting_status} "
+            f"bootstrap={n_bootstrap} inflight={n_inflight} "
             f"drained={self._last_drained_count} infer={infer_ms:.2f}ms"
         )
 
@@ -253,11 +267,11 @@ class PrefillDisaggScheduler(Scheduler):
         self.inflight_queue.append(request)
 
     def has_work(self) -> bool:
-        # Only count work that requires NPU (forward_batch). bootstrap_queue
+        # Only count work that requires an NPU stage. bootstrap_queue
         # and inflight_queue are CPU-only RDMA waits — counting them causes
         # tight-loop dummy forward_batch calls which trigger HCCL AIV
         # all-reduce counter divergence and deadlock on Ascend.
-        return bool(self.waiting_queue)
+        return bool(self.mm_waiting_queue or self.waiting_queue)
 
     def _on_request_finished(self, request) -> None:
         self._cleanup_terminal_request(request)

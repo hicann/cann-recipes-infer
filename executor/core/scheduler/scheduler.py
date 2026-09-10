@@ -20,7 +20,9 @@ from typing import List, Dict, Optional, Union
 from collections import deque
 import torch
 from executor.core.config import SchedulerConfig
-from ..forward_data_info import Request, Batch, MTPInfo, SamplingParams
+from executor.core.mm_processor import BaseMMProcessor
+from executor.utils import ceil_div
+from ..forward_data_info import Request, Batch, MMEncodeBatch, MTPInfo, SamplingParams
 from ..engine import ExecutionEngine
 
 logger = logging.getLogger(__name__)
@@ -37,7 +39,8 @@ class Scheduler:
     Attributes:
         config: Scheduler behavior configuration.
         tokenizer: Tokenizer for encoding prompts.
-        waiting_queue: Queue of pending requests.
+        mm_waiting_queue: Queue of requests awaiting MM Encode, when enabled.
+        waiting_queue: Queue of requests ready for Prefill.
         running_requests: Dict of requests in decode phase.
         finished_requests: Completed requests.
         _request_counter: Auto-incrementing request ID.
@@ -49,6 +52,8 @@ class Scheduler:
         tokenizer,
         config: Optional[SchedulerConfig] = None,
         input_truncated_len: Optional[int] = None,
+        mm_processor: Optional[BaseMMProcessor] = None,
+        enable_mm_encode: bool = False,
     ):
         """Initialize the scheduler.
 
@@ -57,16 +62,24 @@ class Scheduler:
             config: Scheduler configuration. Uses defaults if None.
             input_truncated_len: Optional max prompt length passed to the
                 tokenizer for truncation; None disables truncation.
+            mm_processor: Optional model-specific multimodal processor.
+            enable_mm_encode: Route admitted requests through MM Encode before Prefill.
         """
         self.config = config or SchedulerConfig()
         self.tokenizer = tokenizer
         self.input_truncated_len = input_truncated_len
+        self.mm_processor = mm_processor
 
         # Request state management
+        self.mm_waiting_queue: Optional[deque[Request]] = (
+            deque() if enable_mm_encode else None
+        )
         self.waiting_queue: deque[Request] = deque()
         self.running_requests: Dict[int, Request] = {}
         self.finished_requests: Dict[int, Request] = {}
         self.prefilled_request_count: int = 0
+        self.mm_encode_infer_time: float = 0.0
+        self.prefill_infer_time: float = 0.0
         self._step: int = 0
 
         # ID generators
@@ -106,7 +119,10 @@ class Scheduler:
         else:
             prompt_text = prompt
         kwargs = {}
-        if input_truncated_len is not None:
+        if input_truncated_len is not None and not (
+            self.mm_processor is not None
+            and self.mm_processor.should_defer_truncation(prompt)
+        ):
             kwargs = dict(
                 truncation=True,
                 max_length=input_truncated_len,
@@ -131,7 +147,8 @@ class Scheduler:
             prompt: Input text or messages list.
             request_id: Optional request ID (auto-generated if None).
             sampling_params: Per-request sampling parameters (online PD mode).
-            input_ids: Pre-tokenized input IDs (skips tokenization if provided).
+            input_ids: Pre-tokenized input IDs that skip text tokenization.
+                Registered multimodal models still run MM processing.
         """
         if request_id is None:
             request_id = self._request_counter
@@ -151,14 +168,22 @@ class Scheduler:
         )
         if input_ids is not None:
             request.input_ids = input_ids
-            request.prompt_tokens = input_ids.numel()
-        # Rejected requests are recorded in finished_requests
-        # and NOT queued, so every downstream stage (e.g. _schedule_prefill_batch)
-        # can assume the queue holds only valid requests and never re-checks.
+        self._prepare_request_prompt(request)
+        if self.mm_processor is not None:
+            self.mm_processor.process(request)
+        request.prompt_tokens = int(request.input_ids.numel())
+        # Rejected requests are recorded in finished_requests and never enter
+        # either compute queue.
         if self.reject_if_prompt_too_long(request):
             return request_id
-        self.waiting_queue.append(request)
+        self._enqueue_admitted_request(request)
         return request_id
+
+    def _enqueue_admitted_request(self, request: Request) -> None:
+        if self.mm_waiting_queue is not None:
+            self.mm_waiting_queue.append(request)
+        else:
+            self.waiting_queue.append(request)
 
     def run_step(
         self,
@@ -171,11 +196,8 @@ class Scheduler:
         It assembles a batch, executes it through the engine, and
         processes results.
 
-        The scheduling strategy:
-        1. Process all pending prefill requests in batch cycles
-        2. Otherwise, try to schedule prefill requests first (up to budget)
-        3. If no prefill, schedule decode requests
-        4. Execute batch and update states
+        Offline scheduling prioritizes Prefill-ready requests, then MM Encode,
+        then Decode. Online supplies an explicit global phase.
 
         Args:
             engine: ExecutionEngine instance for model inference.
@@ -184,7 +206,27 @@ class Scheduler:
         that dict directly. Returns True if a real (non-dummy) batch ran, False
         otherwise — offline uses this to break a has_work-but-no-batch stall.
         """
-        # Assemble batch (normal mode)
+        if phase == "mm_encode" or (
+            phase is None
+            and not self.waiting_queue
+            and self.has_mm_pending()
+        ):
+            mm_batch = self._schedule_mm_encode_batch(engine)
+            if mm_batch is None:
+                mm_batch = MMEncodeBatch(is_dummy=True)
+
+            output = engine.encode_mm_batch(mm_batch)
+            if mm_batch.is_dummy:
+                return False
+
+            self._process_mm_encode_output(mm_batch)
+            if self.mode == "offline":
+                self.mm_encode_infer_time += output["inference_time"]
+            self._step += 1
+            self._log_mm_encode_step(mm_batch, output)
+            return True
+
+        # Assemble a token batch.
         batch = self._schedule_batch(engine, phase)
         if batch is None or batch.is_empty():
             return False
@@ -200,10 +242,56 @@ class Scheduler:
 
         # Process outputs and update request states
         self._process_batch_output(batch, engine)
+        if (
+            self.mode == "offline"
+            and self.mm_waiting_queue is not None
+            and batch.is_prefill
+        ):
+            self.prefill_infer_time += output["inference_time"]
 
         self._step += 1
         self._log_step(engine, batch, output)
         return True
+
+    def _schedule_mm_encode_batch(
+        self,
+        engine: ExecutionEngine,
+    ) -> Optional[MMEncodeBatch]:
+        if not self.mm_waiting_queue:
+            return None
+
+        max_mm_tokens = self.config.max_mm_encode_tokens
+        budget_enabled = max_mm_tokens > 0
+        if budget_enabled:
+            dp_size = engine.infer_config.parallel_config.cp_prefill_dp_size
+            max_mm_tokens = ceil_div(max_mm_tokens, dp_size)
+
+        requests = []
+        total_mm_tokens = 0
+        while self.mm_waiting_queue:
+            request = self.mm_waiting_queue[0]
+            next_mm_tokens = total_mm_tokens + request.mm_token_count
+            if budget_enabled and requests and next_mm_tokens > max_mm_tokens:
+                break
+            requests.append(self.mm_waiting_queue.popleft())
+            total_mm_tokens = next_mm_tokens
+        return MMEncodeBatch(requests=requests)
+
+    def _process_mm_encode_output(
+        self,
+        mm_batch: MMEncodeBatch,
+    ) -> None:
+        for request in mm_batch.requests:
+            request.mm_inputs = None
+            self.waiting_queue.append(request)
+
+    @staticmethod
+    def _log_mm_encode_step(mm_batch: MMEncodeBatch, output: dict) -> None:
+        logger.info(
+            "[MM Encode] batch_reqs=%d infer=%.2fms",
+            len(mm_batch.requests),
+            output["inference_time"] * 1000,
+        )
 
     def _schedule_batch(
         self,
@@ -360,7 +448,6 @@ class Scheduler:
             return
 
         request.input_ids = self.tokenize_request(request.prompt, self.input_truncated_len)
-        request.prompt_tokens = int(request.input_ids.numel())
 
     def reject_if_prompt_too_long(self, request: Request) -> bool:
         """Admission-time prompt-length guard — single source of truth.
@@ -371,7 +458,6 @@ class Scheduler:
         Returns False when within the cap. Centralizing the threshold and the
         length source here keeps prefill and decode from drifting apart.
         """
-        self._prepare_request_prompt(request)
         if request.prompt_tokens <= self.config.max_prefill_tokens:
             return False
         request.is_finished = True
@@ -535,7 +621,17 @@ class Scheduler:
         Returns:
             True if scheduler has requests to process (not finished).
         """
-        return bool(self.waiting_queue or self.running_requests)
+        return bool(
+            self.has_mm_pending()
+            or self.waiting_queue
+            or self.running_requests
+        )
+
+    def has_mm_pending(self) -> bool:
+        return bool(self.mm_waiting_queue)
+
+    def has_prefill_ready(self) -> bool:
+        return bool(self.waiting_queue)
 
     # ── Subclass hooks (used by online PD schedulers). ──
     def _on_prefill_complete(self, request: Request) -> None:
@@ -584,10 +680,14 @@ class Scheduler:
 
     def reset(self) -> None:
         """Reset scheduler state. Clears all requests."""
+        if self.mm_waiting_queue is not None:
+            self.mm_waiting_queue.clear()
         self.waiting_queue.clear()
         self.running_requests.clear()
         self.finished_requests.clear()
         self.prefilled_request_count = 0
+        self.mm_encode_infer_time = 0.0
+        self.prefill_infer_time = 0.0
         self._request_counter = 0
         self._batch_counter = 0
 
@@ -595,11 +695,12 @@ class Scheduler:
         """Get scheduler statistics.
 
         Returns:
-            Dict with queue size, running count, finished count.
+            Counts for pending, running, and finished requests.
         """
+        pending = len(self.mm_waiting_queue or ()) + len(self.waiting_queue)
         return {
-            "pending": len(self.waiting_queue),
+            "pending": pending,
             "running": len(self.running_requests),
             "finished": len(self.finished_requests),
-            "total": len(self.waiting_queue) + len(self.running_requests) + len(self.finished_requests),
+            "total": pending + len(self.running_requests) + len(self.finished_requests),
         }

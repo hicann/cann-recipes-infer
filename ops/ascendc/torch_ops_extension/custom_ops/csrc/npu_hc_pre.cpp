@@ -65,6 +65,20 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> construct_hc_pre_output_tensor(co
     return std::tuple<at::Tensor, at::Tensor, at::Tensor>(y, post, comb_frag);
 }
 
+// 工具函数，推导可选输出 pre 的 shape（与 post 一致：x 去掉最后一维 d，末维为 hc_mult）
+at::Tensor construct_hc_pre_pre_output_tensor(const at::Tensor& x, int64_t hc_mult)
+{
+    c10::SymInt hc_mult_sym(hc_mult);
+    auto xDims = x.dim();
+    c10::SymDimVector pre_size;
+    if (xDims == DIM_4) {
+        pre_size = {x.sym_size(DIM_0), x.sym_size(DIM_1), hc_mult_sym};
+    } else if (xDims == DIM_3) {
+        pre_size = {x.sym_size(DIM_0), hc_mult_sym};
+    }
+    return at::empty_symint(pre_size, x.options().dtype(at::kFloat));
+}
+
 // 工具函数，推导输出hc_pre_inv_rms_shape
 at::Tensor construct_hc_pre_rsqrt_output_tensor(const at::Tensor& x, float epsilon=1e-6)
 {
@@ -92,6 +106,8 @@ void check_hc_pre_shape_and_dtype(
     const at::Tensor& hc_fn,
     const at::Tensor& hc_scale,
     const at::Tensor& hc_base,
+    const c10::optional<at::Tensor>& pre_mix,
+    int64_t hc_mult,
     bool is_ascend950 = false)
 {
     // check x shape: [b, s, hc, d]
@@ -109,9 +125,6 @@ void check_hc_pre_shape_and_dtype(
         d = x.sym_size(DIM_3);
     }
     TORCH_CHECK(hc == HC_LIMIT, "The hc of x only support ", HC_LIMIT, ", actual ", hc, ".");
-    TORCH_CHECK(
-        d == D_LIMIT || d == D_LIMIT_EXTEND,
-        "The d of x only support ", D_LIMIT, " or ", D_LIMIT_EXTEND, ", actual ", d, ".");
     // check hc_fn: [mix_hc, hc * d]
     TORCH_CHECK(hc_fn.dim() == DIM_2, "Input tensor hc_fn's dim num should be 2, actual ", hc_fn.dim(), ".");
     auto mix_hc = hc_fn.sym_size(DIM_0);
@@ -136,6 +149,18 @@ void check_hc_pre_shape_and_dtype(
     TORCH_CHECK(hc_fn.dtype() == at::kFloat, "hc_fn's dtype should be FLOAT32.");
     TORCH_CHECK(hc_scale.dtype() == at::kFloat, "hc_scale's dtype should be FLOAT32.");
     TORCH_CHECK(hc_base.dtype() == at::kFloat, "hc_base's dtype should be FLOAT32.");
+    // check pre_mix (optional): shape should be x.shape[:-1]（与 pre 输出一致，最后一维即 hc_mult），dtype float32
+    if (pre_mix.has_value() && pre_mix.value().defined()) {
+        auto& pm = pre_mix.value();
+        TORCH_CHECK(pm.dtype() == at::kFloat, "pre_mix's dtype should be FLOAT32.");
+        TORCH_CHECK(pm.dim() == xDims - DIM_1,
+                    "pre_mix's dim num should be ", xDims - DIM_1, ", actual ", pm.dim(), ".");
+        for (int64_t i = 0; i < xDims - DIM_1; i++) {
+            TORCH_CHECK(pm.sym_size(i) == x.sym_size(i),
+                        "pre_mix.shape[", i, "] should equal x.shape[", i, "], actual ",
+                        pm.sym_size(i), " vs ", x.sym_size(i), ".");
+        }
+    }
 }
 
 // hc_pre 小算子拼接实现
@@ -169,9 +194,10 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> hc_pre_composite(
     return std::tuple<at::Tensor, at::Tensor, at::Tensor>(y, post, comb_frag);
 }
 
-// hc_pre 融合算子实现
-std::tuple<at::Tensor, at::Tensor, at::Tensor> hc_pre_fusion(
+// hc_pre 融合算子实现（alloc_pre 为内部开关：v1 复用时不分配 pre，v2 总是分配并返回 pre）
+std::tuple<at::Tensor, at::Tensor, at::Tensor, c10::optional<at::Tensor>> hc_pre_fusion(
     const at::Tensor& x, const at::Tensor& hc_fn, const at::Tensor& hc_scale, const at::Tensor& hc_base,
+    const c10::optional<at::Tensor>& pre_mix, bool alloc_pre,
     int64_t hc_mult, int64_t hc_sinkhorn_iters, double norm_eps, double hc_eps)
 {
     auto output_tensors = construct_hc_pre_output_tensor(x, hc_mult);
@@ -179,12 +205,18 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> hc_pre_fusion(
     at::Tensor post = std::get<1>(output_tensors);
     at::Tensor comb_frag = std::get<2>(output_tensors);
 
-    EXEC_NPU_CMD_V1(aclnnHcPre, x, hc_fn, hc_scale, hc_base, hc_mult, hc_sinkhorn_iters, hc_eps, norm_eps,
-                    y, post, comb_frag);
+    // 可选输出 pre：仅 alloc_pre 时分配；未分配时以 nullptr 传入 aclnn（hasPreOut=0）
+    c10::optional<at::Tensor> pre_out;
+    if (alloc_pre) {
+        pre_out = construct_hc_pre_pre_output_tensor(x, hc_mult);
+    }
+
+    EXEC_NPU_CMD_V1(aclnnHcPre, x, hc_fn, hc_scale, hc_base, pre_mix, hc_mult, hc_sinkhorn_iters, hc_eps, norm_eps,
+                    y, post, comb_frag, pre_out);
 
     y = y.to(x.dtype());
 
-    return std::tuple<at::Tensor, at::Tensor, at::Tensor>(y, post, comb_frag);
+    return std::tuple<at::Tensor, at::Tensor, at::Tensor, c10::optional<at::Tensor>>(y, post, comb_frag, pre_out);
 }
 
 // step2 为NPU设备实现前向接口
@@ -195,8 +227,28 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_hc_pre_npu(
     static const char* socName = aclrtGetSocName();
     static const char* prefix950 = "Ascend950";
     const bool isAscend950 = socName != nullptr && std::string(socName).find(prefix950) == 0;
-    check_hc_pre_shape_and_dtype(x, hc_fn, hc_scale, hc_base, isAscend950);
-    return hc_pre_fusion(x, hc_fn, hc_scale, hc_base, hc_mult, hc_sinkhorn_iters, norm_eps, hc_eps);
+    check_hc_pre_shape_and_dtype(x, hc_fn, hc_scale, hc_base, c10::nullopt, hc_mult, isAscend950);
+    auto outputs = hc_pre_fusion(x, hc_fn, hc_scale, hc_base, c10::nullopt, false, hc_mult, hc_sinkhorn_iters,
+                                 norm_eps, hc_eps);
+    return std::tuple<at::Tensor, at::Tensor, at::Tensor>(std::get<0>(outputs), std::get<1>(outputs),
+                                                          std::get<2>(outputs));
+}
+
+// step2' npu_hc_pre_v2 NPU实现：新增 pre_mix 可选输入，总是返回 pre
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> npu_hc_pre_v2_npu(
+    const at::Tensor& x, const at::Tensor& hc_fn, const at::Tensor& hc_scale, const at::Tensor& hc_base,
+    const c10::optional<at::Tensor>& pre_mix,
+    int64_t hc_mult, int64_t hc_sinkhorn_iters, double norm_eps, double hc_eps)
+{
+    static const char* socName = aclrtGetSocName();
+    static const char* prefix950 = "Ascend950";
+    const bool isAscend950 = socName != nullptr && std::string(socName).find(prefix950) == 0;
+    check_hc_pre_shape_and_dtype(x, hc_fn, hc_scale, hc_base, pre_mix, hc_mult, isAscend950);
+    auto outputs = hc_pre_fusion(x, hc_fn, hc_scale, hc_base, pre_mix, true, hc_mult, hc_sinkhorn_iters, norm_eps,
+                                 hc_eps);
+    return std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>(std::get<0>(outputs), std::get<1>(outputs),
+                                                                      std::get<2>(outputs),
+                                                                      std::get<3>(outputs).value());
 }
 
 // step3, 为META设备实现前向接口
@@ -209,14 +261,35 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_hc_pre_meta(
     static const char* prefix950 = "Ascend950";
     const bool isAscend950 = socName != nullptr && std::string(socName).find(prefix950) == 0;
 
-    check_hc_pre_shape_and_dtype(x, hc_fn, hc_scale, hc_base, isAscend950);
+    check_hc_pre_shape_and_dtype(x, hc_fn, hc_scale, hc_base, c10::nullopt, hc_mult, isAscend950);
     // construct the output tensor
     auto output_tensors = construct_hc_pre_output_tensor(x, hc_mult);
     at::Tensor y = std::get<0>(output_tensors);
     at::Tensor post = std::get<1>(output_tensors);
     at::Tensor comb_frag = std::get<2>(output_tensors);
-
     return std::tuple<at::Tensor, at::Tensor, at::Tensor>(y, post, comb_frag);
+}
+
+// step3' npu_hc_pre_v2 META实现：新增 pre_mix 可选输入，总是返回 pre
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> npu_hc_pre_v2_meta(
+    const at::Tensor& x, const at::Tensor& hc_fn, const at::Tensor& hc_scale, const at::Tensor& hc_base,
+    const c10::optional<at::Tensor>& pre_mix,
+    int64_t hc_mult, int64_t hc_sinkhorn_iters, double norm_eps, double hc_eps)
+{
+    // get soc name
+    static const char* socName = aclrtGetSocName();
+    static const char* prefix950 = "Ascend950";
+    const bool isAscend950 = socName != nullptr && std::string(socName).find(prefix950) == 0;
+
+    check_hc_pre_shape_and_dtype(x, hc_fn, hc_scale, hc_base, pre_mix, hc_mult, isAscend950);
+    // construct the output tensor
+    auto output_tensors = construct_hc_pre_output_tensor(x, hc_mult);
+    at::Tensor y = std::get<0>(output_tensors);
+    at::Tensor post = std::get<1>(output_tensors);
+    at::Tensor comb_frag = std::get<2>(output_tensors);
+    at::Tensor pre_out = construct_hc_pre_pre_output_tensor(x, hc_mult);
+
+    return std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>(y, post, comb_frag, pre_out);
 }
 
 } // namespace custom
@@ -224,9 +297,11 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_hc_pre_meta(
 // step4, 为NPU设备注册前向实现
 TORCH_LIBRARY_IMPL(custom, PrivateUse1, m) {
     m.impl("npu_hc_pre", &custom::npu_hc_pre_npu);
+    m.impl("npu_hc_pre_v2", &custom::npu_hc_pre_v2_npu);
 }
 
 // step5, 为META设备注册前向实现
 TORCH_LIBRARY_IMPL(custom, Meta, m) {
     m.impl("npu_hc_pre", &custom::npu_hc_pre_meta);
+    m.impl("npu_hc_pre_v2", &custom::npu_hc_pre_v2_meta);
 }

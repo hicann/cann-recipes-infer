@@ -28,6 +28,7 @@ const static int64_t OUT_FLAG_FALSE = 0;
 const static int64_t OUT_FLAG_TRUE = 1;
 const static size_t X_INPUT_DIMS = 2;
 const static size_t BIAS_INPUT_DIMS = 1;
+const static size_t MASK_INPUT_DIMS = 1;
 const static size_t Y_OUTPUT_DIMS = 2;
 const static size_t EXPERT_IDX_OUTPUY_DIMS = 2;
 const static size_t OUT_OUTPUT_DIMS = 2;
@@ -37,6 +38,8 @@ const static int64_t X_INPUT_INDEX = 0;
 const static int64_t BIAS_INPUT_INDEX = 1;
 const static int64_t INPUT_IDS_INPUT_INDEX = 2;
 const static int64_t TID_TO_EID_INPUT_INDEX = 3;
+const static int64_t ADDITIONAL_BIAS_INPUT_INDEX = 4;
+const static int64_t ADDITIONAL_TOKEN_MASK_INPUT_INDEX = 5;
 const static int64_t Y_OUTPUT_INDEX = 0;
 const static int64_t EXPERT_IDX_OUTPUT_INDEX = 1;
 const static int64_t OUT_OUTPUT_INDEX = 2;
@@ -124,6 +127,8 @@ private:
     const gert::Shape *biasShape_ = nullptr;
     const gert::Shape *inputIdsShape_ = nullptr;
     const gert::Shape *tid2eidShape_ = nullptr;
+    const gert::Shape *additionalBiasShape_ = nullptr;
+    const gert::Shape *additionalTokenMaskShape_ = nullptr;
     const gert::Shape *yShape_ = nullptr;
     const gert::Shape *expertIdxShape_ = nullptr;
     const gert::Shape *outShape_ = nullptr;
@@ -178,6 +183,28 @@ ge::graphStatus MoeGatingTopKHashTilingBase::CheckInputShape()
             return ge::GRAPH_FAILED);
     }
     moeGatingTopKTilingData_.set_addBias(addBias_);
+
+    if (additionalBiasShape_ != nullptr) {
+        size_t additionalBiasDimNum = additionalBiasShape_->GetDimNum();
+        OPS_ERR_IF(additionalBiasDimNum != BIAS_INPUT_DIMS,
+                    OPS_LOG_E(context_, "The number of additional bias dim is: %zu, but should be %zu.", additionalBiasDimNum, BIAS_INPUT_DIMS),
+                    return ge::GRAPH_FAILED);
+        OPS_ERR_IF(additionalBiasShape_->GetDim(0) != expertCount_,
+                    OPS_LOG_E(context_, "The first dim of additional bias is: %ld, but should be expert num: %ld.",
+                         additionalBiasShape_->GetDim(0), expertCount_),
+                    return ge::GRAPH_FAILED);
+    }
+
+    if (additionalTokenMaskShape_ != nullptr) {
+        size_t additionalTokenMaskDimNum = additionalTokenMaskShape_->GetDimNum();
+        OPS_ERR_IF(additionalTokenMaskDimNum != MASK_INPUT_DIMS,
+                    OPS_LOG_E(context_, "The number of additional token mask dim is: %zu, but should be %zu.", additionalTokenMaskDimNum, MASK_INPUT_DIMS),
+                    return ge::GRAPH_FAILED);
+        OPS_ERR_IF(additionalTokenMaskShape_->GetDim(0) != rows_,
+                    OPS_LOG_E(context_, "The first dim of additional token mask is: %ld, but should be row num: %ld.",
+                         additionalTokenMaskShape_->GetDim(0), rows_),
+                    return ge::GRAPH_FAILED);
+    }
 
     if (inputIdsShape_ != nullptr) {
         OPS_ERR_IF(
@@ -288,6 +315,12 @@ ge::graphStatus MoeGatingTopKHashTilingBase::GetShapeAttrsInfo()
     auto tid2eidShapePtr = context_->GetOptionalInputShape(TID_TO_EID_INPUT_INDEX);
     tid2eidShape_ = tid2eidShapePtr == nullptr ? nullptr : &tid2eidShapePtr->GetStorageShape();
 
+    auto additionalBiasShapePtr = context_->GetOptionalInputShape(ADDITIONAL_BIAS_INPUT_INDEX);
+    additionalBiasShape_ = additionalBiasShapePtr == nullptr ? nullptr : &additionalBiasShapePtr->GetStorageShape();
+
+    auto additionalTokenMaskShapePtr = context_->GetOptionalInputShape(ADDITIONAL_TOKEN_MASK_INPUT_INDEX);
+    additionalTokenMaskShape_ = additionalTokenMaskShapePtr == nullptr ? nullptr : &additionalTokenMaskShapePtr->GetStorageShape();
+
     // 获取输出shape
     auto yShapePtr = context_->GetOutputShape(Y_OUTPUT_INDEX);
     OPS_LOG_E_IF_NULL(context_, yShapePtr, return ge::GRAPH_FAILED);
@@ -314,6 +347,21 @@ ge::graphStatus MoeGatingTopKHashTilingBase::GetShapeAttrsInfo()
                     OPS_LOG_E(context_, "bias dtype %s not equal x dtype %s, please check.",
                          ge::TypeUtils::DataTypeToSerialString(biasDtype).c_str(),
                          ge::TypeUtils::DataTypeToSerialString(xDtype).c_str()),
+                    return ge::GRAPH_FAILED);
+    }
+    if (additionalBiasShapePtr != nullptr) {
+        auto additionalBiasDtype = context_->GetOptionalInputDesc(ADDITIONAL_BIAS_INPUT_INDEX)->GetDataType();
+        OPS_ERR_IF((additionalBiasDtype != xDtype),
+                    OPS_LOG_E(context_, "additional bias dtype %s not equal x dtype %s, please check.",
+                         ge::TypeUtils::DataTypeToSerialString(additionalBiasDtype).c_str(),
+                         ge::TypeUtils::DataTypeToSerialString(xDtype).c_str()),
+                    return ge::GRAPH_FAILED);
+    }
+    if (additionalTokenMaskShapePtr != nullptr) {
+        auto additionalTokenMaskDtype = context_->GetOptionalInputDesc(ADDITIONAL_TOKEN_MASK_INPUT_INDEX)->GetDataType();
+        OPS_ERR_IF((additionalTokenMaskDtype != ge::DataType::DT_BOOL),
+                    OPS_LOG_E(context_, "additional token mask dtype %s error, only supports bool. please check.",
+                      ge::TypeUtils::DataTypeToSerialString(additionalTokenMaskDtype).c_str()),
                     return ge::GRAPH_FAILED);
     }
     if (inputIdsShapePtr != nullptr) {

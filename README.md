@@ -21,7 +21,8 @@
 
 ## 📰 最新动态
 
-- [2026/08] DeepSeek-V4-Flash 模型在昇腾 910B/A3 上已支持 **单卡推理部署**：attention 与热专家基于NPU计算，其余 MoE 专家 offload 到 Kunpeng CPU 并以原生 MXFP4 计算，decode 约 19–22.5 tok/s。**支持CANNLab lite-infer-and-train镜像部署**。
+- [2026/09] DeepSeek-V4.1-Flash 模型在昇腾 950PR/DT 系列上已支持 **FP8-FP4 推理部署**，支持多模理解、Engram offload等特性
+- [2026/08] DeepSeek-V4-Flash 模型在昇腾 910B/A3 上已支持 **单卡推理部署**：attention 与热专家基于NPU计算，其余 MoE 专家 offload 到 Kunpeng CPU 并以原生 MXFP4 计算，decode 约 19–22.5 tok/s。**支持CANNLab lite-infer-and-train镜像部署**
 - [2026/08] BaiLing-V3 模型在昇腾 Atlas A2/A3系列上已 **0day 支持推理部署**
 - [2026/07] daVinci-MagiHuman模型在昇腾Atlas A2/A3系列上已支持推理部署
 - [2026/07] Kimi K3 模型在昇腾 950PR/DT 系列上已 **0day 支持推理部署**
@@ -153,6 +154,7 @@ bash infer.sh
 
 | 模型实践 | 简介 |
 |------|------|
+| [DeepSeek-V4.1-Flash](models/deepseek_v4_1/README.md)             |950PR/DT昇腾芯片，原生支持多模态推理，Engram offload等优化特性。
 | [daVinci-MagiHuman](models/davinci-magihuman/README.md)                     |基于Transformers库，在Atlas A2/A3环境中完成daVinci-MagiHuman模型部署，使能融合算子等优化特性。
 | [Kimi-K3](models/kimi_k3/README.md)                     |基于Transformers库，在昇腾950PR/DT环境中完成Kimi-K3混合注意力MoE模型的推理部署，KDA接入框架Mamba Cache，Routed Expert采用原生MXFP4权重与动态MXFP8激活，使能图模式编译与多流并行等优化特性。
 | [Ling-2.5](models/bailing_2_5/README.md)                |基于Transformers库，在昇腾950DT环境中完成Ling-2.5混合注意力MoE模型的推理部署，GLA线性注意力与MLA全注意力按层交替，Linear采用MXFP w8a8量化、MoE路由专家采用MXFP w4a8量化，使能图模式编译与多流并行等优化特性。
@@ -200,10 +202,11 @@ bash infer.sh
 │   │       ├── dsv4-flash-single-npu-moe-offload
 │   │       └── qwen3-next
 │   └── models                                  # 原生深度优化模型文档
-│       ├── deepseek_r1                         
-│       ├── deepseek_v3_2_exp                   
-│       ├── deepseek_v4                         
-│       └── ...                                 
+│       ├── deepseek_r1
+│       ├── deepseek_v3_2_exp
+│       ├── deepseek_v4
+|       ├── deepseek_v4_1
+│       └── ...
 ├── accelerator                                 # 加速算法样例
 ├── dataset                                     # 数据集和默认 prompt
 ├── executor                                    # 推理执行框架
@@ -224,16 +227,16 @@ bash infer.sh
 │   └── model_runner.py                         # ModelRunner 类定义
 ├── integration                                 # 外部框架集成
 │   ├── custom                                  # 自定义集成方案
-│   │   └── deepseek-v3-ascend310p  
+│   │   └── deepseek-v3-ascend310p
 │   ├── sglang                                  # SGLang 框架集成
-│   │   ├── dsv4-flash-single-npu-moe-offload   
-│   │   ├── llada2.x                            
-│   │   ├── qwen3-moe                           
-│   │   └── qwen3-next                          
+│   │   ├── dsv4-flash-single-npu-moe-offload
+│   │   ├── llada2.x
+│   │   ├── qwen3-moe
+│   │   └── qwen3-next
 │   └── vllm                                    # vLLM 框架集成
-│       ├── deepseek-ocr-2                      
-│       ├── minimax_m2.5_mxfp4                  
-│       └── pd-hybrid-dp-ep                     
+│       ├── deepseek-ocr-2
+│       ├── minimax_m2.5_mxfp4
+│       └── pd-hybrid-dp-ep
 ├── models                                      # 模型脚本目录
 │   ├── deepseek_v4                             # DeepSeek-V4 的模型脚本及执行配置
 │   ├── deepseek_v4_flash_tilelang_and_inductor_af  # DeepSeek-V4 Flash TileLang/Inductor 算子样例
@@ -258,7 +261,7 @@ bash infer.sh
 │   ├── sana-video                              # SANA-Video 的模型脚本及执行配置
 │   ├── step3p7_flash                           # Step3p7-Flash 的模型脚本及执行配置
 │   ├── wan2.2-i2v                              # Wan2.2-I2V 的模型脚本及执行配置
-│   └── ...                                     
+│   └── ...
 ├── module                                      # Linear 等基础 layer 的类定义
 │   ├── blockwise_sparse                        # 稀疏处理模块
 │   ├── dit_cache                               # DiT Cache 模块

@@ -20,7 +20,7 @@ import yaml
 from executor.core.config import InferenceConfig
 from executor.offline.offline_inference import OfflineInference
 from executor.utils.data_utils import generate_default_prompt, load_longbench_dataset, build_dataset_input, \
-    load_infinitebench_dataset
+    load_infinitebench_dataset, load_mmmu_dataset, export_mmmu_results
 from executor.utils.common_utils import process_infer_time
 from executor.utils.logging_config import setup_logging
 from executor.core.forward_data_info import SamplingParams
@@ -35,8 +35,9 @@ def parse_args():
 
 
 def generate_prompt(dataset, dataset_path):
-    if dataset == "default":
-        preset_prompts = generate_default_prompt(dataset_path)
+    if dataset in ("default", "default_multimodal"):
+        prompt_filename = f"{dataset}_prompt.json"
+        preset_prompts = generate_default_prompt(dataset_path, prompt_filename)
     elif dataset == "LongBench":
         dataset_path = os.path.abspath(os.path.join(dataset_path, f"{dataset}"))
         if os.path.isdir(dataset_path): # use local LongBench dataset first
@@ -50,7 +51,10 @@ def generate_prompt(dataset, dataset_path):
             dataset = dataset_path
         preset_prompts = load_infinitebench_dataset(dataset)
     else:
-        raise Exception(f"your dataset {dataset} is not supported, dataset supported: LongBench, InfiniteBench")
+        raise Exception(
+            f"your dataset {dataset} is not supported, dataset supported: "
+            "default, default_multimodal, LongBench, InfiniteBench, MMMU"
+        )
     return preset_prompts
 
 
@@ -71,23 +75,26 @@ def _get_prompt_dp_rank(config, global_rank):
     return global_rank // parallel_config.attn_tp_size
 
 
-def log_results(results, mtp_stats, infer_time, next_n, model_name):
+def log_results(results, mtp_stats, infer_time, next_n, model_name, enable_mm_encode=False):
     """Log inference results and calculate MTP acceptance rate if MTP is enabled.
 
     Args:
         results: List of GenerationOutput objects containing output_text.
         mtp_stats: Dict of MTP metrics (None if MTP not enabled).
                    Contain 'spec_num_accepted_tokens' and 'spec_num_forward_ct'.
-        infer_time: Per-step inference time list. The first item is prefill time.
+        infer_time: [prefill, decode...] or [encode, prefill, decode...] when MM Encode is enabled.
         next_n: MTP speculation depth (0 if MTP not enabled).
         model_name: Name of the model used for logging.
+        enable_mm_encode: Whether infer_time includes an Encode entry before Prefill.
     """
     # Log output text for each request
     for i, res in enumerate(results):
         logger.info("Request %s: outputs: %s\n", i, res.output_text)
 
-    # Skip the first time which is the prefill inference time
-    decode_infer_time = infer_time[1:] if infer_time and len(infer_time) > 1 else []
+    if enable_mm_encode and infer_time:
+        logger.info("%s encode total inference time cost is %.2f ms", model_name, infer_time[0] * 1000)
+        logger.info("%s prefill total inference time cost is %.2f ms", model_name, infer_time[1] * 1000)
+    decode_infer_time = infer_time[2:] if enable_mm_encode else infer_time[1:]
     # Get average decode inference time
     avg_decode_time = process_infer_time(decode_infer_time, len(decode_infer_time))
     # Calculate and log total MTP acceptance rate if MTP is enabled
@@ -141,8 +148,33 @@ def main():
     attn_dp_size = config.parallel_config.attn_dp_size
     cp_size = config.parallel_config.cp_size
     batch_size = config.scheduler_config.batch_size
-
-    if cp_size > 1:
+    mmmu_ids = None
+    mmmu_ground_truths = None
+    if config.data_config.dataset == "MMMU":
+        if cp_size>1:
+                raise ValueError(
+                "MMMU dataset does not support cp_size>1"
+            )
+        mmmu_path = os.path.abspath(os.path.join(dataset_path, "MMMU"))
+        if os.path.isdir(mmmu_path):
+            mmmu_source = mmmu_path
+        else:
+            mmmu_source = "MMMU/MMMU"
+        prompts, mmmu_ids, mmmu_ground_truths = load_mmmu_dataset(mmmu_source, batch_size)
+        global_dp_rank = 0
+        if attn_dp_size > 1:
+            if batch_size % attn_dp_size !=0:
+                raise ValueError(
+                f"batch_size ({batch_size}) must be divisible by attn_dp_size ({attn_dp_size})"
+            )
+            per_rank = config.scheduler_config.batch_size_per_dp_rank
+            global_dp_rank = _get_prompt_dp_rank(config, global_rank)
+            lo = global_dp_rank * per_rank
+            hi = (global_dp_rank+1)* per_rank
+            prompts =prompts[lo:hi]
+            mmmu_ids = mmmu_ids[lo:hi]
+            mmmu_ground_truths =mmmu_ground_truths[lo:hi]
+    elif cp_size > 1:
         if batch_size % attn_dp_size != 0:
             raise ValueError(f"batch_size ({batch_size}) must be divisible by attn_dp_size ({attn_dp_size})")
         all_prompts = generate_prompt(config.data_config.dataset, dataset_path)
@@ -165,7 +197,7 @@ def main():
 
     llm = OfflineInference(config)
 
-    if config.data_config.dataset != "default":
+    if config.data_config.dataset not in ("default", "default_multimodal", "MMMU"):
         prompts = preprocess_prompts_for_scheduler(
             prompts, llm.engine.tokenizer, config.scheduler_config, config.data_config)
     sampling_params = SamplingParams(
@@ -179,8 +211,13 @@ def main():
     results, mtp_stats, infer_time = llm.generate(prompts=prompts, sampling_params=sampling_params)
     if llm.engine.is_afd_ffn_rank:
         return
-    log_results(results, mtp_stats, infer_time, llm.engine.next_n, llm.engine.main_worker.model_name)
-
+    log_results(
+        results, mtp_stats, infer_time, llm.engine.next_n, llm.engine.main_worker.model_name,
+        enable_mm_encode=llm.engine.enable_mm_encode,
+    )
+    if config.data_config.dataset == "MMMU" and mmmu_ids is not None:
+        suffix = f"_dp{global_dp_rank}" if attn_dp_size>1 else ""
+        export_mmmu_results(results, mmmu_ids, mmmu_ground_truths,config.model_config.output_path, suffix=suffix)
 
 if __name__ == "__main__":
     main()

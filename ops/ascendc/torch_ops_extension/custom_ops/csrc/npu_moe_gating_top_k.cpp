@@ -62,6 +62,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_moe_gating_top_k_npu(
     const c10::optional<at::Tensor>& bias,
     const c10::optional<at::Tensor>& input_ids,
     const c10::optional<at::Tensor>& tid2eid,
+    const c10::optional<at::Tensor>& additional_bias,
+    const c10::optional<at::Tensor>& additional_token_mask,
     int64_t kGroup,
     int64_t groupCount,
     double routedScalingFactor,
@@ -91,11 +93,33 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_moe_gating_top_k_npu(
             x.sym_size(-1), ", Got: ", bias_tensor.sym_size(0));
     }
 
+    // Check additional_bias tensor if provided
+    if (additional_bias.has_value()) {
+        const auto& additional_bias_tensor = additional_bias.value();
+        TORCH_CHECK(additional_bias_tensor.sym_numel() > 0, "additional_bias tensor should not be empty.");
+        TORCH_CHECK(additional_bias_tensor.dim() == 1, "additional_bias tensor should be 1-dimensional.");
+        TORCH_CHECK(additional_bias_tensor.sym_size(0) == x.sym_size(-1),
+            "additional_bias tensor size should match the last dimension of x. Expected: ",
+            x.sym_size(-1), ", Got: ", additional_bias_tensor.sym_size(0));
+        TORCH_CHECK(additional_bias_tensor.dtype() == x.dtype(), "additional_bias dtype should be the same with x dtype.");
+    }
+
+    // Check additional_token_mask tensor if provided
+    if (additional_token_mask.has_value()) {
+        const auto& additional_token_mask_tensor = additional_token_mask.value();
+        TORCH_CHECK(additional_token_mask_tensor.sym_numel() > 0, "additional_token_mask tensor should not be empty.");
+        TORCH_CHECK(additional_token_mask_tensor.dim() == 1, "additional_token_mask tensor should be 1-dimensional.");
+        TORCH_CHECK(additional_token_mask_tensor.sym_size(0) == x.sym_numel() / x.sym_size(-1),
+            "additional_token_mask tensor size should match the row number of x. Expected: ",
+            x.sym_numel() / x.sym_size(-1), ", Got: ", additional_token_mask_tensor.sym_size(0));
+        TORCH_CHECK(additional_token_mask_tensor.dtype() == at::kBool, "additional_token_mask dtype only supports bool.");
+    }
+
     if (input_ids.has_value()) {
         const auto& input_ids_tensor = input_ids.value();
         TORCH_CHECK(input_ids_tensor.sym_numel() > 0, "input_ids tensor should not be empty when not null.");
     }
-    
+
     if (tid2eid.has_value()) {
         const auto& tid2eid_tensor = tid2eid.value();
         TORCH_CHECK(tid2eid_tensor.sym_numel() > 0, "tid2eid tensor should not be empty when not null.");
@@ -119,9 +143,10 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_moe_gating_top_k_npu(
     normOut = at::empty_symint(normOut_shape, x.options().dtype(at::kFloat));
 
     // Execute the NPU operation
-    EXEC_NPU_CMD_V1(aclnnMoeGatingTopKHash, x, bias, input_ids, tid2eid, k, kGroup, groupCount, groupSelectMode, renorm, normType,
-                    outFlag, routedScalingFactor, eps,  yOut, expertIdxOut, normOut);
-    
+    EXEC_NPU_CMD_V1(aclnnMoeGatingTopKHash, x, bias, input_ids, tid2eid, additional_bias, additional_token_mask, k, kGroup,
+                    groupCount, groupSelectMode, renorm, normType, outFlag, routedScalingFactor, eps, yOut,
+                    expertIdxOut, normOut);
+
 
     return std::make_tuple(yOut, expertIdxOut, normOut);
 }
@@ -133,6 +158,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_moe_gating_top_k_meta(
     const c10::optional<at::Tensor>& bias,
     const c10::optional<at::Tensor>& input_ids,
     const c10::optional<at::Tensor>& tid2eid,
+    const c10::optional<at::Tensor>& additional_bias,
+    const c10::optional<at::Tensor>& additional_token_mask,
     int64_t kGroup,
     int64_t groupCount,
     double routedScalingFactor,

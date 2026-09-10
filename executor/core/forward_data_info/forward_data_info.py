@@ -150,6 +150,8 @@ class Request:
         prompt: Input text prompt.
         sampling_params: Per-request sampling parameters (used in online mode).
         input_ids: Tokenized input IDs (populated during prefill).
+        mm_inputs: Opaque model-specific multimodal payload consumed by MM Encode.
+        mm_token_count: Number of multimodal embedding rows produced for this request.
         computed_len: Per-request computed token length.
         prompt_tokens: Actual number of prompt tokens (excluding right padding).
         output_id_list: Generated token IDs (appended during decode).
@@ -194,6 +196,8 @@ class Request:
     disagg_kv_sender: Optional[Any] = None
     cp_rank: int = 0
     generator: torch.Generator = None
+    mm_inputs: Optional[dict] = None
+    mm_token_count: int = 0
 
     @property
     def bootstrap_addr(self) -> str:
@@ -401,3 +405,11 @@ class Batch:
                 request.infer_time.append(infer_time)
 
         return next_tokens_by_request
+
+
+@dataclass
+class MMEncodeBatch:
+    """Requests selected for one multimodal encode step."""
+
+    requests: List[Request] = field(default_factory=list)
+    is_dummy: bool = False

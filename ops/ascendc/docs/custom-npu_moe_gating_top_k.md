@@ -31,6 +31,12 @@
     normOut = normOut + bias
     $$
 
+    如果additional_bias和additional_token_mask都不为空，对于additional_token_mask中取值为true的行，使用additional_bias替换bias参与上述计算：
+
+    $$
+    normOut[row] = normOut[row] + additional\_bias,\ where\ additional\_token\_mask[row] == True
+    $$
+
     对计算结果按照groupCount进行分组，每组按照groupSelectMode取max或topk2的sum值对group进行排序，取前kGroup个组：
 
     $$
@@ -52,7 +58,7 @@
 
 ## 函数原型
 ```
-custom.npu_moe_gating_top_k(Tensor x, int k, *, Tensor? bias=None, Tensor? input_ids=None, Tensor? tid2eid=None, int k_group=1, int group_count=1, float routed_scaling_factor=1., float eps=9.9999999999999995e-21, int group_select_mode=0, int renorm=0, int norm_type=0, bool out_flag=False) -> (Tensor, Tensor, Tensor)
+custom.npu_moe_gating_top_k(Tensor x, int k, *, Tensor? bias=None, Tensor? input_ids=None, Tensor? tid2eid=None, Tensor? additional_bias=None, Tensor? additional_token_mask=None, int k_group=1, int group_count=1, float routed_scaling_factor=1., float eps=9.9999999999999995e-21, int group_select_mode=0, int renorm=0, int norm_type=0, bool out_flag=False) -> (Tensor, Tensor, Tensor)
 ```
 
 ## 参数说明
@@ -67,6 +73,8 @@ custom.npu_moe_gating_top_k(Tensor x, int k, *, Tensor? bias=None, Tensor? input
 | `bias` | Tensor（可选） | 偏置张量，shape为（e），dtype与x相同， 支持`float16`、`bfloat16`和`float32` |
 | `input_ids` | Tensor（可选） | 输入词表，shape为（T）， 仅支持`int64`，取值范围为[0 ,n]，n为tid2eid第一维的大小 |
 | `tid2eid` | Tensor（可选） | 词表到专家id的映射关系表，shape为（n，k）， 仅支持`int32`，取值范围为[0 ,e]，e代表专家数 |
+| `additional_bias` | Tensor（可选） | 附加偏置张量，shape为（e），dtype与x相同。仅在additional_token_mask同时提供时生效：additional_token_mask为true的行使用additional_bias替换bias参与gating计算 |
+| `additional_token_mask` | Tensor（可选） | 附加token标记，shape为（T），仅支持`bool`，取值为true表示该token使用additional_bias替换bias |
 | `k_group` | int（可选） | 选取的组数量，默认为1 |
 | `group_count` | int（可选） | 总组数，默认为1 |
 | `routed_scaling_factor` | float（可选） | 路由缩放因子，默认为1 |
@@ -91,6 +99,8 @@ custom.npu_moe_gating_top_k(Tensor x, int k, *, Tensor? bias=None, Tensor? input
 * input_ids和tid2eid都不为空表示hash场景，都为空表示topk场景，不允许只有一个为空。
 * k_group和group_count为1时，表示不分组排序。
 * bias的dtype要和x相同。
+* additional_bias的dtype要和x相同，shape为（e）；additional_token_mask仅支持bool，shape为（T）。
+* additional_bias仅在additional_token_mask同时提供时生效，additional_token_mask为true的行使用additional_bias替换bias。
 * 该接口支持推理场景下使用。
 * 该接口支持aclgraph入图。
 * 该接口与PyTorch配合使用时，需要保证CANN相关包与PyTorch相关包的版本匹配。

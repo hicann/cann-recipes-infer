@@ -33,6 +33,7 @@ import torch.distributed as dist
 from transformers import GenerationConfig
 
 from executor.core.config import InferenceConfig, CommManager
+from executor.core.tokenizer_registry import get_tokenizer
 from executor.core.kv_cache.cache_info import CacheEntry, LayerCacheInfo, ModelCacheInfo, OffloadWorkspaceMemoryInfo
 from executor.utils.forward_metadata import set_forward_metadata, get_forward_metadata
 from executor.model_loader.default_loader import DefaultModelLoader
@@ -153,6 +154,13 @@ class ModelWorker:
             runner_settings=self.infer_config
         )
         self.hf_generation_config = self._load_generation_config()
+        self.hf_config.tokenizer = get_tokenizer(
+            self.model_name,
+            self.model_path,
+            padding_side="right",
+            truncation_side="right",
+            trust_remote_code=True,
+        )
 
         # Allow custom_params to override hf_config fields (e.g. num_hidden_layers for reduced-layer testing)
         custom_params = self.infer_config.model_config.custom_params
@@ -174,6 +182,10 @@ class ModelWorker:
         # Let model-specific code adjust HF config before model initialization.
         if hasattr(model_cls, "update_model_cfg"):
             model_cls.update_model_cfg(self.hf_config, self.infer_config)
+
+        # Run model-specific validation before constructing model layers or loading weights.
+        if hasattr(model_cls, "check_model_config_before_loading"):
+            model_cls.check_model_config_before_loading(self.hf_config, self.infer_config)
 
         # Phase 2: comm_manager. Secondary workers (MTP) pass the main worker's
         # comm_manager so we don't recreate process-wide state.
@@ -233,6 +245,9 @@ class ModelWorker:
         # Check model settings
         if hasattr(self.model, "check_model_settings"):
             self.model.check_model_settings()
+
+        if hasattr(self.model, "offload_weights"):
+            self.model.offload_weights()
 
         self.model.to(self.device)
 
@@ -339,6 +354,26 @@ class ModelWorker:
         if not dist.is_available() or not dist.is_initialized():
             raise RuntimeError("dist.barrier requires an initialized default process group.")
         dist.barrier()
+
+    def encode_multimodal(self, mm_inputs):
+        """Execute the model's multimodal encoder as an independent stage."""
+        self._barrier_before_timing()
+        torch.npu.synchronize()
+        start_time = time.time()
+
+        if any(item is not None for item in mm_inputs):
+            encode_multimodal = getattr(self.model, "encode_multimodal", None)
+            if not callable(encode_multimodal):
+                raise TypeError(
+                    f"{self.model.__class__.__name__} does not implement encode_multimodal"
+                )
+            with torch.no_grad():
+                output = encode_multimodal(mm_inputs)
+        else:
+            output = [None] * len(mm_inputs)
+
+        torch.npu.synchronize()
+        return output, time.time() - start_time
 
     def inference(self, model_inputs: Dict, is_prefill: bool, is_mtp: bool = False) -> Tuple[torch.Tensor, float]:
         """Execute model inference and log timing information."""

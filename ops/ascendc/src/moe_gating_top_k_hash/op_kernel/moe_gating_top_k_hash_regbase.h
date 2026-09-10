@@ -37,17 +37,19 @@ namespace MoeGatingTopKHashRegbaseNS
     {
     public:
         __aicore__ inline MoeGatingTopKHashRegbase(){};
-        __aicore__ inline void Init(GM_ADDR x, GM_ADDR bias, GM_ADDR inputIds, GM_ADDR tid2eid, GM_ADDR y, GM_ADDR expertIdx, GM_ADDR out, GM_ADDR workspace,
+        __aicore__ inline void Init(GM_ADDR x, GM_ADDR bias, GM_ADDR inputIds, GM_ADDR tid2eid, GM_ADDR additionalBias, GM_ADDR additionalTokenMask,
+                                    GM_ADDR y, GM_ADDR expertIdx, GM_ADDR out, GM_ADDR workspace,
                                     const MoeGatingTopKHashTilingData *tilingData, TPipe *tPipe);
         __aicore__ inline void Process();
 
     private:
         __aicore__ inline void CopyInBias();
+        __aicore__ inline void CopyInAdditionalBias();
         __aicore__ inline void CopyInX(int64_t progress);
-        __aicore__ inline void ComputeX();
-        __aicore__ inline void ComputeSoftmax();
-        __aicore__ inline void ComputeSigmoid();
-        __aicore__ inline void ComputeSoftplus();
+        __aicore__ inline void ComputeX(int64_t row);
+        __aicore__ inline void ComputeSoftmax(int64_t row);
+        __aicore__ inline void ComputeSigmoid(int64_t row);
+        __aicore__ inline void ComputeSoftplus(int64_t row);
         __aicore__ inline void CopyOutXNorm(int64_t progress);
         __aicore__ inline void SortInGroup();
         __aicore__ inline void SelectTopKGroupIndex();
@@ -88,6 +90,7 @@ namespace MoeGatingTopKHashRegbaseNS
         TQue<QuePosition::VECOUT, 1> outOutQueue_;
 
         TBuf<TPosition::VECCALC> biasBuf_;
+        TBuf<TPosition::VECCALC> additionalBiasBuf_;
         TBuf<QuePosition::VECCALC> xBiasBuf_;
         TBuf<QuePosition::VECCALC> xSigmoidBuf_;
         TBuf<QuePosition::VECCALC> groupBuf_;
@@ -98,6 +101,8 @@ namespace MoeGatingTopKHashRegbaseNS
 
         GlobalTensor<T> xGm_;
         GlobalTensor<T> biasGm_;
+        GlobalTensor<T> additionalBiasGm_;
+        GlobalTensor<bool> additionalTokenMaskGm_;
         GlobalTensor<T> yGm_;
         GlobalTensor<int32_t> expertIdxGm_;
         GlobalTensor<float> outGm_;
@@ -118,6 +123,8 @@ namespace MoeGatingTopKHashRegbaseNS
         float routedScalingFactor_;
         float eps_;
         bool hasBias_ = false;
+        bool hasAdditionalBias_ = false;
+        bool hasAdditionalTokenMask_ = false;
         bool hashFlag_ = false;
 
         int64_t perGroupExpertCount_;
@@ -144,6 +151,28 @@ namespace MoeGatingTopKHashRegbaseNS
         DataCopyPadExtParams dataCopyPadParams{false, 0, 0, static_cast<T>(0)};
 
         DataCopyPad(biasTensor, biasGm_, dataCopyParams, dataCopyPadParams);
+        event_t eventIdMte2ToV = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE2_V));
+        SetFlag<HardEvent::MTE2_V>(eventIdMte2ToV);
+        WaitFlag<HardEvent::MTE2_V>(eventIdMte2ToV);
+    }
+
+    template <typename T, typename  U1, typename U2>
+    __aicore__ inline void MoeGatingTopKHashRegbase<T, U1, U2>::CopyInAdditionalBias()
+    {
+        if (!hasAdditionalBias_)
+        {
+            return;
+        }
+        LocalTensor<T> additionalBiasTensor = additionalBiasBuf_.Get<T>();
+
+        DataCopyExtParams dataCopyParams;
+        dataCopyParams.blockCount = groupCount_;
+        dataCopyParams.blockLen = perGroupExpertCount_ * sizeof(T);
+        dataCopyParams.srcStride = 0;
+        dataCopyParams.dstStride = (perGroupExpertCountAlign_ - perGroupExpertCount_) * sizeof(T) / BLOCK_BYTES;
+        DataCopyPadExtParams dataCopyPadParams{false, 0, 0, static_cast<T>(0)};
+
+        DataCopyPad(additionalBiasTensor, additionalBiasGm_, dataCopyParams, dataCopyPadParams);
         event_t eventIdMte2ToV = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE2_V));
         SetFlag<HardEvent::MTE2_V>(eventIdMte2ToV);
         WaitFlag<HardEvent::MTE2_V>(eventIdMte2ToV);
@@ -181,7 +210,7 @@ namespace MoeGatingTopKHashRegbaseNS
     }
 
     template <typename T, typename  U1, typename U2>
-    __aicore__ inline void MoeGatingTopKHashRegbase<T, U1, U2>::ComputeSoftmax()
+    __aicore__ inline void MoeGatingTopKHashRegbase<T, U1, U2>::ComputeSoftmax(int64_t row)
     {
         LocalTensor<float> xSoftmaxTensor = xSigmoidBuf_.Get<float>();
         LocalTensor<float> xBiasTensor = xBiasBuf_.Get<float>();
@@ -191,6 +220,7 @@ namespace MoeGatingTopKHashRegbaseNS
         uint32_t perGroupExpertCount0 = perGroupExpertCount_;
         uint32_t perGroupExpertCountAlign0 = perGroupExpertCountAlign_;
         uint16_t groupCount0 = groupCount_;
+        bool isUseAdditionalBias = hasAdditionalBias_ && hasAdditionalTokenMask_ && additionalTokenMaskGm_.GetValue(row);
         LocalTensor<float> xInLocalTensor = xInQueue_.DeQue<float>();
         if constexpr (!IsSameType<T, float>::value)
         {
@@ -220,9 +250,9 @@ namespace MoeGatingTopKHashRegbaseNS
         __local_mem__ float *softmaxOutAddr = (__local_mem__ float *)xSoftmaxTensor.GetPhyAddr();
         __local_mem__ int32_t *indexOutAddr = (__local_mem__ int32_t *)indexTensor.GetPhyAddr();
         __local_mem__ float *addBiasOutAddr = (__local_mem__ float *)xBiasTensor.GetPhyAddr();
-        if (hasBias_)
+        if (hasBias_ || isUseAdditionalBias)
         {
-            LocalTensor<T> biasTensor = biasBuf_.Get<T>();
+            LocalTensor<T> biasTensor = isUseAdditionalBias ? additionalBiasBuf_.Get<T>() : biasBuf_.Get<T>();
             __VEC_SCOPE__
             {
                 RegTensor<float> vregBiasFp32;
@@ -295,7 +325,7 @@ namespace MoeGatingTopKHashRegbaseNS
     }
 
     template <typename T, typename  U1, typename U2>
-    __aicore__ inline void MoeGatingTopKHashRegbase<T, U1, U2>::ComputeSigmoid()
+    __aicore__ inline void MoeGatingTopKHashRegbase<T, U1, U2>::ComputeSigmoid(int64_t row)
     {
         LocalTensor<float> xSigmoidTensor = xSigmoidBuf_.Get<float>();
         LocalTensor<float> xBiasTensor = xBiasBuf_.Get<float>();
@@ -305,10 +335,11 @@ namespace MoeGatingTopKHashRegbaseNS
         uint32_t perGroupExpertCount0 = perGroupExpertCount_;
         uint32_t perGroupExpertCountAlign0 = perGroupExpertCountAlign_;
         uint16_t groupCount0 = groupCount_;
+        bool isUseAdditionalBias = hasAdditionalBias_ && hasAdditionalTokenMask_ && additionalTokenMaskGm_.GetValue(row);
         LocalTensor<T> xInLocalTensor = xInQueue_.DeQue<T>();
-        if (hasBias_)
+        if (hasBias_ || isUseAdditionalBias)
         {
-            LocalTensor<T> biasTensor = biasBuf_.Get<T>();
+            LocalTensor<T> biasTensor = isUseAdditionalBias ? additionalBiasBuf_.Get<T>() : biasBuf_.Get<T>();
             __VEC_SCOPE__
             {
                 RegTensor<float> vregBiasFp32;
@@ -416,7 +447,7 @@ namespace MoeGatingTopKHashRegbaseNS
     }
 
     template <typename T, typename  U1, typename U2>
-    __aicore__ inline void MoeGatingTopKHashRegbase<T, U1, U2>::ComputeSoftplus()
+    __aicore__ inline void MoeGatingTopKHashRegbase<T, U1, U2>::ComputeSoftplus(int64_t row)
     {
         LocalTensor<float> xSoftplusTensor = xSigmoidBuf_.Get<float>();
         LocalTensor<float> xBiasTensor = xBiasBuf_.Get<float>();
@@ -426,10 +457,11 @@ namespace MoeGatingTopKHashRegbaseNS
         uint32_t perGroupExpertCount0 = perGroupExpertCount_;
         uint32_t perGroupExpertCountAlign0 = perGroupExpertCountAlign_;
         uint16_t groupCount0 = groupCount_;
+        bool isUseAdditionalBias = hasAdditionalBias_ && hasAdditionalTokenMask_ && additionalTokenMaskGm_.GetValue(row);
         LocalTensor<T> xInLocalTensor = xInQueue_.DeQue<T>();
-        if (hasBias_)
+        if (hasBias_ || isUseAdditionalBias)
         {
-            LocalTensor<T> biasTensor = biasBuf_.Get<T>();
+            LocalTensor<T> biasTensor = isUseAdditionalBias ? additionalBiasBuf_.Get<T>() : biasBuf_.Get<T>();
             __VEC_SCOPE__
             {
                 RegTensor<float> vregBiasFp32;
@@ -537,19 +569,19 @@ namespace MoeGatingTopKHashRegbaseNS
     }
 
     template <typename T, typename  U1, typename U2>
-    __aicore__ inline void MoeGatingTopKHashRegbase<T, U1, U2>::ComputeX()
+    __aicore__ inline void MoeGatingTopKHashRegbase<T, U1, U2>::ComputeX(int64_t row)
     {
         if (tilingData_->normType == 0)
         {
-            ComputeSoftmax();
+            ComputeSoftmax(row);
             return;
         }
         if (tilingData_->normType == 1)
         {
-            ComputeSigmoid();
+            ComputeSigmoid(row);
             return;
         }
-        ComputeSoftplus();
+        ComputeSoftplus(row);
     }
 
     template <typename T, typename  U1, typename U2>
@@ -1456,9 +1488,10 @@ namespace MoeGatingTopKHashRegbaseNS
     }
 
     template <typename T, typename  U1, typename U2>
-    __aicore__ inline void MoeGatingTopKHashRegbase<T, U1, U2>::Init(GM_ADDR x, GM_ADDR bias, GM_ADDR inputIds, GM_ADDR tid2eid, GM_ADDR y, GM_ADDR expertIdx, GM_ADDR out,
-                                                         GM_ADDR workspace,
-                                                         const MoeGatingTopKHashTilingData *tilingData, TPipe *tPipe)
+    __aicore__ inline void MoeGatingTopKHashRegbase<T, U1, U2>::Init(GM_ADDR x, GM_ADDR bias, GM_ADDR inputIds, GM_ADDR tid2eid, GM_ADDR additionalBias,
+                                                     GM_ADDR additionalTokenMask, GM_ADDR y, GM_ADDR expertIdx, GM_ADDR out,
+                                                     GM_ADDR workspace,
+                                                     const MoeGatingTopKHashTilingData *tilingData, TPipe *tPipe)
     {
         tilingData_ = tilingData;
         pipe_ = tPipe;
@@ -1490,6 +1523,16 @@ namespace MoeGatingTopKHashRegbaseNS
             hasBias_ = true;
             biasGm_.SetGlobalBuffer((__gm__ T *)bias, expertCount_);
         }
+        if (additionalBias != nullptr)
+        {
+            hasAdditionalBias_ = true;
+            additionalBiasGm_.SetGlobalBuffer((__gm__ T *)additionalBias, expertCount_);
+        }
+        if (additionalTokenMask != nullptr)
+        {
+            hasAdditionalTokenMask_ = true;
+            additionalTokenMaskGm_.SetGlobalBuffer((__gm__ bool *)additionalTokenMask + tilingData_->perCoreRowCount * blockIdx_);
+        }
         yGm_.SetGlobalBuffer((__gm__ T *)y + tilingData_->perCoreRowCount * k_ * blockIdx_, k_);
         expertIdxGm_.SetGlobalBuffer((__gm__ int32_t *)expertIdx + tilingData_->perCoreRowCount * k_ * blockIdx_, k_);
         outGm_.SetGlobalBuffer((__gm__ float *)out + tilingData_->perCoreRowCount * expertCount_ * blockIdx_, expertCount_);
@@ -1506,6 +1549,11 @@ namespace MoeGatingTopKHashRegbaseNS
         pipe_->InitBuffer(outOutQueue_, CONSTANT_TWO, expertGroupAlign * sizeof(float));
 
         pipe_->InitBuffer(biasBuf_, expertGroupAlign * sizeof(T));
+        // 仅在 additional_bias 实际提供时分配, 保证 legacy 调用 UB 布局不变
+        if (hasAdditionalBias_)
+        {
+            pipe_->InitBuffer(additionalBiasBuf_, expertGroupAlign * sizeof(T));
+        }
         pipe_->InitBuffer(xSigmoidBuf_, expertGroupAlign * sizeof(float));
         pipe_->InitBuffer(xBiasBuf_, expertGroupAlign * sizeof(float));
         pipe_->InitBuffer(indexBuffer_, expertGroupAlign * sizeof(int32_t));
@@ -1519,12 +1567,13 @@ namespace MoeGatingTopKHashRegbaseNS
     __aicore__ inline void MoeGatingTopKHashRegbase<T, U1, U2>::Process()
     {
         CopyInBias();
+        CopyInAdditionalBias();
         if (kGroup_ == groupCount_ || groupCount_ == expertCount_)
         {
             CopyInX(0);
             for (int64_t row = 1; row < curCoreRowCount_; row++)
             {
-                ComputeX();
+                ComputeX(row - 1);
                 CopyOutXNorm(row - 1);
                 CopyInX(row);
                 if (hashFlag_)
@@ -1537,7 +1586,7 @@ namespace MoeGatingTopKHashRegbaseNS
                 }
                 CopyOut(row - 1);
             }
-            ComputeX();
+            ComputeX(curCoreRowCount_ - 1);
             CopyOutXNorm(curCoreRowCount_ - 1);
             if (hashFlag_)
             {
@@ -1554,7 +1603,7 @@ namespace MoeGatingTopKHashRegbaseNS
         CopyInX(0);
         for (int64_t row = 1; row < curCoreRowCount_; row++)
         {
-            ComputeX();
+            ComputeX(row - 1);
             CopyOutXNorm(row - 1);
             SortInGroup();
             SelectTopKGroupIndex();
@@ -1564,7 +1613,7 @@ namespace MoeGatingTopKHashRegbaseNS
             SelectTopKExpertScore();
             CopyOut(row - 1);
         }
-        ComputeX();
+        ComputeX(curCoreRowCount_ - 1);
         CopyOutXNorm(curCoreRowCount_ - 1);
         SortInGroup();
         SelectTopKGroupIndex();

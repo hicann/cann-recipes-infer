@@ -136,6 +136,8 @@ class OnlineInference(OfflineInference):
                 is_dp_leader=self.is_dp_leader,
                 tp_cpu_group=tp_cpu_group,
                 input_truncated_len=self.infer_config.data_config.input_truncated_len,
+                mm_processor=self.engine.mm_processor,
+                enable_mm_encode=self.engine.enable_mm_encode,
             )
         return DecodeDisaggScheduler(
             tokenizer=self.engine.tokenizer,
@@ -144,6 +146,7 @@ class OnlineInference(OfflineInference):
             kv_cache_manager=self.engine.kvcache_manager,
             tp_cpu_group=tp_cpu_group,
             input_truncated_len=self.infer_config.data_config.input_truncated_len,
+            mm_processor=self.engine.mm_processor,
         )
 
     def run_continuous_loop(self):
@@ -154,7 +157,7 @@ class OnlineInference(OfflineInference):
           ② advance_queues_consensus: all-rank Gloo-backed queue advancement
              (PREFILL: bootstrap_queue; DECODE: prealloc + transfer_queue).
           ③ negotiate phase: DP-level all_gather → TP broadcast
-          ④ run_step: forward when phase is set; inflight drain when None
+          ④ run_step: MM Encode or token forward when phase is set
           ⑤ dispatch_results: send + retire everything finished this round
           ⑥ idle_wait: only when globally idle (no work anywhere)
 
@@ -270,7 +273,12 @@ class OnlineInference(OfflineInference):
             return obj
         tp_cpu_group = self.engine.comm_manager.get_group("tp_cpu_group")
         obj_list = [obj]
-        dist.broadcast_object_list(obj_list, src=0, group=tp_cpu_group)
+        group_leader_rank = self.dp_rank * self.group_size
+        dist.broadcast_object_list(
+            obj_list,
+            src=group_leader_rank,
+            group=tp_cpu_group,
+        )
         return obj_list[0]
 
     def _idle_wait(self, sockets: InferenceSockets) -> None:
@@ -286,27 +294,40 @@ class OnlineInference(OfflineInference):
 
     def _sync_dp_local_state(
         self,
+        local_has_mm: bool,
         local_has_prefill: bool,
         local_has_decode: bool,
-    ) -> List[Tuple[bool, bool]]:
+    ) -> List[Tuple[bool, bool, bool]]:
         """Synchronize local scheduler state across DP leaders."""
         dp_leader_group = self.engine.comm_manager.get_group("dp_leader_group")
         if self.dp_size <= 1 or dp_leader_group is None:
-            return [(local_has_prefill, local_has_decode)]
+            return [(local_has_mm, local_has_prefill, local_has_decode)]
 
         local_state = torch.tensor(
-            [int(local_has_prefill), int(local_has_decode)],
+            [int(local_has_mm), int(local_has_prefill), int(local_has_decode)],
             dtype=torch.long,
         )
         gathered = [torch.zeros_like(local_state) for _ in range(self.dp_size)]
         dist.all_gather(gathered, local_state, group=dp_leader_group)
-        return [(bool(item[0].item()), bool(item[1].item())) for item in gathered]
+        return [
+            (
+                bool(item[0].item()),
+                bool(item[1].item()),
+                bool(item[2].item()),
+            )
+            for item in gathered
+        ]
 
-    def _decide_phase(self, states: List[Tuple[bool, bool]]) -> Optional[str]:
+    def _decide_phase(
+        self,
+        states: List[Tuple[bool, bool, bool]],
+    ) -> Optional[str]:
         """Determine the global phase from local scheduler states."""
-        if any(has_prefill for has_prefill, _ in states):
+        if any(has_prefill for _, has_prefill, _ in states):
             return "prefill"
-        if any(has_decode for _, has_decode in states):
+        if any(has_mm for has_mm, _, _ in states):
+            return "mm_encode"
+        if any(has_decode for _, _, has_decode in states):
             return "decode"
         return None
 
@@ -361,14 +382,17 @@ class OnlineInference(OfflineInference):
         DP leader decides, then broadcasts to all TP/CP followers in the group.
         Queue advancement is handled upstream by scheduler.advance_queues_consensus()
         (Gloo consensus over tp_cpu_group), so by the time this runs every TP
-        rank already has the same waiting_queue / running_requests —
-        has_work() is a safe local check.
+        rank already has the same MM, Prefill, and Decode queue state.
         """
         mode = self.disaggregation_mode
         if mode == "PREFILL":
-            local_prefill, local_decode = self.scheduler.has_work(), False
+            local_mm = self.scheduler.has_mm_pending()
+            local_prefill = self.scheduler.has_prefill_ready()
+            local_decode = False
         elif mode == "DECODE":
-            local_prefill, local_decode = False, self.scheduler.has_work()
+            local_mm = False
+            local_prefill = False
+            local_decode = self.scheduler.has_work()
         else:
             raise ValueError(f"Unexpected disaggregation_mode: {mode}")
 
@@ -377,12 +401,16 @@ class OnlineInference(OfflineInference):
             return self._broadcast_group(None)
 
         if self.dp_size > 1:
-            states = self._sync_dp_local_state(local_prefill, local_decode)
+            states = self._sync_dp_local_state(
+                local_mm,
+                local_prefill,
+                local_decode,
+            )
         else:
-            states = [(local_prefill, local_decode)]
+            states = [(local_mm, local_prefill, local_decode)]
         phase = self._decide_phase(states)
         return self._broadcast_group(phase)
-    
+
     @staticmethod
     def safe_float(val_list: list) -> list:
         result = []

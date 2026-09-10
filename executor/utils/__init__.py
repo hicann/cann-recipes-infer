@@ -33,4 +33,4 @@ from .hccl_utils import (
     calc_moe_hccl_buffer_size,
     get_global_routed_expert_num,
 )
-from .data_utils import build_dataset_input
+from .data_utils import build_dataset_input, load_mmmu_dataset, export_mmmu_results

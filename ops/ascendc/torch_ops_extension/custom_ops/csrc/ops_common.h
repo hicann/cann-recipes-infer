@@ -20,7 +20,6 @@
 #include <functional>
 #include <type_traits>
 #include <ATen/Tensor.h>
-#include <ATen/NamedTensorUtils.h>
 #include <acl/acl_base.h>
 #include <acl/acl_rt.h>
 #include <c10/util/Exception.h>

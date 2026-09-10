@@ -25,13 +25,14 @@ import torch_npu
 from executor.core.config import InferenceConfig, PlatformVersion
 from executor.utils import get_default_group
 from executor.utils.forward_metadata import PrefillCPMetaData, set_forward_metadata, get_forward_metadata
-from executor.utils.profiler_context import ProfilerManager
+from executor.utils.profiler_context import ProfilerManager, ProfilerPhase
 from executor.core.model_worker import ModelWorker, MTPWorker
-from executor.core.tokenizer_registry import get_tokenizer
+from executor.core.mm_processor_registry import get_mm_processor
 from executor.core.kv_cache import KVCacheManager, ModelCacheInfo, create_single_type_managers
 from executor.core.kv_cache.cache_utils import allocate_cache_tensors, calculate_block_num, \
     prepare_block_tables, prepare_slot_mapping, validate_cache_info
-from ..forward_data_info import Batch
+from ..forward_data_info import Batch, MMEncodeBatch, Request
+from .mm_embedding_store import MMEmbeddingStore
 from .sampler import Sampler
 
 torch.npu.config.allow_internal_format = True
@@ -49,10 +50,13 @@ class ExecutionEngine:
         self.infer_config = infer_config
         self.device = None
         self.tokenizer = None
+        self.mm_processor = None
         self.eos_token_ids = set()
         self.hf_config = None
         self.hf_generation_config = None
         self.kvcache_manager = None
+        self.mm_embedding_store = None
+        self.enable_mm_encode = False
         self.comm_manager = None
         self.max_new_tokens = self.infer_config.scheduler_config.max_new_tokens
         self.input_truncated_len = self.infer_config.data_config.input_truncated_len
@@ -150,16 +154,22 @@ class ExecutionEngine:
                 raise ValueError(f"next_n > 0 enables speculative inference, but {model_name} doesn't " +
                                  "contain an MTP model and doesn't support speculative inference; set next_n to 0")
 
-        # Initialize tokenizer (from main worker)
         self.hf_config = self.main_worker.hf_config
         self.hf_generation_config = self.main_worker.hf_generation_config
-        self.tokenizer = get_tokenizer(
+        self.tokenizer = self.hf_config.tokenizer
+        self.mm_processor = get_mm_processor(
             self.infer_config.model_config.model_name,
             self.infer_config.model_config.model_path,
-            padding_side="right",
-            truncation_side='right',
-            trust_remote_code=True
+            self.tokenizer,
+            input_truncated_len=None if self.is_online else self.input_truncated_len,
         )
+        self.enable_mm_encode = (
+            self.mm_processor is not None
+            and not self.is_afd_ffn_rank
+            and self.infer_config.disagg_config.disaggregation_mode != "DECODE"
+        )
+        if self.enable_mm_encode:
+            self.mm_embedding_store = MMEmbeddingStore()
         self.eos_token_ids = self._collect_eos_token_ids()
 
         # Initialize KV cache
@@ -406,6 +416,7 @@ class ExecutionEngine:
             "input_ids": input_ids.contiguous(),
             "position_ids": position_ids,
             "forward_metadata": get_forward_metadata(),
+            "batch": batch,
         }
         if is_prefill and not self.kvcache_manager:
             model_inputs.update({
@@ -720,11 +731,35 @@ class ExecutionEngine:
                 0, self.hf_config.vocab_size,
                 (prefill_batch_size * seq_len,), dtype=torch.long, device=self.device,
             )
+            warmup_request = None
+            build_multimodal_warmup_inputs = getattr(
+                self.main_worker.model,
+                "build_multimodal_warmup_inputs",
+                None,
+            )
+            if self.enable_mm_encode and callable(build_multimodal_warmup_inputs):
+                multimodal_inputs = build_multimodal_warmup_inputs(seq_len)
+                if multimodal_inputs is not None:
+                    warmup_input_ids, mm_inputs = multimodal_inputs
+                    dummy_input_ids[:seq_len] = warmup_input_ids.to(self.device)
+                    warmup_request = Request(
+                        request_id=-1,
+                        prompt="",
+                        input_ids=warmup_input_ids,
+                        mm_inputs=mm_inputs,
+                        prompt_tokens=seq_len,
+                    )
+                    self.encode_mm_batch(
+                        MMEncodeBatch(requests=[warmup_request]),
+                        profile=False,
+                    )
             if self.is_afd_ffn_rank:
                 num_tokens = prefill_batch_size * seq_len
                 model_inputs = self._build_afd_ffn_inputs(num_tokens, is_prefill=True, is_warm_up=True)
             else:
                 model_inputs = self._build_model_inputs(dummy_input_ids, is_prefill=True, seq_lens=dummy_seq_lens)
+                if warmup_request is not None:
+                    model_inputs["visual_embeddings"] = self.mm_embedding_store.pop_many([-1])
             set_forward_metadata(is_warm_up=True)
             model_inputs["forward_metadata"] = get_forward_metadata()
             output, _ = self.main_worker.inference(model_inputs, is_prefill=True)
@@ -785,6 +820,22 @@ class ExecutionEngine:
         model_inputs["is_warm_up"] = is_warm_up
         return model_inputs
 
+    def encode_mm_batch(self, batch: MMEncodeBatch, profile: bool = True) -> Dict[str, Any]:
+        """Encode one multimodal batch and store per-request visual embeddings."""
+        if profile:
+            self.profiler.set_status(ProfilerPhase.MM_ENCODE)
+        outputs, inference_time = self.main_worker.encode_multimodal(
+            [request.mm_inputs for request in batch.requests]
+        )
+        if batch.requests:
+            self.mm_embedding_store.put_many(
+                [request.request_id for request in batch.requests],
+                outputs,
+            )
+        if profile:
+            self.profiler.step()
+        return {"inference_time": inference_time}
+
     def forward_batch(self, batch: Batch) -> Dict[str, Any]:
         """Execute forward pass for a batch of requests.
 
@@ -803,7 +854,7 @@ class ExecutionEngine:
         if self.is_afd_ffn_rank:
             return self._forward_afd_ffn_batch(batch)
 
-        self.profiler.set_status(batch.is_prefill)
+        self.profiler.set_status(ProfilerPhase.PREFILL if batch.is_prefill else ProfilerPhase.DECODE)
         inputs_ids = batch.input_ids.to(self.device)
         seq_lens = batch.seq_lens.to(self.device) if batch.seq_lens is not None else None
         model_inputs = self._build_model_inputs(
@@ -813,6 +864,12 @@ class ExecutionEngine:
             batch=batch,
             request_offset=batch.request_offset,
         )
+        if batch.is_prefill and not batch.is_dummy and self.mm_embedding_store is not None:
+            visual_embeddings = self.mm_embedding_store.pop_many(
+                request.request_id for request in batch.requests
+            )
+            if visual_embeddings is not None:
+                model_inputs["visual_embeddings"] = visual_embeddings
 
         # Run inference
         output, infer_time_main = self.main_worker.inference(model_inputs, is_prefill=batch.is_prefill)
@@ -872,7 +929,7 @@ class ExecutionEngine:
         }
 
     def _forward_afd_ffn_batch(self, batch: Batch) -> Dict[str, Any]:
-        self.profiler.set_status(batch.is_prefill)
+        self.profiler.set_status(ProfilerPhase.PREFILL if batch.is_prefill else ProfilerPhase.DECODE)
         decode_q_len = 1 if self.next_n == 0 else self.next_n + 1
         if batch.is_prefill:
             input_num_tokens = batch.total_tokens
