@@ -259,10 +259,6 @@ class DeepseekV3MoE(nn.Module):
         self.gmm_int_quant = "a8" in self.gmm_quant_mode and "float" not in self.gmm_quant_mode
         self.moe_ffn = self.experts_w4a8int4 if self.gmm_quant_mode == "w4a8int4" else self.experts
         self._init_gate(prefix)
-        self.use_native_gate_topk = (
-            self.scoring_func == "sqrtsoftplus"
-            and self.platform_version == PlatformVersion.A3
-        )
         if config.n_shared_experts is not None:
             self.shared_experts = DeepseekV3SharedExpert(
                 config,

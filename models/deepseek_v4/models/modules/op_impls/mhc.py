@@ -68,22 +68,18 @@ def hc_split_sinkhorn_torch(
     return pre, post, comb
 
 
-# A3 custom hc_pre keeps the existing preprocessing and changes only the
-# operator binding.
+# A3 uses the complete fused custom hc_pre implementation.
 def _hc_pre_custom_a3(x: torch.Tensor, params: _HCPreParams):
-    dtype = x.dtype
-    x_float = x.float()
-    flatten_start = 2 if x.dim() == 4 else 1
-    x_flat = x_float.flatten(flatten_start, -1)
-    rsqrt = torch.rsqrt(x_flat.square().mean(-1, keepdim=True) + params.norm_eps)
-    mixes = F.linear(x_flat, params.hc_fn) * rsqrt
-    y, post, comb = torch.ops.custom.npu_hc_pre_sinkhorn(
-        mixes.contiguous(), rsqrt.contiguous(), params.hc_scale, params.hc_base, x.contiguous(),
+    return torch.ops.custom.npu_hc_pre(
+        x,
+        params.hc_fn,
+        params.hc_scale,
+        params.hc_base,
         hc_mult=params.hc_mult,
         hc_sinkhorn_iters=params.hc_sinkhorn_iters,
+        norm_eps=params.norm_eps,
         hc_eps=params.hc_eps,
     )
-    return y.to(dtype), post, comb
 
 
 @register_op_impl(op_type="hc_pre", func_key="hc_pre_ascendc_a3")

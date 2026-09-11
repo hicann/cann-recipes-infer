@@ -46,9 +46,6 @@ def gate_topk_ascendc(module, logits, input_ids):
             scores, k=module.top_k, dim=-1, sorted=False
         )
     elif module.topk_method == "noaux_tc":
-        # A3 gating_top_k supports norm_type 0/1 only; sqrtsoftplus requires mode 2.
-        if module.use_native_gate_topk:
-            return gate_topk_native(module, logits, input_ids)
         scoring_func_mapping = {
             "softmax": 0,
             "sigmoid": 1,
@@ -129,4 +126,3 @@ def gate_topk_native(module, logits, input_ids):
         topk_weight = topk_weight / denominator
     topk_weight = topk_weight * module.routed_scaling_factor # must multiply the scaling factor
     return topk_idx, topk_weight, None
-
