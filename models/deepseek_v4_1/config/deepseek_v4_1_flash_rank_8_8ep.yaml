@@ -1,6 +1,6 @@
 model_config:
   model_name: "deepseek_v4_1"
-  model_path: "/data/models/deepseek_v4_1_hybrid_fp8_mxfp4"
+  model_path: "/data/models/deepseek_v4_1_hybrid_mxfp8_mxfp4"
   platform_version: "950"
   with_ckpt: True
   exe_mode: "eager"

@@ -16,3 +16,4 @@ einops==0.8.1
 torchao==0.15.0
 ninja==1.13.0
 setuptools<82
+sympy==1.14.0

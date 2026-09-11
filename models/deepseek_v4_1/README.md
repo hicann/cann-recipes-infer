@@ -11,9 +11,6 @@ DeepSeek团队发布了最新的模型DeepSeek-V4.1-Flash，本实践基于DeepS
 
 操作系统：Linux x86（Ascend 950）
 
-驱动版本：Ascend HDK 25.5.1
-> npu-smi info 检查Ascend NPU固件和驱动是否正确安装。如果已安装，通过命令`npu-smi info`确认版本是否为`25.5.1`。如果未安装或者版本不是`25.5.1`，请先下载[固件和驱动包](https://www.hiascend.com/hardware/firmware-drivers/community?product=6&model=33&cann=9.0.0-beta.2&driver=Ascend+HDK+25.5.1)，并根据[指导](https://hiascend.com/document/redirect/CannCommunityInstSoftware)自行安装。
-
 ## 环境准备
 ### Atlas A5 部署
 
@@ -101,14 +98,7 @@ DeepSeek-v4.1的原始权重中使用了32x32-block的量化，通过broadcast s
 
 权重转换拉起示例：
 ```shell
-python utils/convert_model.py --input_fp8_hf_path /data/models/deepseek_v4_1  --output_hf_path /data/models/deepseek_v4_1_mxfp8
-```
-
-config.json也会一起完成转换，如需单独转换config.json中的quant_config用于配置量化信息，也可以单独转换。
-
-config.json转换示例：
-```shell
-python utils/convert_model.py --input_fp8_hf_path /data/models/deepseek_v4_1  --is_mx
+python utils/convert_model.py --input_fp8_hf_path /data/models/deepseek_v4_1_hybrid_fp8_mxfp4  --output_hf_path /data/models/deepseek_v4_1_hybrid_mxfp8_mxfp4
 ```
 
 ### 修改配置
@@ -127,6 +117,7 @@ python utils/convert_model.py --input_fp8_hf_path /data/models/deepseek_v4_1  --
   | `moe_chunk_max_len` | int | `65536` | MoE token 分发的最大 chunk 长度，用于长序列 prefill 场景规避 OOM。 |
   | `enable_engram_offload` | bool | `True` | 支持对Engram Table做host offload。 |
   | `engram_tp_size` | int | 8 | 支持对Engram Table做TP切分，当前支持`tp_size`=`world_size`。 |
+  | `kernel_config` | dict | `{}` | 按算子类型覆盖 kernel 实现。当前涉及 `hc_pre`、`hc_post`、`gate_topk` 和 `compressor`；`hc_pre`/`hc_post` 当前仅有 `native`，`gate_topk` 支持 `native`/`ascendc`，默认为`ascendc`，`compressor` 支持 `native`/`ascendc`，默认为`native`。 |
 
 ### 拉起多卡推理
 以下命令在仓库根目录执行。统一入口脚本位于 `executor/scripts/infer.sh`，通过以下参数控制启动：
