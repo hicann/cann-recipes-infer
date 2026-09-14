@@ -162,8 +162,7 @@ class NgramHashState(nn.Module):
         # every hash multiplier derives from the compressed vocab size, so a mismatch there would
         # silently rehash the whole table
         token_map, vocab_size = build_compressed_token_map(tokenizer)
-        # Add this assert check after adopting the new tokenizer.
-        # assert vocab_size == config.engram_compressed_vocab_size, (vocab_size, config.engram_compressed_vocab_size)
+        assert vocab_size == config.engram_compressed_vocab_size, (vocab_size, config.engram_compressed_vocab_size)
         self.pad_id = token_map[config.engram_pad_id]
         flat = [[p for per_ngram in layer for p in per_ngram] for layer in layout.primes]
         offsets = [np.cumsum([0, *sizes[:-1]]) for sizes in flat]

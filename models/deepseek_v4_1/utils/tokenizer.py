@@ -21,18 +21,15 @@
 import copy
 from typing import Any
 
-from transformers import PreTrainedTokenizerFast
+from transformers import AutoTokenizer
 
 from .encoding_dsv4 import encode_messages
 
 
-def get_deepseek_v4_tokenizer(tokenizer):
+def get_deepseek_v4_1_tokenizer(tokenizer):
     dsv4_tokenizer = copy.copy(tokenizer)
-    added_vocab = tokenizer.get_added_vocab()
-    added_vocab_size = len(added_vocab)
-    tokenizer_vocab_size = tokenizer.vocab_size
 
-    class _DeepseekV4Tokenizer(tokenizer.__class__):
+    class _DeepseekV41Tokenizer(tokenizer.__class__):
         def apply_chat_template(
             self,
             conversation: list[dict[str, Any]],
@@ -70,22 +67,16 @@ def get_deepseek_v4_tokenizer(tokenizer):
         def num_special_tokens_to_add(self, *args, **kwargs) -> int:
             return len(self.encode(""))
 
-        def __len__(self) -> int:
-            return tokenizer_vocab_size + added_vocab_size
-
-        def get_added_vocab(self) -> dict[str, int]:
-            return added_vocab.copy()
-
         def __reduce__(self):
-            return get_deepseek_v4_tokenizer, (tokenizer,)
+            return get_deepseek_v4_1_tokenizer, (tokenizer,)
 
-    _DeepseekV4Tokenizer.__name__ = f"DSV4{tokenizer.__class__.__name__}"
-    dsv4_tokenizer.__class__ = _DeepseekV4Tokenizer
+    _DeepseekV41Tokenizer.__name__ = f"DSV4{tokenizer.__class__.__name__}"
+    dsv4_tokenizer.__class__ = _DeepseekV41Tokenizer
     return dsv4_tokenizer
 
 
-class DeepseekV4Tokenizer:
+class DeepseekV41Tokenizer:
     @classmethod
     def from_pretrained(cls, *args, **kwargs):
-        tokenizer = PreTrainedTokenizerFast.from_pretrained(*args, **kwargs)
-        return get_deepseek_v4_tokenizer(tokenizer)
+        tokenizer = AutoTokenizer.from_pretrained(*args, **kwargs)
+        return get_deepseek_v4_1_tokenizer(tokenizer)
