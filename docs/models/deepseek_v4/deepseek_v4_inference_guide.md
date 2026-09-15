@@ -21,6 +21,7 @@ DeepSeek团队发布了最新的模型DeepSeek-V4系列模型，包含DeepSeek-V
 - 基于自研PyPTO发布HC Pre和MLAProlog融合算子，提高融合算子的编程易用性，算子前端无需感知芯片的代际差异，后端通过pass IR和PTO_ISA指令进行区分，实现代际兼容。PyPTO Kernel[技术文档](./deepseek_v4_pypto_operator_guide.md)、PTO ISA的[使用指南](https://gitcode.com/cann/pto-isa/blob/master/README.md)和[代码](../../../ops/pypto/README.md)已开源。
 - 开源社区TileLang同步支持了DeepSeek-V4中的所有新增算子开发，并分别对应Tilelang-Ascend的Expert和Developer开发模式，提供AscendC基础指令和PTO AS两种对接层次，为各种编程前端语言和编译器提供多层开放接口，在TileAi开源社区发布，TileLang Kernel[技术文档](./deepseek_v4_tilelang_operator_guide.md)和[代码](../../../ops/tilelang/README.md)已同步开源。
 - 基于NpuGraphEx后端，叠加dynamo编译缓存、静态编译等独有特性，释放昇腾算力，实现极致的图模式加速。
+- 适配DeepSeek-V4 Flash DSpark权重的块级投机解码路径，在原生MTP之外提供DSpark Draft Block生成、主模型批量Verify和拒绝采样校验能力。
 - `950PR/DT`支持原生Hybrid FP8-MXFP4混合量化模式，可实现权重无损平滑迁移。同时本实践支持采用MXFP8替代原生FP8计算，在Prefill或Decode高吞吐场景下进一步提升计算效率。
 - 基于上述优化点，CANN已0 Day支持DeepSeek-V4推理部署。Decode的参考性能：DeepSeek-V4 Flash在`950DT`平台16卡128K序列场景TPOT小于10ms；在`Atlas-A3 Pod`平台64卡8K序列场景Decode单卡吞吐4388TPS@30ms。
 
@@ -31,6 +32,7 @@ DeepSeek团队发布了最新的模型DeepSeek-V4系列模型，包含DeepSeek-V
 - [融合Kernel](#融合kernel)
 - [并行策略](#并行策略)
 - [MTP](#mtp)
+- [DSpark](#dspark)
 - [量化策略](#量化策略)
 - [多流并行优化](#多流并行优化)
 - [Benchmark](#benchmark)
@@ -210,6 +212,41 @@ MTP机制允许Decode在一次主模型推理过程中同时对小模型投机�
 - Attention部分：在MTP场景下，CSA的FA计算在极端情况下需要搬运的KV Cache数据量是非MTP场景的`next_n + 1`倍，一定程度上增加了离散访存代价。但是SWA/HCA/LI的Cache搬运量与非MTP场景几乎一致，能够自然地提升计算访存比。
 - 其余算子，如Matmul等，在MTP机制下可以复用权重搬运，达到更好的计算访存比，因此MTP有比较可观的加速比。
 - 在高吞吐场景下，使用多个Draft Token很容易触及计算瓶颈，因此可采用MTP1进行加速；在低时延场景下，计算密度更小，可采用MTP3获得更大加速比；
+
+
+## DSpark
+
+DeepSeek-V4 Flash的DSpark方案支持Ascend 950系列，在一次草稿模型执行中生成一组Draft Token，由主模型批量Verify。与原生MTP逐步生成候选不同，DSpark使用多级Proposal Layer生成Draft Block，并通过Markov Head建模块内Token依赖，Confidence Head给出候选置信度。
+
+<p align="center">
+  <img src="./figures/dspark.png" width="70%" alt="dspark">
+</p>
+
+### Main Model方案
+
+- Hidden States收集：主模型按 `dspark_target_layer_ids` 输出辅助层表示，供草稿模型构建历史上下文。原生MTP仍使用原有hidden states输出路径。
+- Verify流程：主模型校验上一轮候选，`DSparkWorker` 根据主、草稿模型的采样概率执行拒绝采样，返回接受前缀和下一个Token。每条请求的候选Token、生成概率和有效长度保存在 `DSparkInfo` 中，随Batch组装与回写，保证对应关系。
+- Verify形状：设每组候选数为N，主模型每条请求的Decode输入固定为N+1个位置。Confidence截断只改变有效候选前缀，不切换不同宽度的校验图。
+
+### DSpark Spec Model方案
+
+- 模型结构：`DeepseekV4DSparkProposalModel` 复用主模型类的公共初始化和输入预处理，由多级 `DeepseekV4DSparkProposalLayer` 完成草稿计算。各级使用独立的 `mtp.*` 权重，末级包含Markov Head和Confidence Head；Embedding和LM Head与主模型共享。
+- 框架接入：`DSparkWorker` 与 `MTPWorker` 继承同一投机Worker基类，复用加载、权重共享和框架调用入口；DSpark分别实现辅助表示注册、块级候选生成和概率校验。原生MTP保持逐步生成候选和Exact Match校验。
+- 输入准备：`DSparkWorker` 准备seed/noise、已确认上下文和逻辑位置，再调用模型的 `prepare_proposal_inputs` 接口，完成滑窗裁切、PA槽位和Attention元数据转换。两步均在模型执行前完成；计算入口负责KV投影与写入、Attention及输出头。融合Attention的metadata算子保留在模型辅助流中，与投影重叠。
+- Cache结构：主、草稿模型的KV内容相互独立。DSpark各stage声明SlidingWindow Cache，由框架KVCacheManager统一分配和绑定，复用请求级PA页表、slot mapping及候选所需空间的预留与释放；Request不保存KV快照。
+- Attention范围：每个query读取最近最多window_size个已确认上下文KV和完整Draft Block。各stage写入KV后，按图外准备的索引收集紧凑PA输入，以NoMask执行Attention；padding仅位于末尾，通过有效长度排除。
+- Prefill流程：主模型完成prompt计算后，草稿模型用辅助hidden states写入历史KV，并以主模型采样的首Token生成第一组候选。第一次Decode直接进入批量Verify；预热沿用相同的Prefill与Decode入口。
+- Decode流程：根据接受数量，将本轮输入seed及已接受候选对应的主模型hidden states写入草稿Cache；主模型校验得到的下一个Token作为新seed，生成下一组候选。新seed的主模型hidden state在下一轮主模型执行后获得。
+- 采样与截断：草稿温度默认继承请求温度，也可通过 `draft_temperature` 单独设置。生成候选与保存概率采用同一采样分布；启用 `confidence_threshold` 时，在首个置信度低于阈值的位置截断有效前缀，阈值为0时关闭截断。
+
+### 指标说明
+
+- 接受率：接受的Draft Token总数除以有效候选总数，分母使用置信度截断后的长度。
+- 平均接受长度：每轮接受的Draft Token数加1；额外的1个Token为拒绝后的替换Token或全部接受后的Bonus Token。
+- 等效时延：平均Decode模型执行时间除以平均接受长度，与MTP采用相同公式。时间与接受数按相同请求和验证轮数汇总，不含Prefill及请求结束后的额外静态批执行；该指标不包含调度等端到端开销。
+- 计时范围：DSpark草稿执行耗时包含KV投影、Cache写入、每stage紧凑KV收集及网络计算，不包含Worker的输入、位置准备，以及模型图外接口的PA映射和元数据转换。
+
+DSpark的权重准备、参数和部署约束见[DeepSeek-V4 README](../../../models/deepseek_v4/README.md#dspark投机推理配置)。
 
 
 ## 量化策略

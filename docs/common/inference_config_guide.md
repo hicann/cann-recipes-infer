@@ -25,7 +25,6 @@
 - `output_path`: 保存输出、日志、分析数据、图缓存等的目录（不指定时默认和所执行的yaml配置统一目录）。
 - `dtype`: 计算使用的数据类型（默认 "bfloat16"）。
 - `with_ckpt`: 是否加载权重检查点（默认 True）。
-- `next_n`: 投机采样步骤数，即 MTP 模块数量（默认 0）。
 - `exe_mode`: 执行模式，可选 eager, ge_graph, npugraph_ex（默认 "eager"）。
 - `enable_static_kernel`: 指定npugraph_ex是否开启静态kernel（默认 False）。
 - `enable_cache_compile`: 是否启用缓存编译（默认 False）。
@@ -36,7 +35,27 @@
 - `platform_version`：指定运行推理的平台，支持配置为 A2、A3 或 950。不传入时使用torch.npu.get_device_name()获取设备名，如果获取失败，则指定为A3。不建议传入此参数。
 - `custom_params`：存放模型特有特性的字典（默认{}）。
 
-### 2.3 ParallelConfig (并行配置)
+### 2.3 SpeculativeConfig（投机推理配置）
+
+- `num_speculative_tokens`: 每轮最多生成的 Draft token 数，也是投机推理开关；配置为 0 时关闭投机推理，配置为正数时启用。主模型批量 Verify 的输入宽度通常为 `num_speculative_tokens + 1`，该参数与 `scheduler_config.block_size` 表示不同概念。
+- `method`: 投机方法。启用投机推理时必须配置；当前公共框架实现 `mtp` 和 `dspark` 两种方法，具体模型可用的方法由模型注册决定。关闭投机推理时该字段会被忽略。
+- `draft_model_path`: 可选的独立 Draft checkpoint 目录；未配置或配置为空字符串时复用 `model_config.model_path`。
+- `confidence_threshold`: DSpark Confidence Head 的有效前缀阈值，支持满足 `0.0 <= confidence_threshold <= 1.0` 的任意浮点数，默认为 `0.0`。配置为 `0.0` 表示关闭 Confidence 截断；配置为大于 `0.0` 的值时，只改变每条请求实际参与校验的 Draft token 数，不改变主模型 Verify 图的固定输入长度。MTP 不使用该参数。
+- `draft_temperature`: DSpark Proposal 的独立采样温度。未配置或保留为空时继承每条请求的 Target `temperature`；配置为非负浮点数时，Draft 使用该温度生成 Proposal 并保存对应概率 `q`，下一轮仍使用请求自己的 Target 分布 `p` 完成拒绝采样。
+
+```yaml
+speculative_config:
+  num_speculative_tokens: 5
+  method: dspark
+  confidence_threshold: 0.0
+  draft_temperature:
+```
+
+旧版 `model_config.next_n` 仍可用于 MTP 兼容路径。存在 `speculative_config` 时以新配置为准；不存在时，正数 `model_config.next_n` 会映射为原生 MTP。
+
+不同投机后端可能具有额外的模型、并行和部署约束，例如 proposal block 大小、独立 Cache、PD 分离或 CP 支持范围；启用前请同时查看对应模型 README。
+
+### 2.4 ParallelConfig (并行配置)
 定义分布式推理时的并行维度和 Rank 信息。
 - `world_size`: 总进程数（默认 1）。
 - `global_rank`: **不支持yaml配置**。全局 Rank ID，可在脚本中获取环境变量后传入。
@@ -54,7 +73,7 @@
 - `cp_size`: context并行度（默认 1）。当前仅支持 `cp_size = 1`（不开启 CP）或 `cp_size == world_size`配置。
 - `shared_tp_size`: 共享专家层TP并行数（默认1）。
 
-### 2.4 SchedulerConfig (调度配置)
+### 2.5 SchedulerConfig (调度配置)
 控制请求调度器的策略。
 - `batch_size`: 全局总 Batch Size（默认 1），batch_size 必须为 attn_dp_size 的整数倍。
 - `max_new_tokens`: 最大生成 token 数（默认 32）。

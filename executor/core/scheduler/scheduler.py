@@ -22,7 +22,7 @@ import torch
 from executor.core.config import SchedulerConfig
 from executor.core.mm_processor import BaseMMProcessor
 from executor.utils import ceil_div
-from ..forward_data_info import Request, Batch, MMEncodeBatch, MTPInfo, SamplingParams
+from ..forward_data_info import Request, Batch, MMEncodeBatch, SamplingParams
 from ..engine import ExecutionEngine
 
 logger = logging.getLogger(__name__)
@@ -393,6 +393,11 @@ class Scheduler:
                     request.request_id,
                     request.computed_len,
                     request.input_ids.shape[-1],
+                    lookahead_tokens=(
+                        engine.draft_worker.prefill_lookahead_tokens
+                        if engine.draft_worker is not None
+                        else 0
+                    ),
                     manager_keys=manager_keys,
                 )
             ):
@@ -520,8 +525,8 @@ class Scheduler:
         )
         dummy.prompt_tokens = 1
         dummy.computed_len = 0 if phase == "prefill" else 1
-        if engine.next_n > 0:
-            dummy.mtp_info = MTPInfo(
+        if engine.draft_worker is not None:
+            dummy.draft_info = engine.draft_worker.state_cls(
                 spec_tokens=torch.zeros(engine.next_n, dtype=torch.long),
             )
         batch = Batch(
@@ -653,19 +658,22 @@ class Scheduler:
 
     # ── Per-step status logging. ──
     def _log_step(self, engine: ExecutionEngine, batch: Batch, output: dict) -> None:
-        """Emit a per-component timing log line per forward step.
-
-        Prints the main worker time and each MTP step time separately —
-        speculative decoding runs the small model multiple times per main
-        step, and a slowdown in any single MTP iteration is invisible if
-        only the summed total is reported. Online PD schedulers override
-        this to fold queue depths + kv-cache usage into a single richer line.
-        """
+        """Emit main-model and speculative-model timing per forward step."""
         stage = "prefill" if batch.is_prefill else "decode"
         main_ms = output.get("inference_time_main", 0.0)
         logger.info(f"[Main] Inference time ({stage}): {main_ms * 1000:.2f} ms")
-        for idx, t in enumerate(output.get("inference_times_mtp", [])):
-            logger.info(f"[MTP {idx}] Inference time ({stage}): {t * 1000:.2f} ms")
+        draft_times = output.get("inference_times_draft", [])
+        if engine.draft_worker is not None and engine.draft_worker.method == "mtp":
+            for index, draft_time in enumerate(draft_times):
+                logger.info(
+                    f"[MTP {index}] Inference time ({stage}): {draft_time * 1000:.2f} ms"
+                )
+        elif draft_times and engine.draft_worker is not None:
+            draft_type = engine.draft_worker.method.capitalize()
+            draft_ms = sum(draft_times)
+            logger.info(
+                f"[{draft_type}{engine.next_n}] Inference time ({stage}): {draft_ms * 1000:.2f} ms"
+            )
 
     def pop_finished_request(self, request_id: int) -> Optional[Request]:
         """Remove and return a finished request by ID.

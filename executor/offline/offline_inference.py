@@ -15,7 +15,7 @@
 
 """Offline batch inference entrypoint using Scheduler and ExecutionEngine."""
 
-from typing import Dict, List, Optional
+from typing import List, Optional
 import logging
 
 import torch
@@ -25,7 +25,7 @@ from executor.core.forward_data_info import SamplingParams
 from executor.core.engine import ExecutionEngine
 from executor.core.scheduler import Scheduler
 from executor.core.forward_data_info import GenerationOutput, Request
-from executor.core.support_models import load_model_classes
+from executor.core.support_models import load_model_classes, load_speculative_model_classes
 from executor.utils.common_utils import process_infer_time
 
 logger = logging.getLogger(__name__)
@@ -82,11 +82,23 @@ class OfflineInference:
         model_config_cls = load_model_classes(model_name)
         if len(model_config_cls) == 2:
             model_class, config_class = model_config_cls
-            model_mtp_class = None
         else:
-            model_class, model_mtp_class, config_class = model_config_cls
-            model_mtp_class = None if self.engine.next_n == 0 else model_mtp_class
-        self.engine.init(config_class, model_class, model_mtp_class)
+            model_class, _, config_class = model_config_cls
+        speculative_config = self.infer_config.speculative_config
+        if not speculative_config.enabled:
+            draft_model_class = None
+            draft_config_class = None
+        else:
+            draft_model_class, draft_config_class = load_speculative_model_classes(
+                model_name,
+                speculative_config.method,
+            )
+        self.engine.init(
+            config_class,
+            model_class,
+            draft_model_class,
+            draft_config_class,
+        )
         self.engine.warm_up()
 
     def generate(
@@ -159,11 +171,14 @@ class OfflineInference:
 
         # Collect results (only for original requests, not padded ones)
         results = []
-        # Store raw MTP statistics
-        mtp_stats = {
+        # Store backend-neutral speculative decoding statistics.
+        speculative_stats = {
             "spec_num_accepted_tokens": [],
+            "spec_num_draft_tokens": [],
             "spec_num_forward_ct": [],
-            "valid_output_len": []
+            "valid_output_len": [],
+            "decode_execution_time": [],
+            "decode_output_tokens": [],
         }
         result_request_ids = request_ids[:original_request_count]
         if enable_cp:
@@ -209,11 +224,16 @@ class OfflineInference:
             valid_output_id_list = self.get_valid_output(request)
             output_text = self.engine.tokenizer.decode(
                 torch.tensor(valid_output_id_list), skip_special_tokens=True)
-            # Calculate MTP accept rate
-            if request.mtp_info:
-                mtp_stats["spec_num_accepted_tokens"].append(request.spec_num_accepted_tokens)
-                mtp_stats["spec_num_forward_ct"].append(request.spec_num_forward_ct)
-                mtp_stats["valid_output_len"].append(request.valid_output_len)
+            if request.draft_info:
+                # Match durations to counted request verification rounds, excluding
+                # trailing static-batch execution after this request has finished.
+                request_decode_times = request.infer_time[1:request.spec_num_forward_ct + 1]
+                speculative_stats["decode_execution_time"].append(sum(request_decode_times))
+                speculative_stats["decode_output_tokens"].append(max(len(valid_output_id_list) - 1, 0))
+                speculative_stats["spec_num_accepted_tokens"].append(request.spec_num_accepted_tokens)
+                speculative_stats["spec_num_draft_tokens"].append(request.spec_num_draft_tokens)
+                speculative_stats["spec_num_forward_ct"].append(request.spec_num_forward_ct)
+                speculative_stats["valid_output_len"].append(request.valid_output_len)
 
             results.append(GenerationOutput(
                 prompt=prompt_map[request_id],
@@ -221,7 +241,7 @@ class OfflineInference:
                 finish_reason=request.finish_reason,
             ))
 
-        return results, mtp_stats, batch_infer_time
+        return results, speculative_stats, batch_infer_time
 
     def _generate_afd_ffn(self, prompts: List[str]) -> tuple[List[GenerationOutput], Optional[dict], List[float]]:
         self.scheduler.reset()

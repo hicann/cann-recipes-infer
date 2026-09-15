@@ -3023,6 +3023,27 @@ Copyright 2023 DeepSeek-AI and The HuggingFace Inc. team
 License: MIT License
 Please see above
 
+Software: DeepSeek-V4-Flash-DSpark
+Official Repository: https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-DSpark/tree/main
+Usage: "
+models/deepseek_v4/models/modeling_dspark.py
+"
+Copyright Notice:
+Copyright (c) 2023 DeepSeek
+License: MIT License
+Please see above
+
+Software: DeepSpec
+Official Repository: https://github.com/deepseek-ai/DeepSpec
+Usage: "
+executor/core/engine/sampler.py,
+executor/core/model_worker/dspark_worker.py
+"
+Copyright Notice:
+Copyright (c) 2026 The DeepSpec Authors
+License: MIT License
+Please see above
+
 
 Software: vllm 0.9.0
 Official Repository: https://github.com/vllm-project/vllm/tree/v0.9.0

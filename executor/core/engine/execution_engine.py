@@ -26,7 +26,7 @@ from executor.core.config import InferenceConfig, PlatformVersion
 from executor.utils import get_default_group
 from executor.utils.forward_metadata import PrefillCPMetaData, set_forward_metadata, get_forward_metadata
 from executor.utils.profiler_context import ProfilerManager, ProfilerPhase
-from executor.core.model_worker import ModelWorker, MTPWorker
+from executor.core.model_worker import DSparkWorker, ModelWorker, MTPWorker
 from executor.core.mm_processor_registry import get_mm_processor
 from executor.core.kv_cache import KVCacheManager, ModelCacheInfo, create_single_type_managers
 from executor.core.kv_cache.cache_utils import allocate_cache_tensors, calculate_block_num, \
@@ -62,8 +62,9 @@ class ExecutionEngine:
         self.input_truncated_len = self.infer_config.data_config.input_truncated_len
         self.temperature = self.infer_config.data_config.temperature
         self.block_size = self.infer_config.scheduler_config.block_size
+        speculative_config = self.infer_config.speculative_config
         self.next_n = self.infer_config.model_config.next_n
-        # PD (prefill or decode) roles hold only their own KV and do not need the MTP draft-token buffer
+        # PD roles hold only their own KV and do not need an offline draft-token buffer.
         self.is_online = (
             infer_config.disagg_config.disaggregation_mode in ("PREFILL", "DECODE")
         )
@@ -71,7 +72,7 @@ class ExecutionEngine:
             # no chunk so max_prefill_tokens is the max len of kv
             self.max_total_len = self.infer_config.scheduler_config.max_prefill_tokens + self.max_new_tokens
         else:
-            # In offline MTP mode, reserve extra KV cache for the draft model's speculative forwards.
+            # Reserve extra KV cache for offline speculative decoding.
             self.max_total_len = self.input_truncated_len + self.max_new_tokens * (self.next_n + 1) + self.next_n
         self.block_table_max_len = int((self.max_total_len + self.block_size - 1) / self.block_size)
         self.exe_mode = self.infer_config.model_config.exe_mode
@@ -87,8 +88,21 @@ class ExecutionEngine:
 
         # Initialize workers
         self.main_worker = ModelWorker(self.infer_config, self.device)
-        self.mtp_worker = MTPWorker(self.infer_config, self.device) if self.next_n > 0 \
-            and not self.is_afd_ffn_rank else None
+        self.draft_worker = None
+        if self.next_n > 0 and not self.is_afd_ffn_rank:
+            if speculative_config.method == MTPWorker.method:
+                worker_cls = MTPWorker
+            elif speculative_config.method == DSparkWorker.method:
+                worker_cls = DSparkWorker
+            else:
+                raise ValueError(
+                    f"Unsupported speculative method: {speculative_config.method!r}. "
+                    f"Supported methods: {MTPWorker.method}, {DSparkWorker.method}."
+                )
+            self.draft_worker = worker_cls(
+                self.infer_config,
+                self.device,
+            )
 
         # Profiling configuration
         self.enable_profiler = self.infer_config.model_config.enable_profiler
@@ -127,10 +141,20 @@ class ExecutionEngine:
         # Initialize sampler after device is set
         self.sampler = Sampler(self.device)
 
-    def init(self, config_cls, main_model_cls, mtp_model_cls=None):
-        """Bring the engine to ready: load the model (and MTP draft if any),
+    def init(
+        self,
+        config_cls,
+        main_model_cls,
+        mtp_model_cls=None,
+        draft_config_cls=None,
+        *,
+        draft_model_cls=None,
+    ):
+        """Bring the engine to ready: load the model (and draft model if any),
         build the comm_manager, set up tokenizer + KV cache.
         """
+        if draft_model_cls is None:
+            draft_model_cls = mtp_model_cls
         logger.info("Loading main model...")
         # Primary worker creates the process-wide comm_manager (sized from
         # hf_config); secondary workers (e.g. MTP) reuse it.
@@ -138,21 +162,27 @@ class ExecutionEngine:
         self.comm_manager = self.main_worker.comm_manager
         cache_info = self.main_worker.get_cache_info()
 
-        if self.mtp_worker is not None:
-            if mtp_model_cls is not None:
-                logger.info("Loading mtp model...")
-                self.mtp_worker.mtp_model_worker.init(
-                    mtp_model_cls, config_cls, comm_manager=self.comm_manager,
+        if self.draft_worker is not None:
+            speculative_method = self.draft_worker.method
+            if draft_model_cls is not None:
+                logger.info("Loading %s speculative model...", speculative_method)
+                self.draft_worker.init(
+                    draft_model_cls,
+                    draft_config_cls or config_cls,
+                    comm_manager=self.comm_manager,
                 )
-                cache_info_mtp = self.mtp_worker.mtp_model_worker.get_cache_info()
-                if cache_info and cache_info_mtp:
+                cache_info_spec = self.draft_worker.get_cache_info()
+                if cache_info and cache_info_spec:
                     # Support page attention
-                    cache_info = cache_info.merge(cache_info_mtp)
-                self.mtp_worker.share_weights_from_main_model(self.main_worker.model)
+                    cache_info = cache_info.merge(cache_info_spec)
+                self.draft_worker.configure_main_model(self.main_worker.model)
+                self.draft_worker.share_weights_from_main_model(self.main_worker.model)
             else:
                 model_name = self.infer_config.model_config.model_name
-                raise ValueError(f"next_n > 0 enables speculative inference, but {model_name} doesn't " +
-                                 "contain an MTP model and doesn't support speculative inference; set next_n to 0")
+                raise ValueError(
+                    f"speculative method {speculative_method!r} is enabled, but "
+                    f"{model_name!r} does not provide its draft implementation"
+                )
 
         self.hf_config = self.main_worker.hf_config
         self.hf_generation_config = self.main_worker.hf_generation_config
@@ -180,9 +210,8 @@ class ExecutionEngine:
         else:
             # Not support page attention
             self.main_worker.init_kvcache()
-            if self.mtp_worker is not None:
-                # Support MTP
-                self.mtp_worker.mtp_model_worker.init_kvcache()
+            if self.draft_worker is not None:
+                self.draft_worker.init_kvcache()
 
     @staticmethod
     def _normalize_eos_token_ids(eos_token_id: Any) -> Set[int]:
@@ -256,14 +285,16 @@ class ExecutionEngine:
             single_type_managers=single_type_managers,
             cache_info=cache_info,
         )
-        if self.mtp_worker is not None:
-            self.mtp_worker.kvcache_manager = self.kvcache_manager
+        if self.draft_worker is not None:
+            self.draft_worker.kvcache_manager = self.kvcache_manager
         self._init_offload_workspace()
 
     def _get_offload_workspace_npu_bytes(self) -> int:
         memory_infos = [self.main_worker.get_offload_workspace_memory_info()]
-        if self.mtp_worker is not None:
-            memory_infos.append(self.mtp_worker.mtp_model_worker.get_offload_workspace_memory_info())
+        if self.draft_worker is not None:
+            memory_infos.append(
+                self.draft_worker.get_offload_workspace_memory_info()
+            )
 
         total_npu_bytes = 0
         for memory_info in memory_infos:
@@ -283,8 +314,8 @@ class ExecutionEngine:
 
     def _init_offload_workspace(self):
         self.main_worker.init_offload_workspace()
-        if self.mtp_worker is not None:
-            self.mtp_worker.mtp_model_worker.init_offload_workspace()
+        if self.draft_worker is not None:
+            self.draft_worker.init_offload_workspace()
 
     @property
     def model(self):
@@ -292,9 +323,14 @@ class ExecutionEngine:
         return self.main_worker.model if self.main_worker else None
 
     @property
+    def draft_model(self):
+        """Get the configured speculative draft model."""
+        return self.draft_worker.model if self.draft_worker else None
+
+    @property
     def mtp_model(self):
-        """Get the mtp model."""
-        return self.mtp_worker.mtp_model_worker.model if self.mtp_worker else None
+        """Compatibility alias for callers of the former MTP-only engine API."""
+        return self.draft_model
 
     def _build_model_inputs(
         self,
@@ -329,9 +365,10 @@ class ExecutionEngine:
                 )
             kv_len = torch.cat(kv_len_list) if kv_len_list else torch.empty(0, dtype=torch.long, device=self.device)
         else:
-            if self.mtp_worker:
-                input_ids, kv_len, position_ids = self.mtp_worker.get_main_model_inputs(input_ids, batch)
-                seq_len = self.mtp_worker.next_n + 1
+            worker = self.draft_worker
+            draft_inputs = worker.get_main_model_inputs(input_ids, batch) if worker else None
+            if draft_inputs is not None:
+                input_ids, kv_len, position_ids, seq_len = draft_inputs
                 # Pad to batch_size_per_dp_rank. kv_len is [actual_bs];
                 # input_ids / position_ids are [actual_bs * seq_len].
                 # _pad_batch works on dim-0, so only kv_len can use it directly;
@@ -345,7 +382,7 @@ class ExecutionEngine:
                         input_ids,
                         torch.zeros(pad_tokens, dtype=input_ids.dtype, device=input_ids.device),
                     ])
-                    position_ids = torch.cat([  # [batch, next_n + 1]
+                    position_ids = torch.cat([
                         position_ids,
                         torch.zeros(pad_tokens, dtype=position_ids.dtype, device=position_ids.device),
                     ])
@@ -653,9 +690,9 @@ class ExecutionEngine:
             torch.full(pad_shape, pad_value, dtype=tensor.dtype, device=tensor.device),
         ], dim=0)
 
-    def _prepare_mtp_next_tokens(self, next_tokens: torch.Tensor, model_inputs: Dict[str, Any],
-                                 is_prefill: bool) -> torch.Tensor:
-        """Expand owner-local prefill CP samples to the global request order for MTP."""
+    def _prepare_draft_next_tokens(self, next_tokens: torch.Tensor, model_inputs: Dict[str, Any],
+                                   is_prefill: bool) -> torch.Tensor:
+        """Expand owner-local prefill CP samples to the global request order for draft inference."""
         if not is_prefill:
             return next_tokens
         forward_metadata = model_inputs.get("forward_metadata")
@@ -668,20 +705,20 @@ class ExecutionEngine:
         output_indices = cp_metadata.output_request_indices.to(self.device)
         if local_next_tokens.shape[0] != output_indices.numel():
             raise RuntimeError(
-                "CP MTP next_tokens must match output_request_indices before global restore, "
+                "CP draft next_tokens must match output_request_indices before global restore, "
                 f"got next_tokens={local_next_tokens.shape[0]}, indices={output_indices.numel()}."
             )
-        mtp_next_tokens = local_next_tokens.new_zeros(
+        draft_next_tokens = local_next_tokens.new_zeros(
             (global_batch_size,) + tuple(local_next_tokens.shape[1:])
         )
         if output_indices.numel() > 0:
-            mtp_next_tokens.index_copy_(0, output_indices, local_next_tokens)
+            draft_next_tokens.index_copy_(0, output_indices, local_next_tokens)
         torch.distributed.all_reduce(
-            mtp_next_tokens,
+            draft_next_tokens,
             op=torch.distributed.ReduceOp.SUM,
             group=self.comm_manager.get_group("cp_group"),
         )
-        return mtp_next_tokens
+        return draft_next_tokens
 
     def _get_warmup_shape(self):
         """Calculate warm-up input shapes based on current packed prefill/decode config."""
@@ -708,7 +745,9 @@ class ExecutionEngine:
         return prefill_batch_size, decode_batch_size, seq_len
 
     def warm_up(self):
-        """Execute warm-up by running exactly one prefill and one decode step of main and mtp model.
+        """Warm up one prefill and decode step for the main and configured draft models.
+
+        Draft prefill follows the same backend-specific path used by runtime requests.
         Triggers graph compilation during decode if graph mode enabled.
         """
         logger.info("Starting warm-up...")
@@ -763,11 +802,16 @@ class ExecutionEngine:
             set_forward_metadata(is_warm_up=True)
             model_inputs["forward_metadata"] = get_forward_metadata()
             output, _ = self.main_worker.inference(model_inputs, is_prefill=True)
-            if self.mtp_worker:
-                logger.info("Warm-up [MTP]: executing model prefill step...")
+            worker = self.draft_worker
+            if worker:
+                logger.info("Warm-up [draft]: executing draft model prefill step...")
                 prev_hidden_states = output[1]
-                model_inputs['prev_hidden_states'] = prev_hidden_states
-                output, _ = self.mtp_worker.mtp_model_worker.inference(model_inputs, is_prefill=True, is_mtp=True)
+                worker.warm_up_prefill(
+                    dummy_input_ids,
+                    dummy_seq_lens,
+                    model_inputs,
+                    prev_hidden_states,
+                )
 
         if self.infer_config.disagg_config.disaggregation_mode in ["NONE", "DECODE"]:
             dummy_kv_len = torch.full(
@@ -776,36 +820,52 @@ class ExecutionEngine:
                 dtype=torch.long,
                 device=self.device,
             )
-            set_forward_metadata(kv_len=dummy_kv_len)
-            # 3. Execute ONE decode step with graph compilation
-            seq_len = 1 if self.next_n == 0 else self.next_n + 1
+            set_forward_metadata(kv_len=dummy_kv_len, is_warm_up=True)
+            worker = self.draft_worker
+            # AFD FFN ranks do not own a draft worker, but still process the
+            # main model's full speculative verification block.
+            decode_q_len = self.next_n + 1
+
             logger.info("Warm-up [%s]: executing model decode step...", warmup_role)
             dummy_input_ids = torch.randint(
-                0, self.hf_config.vocab_size,
-                (decode_batch_size * seq_len,), dtype=torch.long, device=self.device,
+                0,
+                self.hf_config.vocab_size,
+                (decode_batch_size,),
+                dtype=torch.long,
+                device=self.device,
             )
+            if self.exe_mode in ["ge_graph", "npugraph_ex"]:
+                logger.info("Warm-up: triggering graph compilation...")
+                compile_q_len = (
+                    decode_q_len
+                    if self.infer_config.model_config.enable_cache_compile
+                    else None
+                )
+                self.main_worker.compile_model(decode_q_len=compile_q_len)
+
             if self.is_afd_ffn_rank:
                 model_inputs = self._build_afd_ffn_inputs(
-                    decode_batch_size * seq_len,
+                    decode_batch_size * decode_q_len,
                     is_prefill=False,
                     is_warm_up=True,
                 )
             else:
-                model_inputs = self._build_model_inputs(dummy_input_ids, is_prefill=False)
+                warmup_batch = (
+                    worker.build_main_warmup_batch(dummy_input_ids)
+                    if worker
+                    else None
+                )
+                model_inputs = self._build_model_inputs(
+                    dummy_input_ids,
+                    is_prefill=False,
+                    batch=warmup_batch,
+                )
 
-            # Trigger graph compilation if graph mode enabled and not yet compiled
-            if self.exe_mode in ["ge_graph", "npugraph_ex"]:
-                logger.info("Warm-up: triggering graph compilation...")
-                self.main_worker.compile_model()
             output, _ = self.main_worker.inference(model_inputs, is_prefill=False)
 
-            if self.mtp_worker:
-                logger.info("Warm-up [MTP]: executing mtp model decode step...")
-                model_inputs['prev_hidden_states'] = output[1]
-                if self.exe_mode in ["ge_graph", "npugraph_ex"]:
-                    logger.info("Warm-up: triggering graph compilation...")
-                    self.mtp_worker.mtp_model_worker.compile_model()
-                _ = self.mtp_worker.mtp_model_worker.inference(model_inputs, is_prefill=False, is_mtp=True)
+            if worker:
+                logger.info("Warm-up [draft]: executing draft model decode step...")
+                worker.warm_up_decode(model_inputs, output)
 
         set_forward_metadata(is_warm_up=False)
         logger.info("Warm-up completed successfully.")
@@ -893,14 +953,33 @@ class ExecutionEngine:
                 # request rows are consumed by sampling and request updates.
                 selected_logits = torch.index_select(logits, 0, output_indices)
             set_forward_metadata(kv_len=kv_len)
-        next_tokens, logprobs_tensors = self.sampler.sample_and_gather_logprobs(batch, selected_logits)
-
-        infer_times_mtp: list[float] = []
-        if self.mtp_worker:
-            accepted_num = self.verify_spec_tokens(batch, next_tokens)
-            mtp_next_tokens = self._prepare_mtp_next_tokens(next_tokens, model_inputs, batch.is_prefill)
-            infer_times_mtp = self.mtp_worker.inference(batch, mtp_next_tokens, accepted_num,
-                                                        model_inputs, prev_hidden_states)
+        infer_times_draft: list[float] = []
+        worker = self.draft_worker
+        if worker:
+            accepted_num, next_tokens, logprobs_tensors = worker.verify_spec_tokens(
+                self.sampler,
+                batch,
+                selected_logits,
+                logits,
+                eos_token_ids=self.eos_token_ids,
+            )
+            draft_next_tokens = self._prepare_draft_next_tokens(
+                next_tokens,
+                model_inputs,
+                batch.is_prefill,
+            )
+            infer_times_draft = worker.inference(
+                batch=batch,
+                main_next_tokens=draft_next_tokens,
+                accepted_num=accepted_num,
+                model_inputs_main=model_inputs,
+                prev_hidden_states=prev_hidden_states,
+            )
+        else:
+            next_tokens, logprobs_tensors = self.sampler.sample_and_gather_logprobs(
+                batch,
+                selected_logits,
+            )
 
         self.profiler.step()
 
@@ -912,7 +991,7 @@ class ExecutionEngine:
         if kv_len is not None and kv_len.shape[0] > actual_batch:
             set_forward_metadata(kv_len=kv_len[:actual_batch])
 
-        infer_time_total = infer_time_main + sum(infer_times_mtp)
+        infer_time_total = infer_time_main + sum(infer_times_draft)
         next_tokens_by_request = batch.update_requests_from_batch(
             batch.is_prefill,
             next_tokens,
@@ -925,7 +1004,8 @@ class ExecutionEngine:
             "logits": selected_logits,
             "inference_time": infer_time_total,
             "inference_time_main": infer_time_main,
-            "inference_times_mtp": infer_times_mtp,
+            "inference_times_draft": infer_times_draft,
+            "inference_times_mtp": infer_times_draft,
         }
 
     def _forward_afd_ffn_batch(self, batch: Batch) -> Dict[str, Any]:
@@ -967,20 +1047,6 @@ class ExecutionEngine:
             "logits": None,
             "inference_time": infer_time_main,
             "inference_time_main": infer_time_main,
+            "inference_times_draft": [],
             "inference_times_mtp": [],
         }
-
-    def verify_spec_tokens(self, batch, main_next_tokens):
-        '''
-        Verify spec tokens with main model's output, stop accepting tokens if rejection occurs in a batch.
-        Each batch processes verification separately.
-        '''
-        if batch.is_prefill:
-            return torch.zeros([main_next_tokens.shape[0]], dtype=torch.int64, device=self.device) # shape: (Batch,)
-        else: # after main decode
-            batch_size = batch.input_ids.shape[0]
-            token_mask = batch.mtp_infos.spec_tokens == main_next_tokens[:batch_size, :self.next_n]
-            has_invalid = (token_mask == False).any(dim=-1)
-            invalid_pos = (token_mask == False).int().argmax(dim=-1)
-            accepted_num = torch.where(has_invalid, invalid_pos, token_mask.shape[-1]).to(self.device)
-        return accepted_num

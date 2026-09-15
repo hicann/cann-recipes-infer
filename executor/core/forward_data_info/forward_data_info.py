@@ -15,7 +15,7 @@
 
 """Core type definitions for Executor Core."""
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from typing import Any, List, Dict, Optional
 
 import torch
@@ -92,11 +92,8 @@ class GenerationOutput:
 
 
 @dataclass
-class MTPInfo:
-    """MTP (Multi-step Speculative Decoding) state container.
-
-    This class encapsulates state information for MTP speculative decoding,
-    managing the multi-token prediction workflow between the draft and main models.
+class BaseSpeculativeInfo:
+    """State shared by speculative decoding backends.
 
     Attributes:
         is_prefill: Whether the current phase is prefill (initial token processing).
@@ -107,16 +104,71 @@ class MTPInfo:
     spec_tokens: Optional[torch.Tensor] = None
     accepted_num: Optional[torch.Tensor] = None
 
-    def set_mtp_info(self, **kwargs):
-        """Update MTPInfo instance attributes from keyword arguments.
+    @classmethod
+    def stack(cls, infos: List["BaseSpeculativeInfo"]) -> "BaseSpeculativeInfo":
+        """Batch request-local state while preserving the concrete state type."""
+        if not infos:
+            return cls()
 
-        Args:
-            **kwargs: Keyword arguments to update instance attributes.
-                      Valid keys: is_prefill, spec_tokens, accepted_num, next_n
-        """
+        values_by_field = {}
+        for state_field in fields(cls):
+            values = [getattr(info, state_field.name) for info in infos]
+            if state_field.name == "is_prefill":
+                values_by_field[state_field.name] = values[0]
+            elif all(value is None for value in values):
+                values_by_field[state_field.name] = None
+            else:
+                values_by_field[state_field.name] = torch.stack(values, dim=0)
+        return cls(**values_by_field)
+
+    def select(self, index: int) -> "BaseSpeculativeInfo":
+        """Extract one request from batched speculative state."""
+        values_by_field = {}
+        for state_field in fields(self):
+            value = getattr(self, state_field.name)
+            values_by_field[state_field.name] = (
+                value if state_field.name == "is_prefill" or value is None else value[index]
+            )
+        return type(self)(**values_by_field)
+
+
+    def update_request(self, request: "Request", is_prefill: bool) -> None:
+        """Persist this request-local state without dropping backend fields."""
+        request.update_draft_info(self)
+
+    @staticmethod
+    def progress_base(total_lens: torch.Tensor, is_prefill: bool):
+        """Return the absolute progress base, or None for committed-token increments."""
+        return total_lens if is_prefill else None
+
+
+@dataclass
+class MTPInfo(BaseSpeculativeInfo):
+    """Native MTP state with its established update interface."""
+
+    def update_request(self, request: "Request", is_prefill: bool) -> None:
+        """Keep the established native MTP request update path."""
+        accepted_num = None if is_prefill or self.accepted_num is None else int(self.accepted_num.item())
+        request.update_mtp_info(accepted_num, self.spec_tokens)
+
+    def progress_base(self, total_lens: torch.Tensor, is_prefill: bool):
+        """Remove native MTP draft forwards from the shared metadata cursor."""
+        next_n = self.spec_tokens.shape[-1]
+        return total_lens - next_n - (next_n - 1)
+
+    def set_mtp_info(self, **kwargs):
+        """Update known MTP state attributes."""
         for key, value in kwargs.items():
             if hasattr(self, key):
                 setattr(self, key, value)
+
+
+@dataclass
+class DSparkInfo(BaseSpeculativeInfo):
+    """DSpark candidates and their sampling distributions."""
+
+    draft_probs: Optional[torch.Tensor] = None
+    proposal_lens: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -162,6 +214,8 @@ class Request:
         spec_num_accepted_tokens: Number of accepted speculative tokens for MTP acceptance statistics.
         decode_step_count: Number of decode steps completed (each step generates one or more tokens).
         valid_output_len: Length of valid output tokens when hitting EOS or max_new_tokens.
+        spec_num_draft_tokens: Number of valid proposal tokens eligible for
+            speculative acceptance statistics.
         eos_output_len: Output length through the first EOS token. This records
             EOS inside a multi-token MTP step without making finish decisions.
         cp_rank: Group-local rank that owns this request's partitioned persistent cache.
@@ -177,10 +231,14 @@ class Request:
     is_prefill_done: bool = False
     is_finished: bool = False
     finish_reason: Optional[str] = None
-    mtp_info: Optional[MTPInfo] = None
+    # Legacy storage name retained so existing constructors and online transfer
+    # code can continue passing ``mtp_info``. New runtime code should use the
+    # backend-neutral ``draft_info`` property below.
+    mtp_info: Optional[BaseSpeculativeInfo] = None
     # Metrics
     spec_num_forward_ct: int = 0
     spec_num_accepted_tokens: int = 0
+    spec_num_draft_tokens: int = 0
     # Measure the combined inference time of the main model and the MTP model
     infer_time: List[float] = field(default_factory=list)
     # Step counter for decode phase
@@ -228,13 +286,26 @@ class Request:
         output_len = len(self.output_id_list)
         return input_len + output_len
 
-    def update_mtp_info(self, accepted_num, spec_tokens):
+    @property
+    def draft_info(self) -> Optional[BaseSpeculativeInfo]:
+        """Backend-neutral access to this request's speculative state."""
+        return self.mtp_info
+
+    @draft_info.setter
+    def draft_info(self, value: Optional[BaseSpeculativeInfo]) -> None:
+        self.mtp_info = value
+
+    def update_draft_info(self, draft_info: BaseSpeculativeInfo):
+        self.draft_info = draft_info
+
+    def update_mtp_info(
+        self,
+        accepted_num,
+        spec_tokens,
+    ):
+        """Update native MTP state through its established Request API."""
         if not self.mtp_info:
             self.mtp_info = MTPInfo()
-        # Update metrics
-        if self.valid_output_len is None:
-            self.spec_num_forward_ct += 1
-            self.spec_num_accepted_tokens += accepted_num
         self.mtp_info.set_mtp_info(
             spec_tokens=spec_tokens,
         )
@@ -256,7 +327,7 @@ class Batch:
         total_tokens: Total number of valid prompt tokens in prefill.
         request_offset: Absolute request-slot offset for packed prefill batches.
         request_indices: Mapping from request_id to batch index.
-        mtp_infos: Original MTP state containing speculative tokens and accepted num.
+        draft_info: Batched speculative state shared by all draft backends.
     """
     requests: List['Request'] = field(default_factory=list)
     is_prefill: bool = True
@@ -271,13 +342,23 @@ class Batch:
     # Metadata
     request_indices: Dict[int, int] = field(default_factory=dict)
 
-    # MTPInfo
-    mtp_infos: Optional[MTPInfo] = None
+    # Legacy storage name retained for constructor compatibility. Runtime code
+    # should use the singular, backend-neutral ``draft_info`` property.
+    mtp_infos: Optional[BaseSpeculativeInfo] = None
 
     # True when this batch was synthesized to keep DP+TP collectives aligned
     # on ranks with no local work (online PD). Engine runs forward normally so
     # collectives complete, but scheduler skips state updates / output emit.
     is_dummy: bool = False
+
+    @property
+    def draft_info(self) -> Optional[BaseSpeculativeInfo]:
+        """Backend-neutral access to the batch's speculative state."""
+        return self.mtp_infos
+
+    @draft_info.setter
+    def draft_info(self, value: Optional[BaseSpeculativeInfo]) -> None:
+        self.mtp_infos = value
 
     def __len__(self) -> int:
         """Return number of requests in batch."""
@@ -321,23 +402,18 @@ class Batch:
         kv_lens = torch.tensor([request.computed_len for request in self.requests], dtype=torch.long)
         set_forward_metadata(kv_len=kv_lens)
 
-        spec_tokens_list = []
-        for request in self.requests:
-            if request.mtp_info:
-                spec_tokens_list.append(request.mtp_info.spec_tokens)
-            else:
-                self.mtp_infos = None
-                return
-
-        self.mtp_infos = MTPInfo(
-            spec_tokens=torch.stack(spec_tokens_list, dim=0),
-        )
+        draft_infos = [request.draft_info for request in self.requests]
+        if not all(draft_infos):
+            self.draft_info = None
+            return
+        state_cls = type(draft_infos[0])
+        self.draft_info = state_cls.stack(draft_infos)
 
     def update_requests_from_batch(
         self,
         is_prefill: bool,
         next_tokens: Optional[torch.Tensor],
-        infer_time: Optional[List],
+        infer_time: Optional[float],
         logprobs_tensors: Optional[LogprobsTensors] = None,
         eos_token_ids: Optional[set[int]] = None,
     ) -> Dict[int, List[int]]:
@@ -362,25 +438,19 @@ class Batch:
 
         for output_idx, request_idx in enumerate(request_indices):
             request = self.requests[request_idx]
-            accepted_num = None
+            accepted_count = None
 
-            if self.mtp_infos:
-                accepted_num = (
-                    self.mtp_infos.accepted_num[output_idx] if self.mtp_infos.accepted_num is not None else None
-                )
-                spec_tokens = self.mtp_infos.spec_tokens[output_idx] if self.mtp_infos.spec_tokens is not None else None
-                request.update_mtp_info(accepted_num, spec_tokens)
-                # Since the main model and draft model share forward_metadata, and total_lens includes MTP inference
-                # length when MTP is enabled, after iteration completes, subtract the MTP added length (next_n - 1)
-                # and inference length (next_n) to get the current request's computed_lens.
-                next_n = spec_tokens.shape[-1]
-                computed_lens = total_lens - next_n - (next_n - 1)
+            if self.draft_info:
+                state = self.draft_info.select(output_idx)
+                accepted_count = int(state.accepted_num.item()) if state.accepted_num is not None else None
+                state.update_request(request, is_prefill)
+                computed_lens = self.draft_info.progress_base(total_lens, is_prefill)
             else:
                 computed_lens = total_lens
 
             if next_tokens is not None:
-                if accepted_num is not None:
-                    request_next_tokens = next_tokens[output_idx, :accepted_num + 1].tolist()
+                if accepted_count is not None:
+                    request_next_tokens = next_tokens[output_idx, :accepted_count + 1].tolist()
                 else:
                     request_next_tokens = next_tokens[output_idx].tolist()
                 old_output_len = len(request.output_id_list)
@@ -393,13 +463,15 @@ class Batch:
                 next_tokens_by_request[request.request_id] = request_next_tokens
 
             if logprobs_tensors is not None:
-                request_logprobs = logprobs_tensors.filter(output_idx, accepted_num)
+                request_logprobs = logprobs_tensors.filter(output_idx, accepted_count)
                 request.output_logprobs += request_logprobs
 
             if computed_lens is not None:
                 request.computed_len = computed_lens[output_idx].item()
-                if accepted_num is not None:
-                    request.computed_len += accepted_num.item()
+                if accepted_count is not None:
+                    request.computed_len += accepted_count
+            elif accepted_count is not None:
+                request.computed_len += accepted_count + 1
 
             if infer_time is not None:
                 request.infer_time.append(infer_time)

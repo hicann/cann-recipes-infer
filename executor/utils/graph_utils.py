@@ -18,7 +18,6 @@ Graph compilation utilities for NPU inference.
 """
 
 import os
-import logging
 import torch
 from torchair.configs.compiler_config import CompilerConfig
 
@@ -29,6 +28,7 @@ def compile_model_forward(
     frozen_parameter=True,
     tiling_schedule_optimize=True,
     topology_sorting_strategy="StableRDFS",
+    cache_namespace=None,
 ):
     """
     Compile a model.forward method for graph execution.
@@ -39,6 +39,7 @@ def compile_model_forward(
         frozen_parameter: Whether to freeze parameters.
         tiling_schedule_optimize: Whether to enable tiling schedule optimization.
         topology_sorting_strategy: Strategy for topology sorting.
+        cache_namespace: Optional subdirectory for an independent static graph shape.
 
     Returns:
         Compiled forward function.
@@ -54,6 +55,8 @@ def compile_model_forward(
     enable_cache_compile = model_config.enable_cache_compile
     enable_dynamic_graph = model_config.enable_dynamic_graph
     cache_dir = os.path.join(model_config.output_path, "compile_cache")
+    if cache_namespace:
+        cache_dir = os.path.join(cache_dir, cache_namespace)
     enable_static_kernel = model_config.enable_static_kernel
     enable_superkernel = model_config.custom_params.get("enable_superkernel", False)
 

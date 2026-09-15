@@ -212,6 +212,31 @@ docker run -u root -itd --name cann_recipes_infer --ulimit nproc=65535:65535 --i
 
   > **Note**: 在A3环境下，INT8 W8A8场景支持 4~64卡部署。可分别在config下的yaml文件中修改 `parallel_config.world_size`（chips * 2）配置。
 
+### DSpark投机推理配置
+
+DeepSeek-V4 Flash支持通过DSpark草稿模型一次生成多个Draft Token，再由主模型批量校验。DSpark支持Ascend 950系列，4卡离线推理示例为[deepseek_v4_flash_rank_4_4ep_dspark.yaml](config/ci_950/deepseek_v4_flash_rank_4_4ep_dspark.yaml)，实现说明见[DSpark方案](../../docs/models/deepseek_v4/deepseek_v4_inference_guide.md#dspark)。
+
+**权重准备：**
+
+- 将 `model_config.model_path` 设置为配套DSpark权重目录，包含主模型和 `mtp.*` 草稿权重。使用独立草稿目录时，设置 `speculative_config.draft_model_path`；草稿模型仍共享主模型的Embedding和LM Head，需使用配套权重及相同词表。
+- 草稿配置需包含 `dspark_target_layer_ids`（主模型辅助输出层）和 `dspark_block_size`（每组候选数）。`n_mtp_layers` 表示草稿stage数，可由权重目录下的 `inference/config.json` 补充，无需在YAML中重复设置。
+
+**参数配置：**
+
+以下字段位于 `speculative_config`，其余配置沿用前文说明。
+
+| 参数名 | 示例值 | 含义 |
+| --- | --- | --- |
+| `method` | `"dspark"` | 选择DSpark；原生MTP使用 `"mtp"`。 |
+| `num_speculative_tokens` | `5` | 每轮最大候选Token数；`0` 关闭投机推理。启用DSpark时须与权重的 `dspark_block_size` 一致。 |
+| `draft_model_path` | `""` | 草稿权重目录；空字符串复用 `model_config.model_path`。 |
+| `confidence_threshold` | `0.0` | 候选置信度阈值，范围为 `[0, 1]`；`0` 关闭前缀截断。 |
+| `draft_temperature` | 空值 | 草稿采样温度，非负；空值继承请求温度。主模型温度由 `data_config.temperature` 设置。 |
+
+> DSpark当前仅支持离线非PD分离部署，要求 `parallel_config.cp_size=1`。置信度截断只调整有效候选前缀，主模型校验宽度仍为 `num_speculative_tokens + 1`。
+
+> 原生MTP兼容 `model_config.next_n` 配置，DSpark示例使用 `speculative_config`。同时设置 `model_config.next_n` 和 `speculative_config.num_speculative_tokens` 时，两个参数的数值须保持一致。
+
 ### 拉起多卡推理
 以下命令在仓库根目录执行。统一入口脚本位于 `executor/scripts/infer.sh`，通过以下参数控制启动：
 
@@ -236,6 +261,9 @@ bash executor/scripts/infer.sh --model deepseek_v4 --yaml ci_a3/deepseek_v4_flas
 
 # offline 模式，Ascend 950
 bash executor/scripts/infer.sh --model deepseek_v4 --yaml ci_950/deepseek_v4_flash_rank_16_16ep.yaml
+
+# offline 模式，Ascend 950系列，DeepSeek-V4 Flash DSpark
+bash executor/scripts/infer.sh --model deepseek_v4 --yaml ci_950/deepseek_v4_flash_rank_4_4ep_dspark.yaml
 
 # online PD 模式，暂时只支持A3机型
 bash executor/scripts/infer.sh --model deepseek_v4 --mode online --pd-role prefill --p-yaml-name ci_a3/deepseek_v4_pd/prefill.yaml --d-yaml-name ci_a3/deepseek_v4_pd/decode.yaml

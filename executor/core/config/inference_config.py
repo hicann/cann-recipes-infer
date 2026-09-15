@@ -18,19 +18,19 @@
 This module contains all configuration classes for the inference framework:
 - DataConfig: Data and sequence configuration
 - ModelConfig: Model-specific configuration
+- SpeculativeConfig: Speculative decoding method and draft-model configuration
 - ParallelConfig: Parallel execution configuration
 - SchedulerConfig: Request scheduler configuration
 - InferenceConfig: Unified configuration container
 """
 import logging
-import math
 import os
 from dataclasses import dataclass, field
 from enum import Enum
 from functools import lru_cache
-from typing import Any, Literal
+from typing import Literal
 import torch
-import torch_npu
+import torch_npu  # noqa: F401  # Registers torch.npu device APIs.
 
 
 class PlatformVersion(Enum):
@@ -137,7 +137,11 @@ class ModelConfig:
         output_path: Path to save the output, log, profiling, graph cache etc. (default: "")
         dtype: Data type for model weights and computation (default: "bfloat16")
         with_ckpt: Whether to load checkpoint (default: True)
-        next_n: Number of the speculative steps (default: 0)
+        next_n: Legacy native-MTP proposal width (default: 0). When
+            ``speculative_config`` is absent, a positive value is normalized to
+            ``method="mtp"``. An explicit ``speculative_config`` takes
+            precedence and its ``num_speculative_tokens`` value is backfilled
+            here for model-side compatibility.
 
         exe_mode: Execution mode (eager, ge_graph, npugraph_ex) (default: "eager")
         enable_cache_compile: Enable cache compilation (default: False)
@@ -229,6 +233,91 @@ class ModelConfig:
             logging.warning(
                 "When exe_mode is set to 'ge_graph', only static graph mode is supported; "
                 "enable_dynamic_graph=True will be ignored."
+            )
+
+
+@dataclass
+class SpeculativeConfig:
+    """Configuration shared by speculative decoding backends.
+
+    ``num_speculative_tokens`` is the feature switch: zero disables speculative
+    decoding and a positive value requires a backend ``method``. ``mtp`` selects
+    the model's native MTP implementation; other values are resolved by the
+    speculative backend registry. ``confidence_threshold`` must be in
+    ``[0.0, 1.0]`` when speculation is enabled. ``draft_temperature`` selects
+    the proposal distribution independently from each request's target
+    temperature; ``None`` preserves the target temperature. An empty
+    ``draft_model_path`` reuses ``model_config.model_path``.
+    """
+
+    num_speculative_tokens: int = 0
+    method: str | None = None
+    draft_model_path: str | None = None
+    confidence_threshold: float = 0.0
+    draft_temperature: float | None = None
+
+    @property
+    def enabled(self) -> bool:
+        return self.num_speculative_tokens > 0
+
+    def uses_method(self, method: str) -> bool:
+        """Return whether speculative decoding is enabled with ``method``."""
+        return self.enabled and self.method == method
+
+    @classmethod
+    def from_dict(cls, speculative_config_dict: dict) -> "SpeculativeConfig":
+        if not isinstance(speculative_config_dict, dict):
+            raise TypeError("speculative_config must be a mapping")
+        method = speculative_config_dict.get("method")
+        config = cls(
+            num_speculative_tokens=int(speculative_config_dict.get("num_speculative_tokens", 0)),
+            method=str(method).lower() if method is not None else None,
+            draft_model_path=speculative_config_dict.get("draft_model_path"),
+            confidence_threshold=float(
+                speculative_config_dict.get("confidence_threshold", 0.0)
+            ),
+            draft_temperature=(
+                float(speculative_config_dict["draft_temperature"])
+                if speculative_config_dict.get("draft_temperature") is not None
+                else None
+            ),
+        )
+        config.validate()
+        return config
+
+    @classmethod
+    def from_legacy_model_config(cls, model_config_dict: dict) -> "SpeculativeConfig":
+        next_n = int(model_config_dict.get("next_n", 0))
+        config = cls(
+            num_speculative_tokens=next_n,
+            method="mtp" if next_n > 0 else None,
+        )
+        config.validate()
+        return config
+
+    def validate(self):
+        """Validate speculative options for factories and enclosing configurations."""
+        if self.num_speculative_tokens < 0:
+            raise ValueError(
+                "speculative_config.num_speculative_tokens must be non-negative, "
+                f"got {self.num_speculative_tokens}"
+            )
+        if self.draft_temperature is not None and self.draft_temperature < 0.0:
+            raise ValueError(
+                "speculative_config.draft_temperature must be non-negative, "
+                f"got {self.draft_temperature}"
+            )
+        if not self.enabled:
+            return
+        if not self.method or self.method == "none":
+            raise ValueError(
+                "speculative_config.method must select a draft backend when "
+                "num_speculative_tokens is greater than 0"
+            )
+        if not 0.0 <= self.confidence_threshold <= 1.0:
+            raise ValueError(
+                "speculative_config.confidence_threshold must be "
+                f"in [0.0, 1.0], got {self.confidence_threshold}"
             )
 
 
@@ -452,6 +541,16 @@ class InferenceConfig:
     parallel_config: ParallelConfig
     scheduler_config: SchedulerConfig
     disagg_config: DisaggConfig = field(default_factory=DisaggConfig)
+    speculative_config: SpeculativeConfig | None = None
+
+    def __post_init__(self):
+        if self.speculative_config is None:
+            self.speculative_config = SpeculativeConfig.from_legacy_model_config(
+                {"next_n": self.model_config.next_n},
+            )
+        else:
+            self.speculative_config.validate()
+        self.model_config.next_n = self.speculative_config.num_speculative_tokens
 
     @classmethod
     def from_dict(
@@ -463,8 +562,31 @@ class InferenceConfig:
     ) -> "InferenceConfig":
         """Create InferenceConfig from YAML-parsed dictionary."""
 
+        model_config_dict = yaml_dict.get("model_config", {})
+        if "next_n" in model_config_dict:
+            logging.warning(
+                "model_config.next_n is deprecated and will be removed in a future release; "
+                "use speculative_config.num_speculative_tokens and speculative_config.method instead."
+            )
+        if "speculative_config" in yaml_dict:
+            speculative_config = SpeculativeConfig.from_dict(yaml_dict["speculative_config"])
+            if ("next_n" in model_config_dict
+                    and int(model_config_dict["next_n"]) != speculative_config.num_speculative_tokens):
+                raise ValueError(
+                    "model_config.next_n conflicts with speculative_config.num_speculative_tokens; "
+                    "remove the legacy next_n setting."
+                )
+        else:
+            speculative_config = SpeculativeConfig.from_legacy_model_config(model_config_dict)
+
+        model_config = ModelConfig.from_dict(model_config_dict)
+        # Keep the normalized proposal width visible to legacy model-side code
+        # that still consumes model_config.next_n.
+        model_config.next_n = speculative_config.num_speculative_tokens
+
         infer_config = cls(
-            model_config=ModelConfig.from_dict(yaml_dict.get("model_config", {})),
+            model_config=model_config,
+            speculative_config=speculative_config,
             data_config=DataConfig.from_dict(yaml_dict.get("data_config", {})),
             parallel_config=ParallelConfig.from_dict(
                 yaml_dict.get("parallel_config", {}),
@@ -474,6 +596,15 @@ class InferenceConfig:
             scheduler_config=SchedulerConfig.from_dict(yaml_dict.get("scheduler_config", {})),
             disagg_config=disagg_config or DisaggConfig(),
         )
+
+        if (
+            speculative_config.uses_method("dspark")
+            and infer_config.disagg_config.disaggregation_mode in ("PREFILL", "DECODE")
+        ):
+            raise ValueError(
+                "DSpark does not support prefill/decode disaggregation; "
+                "set disaggregation_mode to NONE."
+            )
 
         attn_dp_size = infer_config.parallel_config.attn_dp_size
         if infer_config.model_config.custom_params.get("enable_afd", False):

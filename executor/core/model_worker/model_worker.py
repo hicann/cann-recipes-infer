@@ -25,17 +25,17 @@ for a single model (either main model or MTP model), including:
 
 import logging
 import time
+from functools import wraps
 from typing import Dict, Optional, Tuple
 
 import torch
-import torch_npu
+import torch_npu  # noqa: F401  # Registers torch.npu device APIs.
 import torch.distributed as dist
 from transformers import GenerationConfig
 
 from executor.core.config import InferenceConfig, CommManager
 from executor.core.tokenizer_registry import get_tokenizer
-from executor.core.kv_cache.cache_info import CacheEntry, LayerCacheInfo, ModelCacheInfo, OffloadWorkspaceMemoryInfo
-from executor.utils.forward_metadata import set_forward_metadata, get_forward_metadata
+from executor.core.kv_cache.cache_info import OffloadWorkspaceMemoryInfo
 from executor.model_loader.default_loader import DefaultModelLoader
 from executor.model_loader.dummy_loader import DummyModelLoader
 from module.quantization import (QUANTIZATION_METHODS, get_quant_config)
@@ -49,6 +49,22 @@ def main_decode(self, **kwargs):
 
 def mtp_decode(self, **kwargs):
     return self.forward(**kwargs)
+
+
+def _measure_model_execution(before_execute):
+    """Measure completed device execution outside the compiled model graph."""
+    def decorate(execute):
+        @wraps(execute)
+        def wrapped(self, *args, **kwargs):
+            before_execute(self)
+            torch.npu.synchronize()
+            start_time = time.time()
+            with torch.no_grad():
+                output = execute(self, *args, **kwargs)
+            torch.npu.synchronize()
+            return output, time.time() - start_time
+        return wrapped
+    return decorate
 
 
 class ModelWorker:
@@ -93,13 +109,28 @@ class ModelWorker:
             enable_cache_compile: Whether to enable compiled graph cache.
     """
 
-    def __init__(self, infer_config: InferenceConfig, device, is_mtp: bool = False):
-        """Initialize ModelWorker with inference configuration and device."""
+    def __init__(
+        self,
+        infer_config: InferenceConfig,
+        device,
+        is_mtp: bool = False,
+        *,
+        is_draft_model: bool | None = None,
+        model_path: str | None = None,
+    ):
+        """Initialize a model execution worker.
+
+        ``is_draft_model`` selects the draft compile interface without assuming
+        a particular speculative method. ``model_path`` allows that worker to
+        load an independent checkpoint. Main models and integrated draft
+        checkpoints omit the path and continue to use
+        ``model_config.model_path``.
+        """
         # Config
-        self.is_mtp = is_mtp
+        self.is_draft_model = is_mtp if is_draft_model is None else is_draft_model
         self.infer_config = infer_config
         self.model_name = self.infer_config.model_config.model_name
-        self.model_path = self.infer_config.model_config.model_path
+        self.model_path = model_path or self.infer_config.model_config.model_path
         self.exe_mode = self.infer_config.model_config.exe_mode
         self.enable_static_kernel = self.infer_config.model_config.enable_static_kernel
         self.use_pretrained_model = self.infer_config.model_config.with_ckpt
@@ -240,8 +271,6 @@ class ModelWorker:
             model_path=self.model_path,
             comm_manager=self.comm_manager,
         )
-        self._ensure_compile_interface()
-
         # Check model settings
         if hasattr(self.model, "check_model_settings"):
             self.model.check_model_settings()
@@ -265,7 +294,7 @@ class ModelWorker:
         if self.exe_mode not in ["ge_graph", "npugraph_ex"]:
             return
 
-        if self.is_mtp:
+        if self.is_draft_model:
             compile_func_name = "mtp_decode"
         else:
             compile_func_name = "main_decode"
@@ -375,6 +404,20 @@ class ModelWorker:
         torch.npu.synchronize()
         return output, time.time() - start_time
 
+    @property
+    def is_mtp(self) -> bool:
+        """Compatibility alias for the former draft-worker flag."""
+        return self.is_draft_model
+
+    @is_mtp.setter
+    def is_mtp(self, value: bool) -> None:
+        self.is_draft_model = value
+
+    @_measure_model_execution(_barrier_before_timing)
+    def execute_model_call(self, model_call, *args, **kwargs):
+        """Execute a callable and return its output and device-complete duration."""
+        return model_call(*args, **kwargs)
+
     def inference(self, model_inputs: Dict, is_prefill: bool, is_mtp: bool = False) -> Tuple[torch.Tensor, float]:
         """Execute model inference and log timing information."""
         # Generate expert indices for force EPLB if enabled
@@ -399,33 +442,24 @@ class ModelWorker:
                 is_mtp=is_mtp,
             )
 
-        # Synchronize and start timing
-        self._barrier_before_timing()
-        torch.npu.synchronize()
-        start_time = time.time()
-
-        # Execute model forward
-        with torch.no_grad():
+        def model_call():
             if self.exe_mode in ["ge_graph", "npugraph_ex"] and not is_prefill:
                 # Use compiled model for decode phase
+                compiled_model = self.model_compiled
+                forward_metadata = model_inputs.get("forward_metadata")
                 is_warm_up = getattr(
-                    model_inputs.get("forward_metadata"),
+                    forward_metadata,
                     "is_warm_up",
                     model_inputs.get("is_warm_up", False),
                 )
                 if self.exe_mode == "npugraph_ex" and self.enable_cache_compile and not is_warm_up:
                     with torch.compiler.set_stance(skip_guard_eval_unsafe=True):
-                        output = self.model_compiled(**model_inputs)
-                else:
-                    output = self.model_compiled(**model_inputs)
-            else:
-                # Use eager execution for prefill or non-graph mode
-                output = self.model(**model_inputs)
+                        return compiled_model(**model_inputs)
+                return compiled_model(**model_inputs)
+            # Use eager execution for prefill or non-graph mode
+            return self.model(**model_inputs)
 
-        # Synchronize and calculate timing
-        torch.npu.synchronize()
-        end_time = time.time()
-        inference_time = end_time - start_time
+        output, inference_time = self.execute_model_call(model_call)
 
         # Per-step timing log moved to Scheduler._log_step (the scheduler has
         # the queue/kv-usage context that makes a single combined log line
@@ -433,30 +467,56 @@ class ModelWorker:
 
         return output, inference_time
 
-    def compile_model(self):
-        """Compile model forward for graph mode."""
+    def compile_model(
+        self,
+        decode_q_len: Optional[int] = None,
+        interface_name: Optional[str] = None,
+        compiled_attr: Optional[str] = None,
+    ):
+        """Compile and bind one model decode interface for graph mode.
+
+        ``interface_name`` lets model-specific workers reuse the framework's
+        compile path without importing graph utilities themselves. When
+        ``compiled_attr`` is provided, the compiled callable is bound to that
+        model attribute instead of the worker's standard decode slot.
+        """
         from executor.utils.graph_utils import compile_model_forward
 
         logger.info("The final model structure is: \n %s", self.model)
         if self.exe_mode in ["ge_graph", "npugraph_ex"]:
+            if interface_name is None:
+                self._ensure_compile_interface()
             logger.info("Try to compile model")
-            # For cache compile, the main model and draft/MTP model must use
+            # For cache compile, the main model and draft model must use
             # different compile interfaces; otherwise they may trigger unnecessary recompilation.
-            if self.is_mtp:
-                compile_func_name = "mtp_decode"
-            else:
-                compile_func_name = "main_decode"
+            compile_func_name = interface_name or (
+                "mtp_decode" if self.is_draft_model else "main_decode"
+            )
 
             # In graph mode, forward should be wrapped by a compiled method to avoid
             # the effect of @torch.inference_mode.
-            model_forward = getattr(self.model, compile_func_name)
+            model_forward = getattr(self.model, compile_func_name, None)
+            if not callable(model_forward):
+                raise RuntimeError(
+                    f"{self.model.__class__.__name__} must implement {compile_func_name}() "
+                    "for graph mode."
+                )
             logger.info("Compile model interface: %s.%s", self.model.__class__.__name__, compile_func_name)
 
-            self.model_compiled = compile_model_forward(
+            compiled_model = compile_model_forward(
                 model_forward,
                 self.infer_config,
+                cache_namespace=(
+                    f"decode_q_len_{decode_q_len}"
+                    if decode_q_len is not None
+                    else None
+                ),
             )
-        else:
+            if compiled_attr is not None:
+                setattr(self.model, compiled_attr, compiled_model)
+            else:
+                self.model_compiled = compiled_model
+        elif compiled_attr is None:
             self.model_compiled = None
 
     def gen_force_eplb_topk_idx(

@@ -1,4 +1,4 @@
-﻿# coding=utf-8
+# coding=utf-8
 # Copyright (c) 2026 Huawei Technologies Co., Ltd.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,129 +13,95 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""MTP Worker for speculative inference with multi-token prediction.
+"""Native multi-token-prediction backend for speculative decoding.
 
-This module provides the MTPWorker class that handles multi-token prediction
-for speculative decoding. It orchestrates multiple steps of MTP model inference
-to draft tokens that will be verified by the main model.
+MTP reuses the target model's cache timeline and predicts one proposal token
+per draft invocation. The worker accumulates ``next_n`` proposal tokens, then
+builds one fixed-width ``next_n + 1`` target verification bucket. Framework
+lifecycle, shared weights, and verification orchestration live in
+``BaseSpeculativeWorker``; this module owns only MTP-specific state updates and
+model-input construction.
 """
 
-import logging
-from typing import Dict, Optional, Tuple
+from typing import Dict
 
 import torch
 
 from executor.core.config import InferenceConfig
-from executor.core.model_worker.model_worker import ModelWorker
 from executor.core.kv_cache.cache_utils import prepare_slot_mapping
-from executor.utils.forward_metadata import set_forward_metadata, get_forward_metadata
-from ..forward_data_info import MTPInfo, Batch
+from executor.core.model_worker.model_worker import ModelWorker
+from executor.utils.forward_metadata import get_forward_metadata, set_forward_metadata
+from .base_speculative_worker import BaseSpeculativeWorker
+from ..forward_data_info import Batch, MTPInfo
 
 
-logger = logging.getLogger(__name__)
+class MTPWorker(BaseSpeculativeWorker):
+    """Generate sequential MTP proposals against the target-model cache."""
 
+    method = "mtp"
+    state_cls = MTPInfo
 
-class MTPWorker:
-    """Worker class for executing MTP (Multi-Token Prediction) model inference.
+    def __init__(
+        self,
+        infer_config: InferenceConfig,
+        device,
+    ):
+        super().__init__(infer_config, device)
+        self.mtp_model_worker = ModelWorker(
+            infer_config,
+            device,
+            is_draft_model=True,
+            model_path=infer_config.speculative_config.draft_model_path,
+        )
 
-    This class encapsulates the MTP model worker and provides methods for:
-    - Getting MTP model inputs
-    - Processing MTP model outputs
-    - Executing multi-step speculative inference (propose)
+    @property
+    def model_worker(self) -> ModelWorker:
+        return self.mtp_model_worker
 
-    The MTPWorker is responsible for the small draft model that predicts
-    multiple tokens in speculative decoding.
+    def warm_up_prefill(
+        self,
+        input_ids: torch.Tensor,
+        seq_lens: torch.Tensor,
+        model_inputs: Dict,
+        prev_hidden_states: torch.Tensor,
+    ) -> None:
+        draft_inputs = dict(model_inputs)
+        draft_inputs["prev_hidden_states"] = prev_hidden_states
+        self.mtp_model_worker.inference(draft_inputs, is_prefill=True, is_mtp=True)
 
-    Member Variables:
-        Config:
-            infer_config: Inference configuration containing all runtime settings.
-            next_n: Number of speculative tokens to predict per step.
-            exe_mode: Execution mode (eager, npugraph_ex, etc.).
-            batch_size_per_dp_rank: Batch size for each dp rank.
+    def build_main_warmup_batch(self, input_ids: torch.Tensor) -> Batch:
+        batch_size = input_ids.shape[0]
+        batch = Batch(
+            is_prefill=False,
+            input_ids=input_ids,
+        )
+        batch.mtp_infos = MTPInfo(
+            spec_tokens=input_ids.new_zeros((batch_size, self.next_n)),
+        )
+        return batch
 
-        Model Components:
-            device: NPU device for computation.
-            mtp_model_worker: ModelWorker instance wrapping the MTP model.
-    """
-
-    def __init__(self, infer_config: InferenceConfig, device):
-        """Initialize MTPWorker with inference configuration and device."""
-        # Config
-        self.infer_config = infer_config
-        self.next_n = self.infer_config.model_config.next_n
-        self.exe_mode = self.infer_config.model_config.exe_mode
-        self.batch_size_per_dp_rank = self.infer_config.scheduler_config.batch_size_per_dp_rank
-        self.block_size = self.infer_config.scheduler_config.block_size
-
-        # Model Components
-        self.device = device
-        self.mtp_model_worker = ModelWorker(self.infer_config, self.device, True)
-        self.kvcache_manager = None
-
-    def share_weights_from_main_model(self, main_model):
-        """Share reusable weights from the main model to the MTP model when missing."""
-        mtp_model = self.mtp_model_worker.model
-
-        # Share lm_head if mtp_model's lm_head is None
-        if hasattr(mtp_model, 'lm_head') and mtp_model.lm_head is None:
-            if hasattr(main_model, 'lm_head'):
-                mtp_model.lm_head = main_model.lm_head
-            else:
-                raise ValueError(
-                    f"Current MTP model lacks and needs to reuse the main model's lm_head, "
-                    f"but lm_head cannot be found in {main_model.__class__.__name__}. "
-                    "Please check the main model's lm_head."
-                )
-
-        # Share embed_tokens if mtp_model's embed_tokens is None
-        if hasattr(mtp_model.model, 'embed_tokens') and mtp_model.model.embed_tokens is None:
-            if hasattr(main_model.model, 'embed_tokens'):
-                mtp_model.model.embed_tokens = main_model.model.embed_tokens
-            else:
-                raise ValueError(
-                    "Current MTP model lacks and needs to reuse the main model's embed_tokens, "
-                    f"but embed_tokens cannot be found in {main_model.__class__.__name__}. "
-                    "Please check the main model's embed_tokens."
-                )
-
-    @staticmethod
-    def _pad_seq_len_to_size(tensor, size):
-        """Pad or truncate tensor to the specified size along sequence dimension."""
-        if tensor.dim() < 2:
-            raise ValueError("Tensor must have at least 2 dimensions, where dim 1 is seq_len")
-        if tensor.shape[1] >= size:
-            # Truncate if tensor is already larger than target size
-            return tensor[:, :size]
-        else:
-            # Pad with zeros if tensor is smaller than target size
-            return torch.cat(
-                [
-                    tensor,
-                    torch.zeros((tensor.shape[0], size - tensor.shape[1], *tensor.shape[2:]),
-                                dtype=tensor.dtype, device=tensor.device),
-                ],
-                dim=1,
-            )
+    def warm_up_decode(self, model_inputs: Dict, main_output) -> None:
+        draft_inputs = dict(model_inputs)
+        draft_inputs["prev_hidden_states"] = main_output[1]
+        if self.exe_mode in ["ge_graph", "npugraph_ex"]:
+            self.mtp_model_worker.compile_model()
+        self.mtp_model_worker.inference(draft_inputs, is_prefill=False, is_mtp=True)
 
     def get_main_model_inputs(self, input_ids, batch):
-        """Build main model decode inputs. Returns 1D packed input_ids and position_ids."""
-        kv_len = get_forward_metadata().kv_len.to(self.device)
-        q_len = self.next_n + 1
-        if batch:
-            # Move spec_tokens to NPU (may be CPU when sourced from PD transfer
-            # metadata or the dummy-batch synthesizer) and write back so the
-            # later verify_spec_tokens read in execution_engine sees an NPU
-            # tensor — otherwise that comparison hits a device mismatch.
-            batch.mtp_infos.spec_tokens = batch.mtp_infos.spec_tokens.to(self.device)
-            spec_tokens = batch.mtp_infos.spec_tokens
-            # input_ids is [B] 1D, unsqueeze to [B, 1] for concat with spec_tokens [B, next_n]
-            input_ids = torch.cat([input_ids.unsqueeze(1), spec_tokens], dim=1)
-            input_ids = input_ids[:, -q_len:].reshape(-1).clone()
-            kv_len = kv_len + self.next_n + 1
-        indices = torch.arange(q_len - 1, -1, -1, device=self.mtp_model_worker.device)
-        position_ids = (kv_len.unsqueeze(1) - indices).clamp(min=0).reshape(-1)
+        """Build main model decode inputs. Returns packed inputs and verification width."""
+        mtp_infos = batch.mtp_infos if batch is not None else None
+        if mtp_infos is None or mtp_infos.spec_tokens is None:
+            return None
 
-        return input_ids, kv_len, position_ids
+        q_len = self.next_n + 1
+        # Speculative tokens may come from CPU-side PD transfer metadata or a
+        # dummy warm-up batch. Keep the batch state on the verification device.
+        mtp_infos.spec_tokens = mtp_infos.spec_tokens.to(self.device)
+        return self._build_main_verification_inputs(
+            input_ids,
+            mtp_infos.spec_tokens,
+            q_len,
+        )
 
     def get_mtp_model_inputs(
         self,
@@ -206,7 +172,7 @@ class MTPWorker:
         model_inputs: Dict,
         logits: torch.Tensor,
         mtp_infos: MTPInfo,
-    ) -> Dict:
+    ) -> None:
         """Process MTP model output and update state for the next inference step."""
         forward_metadata = get_forward_metadata()
         cp_metadata = getattr(forward_metadata, "cp_metadata", None)
@@ -216,9 +182,7 @@ class MTPWorker:
             # updates speculative state for rows selected by the current rank.
             logits = torch.index_select(logits, 0, output_indices)
         next_tokens = torch.argmax(logits, dim=-1)
-        batch_size = next_tokens.shape[0]
         q_len = self.next_n + 1
-        # is_prefill_step = mtp_info.is_prefill
         if mtp_infos.is_prefill:
             # Prefill branch: skip MTP decode, advance kv_len directly
             kv_len = forward_metadata.kv_len + q_len - 1
@@ -260,6 +224,8 @@ class MTPWorker:
         actual_seq_lengths_list_q = None
         actual_seq_lengths_list_kv = None
         if self.mtp_model_worker.exe_mode == "npugraph_ex":
+            # NPU graph metadata keeps device tensors for operators and host
+            # lists for static graph guards; both describe the same lengths.
             actual_seq_lengths_cu_list_q = actual_seq_lengths_cu_q.detach().cpu().numpy().tolist()
             actual_seq_lengths_cu_list_kv = actual_seq_lengths_cu_kv.detach().cpu().numpy().tolist()
             actual_seq_lengths_list_q = actual_seq_lengths_q.detach().cpu().numpy().tolist()
@@ -307,27 +273,27 @@ class MTPWorker:
         Returns per-step inference times so the scheduler can log each step
         individually instead of only seeing the summed total.
         """
-        # Determine number of MTP steps: single for mini-batch prefill, else next_n steps
+        # Prefill produces the first proposal token; decode recursively advances
+        # the MTP model until the fixed-width verification bucket is complete.
         loop_mtp = 1 if batch.is_prefill else self.next_n
         infer_times: list[float] = []
         if not batch.mtp_infos:
             batch.mtp_infos = MTPInfo()
         batch.mtp_infos.set_mtp_info(
-            accepted_num=accepted_num, is_prefill=batch.is_prefill, next_n=self.next_n, spec_tokens=None)
+            accepted_num=accepted_num, is_prefill=batch.is_prefill,
+            spec_tokens=None)
 
-        # Step 1: Get initial MTP model inputs
         model_inputs_mtp = self.get_mtp_model_inputs(
             batch,
             main_next_tokens,
             model_inputs_main,
             prev_hidden_states)
 
-        # Step 2: Loop through MTP inference steps
         for step_idx in range(loop_mtp):
             if step_idx > 0:
-                model_inputs_mtp = self.get_next_mtp_model_inputs(model_inputs_mtp, batch.mtp_infos, prev_hidden_states)
+                model_inputs_mtp = self.get_next_mtp_model_inputs(model_inputs_mtp, batch.mtp_infos,
+                                                                  prev_hidden_states)
 
-            # Execute MTP model inference
             output, infer_time = self.mtp_model_worker.inference(
                 model_inputs_mtp,
                 is_prefill=batch.mtp_infos.is_prefill,
@@ -336,7 +302,6 @@ class MTPWorker:
             infer_times.append(infer_time)
             logits, prev_hidden_states = output
 
-            # Process output after inference
             self.mtp_model_output_postprocess(
                 model_inputs_mtp,
                 logits,

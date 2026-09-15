@@ -17,7 +17,7 @@ import os
 import argparse
 import logging
 import yaml
-from executor.core.config import InferenceConfig
+from executor.core.config import InferenceConfig, SpeculativeConfig
 from executor.offline.offline_inference import OfflineInference
 from executor.utils.data_utils import generate_default_prompt, load_longbench_dataset, build_dataset_input, \
     load_infinitebench_dataset, load_mmmu_dataset, export_mmmu_results
@@ -75,18 +75,21 @@ def _get_prompt_dp_rank(config, global_rank):
     return global_rank // parallel_config.attn_tp_size
 
 
-def log_results(results, mtp_stats, infer_time, next_n, model_name, enable_mm_encode=False):
-    """Log inference results and calculate MTP acceptance rate if MTP is enabled.
+def log_results(results, speculative_stats, infer_time, model_name, speculative_config: SpeculativeConfig,
+                *, enable_mm_encode=False):
+    """Log inference results and calculate draft acceptance rate when enabled.
 
     Args:
         results: List of GenerationOutput objects containing output_text.
-        mtp_stats: Dict of MTP metrics (None if MTP not enabled).
+        speculative_stats: Draft metrics (None if speculative inference is disabled).
                    Contain 'spec_num_accepted_tokens' and 'spec_num_forward_ct'.
         infer_time: [prefill, decode...] or [encode, prefill, decode...] when MM Encode is enabled.
-        next_n: MTP speculation depth (0 if MTP not enabled).
         model_name: Name of the model used for logging.
+        speculative_config: Proposal width and backend used for speculative statistics.
         enable_mm_encode: Whether infer_time includes an Encode entry before Prefill.
     """
+    next_n = speculative_config.num_speculative_tokens
+    speculative_method = speculative_config.method or "none"
     # Log output text for each request
     for i, res in enumerate(results):
         logger.info("Request %s: outputs: %s\n", i, res.output_text)
@@ -95,30 +98,49 @@ def log_results(results, mtp_stats, infer_time, next_n, model_name, enable_mm_en
         logger.info("%s encode total inference time cost is %.2f ms", model_name, infer_time[0] * 1000)
         logger.info("%s prefill total inference time cost is %.2f ms", model_name, infer_time[1] * 1000)
     decode_infer_time = infer_time[2:] if enable_mm_encode else infer_time[1:]
-    # Get average decode inference time
-    avg_decode_time = process_infer_time(decode_infer_time, len(decode_infer_time))
-    # Calculate and log total MTP acceptance rate if MTP is enabled
+    # Calculate and log total draft acceptance rate if speculative inference is enabled
     if next_n > 0:
-        spec_num_forward_ct = sum(mtp_stats['spec_num_forward_ct'])
-        total_spec_tokens = spec_num_forward_ct * next_n
-        total_accept_tokens = sum(mtp_stats['spec_num_accepted_tokens'])
-        valid_output_len = sum(mtp_stats['valid_output_len'])
+        spec_num_forward_ct = sum(speculative_stats['spec_num_forward_ct'])
+        draft_token_counts = speculative_stats.get('spec_num_draft_tokens')
+        total_spec_tokens = sum(draft_token_counts) if draft_token_counts is not None \
+            else spec_num_forward_ct * next_n
+        total_accept_tokens = sum(speculative_stats['spec_num_accepted_tokens'])
+        valid_output_len = sum(speculative_stats['valid_output_len'])
+        draft_label = {"mtp": "MTP", "dspark": "DSpark"}.get(
+            speculative_method, speculative_method
+        )
 
-        avg_accept_rate = total_accept_tokens / total_spec_tokens
-        avg_accept_length = total_accept_tokens / spec_num_forward_ct + 1
+        avg_accept_rate = total_accept_tokens / total_spec_tokens if total_spec_tokens > 0 else 0.0
+        avg_accept_length = total_accept_tokens / spec_num_forward_ct + 1 if spec_num_forward_ct > 0 else 1.0
+        decode_execution_times = speculative_stats.get("decode_execution_time")
+        if decode_execution_times is not None:
+            total_decode_time = sum(decode_execution_times)
+            avg_decode_time = total_decode_time / spec_num_forward_ct if spec_num_forward_ct > 0 else 0.0
+        else:
+            avg_decode_time = process_infer_time(decode_infer_time, len(decode_infer_time))
         avg_equivalent_time = avg_decode_time / avg_accept_length
 
         logger.info(f"Finished inference, the number of valid output tokens is {valid_output_len}, "
                     f"total number of draft tokens is {total_spec_tokens}, "
                     f"total accepted number is {total_accept_tokens}")
         logger.info(
-            f"{model_name} main and mtp model average inference time cost is {avg_decode_time*1000:.2f} ms")
+            f"{model_name} main and {draft_label} model average inference time cost "
+            f"is {avg_decode_time*1000:.2f} ms")
         logger.info(
-            f"{model_name} model average equivalent latency of MTP{next_n}"
+            f"{model_name} model average equivalent latency of {draft_label}{next_n}"
             f" is {avg_equivalent_time*1000:.2f} ms")
         logger.info("The speculation accept length: %.4f", avg_accept_length)
         logger.info("The speculation accept rate: %.4f", avg_accept_rate)
+        decode_output_counts = speculative_stats.get("decode_output_tokens")
+        if decode_execution_times is not None and decode_output_counts is not None:
+            total_decode_outputs = sum(decode_output_counts)
+            if total_decode_outputs > 0:
+                logger.info(
+                    "Decode model execution time per delivered token (excluding scheduling): %.2f ms",
+                    total_decode_time / total_decode_outputs * 1000,
+                )
     else:
+        avg_decode_time = process_infer_time(decode_infer_time, len(decode_infer_time))
         logger.info(
             "%s decode average inference time cost is %.2f ms",
             model_name,
@@ -141,7 +163,7 @@ def main():
     logger.info("Inference Configuration")
     logger.info(config)
 
-    dataset_path = os.path.join(os.path.dirname(__file__), f"../../dataset")
+    dataset_path = os.path.join(os.path.dirname(__file__), "../../dataset")
     if config.data_config.dataset_path != "":
         dataset_path = config.data_config.dataset_path
 
@@ -208,13 +230,18 @@ def main():
         top_logprobs=0,
         logprobs=False
     )
-    results, mtp_stats, infer_time = llm.generate(prompts=prompts, sampling_params=sampling_params)
+    results, speculative_stats, infer_time = llm.generate(prompts=prompts, sampling_params=sampling_params)
     if llm.engine.is_afd_ffn_rank:
         return
     log_results(
-        results, mtp_stats, infer_time, llm.engine.next_n, llm.engine.main_worker.model_name,
+        results,
+        speculative_stats,
+        infer_time,
+        llm.engine.main_worker.model_name,
+        config.speculative_config,
         enable_mm_encode=llm.engine.enable_mm_encode,
     )
+
     if config.data_config.dataset == "MMMU" and mmmu_ids is not None:
         suffix = f"_dp{global_dp_rank}" if attn_dp_size>1 else ""
         export_mmmu_results(results, mmmu_ids, mmmu_ground_truths,config.model_config.output_path, suffix=suffix)

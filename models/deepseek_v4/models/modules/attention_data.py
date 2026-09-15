@@ -502,7 +502,12 @@ class AttnMetaData(nn.Module):
                 actual_seq_lengths_q,
             )
         else:
-            start_pos = metadata_get("kv_len") - self.infer_config.model_config.next_n
+            if self.infer_config.speculative_config.uses_method("dspark"):
+                # DSpark queries start at their explicit positions after verification.
+                query_offsets = F.pad(actual_seq_lengths_q.cumsum(0), (1, 0))[:-1]
+                start_pos = position_ids.reshape(-1).index_select(0, query_offsets.long())
+            else:
+                start_pos = metadata_get("kv_len") - self.infer_config.model_config.next_n
         if is_prefill and self.cp_size > 1:
             attn_metadata = {
                 "is_prefill": is_prefill,

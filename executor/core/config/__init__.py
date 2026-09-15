@@ -24,6 +24,7 @@ from .inference_config import (
     ParallelConfig,
     PlatformVersion,
     SchedulerConfig,
+    SpeculativeConfig,
 )
 
 __all__ = [
@@ -35,4 +36,5 @@ __all__ = [
     "ParallelConfig",
     "PlatformVersion",
     "SchedulerConfig",
+    "SpeculativeConfig",
 ]

@@ -1803,12 +1803,20 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
         self.global_rank = kwargs.get("global_rank")
         self.enable_superkernel = self.infer_config.model_config.custom_params.get("enable_superkernel", False)
         self.enable_multi_streams = self.infer_config.model_config.custom_params.get("enable_multi_streams", False)
+        self.collect_layer_ids = frozenset()
         self.world_size = self.infer_config.parallel_config.world_size
         self.max_position_embeddings = get_max_position_embeddings(
             self.infer_config,
             kwargs.get("is_mtp", False),
         )
 
+        self._init_decoder(config, **kwargs)
+        # Initialize weights and apply final processing
+        self.post_init()
+        _init_rope(self)
+
+    def _init_decoder(self, config: DeepseekV3Config, **kwargs):
+        """Construct decoder parameters; input-only subclasses override this hook."""
         is_mtp = kwargs.get("is_mtp")
         if not is_mtp:
             self.embed_tokens = VocabParallelEmbedding(
@@ -1848,9 +1856,6 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
         self.norm_eps = config.rms_norm_eps
 
         self.gradient_checkpointing = False
-        # Initialize weights and apply final processing
-        self.post_init()
-        _init_rope(self)
 
     def get_input_embeddings(self):
         return self.embed_tokens
@@ -2049,8 +2054,9 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
         # mhc
         hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
 
+        collected_hidden_states = []
         with superkernel_scope(self.enable_superkernel and not is_prefill, label, option):
-            for decoder_layer in self.layers:
+            for layer_idx, decoder_layer in enumerate(self.layers):
                 hidden_states = decoder_layer(
                     hidden_states,
                     attn_metadata=attn_metadata,
@@ -2060,8 +2066,12 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
                     input_ids=input_ids,
                     prefill_moe_global_chunks=prefill_moe_global_chunks,
                 )
+                if layer_idx in self.collect_layer_ids:
+                    collected_hidden_states.append(hidden_states.mean(dim=1))
         hidden_states = self.hc_head(hidden_states, self.hc_head_fn, self.hc_head_scale, self.hc_head_base)
         hidden_states = self.norm(hidden_states)
+        if self.collect_layer_ids:
+            return hidden_states, torch.cat(collected_hidden_states, dim=-1)
         return hidden_states
 
 
@@ -2132,6 +2142,13 @@ class DeepseekV4CompressedTensorsConfig(CompressedTensorsConfig):
 class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
     _tied_weights_keys = ["lm_head.weight"]
 
+    def set_auxiliary_hidden_layers(self, layer_ids) -> None:
+        """Enable generic intermediate hidden-state collection for a consumer."""
+        layer_ids = tuple(layer_ids or ())
+        if any(layer_id < 0 or layer_id >= self.config.num_hidden_layers for layer_id in layer_ids):
+            raise ValueError("Auxiliary hidden layer ids must refer to main-model layers.")
+        self.model.collect_layer_ids = frozenset(layer_ids)
+
     @staticmethod
     def update_model_cfg(config, infer_config: InferenceConfig):
         if config.compress_ratios is not None:
@@ -2194,12 +2211,7 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
         self.init_parallel_comm_group()
         self.batch_size_per_rank = self.infer_config.scheduler_config.batch_size_per_dp_rank
 
-        mtp_layer_idx = config.num_hidden_layers # MTP is the last layer
-        self.model = DeepseekV3ModelMTPLayer(
-            config, self.infer_config, self.comm_manager, mtp_layer_idx, prefix, **kwargs
-        ) if is_mtp else DeepseekV3Model(
-            config, self.infer_config, self.comm_manager, prefix, **kwargs
-        )
+        self.model = self._build_decoder(config, prefix, **kwargs)
         self.vocab_size = config.vocab_size
         self.rope_head_dim = config.qk_rope_head_dim
         if not is_mtp:
@@ -2226,7 +2238,7 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
         self.window_size = config.sliding_window
         self.cp_segment_min_len = self.window_size
         self.init_cache_dim()
-        self.first_layer_idx = mtp_layer_idx if is_mtp else 0
+        self.first_layer_idx = config.num_hidden_layers if is_mtp else 0
         self.first_layer_ratio = self.config.compress_ratios[self.first_layer_idx]
 
     def check_model_settings(self):
@@ -2270,7 +2282,7 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
             raise ValueError(f"{enable_limit_core=} only supports platform A3!")
         if enable_limit_core and enable_pypto:
             raise ValueError(f"{enable_pypto=} does not support {enable_limit_core=}!")
-        if next_n > 3:
+        if next_n > 3 and not self.infer_config.speculative_config.uses_method("dspark"):
             raise ValueError(f"{next_n=} must equal or smaller than 3")
 
         if parallel_config.cp_size > 1 and scheduler_config.cp_mini_batch != 1:
@@ -2278,6 +2290,15 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
 
         model_config.enable_weight_nz = platform_version != PlatformVersion.ASCEND_950
         self.update_op_kernel_dict()
+
+    def _build_decoder(self, config: DeepseekV3Config, prefix: str, **kwargs):
+        """Select the native main or MTP decoder without backend-specific branches."""
+        mtp_layer_idx = config.num_hidden_layers # MTP is the last layer
+        return DeepseekV3ModelMTPLayer(
+            config, self.infer_config, self.comm_manager, mtp_layer_idx, prefix, **kwargs
+        ) if kwargs.get("is_mtp") else DeepseekV3Model(
+            config, self.infer_config, self.comm_manager, prefix, **kwargs
+        )
 
     def update_op_kernel_dict(self):
         """
@@ -2739,7 +2760,15 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
             cur_topk_list=cur_topk_list,
         ) # (num_tokens, hidden_size)
 
+        auxiliary_hidden_states = None
+        if isinstance(outputs, tuple):
+            outputs, auxiliary_hidden_states = outputs
         prev_hidden_states = outputs
+        if auxiliary_hidden_states is not None:
+            prev_hidden_states = {
+                "prev_hidden_states": prev_hidden_states,
+                "auxiliary_hidden_states": auxiliary_hidden_states,
+            }
 
         logits = self.forward_lm_head(outputs, attn_metadata["actual_seq_q"], is_prefill, attn_metadata)
         return logits, prev_hidden_states

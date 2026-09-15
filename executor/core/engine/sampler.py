@@ -13,7 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Sampler for token sampling and logprobs gathering."""
+"""Token sampling, logprob gathering, and speculative rejection sampling."""
+
+from dataclasses import dataclass
 
 import torch
 
@@ -21,6 +23,7 @@ from executor.utils.forward_metadata import get_forward_metadata
 from ..forward_data_info import Batch, LogprobsTensors, SamplingMetadata
 
 _SAMPLING_EPS = 1e-5
+_REJECTION_PROB_EPS = 1e-8
 
 
 class Sampler:
@@ -28,7 +31,7 @@ class Sampler:
 
     def __init__(self, device: torch.device):
         """Initialize sampler with device.
-        
+
         Args:
             device: The device to use for tensor operations.
         """
@@ -133,7 +136,7 @@ class Sampler:
         logprobs_flag = torch.any(logprobs_tensor).item()
         all_greedy = torch.all(temperature < _SAMPLING_EPS).item()
         all_random = torch.all(temperature >= _SAMPLING_EPS).item()
-        
+
         return SamplingMetadata(
             temperature=temperature,
             top_p=top_p,
@@ -143,6 +146,101 @@ class Sampler:
             max_num_logprobs=max_num_logprobs,
             logprobs=logprobs_flag,
             generators=generators
+        )
+
+    def build_sampling_tensors(
+        self,
+        batch: Batch,
+        batch_size: int,
+        vocab_size: int,
+        *,
+        default_temperature: float = 1.0,
+        default_top_p: float = 1.0,
+        default_top_k: int = 0,
+    ) -> dict[str, torch.Tensor | bool]:
+        """Build dense per-request parameters for model-side sampling."""
+        temperatures = []
+        top_ps = []
+        top_ks = []
+        filter_enabled = False
+        for row_idx in range(batch_size):
+            if row_idx < len(batch.requests):
+                params = batch.requests[row_idx].sampling_params
+                temperature = float(params.temperature)
+                top_p = float(params.top_p)
+                top_k = int(params.top_k)
+            else:
+                temperature = float(default_temperature)
+                top_p = float(default_top_p)
+                top_k = int(default_top_k)
+            normalized_top_k = top_k if 0 < top_k < vocab_size else vocab_size
+            temperatures.append(temperature)
+            top_ps.append(top_p)
+            top_ks.append(normalized_top_k)
+            filter_enabled |= top_p < 1.0 or normalized_top_k < vocab_size
+        return {
+            "temperature": torch.tensor(temperatures, dtype=torch.float32, device=self.device),
+            "top_p": torch.tensor(top_ps, dtype=torch.float32, device=self.device),
+            "top_k": torch.tensor(top_ks, dtype=torch.int64, device=self.device),
+            "filter_enabled": filter_enabled,
+        }
+
+    @staticmethod
+    def logits_to_probs(
+        logits: torch.Tensor,
+        sampling_params: dict[str, torch.Tensor | bool],
+    ) -> torch.Tensor:
+        """Return the distribution actually sampled after request filters."""
+        temperature = sampling_params["temperature"]
+        greedy_mask = temperature < _SAMPLING_EPS
+        safe_temperature = torch.where(greedy_mask, torch.ones_like(temperature), temperature)
+        processed_logits = logits.float() / safe_temperature.view(-1, 1, 1)
+        if sampling_params["filter_enabled"]:
+            processed_logits = Sampler._filter_logits_kp(
+                processed_logits, sampling_params["top_k"], sampling_params["top_p"],
+            )
+        probs = processed_logits.softmax(dim=-1, dtype=torch.float32)
+        greedy_probs = torch.zeros_like(probs)
+        greedy_probs.scatter_(-1, logits.argmax(dim=-1, keepdim=True), 1.0)
+        return torch.where(greedy_mask.view(-1, 1, 1), greedy_probs, probs)
+
+
+    def gather_logprobs_for_tokens(
+        self,
+        batch: Batch,
+        logits: torch.Tensor,
+        token_ids: torch.Tensor,
+    ) -> LogprobsTensors | None:
+        """Gather logprobs for caller-selected tokens using normal sampling filters."""
+        if not any(request.sampling_params.logprobs for request in batch.requests):
+            return None
+        sampling_data = self.build_sampling_params_from_requests(batch, logits)
+        if not sampling_data.logprobs or sampling_data.max_num_logprobs is None:
+            return None
+
+        processed_logits = logits.clone()
+        if batch.is_prefill:
+            processed_logits = processed_logits[:, -1:, :]
+        if not sampling_data.all_greedy:
+            greedy_mask = sampling_data.temperature < _SAMPLING_EPS
+            temperatures = torch.where(
+                greedy_mask,
+                torch.ones_like(sampling_data.temperature),
+                sampling_data.temperature,
+            )
+            processed_logits.div_(temperatures.unsqueeze(1).unsqueeze(1))
+            processed_logits = self._filter_logits_kp(
+                processed_logits,
+                sampling_data.top_k,
+                sampling_data.top_p,
+            )
+
+        processed_logprobs = processed_logits.log_softmax(dim=-1, dtype=torch.float32)
+        processed_logprobs = processed_logprobs[:token_ids.shape[0], :token_ids.shape[1]]
+        return self.gather_logprobs(
+            processed_logprobs,
+            max_num_logprobs=sampling_data.max_num_logprobs,
+            token_ids=token_ids.long(),
         )
 
     def random_sample(
@@ -157,7 +255,36 @@ class Sampler:
             for i, generator in generators.items():
                 q[i].exponential_(generator=generator)
         return probs.div_(q).argmax(dim=-1)
-    
+
+    @staticmethod
+    def request_generators(batch: Batch, batch_size: int) -> dict[int, torch.Generator]:
+        """Return row-local RNGs shared by normal and speculative sampling."""
+        return {
+            row_idx: request.generator
+            for row_idx, request in enumerate(batch.requests[:batch_size])
+            if request.generator is not None
+        }
+
+    def random_like_by_request(
+        self,
+        reference: torch.Tensor,
+        batch: Batch,
+        distribution: str,
+    ) -> torch.Tensor:
+        """Draw request-local noise without coupling RNG state to graph execution."""
+        if distribution not in {"exponential", "uniform"}:
+            raise ValueError(f"Unsupported random distribution: {distribution}.")
+        random_values = torch.empty_like(reference)
+        generators = self.request_generators(batch, reference.shape[0])
+        random_op = random_values.exponential_ if distribution == "exponential" else random_values.uniform_
+        if len(generators) != reference.shape[0]:
+            random_op()
+        for row_idx, generator in generators.items():
+            row_op = random_values[row_idx].exponential_ \
+                if distribution == "exponential" else random_values[row_idx].uniform_
+            row_op(generator=generator)
+        return random_values
+
     @staticmethod
     def _filter_logits_kp(
         logits: torch.Tensor,
@@ -207,7 +334,7 @@ class Sampler:
     ) -> tuple[torch.Tensor, torch.Tensor | None]: # sampled, processed_logprobs
         if batch.is_prefill:
             logits = logits[:, -1:, :]
-        
+
         if sampling_data.all_greedy and sampling_data.all_random:
             raise ValueError("all_greedy and all_random cannot be True at the same time.")
         if sampling_data.all_random:
@@ -219,7 +346,7 @@ class Sampler:
                 if sampling_data.logprobs and sampling_data.max_num_logprobs is not None:
                     processed_logprobs = logits.log_softmax(dim=-1, dtype=torch.float32)
                 return greedy_sampled, processed_logprobs
-        
+
         if sampling_data.temperature is None:
             raise ValueError("sampling_data.temperature cannot be None here")
 
@@ -258,11 +385,11 @@ class Sampler:
         logits: torch.Tensor
     ) -> tuple[torch.Tensor, LogprobsTensors | None]:
         """Sample tokens and gather logprobs for a batch.
-        
+
         Args:
             batch: Batch containing requests.
             logits: Model output logits.
-            
+
         Returns:
             Tuple of (next_tokens, logprobs_tensors)
         """
@@ -290,5 +417,197 @@ class Sampler:
                 max_num_logprobs=sampling_data.max_num_logprobs,
                 token_ids=next_tokens
             )
-        
+
         return next_tokens, logprobs_tensors
+
+
+@dataclass(frozen=True)
+class RejectionSamplingResult:
+    """Result of speculative rejection sampling."""
+
+    accepted_num: torch.Tensor
+    output_tokens: torch.Tensor
+    proposal_lens: torch.Tensor
+
+
+class SpeculativeRejectionSampler:
+    """Verify proposals from ``q`` while preserving target distribution ``p``."""
+
+    def __init__(self, sampler: Sampler):
+        self._sampler = sampler
+
+    @staticmethod
+    def _residual_probs(
+        target_probs: torch.Tensor,
+        draft_probs: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return the normalized positive residual of target minus draft."""
+        residual = torch.clamp(target_probs - draft_probs, min=0.0)
+        residual_mass = residual.sum(dim=-1, keepdim=True)
+        residual = torch.where(residual_mass <= _REJECTION_PROB_EPS, target_probs, residual)
+        residual_mass = residual.sum(dim=-1, keepdim=True)
+        return residual / residual_mass.clamp_min(_REJECTION_PROB_EPS)
+
+    @staticmethod
+    def _truncate_accepted_at_eos(
+        batch: Batch,
+        draft_tokens: torch.Tensor,
+        accepted_num: torch.Tensor,
+        proposal_lens: torch.Tensor,
+        eos_token_ids,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Cap accepted and verified proposal lengths at the first accepted EOS."""
+        if not eos_token_ids or draft_tokens.shape[1] == 0:
+            return accepted_num, proposal_lens
+
+        token_indices = torch.arange(
+            draft_tokens.shape[1], device=draft_tokens.device,
+        ).unsqueeze(0)
+        accepted_mask = token_indices < accepted_num.unsqueeze(1)
+        eos_mask = torch.zeros_like(accepted_mask)
+        for eos_token_id in eos_token_ids:
+            eos_mask |= draft_tokens == eos_token_id
+
+        batch_size = draft_tokens.shape[0]
+        if batch.requests:
+            observes_eos_values = [
+                not request.sampling_params.ignore_eos
+                for request in batch.requests[:batch_size]
+            ]
+            observes_eos_values.extend(
+                [False] * (batch_size - len(observes_eos_values))
+            )
+            observes_eos = torch.tensor(
+                observes_eos_values,
+                dtype=torch.bool,
+                device=draft_tokens.device,
+            ).unsqueeze(1)
+            eos_mask &= observes_eos
+
+        accepted_eos = eos_mask & accepted_mask
+        has_accepted_eos = accepted_eos.any(dim=1)
+        eos_prefix_len = accepted_eos.to(torch.int64).argmax(dim=1) + 1
+        accepted_num = torch.where(has_accepted_eos, eos_prefix_len, accepted_num)
+        proposal_lens = torch.where(
+            has_accepted_eos,
+            eos_prefix_len,
+            proposal_lens,
+        )
+        return accepted_num, proposal_lens
+
+    @staticmethod
+    def _validate_inputs(
+        draft_tokens: torch.Tensor,
+        draft_probs: torch.Tensor,
+        target_probs: torch.Tensor,
+        fallback_tokens: torch.Tensor,
+        proposal_lens: torch.Tensor,
+    ) -> None:
+        batch_size, draft_len = draft_tokens.shape
+        if draft_probs.shape[:2] != (batch_size, draft_len):
+            raise ValueError(
+                "Draft probability shape must match draft tokens, "
+                f"got tokens={tuple(draft_tokens.shape)} and probs={tuple(draft_probs.shape)}."
+            )
+        if target_probs.shape[0] != batch_size or target_probs.shape[1] < draft_len + 1:
+            raise ValueError(
+                "Target probabilities must contain each draft position plus a bonus position, "
+                f"got draft_len={draft_len} and target shape={tuple(target_probs.shape)}."
+            )
+        if draft_probs.shape[-1] != target_probs.shape[-1]:
+            raise ValueError(
+                "Rejection sampling requires matching draft and target vocab sizes, "
+                f"got {draft_probs.shape[-1]} and {target_probs.shape[-1]}."
+            )
+        if fallback_tokens.shape[0] != batch_size or fallback_tokens.shape[1] < draft_len + 1:
+            raise ValueError(
+                "Fallback tokens must contain the full verification block, "
+                f"got draft_len={draft_len} and fallback shape={tuple(fallback_tokens.shape)}."
+            )
+        if proposal_lens.numel() != batch_size:
+            raise ValueError(
+                f"Proposal lengths batch size mismatch: expected {batch_size}, "
+                f"got {proposal_lens.numel()}."
+            )
+
+    def sample(
+        self,
+        *,
+        batch: Batch,
+        draft_tokens: torch.Tensor,
+        draft_probs: torch.Tensor,
+        target_probs: torch.Tensor,
+        fallback_tokens: torch.Tensor,
+        proposal_lens: torch.Tensor,
+        eos_token_ids=None,
+    ) -> RejectionSamplingResult:
+        """Accept a proposal prefix and sample its rejection or bonus position.
+
+        ``draft_probs`` must describe the distribution that generated each
+        proposal and ``target_probs`` must describe the requested target
+        distribution. The two distributions may use different temperatures;
+        the acceptance ratio remains valid because it is computed from the
+        actual proposal distribution ``q`` and target distribution ``p``.
+        """
+        self._validate_inputs(
+            draft_tokens,
+            draft_probs,
+            target_probs,
+            fallback_tokens,
+            proposal_lens,
+        )
+        batch_size, draft_len = draft_tokens.shape
+        proposal_lens = proposal_lens.to(
+            device=draft_tokens.device,
+            dtype=torch.int64,
+        ).reshape(-1).clamp(min=0, max=draft_len)
+        target_probs = target_probs[:, :draft_len + 1, :]
+        selected_target_probs = target_probs[:, :draft_len, :].gather(
+            dim=-1,
+            index=draft_tokens.unsqueeze(-1),
+        ).squeeze(-1)
+        selected_draft_probs = draft_probs.gather(
+            dim=-1,
+            index=draft_tokens.unsqueeze(-1),
+        ).squeeze(-1).clamp_min(_REJECTION_PROB_EPS)
+        accept_prob = torch.clamp(selected_target_probs / selected_draft_probs, max=1.0)
+
+        token_indices = torch.arange(draft_len, device=draft_tokens.device).unsqueeze(0)
+        valid_mask = token_indices < proposal_lens.unsqueeze(1)
+        accept_draw = self._sampler.random_like_by_request(accept_prob, batch, "uniform")
+        accept_mask = ((accept_draw < accept_prob) & valid_mask).to(torch.int64)
+        accepted_num = accept_mask.cumprod(dim=1).sum(dim=1).to(torch.int64)
+        accepted_num, proposal_lens = self._truncate_accepted_at_eos(
+            batch,
+            draft_tokens,
+            accepted_num,
+            proposal_lens,
+            eos_token_ids,
+        )
+
+        output_tokens = fallback_tokens.clone()
+        accepted_mask = token_indices < accepted_num.unsqueeze(1)
+        output_tokens[:, :draft_len] = torch.where(
+            accepted_mask,
+            draft_tokens,
+            output_tokens[:, :draft_len],
+        )
+
+        rejected_indices = accepted_num.clamp(max=draft_len - 1)
+        batch_indices = torch.arange(batch_size, device=draft_tokens.device)
+        rejected_target_probs = target_probs[batch_indices, rejected_indices]
+        rejected_draft_probs = draft_probs[batch_indices, rejected_indices]
+        bonus_target_probs = target_probs[batch_indices, proposal_lens]
+        replacement_probs = torch.where(
+            (accepted_num < proposal_lens).unsqueeze(1),
+            self._residual_probs(rejected_target_probs, rejected_draft_probs),
+            bonus_target_probs,
+        )
+        generators = self._sampler.request_generators(batch, batch_size)
+        replacement = self._sampler.random_sample(replacement_probs, generators)
+        output_tokens.scatter_(1, accepted_num.unsqueeze(1), replacement.unsqueeze(1))
+        return RejectionSamplingResult(
+            accepted_num=accepted_num,
+            output_tokens=output_tokens,
+            proposal_lens=proposal_lens,
+        )

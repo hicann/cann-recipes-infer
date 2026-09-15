@@ -14,7 +14,7 @@
 # limitations under the License.
 
 
-"""Lazy registry mapping model name to (ForCausalLM, [ModelMTP,] Config) classes."""
+"""Lazy registry mapping model names to model and config classes."""
 
 import importlib
 
@@ -112,6 +112,13 @@ _specs: dict[str, list[tuple[str, str]]] = {
     ],
 }
 
+_speculative_specs: dict[tuple[str, str], tuple[tuple[str, str], tuple[str, str]]] = {
+    ("deepseek_v4", "dspark"): (
+        ("models.deepseek_v4.models.modeling_dspark", "DeepseekV4DSparkProposalModel"),
+        ("models.deepseek_v4.models.configuration_deepseek", "DeepseekV3Config"),
+    ),
+}
+
 
 def load_model_classes(name: str) -> tuple:
     if name not in _specs:
@@ -120,3 +127,28 @@ def load_model_classes(name: str) -> tuple:
         return tuple(getattr(importlib.import_module(m), a) for m, a in _specs[name])
     except Exception as e:
         raise ImportError(f"failed to load model '{name}': {e}") from e
+
+
+def load_speculative_model_classes(name: str, speculative_method: str):
+    """Load the model and config classes for a speculative backend."""
+    if speculative_method == "mtp":
+        model_classes = load_model_classes(name)
+        if len(model_classes) != 3:
+            raise ValueError(f"Model {name!r} does not provide a native MTP implementation")
+        _, draft_model_class, config_class = model_classes
+        return draft_model_class, config_class
+
+    class_specs = _speculative_specs.get((name, speculative_method))
+    if class_specs is None:
+        supported = sorted(method for model, method in _speculative_specs if model == name)
+        raise ValueError(
+            f"Model {name!r} does not support speculative method "
+            f"{speculative_method!r}; supported methods: {supported}"
+        )
+    try:
+        return tuple(getattr(importlib.import_module(m), a) for m, a in class_specs)
+    except Exception as e:
+        raise ImportError(
+            f"failed to load speculative method {speculative_method!r} "
+            f"for {name!r}: {e}"
+        ) from e

@@ -172,6 +172,10 @@ class DeepseekV3Config(PretrainedConfig):
         attention_bias=False,
         attention_dropout=0.0,
         max_seq_len=65536,
+        dspark_block_size=0,
+        dspark_noise_token_id=0,
+        dspark_target_layer_ids=None,
+        dspark_markov_rank=256,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -181,6 +185,10 @@ class DeepseekV3Config(PretrainedConfig):
         self.moe_intermediate_size = moe_intermediate_size
         self.num_hidden_layers = num_hidden_layers
         self.num_nextn_predict_layers = num_nextn_predict_layers
+        self.dspark_block_size = dspark_block_size
+        self.dspark_noise_token_id = dspark_noise_token_id
+        self.dspark_target_layer_ids = dspark_target_layer_ids or []
+        self.dspark_markov_rank = dspark_markov_rank
         self.num_attention_heads = num_attention_heads
         self.n_shared_experts = n_shared_experts
         self.n_routed_experts = n_routed_experts

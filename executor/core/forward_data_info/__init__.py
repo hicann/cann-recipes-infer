@@ -16,7 +16,7 @@
 """Forward data info module"""
 
 from .forward_data_info import (
-    GenerationOutput, Request, Batch, MMEncodeBatch, MTPInfo,
+    GenerationOutput, Request, Batch, MMEncodeBatch, BaseSpeculativeInfo, DSparkInfo, MTPInfo,
     SamplingParams, LogprobsTensors, Logprobs, SamplingMetadata
 )
 
@@ -25,6 +25,8 @@ __all__ = [
     "Request",
     "Batch",
     "MMEncodeBatch",
+    "BaseSpeculativeInfo",
+    "DSparkInfo",
     "MTPInfo",
     "SamplingParams",
     "LogprobsTensors",
