@@ -1,4 +1,3 @@
-# coding=utf-8
 # Adapted from transformers/models/hy_v3/modeling_hy_v3.py
 # Copyright (c) 2026 Huawei Technologies Co., Ltd.
 # Copyright 2026 Tencent HunYuan Team and The HuggingFace Inc. team. All rights reserved.
@@ -17,23 +16,20 @@
 
 """PyTorch HYV3 model implementation adapted for CANN NPU inference framework."""
 
-import glob
-import logging
 import math
-import os
 import re
-import sysconfig
-from dataclasses import replace
-from functools import lru_cache
-from typing import Generator, Optional, Set, Tuple
+from collections.abc import Generator
 
 import torch
-from torch import nn
-import torch_npu
 import torch.distributed as dist
+import torch_npu
+from torch import nn
 
+from executor.core.config import CommManager, InferenceConfig
+from executor.core.kv_cache.cache_info import CacheEntry, LayerCacheInfo, ModelCacheInfo
 from executor.model_loader.weight_utils import default_weight_loader
 from executor.utils import calc_moe_hccl_buffer_size
+from executor.utils.forward_metadata import ForwardMetaData, get_forward_metadata
 from executor.utils.stream_utils import (
     create_event,
     create_stream,
@@ -42,9 +38,7 @@ from executor.utils.stream_utils import (
     record_stream,
     wait_event,
 )
-from executor.utils.forward_metadata import ForwardMetaData, get_forward_metadata
-from executor.core.config import InferenceConfig, CommManager
-from executor.core.kv_cache.cache_info import CacheEntry, LayerCacheInfo, ModelCacheInfo
+from module.fuse_moe_gmm import FusedMoEGMM
 from module.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -53,47 +47,50 @@ from module.linear import (
     VocabParallelEmbedding,
     ReplicatedLinear,
 )
-from module.fuse_moe_gmm import FusedMoEGMM
 from module.utils import get_moe_num_chunks, split_moe_tensors
 from module.quantization.mxfp4 import W4A8MxFp4MoEGMMMethod
 
 from .configuration_hy_v3 import HYV3Config
-
-logger = logging.getLogger(__name__)
-
-
-def _custom_ops_dir():
-    return os.path.join(sysconfig.get_paths()["purelib"], "custom_ops")
-
-
-def _load_swiglu_group_quant_op():
-    """Load the installed swiglu_group_quant op without importing custom_ops."""
-    if hasattr(torch.ops.custom, "npu_swiglu_group_quant"):
-        return
-    so = glob.glob(os.path.join(_custom_ops_dir(), "custom_ops_lib*.so"))
-    if so:
-        torch.ops.load_library(so[0])
+from .modules import (
+    HYV3RMSNorm,
+    HYV3RotaryEmbedding,
+    build_pad_aware_prefill_metadata,
+    ensure_qkv_fused_kscale_registered,
+    equal_all_to_all,
+    is_sequence_parallel_enabled,
+    quantize_sequence_parallel_transport,
+)
 
 
-_load_swiglu_group_quant_op()
+def _resolve_dtype(dtype) -> torch.dtype:
+    """Resolve a serialized model dtype to a supported floating-point dtype."""
+    if dtype is None:
+        return torch.bfloat16
+    if isinstance(dtype, torch.dtype):
+        return dtype
+    if not isinstance(dtype, str):
+        raise TypeError(
+            f"HYV3Config.torch_dtype must be a string or torch.dtype, got {type(dtype)!r}"
+        )
 
+    dtype_name = dtype.removeprefix("torch.").lower()
+    aliases = {
+        "bf16": "bfloat16",
+        "fp16": "float16",
+        "fp32": "float32",
+        "float": "float32",
+    }
+    dtype_name = aliases.get(dtype_name, dtype_name)
+    if dtype_name == "auto":
+        return torch.bfloat16
 
-def _sp_enabled(infer_config):
-    """Explicit sequence-parallel switch.
-
-    SP (token-shard across the attn_tp group + attention AllGather-in /
-    ReduceScatter-out, prefill-only) is driven by an explicit config flag
-    (custom_params.enable_sp), deployment-controlled rather than inferred from
-    topology.
-
-    The ONLY physical precondition for attention SP is attn_tp>1 (checked at the
-    use site). attn_dp / ep do NOT gate SP: attn_dp is a batch-DP encoding, and
-    attn_tp==ep only selects the MoE dispatch (moe_infer_ag vs manual AllToAll).
-    """
-    try:
-        return bool(infer_config.model_config.custom_params.get("enable_sp", False))
-    except Exception:
-        return False
+    resolved_dtype = getattr(torch, dtype_name, None)
+    if resolved_dtype not in (torch.bfloat16, torch.float16, torch.float32):
+        raise ValueError(
+            "HYV3Config.torch_dtype must be one of 'bfloat16', 'float16', or 'float32'; "
+            f"got {dtype!r}"
+        )
+    return resolved_dtype
 
 
 def _use_moe_ag_dispatch(config: HYV3Config, infer_config: InferenceConfig) -> bool:
@@ -101,7 +98,7 @@ def _use_moe_ag_dispatch(config: HYV3Config, infer_config: InferenceConfig) -> b
     attn_tp_size = parallel_config.attn_tp_size
     attn_dp_size = parallel_config.attn_dp_size
     moe_ep_size = parallel_config.moe_ep_size
-    sp_on = _sp_enabled(infer_config) and attn_tp_size > 1
+    sp_on = is_sequence_parallel_enabled(infer_config) and attn_tp_size > 1
 
     # AG (AllGather) prefill dispatch precondition -- a true predicate, not the
     # sp_ep_aligned proxy. AG broadcasts every token to all ep cards, routes the
@@ -127,193 +124,6 @@ def _use_moe_ag_dispatch(config: HYV3Config, infer_config: InferenceConfig) -> b
         and attn_tp_size == moe_ep_size
         and config.num_experts_per_tok > moe_ep_size
     )
-
-
-def _sp_transport_quant(x, gmm_quant_mode, target_linear=None):
-    """Quantize an activation for the SP / DP-TP-DP transport, dispatched by quant tier.
-
-    mxfp4 (w4a8mx): dynamic MXFP8, returns (values, per-group scale).
-    fp8 (w8a8float8): static per-tensor quant by `target_linear`.input_scale,
-    returns (values, None); the scalar scale is not transported.
-    """
-    if gmm_quant_mode in ("w4a8mxfloat4", "w4a8mx"):
-        return torch_npu.npu_dynamic_mx_quant(x, dst_type=torch.float8_e4m3fn)
-    if gmm_quant_mode == "w8a8float8":
-        q = torch_npu.npu_quantize(
-            x, target_linear.input_scale, None,
-            torch.float8_e4m3fn, -1, True)
-        return q, None
-    raise NotImplementedError(
-        f"DP-TP-DP / SP transport quant not implemented for gmm_quant_mode="
-        f"{gmm_quant_mode!r}; wired tiers: mxfp4 (dynamic MXFP8), fp8 "
-        f"(static per-tensor)."
-    )
-
-
-def _equal_all_to_all(x, group, group_size):
-    """Equal-split all_to_all over dim0, flattened to 1D with explicit split
-    sizes so it captures correctly under npugraph_ex. dim0 must be divisible by
-    group_size.
-    """
-    flat = x.reshape(-1)
-    n = flat.shape[0]
-    chunk = n // group_size
-    splits = [chunk] * group_size
-    out = torch.empty_like(flat)
-    dist.all_to_all_single(out, flat, output_split_sizes=splits,
-                           input_split_sizes=splits, group=group)
-    return out.view_as(x)
-
-
-def _build_pad_aware_prefill_metadata(forward_metadata, slot_mapping, block_table,
-                                      pad_len, prompt_tokens):
-    """Append the SP alignment pad as an independent dummy segment so FA runs on the
-    full padded length (model-side, no framework changes).
-
-    The pad (pad_len <= attn_tp-1, from right-padding the prompt to a multiple of
-    attn_tp) becomes one extra request-segment in the packed metadata:
-      * actual_seq_lengths_cu_q: append prompt_tokens + pad_len
-      * actual_seq_lengths_kv:   append pad_len (the dummy's own kv length)
-      * slot_mapping / block_table: point the dummy at null_block (block 0)
-
-    The dummy writes its pad K/V to null_block and reads back the same offsets, so its
-    attention is self-consistent (no stale read). null_block is block 0 by BlockPool
-    invariant (free_queue[0] = deque(range(N)).popleft(), never given to real requests,
-    so real slots >= block_size never collide). Real segments are byte-for-byte
-    unchanged; the dummy output is dropped by the real-cu_q index_select at the model tail.
-
-    Returns fresh (forward_metadata, slot_mapping, block_table); inputs untouched.
-    """
-    cu_q = forward_metadata.actual_seq_lengths_cu_q
-    kv = forward_metadata.actual_seq_lengths_kv
-    padded_cu_q = torch.cat([cu_q, cu_q.new_tensor([prompt_tokens + pad_len])])
-    padded_kv = torch.cat([kv, kv.new_tensor([pad_len])])
-    fmeta = replace(
-        forward_metadata,
-        actual_seq_lengths_cu_q=padded_cu_q,
-        actual_seq_lengths_kv=padded_kv,
-    )
-
-    new_slot_mapping = dict(slot_mapping) if slot_mapping else slot_mapping
-    if slot_mapping:
-        for key, sm in slot_mapping.items():
-            sm_flat = sm.view(-1)
-            # DISCARD_SLOT = null_block(=0) * block_size + [0..pad_len-1] = arange(pad_len)
-            dummy_slots = torch.arange(pad_len, device=sm_flat.device, dtype=sm_flat.dtype)
-            new_slot_mapping[key] = torch.cat([sm_flat, dummy_slots])
-
-    new_block_table = dict(block_table) if block_table else block_table
-    if block_table:
-        for key, bt in block_table.items():
-            dummy_row = bt.new_zeros((1, bt.shape[1]))  # all null_block (0)
-            new_block_table[key] = torch.cat([bt, dummy_row], dim=0)
-
-    return fmeta, new_slot_mapping, new_block_table
-
-
-@lru_cache(maxsize=1)
-def _ensure_qkv_fused_kscale_registered():
-    from cann_ops_transformer.ops import (
-        qkv_rms_norm_rope_cache_with_k_scale as _register_qkv_fused_kscale,  # noqa: F401
-    )
-
-
-# ---------------------------------------------------------------------------
-# RMSNorm
-# ---------------------------------------------------------------------------
-
-class HYV3RMSNorm(nn.Module):
-    def __init__(self, hidden_size, eps: float = 1e-6):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.variance_epsilon = eps
-
-    def forward(self, hidden_states: torch.Tensor, *args):
-        """RMSNorm using NPU fused kernel, with optional residual fusion.
-
-        forward(hidden_states) -> rms_norm(hidden_states)
-        forward(hidden_states, None) -> (rms_norm(hidden_states), hidden_states) for first layer
-        forward(hidden_states, residual) -> (residual + rms_norm, rms_norm) fused via npu_add_rms_norm
-        """
-        if len(args) == 0:
-            return torch_npu.npu_rms_norm(hidden_states, self.weight, self.variance_epsilon)[0]
-        elif len(args) == 1 and args[0] is None:
-            result = torch_npu.npu_rms_norm(hidden_states, self.weight, self.variance_epsilon)[0]
-            residual = hidden_states
-            return (result, residual)
-        elif len(args) == 1:
-            residual = args[0]
-            y, _, x = torch_npu.npu_add_rms_norm(
-                residual, hidden_states, self.weight, self.variance_epsilon
-            )
-            return (y, x)
-        else:
-            raise NotImplementedError(
-                f"insupportable HYV3RMSNorm for input_args len as (include hid): {len(args) + 1}"
-            )
-
-
-# ---------------------------------------------------------------------------
-# RotaryEmbedding
-# ---------------------------------------------------------------------------
-
-class HYV3RotaryEmbedding(nn.Module):
-    def __init__(self, config: HYV3Config, max_position_embeddings=2048, device=None):
-        super().__init__()
-        self.config = config
-        self.dim = config.head_dim
-        self.max_position_embeddings = max_position_embeddings
-        self.rope_theta = config.rope_parameters.get("rope_theta", config.default_theta)
-
-        inv_freq = 1.0 / (
-            self.rope_theta ** (torch.arange(0, self.dim, 2).float().to(device) / self.dim)
-        )
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
-        self._set_cos_sin_cache(seq_len=max_position_embeddings, device=self.inv_freq.device,
-                                dtype=torch.get_default_dtype())
-
-    def forward(self, x, position_ids, max_seq_len=None):
-        # max_seq_len is always provided by HYV3Model caller
-        if max_seq_len is not None and max_seq_len > self.max_seq_len_cached:
-            self._set_cos_sin_cache(seq_len=max_seq_len, device=x.device, dtype=x.dtype)
-
-        if position_ids.dim() != 1:
-            raise RuntimeError("HYV3 expects packed 1D position_ids.")
-
-        cos = self.cos_cached[position_ids]
-        sin = self.sin_cached[position_ids]
-
-        if x.dim() == 2:
-            # TND packed hidden states: (total_tokens, hidden)
-            cos = cos.unsqueeze(1)
-            sin = sin.unsqueeze(1)
-        elif x.dim() == 3:
-            # Legacy BSH hidden states: (batch, seq_len, hidden)
-            batch_size, seq_len, _ = x.shape
-            cos = cos.view(batch_size, seq_len, 1, self.dim)
-            sin = sin.view(batch_size, seq_len, 1, self.dim)
-        else:
-            raise RuntimeError(f"Unsupported HYV3 RoPE input dim: {x.dim()}")
-
-        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
-
-    def get_cos_sin_table(self, max_seq_len=None):
-        if max_seq_len is not None and max_seq_len > self.max_seq_len_cached:
-            self._set_cos_sin_cache(seq_len=max_seq_len, device=self.inv_freq.device, dtype=self.inv_freq.dtype)
-        return self.cos_sin_cached
-
-    def _set_cos_sin_cache(self, seq_len, device, dtype):
-        self.max_seq_len_cached = seq_len
-        t = torch.arange(self.max_seq_len_cached, device=device, dtype=self.inv_freq.dtype)
-        freqs = torch.outer(t, self.inv_freq.to(t.device))
-        emb = torch.cat((freqs, freqs), dim=-1)
-        self.register_buffer("cos_cached", emb.cos().to(dtype), persistent=False)
-        self.register_buffer("sin_cached", emb.sin().to(dtype), persistent=False)
-        self.register_buffer(
-            "cos_sin_cached",
-            torch.cat((freqs.cos(), freqs.sin()), dim=-1).to(torch.float32),
-            persistent=False,
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -345,11 +155,10 @@ class HYV3Attention(nn.Module):
         self.comm_manager = comm_manager
         self.moe_ep_size = infer_config.parallel_config.moe_ep_size
 
-        # Sequence parallel: the ONLY physical precondition is attn_tp>1 (+enable_sp,
-        # +prefill). NOT gated on attn_dp (a batch-DP encoding) nor on ep (which only
-        # picks the MoE dispatch). Decode stays unsharded (single token would 0-row
-        # crash if split across attn_tp).
-        self.enable_sp = _sp_enabled(infer_config)
+        # Attention SP requires attn_tp > 1 and is enabled only for prefill.
+        # attn_dp encodes batch DP, while EP only selects the MoE dispatch path.
+        # Decode stays unsharded because a single token cannot be split over TP.
+        self.enable_sp = is_sequence_parallel_enabled(infer_config)
         sp_on = self.enable_sp and self.attn_tp_size > 1
 
         self.quant_config = getattr(config, "quant_config", None)
@@ -450,16 +259,14 @@ class HYV3Attention(nn.Module):
                 raise ValueError("FIA GQA full-quant paged path requires head_dim == 128")
             if self.block_size != 128:
                 raise ValueError("FIA GQA full-quant paged path requires block_size == 128")
-            _ensure_qkv_fused_kscale_registered()
+            ensure_qkv_fused_kscale_registered()
 
         if self.use_fia_fp8:
             cache_dtype = torch.float8_e4m3fn
         else:
-            cache_dtype = config.torch_dtype if config.torch_dtype is not None else torch.bfloat16
-        # Source branch passes cache_layout ("BnNBsD" for fia / "BnBsND" otherwise);
-        # this repo's CacheEntry has no cache_layout field, so pass it only on the
-        # fia path (keeps the default path byte-identical to before). Enabling
-        # fia_fp8 additionally requires the framework CacheEntry to gain cache_layout.
+            cache_dtype = _resolve_dtype(config.torch_dtype)
+        # Source branch passes cache_layout ("BnNBsD" for FIA / "BnBsND" otherwise).
+        # CacheEntry defaults to the non-FIA layout, so override it only for FIA.
         _kv_layout_kw = {"cache_layout": "BnNBsD"} if self.use_fia_fp8 else {}
         self.cache_entries = [
             CacheEntry(
@@ -541,17 +348,17 @@ class HYV3Attention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        cos_sin: Tuple[torch.Tensor, torch.Tensor] = None,
+        cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None,
         forward_metadata: ForwardMetaData = None,
         slot_mapping=None,
         block_table=None,
         dp_decode: bool = False,
-        cos_sin_table: Optional[torch.Tensor] = None,
-        qkv_fused_cu_seq_len: Optional[torch.Tensor] = None,
-        qkv_fused_actual_seq_lens: Optional[torch.Tensor] = None,
-        qkv_fused_slot_mapping: Optional[torch.Tensor] = None,
-        prefill_fa_actual_seq_qlen: Optional[list] = None,
-        prefill_fa_actual_seq_kvlen: Optional[list] = None,
+        cos_sin_table: torch.Tensor | None = None,
+        qkv_fused_cu_seq_len: torch.Tensor | None = None,
+        qkv_fused_actual_seq_lens: torch.Tensor | None = None,
+        qkv_fused_slot_mapping: torch.Tensor | None = None,
+        prefill_fa_actual_seq_qlen: list[int] | None = None,
+        prefill_fa_actual_seq_kvlen: list[int] | None = None,
         **kwargs,
     ):
         if forward_metadata is None:
@@ -615,7 +422,7 @@ class HYV3Attention(nn.Module):
 
         # pad-aware FA: q_len stays the full padded length (no trim/re-pad); the SP pad
         # tail rides as a dummy segment in the padded metadata (see
-        # _build_pad_aware_prefill_metadata). pad_len == 0 -> original packed path.
+        # build_pad_aware_prefill_metadata). pad_len == 0 -> original packed path.
 
         if slot_mapping is None or block_table is None:
             raise RuntimeError("PagedAttention requires slot_mapping and block_table.")
@@ -753,7 +560,7 @@ class HYV3Attention(nn.Module):
                 )
             # pad-aware FA: attn_output is the full padded length (divisible by attn_tp),
             # so AlltoAll needs no re-pad; dummy pad rows carry finite (dropped) values.
-            attn_output, attn_output_scale = _sp_transport_quant(
+            attn_output, attn_output_scale = quantize_sequence_parallel_transport(
                 attn_output, self.gmm_quant_mode, self.o_proj)
             out_dim = attn_output.shape[-1]
             attn_tp_group = self.comm_manager.get_group("attn_tp_group")
@@ -761,12 +568,12 @@ class HYV3Attention(nn.Module):
             # Value AllToAll is common to both tiers; only mxfp4 also reorders the
             # per-group scale. fp8 transports only the values (o_proj applies its
             # static input_scale internally).
-            ao_dp = _equal_all_to_all(attn_output, attn_tp_group, tp)
+            ao_dp = equal_all_to_all(attn_output, attn_tp_group, tp)
             attn_output = ao_dp.view(tp, -1, out_dim).transpose(0, 1).contiguous().view(-1, tp * out_dim)
             if self.sp_scale_transport:
                 if out_dim % self.dynamic_mx_block != 0:
                     raise ValueError(f"o_proj in-dim {out_dim} not divisible by {self.dynamic_mx_block}")
-                as_dp = _equal_all_to_all(attn_output_scale, attn_tp_group, tp)
+                as_dp = equal_all_to_all(attn_output_scale, attn_tp_group, tp)
                 attn_output_scale = as_dp.view(tp, -1, out_dim // self.dynamic_mx_block, 2) \
                     .transpose(0, 1).contiguous().view(-1, tp * (out_dim // self.dynamic_mx_block), 2)
                 attn_output = self.o_proj(attn_output, dynamic_scale=attn_output_scale)
@@ -809,7 +616,7 @@ class HYV3MLP(nn.Module):
         config: HYV3Config,
         infer_config: InferenceConfig = None,
         comm_manager: CommManager = None,
-        intermediate_size: Optional[int] = None,
+        intermediate_size: int | None = None,
         dense_tp_size: int = 1,
         dense_tp_group=None,
         prefix: str = "",
@@ -961,7 +768,7 @@ class HYV3TopKRouter(nn.Module):
         self,
         hidden_states: torch.Tensor,
         e_score_correction_bias: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         hidden_states = hidden_states.reshape(-1, self.hidden_dim)
         router_logits = self.gate(hidden_states.float())
 
@@ -971,7 +778,7 @@ class HYV3TopKRouter(nn.Module):
             bias=e_score_correction_bias.float(),
             norm_type=1,  # sigmoid
             routed_scaling_factor=self.router_scaling_factor,
-            eps=float(1e-20),
+            eps=1e-20,
         )
         top_k_weights = top_k_weights.to(hidden_states.dtype)
 
@@ -1017,7 +824,7 @@ class HYV3MoE(nn.Module):
         )
         self.attn_dp_size = infer_config.parallel_config.attn_dp_size
         self.experts_per_rank = self.num_experts // self.moe_ep_size
-        self.enable_sp = _sp_enabled(infer_config)
+        self.enable_sp = is_sequence_parallel_enabled(infer_config)
         # sp_on / sp_ep_aligned gate the SP *transport layout* only (attn_tp>1
         # token-shard, fp32/bf16 gate split, shared-expert sequence parallel).
         # attn_tp>1 SP is the *mechanism* that makes the ep group hold a 1/ep token
@@ -1074,7 +881,7 @@ class HYV3MoE(nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor, is_prefill: bool = False,
-                prefill_moe_global_chunks: Optional[int] = None) -> torch.Tensor:
+                prefill_moe_global_chunks: int | None = None) -> torch.Tensor:
         # sp_ep_aligned feeds (fp32-for-gate, bf16-for-experts); gate keeps fp32 precision.
         if self.sp_ep_aligned and isinstance(hidden_states, (tuple, list)):
             hidden_states_fp32, hidden_states_bf16 = hidden_states
@@ -1299,13 +1106,18 @@ class HYV3MoE(nn.Module):
         topk_weight = w_ag
 
         active_num = topk_ids.shape[0] * topk_ids.shape[1]
-        routing_kwargs = dict(
-            expert_idx=topk_ids, active_num=active_num, expert_num=self.num_experts,
-            expert_tokens_num_type=1, expert_tokens_num_flag=True,
-            active_expert_range=[ep_rank * self.experts_per_rank,
-                                 (ep_rank + 1) * self.experts_per_rank],
-            quant_mode=-1,
-        )
+        routing_kwargs = {
+            "expert_idx": topk_ids,
+            "active_num": active_num,
+            "expert_num": self.num_experts,
+            "expert_tokens_num_type": 1,
+            "expert_tokens_num_flag": True,
+            "active_expert_range": [
+                ep_rank * self.experts_per_rank,
+                (ep_rank + 1) * self.experts_per_rank,
+            ],
+            "quant_mode": -1,
+        }
         expanded_x, expanded_row_idx, tokens_per_expert, _ = \
             torch_npu.npu_moe_init_routing_v2(x.view(torch.bfloat16), **routing_kwargs)
         expanded_x = expanded_x.view(x.dtype)
@@ -1494,9 +1306,8 @@ class HYV3DecoderLayer(nn.Module):
         gmm_quant_mode = quant_config.gmm_quant_mode if quant_config is not None else "w16a16"
         self.gmm_quant_mode = gmm_quant_mode
         attn_tp = infer_config.parallel_config.attn_tp_size
-        # sp_quant (MXFP8 fused norm feeding the sharded attention) is the 4bit SP
-        # transport variant: SP-on (enable_sp AND attn_tp>1) AND 4bit-gmm. No attn_dp.
-        sp_on = _sp_enabled(infer_config) and attn_tp > 1
+        # sp_quant is the quantized transport used by sharded attention.
+        sp_on = is_sequence_parallel_enabled(infer_config) and attn_tp > 1
         self.sp_quant = (sp_on
                             and gmm_quant_mode in ("w4a8mxfloat4", "w4a8mx", "w8a8float8")
                             and isinstance(self.mlp, HYV3MoE))
@@ -1504,19 +1315,19 @@ class HYV3DecoderLayer(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        cos_sin: Tuple[torch.Tensor, torch.Tensor] = None,
+        cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None,
         forward_metadata: ForwardMetaData = None,
-        past_residual: Optional[torch.Tensor] = None,
+        past_residual: torch.Tensor | None = None,
         slot_mapping=None,
         block_table=None,
         dp_decode: bool = False,
-        cos_sin_table: Optional[torch.Tensor] = None,
-        qkv_fused_cu_seq_len: Optional[torch.Tensor] = None,
-        qkv_fused_actual_seq_lens: Optional[torch.Tensor] = None,
-        qkv_fused_slot_mapping: Optional[torch.Tensor] = None,
-        prefill_fa_actual_seq_qlen: Optional[list] = None,
-        prefill_fa_actual_seq_kvlen: Optional[list] = None,
-        prefill_moe_global_chunks: Optional[int] = None,
+        cos_sin_table: torch.Tensor | None = None,
+        qkv_fused_cu_seq_len: torch.Tensor | None = None,
+        qkv_fused_actual_seq_lens: torch.Tensor | None = None,
+        qkv_fused_slot_mapping: torch.Tensor | None = None,
+        prefill_fa_actual_seq_qlen: list[int] | None = None,
+        prefill_fa_actual_seq_kvlen: list[int] | None = None,
+        prefill_moe_global_chunks: int | None = None,
         **kwargs,
     ):
         is_prefill = forward_metadata.is_prefill if forward_metadata else False
@@ -1552,7 +1363,7 @@ class HYV3DecoderLayer(nn.Module):
                     hidden_norm, _ = torch_npu.npu_rms_norm(
                         hidden_states, self.input_layernorm.weight,
                         self.input_layernorm.variance_epsilon)
-                hidden_mx, hidden_scale = _sp_transport_quant(
+                hidden_mx, hidden_scale = quantize_sequence_parallel_transport(
                     hidden_norm, self.gmm_quant_mode, self.self_attn.merged_qkv_proj)
             attn_in = (hidden_mx, hidden_scale)
         else:
@@ -1631,15 +1442,13 @@ class HYV3Model(nn.Module):
         self.dense_tp_size = infer_config.parallel_config.dense_tp_size
         self.moe_ep_size = infer_config.parallel_config.moe_ep_size
         self.moe_chunk_max_len = infer_config.model_config.custom_params.get("moe_chunk_max_len", 65536)
-        self.enable_sp = _sp_enabled(infer_config)
+        self.enable_sp = is_sequence_parallel_enabled(infer_config)
         self.moe_ag_dispatch = _use_moe_ag_dispatch(config, infer_config)
         sp_on = self.enable_sp and self.attn_tp_size > 1
         _qc = getattr(config, "quant_config", None)
         _gmm = _qc.gmm_quant_mode if _qc is not None else "w16a16"
-        # Token-shard SP (sp_shard in forward): driven by sp_on, transport by tier.
-        # No attn_dp -- the attention AllGathers the sharded hidden back to the full
-        # sequence before touching the framework KV ledger, so full-sequence metadata
-        # (which holds at attn_dp=1 too) is exactly what SP needs.
+        # Attention gathers hidden-state shards before accessing the framework KV
+        # ledger, so the SP path consumes full-sequence metadata.
         _gmm_4bit = _gmm in ("w4a8mxfloat4", "w4a8mx")
         # Unified SP / DP-TP-DP tier: mxfp4 (dynamic MXFP8) + fp8 (static
         # per-tensor) share the model-level sp_quant gate that drives
@@ -1655,15 +1464,12 @@ class HYV3Model(nn.Module):
         # attn_tp. At attn_dp==1 the two coincide. Single-request / bs<attn_tp
         # are rejected (pure-TP decode is unsupported). MTP shares this
         # gate: next_n scales rows, not request count.
-        if self.enable_sp:
-            # hy3 dp-tp-dp shards the decode batch within a single attn_tp group
-            # (request axis). It is only validated/adapted for attn_dp==1 (one TP
-            # group spanning all ranks); attn_dp>1 (multi-group) is not supported.
-            if self.attn_dp_size != 1:
-                raise ValueError(
-                    "hy3 dp-tp-dp 只支持 attn_dp==1(单TP组);attn_dp>1 未适配 "
-                    f"(attn_dp_size={self.attn_dp_size})"
-                )
+        # Hy3 DP-TP-DP shards decode requests within one attention TP group.
+        if self.enable_sp and self.attn_dp_size != 1:
+            raise ValueError(
+                "HYV3 DP-TP-DP requires attn_dp_size == 1; "
+                f"got attn_dp_size={self.attn_dp_size}"
+            )
         if self.sp_quant and infer_config is not None:
             _bs = infer_config.scheduler_config.batch_size_per_dp_rank
             if _bs < self.attn_tp_size or _bs % self.attn_tp_size != 0:
@@ -1764,7 +1570,7 @@ class HYV3Model(nn.Module):
     def forward(
         self,
         input_ids: torch.Tensor,
-        position_ids: Optional[torch.LongTensor] = None,
+        position_ids: torch.LongTensor | None = None,
         forward_metadata: ForwardMetaData = None,
         **kwargs,
     ):
@@ -1781,9 +1587,8 @@ class HYV3Model(nn.Module):
         decode_dp = self._dp_decode_active(is_prefill, token_count)
         tp_dp_active = prefill_sp or decode_dp
 
-        # bug#2: sharding input_ids BEFORE the vocab-parallel embedding all_reduce
-        # (over embed_tp_group == attn_tp ranks) mixes different tokens -> corrupt
-        # embeddings from layer 0. Fix: embed on the full seq FIRST, then shard.
+        # Vocab-parallel embedding must complete the full-sequence all-reduce before
+        # hidden states are sharded; otherwise ranks would combine different tokens.
         sp_shard = None
         sp_pad_len = 0
         if tp_dp_active:
@@ -1825,12 +1630,12 @@ class HYV3Model(nn.Module):
         slot_mapping = forward_metadata.slot_mapping
 
         # pad-aware FA: carry the SP pad as a dummy segment (see
-        # _build_pad_aware_prefill_metadata); keep the ORIGINAL forward_metadata (real
+        # build_pad_aware_prefill_metadata); keep the original metadata (real
         # cu_q) for the output-tail selection that drops the dummy. pad_len == 0 -> no-op.
         padded_forward_metadata = forward_metadata
         if sp_pad_len > 0:
             position_ids = torch.cat([position_ids, position_ids.new_zeros(sp_pad_len)])
-            padded_forward_metadata, slot_mapping, block_table = _build_pad_aware_prefill_metadata(
+            padded_forward_metadata, slot_mapping, block_table = build_pad_aware_prefill_metadata(
                 forward_metadata, slot_mapping, block_table, sp_pad_len, prompt_tokens
             )
 
@@ -1940,7 +1745,7 @@ class HYV3ForCausalLM(nn.Module):
     LM head (lmhead_tp), and EP on MoE experts (moe_ep).
     """
 
-    _ignore_weights_patterns = ["model.layers.80."]
+    _ignore_weights_patterns = ("model.layers.80.",)
 
     def __init__(
         self,
@@ -1950,15 +1755,9 @@ class HYV3ForCausalLM(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        # Convert torch_dtype from string to actual dtype
-        dtype_map = {
-            "bfloat16": torch.bfloat16,
-            "float16": torch.float16,
-            "float32": torch.float32,
-            "float": torch.float32,
-        }
-        if isinstance(config.torch_dtype, str):
-            config.torch_dtype = dtype_map.get(config.torch_dtype, torch.bfloat16)
+        # Convert the serialized dtype name to the runtime torch dtype once,
+        # before constructing modules and their cache metadata.
+        config.torch_dtype = _resolve_dtype(config.torch_dtype)
 
         self.config = config
         self.infer_config = infer_config
@@ -1976,7 +1775,7 @@ class HYV3ForCausalLM(nn.Module):
         self.moe_ep_size = infer_config.parallel_config.moe_ep_size
         self.lmhead_tp_size = infer_config.parallel_config.lmhead_tp_size
         self.next_n = infer_config.model_config.next_n
-        self.enable_sp = _sp_enabled(infer_config)
+        self.enable_sp = is_sequence_parallel_enabled(infer_config)
 
         self.init_parallel_comm_group()
         self.model = HYV3Model(config, infer_config, comm_manager, prefix="model")
@@ -2087,7 +1886,7 @@ class HYV3ForCausalLM(nn.Module):
         cache_seq_len = self.infer_config.data_config.input_truncated_len + \
             self.infer_config.scheduler_config.max_new_tokens
         batch_size_per_dp_rank = self.infer_config.scheduler_config.batch_size_per_dp_rank
-        dtype = self.config.torch_dtype
+        dtype = _resolve_dtype(self.config.torch_dtype)
 
         if self.attn_tp_size > 1 and self.attn_dp_size > 1:
             cache_batch_size = batch_size_per_dp_rank * self.attn_tp_size
@@ -2153,7 +1952,10 @@ class HYV3ForCausalLM(nn.Module):
             is_mla_backend=False,
         )
 
-    def load_weights(self, weights: Generator[Tuple[str, torch.Tensor], None, None]) -> Set[str]:
+    def load_weights(
+        self,
+        weights: Generator[tuple[str, torch.Tensor], None, None],
+    ) -> set[str]:
         """Load weights from the checkpoint iterator.
 
         Handles:
@@ -2162,7 +1964,7 @@ class HYV3ForCausalLM(nn.Module):
         """
         params_dict = dict(self.named_parameters())
         buffers_dict = dict(self.named_buffers())
-        loaded_params: Set[str] = set()
+        loaded_params: set[str] = set()
         expert_params_mapping = FusedMoEGMM.make_expert_params_mapping(
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
@@ -2265,7 +2067,7 @@ class HYV3ForCausalLM(nn.Module):
     def forward(
         self,
         input_ids: torch.LongTensor = None,
-        position_ids: Optional[torch.LongTensor] = None,
+        position_ids: torch.LongTensor | None = None,
         forward_metadata: ForwardMetaData = None,
         **kwargs,
     ):
@@ -2324,7 +2126,6 @@ class HYV3ForCausalLM(nn.Module):
         if self.lmhead_tp_size > 1:
             logits = logits.float()
             lmhead_tp_group = self.comm_manager.get_group("lmhead_tp_group")
-            bs, q_len, _ = logits.shape
             gathered_list = [
                 torch.empty_like(logits) for _ in range(self.lmhead_tp_size)
             ]
@@ -2365,7 +2166,7 @@ class HYV3ModelMTPLayer(HYV3Model):
         self.moe_ep_size = infer_config.parallel_config.moe_ep_size
         self.moe_chunk_max_len = infer_config.model_config.custom_params.get("moe_chunk_max_len", 65536)
         self.next_n = infer_config.model_config.next_n if infer_config is not None else 0
-        self.enable_sp = _sp_enabled(infer_config)
+        self.enable_sp = is_sequence_parallel_enabled(infer_config)
         self.moe_ag_dispatch = _use_moe_ag_dispatch(config, infer_config)
         sp_on = self.enable_sp and self.attn_tp_size > 1
         # DP-TP-DP decode tier: mirror HYV3Model so _dp_decode_active works on the
@@ -2414,7 +2215,7 @@ class HYV3ModelMTP(HYV3ForCausalLM):
     model.layers.80.* in the checkpoint; closing norm = layers.80.final_layernorm."""
 
     # MTP loads only its own layer; never inherit the main "skip layer 80" rule.
-    _ignore_weights_patterns = []
+    _ignore_weights_patterns = ()
 
     def __init__(self, config, infer_config, comm_manager=None, prefix=""):
         super().__init__(config, infer_config, comm_manager, prefix=prefix)
@@ -2431,7 +2232,7 @@ class HYV3ModelMTP(HYV3ForCausalLM):
         cache_seq_len = self.infer_config.data_config.input_truncated_len + \
             self.infer_config.scheduler_config.max_new_tokens
         bsz = self.infer_config.scheduler_config.batch_size_per_dp_rank
-        dtype = self.config.torch_dtype
+        dtype = _resolve_dtype(self.config.torch_dtype)
         cache_batch = bsz * self.attn_tp_size if (self.attn_tp_size > 1 and self.attn_dp_size > 1) else bsz
         for layer in self.model.layers.values():
             attn = layer.self_attn
@@ -2440,7 +2241,7 @@ class HYV3ModelMTP(HYV3ForCausalLM):
             attn.v_cache = torch.zeros(cache_shape, dtype=dtype, device=device)
 
     def get_cache_info(self) -> ModelCacheInfo:
-        # relative idx; merge() offsets by main layer count (deepseek pattern)
+        # Use relative indices; ModelCacheInfo.merge offsets by the main layer count.
         layer_infos = [LayerCacheInfo(layer_idx=i, caches=list(layer.self_attn.cache_entries))
                        for i, layer in enumerate(self.model.layers.values())]
         return ModelCacheInfo(num_layers=len(layer_infos), layer_infos=layer_infos, is_mla_backend=False)
@@ -2465,12 +2266,10 @@ class HYV3ModelMTP(HYV3ForCausalLM):
         decode_dp = (not is_prefill) and m._dp_decode_active(is_prefill, token_count)
         tp_dp_active = prefill_sp or decode_dp
 
-        # bug#2 (mirror HYV3Model): shard AFTER the vocab-parallel embed all_reduce +
-        # eh_proj, never before -- sharding input_ids first would mix tokens across the
-        # embed_tp all_reduce. prefill pads input_ids AND prev_hidden_states to a
-        # multiple of attn_tp (equal per-rank chunks); pad rows are zero and get
-        # dropped by the real-cu_q output selection below. decode-DP keeps the full-B
-        # row-major request blocks (token_count % attn_tp == 0 from the gate).
+        # Match the main model: shard only after vocab-parallel embedding and eh_proj.
+        # Prefill pads ids and previous hidden states to equal per-rank chunks; real
+        # cumulative query lengths remove pad rows from the output. Decode DP request
+        # blocks are already divisible by attention TP.
         sp_shard = None
         sp_pad_len = 0
         if tp_dp_active:
@@ -2518,7 +2317,7 @@ class HYV3ModelMTP(HYV3ForCausalLM):
         padded_forward_metadata = forward_metadata
         if sp_pad_len > 0:
             position_ids = torch.cat([position_ids, position_ids.new_zeros(sp_pad_len)])
-            padded_forward_metadata, slot_mapping, block_table = _build_pad_aware_prefill_metadata(
+            padded_forward_metadata, slot_mapping, block_table = build_pad_aware_prefill_metadata(
                 forward_metadata, slot_mapping, block_table, sp_pad_len, prompt_tokens
             )
 
@@ -2633,7 +2432,10 @@ class HYV3ModelMTP(HYV3ForCausalLM):
         # Graph-compile entry for the MTP head: compile forward directly.
         return self.forward
 
-    def load_weights(self, weights: Generator[Tuple[str, torch.Tensor], None, None]) -> Set[str]:
+    def load_weights(
+        self,
+        weights: Generator[tuple[str, torch.Tensor], None, None],
+    ) -> set[str]:
         mtp_prefix = f"model.layers.{self.config.num_hidden_layers}."
         unique = ("enorm", "hnorm", "eh_proj", "final_layernorm")
 
