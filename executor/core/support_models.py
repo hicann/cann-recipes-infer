@@ -59,6 +59,10 @@ _specs: dict[str, list[tuple[str, str]]] = {
         ("models.glm_5.models.modeling_glm", "GlmMoeDsaModelMTP"),
         ("models.glm_5.models.configuration_glm", "GlmMoeDsaConfig"),
     ],
+    "glm_5_3": [
+        ("models.glm_5_3.models.modeling_glm53", "Glm53ForCausalLM"),
+        ("models.glm_5_3.models.configuration_glm53", "Glm53Config"),
+    ],
     "hy3": [
         ("models.hy3.models.modeling_hy_v3", "HYV3ForCausalLM"),
         ("models.hy3.models.modeling_hy_v3", "HYV3ModelMTP"),

@@ -1,0 +1,31 @@
+model_config:
+  model_name: "glm_5_3"
+  model_path: "/data/model/glm_5_3"
+  exe_mode: "npugraph_ex"       # ["npugraph_ex", "eager"]
+  platform_version: "950"
+  with_ckpt: True
+  enable_weight_nz: False
+  enable_dynamic_graph: False
+  enable_static_kernel: False
+  enable_profiler: False
+  custom_params:
+    enable_multi_streams: True
+
+data_config:
+  dataset: "InfiniteBench"
+  input_truncated_len: 8192
+
+parallel_config:
+  world_size: 8
+  cp_size: 1
+  attn_tp_size: 1
+  dense_tp_size: 1
+  moe_tp_size: 1
+  embed_tp_size: 1
+  lmhead_tp_size: 1
+
+scheduler_config:
+  block_size: 128
+  max_new_tokens: 1000
+  batch_size: 8
+  max_prefill_tokens: 8192
