@@ -304,7 +304,7 @@ class EncoderVisionAttention(nn.Module):
             k_bsh = k.transpose(1, 2).reshape(bsz, seq_len, self.num_heads * self.head_dim)
             v_bsh = v.transpose(1, 2).reshape(bsz, seq_len, self.num_heads * self.head_dim)
             attn_output, _ = torch.ops.npu.npu_fused_infer_attention_score(
-                q_bsh, k_bsh, v_bsh,
+                q_bsh.contiguous(), k_bsh.contiguous(), v_bsh.contiguous(),
                 num_heads=self.num_heads,
                 num_key_value_heads=self.num_heads,
                 input_layout="BSH",
