@@ -64,6 +64,10 @@ constexpr uint16_t FP4_E2M1_BF16_MAX_EXP = 0x0100;
 constexpr uint16_t SPECIAL_VALUE_E2M1 = 0x00ff;
 constexpr uint16_t SPECIAL_VALUE_E1M2 = 0x007f;
 constexpr uint16_t NEW_MANTISSA = 0x0008;
+// group_list_type = 2: group_index is [E, 2] pairs of [group_id, count]
+constexpr int64_t GROUP_LIST_TYPE_PAIR = 2;
+constexpr int64_t GROUP_INDEX_PAIR_ELE_NUM = 2; // int64 elements per [group_id, count] pair
+constexpr int64_t GROUP_INDEX_COUNT_OFFSET = 1; // count is the second element of a pair
 
 #define FLOAT_OVERFLOW_MODE_CTRL 60
 #ifndef INFINITY
@@ -307,7 +311,7 @@ __aicore__ inline void VFComputeMaxExpMXFP4(const LocalTensor<T>& srcLocal, cons
         static constexpr AscendC::MicroAPI::CastTrait castTraitHalf2Bf16 = {
             AscendC::MicroAPI::RegLayout::UNKNOWN, AscendC::MicroAPI::SatMode::UNKNOWN,
             AscendC::MicroAPI::MaskMergeMode::ZEROING, RoundMode::CAST_TRUNC};
-        
+
         for (uint16_t i = 0; i < loopNum; i++) {
             scaleMask1 = AscendC::MicroAPI::UpdateMask<T>(totalCountInUB);
             scaleMask2 = AscendC::MicroAPI::UpdateMask<T>(totalCountInUB);
@@ -944,6 +948,23 @@ __aicore__ inline void CopyIn(
     dataCoptExtParams.srcStride = srcStride * sizeof(T);
     dataCoptExtParams.dstStride = 0;
     DataCopyPad(inputTensor, inputGm, dataCoptExtParams, dataCopyPadExtParams);
+}
+
+// DataCopy block count is hardware-limited. Split sparse pair gathers so large
+// group lists do not silently truncate a transfer at the UB boundary.
+__aicore__ inline void CopyInGroupIndexType2(
+    const GlobalTensor<int64_t>& inputGm, const LocalTensor<int64_t>& inputTensor, uint32_t pairCount)
+{
+    constexpr uint32_t MAX_BURST_COUNT = 2048;
+    uint32_t copied = 0;
+    while (copied < pairCount) {
+        uint32_t curCount = (pairCount - copied) > MAX_BURST_COUNT
+            ? MAX_BURST_COUNT : (pairCount - copied);
+        // Stride over pairs, taking only the count element of each one.
+        CopyIn(inputGm[copied * GROUP_INDEX_PAIR_ELE_NUM + GROUP_INDEX_COUNT_OFFSET], inputTensor[copied],
+            static_cast<uint16_t>(curCount), 1, 1);
+        copied += curCount;
+    }
 }
 
 template <typename T, AscendC::PaddingMode mode = AscendC::PaddingMode::Normal>

@@ -36,6 +36,11 @@ const int BLOCK_QUANT_INPUT_ALIGN = PER_BLOCK_FP16 * SWIGLU_FACTOR;
 const int MX_SCALE_ALIGN_FACTOR = 2;
 const int BLOCK_QUANT = 0;
 const int MX_QUANT = 1;
+// group_list_type: 1 = flat count list, 2 = [E, 2] pairs of [group_id, count]
+const int64_t GROUP_LIST_TYPE_COUNT = 1;
+const int64_t GROUP_LIST_TYPE_PAIR = 2;
+const int64_t GROUP_INDEX_PAIR_DIM = 2;  // group_index dims for type 2
+const int64_t GROUP_INDEX_PAIR_COLS = 2; // columns per pair row: [group_id, count]
 // ge::DataType integer codes used by the host op (aclnn dst_type attr)
 const int64_t DTYPE_CODE_FLOAT8_E5M2 = 35;
 const int64_t DTYPE_CODE_FLOAT8_E4M3FN = 36;
@@ -155,8 +160,21 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_swiglu_group_quant_npu(
     int64_t block_size = 0,
     bool round_scale = false,
     const c10::optional<double>& clamp_limit = c10::nullopt,
-    bool output_origin = false)
+    bool output_origin = false,
+    int64_t group_list_type = 1)
 {
+    // group_list_type=2 requires a contiguous int64 [E, 2] tensor of [group_id, count] pairs.
+    TORCH_CHECK(group_list_type == GROUP_LIST_TYPE_COUNT || group_list_type == GROUP_LIST_TYPE_PAIR,
+        "group_list_type only supports 1 or 2, got ", group_list_type);
+    if (group_list_type == GROUP_LIST_TYPE_PAIR) {
+        TORCH_CHECK(group_index.has_value(), "group_index is required when group_list_type is 2");
+        TORCH_CHECK(group_index->dim() == GROUP_INDEX_PAIR_DIM && group_index->size(1) == GROUP_INDEX_PAIR_COLS,
+            "group_index should have shape [E, 2] when group_list_type is 2, got ", group_index->sizes());
+        TORCH_CHECK(group_index->is_contiguous(),
+            "group_index should be contiguous when group_list_type is 2");
+        TORCH_CHECK(group_index->dtype() == at::kLong && group_index->is_contiguous(),
+            "group_index should be contiguous int64 when group_list_type is 2");
+    }
     // dst_type is selected purely through the standard ScalarType; fp4 (FLOAT4_E2M1) is reachable
     // only on torch>=2.8 via at::ScalarType::Float4_e2m1fn_x2 (see get_type_code).
     int64_t dst_type_code = get_type_code(dst_type);
@@ -175,7 +193,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_swiglu_group_quant_npu(
     // packed at::kFloat4_e2m1fn_x2 dtype which EXEC_NPU_CMD maps to ACL_FLOAT4_E2M1. No TensorWrapper
     // override is required. The kernel/tiling are still driven by the dst_type attr (dst_type_code).
     EXEC_NPU_CMD_V1(aclnnSwigluGroupQuant, x, weight, group_index, dst_type_code, quant_mode, block_size,
-        round_scale, actualClampLimit, output_origin, y, scale_out, y_origin);
+        round_scale, actualClampLimit, output_origin, group_list_type, y, scale_out, y_origin);
 
     return std::tuple<at::Tensor, at::Tensor, at::Tensor>(y, scale_out, y_origin);
 }
@@ -190,8 +208,19 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_swiglu_group_quant_meta(
     int64_t block_size = 0,
     bool round_scale = false,
     const c10::optional<double>& clamp_limit = c10::nullopt,
-    bool output_origin = false)
+    bool output_origin = false,
+    int64_t group_list_type = 1)
 {
+    // group_list_type=2 requires a contiguous int64 [E, 2] tensor of [group_id, count] pairs.
+    TORCH_CHECK(group_list_type == GROUP_LIST_TYPE_COUNT || group_list_type == GROUP_LIST_TYPE_PAIR,
+        "group_list_type only supports 1 or 2, got ", group_list_type);
+    if (group_list_type == GROUP_LIST_TYPE_PAIR) {
+        TORCH_CHECK(group_index.has_value(), "group_index is required when group_list_type is 2");
+        TORCH_CHECK(group_index->dim() == GROUP_INDEX_PAIR_DIM && group_index->size(1) == GROUP_INDEX_PAIR_COLS,
+            "group_index should have shape [E, 2] when group_list_type is 2, got ", group_index->sizes());
+        TORCH_CHECK(group_index->dtype() == at::kLong && group_index->is_contiguous(),
+            "group_index should be contiguous int64 when group_list_type is 2");
+    }
     int64_t dst_type_code = get_type_code(dst_type);
 
     // construct the output tensor

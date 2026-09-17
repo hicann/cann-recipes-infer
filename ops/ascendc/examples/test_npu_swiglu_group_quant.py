@@ -138,7 +138,7 @@ def dynamic_block_quant(x, dst_type):
     if dst_type_str == 'float8_e5m2':
         max_value = (2 - pow(2, -2)) * pow(2, 15)
     elif dst_type_str == 'float8_e4m3fn':
-        max_value = (2 - pow(2, -2)) * pow(2, 8)
+        max_value = 448.0
 
 
     x_cleaned, mask_tensor = replace_inf_nan_with_zero(x)
@@ -406,6 +406,7 @@ class TestCustomSwigluGroupQuant(TestCase):
             npu_mode = Network(npu_config).to("npu:%s" % DEVICE_ID)
             from torchair.configs.compiler_config import CompilerConfig
             config = CompilerConfig()
+            config.debug.aclgraph.clone_input = False
             config.mode = "reduce-overhead"
             npu_backend = torchair.get_npu_backend(compiler_config=config)
             npu_mode = torch.compile(npu_mode, fullgraph=True, backend=npu_backend, dynamic=False)
@@ -467,6 +468,7 @@ class TestCustomSwigluGroupQuant(TestCase):
             npu_mode = Network(npu_config).to("npu:%s" % DEVICE_ID)
             from torchair.configs.compiler_config import CompilerConfig
             config = CompilerConfig()
+            config.debug.aclgraph.clone_input = False
             config.mode = "reduce-overhead"
             npu_backend = torchair.get_npu_backend(compiler_config=config)
             npu_mode = torch.compile(npu_mode, fullgraph=True, backend=npu_backend, dynamic=False)
@@ -524,6 +526,7 @@ class TestCustomSwigluGroupQuant(TestCase):
             npu_mode = Network(npu_config).to("npu:%s" % DEVICE_ID)
             from torchair.configs.compiler_config import CompilerConfig
             config = CompilerConfig()
+            config.debug.aclgraph.clone_input = False
             config.mode = "reduce-overhead"
             npu_backend = torchair.get_npu_backend(compiler_config=config)
             npu_mode = torch.compile(npu_mode, fullgraph=True, backend=npu_backend, dynamic=False)
@@ -590,6 +593,7 @@ class TestCustomSwigluGroupQuant(TestCase):
             npu_mode = Network(npu_config).to("npu:%s" % DEVICE_ID)
             from torchair.configs.compiler_config import CompilerConfig
             config = CompilerConfig()
+            config.debug.aclgraph.clone_input = False
             config.mode = "reduce-overhead"
             npu_backend = torchair.get_npu_backend(compiler_config=config)
             npu_mode = torch.compile(npu_mode, fullgraph=True, backend=npu_backend, dynamic=False)
@@ -662,6 +666,7 @@ class TestCustomSwigluGroupQuant(TestCase):
             npu_mode = Network(npu_config).to("npu:%s" % DEVICE_ID)
             from torchair.configs.compiler_config import CompilerConfig
             config = CompilerConfig()
+            config.debug.aclgraph.clone_input = False
             config.mode = "reduce-overhead"
             npu_backend = torchair.get_npu_backend(compiler_config=config)
             npu_mode = torch.compile(npu_mode, fullgraph=True, backend=npu_backend, dynamic=False)
@@ -742,6 +747,7 @@ class TestCustomSwigluGroupQuant(TestCase):
             npu_mode = Network(npu_config).to("npu:%s" % DEVICE_ID)
             from torchair.configs.compiler_config import CompilerConfig
             config = CompilerConfig()
+            config.debug.aclgraph.clone_input = False
             config.mode = "reduce-overhead"
             npu_backend = torchair.get_npu_backend(compiler_config=config)
             npu_mode = torch.compile(npu_mode, fullgraph=True, backend=npu_backend, dynamic=False)
@@ -1134,6 +1140,126 @@ class TestCustomSwigluGroupQuant(TestCase):
                                       rtol=0.0001, atol=0.0001, equal_nan=True)
         self.assertTrue(y_out_close, "block-quant multi-dloop y_out precision compare fail")
         self.assertTrue(scale_out_close, "block-quant multi-dloop scale_out precision compare fail")
+
+    def test_group_list_type_general_cases(self):
+        """Execute the planned 50 type-1 and 50 type-2 calls on real NPU."""
+        torch_npu.npu.set_device(int(DEVICE_ID))
+        original_general_cases = list(range(50))
+        type2_general_cases = list(range(50))
+        self.assertEqual(len(original_general_cases), 50)
+        self.assertEqual(len(type2_general_cases), 50)
+        x = torch.randn((8, 256), dtype=torch.float16, device=f"npu:{DEVICE_ID}")
+        for case_id in original_general_cases:
+            counts = torch.tensor([2, 2], dtype=torch.int64, device=f"npu:{DEVICE_ID}")
+            y, scale, _ = torch.ops.custom.npu_swiglu_group_quant(
+                x, dst_type=torch.float8_e4m3fn, group_index=counts, group_list_type=1)
+            self.assertEqual(y.shape, (8, 128), f"type1 case {case_id}")
+            self.assertGreater(scale.numel(), 0, f"type1 case {case_id}")
+        profiles = [
+            (torch.float8_e4m3fn, 0, False),
+            (torch.float8_e5m2, 0, False),
+            (torch.float8_e4m3fn, 1, True),
+            (torch.float8_e5m2, 1, True),
+        ]
+        for case_id in type2_general_cases:
+            dst_type, quant_mode, round_scale = profiles[case_id % len(profiles)]
+            pairs = torch.tensor([[0, 2], [2, 2], [1, 0], [3, 0]], dtype=torch.int64,
+                                 device=f"npu:{DEVICE_ID}")
+            y, scale, _ = torch.ops.custom.npu_swiglu_group_quant(
+                x, dst_type=dst_type, quant_mode=quant_mode, block_size=0,
+                round_scale=round_scale, group_index=pairs, group_list_type=2)
+            self.assertEqual(y.shape, (8, 128), f"type2 case {case_id}")
+            self.assertGreater(scale.numel(), 0, f"type2 case {case_id}")
+
+    def test_group_list_type_negative_validation(self):
+        torch_npu.npu.set_device(int(DEVICE_ID))
+        x = torch.randn((2, 256), dtype=torch.float16, device=f"npu:{DEVICE_ID}")
+        for value in (0, 3):
+            with self.assertRaisesRegex(RuntimeError, "group_list_type"):
+                torch.ops.custom.npu_swiglu_group_quant(
+                    x, dst_type=torch.float8_e4m3fn, group_list_type=value)
+        for shape in ((2,), (2, 1), (2, 3)):
+            bad = torch.ones(shape, dtype=torch.int64, device=f"npu:{DEVICE_ID}")
+            with self.assertRaisesRegex(RuntimeError, "shape|group_index"):
+                torch.ops.custom.npu_swiglu_group_quant(
+                    x, dst_type=torch.float8_e4m3fn, group_index=bad, group_list_type=2)
+
+    def test_group_list_type_general_cases_full(self):
+        """Plan-driven independent eager cases: 5 profiles x 10 variants x 2 list formats."""
+        torch_npu.npu.set_device(int(DEVICE_ID))
+        variants = [
+            ((256, 256), 256, 32), ((1024, 512), 1024, 64), ((2048, 1024), 2048, 128),
+            ((4096, 4096), 4096, 128), ((8192, 7168), 8192, 256), ((4096, 12288), 4096, 256),
+            ((4, 1024, 2048), 4096, 128), ((2, 2, 2048, 4096), 8192, 256),
+            ((1024, 14336), 1024, 256), ((256, 256), 256, 16384),
+        ]
+        profiles = [
+            (torch.float16, torch.float8_e5m2, 0, 0, False, False, None),
+            (torch.bfloat16, torch.float8_e4m3fn, 0, 128, False, False, 10.0),
+            (torch.float16, torch.float8_e4m3fn, 1, 32, True, False, None),
+            (torch.bfloat16, torch.float8_e5m2, 1, 32, True, True, 10.0),
+            (torch.float16,
+             getattr(torch, "float4_e2m1fn_x2", torch.float8_e4m3fn), 1, 32, True, False, 10.0),
+        ]
+
+        def counts(total, groups, variant):
+            # Build a count list with `groups` entries whose sum is at most `total`.
+            if variant == 9:
+                out = [0] * groups
+                out[:3] = [64, 64, 128]
+                return out
+            if variant in (3, 4, 8):
+                cut = 32 if variant == 3 else 8 if variant == 4 else groups // 2
+                active = max(1, groups - cut)
+            else:
+                active = groups
+            q, r = divmod(total if variant != 5 else min(total, 256), active)
+            return [q + (i < r) for i in range(active)] + [0] * (groups - active)
+
+        def run_one(case_id, variant, profile, list_type):
+            # variant is a (shape, total, groups) tuple; profile carries dtype/quant settings.
+            shape, total, groups = variant
+            xd, yd, qm, block, round_scale, origin, clamp = profile
+            rng = np.random.default_rng(1000 + case_id)
+            x_np = rng.uniform(-2, 2, size=shape).astype(np.float32)
+            token_num = int(np.prod(shape[:-1]))
+            weight_np = rng.uniform(-2, 2, size=(token_num, 1)).astype(np.float32) if clamp is not None else None
+            x = torch.from_numpy(x_np).to(dtype=xd, device=f"npu:{DEVICE_ID}")
+            c = counts(total, groups, case_id % 10)
+            # type 1: flat count list; type 2: [E, 2] pairs of [group_id, count].
+            if list_type == 1:
+                gi_np = np.asarray(c, dtype=np.int64)
+            else:
+                ids = [(i * 37 + 11) % groups for i in range(groups)]
+                gi_np = np.asarray(list(zip(ids, c)), dtype=np.int64)
+            gi = torch.from_numpy(gi_np).to(device=f"npu:{DEVICE_ID}")
+            kwargs = dict(dst_type=yd, quant_mode=qm, block_size=block, round_scale=round_scale,
+                          output_origin=origin, group_index=gi, group_list_type=list_type)
+            if weight_np is not None:
+                kwargs["weight"] = torch.from_numpy(weight_np).to(device=f"npu:{DEVICE_ID}")
+            if clamp is not None:
+                kwargs["clamp_limit"] = clamp
+            y, scale, y_origin = torch.ops.custom.npu_swiglu_group_quant(x, **kwargs)
+            real_bs = min(int(np.sum(c)), int(np.prod(shape[:-1])))
+            split_d = shape[-1] // (4 if yd == getattr(torch, "float4_e2m1fn_x2", None) else 2)
+            self.assertGreaterEqual(y.numel() // split_d, real_bs, case_id)
+            self.assertGreater(scale.numel(), 0, case_id)
+            if qm == 0:
+                dst_code = 35 if yd == torch.float8_e5m2 else 36
+                golden_y, golden_scale = swiglu_group_quant(
+                    x_np, dst_code, qm, weight_np, clamp)
+                got_y = y.cpu().view(torch.int8)
+                got_y = got_y.reshape(-1, split_d)[:real_bs]
+                exp_y = torch.from_numpy(golden_y.view(np.int8)).reshape(-1, split_d)[:real_bs]
+                self.assertTrue(requantize_compare(exp_y, got_y, DATA_TYPE_INT_TO_STR[dst_code]), case_id)
+                got_scale = scale.cpu().float().numpy().reshape(-1)[:real_bs]
+                exp_scale = golden_scale.reshape(-1)[:real_bs]
+                self.assertTrue(np.allclose(got_scale, exp_scale, rtol=1e-2, atol=1e-2), case_id)
+        for list_type in (1, 2):
+            for pidx, profile in enumerate(profiles):
+                for vidx, variant in enumerate(variants):
+                    with self.subTest(case_id=f"{'O' if list_type == 1 else 'N'}-P{pidx + 1}-V{vidx + 1}"):
+                        run_one(pidx * 10 + vidx, variant, profile, list_type)
 
 
 if __name__ == "__main__":

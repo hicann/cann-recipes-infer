@@ -81,6 +81,7 @@ public:
         this->Attr("round_scale").AttrType(OPTIONAL).Bool(false);
         this->Attr("clamp_limit").AttrType(OPTIONAL).Float(0.0f);
         this->Attr("output_origin").AttrType(OPTIONAL).Bool(false);
+        this->Attr("group_list_type").AttrType(OPTIONAL).Int(1);
 
         this->AICore().AddConfig("ascend950");
     }

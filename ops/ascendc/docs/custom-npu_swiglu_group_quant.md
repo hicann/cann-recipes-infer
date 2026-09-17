@@ -68,7 +68,8 @@ custom.npu_swiglu_group_quant(
     bool round_scale=False,
     float? clamp_limit=None,
     bool output_origin=False,
-    int dst_type_code=-1
+    int dst_type_code=-1,
+    int group_list_type=1
 ) -> (Tensor, Tensor, Tensor)
 ```
 
@@ -86,7 +87,7 @@ custom.npu_swiglu_group_quant(
 
 - **weight**（`Tensor`，可选）：可选输入。量化前按token乘到SwiGLU输出上。不支持非连续，数据格式支持ND，数据类型支持`float32`。shape通常为`[T]`或`[T, 1]`，需要与`x`合轴后的token维匹配。
 
-- **group_index**（`Tensor`，可选）：可选输入。表示各group中的token数量，当前按count模式使用。不支持非连续，数据格式支持ND，数据类型支持`int64`。shape通常为`[G]`。传入后，算子只保证前`sum(group_index)`个token对应输出有效。
+- **group_index**（`Tensor`，可选）：可选输入。数据格式支持ND，数据类型为`int64`。`group_list_type=1`时为count列表（通常为`[G]`），传入后只保证前`sum(group_index)`个token有效；`group_list_type=2`时必须为连续的`[E, 2]`二元组`[group_id, count]`，只对第二列求和。
 
 - **dst_type**（`ScalarType`）：必选属性。量化输出`y`的数据类型，支持`torch.float8_e4m3fn`、`torch.float8_e5m2`。MX FP4 场景下若 torch ≥ 2.8 可传入`torch.float4_e2m1fn_x2`；torch < 2.8 无 fp4 ScalarType，请传入占位 ScalarType（如`torch.float8_e4m3fn`）并通过`dst_type_code`显式指定 fp4 子类型，详见「MX FP4 量化模式」。
 
@@ -105,6 +106,8 @@ custom.npu_swiglu_group_quant(
 - **clamp_limit**（`float`，可选）：SwiGLU计算前对输入进行截断的阈值。不传入时不执行clamp；传入时取值必须大于等于`0.0`，不支持NaN。
 
 - **output_origin**（`bool`，可选）：是否在MX FP8量化模式下写出量化前的SwiGLU结果`y_origin`，默认值为`False`。`quant_mode=0`时该输出不作为有效结果使用。MX FP4 模式不支持`y_origin`语义（fp4 无量化前原值输出）。
+
+- **group_list_type**（`int`，可选）：group列表语义，默认值为`1`。支持`1`（count列表）和`2`（`[group_id, count]`稀疏二元组）；`0`及其他值暂不支持。
 
 - **dst_type_code**（`int`，可选）：量化输出`y`的目标数据类型对应的`ge::DataType`整型编码，默认值为`-1`，表示由`dst_type`（ScalarType）推导。当目标类型在当前 torch 版本无可用 ScalarType（fp4）时，通过该参数显式覆盖。取值：`FLOAT8_E5M2=35`、`FLOAT8_E4M3FN=36`、`FLOAT4_E2M1=40`、`FLOAT4_E1M2=41`。
 
@@ -136,6 +139,7 @@ custom.npu_swiglu_group_quant(
   | `block_size` | `quant_mode=0`时为`0`或`128`；`quant_mode=1`时为`0`或`32` |
   | `round_scale` | `quant_mode=0`时必须为`False`；`quant_mode=1`时必须为`True` |
   | `clamp_limit` | 不传入，或传入大于等于`0.0`的有限/无穷浮点值；不支持NaN |
+  | `group_list_type` | `1`、`2`；`0`及其他值不支持 |
 
 - 输出dtype约束：
   - `y`数据类型必须与`dst_type`一致。
@@ -143,8 +147,8 @@ custom.npu_swiglu_group_quant(
   - `y_origin`数据类型必须与`x`一致。
 
 - `group_index`约束：
-  - 仅支持count模式，表示每个group的token数量。
-  - 需要保证`sum(group_index) <= T`，否则可能访问超出`x`有效token范围。
+  - type=1为count列表；type=2必须为连续`int64`的`[E,2]`，每行格式为`[group_id,count]`。
+  - type=2只使用第二列求和；调用者需保证组大小非负、非零组前置且总和`<= T`。
   - 传入`group_index`后，输出中超过`sum(group_index)`对应token范围的部分不保证为有效业务数据。
 
 - 其他约束：

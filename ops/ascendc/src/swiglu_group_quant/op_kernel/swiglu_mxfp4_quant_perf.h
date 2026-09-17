@@ -51,13 +51,22 @@ public:
             for (int64_t idx = 0; idx < tilingData->gLoop; idx++) {
                 int64_t curGFactor = (idx == tilingData->gLoop - 1) ? tilingData->tailGFactor : tilingData->gFactor;
                 groupIndexLocal = groupIndexQue.template AllocTensor<int64_t>();
-                CopyIn(groupIndexGm[idx * tilingData->gFactor], groupIndexLocal, 1, curGFactor);
+                if (tilingData->groupListType == GROUP_LIST_TYPE_PAIR) {
+                    // Gather the count (second) element of each [group_id, count] pair.
+                    CopyInGroupIndexType2(groupIndexGm[idx * tilingData->gFactor], groupIndexLocal,
+                        curGFactor / GROUP_INDEX_PAIR_ELE_NUM);
+                } else {
+                    CopyIn(groupIndexGm[idx * tilingData->gFactor], groupIndexLocal, 1, curGFactor);
+                }
                 groupIndexQue.template EnQue(groupIndexLocal);
                 groupIndexLocal = groupIndexQue.template DeQue<int64_t>();
+                // Pair layout reduces only the gathered count column.
+                int64_t groupEleNum = tilingData->groupListType == GROUP_LIST_TYPE_PAIR
+                    ? curGFactor / GROUP_INDEX_PAIR_ELE_NUM : curGFactor;
                 if (idx == 0) {
-                    VFProcessGroupIndex<int64_t, false>(groupSumLocal, groupIndexLocal, curGFactor);
+                    VFProcessGroupIndex<int64_t, false>(groupSumLocal, groupIndexLocal, groupEleNum);
                 } else {
-                    VFProcessGroupIndex<int64_t, true>(groupSumLocal, groupIndexLocal, curGFactor);
+                    VFProcessGroupIndex<int64_t, true>(groupSumLocal, groupIndexLocal, groupEleNum);
                 }
                 groupIndexQue.template FreeTensor(groupIndexLocal);
             }
@@ -111,7 +120,7 @@ public:
         tBufPool.InitBuffer(swigluBuf, tilingData->rowFactor * RoundUp<T0>(tilingData->dFactor) * sizeof(T0));
         tBufPool.InitBuffer(maxExpBuf, tilingData->rowFactor * RoundUp<uint16_t>(scaleColNum) * sizeof(uint16_t));
         tBufPool.InitBuffer(invScaleBuf, tilingData->rowFactor * RoundUp<uint16_t>(scaleColNum) * sizeof(uint16_t));
-    
+
         swigluLocal = swigluBuf.Get<T0>();
         maxExpLocal = maxExpBuf.Get<uint16_t>();
         invScaleLocal = invScaleBuf.Get<uint16_t>();
@@ -200,7 +209,7 @@ public:
                         dLoopIdx * CeilDiv(tilingData->dFactor, PER_MX_FP16)],
                     curRowFactor, scaleDFactor, tilingData->scaleCol - scaleDFactor);
                 scaleQue.template FreeTensor(scaleLocal);
-        
+
                 yLocal = yQue.template AllocTensor<T1>();
                 if constexpr (IsSameType<T1, fp4x2_e2m1_t>::value) {
                     VFComputeDataMXFP4<T0, fp4x2_e2m1_t>(swigluLocal, invScaleLocal,

@@ -40,7 +40,7 @@ TORCH_LIBRARY(custom, m) {
     m.def("npu_swiglu_clip_quant(Tensor x, Tensor group_index, Tensor group_alpha, *, bool activate_left=False, int quant_mode=1, int clamp_mode=1) -> (Tensor, Tensor)");
     m.def("npu_swiglu_group_quant(Tensor x, *, Tensor? weight=None, Tensor? group_index=None, "
         "ScalarType dst_type, int quant_mode=0, int block_size=0, bool round_scale=False, "
-        "float? clamp_limit=None, bool output_origin=False) -> (Tensor, Tensor, Tensor)");
+        "float? clamp_limit=None, bool output_origin=False, int group_list_type=1) -> (Tensor, Tensor, Tensor)");
     m.def("npu_hc_post(Tensor x, Tensor residual, Tensor post, Tensor comb) -> Tensor");
     m.def("indexer_compress_epilog(Tensor(a!) indexer_compress_cache, Tensor(b!) indexer_compress_scale, Tensor x, "
           "Tensor slot_mapping, *, int quant_mode=1, bool round_scale=True, float scale=1.0) -> ()");
@@ -56,7 +56,7 @@ TORCH_LIBRARY(custom, m) {
         "Tensor full_k_rope, Tensor full_kv_cache, Tensor full_kv_block_table, Tensor full_kv_actual_seq, "
         "Tensor full_q_actual_seq, *, int selection_topk_block_size=64) -> (Tensor, Tensor, Tensor, Tensor, Tensor)");
     m.def("npu_moe_gating_top_k(Tensor x, int k, *, Tensor? bias=None, Tensor? input_ids=None, Tensor? tid2eid=None, Tensor? additional_bias=None, Tensor? additional_token_mask=None, int k_group=1, int group_count=1, float routed_scaling_factor=1., float eps=9.9999999999999995e-21, int group_select_mode=0, int renorm=0, int norm_type=0, bool out_flag=False) -> (Tensor, Tensor, Tensor)");
-    
+
     m.def("compressor(Tensor x, Tensor wkv, Tensor wgate, Tensor(a!) state_cache, "
         "Tensor ape, Tensor norm_weight, Tensor rope_sin, Tensor rope_cos, int rope_head_dim, int cmp_ratio, *,"
         "Tensor? state_block_table=None, Tensor? cu_seqlens=None, Tensor? seqused=None, Tensor? start_pos=None,"
@@ -69,7 +69,7 @@ TORCH_LIBRARY(custom, m) {
         "int coff=1, int cache_mode=1) -> (Tensor)");
 
     m.def("scatter_nd_update_asc(Tensor(a!) var, Tensor indices, Tensor update) -> ()");
-    
+
     m.def("npu_hc_pre_sinkhorn(Tensor mixes, Tensor rsqrt, Tensor hc_scale, Tensor hc_base, Tensor x, int hc_mult=4, int hc_sinkhorn_iters=20,"
           "float hc_eps=1e-5) -> (Tensor, Tensor, Tensor)");
 
@@ -94,7 +94,7 @@ TORCH_LIBRARY(custom, m) {
         " *, Tensor? cu_seqlens_q=None, Tensor? cu_seqlens_ori_kv=None, Tensor? cu_seqlens_cmp_kv=None, Tensor? seqused_q=None, Tensor? seqused_kv=None, "
         "int batch_size=0, int max_seqlen_q=0, int max_seqlen_kv=0, int ori_topk=0, int cmp_topk=0, int cmp_ratio=-1, int ori_mask_mode=4, int cmp_mask_mode=3, int ori_win_left=127, int ori_win_right=0, "
         "str layout_q='BSND', str layout_kv='PA_ND', bool has_ori_kv=True, bool has_cmp_kv=True, str device='npu:0') -> Tensor");
-    
+
     m.def("kv_compress_epilog(Tensor(a!) kv_compress_cache, Tensor x, Tensor slot_mapping, "
           " *, int quant_group_size=64, int quant_mode = 2, bool round_scale_flag=True, float scale=1.0) -> ()");
     m.def("kv_compress_epilog_v2(Tensor(a!) cache, Tensor x, Tensor slot_mapping, "

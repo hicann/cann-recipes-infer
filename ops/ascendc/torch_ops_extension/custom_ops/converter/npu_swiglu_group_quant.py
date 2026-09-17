@@ -39,6 +39,7 @@ def convert_npu_swiglu_group_quant(
     round_scale: bool = False,
     clamp_limit: Optional[float] = None,
     output_origin: bool = False,
+    group_list_type: int = 1,
     meta_outputs: Any = None):
     dst_type_code = 35
     if dst_type == 23:
@@ -65,6 +66,7 @@ def convert_npu_swiglu_group_quant(
                "round_scale": attr.Bool(round_scale),
                "output_origin": attr.Bool(output_origin),
                "clamp_limit": attr.Float(actual_clamp_limit),
+               "group_list_type": attr.Int(group_list_type),
                },
         outputs=['y', 'scale_out', 'y_origin']
     )

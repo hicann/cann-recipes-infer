@@ -13,6 +13,7 @@
  * \brief
  */
 
+#include <algorithm>
 #include <cmath>
 #include <sstream>
 #include "swiglu_group_quant_tiling.h"
@@ -53,12 +54,19 @@ constexpr int64_t PER_MX_FP16 = 32;
 constexpr int64_t FP4_PACK_NUM = 2;
 constexpr int64_t BLOCK_QUANT = 0;
 constexpr int64_t MX_QUANT = 1;
+// group_list_type: 1 = flat count list, 2 = [E, 2] pairs of [group_id, count]
+constexpr int64_t GROUP_LIST_TYPE_COUNT = 1;
+constexpr int64_t GROUP_LIST_TYPE_PAIR = 2;
+constexpr int64_t GROUP_INDEX_PAIR_DIM_NUM = 2; // group_index dims for type 2
+constexpr int64_t GROUP_INDEX_PAIR_COLS = 2;    // columns per pair row: [group_id, count]
+constexpr int64_t MIN_EVEN_GFACTOR = 2;         // min gFactor that keeps pairs whole
 constexpr size_t ATTR_INDEX_DST_TYPE = 0;
 constexpr size_t ATTR_INDEX_QUANT_MODE = 1;
 constexpr size_t ATTR_INDEX_BLOCK_SIZE = 2;
 constexpr size_t ATTR_INDEX_ROUND_SCALE = 3;
 constexpr size_t ATTR_INDEX_CLAMP_LIMIT = 4;
 constexpr size_t ATTR_INDEX_OUTPUT_ORIGIN = 5;
+constexpr size_t ATTR_INDEX_GROUP_LIST_TYPE = 6;
 constexpr size_t INPUT_INDEX_X = 0;
 constexpr size_t INPUT_INDEX_WEIGHT = 1;
 constexpr size_t INPUT_INDEX_GROUP_INDEX = 2;
@@ -159,6 +167,12 @@ ge::graphStatus SwigluGroupQuantTiling::GetAttr()
         }
     }
 
+    auto groupListTypeAttr = attrs->GetAttrPointer<int>(ATTR_INDEX_GROUP_LIST_TYPE);
+    groupListType_ = groupListTypeAttr == nullptr ? GROUP_LIST_TYPE_COUNT : *groupListTypeAttr;
+    OPS_ERR_IF((groupListType_ != GROUP_LIST_TYPE_COUNT && groupListType_ != GROUP_LIST_TYPE_PAIR),
+        OPS_LOG_E(context_->GetNodeName(), "attr group_list_type only support 1 or 2, got %ld.", groupListType_),
+        return ge::GRAPH_FAILED);
+
     return ge::GRAPH_SUCCESS;
 }
 
@@ -198,8 +212,17 @@ ge::graphStatus SwigluGroupQuantTiling::GetShapeAttrsInfoInner()
         }
     }
 
+    // Parse attrs before validating mode-dependent input shapes.
+    if (GetAttr() == ge::GRAPH_FAILED) {
+        OPS_LOG_E(context_->GetNodeName(), "Get attr failed.");
+        return ge::GRAPH_FAILED;
+    }
+
     auto groupIndexDesc = context_->GetOptionalInputDesc(INPUT_INDEX_GROUP_INDEX);
     if (groupIndexDesc != nullptr) {
+        OPS_ERR_IF((groupIndexDesc->GetDataType() != ge::DT_INT64),
+            OPS_LOG_E(context_->GetNodeName(), "group_index dtype should be INT64."),
+            return ge::GRAPH_FAILED);
         auto groupIndexShape = context_->GetOptionalInputShape(INPUT_INDEX_GROUP_INDEX);
         if (groupIndexShape != nullptr) {
             auto groupIndexStorageShape = groupIndexShape->GetStorageShape();
@@ -207,15 +230,18 @@ ge::graphStatus SwigluGroupQuantTiling::GetShapeAttrsInfoInner()
             for (size_t i = 0; i < groupIndexStorageShape.GetDimNum(); i++) {
                 g_ = g_ * groupIndexStorageShape.GetDim(i);
             }
+            if (groupListType_ == GROUP_LIST_TYPE_PAIR) {
+                OPS_ERR_IF((groupIndexStorageShape.GetDimNum() != GROUP_INDEX_PAIR_DIM_NUM ||
+                            groupIndexStorageShape.GetDim(1) != GROUP_INDEX_PAIR_COLS),
+                    OPS_LOG_E(context_->GetNodeName(), "group_index shape should be [E, 2] for group_list_type=2."),
+                    return ge::GRAPH_FAILED);
+            }
             hasGroupIndex_ = true;
         }
     }
-
-    // Get Attrs
-    if (GetAttr() == ge::GRAPH_FAILED) {
-        OPS_LOG_E(context_->GetNodeName(), "Get attr failed.");
-        return ge::GRAPH_FAILED;
-    }
+    OPS_ERR_IF((groupListType_ == GROUP_LIST_TYPE_PAIR && !hasGroupIndex_),
+        OPS_LOG_E(context_->GetNodeName(), "group_index is required when group_list_type is 2."),
+        return ge::GRAPH_FAILED);
 
     auto yDesc = context_->GetOutputDesc(OUTPUT_INDEX_Y);
     OPS_LOG_E_IF_NULL(context_, yDesc, return ge::GRAPH_FAILED);
@@ -270,6 +296,10 @@ ge::graphStatus SwigluGroupQuantTiling::CalcGroupIndexTiling()
             }
             if (gFactor_ > CACHE_LINE_SIZE / sizeof(int64_t)) {
                 gFactor_ = DownAlign(gFactor_, CACHE_LINE_SIZE / sizeof(int64_t));
+            }
+            // Pair layout requires an even gFactor so no [group_id, count] pair is split.
+            if (groupListType_ == GROUP_LIST_TYPE_PAIR && (gFactor_ & 1) != 0) {
+                gFactor_ = std::max<int64_t>(MIN_EVEN_GFACTOR, gFactor_ - 1);
             }
             gLoop_ = CeilDiv(g_, gFactor_);
             tailGFactor_ = g_ % gFactor_ == 0 ? gFactor_ : g_ % gFactor_;
@@ -608,6 +638,7 @@ void SwigluGroupQuantTiling::SetTilingData()
     tilingData_.set_tailGFactor(tailGFactor_);
     tilingData_.set_coreNum(coreNum_);
     tilingData_.set_hasClampLimit(hasClampLimit_);
+    tilingData_.set_groupListType(groupListType_);
 }
 
 ge::graphStatus SwigluGroupQuantTiling::CalcOpTiling() {

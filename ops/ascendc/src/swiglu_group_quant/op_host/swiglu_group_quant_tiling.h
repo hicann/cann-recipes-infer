@@ -67,6 +67,7 @@ TILING_DATA_FIELD_DEF(int64_t, gLoop);
 TILING_DATA_FIELD_DEF(int64_t, gFactor);
 TILING_DATA_FIELD_DEF(int64_t, tailGFactor);
 TILING_DATA_FIELD_DEF(int64_t, coreNum);
+TILING_DATA_FIELD_DEF(int64_t, groupListType);
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(SwigluGroupQuant, SwigluGroupQuantTilingData)
@@ -84,7 +85,7 @@ public:
     {
     }
     ~SwigluGroupQuantTiling() = default;
-    
+
     ge::graphStatus GetPlatformInfo();
     ge::graphStatus DoOpTiling();
     ge::graphStatus GetWorkspaceSize();
@@ -127,6 +128,7 @@ private:
     double clampLimit_ = 0.0;
     int64_t hasClampLimit_ = 0;
     int64_t outputOrigin_ = 0;
+    int64_t groupListType_ = 1;
     bool isMxFp4Quant_ = false;
     bool hasWeight_ = false;
     int64_t g_ = 0;
