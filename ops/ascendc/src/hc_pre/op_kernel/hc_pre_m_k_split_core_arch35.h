@@ -43,7 +43,7 @@ public:
         pipe->InitBuffer(l1Buffer, L1_ALLOC_SIZE);
         xL1_ = l1Buffer.Get<float>();
         wL1_ = l1Buffer.Get<float>()[L1_BUF_NUM * L1_BUF_OFFSET];
-        
+
         // InQue
         pipe->InitBuffer(xQue, 2, tilingData->mUbSize * RoundUp<T>(tilingData->kUbSize) * sizeof(T));
 
@@ -73,7 +73,7 @@ public:
         uint64_t mBlkDimIdx = curBlockIdx / tilingData->cubeBlockDimK;
         uint64_t kBlkDimIdx = curBlockIdx % tilingData->cubeBlockDimK;
 
-        // todo 移到tiling计算    
+        // todo 移到tiling计算
         uint64_t mCnt = CeilDiv(tilingData->bs, tilingData->mL1Size);
         uint64_t singleCoreMaxRound = CeilDiv(mCnt, tilingData->cubeBlockDimM);
         uint64_t mainCoreCount = mCnt % tilingData->cubeBlockDimM;
@@ -89,12 +89,13 @@ public:
         int64_t rmsGmBaseOffset = 0;
         if ASCEND_IS_AIV {
             int64_t aivCurBlockIdx = GetBlockIdx();
-            xGmBaseOffset = ((aivCurBlockIdx / 2) / tilingData->cubeBlockDimK) * singleCoreMaxRound * tilingData->mL1Size * tilingData->hcMult * tilingData->d + 
-                ((aivCurBlockIdx / 2) % tilingData->cubeBlockDimK) * tilingData->multCoreSplitKSize;
+            xGmBaseOffset = ((aivCurBlockIdx / 2) / tilingData->cubeBlockDimK) * singleCoreMaxRound *
+                            tilingData->mL1Size * tilingData->hcMult * tilingData->d +
+                            ((aivCurBlockIdx / 2) % tilingData->cubeBlockDimK) * tilingData->multCoreSplitKSize;
             rmsGmBaseOffset = ((aivCurBlockIdx / 2) / tilingData->cubeBlockDimK) * singleCoreMaxRound * tilingData->mL1Size;
         }
 
-        // todo 移到tiling计算        
+        // todo 移到tiling计算
         int64_t xSplitOffset = 0;
         int64_t rmsSplitOffset = 0;
         // m轴切分 按照0 0 1 1..分核
@@ -105,7 +106,7 @@ public:
         } else {
             curAicBlockIdx = curBlockIdx / 2;
         }
- 
+
         if (curAicBlockIdx < tilingData->cubeBlockDimK * tilingData->cubeBlockDimM) {
             if ASCEND_IS_AIV {
                 SetFlag<HardEvent::MTE3_V>(static_cast<event_t>(0));
@@ -115,7 +116,7 @@ public:
             {
                 uint64_t mL1RealSize = AscendC::Std::min(tilingData->bs - mGmOffset, (uint64_t)tilingData->mL1Size);
                 uint64_t kGmStartOffset = 0;
-                uint64_t kGmEndOffset = AscendC::Std::min(tilingData->multCoreSplitKSize, 
+                uint64_t kGmEndOffset = AscendC::Std::min(tilingData->multCoreSplitKSize,
                     tilingData->k -  (curAicBlockIdx % tilingData->cubeBlockDimK) * tilingData->multCoreSplitKSize);
                 if ASCEND_IS_AIV {
                     if (GetBlockIdx() % 2 != 0) {
@@ -131,16 +132,20 @@ public:
                     if ASCEND_IS_AIC {
                         bool isFirstKL1 = kGmOffset == kGmStartOffset;
                         bool isLastKL1 = (kGmOffset + tilingData->kL1Size) >= kGmEndOffset;
-                        mmService_.CopyInB1Nd2Nz(tilingData->hcMult * tilingData->d, kL1RealSize, 
-                                                tilingData->hcMix, hcFnGm[kGmOffset + kBlkDimIdx * tilingData->multCoreSplitKSize], 
-                                                wL1_[mmService_.GetBL1BufferId() * L1_BUF_OFFSET]);
+                        mmService_.CopyInB1Nd2Nz(
+                            tilingData->hcMult * tilingData->d, kL1RealSize, tilingData->hcMix,
+                            hcFnGm[kGmOffset + kBlkDimIdx * tilingData->multCoreSplitKSize],
+                            wL1_[mmService_.GetBL1BufferId() * L1_BUF_OFFSET]);
                         CrossCoreWaitFlag<SYNC_MODE4, PIPE_MTE1>(SYNC_AIV_AIC_FLAG + FLAG_ID_MAX);
                         CrossCoreWaitFlag<SYNC_MODE4, PIPE_MTE1>(SYNC_AIV_AIC_FLAG);
                         uint64_t mL1AlignSize = Align(mL1RealSize, AscendC::BLOCK_CUBE);
                         uint64_t nL1AlignSize = Align((uint64_t)tilingData->hcMix, AscendC::BLOCK_CUBE);
 
-                        mmService_.Process(tilingData->bs, tilingData->hcMix, mL1RealSize, (256 / AscendC::Std::max(mL1AlignSize, nL1AlignSize)) * 32, 
-                                        isFirstKL1, isLastKL1, xL1_[aL1BufferID_ * L1_BUF_OFFSET], wL1_[mmService_.GetBL1BufferId() * L1_BUF_OFFSET]);
+                        mmService_.Process(
+                            tilingData->bs, tilingData->hcMix, mL1RealSize,
+                            (256 / AscendC::Std::max(mL1AlignSize, nL1AlignSize)) * 32,
+                            isFirstKL1, isLastKL1, xL1_[aL1BufferID_ * L1_BUF_OFFSET],
+                            wL1_[mmService_.GetBL1BufferId() * L1_BUF_OFFSET]);
                         if (isLastKL1) {
                             mmService_.CopyOut(mmGm[mBlkDimIdx * tilingData->mL1Size * singleCoreMaxRound * tilingData->hcMix + kBlkDimIdx * tilingData->bs * tilingData->hcMix + roundIdx * tilingData->mL1Size]);
                         }
@@ -171,7 +176,7 @@ public:
                                 VFProcessCastAndInvRmsPart1<T, true>(rmsNormLocal, xCastLocal, xLocal, coeff, curRowFactor, kRealSize);
                             }
                             xQue.template FreeTensor(xLocal);
-                            
+
                             WaitFlag<HardEvent::MTE3_V>(static_cast<event_t>(bufferIdx & 1));
                             VFTransND2NZ(xNd2NzLocal[nd2NzBufSize * (bufferIdx & 1)], xCastLocal, curRowFactor, kRealSize);
                             SetFlag<HardEvent::V_MTE3>(static_cast<event_t>(bufferIdx & 1));
@@ -264,7 +269,7 @@ public:
     {}
 
     __aicore__ inline void Init(
-        GM_ADDR x, GM_ADDR hcScale, GM_ADDR hcBase, GM_ADDR preMix, GM_ADDR y, GM_ADDR post,
+        GM_ADDR x, GM_ADDR hcScale, GM_ADDR hcBase, GM_ADDR y, GM_ADDR post,
         GM_ADDR combFrag, GM_ADDR pre, GM_ADDR workspace, const HcPreTilingData* tilingDataPtr, TPipe* pipePtr)
     {
         pipe = pipePtr;
@@ -276,11 +281,7 @@ public:
         yGm.SetGlobalBuffer((__gm__ T*)y);
         postGm.SetGlobalBuffer((__gm__ float*)post);
         combFragGm.SetGlobalBuffer((__gm__ float*)combFrag);
-        hasPreMix_ = (preMix != nullptr);
         hasPreOut_ = (pre != nullptr);
-        if (hasPreMix_) {
-            preMixGm.SetGlobalBuffer((__gm__ float*)preMix);
-        }
         if (hasPreOut_) {
             preGm.SetGlobalBuffer((__gm__ float*)pre);
         }
@@ -288,19 +289,14 @@ public:
         mmGm.SetGlobalBuffer((__gm__ float*)workspace);
         rmsGm.SetGlobalBuffer((__gm__ float*)workspace + tilingData->kBlockFactor * tilingData->bs * tilingData->hcMix);
 
-
         // InQue
         pipe->InitBuffer(
             xQue, 2, tilingData->stage2RowFactor * tilingData->hcMult * RoundUp<T>(tilingData->dFactor) * sizeof(T));
-        int64_t rmsAndmmQueSize = tilingData->kBlockFactor * RoundUp<float>(tilingData->stage2RowFactor) * sizeof(float) + 
-                                  tilingData->kBlockFactor * tilingData->stage2RowFactor * RoundUp<float>(tilingData->hcMix) * sizeof(float);
+        int64_t rmsAndmmQueSize = tilingData->kBlockFactor * RoundUp<float>(tilingData->stage2RowFactor) *
+                                  sizeof(float) + tilingData->kBlockFactor * tilingData->stage2RowFactor *
+                                  RoundUp<float>(tilingData->hcMix) * sizeof(float);
         pipe->InitBuffer(rmsAndmmQue, 2, rmsAndmmQueSize);
 
-        // 可选输入pre_mix使用独立的UB空间，由TQue管理MTE2->V同步；未传入时跳过分配
-        if (hasPreMix_) {
-            pipe->InitBuffer(preMixQue, DOUBLE_BUFFER,
-                             tilingData->stage2RowFactor * RoundUp<float>(tilingData->hcMix) * sizeof(float));
-        }
         // 可选输出pre使用独立UB空间（hcMultAlign行距紧凑布局），TQue double buffer
         // 管理V->MTE3同步，MTE3搬出与下一轮V计算重叠；未请求输出时跳过分配
         if (hasPreOut_) {
@@ -362,25 +358,12 @@ public:
 
                 rmsAndmmQue.EnQue(rmsAndmmLocal);
                 rmsAndmmLocal = rmsAndmmQue.DeQue<float>();
-                
+
                 VFProcessInvRmsPart3WithGroupReduce(mixesLocal, rmsAndmmLocal, rmsAndmmLocal[mmLocalSize], tilingData->normEps, tilingData->kBlockFactor, curRowFactor, tilingData->hcMix);
 
-                if (hasPreMix_) {
-                    preMixLocal = preMixQue.AllocTensor<float>();
-                    // pre_mix与post同为[bs, hcMult]，复用post的GM偏移；加载后按hcMixAlign行距排布
-                    CopyInWithUbStride(
-                        preMixGm[curBlockIdx * tilingData->rowOfFormerBlock * tilingData->hcMult +
-                                 rowOuterIdx * tilingData->stage2RowFactor * tilingData->hcMult],
-                        preMixLocal, curRowFactor, tilingData->hcMult, 0, ubRowGapBlocks_);
-                    preMixQue.EnQue(preMixLocal);
-                }
-
-                // 内部pre仅在需要输出或未传入pre_mix(用于y计算)时计算
-                if (hasPreOut_ || !hasPreMix_) {
-                    VFProcessPre(
-                        mixesLocal, mixesLocal, hcBase0Local, hcScaleGm.GetValue(0), tilingData->hcEps,
-                        curRowFactor, tilingData->hcMult, tilingData->hcMix);
-                }
+                VFProcessPre(
+                    mixesLocal, mixesLocal, hcBase0Local, hcScaleGm.GetValue(0), tilingData->hcEps,
+                    curRowFactor, tilingData->hcMult, tilingData->hcMix);
                 if (hasPreOut_) {
                     // pre与post同为[bs, hcMult]，复用post的GM偏移；先将mixesLocal行首的hcMult个
                     // 元素按hcMixAlign行距聚拢到preLocal(hcMultAlign行距)，再经TQue异步搬出
@@ -394,9 +377,6 @@ public:
                             curRowFactor, tilingData->hcMult);
                     preQue.FreeTensor(preLocal);
                 }
-                if (hasPreMix_) {
-                    preMixLocal = preMixQue.DeQue<float>();
-                }
                 for (int64_t dLoopIdx = 0; dLoopIdx < tilingData->dLoop; dLoopIdx++) {
                     int64_t curDFactor =
                         (dLoopIdx == tilingData->dLoop - 1) ? tilingData->tailDFactor : tilingData->dFactor;
@@ -407,10 +387,9 @@ public:
                         xLocal, curRowFactor * tilingData->hcMult, curDFactor, tilingData->d - curDFactor);
                     xQue.template EnQue(xLocal);
                     xLocal = xQue.template DeQue<T>();
-                    
+
                     yLocal = yQue.template AllocTensor<T>();
-                    // pre_mix传入时y的加权求和使用pre_mix(布局与mixesLocal一致)，否则使用本轮计算的pre
-                    VFProcessY(yLocal, hasPreMix_ ? preMixLocal : mixesLocal, xLocal, curRowFactor, tilingData->hcMult,
+                    VFProcessY(yLocal, mixesLocal, xLocal, curRowFactor, tilingData->hcMult,
                                curDFactor, tilingData->hcMix);
                     xQue.template FreeTensor(xLocal);
                     yQue.template EnQue(yLocal);
@@ -418,10 +397,6 @@ public:
                     CopyOut(yLocal, yGm[curBlockIdx * tilingData->rowOfFormerBlock * tilingData->d + rowOuterIdx * tilingData->stage2RowFactor * tilingData->d + dLoopIdx * tilingData->dFactor], curRowFactor, curDFactor, tilingData->d - curDFactor);
                     yQue.template FreeTensor(yLocal);
                 }
-                if (hasPreMix_) {
-                    preMixQue.FreeTensor(preMixLocal);
-                }
-
                 // post
                 postLocal = postQue.AllocTensor<float>();
                 VFProcessPost(
@@ -460,7 +435,6 @@ private:
     GlobalTensor<T> yGm;
     GlobalTensor<float> postGm;
     GlobalTensor<float> combFragGm;
-    GlobalTensor<float> preMixGm;
     GlobalTensor<float> preGm;
 
     GlobalTensor<float> mmGm;
@@ -468,7 +442,6 @@ private:
 
     TQue<QuePosition::VECIN, 1> rmsAndmmQue;
     TQue<QuePosition::VECIN, 1> xQue;
-    TQue<QuePosition::VECIN, 1> preMixQue;
     TQue<QuePosition::VECOUT, 1> preQue;
 
     TQue<QuePosition::VECOUT, 1> yQue;
@@ -489,9 +462,7 @@ private:
     LocalTensor<float> hcBase0Local;
     LocalTensor<float> hcBase1Local;
     LocalTensor<float> hcBase2Local;
-    LocalTensor<float> preMixLocal;
     LocalTensor<float> preLocal;
-    bool hasPreMix_ = false;
     bool hasPreOut_ = false;
     uint32_t ubRowGapBlocks_ = 0;
 };

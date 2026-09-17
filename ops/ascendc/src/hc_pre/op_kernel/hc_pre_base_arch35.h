@@ -230,11 +230,11 @@ __aicore__ inline void VFProcessCast(const LocalTensor<float> &yLocal, const Loc
             }
         }
     }
-    
 }
 
 template <typename T, bool WithUbReduce = false>
-__aicore__ inline void VFProcessCastAndInvRmsPart1(const LocalTensor<float> &rmsNormLocal, const LocalTensor<float> &xCastLocal, 
+__aicore__ inline void VFProcessCastAndInvRmsPart1(const LocalTensor<float> &rmsNormLocal,
+                                                   const LocalTensor<float> &xCastLocal,
                                                    const LocalTensor<T> &xLocal, float coeff,
                                                    const uint16_t curRowNum, const uint16_t curColNum)
 {
@@ -263,7 +263,7 @@ __aicore__ inline void VFProcessCastAndInvRmsPart1(const LocalTensor<float> &rms
                 }
                 sreg = curColNum;
                 for (uint16_t j = 0; j < loopCount; j++) {
-                    pregLoop = UpdateMask<float>(sreg); 
+                    pregLoop = UpdateMask<float>(sreg);
                     LoadInputData(x, xLocalAddr, pregLoop, i * curColNumAlign + j * VL_FP32);
                     Mul(x1, x, x, pregLoop);
                     Add(sum, sum, x1, pregMain);
@@ -278,7 +278,6 @@ __aicore__ inline void VFProcessCastAndInvRmsPart1(const LocalTensor<float> &rms
                     DataCopy<float, AscendC::MicroAPI::StoreDist::DIST_FIRST_ELEMENT_B32>(rmsNormLocalAddr + i, sum, pregMerge);
                 }
             }
-
         }
     } else {
         __VEC_SCOPE__
@@ -314,6 +313,101 @@ __aicore__ inline void VFProcessCastAndInvRmsPart1(const LocalTensor<float> &rms
     }
 }
 
+template <typename T, bool WithRmsReduce, bool WithYReduce>
+__aicore__ inline void VFProcessCastInvRmsAndPremixYPart1(
+    const LocalTensor<float> &rmsNormLocal, const LocalTensor<float> &yAccLocal,
+    const LocalTensor<float> &xCastLocal, const LocalTensor<float> &preMixLocal,
+    const LocalTensor<T> &xLocal, float coeff, uint16_t preMixColIdx,
+    uint16_t preMixRowStride, uint16_t yAccRowStride,
+    uint16_t curRowNum, uint16_t curColNum)
+{
+    __local_mem__ float *rmsAddr = (__local_mem__ float *)rmsNormLocal.GetPhyAddr();
+    __local_mem__ float *yAccAddr = (__local_mem__ float *)yAccLocal.GetPhyAddr();
+    __local_mem__ float *xCastAddr = (__local_mem__ float *)xCastLocal.GetPhyAddr();
+    __local_mem__ float *preMixAddr = (__local_mem__ float *)preMixLocal.GetPhyAddr();
+    __local_mem__ T *xAddr = (__local_mem__ T *)xLocal.GetPhyAddr();
+    uint16_t loopCount = CeilDiv(curColNum, VL_FP32);
+    uint16_t xRowStride = RoundUp<T>(curColNum);
+    uint16_t floatRowStride = RoundUp<float>(curColNum);
+    uint16_t castRowStride = floatRowStride + BLOCK_SIZE / sizeof(float);
+
+    __VEC_SCOPE__
+    {
+        RegTensor<float> x;
+        RegTensor<float> xSquare;
+        RegTensor<float> squareSum;
+        RegTensor<float> rmsOld;
+        RegTensor<float> mix;
+        RegTensor<float> weightedX;
+        RegTensor<float> yAcc;
+        MaskReg pregLoop;
+        MaskReg pregFull = CreateMask<float>();
+        MaskReg pregScalar = CreateMask<float, AscendC::MicroAPI::MaskPattern::VL1>();
+        uint32_t sreg;
+        for (uint16_t i = 0; i < curRowNum; i++) {
+            Duplicate(squareSum, 0.0f, pregFull);
+            if constexpr (WithRmsReduce) {
+                LoadInputDataWithBrc<float>(rmsOld, rmsAddr, pregScalar, i);
+            }
+            sreg = curColNum;
+            for (uint16_t j = 0; j < loopCount; j++) {
+                pregLoop = UpdateMask<float>(sreg);
+                uint32_t xOffset = i * xRowStride + j * VL_FP32;
+                uint32_t yAccOffset = i * yAccRowStride + j * VL_FP32;
+                LoadInputData<T>(x, xAddr, pregLoop, xOffset);
+                StoreOutputData<float>(xCastAddr, x, pregLoop,
+                                       i * castRowStride + j * VL_FP32);
+
+                Mul(xSquare, x, x, pregLoop);
+                Add(squareSum, squareSum, xSquare, pregLoop);
+
+                LoadInputDataWithBrc<float>(
+                    mix, preMixAddr, pregLoop, i * preMixRowStride + preMixColIdx);
+                Mul(weightedX, mix, x, pregLoop);
+                if constexpr (WithYReduce) {
+                    LoadInputData<float>(yAcc, yAccAddr, pregLoop, yAccOffset);
+                } else {
+                    Duplicate(yAcc, 0.0f, pregLoop);
+                }
+                Add(yAcc, yAcc, weightedX, pregLoop);
+                StoreOutputData<float>(yAccAddr, yAcc, pregLoop, yAccOffset);
+            }
+            Muls(squareSum, squareSum, coeff, pregFull);
+            ReduceSum(squareSum, squareSum, pregFull);
+            if constexpr (WithRmsReduce) {
+                Add(squareSum, rmsOld, squareSum, pregScalar);
+            }
+            DataCopy<float, AscendC::MicroAPI::StoreDist::DIST_FIRST_ELEMENT_B32>(
+                rmsAddr + i, squareSum, pregScalar);
+        }
+    }
+}
+
+template <typename T>
+__aicore__ inline void VFProcessPremixYCast(const LocalTensor<T> &yLocal,
+                                            const LocalTensor<float> &yAccLocal,
+                                            uint16_t yAccRowStride,
+                                            uint16_t curRowNum, uint16_t curColNum)
+{
+    __local_mem__ T *yAddr = (__local_mem__ T *)yLocal.GetPhyAddr();
+    __local_mem__ float *yAccAddr = (__local_mem__ float *)yAccLocal.GetPhyAddr();
+    uint16_t loopCount = CeilDiv(curColNum, VL_FP32);
+    uint16_t dstRowStride = RoundUp<T>(curColNum);
+    __VEC_SCOPE__
+    {
+        RegTensor<float> y;
+        MaskReg pregLoop;
+        uint32_t sreg;
+        for (uint16_t i = 0; i < curRowNum; i++) {
+            sreg = curColNum;
+            for (uint16_t j = 0; j < loopCount; j++) {
+                pregLoop = UpdateMask<float>(sreg);
+                LoadInputData<float>(y, yAccAddr, pregLoop, i * yAccRowStride + j * VL_FP32);
+                StoreOutputData<T>(yAddr, y, pregLoop, i * dstRowStride + j * VL_FP32);
+            }
+        }
+    }
+}
 
 template <bool WithUbReduce = false>
 __aicore__ inline void VFProcessInvRmsPart1(const LocalTensor<float> &yLocal, const LocalTensor<float> &xLocal,
@@ -342,7 +436,7 @@ __aicore__ inline void VFProcessInvRmsPart1(const LocalTensor<float> &yLocal, co
                 }
                 sreg = curColNum;
                 for (uint16_t j = 0; j < loopCount; j++) {
-                    pregLoop = UpdateMask<float>(sreg); 
+                    pregLoop = UpdateMask<float>(sreg);
                     LoadInputData(x, xLocalAddr, pregLoop, i * curColNumAlign + j * VL_FP32);
                     Mul(x, x, x, pregLoop);
                     Add(sum, sum, x, pregMain);
@@ -385,7 +479,7 @@ __aicore__ inline void VFProcessInvRmsPart1(const LocalTensor<float> &yLocal, co
                     DataCopy<float, AscendC::MicroAPI::StoreDist::DIST_FIRST_ELEMENT_B32>(yLocalAddr + i, sum, pregMerge);
                 }
             }
-        }  
+        }
     }
 }
 
@@ -420,13 +514,6 @@ __aicore__ inline void VFProcessInvRmsPart2(const LocalTensor<float> &yLocal, co
 
 
 // (k, bs, hc_mix) * (k, bs, 1) = (bs, hc_mix)
-// for循环组织形式如下:
-/*
-    for (i, 0, bs)
-        
-        for (j, 0, k)
-            for (h, 0, hc_mix)
-*/
 // hcMix小于64，因此直接去掉内层for循环
 __aicore__ inline void VFProcessInvRmsPart3WithGroupReduce(const LocalTensor<float> &yLocal,
                                                            const LocalTensor<float> &mmLocal,
@@ -548,14 +635,14 @@ __aicore__ inline void VFProcessInvRmsPart3WithGroupReduce(const LocalTensor<flo
                 StoreOutputData(yLocalAddr, y, pregLoop, i * hcMixAlign);
             }
         }
-    } 
+    }
 }
 
 
 __aicore__ inline void VFProcessInvRmsPart3(const LocalTensor<float> &yLocal,
                                             const LocalTensor<float> &mmLocal,
                                             const LocalTensor<float> &xLocal, float eps,
-                                            uint16_t bs, uint32_t hcMix) 
+                                            uint16_t bs, uint32_t hcMix)
 {
     __local_mem__ float *yLocalAddr = (__local_mem__ float *)yLocal.GetPhyAddr();
     __local_mem__ float *mmLocalAddr = (__local_mem__ float *)mmLocal.GetPhyAddr();
@@ -1004,6 +1091,158 @@ __aicore__ inline void VFProcessCombFragPacked(const LocalTensor<float> &combFra
             DataCopyScatter(oBase + 1 * R, mix1, (RegTensor<uint32_t> &)sIdx, preg);
             DataCopyScatter(oBase + 2 * R, mix2, (RegTensor<uint32_t> &)sIdx, preg);
             DataCopyScatter(oBase + 3 * R, mix3, (RegTensor<uint32_t> &)sIdx, preg);
+        }
+    }
+}
+
+template <bool Pairwise>
+__aicore__ inline void VFElementMajorSum(RegTensor<float> &sum, RegTensor<float> &a, RegTensor<float> &b,
+                                         RegTensor<float> &c, RegTensor<float> &d, MaskReg &mask)
+{
+    Add(sum, a, b, mask);
+    if constexpr (Pairwise) {
+        RegTensor<float> tail;
+        Add(tail, c, d, mask);
+        Add(sum, sum, tail, mask);
+    } else {
+        Add(sum, sum, c, mask);
+        Add(sum, sum, d, mask);
+    }
+}
+
+template <bool Pairwise>
+__aicore__ inline void VFElementMajorNormalize(RegTensor<float> &a, RegTensor<float> &b, RegTensor<float> &c,
+                                               RegTensor<float> &d, float eps, MaskReg &mask)
+{
+    RegTensor<float> sum;
+    VFElementMajorSum<Pairwise>(sum, a, b, c, d, mask);
+    Adds(sum, sum, eps, mask);
+    Div(a, a, sum, mask);
+    Div(b, b, sum, mask);
+    Div(c, c, sum, mask);
+    Div(d, d, sum, mask);
+}
+
+__aicore__ inline void VFElementMajorSoftmax(RegTensor<float> &a, RegTensor<float> &b, RegTensor<float> &c,
+                                             RegTensor<float> &d, float eps, MaskReg &mask)
+{
+    RegTensor<float> maximum;
+    RegTensor<float> tail;
+    RegTensor<float> sum;
+    Max(maximum, a, b, mask);
+    Max(tail, c, d, mask);
+    Max(maximum, maximum, tail, mask);
+    Sub(a, a, maximum, mask);
+    Sub(b, b, maximum, mask);
+    Sub(c, c, maximum, mask);
+    Sub(d, d, maximum, mask);
+    Exp(a, a, mask);
+    Exp(b, b, mask);
+    Exp(c, c, mask);
+    Exp(d, d, mask);
+    VFElementMajorSum<true>(sum, a, b, c, d, mask);
+    Div(a, a, sum, mask);
+    Div(b, b, sum, mask);
+    Div(c, c, sum, mask);
+    Div(d, d, sum, mask);
+    Adds(a, a, eps, mask);
+    Adds(b, b, eps, mask);
+    Adds(c, c, eps, mask);
+    Adds(d, d, eps, mask);
+}
+
+template <uint32_t Element>
+__aicore__ inline void VFElementMajorLoad(RegTensor<float> &value, __local_mem__ float *input,
+                                          __local_mem__ float *bias, RegTensor<uint32_t> &index,
+                                          float scale, MaskReg &mask)
+{
+    RegTensor<float> base;
+    Gather(value, input + Element, index, mask);
+    LoadAlign<float, LoadDist::DIST_BRC_B32>(base, bias + Element / 4 * C0_SIZE + Element % 4);
+    Muls(value, value, scale, mask);
+    Add(value, value, base, mask);
+}
+
+// mixesLocal has a 24-float input row; its 16-float output rows may reuse the same UB.
+__aicore__ inline void VFProcessCombFragPremixElementMajor(const LocalTensor<float> &mixesLocal,
+                                                           const LocalTensor<float> &bias, float scale, float eps,
+                                                           uint16_t iters, uint16_t rows, uint16_t hcMix)
+{
+    __local_mem__ float *mixAddr = (__local_mem__ float *)mixesLocal.GetPhyAddr();
+    __local_mem__ float *biasAddr = (__local_mem__ float *)bias.GetPhyAddr();
+    const uint32_t inputStride = RoundUp<float>(hcMix);
+    const uint16_t loops = CeilDiv(rows, VL_FP32);
+    __VEC_SCOPE__
+    {
+        RegTensor<uint32_t> lane;
+        RegTensor<uint32_t> inputIndex;
+        RegTensor<uint32_t> outputIndex;
+        MaskReg fullMask = CreateMask<float>();
+        Arange((RegTensor<int32_t> &)lane, static_cast<int32_t>(0));
+        Muls(inputIndex, lane, inputStride, fullMask);
+        Muls(outputIndex, lane, static_cast<uint32_t>(16), fullMask);
+        uint32_t remaining = rows;
+        for (uint16_t batch = 0; batch < loops; ++batch) {
+            MaskReg mask = UpdateMask<float>(remaining);
+            __local_mem__ float *input = mixAddr + batch * VL_FP32 * inputStride + 8;
+            RegTensor<float> m00, m01, m02, m03;
+            RegTensor<float> m10, m11, m12, m13;
+            RegTensor<float> m20, m21, m22, m23;
+            RegTensor<float> m30, m31, m32, m33;
+            VFElementMajorLoad<0>(m00, input, biasAddr, inputIndex, scale, mask);
+            VFElementMajorLoad<1>(m01, input, biasAddr, inputIndex, scale, mask);
+            VFElementMajorLoad<2>(m02, input, biasAddr, inputIndex, scale, mask);
+            VFElementMajorLoad<3>(m03, input, biasAddr, inputIndex, scale, mask);
+            VFElementMajorLoad<4>(m10, input, biasAddr, inputIndex, scale, mask);
+            VFElementMajorLoad<5>(m11, input, biasAddr, inputIndex, scale, mask);
+            VFElementMajorLoad<6>(m12, input, biasAddr, inputIndex, scale, mask);
+            VFElementMajorLoad<7>(m13, input, biasAddr, inputIndex, scale, mask);
+            VFElementMajorLoad<8>(m20, input, biasAddr, inputIndex, scale, mask);
+            VFElementMajorLoad<9>(m21, input, biasAddr, inputIndex, scale, mask);
+            VFElementMajorLoad<10>(m22, input, biasAddr, inputIndex, scale, mask);
+            VFElementMajorLoad<11>(m23, input, biasAddr, inputIndex, scale, mask);
+            VFElementMajorLoad<12>(m30, input, biasAddr, inputIndex, scale, mask);
+            VFElementMajorLoad<13>(m31, input, biasAddr, inputIndex, scale, mask);
+            VFElementMajorLoad<14>(m32, input, biasAddr, inputIndex, scale, mask);
+            VFElementMajorLoad<15>(m33, input, biasAddr, inputIndex, scale, mask);
+
+            VFElementMajorSoftmax(m00, m01, m02, m03, eps, mask);
+            VFElementMajorSoftmax(m10, m11, m12, m13, eps, mask);
+            VFElementMajorSoftmax(m20, m21, m22, m23, eps, mask);
+            VFElementMajorSoftmax(m30, m31, m32, m33, eps, mask);
+            VFElementMajorNormalize<false>(m00, m10, m20, m30, eps, mask);
+            VFElementMajorNormalize<false>(m01, m11, m21, m31, eps, mask);
+            VFElementMajorNormalize<false>(m02, m12, m22, m32, eps, mask);
+            VFElementMajorNormalize<false>(m03, m13, m23, m33, eps, mask);
+            for (uint16_t iter = 0; iter < iters; ++iter) {
+                VFElementMajorNormalize<true>(m00, m01, m02, m03, eps, mask);
+                VFElementMajorNormalize<true>(m10, m11, m12, m13, eps, mask);
+                VFElementMajorNormalize<true>(m20, m21, m22, m23, eps, mask);
+                VFElementMajorNormalize<true>(m30, m31, m32, m33, eps, mask);
+                VFElementMajorNormalize<false>(m00, m10, m20, m30, eps, mask);
+                VFElementMajorNormalize<false>(m01, m11, m21, m31, eps, mask);
+                VFElementMajorNormalize<false>(m02, m12, m22, m32, eps, mask);
+                VFElementMajorNormalize<false>(m03, m13, m23, m33, eps, mask);
+            }
+
+            // All input lanes are resident before compacting this batch in place.
+            __local_mem__ float *output = mixAddr + batch * VL_FP32 * 16;
+            Scatter(output + 0, m00, outputIndex, mask);
+            Scatter(output + 1, m01, outputIndex, mask);
+            Scatter(output + 2, m02, outputIndex, mask);
+            Scatter(output + 3, m03, outputIndex, mask);
+            Scatter(output + 4, m10, outputIndex, mask);
+            Scatter(output + 5, m11, outputIndex, mask);
+            Scatter(output + 6, m12, outputIndex, mask);
+            Scatter(output + 7, m13, outputIndex, mask);
+            Scatter(output + 8, m20, outputIndex, mask);
+            Scatter(output + 9, m21, outputIndex, mask);
+            Scatter(output + 10, m22, outputIndex, mask);
+            Scatter(output + 11, m23, outputIndex, mask);
+            Scatter(output + 12, m30, outputIndex, mask);
+            Scatter(output + 13, m31, outputIndex, mask);
+            Scatter(output + 14, m32, outputIndex, mask);
+            Scatter(output + 15, m33, outputIndex, mask);
         }
     }
 }
