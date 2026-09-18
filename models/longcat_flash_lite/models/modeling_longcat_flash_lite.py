@@ -42,9 +42,8 @@ from module.linear import (
 from module.fuse_moe_gmm import FusedMoEGMM
 from executor.model_loader.weight_utils import default_weight_loader
 from executor.utils import calc_moe_hccl_buffer_size, get_init_attn_mask
-from executor.utils.common_utils import (
-    npu_stream_switch, limit_core_num, npu_wait_tensor,
-)
+from executor.utils.common_utils import npu_stream_switch, npu_wait_tensor
+from executor.utils.stream_utils import limit_core_num
 from .configuration_longcat_flash_lite import LongcatFlashNgramConfig
 
 
@@ -1100,6 +1099,7 @@ class LongcatFlashDecoderLayer(nn.Module):
         super().__init__()
         self.layer_idx = layer_idx
         self.hidden_size = config.hidden_size
+        self.exe_mode = infer_config.model_config.exe_mode
 
         # MoE multi-stream overlap (Plan-A): hide MoE (dispatch+GMM+combine)
         # behind sub-layer 1 (dense_a + mla[1] + dense_b) on a side stream,
@@ -1166,12 +1166,16 @@ class LongcatFlashDecoderLayer(nn.Module):
 
         # -- MoE on side stream, sub-layer 1 on main stream (merge at three-way add) --
         with npu_stream_switch(moe_overlap, "moe"):
-            with limit_core_num(_limit_core_active, self._moe_aic_num, self._moe_aiv_num):
+            with limit_core_num(
+                _limit_core_active, self._moe_aic_num, self._moe_aiv_num, exe_mode=self.exe_mode
+            ):
                 hidden_states = npu_wait_tensor(moe_overlap, hidden_states, residual)
                 shortcut_mlp_output = self.mlp(hidden_states, is_prefill=is_prefill)
 
         # Main stream: sub-layer 1, limit-core split so it overlaps the MoE side stream.
-        with limit_core_num(_limit_core_active, self._main_aic_num, self._main_aiv_num):
+        with limit_core_num(
+            _limit_core_active, self._main_aic_num, self._main_aiv_num, exe_mode=self.exe_mode
+        ):
             hidden_states = self.mlps[0](hidden_states)
             hidden_states, residual = self.input_layernorm[1](hidden_states, residual)
             hidden_states = self.self_attn[1](

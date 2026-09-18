@@ -68,6 +68,18 @@ def npu_stream_switch_gegraph(switch_flag: bool, stream_tag: str, stream_priorit
         return FakeContextManager()
 
 
+def limit_core_num(switch_flag: bool, aic_num: str, aiv_num: str,
+                   exe_mode: Optional[str] = None):
+    if not switch_flag:
+        return FakeContextManager()
+
+    if exe_mode == "npugraph_ex":
+        return torch.npu.npugraph_ex.scope.limit_core_num(int(aic_num), int(aiv_num))
+    if exe_mode == "ge_graph":
+        return tng.scope.limit_core_num(int(aic_num), int(aiv_num))
+    return FakeContextManager()
+
+
 def record_event(switch_flag: bool, events: tuple, idx: int, exe_mode: Optional[str] = None):
     """Records the specified NPU event if switch_flag is True."""
     if use_native_stream_api(switch_flag, exe_mode):
@@ -107,7 +119,7 @@ def wait_tensor(
 ):
     """
     Controls multi-stream execution synchronization during graph execution.
-    Forces the consumer op (associated with 'self') to wait for the completion 
+    Forces the consumer op (associated with 'self') to wait for the completion
     of the producer op (associated with 'dependency') to ensure correct temporal ordering.
     """
     if switch_flag and exe_mode == "ge_graph":

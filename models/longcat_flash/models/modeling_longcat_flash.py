@@ -40,9 +40,9 @@ from transformers.modeling_utils import PreTrainedModel
 from transformers.processing_utils import Unpack
 from transformers.utils import logging
 
-from executor.utils import align_up, calc_moe_hccl_buffer_size, limit_core_num, superkernel_scope, npu_prefetch
+from executor.utils import align_up, calc_moe_hccl_buffer_size, superkernel_scope, npu_prefetch
 from executor.utils.stream_utils import (npu_stream_switch, npu_stream_switch_gegraph, record_event,
-                                         record_stream, wait_event)
+                                         record_stream, wait_event, limit_core_num)
 from module.linear import (
     ColumnParallelLinear,
     ReplicatedLinear,
@@ -1358,6 +1358,7 @@ class LongcatFlashDecoderLayer(GradientCheckpointingLayer):
     ) -> tuple[torch.FloatTensor, Optional[tuple[torch.FloatTensor, torch.FloatTensor]]]:
         residual = past_residual
         route_prefetch = self.npugraph_prefetch_stream is not None
+        exe_mode = self.infer_config.model_config.exe_mode
         with superkernel_scope(self.enable_superkernel, f"scope_{self.layer_idx}_part1", ""):
             hidden_states, residual = self.input_layernorm[0](hidden_states, residual)
             attn_ret = self.self_attn[0].forward_page_attention_absorb(
@@ -1396,7 +1397,7 @@ class LongcatFlashDecoderLayer(GradientCheckpointingLayer):
             with stream_ctx:
                 if use_npugraph_event:
                     wait_event(use_npugraph_event, self.npugraph_moe_events, 0)
-                with limit_core_num(True, self.aic_num1, self.aiv_num1):
+                with limit_core_num(True, self.aic_num1, self.aiv_num1, exe_mode=exe_mode):
                     with superkernel_scope(self.enable_superkernel, f"scope_{self.layer_idx}_part2_moe", ""):
                         shortcut_mlp_output = self.mlp(hidden_states_norm, is_prefill, cur_topk_list=cur_topk_list)
                 if use_npugraph_event:
@@ -1408,7 +1409,7 @@ class LongcatFlashDecoderLayer(GradientCheckpointingLayer):
             if not defer_afd_recv:
                 dist.recv(shortcut_mlp_output, src=(self.global_rank - self.ffn_world_size), tag=self.recv_tag)
 
-        with limit_core_num(not self.enable_afd, self.aic_num2, self.aiv_num2):
+        with limit_core_num(not self.enable_afd, self.aic_num2, self.aiv_num2, exe_mode=exe_mode):
             with superkernel_scope(self.enable_superkernel, f"scope_{self.layer_idx}_part2_main", ""):
 
                 if route_prefetch and self.enable_prefetch:
