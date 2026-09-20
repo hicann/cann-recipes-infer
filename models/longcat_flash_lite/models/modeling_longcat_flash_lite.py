@@ -30,7 +30,7 @@ import torchair as tng
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 
 from executor.utils.forward_metadata import ForwardMetaData
-from executor.core.config import InferenceConfig, CommManager
+from executor.core.config import InferenceConfig, CommManager, PlatformVersion
 from executor.core.kv_cache.cache_info import CacheEntry, LayerCacheInfo, ModelCacheInfo
 from module.linear import (
     ColumnParallelLinear,
@@ -47,7 +47,26 @@ from executor.utils.stream_utils import limit_core_num
 from .configuration_longcat_flash_lite import LongcatFlashNgramConfig
 
 
+# A2 MC2 dispatch_v2 supports at most 24 routed experts per rank.
+A2_MC2_MAX_EXPERTS_PER_RANK = 24
 ENABLE_NGRAM_EMBEDDING = True
+
+
+def _should_use_moe_mc2_dispatch(
+    config: LongcatFlashNgramConfig,
+    infer_config: InferenceConfig,
+) -> bool:
+    """Return whether MC2 dispatch should be used for the current configuration."""
+    parallel_config = infer_config.parallel_config
+    if parallel_config.moe_ep_size <= 1 or parallel_config.moe_tp_size != 1:
+        return False
+
+    experts_per_rank = config.n_routed_experts // parallel_config.moe_ep_size
+    platform = infer_config.model_config.platform_version
+    return (
+        platform != PlatformVersion.A2
+        or experts_per_rank <= A2_MC2_MAX_EXPERTS_PER_RANK
+    )
 
 
 def _mark_static(tensor):
@@ -772,19 +791,12 @@ class LongcatFlashMoE(nn.Module):
         self.router = LongcatFlashTopkRouter(config)
 
         if self.use_ep:
-            self.experts_per_rank = self.n_routed_experts // self.moe_ep_size
             # MC2 op kwargs are filled lazily (need group_name from comm_manager).
             self.dispatch_kwargs = None
             self.combine_kwargs = None
-            # MC2 npu_moe_distribute_dispatch_v2 / combine_v2 caps
-            # experts_per_rank <= 24 on A2 unlayered tiling; A3 has no such
-            # cap. Default is ON unless the runtime platform is A2 and the
-            # model exceeds the A2 cap. Override via
-            # ``custom_params.enable_moe_mc2_dispatch``.
-            platform = infer_config.model_config.platform_version
-            cp = infer_config.model_config.custom_params or {}
-            default_mc2 = not (platform == "A2" and self.experts_per_rank > 24)
-            self.enable_moe_mc2_dispatch = bool(cp.get("enable_moe_mc2_dispatch", default_mc2))
+            self.enable_moe_mc2_dispatch = _should_use_moe_mc2_dispatch(
+                config, infer_config
+            )
 
         # W8A8 routing flag — when the framework attaches a CompressedTensors
         # quant_config (gmm_quant_mode == "w8a8int8"), the dispatch/prefill EP
@@ -820,8 +832,8 @@ class LongcatFlashMoE(nn.Module):
         """
         if self.use_ep:
             # Prefill: always double-routing AllToAll (unconstrained, every chip).
-            # Decode: MC2 dispatch_v2/combine_v2 when enabled (A3 graph mode);
-            # otherwise reuse the prefill double-routing path so EP runs on A2.
+            # Decode: MC2 when supported; A2 layouts above the per-rank expert
+            # limit reuse the prefill double-routing path.
             if is_prefill or not self.enable_moe_mc2_dispatch:
                 return self._forward_ep_prefill(hidden_states)
             return self._forward_ep_decode(hidden_states)
@@ -1846,11 +1858,7 @@ class LongcatFlashNgramForCausalLM(nn.Module):
                 group_stride=moe_ep_group_num,
                 return_name=True,
             )
-            custom_params = self.infer_config.model_config.custom_params or {}
-            enable_moe_mc2_dispatch = custom_params.get("enable_moe_mc2_dispatch", None)
-            if enable_moe_mc2_dispatch is None:
-                enable_moe_mc2_dispatch = self.infer_config.model_config.exe_mode == "ge_graph"
-            if self.moe_tp_size == 1 and enable_moe_mc2_dispatch:
+            if _should_use_moe_mc2_dispatch(self.config, self.infer_config):
                 moe_ep_mc2_buffer_size = calc_moe_hccl_buffer_size(
                     self.infer_config, self.config, is_full_mesh_v2=False
                 )
@@ -2001,7 +2009,7 @@ class LongcatFlashNgramForCausalLM(nn.Module):
                 continue
             if not getattr(module, "use_ep", False):
                 continue
-            if not getattr(module, "enable_moe_mc2_dispatch", False):
+            if not module.enable_moe_mc2_dispatch:
                 continue
             if module.dispatch_kwargs is not None:
                 continue
