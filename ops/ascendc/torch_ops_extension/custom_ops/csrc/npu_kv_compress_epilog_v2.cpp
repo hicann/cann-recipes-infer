@@ -19,6 +19,14 @@ namespace custom {
 using namespace at_npu::native;
 
 namespace {
+// 与算子侧 IR/tiling 一致的维度与量化约束常量。
+constexpr int64_t KCEV2_CACHE_RANK_2D = 2;
+constexpr int64_t KCEV2_CACHE_RANK_4D = 4;
+constexpr int64_t KCEV2_CACHE_UNIT_DIM_INDEX = 2;
+constexpr int64_t KCEV2_CACHE_LAST_DIM_INDEX = 3;
+constexpr int64_t KCEV2_QUANT_GROUP_16 = 16;
+constexpr int64_t KCEV2_QUANT_GROUP_32 = 32;
+
 std::string NormalizeQuantMode(const std::string &quantMode) {
   size_t begin = 0;
   size_t end = quantMode.size();
@@ -50,35 +58,46 @@ void ValidateKvCompressEpilogV2Inputs(at::Tensor &cache, const at::Tensor &x,
                                       int64_t quantGroupSize,
                                       const std::string &quantMode,
                                       double xScale) {
-  TORCH_CHECK(cache.dim() == 2, "cache must be 2D, but got rank ", cache.dim());
-  TORCH_CHECK(x.dim() == 2, "x must be 2D, but got rank ", x.dim());
-  TORCH_CHECK(slotMapping.dim() == 1, "slot_mapping must be 1D, but got rank ",
-              slotMapping.dim());
-  TORCH_CHECK(x.size(0) > 0 && x.size(1) > 0, "x dimensions must be positive");
-  TORCH_CHECK(slotMapping.size(0) == x.size(0),
-              "slot_mapping length must equal x dim 0, got ",
-              slotMapping.size(0), " and ", x.size(0));
-  TORCH_CHECK(x.scalar_type() == at::kBFloat16,
-              "x dtype must be bfloat16, got ", x.scalar_type());
-  TORCH_CHECK(slotMapping.scalar_type() == at::kInt ||
-                  slotMapping.scalar_type() == at::kLong,
-              "slot_mapping dtype must be int32 or int64, got ",
-              slotMapping.scalar_type());
-  TORCH_CHECK(cache.is_contiguous() && x.is_contiguous() &&
-                  slotMapping.is_contiguous(),
-              "cache, x and slot_mapping must be contiguous");
-  const bool validModeAndGroup =
-      (quantMode == "mxfp8_bf16" && quantGroupSize == 32) ||
-      (quantMode == "mxfp4_bf16" &&
-       (quantGroupSize == 16 || quantGroupSize == 32));
-  TORCH_CHECK(validModeAndGroup,
-              "invalid quant_mode and quant_group_size combination: "
-              "supported combinations are (mxfp8_bf16, 32), "
-              "(mxfp4_bf16, 32), and (mxfp4_bf16, 16), but got ",
-              quantMode, " and group size ", quantGroupSize);
-  TORCH_CHECK(x.size(1) % quantGroupSize == 0,
-              "x last dimension must be divisible by quant_group_size, got d=",
-              x.size(1), " and quant_group_size=", quantGroupSize);
+    TORCH_CHECK(cache.dim() == KCEV2_CACHE_RANK_2D || cache.dim() == KCEV2_CACHE_RANK_4D,
+                "cache must be 2D or 4D, but got rank ", cache.dim());
+    if (cache.dim() == KCEV2_CACHE_RANK_4D) {
+        TORCH_CHECK(cache.size(KCEV2_CACHE_UNIT_DIM_INDEX) == 1,
+                    "4D cache dim 2 must be 1, but got ", cache.size(KCEV2_CACHE_UNIT_DIM_INDEX));
+        TORCH_CHECK(cache.stride(KCEV2_CACHE_LAST_DIM_INDEX) == 1,
+                    "4D cache last dimension must be contiguous, but stride(3)=",
+                    cache.stride(KCEV2_CACHE_LAST_DIM_INDEX));
+    }
+    TORCH_CHECK(x.dim() == KCEV2_CACHE_RANK_2D, "x must be 2D, but got rank ", x.dim());
+    TORCH_CHECK(slotMapping.dim() == 1, "slot_mapping must be 1D, but got rank ",
+                slotMapping.dim());
+    TORCH_CHECK(x.size(0) > 0 && x.size(1) > 0, "x dimensions must be positive");
+    TORCH_CHECK(slotMapping.size(0) == x.size(0),
+                "slot_mapping length must equal x dim 0, got ",
+                slotMapping.size(0), " and ", x.size(0));
+    TORCH_CHECK(x.scalar_type() == at::kBFloat16,
+                "x dtype must be bfloat16, got ", x.scalar_type());
+    TORCH_CHECK(slotMapping.scalar_type() == at::kInt ||
+                    slotMapping.scalar_type() == at::kLong,
+                "slot_mapping dtype must be int32 or int64, got ",
+                slotMapping.scalar_type());
+    TORCH_CHECK(x.is_contiguous() && slotMapping.is_contiguous(),
+                "x and slot_mapping must be contiguous");
+    if (cache.dim() == KCEV2_CACHE_RANK_2D) {
+        TORCH_CHECK(cache.is_contiguous(),
+                    "2D cache must remain contiguous for the existing layout1 path");
+    }
+    const bool validModeAndGroup =
+        (quantMode == "mxfp8_bf16" && quantGroupSize == KCEV2_QUANT_GROUP_32) ||
+        (quantMode == "mxfp4_bf16" &&
+         (quantGroupSize == KCEV2_QUANT_GROUP_16 || quantGroupSize == KCEV2_QUANT_GROUP_32));
+    TORCH_CHECK(validModeAndGroup,
+        "invalid quant_mode and quant_group_size combination: "
+        "supported combinations are (mxfp8_bf16, 32), "
+        "(mxfp4_bf16, 32), and (mxfp4_bf16, 16), but got ",
+        quantMode, " and group size ", quantGroupSize);
+    TORCH_CHECK(quantGroupSize != 0 && x.size(1) % quantGroupSize == 0,
+        "x last dimension must be divisible by quant_group_size, got d=",
+        x.size(1), " and quant_group_size=", quantGroupSize);
   TORCH_CHECK(x.size(1) <= 8192, "x last dimension must not exceed 8192, got ",
               x.size(1));
   TORCH_CHECK(xScale == 1.0, "x_scale is reserved and must be 1.0, got ",
@@ -101,8 +120,9 @@ void KvCompressEpilogV2Npu(at::Tensor &cache, const at::Tensor &x,
   ValidateKvCompressEpilogV2Inputs(cache, x, slotMapping, quantGroupSize,
                                    normalizedQuantMode, xScale);
   const int64_t quantModeInt = normalizedQuantMode == "mxfp8_bf16" ? 2 : 4;
+  const int64_t blockStride = cache.stride(0);
   EXEC_NPU_CMD_V1(aclnnKvCompressEpilogV2, cache, x, slotMapping,
-                  quantGroupSize, quantModeInt, roundScale, xScale);
+                  quantGroupSize, quantModeInt, roundScale, xScale, blockStride);
 }
 
 void KvCompressEpilogV2Meta(at::Tensor &cache, const at::Tensor &x,

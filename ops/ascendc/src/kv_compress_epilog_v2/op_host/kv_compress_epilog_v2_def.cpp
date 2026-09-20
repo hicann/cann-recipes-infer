@@ -22,7 +22,8 @@ public:
             .Format({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND,
                      ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND,
-                                 ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND});
+                                 ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND})
+            .IgnoreContiguous();
         this->Input("x")
             .ParamType(REQUIRED)
             .DataType({ge::DT_BF16, ge::DT_BF16, ge::DT_BF16, ge::DT_BF16, ge::DT_BF16, ge::DT_BF16})
@@ -44,12 +45,16 @@ public:
             .Format({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND,
                      ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND,
-                                 ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND});
+                                 ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND})
+            .IgnoreContiguous();
 
         this->Attr("quant_group_size").AttrType(OPTIONAL).Int(32);
         this->Attr("quant_mode").AttrType(OPTIONAL).Int(2);
         this->Attr("round_scale").AttrType(OPTIONAL).Bool(true);
         this->Attr("x_scale").AttrType(OPTIONAL).Float(1.0f);
+        // Physical block stride in cache elements; 0 means the contiguous
+        // stride derived from the cache descriptor.
+        this->Attr("block_stride").AttrType(OPTIONAL).Int(0);
         this->AICore().AddConfig("ascend950");
     }
 };

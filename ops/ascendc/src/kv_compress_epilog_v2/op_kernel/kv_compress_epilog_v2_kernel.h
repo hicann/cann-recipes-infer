@@ -8,12 +8,17 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  */
 
+// 退役基线壳（TilingKey 2000/2001 原始实现）：入口已不实例化，仅作回滚参考保留。
+// 其独占依赖（VFProcessMxFp4Verified 等）在 quant_fp4_g32.h 尾部"基线参考"段。
+
 #ifndef KV_COMPRESS_EPILOG_V2_KERNEL_H
 #define KV_COMPRESS_EPILOG_V2_KERNEL_H
 
 #include "kernel_operator.h"
 #include "kernel_tiling/kernel_tiling.h"
 #include "kv_compress_epilog_v2_common.h"
+#include "kv_compress_epilog_v2_quant_fp8.h"
+#include "kv_compress_epilog_v2_quant_fp4_g32.h"
 
 namespace KvCompressEpilogV2Ops {
 using namespace AscendC;

@@ -15,6 +15,8 @@
 
 namespace optiling {
 namespace {
+// layout2 block_stride requires 32-byte alignment.
+constexpr int64_t BLOCK_STRIDE_ALIGN_BYTES = 32;
 template <typename T>
 T CeilDiv(T value, T divisor)
 {
@@ -59,9 +61,9 @@ ge::graphStatus KvCompressEpilogV2Tiling::GetShapeAndDtypeInfo()
     const auto &cacheStorageShape = cacheShape->GetStorageShape();
     const auto &xStorageShape = xShape->GetStorageShape();
     const auto &slotStorageShape = slotShape->GetStorageShape();
-    OPS_CHECK(cacheStorageShape.GetDimNum() != 2,
-                OPS_LOG_E(context_->GetNodeName(), "cache must be 2D, got rank %zu.",
-                          cacheStorageShape.GetDimNum()),
+    cacheRank_ = static_cast<int64_t>(cacheStorageShape.GetDimNum());
+    OPS_CHECK(cacheRank_ != 2 && cacheRank_ != 4,
+                OPS_LOG_E(context_->GetNodeName(), "cache must be 2D or 4D, got rank %ld.", cacheRank_),
                 return ge::GRAPH_FAILED);
     OPS_CHECK(xStorageShape.GetDimNum() != 2,
                 OPS_LOG_E(context_->GetNodeName(), "x must be 2D, got rank %zu.", xStorageShape.GetDimNum()),
@@ -71,8 +73,24 @@ ge::graphStatus KvCompressEpilogV2Tiling::GetShapeAndDtypeInfo()
                           slotStorageShape.GetDimNum()),
                 return ge::GRAPH_FAILED);
 
-    cacheRows_ = cacheStorageShape.GetDim(0);
-    cacheRowStride_ = cacheStorageShape.GetDim(1);
+    if (cacheRank_ == KCEV2_CACHE_RANK_2D) {
+        layout_ = KCEV2_LAYOUT_1;
+        cacheRows_ = cacheStorageShape.GetDim(0);
+        cacheRowStride_ = cacheStorageShape.GetDim(1);
+        blockSize_ = 1;
+        blockStride_ = cacheRowStride_;
+    } else {
+        layout_ = KCEV2_LAYOUT_2;
+        const int64_t blockNum = cacheStorageShape.GetDim(0);
+        blockSize_ = cacheStorageShape.GetDim(1);
+        OPS_CHECK(cacheStorageShape.GetDim(2) != 1,
+                  OPS_LOG_E(context_->GetNodeName(), "layout2 cache dim2 must be 1, got %ld.",
+                             cacheStorageShape.GetDim(2)),
+                  return ge::GRAPH_FAILED);
+        cacheRowStride_ = cacheStorageShape.GetDim(KCEV2_CACHE_COL_DIM_INDEX);
+        cacheRows_ = blockNum * blockSize_;
+        blockStride_ = 0;
+    }
     bs_ = xStorageShape.GetDim(0);
     d_ = xStorageShape.GetDim(1);
     OPS_CHECK(slotStorageShape.GetDim(0) != bs_,
@@ -103,10 +121,14 @@ ge::graphStatus KvCompressEpilogV2Tiling::GetAttributes()
     const int64_t *mode = attrs->GetAttrPointer<int64_t>(KCEV2_MODE_ATTR_INDEX);
     const bool *roundScale = attrs->GetAttrPointer<bool>(KCEV2_ROUND_ATTR_INDEX);
     const float *xScale = attrs->GetAttrPointer<float>(KCEV2_X_SCALE_ATTR_INDEX);
+    const int64_t *blockStride = attrs->GetAttrPointer<int64_t>(KCEV2_BLOCK_STRIDE_ATTR_INDEX);
     quantGroupSize_ = groupSize == nullptr ? KCEV2_GROUP_SIZE_32 : *groupSize;
     quantMode_ = mode == nullptr ? KCEV2_MODE_MXFP8 : *mode;
     roundScale_ = roundScale == nullptr || *roundScale ? 1 : 0;
     xScale_ = xScale == nullptr ? 1.0f : *xScale;
+    if (blockStride != nullptr) {
+        blockStride_ = *blockStride;
+    }
     return ge::GRAPH_SUCCESS;
 }
 
@@ -166,10 +188,36 @@ ge::graphStatus KvCompressEpilogV2Tiling::ValidateAndCalculateLayout()
     concatCol_ = dataCol_ + scaleCol_ * static_cast<int64_t>(sizeof(uint16_t));
     kvCacheCol_ = RoundUp(concatCol_, 32L);
     padCol_ = kvCacheCol_ - concatCol_;
-    OPS_CHECK(cacheRowStride_ < kvCacheCol_,
+    scaleBytes_ = scaleCol_ * static_cast<int64_t>(sizeof(uint16_t));
+    tokenStride_ = dataCol_ + scaleBytes_;
+    // Keep the legacy field populated, but its layout2 meaning is now the
+    // exact scale payload size rather than a padded per-token stride.
+    scalePerToken_ = scaleBytes_;
+    if (layout_ == KCEV2_LAYOUT_2) {
+        OPS_CHECK(blockStride_ < 0,
+                  OPS_LOG_E(context_->GetNodeName(), "layout2 block_stride must be non-negative, got %ld.",
+                             blockStride_),
+                  return ge::GRAPH_FAILED);
+        if (blockStride_ == 0) {
+            blockStride_ = blockSize_ * cacheRowStride_;
+        }
+        OPS_CHECK(cacheRowStride_ < tokenStride_,
+                  OPS_LOG_E(context_->GetNodeName(), "layout2 cache row width must be at least %ld bytes, got %ld.",
+                             tokenStride_, cacheRowStride_),
+                  return ge::GRAPH_FAILED);
+        OPS_CHECK(blockStride_ < blockSize_ * cacheRowStride_ ||
+                  blockStride_ % BLOCK_STRIDE_ALIGN_BYTES != 0,
+                  OPS_LOG_E(context_->GetNodeName(),
+                            "layout2 block_stride must be >= block_size*cache_col and "
+                            "32B aligned, got %ld.",
+                            blockStride_),
+                  return ge::GRAPH_FAILED);
+    } else {
+        OPS_CHECK(cacheRowStride_ < kvCacheCol_,
                 OPS_LOG_E(context_->GetNodeName(), "cache row width must be at least %ld bytes, got %ld.",
                         kvCacheCol_, cacheRowStride_),
                 return ge::GRAPH_FAILED);
+    }
     return ge::GRAPH_SUCCESS;
 }
 
@@ -224,15 +272,26 @@ ge::graphStatus KvCompressEpilogV2Tiling::DoOpTiling()
     tilingData_.set_rowFactor(rowFactor);
     tilingData_.set_tailRowFactorOfFormerBlock(tailFormer);
     tilingData_.set_tailRowFactorOfTailBlock(tailTail);
+    tilingData_.set_layout(layout_);
+    tilingData_.set_blockSize(blockSize_);
+    tilingData_.set_blockStride(blockStride_);
+    tilingData_.set_scalePerToken(scalePerToken_);
+    tilingData_.set_scaleBytes(scaleBytes_);
+    tilingData_.set_tokenStride(tokenStride_);
+    tilingData_.set_cacheCol(cacheRowStride_);
     return ge::GRAPH_SUCCESS;
 }
 
 ge::graphStatus KvCompressEpilogV2Tiling::PostTiling()
 {
     context_->SetBlockDim(usedCoreNums_);
-    uint64_t tilingKey = 2000UL;
+    uint64_t tilingKey = layout_ == KCEV2_LAYOUT_2 ? 2100UL : 2000UL;
     if (quantMode_ == KCEV2_MODE_MXFP4) {
-        tilingKey = quantGroupSize_ == KCEV2_GROUP_SIZE_16 ? 2002UL : 2001UL;
+        if (layout_ == KCEV2_LAYOUT_2) {
+            tilingKey = quantGroupSize_ == KCEV2_GROUP_SIZE_16 ? 2102UL : 2101UL;
+        } else {
+            tilingKey = quantGroupSize_ == KCEV2_GROUP_SIZE_16 ? 2002UL : 2001UL;
+        }
     }
     context_->SetTilingKey(tilingKey);
     size_t *workspaceSizes = context_->GetWorkspaceSizes(1);

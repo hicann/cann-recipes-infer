@@ -61,13 +61,14 @@ struct CallResult {
 // 一次完整两段式调用；copyBack=true 时把 cache 拷回 hostCache
 inline CallResult RunOp(const aclTensor *cache, const aclTensor *x, const aclTensor *slot, int64_t mode,
                         int64_t groupSize, bool roundScale, double xScale, void *cacheDev, size_t cacheBytes,
-                        uint8_t *hostCache)
+                        uint8_t *hostCache, int64_t blockStride = 0)
 {
     CallResult result;
     aclOpExecutor *executor = nullptr;
-    result.wsStatus = aclnnKvCompressEpilogV2GetWorkspaceSize(const_cast<aclTensor *>(cache), x, slot, groupSize,
-                                                               mode, roundScale, xScale, &result.workspaceSize,
-                                                               &executor);
+    result.wsStatus =
+        aclnnKvCompressEpilogV2GetWorkspaceSize(const_cast<aclTensor *>(cache), x, slot, groupSize, mode,
+                                                roundScale, xScale, blockStride, &result.workspaceSize,
+                                                &executor);
     if (result.wsStatus != 0) {
         return result;
     }

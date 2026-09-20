@@ -128,7 +128,7 @@ int RunCase(const CaseSpec &spec) {
 
     // 第一段：GetWorkspaceSize，参数顺序与算子 IR 一致（cache, x, slot_mapping, 4 个属性）
     CHECK(aclnnKvCompressEpilogV2GetWorkspaceSize(cacheTensor, xTensor, slotTensor, spec.groupSize, spec.mode,
-                                                  true, 1.0, &workspaceSize, &executor) == 0,
+                                                  true, 1.0, 0, &workspaceSize, &executor) == 0,
           "GetWorkspaceSize");
     wsSize = workspaceSize == 0 ? 1 : workspaceSize;
     CHECK(aclrtMalloc(&workspace, wsSize, ACL_MEM_MALLOC_HUGE_FIRST) == ACL_SUCCESS, "malloc workspace");

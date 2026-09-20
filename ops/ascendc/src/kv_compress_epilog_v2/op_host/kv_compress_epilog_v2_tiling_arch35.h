@@ -29,9 +29,15 @@ constexpr int64_t KCEV2_GROUP_ATTR_INDEX = 0;
 constexpr int64_t KCEV2_MODE_ATTR_INDEX = 1;
 constexpr int64_t KCEV2_ROUND_ATTR_INDEX = 2;
 constexpr int64_t KCEV2_X_SCALE_ATTR_INDEX = 3;
+constexpr int64_t KCEV2_BLOCK_STRIDE_ATTR_INDEX = 4;
 constexpr int64_t KCEV2_GROUP_SIZE_16 = 16;
 constexpr int64_t KCEV2_GROUP_SIZE_32 = 32;
 constexpr int64_t KCEV2_MODE_MXFP8 = 2;
+constexpr int64_t KCEV2_CACHE_RANK_2D = 2;
+constexpr int64_t KCEV2_CACHE_RANK_4D = 4;
+constexpr int64_t KCEV2_LAYOUT_1 = 1;
+constexpr int64_t KCEV2_LAYOUT_2 = 2;
+constexpr int64_t KCEV2_CACHE_COL_DIM_INDEX = 3;
 constexpr int64_t KCEV2_MODE_MXFP4 = 4;
 constexpr int64_t KCEV2_WORKSPACE_SIZE = 32;
 
@@ -55,6 +61,16 @@ TILING_DATA_FIELD_DEF(int64_t, rowLoopOfTailBlock);
 TILING_DATA_FIELD_DEF(int64_t, rowFactor);
 TILING_DATA_FIELD_DEF(int64_t, tailRowFactorOfFormerBlock);
 TILING_DATA_FIELD_DEF(int64_t, tailRowFactorOfTailBlock);
+// Layout is derived from cache rank: 1 for [N, C], 2 for [B, S, 1, C].
+TILING_DATA_FIELD_DEF(int64_t, layout);
+TILING_DATA_FIELD_DEF(int64_t, blockSize);
+TILING_DATA_FIELD_DEF(int64_t, blockStride);
+// Layout2 physical token bundle fields.  scalePerToken is retained for ABI
+// compatibility and is no longer rounded up for layout2.
+TILING_DATA_FIELD_DEF(int64_t, scalePerToken);
+TILING_DATA_FIELD_DEF(int64_t, scaleBytes);
+TILING_DATA_FIELD_DEF(int64_t, tokenStride);
+TILING_DATA_FIELD_DEF(int64_t, cacheCol);
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(KvCompressEpilogV2, KvCompressEpilogV2TilingData)
@@ -87,11 +103,18 @@ private:
     int64_t d_ = 0;
     int64_t cacheRows_ = 0;
     int64_t cacheRowStride_ = 0;
+    int64_t cacheRank_ = 0;
+    int64_t blockSize_ = 1;
+    int64_t blockStride_ = 0;
+    int64_t layout_ = 1;
     int64_t dataCol_ = 0;
     int64_t scaleCol_ = 0;
     int64_t concatCol_ = 0;
     int64_t kvCacheCol_ = 0;
     int64_t padCol_ = 0;
+    int64_t scalePerToken_ = 0;
+    int64_t scaleBytes_ = 0;
+    int64_t tokenStride_ = 0;
     int64_t quantGroupSize_ = KCEV2_GROUP_SIZE_32;
     int64_t quantMode_ = KCEV2_MODE_MXFP8;
     int64_t roundScale_ = 1;

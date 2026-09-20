@@ -61,6 +61,9 @@ def convert_kv_compress_epilog_v2(
             "quant_mode": attr.Int(quant_mode_int),
             "round_scale": attr.Bool(round_scale),
             "x_scale": attr.Float(x_scale),
+            # Static graph path: contiguous rank-4 cache has block stride
+            # size(1)*size(2)*size(3); host still validates the descriptor.
+            "block_stride": attr.Int(0),
         },
         outputs=["cache"],
     )

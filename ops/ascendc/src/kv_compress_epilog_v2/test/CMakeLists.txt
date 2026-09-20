@@ -79,3 +79,14 @@ set_target_properties(test_kernel PROPERTIES
     BUILD_RPATH "${ASCEND_HOME_PATH}/lib64;${_VENDOR_DIR}/op_api/lib"
 )
 target_link_libraries(test_kernel PRIVATE ascendcl nnopbase cust_opapi pthread dl)
+
+add_executable(test_layout2 test_layout2.cpp)
+target_include_directories(test_layout2 PRIVATE ${HOST_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_directories(test_layout2 PRIVATE
+    "${ASCEND_HOME_PATH}/lib64"
+    "${_VENDOR_DIR}/op_api/lib"
+)
+set_target_properties(test_layout2 PROPERTIES
+    BUILD_RPATH "${ASCEND_HOME_PATH}/lib64;${_VENDOR_DIR}/op_api/lib"
+)
+target_link_libraries(test_layout2 PRIVATE ascendcl nnopbase cust_opapi pthread dl)

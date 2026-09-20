@@ -12,14 +12,18 @@
 并与内置 CPU 参考实现做逐字节比对。
 
 算子契约：
-  - cache: 二维 [N, kvCacheCol]，原地更新（输入即输出）；x: [T, d] BF16；
+  - cache: rank2 layout1 [N, kvCacheCol] 或 rank4 layout2
+    [block_num, block_size, 1, cache_col]，原地更新（输入即输出）；x: [T, d] BF16；
   - slot_mapping: [T] INT32/INT64，-1 表示跳过该行，越界 slot 静默跳过；
   - quant_mode: "mxfp8_bf16"（默认，cache 为 E4M3FN/E5M2）/ "mxfp4_bf16"
     （packed E2M1，cache 为 UINT8）；
   - quant_group_size: MXFP8 固定 32；MXFP4 支持 16 或 32；
-  - 行布局: [量化数据区 | BF16 scale 区 | 0 填充至 32B 对齐]，
+  - layout1 行布局: [量化数据区 | BF16 scale 区 | 0 填充至 32B 对齐]，
     G = d/quant_group_size, dataCol = d(mxfp8) 或 d/2(mxfp4),
     concatCol = dataCol + 2*G, kvCacheCol = RoundUp(concatCol, 32)。
+  - layout2 block 布局: [data0 | scale0 | data1 | scale1 | ...]，
+    scaleBytes = 2*G，tokenStride = dataCol + scaleBytes；不写 scale padding、
+    block tail 或 block stride gap。
 
 前置条件：
   1. 编译并安装自定义算子 run 包（见 README.md「自定义融合算子安装」）；
@@ -34,6 +38,8 @@
   pytest test_npu_kv_compress_epilog_v2.py -v
 """
 
+from typing import NamedTuple
+
 import numpy as np
 import pytest
 import torch
@@ -46,6 +52,7 @@ from custom_ops.converter.npu_kv_compress_epilog_v2 import (
 
 OP = torch.ops.custom.kv_compress_epilog_v2.default
 DEFAULT_GROUP = 32
+LAYOUT2_SENTINEL = 0x5A
 
 FP8_DTYPE_MAX = {
     torch.float8_e4m3fn: 448.0,
@@ -187,6 +194,69 @@ def _make_inputs(quant_mode, d, t, n, seed, wide=0, slot_np=None,
 
 def _to_u8(t):
     return t.detach().cpu().contiguous().view(torch.uint8).numpy()
+
+
+class Layout2Cache(NamedTuple):
+    """layout2 cache 构造结果：物理底座、逻辑 view 与地址参数。"""
+
+    cache_base: "torch.Tensor"
+    cache: "torch.Tensor"
+    data_col: int
+    scale_bytes: int
+    token_stride: int
+    cache_col: int
+
+
+def _make_layout2_cache(quant_mode, group_size, wide=0, strided=False):
+    """构造 d=512 layout2 cache，返回物理底座、逻辑 view 和地址参数。"""
+    block_num, block_size, d = 2, 4, 512
+    _, data_col, _, _ = _layout(d, quant_mode, group_size)
+    scale_bytes = 2 * (d // group_size)
+    token_stride = data_col + scale_bytes
+    cache_col = token_stride + wide
+    physical_blocks = block_num * 2 if strided else block_num
+    cache_base = torch.full(
+        (physical_blocks, block_size, 1, cache_col), LAYOUT2_SENTINEL,
+        dtype=torch.uint8, device="npu:0")
+    if quant_mode == 2:
+        cache_base = cache_base.view(torch.float8_e4m3fn)
+    cache = cache_base[::2] if strided else cache_base
+    return Layout2Cache(cache_base, cache, data_col, scale_bytes, token_stride, cache_col)
+
+
+def _assert_layout2_interleaved(cache_base, quant_mode, group_size, hit_slots,
+                                physical_block_step=1):
+    """逐字节检查 token bundle、未命中 token、block tail 和 stride gap。"""
+    block_num, block_size, d = 2, 4, 512
+    _, data_col, _, _ = _layout(d, quant_mode, group_size)
+    scale_bytes = 2 * (d // group_size)
+    token_stride = data_col + scale_bytes
+    cache_col = cache_base.shape[-1]
+    raw = cache_base.detach().cpu().view(torch.uint8).numpy()
+    data_byte = 0x78 if quant_mode == 2 else 0x66
+    scale_bits = 0x3B80 if quant_mode == 2 else 0x3E80
+    hit_slots = set(hit_slots)
+
+    for slot_id in range(block_num * block_size):
+        logical_block, pos = divmod(slot_id, block_size)
+        physical_block = logical_block * physical_block_step
+        block = raw[physical_block].reshape(-1)
+        token_base = pos * token_stride
+        token = block[token_base:token_base + token_stride]
+        if slot_id not in hit_slots:
+            assert np.all(token == LAYOUT2_SENTINEL)
+            continue
+        assert np.all(token[:data_col] == data_byte)
+        scale = token[data_col:data_col + scale_bytes].view(np.uint16)
+        assert np.all(scale == scale_bits)
+
+    for logical_block in range(block_num):
+        physical_block = logical_block * physical_block_step
+        block = raw[physical_block].reshape(-1)
+        payload_bytes = block_size * token_stride
+        assert np.all(block[payload_bytes:block_size * cache_col] == LAYOUT2_SENTINEL)
+    if physical_block_step > 1:
+        assert np.all(raw[1::physical_block_step] == LAYOUT2_SENTINEL)
 
 
 def _meta_inputs(d, quant_mode_name, group_size, cache_col=None):
@@ -390,6 +460,34 @@ def test_eager_invalid_quant_mode_rejected():
     assert np.array_equal(_to_u8(cache), before)
 
 
+@pytest.mark.parametrize(
+    "quant_mode_name,group_size,slot_dtype",
+    [
+        ("mxfp8_bf16", 32, torch.int32),
+        ("mxfp4_bf16", 32, torch.int32),
+        ("mxfp4_bf16", 16, torch.int64),
+    ],
+)
+def test_eager_layout2_4d_interleaved_noncontiguous_block_stride(
+        quant_mode_name, group_size, slot_dtype):
+    """Rank4 layout2 交错存放 token bundle，并保持 block tail/stride gap。"""
+    torch_npu.npu.set_device(0)
+    d, token_num = 512, 6
+    hit_slots = (0, 3, 4, 6)
+    slots = torch.tensor([0, 3, 4, 6, -1, 8], dtype=slot_dtype)
+    x = torch.ones((token_num, d), dtype=torch.bfloat16)
+    quant_mode = 2 if quant_mode_name == "mxfp8_bf16" else 4
+    cache_base, cache_npu, _, _, _, cache_col = _make_layout2_cache(
+        quant_mode, group_size, wide=32, strided=True)
+    OP(cache_npu, x.to("npu:0"), slots.to("npu:0"),
+       quant_group_size=group_size, quant_mode=quant_mode_name)
+    torch.npu.synchronize()
+    assert cache_npu.dim() == 4
+    assert cache_npu.stride(0) > 4 * cache_col
+    _assert_layout2_interleaved(
+        cache_base, quant_mode, group_size, hit_slots, physical_block_step=2)
+
+
 # ==================== torchair ACL Graph 图模式用例（capture + 换值 replay） ====================
 
 # ACL Graph 图模式的被编译模块：forward 内直调算子，cache 原地更新后返回
@@ -434,6 +532,34 @@ def _run_aclgraph(backend_mode, quant_mode_str, quant_mode, d, group_size=32):
     assert not np.array_equal(second, first), "stale capture detected"
 
 
+def _run_aclgraph_layout2():
+    """layout2 capture/replay：相同静态地址下更换 slot，并检查新交错布局。"""
+    config = torchair.CompilerConfig()
+    config.mode = "npugraph_ex"
+    config.debug.aclgraph.clone_input = False
+    backend = torchair.get_npu_backend(compiler_config=config)
+    compiled = torch.compile(
+        _Kcev2Module("mxfp8_bf16", 32), backend=backend,
+        fullgraph=True, dynamic=False)
+
+    cache_base, cache, _, _, _, _ = _make_layout2_cache(
+        2, 32, wide=0, strided=False)
+    x = torch.ones((6, 512), dtype=torch.bfloat16, device="npu:0")
+    slot = torch.tensor([0, 3, 4, 6, -1, 8], dtype=torch.int32, device="npu:0")
+    compiled(cache, x, slot)
+    torch.npu.synchronize()
+    first = cache_base.detach().cpu().view(torch.uint8).numpy().copy()
+    _assert_layout2_interleaved(cache_base, 2, 32, (0, 3, 4, 6))
+
+    cache_base.view(torch.uint8).fill_(LAYOUT2_SENTINEL)
+    slot.copy_(torch.tensor([1, 2, 5, 7, -1, 8], dtype=torch.int32, device="npu:0"))
+    compiled(cache, x, slot)
+    torch.npu.synchronize()
+    second = cache_base.detach().cpu().view(torch.uint8).numpy().copy()
+    _assert_layout2_interleaved(cache_base, 2, 32, (1, 2, 5, 7))
+    assert not np.array_equal(second, first), "layout2 replay used stale slot mapping"
+
+
 # torch ACL Graph 图模式：npugraph_ex（现行后端）× mxfp8_bf16，capture 与换值 replay 均逐字节对齐
 def test_aclgraph_mxfp8_npugraph_ex():
     _run_aclgraph("npugraph_ex", "mxfp8_bf16", 2, 512)
@@ -442,3 +568,7 @@ def test_aclgraph_mxfp8_npugraph_ex():
 # torch ACL Graph 图模式：reduce-overhead（legacy 后端）× mxfp4_bf16，覆盖另一后端与另一量化族
 def test_aclgraph_mxfp4_reduce_overhead():
     _run_aclgraph("reduce-overhead", "mxfp4_bf16", 4, 128, group_size=16)
+
+
+def test_aclgraph_layout2_mxfp8_npugraph_ex():
+    _run_aclgraph_layout2()
