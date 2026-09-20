@@ -37,8 +37,9 @@ import cann_ops_transformer
 
 from transformers.cache_utils import Cache
 from executor.core.config import InferenceConfig, CommManager
-from executor.utils import get_had_pow2, limit_core_num
-from executor.utils.stream_utils import npu_stream_switch, record_event, wait_event, record_stream
+from executor.utils import get_had_pow2
+from executor.utils.stream_utils import (
+    limit_core_num, npu_stream_switch, record_event, wait_event, record_stream)
 from module.linear import ReplicatedLinear
 from .common_modules import DeepseekV3RMSNorm, apply_rotary_emb, rotate_activation, \
     partial_rotary_mul_quant
@@ -157,7 +158,8 @@ class Indexer(nn.Module):
         else:
             cos, sin = attn_metadata["cos_sin"]["comp"]
 
-        with limit_core_num(enable_limit_core, self.cmpr_aic_num, self.cmpr_aiv_num):
+        with limit_core_num(enable_limit_core, self.cmpr_aic_num, self.cmpr_aiv_num,
+                            exe_mode=self.infer_config.model_config.exe_mode):
             # weight project
             if is_prefill and self.cp_size > 1:
                 q_len = qr.shape[0] // 2
@@ -179,7 +181,8 @@ class Indexer(nn.Module):
         cur_stream = torch.npu.current_stream()
         with npu_stream_switch(enable_multi_streams, attn_metadata.get('indexer_stream', None)):
             wait_event(enable_multi_streams, self.indexer_events, 0)
-            with limit_core_num(enable_limit_core, self.rope_aic_num, self.rope_aiv_num):
+            with limit_core_num(enable_limit_core, self.rope_aic_num, self.rope_aiv_num,
+                                exe_mode=self.infer_config.model_config.exe_mode):
                 q = self.wq_b(qr, dynamic_scale=qr_scale)
                 q = q.view(-1, self.n_heads, self.head_dim)
 

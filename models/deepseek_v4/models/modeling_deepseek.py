@@ -51,10 +51,9 @@ from executor.utils import (
     get_decode_mask)
 
 from executor.model_loader.weight_utils import default_weight_loader
-from executor.utils import (
-    superkernel_scope, weight_dequant,
-    limit_core_num)
-from executor.utils.stream_utils import npu_stream_switch, record_event, wait_event, record_stream
+from executor.utils import superkernel_scope, weight_dequant
+from executor.utils.stream_utils import (
+    limit_core_num, npu_stream_switch, record_event, wait_event, record_stream)
 from executor.core.config import InferenceConfig, CommManager, PlatformVersion
 from executor.core.kv_cache.cache_info import CacheEntry, LayerCacheInfo, ModelCacheInfo
 from executor.utils.forward_metadata import ForwardMetaData
@@ -1307,7 +1306,9 @@ class Attention(nn.Module):
             wait_event(enable_multi_streams, self.mla_events, 0)
             kv = self.wkv(x)
             record_event(enable_multi_streams, self.mla_events, 1)
-            with limit_core_num(enable_limit_core, kv_aic_num, kv_aic_num * self.aiv_to_aic_ratio): # parallel to wq_b
+            with limit_core_num(enable_limit_core, kv_aic_num,
+                                kv_aic_num * self.aiv_to_aic_ratio,
+                                exe_mode=self.infer_config.model_config.exe_mode): # parallel to wq_b
                 kv = self.kv_norm(kv)
                 torch.ops.cann_ops_transformer.inplace_partial_rotary_mul(
                     kv.view(-1, 1, 1, self.head_dim), cos, sin,
@@ -1326,7 +1327,9 @@ class Attention(nn.Module):
             record_stream(enable_multi_streams, qr, attn_metadata.get('indexer_stream', None))
             record_stream(enable_multi_streams, qr_scale, attn_metadata.get('indexer_stream', None))
             record_event(enable_multi_streams, self.indexer.indexer_events, 0)
-        with limit_core_num(enable_limit_core, qb_aic_num, qb_aic_num * self.aiv_to_aic_ratio):
+        with limit_core_num(enable_limit_core, qb_aic_num,
+                            qb_aic_num * self.aiv_to_aic_ratio,
+                            exe_mode=self.infer_config.model_config.exe_mode):
             q = self.q_b_norm(q)
             if self.kv_cache_quant_mode == "hifloat8":
                 q = partial_rotary_mul_quant(
@@ -1495,7 +1498,9 @@ class Attention(nn.Module):
         if self.compress_ratio > 1:
             with npu_stream_switch(enable_cmpr_stream, attn_metadata.get('compressor_stream', None)):
                 wait_event(enable_cmpr_stream, self.cmpr_events, 0)
-                with limit_core_num(enable_limit_core, self.cmpr_aic_num, self.cmpr_aic_num * self.aiv_to_aic_ratio):
+                with limit_core_num(enable_limit_core, self.cmpr_aic_num,
+                                    self.cmpr_aic_num * self.aiv_to_aic_ratio,
+                                    exe_mode=self.infer_config.model_config.exe_mode):
                     self.compressor(x, attn_metadata, is_prefill)
                 record_event(enable_cmpr_stream, self.cmpr_events, 1)
 

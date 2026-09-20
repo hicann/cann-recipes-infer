@@ -22,9 +22,10 @@ from .common_utils import (update_settings, override, get_init_attn_mask, get_de
                            superkernel_scope, ceil_div,
                            process_infer_time, MicroBatchMode, remove_padding_left, remove_eos_right,
                            get_had_pow2, detokenize_outputs,
-                           limit_core_num, npu_prefetch, obtain_mtp_stats, record_event, wait_event,
+                           npu_prefetch, obtain_mtp_stats, record_event, wait_event,
                            record_stream, weight_dequant
                           )
+from .stream_utils import limit_core_num
 from .hccl_utils import (
     init_comm_group,
     init_comm_group_by_ranks,

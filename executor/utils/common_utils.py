@@ -130,12 +130,6 @@ def npu_stream_switch(switch_flag: bool, stream_tag: str, stream_priority: int =
         return FakeContextManager()
 
 
-def limit_core_num(switch_flag: bool, aic_num: str, aiv_num: str):
-    if switch_flag:
-        return tng.scope.limit_core_num(aic_num, aiv_num)
-    else:
-        return FakeContextManager()
-
 def record_event(switch_flag: bool, events: tuple[torch.npu.Event], idx: int):
     if switch_flag:
         tng.ops.npu_tagged_event_record(events[idx])
