@@ -89,10 +89,17 @@ def generate_quant_group(a_num_bits=8, w_num_bits=8, qtype="float", activation_u
     return quant_group
 
 
-def generate_quant_config(cache_scheme, ignores, w4a8=False, is_fp=False, is_mx=False, hif=False):
+def generate_quant_config(cache_scheme, ignores, w4a8=False, is_fp=False, is_mx=False, hif=False,
+                          moe_activation_bits=NUM_BITS_8):
     """
     Generate a quantization configuration dictionary based on the specified parameters.
     """
+    if moe_activation_bits not in (NUM_BITS_4, NUM_BITS_8):
+        raise ValueError(
+            f"MoE activation bits must be 4 or 8, got {moe_activation_bits}")
+    if moe_activation_bits == NUM_BITS_4 and not (w4a8 and is_fp):
+        raise ValueError("A4W4 MoE requires 4-bit float expert weights")
+
     config_groups = {"group_0": {"targets": ["Linear"]}}
     if w4a8:
         config_groups.update({"group_1": {"targets": ["MoEGMM"]}})
@@ -113,10 +120,10 @@ def generate_quant_config(cache_scheme, ignores, w4a8=False, is_fp=False, is_mx=
     if w4a8:
         quant_config["config_groups"]["group_1"].update(
             generate_quant_group(
-                a_num_bits=NUM_BITS_8,
+                a_num_bits=moe_activation_bits,
                 w_num_bits=NUM_BITS_4,
                 qtype=qtype,
-                is_mx=is_fp,  # only support mxfp4 for w4a8 with float type
+                is_mx=is_fp,  # W4 routed experts use MXFP4 for float quantization.
                 )
             )
     if hif:
@@ -124,7 +131,7 @@ def generate_quant_config(cache_scheme, ignores, w4a8=False, is_fp=False, is_mx=
     return quant_config
 
 
-def main(fp8_path, hif=False):
+def main(fp8_path, hif=False, moe_activation_bits=NUM_BITS_4):
     config_file = os.path.join(fp8_path, 'config.json')
     with open(config_file, "r") as f:
         config = json.load(f)
@@ -140,7 +147,13 @@ def main(fp8_path, hif=False):
 
     quant_ignore_layers = generate_ignore_item(num_layers, compress_ratios, is_fp=True, hif=hif)
     quantization_config = generate_quant_config(
-        cache_scheme, quant_ignore_layers, w4a8=True, is_fp=True, hif=hif)
+        cache_scheme,
+        quant_ignore_layers,
+        w4a8=True,
+        is_fp=True,
+        hif=hif,
+        moe_activation_bits=moe_activation_bits,
+    )
     config['quantization_config'] = quantization_config
     config['quantization_config']["quant_method"] = "compressed-tensors"
     config['quantization_config']["quantization_status"] = "compressed"
@@ -154,5 +167,8 @@ if __name__ == "__main__":
     parser.add_argument("--input_fp8_hf_path", type=str, required=True)
     parser.add_argument("--hif", action="store_true",
                         help="generate a HiF8 quant config instead of the default MXFP4 config")
+    parser.add_argument("--moe_activation_bits", type=int, choices=[NUM_BITS_4, NUM_BITS_8],
+                        default=NUM_BITS_4,
+                        help="MoE activation bit width. Default 4 enables A4W4 MXFP4; use 8 for W4A8.")
     args = parser.parse_args()
-    main(args.input_fp8_hf_path, hif=args.hif)
+    main(args.input_fp8_hf_path, hif=args.hif, moe_activation_bits=args.moe_activation_bits)

@@ -71,6 +71,7 @@ from module.quantization import QuantizeMethodBase
 from module.quantization.compressed_tensors.compressed_tensors import CompressedTensorsConfig
 from module.quantization.compressed_tensors.compressed_tensors_w8a8_hif8 import CompressedTensorsW8A8Hif8LinearMethod
 from module.quantization.mxfp8 import MxFp8LinearMethod
+from module.quantization.mxfp4 import W4A4MxFp4MoEGMMMethod
 from module.quantization.compressed_tensors.compressed_tensors_moe_gmm import (
     CompressedTensorW8A8Int8MoEGMMMethod,
     CompressedTensorW4A8Int8MoEGMMMethod,
@@ -217,6 +218,7 @@ class DeepseekV3MoE(nn.Module):
             config.quant_config.gmm_quant_mode
             if config.quant_config is not None
             else "w16a16")
+        self.is_a4w4_mxfp4 = self.gmm_quant_mode == "w4a4mxfloat4"
         self.swiglu_limit = config.swiglu_limit if hasattr(config, "swiglu_limit") else None
         self.hidden_dim = config.hidden_size
         self.intermediate_size = config.moe_intermediate_size
@@ -274,7 +276,9 @@ class DeepseekV3MoE(nn.Module):
             "w8a8float8": 3,
             "w8a8mxfloat8": 4,
             "w4a8mxfloat4": 4,
-            "w4a4mxfloat4": 4,
+            # A4W4 decode keeps the dispatch payload in BF16. The expert
+            # implementation performs MXFP4 activation quantization locally.
+            "w4a4mxfloat4": 0,
         }
 
         self.dispatch_kwargs = None
@@ -317,6 +321,9 @@ class DeepseekV3MoE(nn.Module):
             quant_mode = self.dispatch_quant_mode["w16a16"]
         else:
             quant_mode = self.dispatch_quant_mode[self.gmm_quant_mode]
+        if self.is_a4w4_mxfp4:
+            # Quantize activation before decode dispatch to reduce EP traffic.
+            quant_mode = 4
         enable_smooth_scale = quant_mode == self.dispatch_quant_mode["w8a8int8"]
         self.dispatch_kwargs = {
                 "x_active_mask": None,
@@ -333,7 +340,7 @@ class DeepseekV3MoE(nn.Module):
                 "tp_world_size": self.moe_tp_size,
                 "tp_rank_id": global_rank % self.moe_tp_size,
             }
-        if self.gmm_quant_mode == "w4a4mxfloat4":
+        if self.is_a4w4_mxfp4:
             self.dispatch_kwargs['y_dtype'] = torch_npu.float4_e2m1fn_x2
         elif quant_mode in (self.dispatch_quant_mode["w8a8float8"], self.dispatch_quant_mode["w8a8mxfloat8"]):
             self.dispatch_kwargs['y_dtype'] = torch.float8_e4m3fn
@@ -396,9 +403,12 @@ class DeepseekV3MoE(nn.Module):
         # reroute
         if "mx" in self.gmm_quant_mode:
             gathered_pertoken_scale = gathered_pertoken_scale.flatten(1)
+        re_routing_kwargs = {"per_token_scales": gathered_pertoken_scale}
+        if self.is_a4w4_mxfp4:
+            re_routing_kwargs["tokens_dtype"] = torch_npu.float4_e2m1fn_x2
         hidden_states_ordered_by_experts, gathered_pertoken_scale, gathered_ids_unsort, tokens_per_local_expert = \
                 torch_npu.npu_moe_re_routing(gathered_tokens, tokens_per_expert_group.view(self.moe_ep_size, -1),
-                per_token_scales=gathered_pertoken_scale)
+                **re_routing_kwargs)
 
         # compute experts
         gmm_args = {
@@ -497,8 +507,6 @@ class DeepseekV3MoE(nn.Module):
         combine_tokens_cpu = combine_tokens.cpu().tolist()
         input_splits = combine_tokens_cpu[1]
         output_splits = combine_tokens_cpu[0]
-        if "a4mxfloat4" in self.gmm_quant_mode:
-            expanded_x = expanded_x.view(torch.float8_e4m3fn)
         gathered_tokens = expanded_x.new_empty(all_tokens.item(), expanded_x.shape[1])
         dist.all_to_all_single(gathered_tokens, expanded_x, output_splits, input_splits, group=moe_ep_group)
 
@@ -511,11 +519,11 @@ class DeepseekV3MoE(nn.Module):
                 gathered_pertoken_scale = pertoken_scale.new_empty(gathered_tokens.shape[0], *pertoken_scale.shape[1:])
             else:
                 gathered_pertoken_scale = pertoken_scale.new_empty(gathered_tokens.shape[0])
-        if "a16" not in self.gmm_quant_mode:
-            dist.all_to_all_single(gathered_pertoken_scale, \
-                                   pertoken_scale, output_splits, input_splits, group=moe_ep_group)
-        if "mxfloat" in self.gmm_quant_mode:
-            gathered_pertoken_scale = gathered_pertoken_scale.view(torch.float8_e8m0fnu)
+            if "a16" not in self.gmm_quant_mode:
+                dist.all_to_all_single(gathered_pertoken_scale, \
+                                       pertoken_scale, output_splits, input_splits, group=moe_ep_group)
+            if "mxfloat" in self.gmm_quant_mode:
+                gathered_pertoken_scale = gathered_pertoken_scale.view(torch.float8_e8m0fnu)
         return tokens_per_expert_group, gathered_tokens, gathered_pertoken_scale, input_splits, output_splits
 
     def moe_infer_double_routing(self, x, topk_ids, topk_weight, hidden_states_share, prefill_moe_global_chunks=None):
@@ -572,6 +580,10 @@ class DeepseekV3MoE(nn.Module):
                 **routing_args
             )
 
+            if self.is_a4w4_mxfp4:
+                expanded_x, pertoken_scale = torch_npu.npu_dynamic_mx_quant(
+                    expanded_x.bfloat16(), dst_type=torch_npu.float4_e2m1fn_x2)
+
             tokens_per_expert_group, gathered_tokens, gathered_pertoken_scale, input_splits, output_splits =\
                 self.dispatch_double_routing(tokens_per_expert, expanded_x, pertoken_scale)
 
@@ -626,7 +638,7 @@ class DeepseekV3MoE(nn.Module):
             "enable_cann_ops_nn": True
         }
 
-        if "a16" not in self.gmm_quant_mode:
+        if dynamic_scale is not None and "a16" not in self.gmm_quant_mode:
             if "mxfloat" in self.gmm_quant_mode:
                 # match GMM operator requirement (dim0, dim1)->(dim0, dim1//2, 2)
                 dynamic_scale = reshape_mx_scale(dynamic_scale)
@@ -2292,6 +2304,17 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
 
         if parallel_config.cp_size > 1 and scheduler_config.cp_mini_batch != 1:
             raise ValueError(f"when cp enabled, {scheduler_config.cp_mini_batch=} should be 1")
+
+        gmm_quant_mode = self.config.quant_config.gmm_quant_mode
+        if gmm_quant_mode == "w4a4mxfloat4":
+            if platform_version != PlatformVersion.ASCEND_950:
+                raise ValueError("A4W4 MXFP4 MoE is only supported on Ascend 950")
+            layers = self.model.layers.values() if self.is_mtp else self.model.layers
+            first_moe = next(iter(layers)).ffn
+            if not isinstance(first_moe.experts.quant_method, W4A4MxFp4MoEGMMMethod):
+                raise RuntimeError(
+                    "w4a4mxfloat4 must select W4A4MxFp4MoEGMMMethod, got "
+                    f"{type(first_moe.experts.quant_method).__name__}")
 
         model_config.enable_weight_nz = platform_version != PlatformVersion.ASCEND_950
         self.update_op_kernel_dict()

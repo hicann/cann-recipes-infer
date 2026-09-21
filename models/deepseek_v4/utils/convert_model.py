@@ -292,10 +292,11 @@ def main(fp8_path, output_path, quant_type, quant_param_path=None):
     fp8_path (str): The path to the directory containing the FP8 weights and model index file.
     output_path (str): The path to the directory where the converted BF16/INT8/MXFP4/8 weights will be saved.
     quant_type (str): The type of quantization to apply. Supported values are "bfloat16",
-    "w8a8-int",  "w8a8-mx", "w4a8-mx".
+    "w8a8-int", "w4a8-int", "w4a8-mx", "w4a4-mx", and their HiF variants.
     clip (bool, optional): Whether to apply clipping during quantization. Defaults to False.
     quant_param_path (str, optional): The path to the directory containing quantization parameters.
-    w4a8 (bool): Quantize the MoE to W4A8.
+    W4 quantization modes store routed-expert weights as MXFP4 or INT4. The
+    w4a4-mx mode additionally quantizes both MoE matmul activations to MXFP4.
 
     Raises:
     KeyError: If a required scale_inv tensor is missing for a weight.
@@ -308,7 +309,8 @@ def main(fp8_path, output_path, quant_type, quant_param_path=None):
     torch.set_default_dtype(torch.bfloat16)
     os.makedirs(output_path, exist_ok=True)
     assert quant_type in [
-        "bfloat16", "w8a8-int", "w4a8-int", "w8a8-mx", "w4a8-mx", "w4a8-mx-hif"], f"Unsupported quant_type:{quant_type}"
+        "bfloat16", "w8a8-int", "w4a8-int", "w8a8-mx", "w4a8-mx",
+        "w4a4-mx", "w4a8-mx-hif"], f"Unsupported quant_type:{quant_type}"
     model_index_file = os.path.join(fp8_path, "model.safetensors.index.json")
     config_file = os.path.join(fp8_path, 'config.json')
     with open(model_index_file, "r") as f:
@@ -324,11 +326,13 @@ def main(fp8_path, output_path, quant_type, quant_param_path=None):
 
     quant_parts = quant_type.split('-')
     w4a8 = quant_type.startswith("w4a8")
+    w4a4 = quant_type.startswith("w4a4")
+    w4 = w4a8 or w4a4
     w8a8 = quant_type.startswith("w8a8")
     mx = "mx" in quant_parts
     hif = quant_type.endswith('hif')
 
-    if w8a8 or w4a8:
+    if w8a8 or w4:
         cache_scheme = {"kv_cache_scheme": {"num_bits": NUM_BITS_8, "type": "float"} if mx else None,
                         "li_cache_scheme": {
                             "type": "float" if mx else "int",
@@ -343,9 +347,16 @@ def main(fp8_path, output_path, quant_type, quant_param_path=None):
                 config.pop('quantization_config')
             quant_ignore_layers = generate_ignore_item(num_layers, compress_ratios, is_fp=mx, hif=hif)
             quantization_config = generate_quant_config(
-                cache_scheme, quant_ignore_layers, w4a8=w4a8, is_fp=mx, is_mx=mx, hif=hif)
+                cache_scheme,
+                quant_ignore_layers,
+                w4a8=w4,
+                is_fp=mx,
+                is_mx=mx,
+                hif=hif,
+                moe_activation_bits=NUM_BITS_4 if w4a4 else NUM_BITS_8,
+            )
             config['quantization_config'] = quantization_config
-    quant_layers = generate_quant_layers(num_layers, num_experts, compress_ratios, w4a8=w4a8, is_mx=mx, hif=hif)
+    quant_layers = generate_quant_layers(num_layers, num_experts, compress_ratios, w4a8=w4, is_mx=mx, hif=hif)
     # Cache for loaded safetensor files
     loaded_files = {}
 
@@ -403,7 +414,7 @@ def main(fp8_path, output_path, quant_type, quant_param_path=None):
             else:
                 new_state_dict[weight_name] = weight
                 new_weight_map[weight_name] = file_name
-            if w4a8 or w8a8:
+            if w4 or w8a8:
                 new_weight_name = weight_name.rsplit(".", 1)[0]
                 if new_weight_name in list(quant_layers.keys()):
                     bit = quant_layers[new_weight_name]
@@ -469,7 +480,8 @@ if __name__ == "__main__":
     parser.add_argument("--input_fp8_hf_path", type=str, required=True)
     parser.add_argument("--output_hf_path", type=str, required=True)
     parser.add_argument("--quant_type", type=str, default="w8a8-int",
-                        choices=["w8a8-int", "w4a8-int", "bfloat16", "w4a8-mx", "w4a8-mx-hif"])
+                        choices=["w8a8-int", "w4a8-int", "bfloat16", "w4a8-mx", "w4a4-mx",
+                                 "w4a8-mx-hif"])
     parser.add_argument("--quant_param_path", type=str, default=None)
     args = parser.parse_args()
 

@@ -20,7 +20,6 @@ from typing import Callable, Any, Dict, List, Optional, Union
 
 import torch
 import torch_npu
-import torch.nn.functional as F
 from torch.nn import Parameter
 import math
 from module.quantization import QuantizationMethods, QuantizeMethodBase, QuantizationConfig
@@ -261,9 +260,21 @@ class W4A4MxFp4MoEGMMMethod(W4A8MxFp4MoEGMMMethod):
             tuning_config=[0],
         )[0]
 
-        mm1_mm3 = torch_npu.npu_swiglu(mm1_mm3)
-        intermediate_h, pertoken_scale = torch_npu.npu_dynamic_mx_quant(
-            mm1_mm3.bfloat16(), dst_type=torch_npu.float4_e2m1fn_x2)
+        swiglu_limit = kwargs.get("swiglu_limit")
+        swiglu_kwargs = {}
+        if swiglu_limit is not None:
+            swiglu_kwargs.update({
+                "swiglu_mode": 0,
+                "clamp_limit": swiglu_limit,
+                "glu_alpha": 1,
+                "glu_bias": 0,
+            })
+        intermediate_h, pertoken_scale = torch_npu.npu_swiglu_mx_quant(
+            mm1_mm3,
+            group_index=expert_tokens,
+            dst_type=torch_npu.float4_e2m1fn_x2,
+            activate_left=True,
+            **swiglu_kwargs)
 
         return torch_npu.npu_grouped_matmul(
             [intermediate_h], [layer.w2_weight],
