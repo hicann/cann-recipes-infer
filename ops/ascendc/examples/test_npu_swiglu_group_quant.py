@@ -1141,6 +1141,220 @@ class TestCustomSwigluGroupQuant(TestCase):
         self.assertTrue(y_out_close, "block-quant multi-dloop y_out precision compare fail")
         self.assertTrue(scale_out_close, "block-quant multi-dloop scale_out precision compare fail")
 
+    # ======================== test 2*block_size tail-d (d % 64 for mx) =========================
+    def test_mode1_fp8mx_tail_d(self):
+        # MX fp8 with d divisible by 64 but (mostly) not by 256: splitD in {32, 64, 96, 160, ...}
+        # exercises the kernel's 32/64/96-element tail chunks and odd scaleCol (e8m0 GM row stride
+        # padded to even). Covers fp16/bf16 input, weight+clamp, output_origin on/off.
+        torch_npu.npu.set_device(int(DEVICE_ID))
+
+        bs = 512
+        d_list = [64, 128, 192, 320, 448, 576, 1088, 2240]
+        quant_mode = 1
+        round_scale = True
+        block_size = 32
+        dst_type = 36
+        dst_type_torch = torch.float8_e4m3fn
+        dst_type_str = DATA_TYPE_INT_TO_STR[dst_type]
+
+        for x_dtype in (torch.float16, torch.bfloat16):
+            for output_origin in (False, True):
+                for use_wc in (False, True):
+                    for d in d_list:
+                        split_d = d // 2
+                        scale_col = (split_d + 31) // 32
+                        clamp_limit = 10.0 if use_wc else None
+                        np.random.seed(42)
+                        x = torch.tensor(np.random.uniform(-2, 2, (bs, d))).to(x_dtype)
+                        x_np = x.float().numpy().astype(np.float32)
+                        weight = (torch.tensor(np.random.uniform(-2, 2, (bs, 1))).to(torch.float32)
+                                  if use_wc else None)
+
+                        cpu_y_out, cpu_scale_out, cpu_y_origin = swiglu_fp8_quant_per_token_golden(
+                            x_np, weight.numpy() if use_wc else None, clamp_limit, round_scale)
+
+                        x_npu = x.to("npu:%s" % DEVICE_ID)
+                        kwargs = dict(dst_type=dst_type_torch, quant_mode=quant_mode,
+                                      block_size=block_size, round_scale=round_scale,
+                                      output_origin=output_origin)
+                        if use_wc:
+                            kwargs["weight"] = weight.to("npu:%s" % DEVICE_ID)
+                            kwargs["clamp_limit"] = clamp_limit
+                        npu_y_out, npu_scale_out, npu_y_origin_out = \
+                            torch.ops.custom.npu_swiglu_group_quant(x_npu, **kwargs)
+
+                        npu_y_out_cpu = npu_y_out.cpu()
+                        # scale_out is [bs, ceil(scale_col/2), 2]; compare the valid scale_col per row.
+                        npu_scale_cpu = npu_scale_out.view(torch.uint8).cpu().numpy().reshape(bs, -1)
+                        npu_scale_cpu = npu_scale_cpu[:, :scale_col]
+                        tag = f"x={x_dtype} d={d} origin={output_origin} wc={use_wc}"
+                        y_out_close = requantize_compare(
+                            torch.from_numpy(cpu_y_out.view(np.int8)), npu_y_out_cpu, dst_type_str)
+                        scale_out_close = np.allclose(npu_scale_cpu.reshape(-1), cpu_scale_out.reshape(-1),
+                                                      rtol=0.0001, atol=1, equal_nan=True)
+                        self.assertTrue(y_out_close, f"y_out precision compare fail ({tag})")
+                        self.assertTrue(scale_out_close, f"scale_out precision compare fail ({tag})")
+                        if output_origin:
+                            npu_y_origin_cpu = npu_y_origin_out.cpu().float().numpy()
+                            y_origin_close = np.allclose(npu_y_origin_cpu.reshape(-1),
+                                                         cpu_y_origin.reshape(-1),
+                                                         rtol=0.01, atol=0.01, equal_nan=True)
+                            self.assertTrue(y_origin_close, f"y_origin precision compare fail ({tag})")
+
+    def test_mode1_fp8mx_tail_d_with_group_index(self):
+        # MX fp8 tail-d with group_index, both group_list_type=1 (counts) and 2 ([E, 2] pairs).
+        torch_npu.npu.set_device(int(DEVICE_ID))
+
+        bs = 1024
+        d_list = [192, 320, 576]
+        quant_mode = 1
+        round_scale = True
+        block_size = 32
+        dst_type = 36
+        dst_type_torch = torch.float8_e4m3fn
+        dst_type_str = DATA_TYPE_INT_TO_STR[dst_type]
+        clamp_limit = 10.0
+
+        for x_dtype in (torch.float16, torch.bfloat16):
+            for list_type in (1, 2):
+                for d in d_list:
+                    split_d = d // 2
+                    scale_col = (split_d + 31) // 32
+                    np.random.seed(42)
+                    x = torch.tensor(np.random.uniform(-2, 2, (bs, d))).to(x_dtype)
+                    x_np = x.float().numpy().astype(np.float32)
+                    weight = torch.tensor(np.random.uniform(-2, 2, (bs, 1))).to(torch.float32)
+                    counts = [bs // 2, bs - bs // 2 - 20]
+                    if list_type == 1:
+                        group_index = torch.tensor(counts, dtype=torch.int64)
+                    else:
+                        group_index = torch.tensor([[0, counts[0]], [1, counts[1]]], dtype=torch.int64)
+                    real_bs = sum(counts)
+
+                    cpu_y_out, cpu_scale_out, cpu_y_origin = swiglu_fp8_quant_per_token_golden(
+                        x_np, weight.numpy(), clamp_limit, round_scale)
+
+                    x_npu = x.to("npu:%s" % DEVICE_ID)
+                    npu_y_out, npu_scale_out, _ = torch.ops.custom.npu_swiglu_group_quant(
+                        x_npu, weight=weight.to("npu:%s" % DEVICE_ID),
+                        group_index=group_index.to("npu:%s" % DEVICE_ID),
+                        dst_type=dst_type_torch, quant_mode=quant_mode, block_size=block_size,
+                        round_scale=round_scale, clamp_limit=clamp_limit, group_list_type=list_type)
+
+                    npu_y_out_cpu = npu_y_out.cpu().reshape(bs, split_d)[:real_bs]
+                    cpu_y = cpu_y_out.reshape(bs, split_d)[:real_bs]
+                    npu_scale_cpu = npu_scale_out.view(torch.uint8).cpu().numpy().reshape(bs, -1)
+                    npu_scale_cpu = npu_scale_cpu[:real_bs, :scale_col]
+                    cpu_scale = cpu_scale_out.reshape(bs, scale_col)[:real_bs]
+                    tag = f"x={x_dtype} d={d} list_type={list_type}"
+                    y_out_close = requantize_compare(
+                        torch.from_numpy(cpu_y.view(np.int8)), npu_y_out_cpu, dst_type_str)
+                    scale_out_close = np.allclose(npu_scale_cpu.reshape(-1), cpu_scale.reshape(-1),
+                                                  rtol=0.0001, atol=1, equal_nan=True)
+                    self.assertTrue(y_out_close, f"y_out precision compare fail ({tag})")
+                    self.assertTrue(scale_out_close, f"scale_out precision compare fail ({tag})")
+
+    def test_mode1_fp8mx_multi_dloop_tail(self):
+        # Multi d-loop with a non-128-multiple tail chunk: d=49216 -> splitD=24608, which is
+        # 192*128 + 32, so the last d-chunk is a 32-element tail with 1 e8m0 scale per row.
+        torch_npu.npu.set_device(int(DEVICE_ID))
+
+        bs = 64
+        d = 49216
+        split_d = d // 2
+        scale_col = (split_d + 31) // 32
+        dst_type = 36
+        dst_type_torch = torch.float8_e4m3fn
+        dst_type_str = DATA_TYPE_INT_TO_STR[dst_type]
+        quant_mode = 1
+        round_scale = True
+        block_size = 32
+
+        np.random.seed(42)
+        x = torch.tensor(np.random.uniform(-2, 2, (bs, d))).to(torch.float16)
+        cpu_y_out, cpu_scale_out, cpu_y_origin = swiglu_fp8_quant_per_token_golden(
+            x.float().numpy().astype(np.float32), round_scale=round_scale)
+        x_npu = x.to("npu:%s" % DEVICE_ID)
+
+        for output_origin in (False, True):
+            npu_y_out, npu_scale_out, npu_y_origin = torch.ops.custom.npu_swiglu_group_quant(
+                x_npu, dst_type=dst_type_torch, quant_mode=quant_mode, block_size=block_size,
+                round_scale=round_scale, output_origin=output_origin)
+
+            npu_y_out_cpu = npu_y_out.cpu()
+            npu_scale_cpu = npu_scale_out.view(torch.uint8).cpu().numpy().reshape(bs, -1)[:, :scale_col]
+            y_out_close = requantize_compare(
+                torch.from_numpy(cpu_y_out.view(np.int8)), npu_y_out_cpu, dst_type_str)
+            scale_out_close = np.allclose(npu_scale_cpu.reshape(-1), cpu_scale_out.reshape(-1),
+                                          rtol=0.0001, atol=1, equal_nan=True)
+            self.assertTrue(y_out_close, f"fp8-mx multi-dloop-tail y_out fail (origin={output_origin})")
+            self.assertTrue(scale_out_close,
+                            f"fp8-mx multi-dloop-tail scale_out fail (origin={output_origin})")
+            if output_origin:
+                npu_y_origin_cpu = npu_y_origin.cpu().float().numpy()
+                y_origin_close = np.allclose(npu_y_origin_cpu.reshape(-1), cpu_y_origin.reshape(-1),
+                                             rtol=0.01, atol=0.01, equal_nan=True)
+                self.assertTrue(y_origin_close, "fp8-mx multi-dloop-tail y_origin fail")
+
+    @unittest.skipUnless(HAS_TORCH_FP4, FP4_SKIP_MSG)
+    def test_mode1_mxfp4_tail_d(self):
+        # MX fp4 (e2m1) with d divisible by 64 but not 256: splitD in {96, 160, 288} gives
+        # 32-element-granularity tails and odd scaleCol. Covers fp16 and bf16 inputs.
+        if not HAS_ML_FP4:
+            self.skipTest("ml_dtypes lacks float4_e2m1fn; cannot build MxFp4 golden")
+        torch_npu.npu.set_device(int(DEVICE_ID))
+
+        bs = 512
+        d_list = [192, 320, 576]
+        dst_type = 40
+        quant_mode = 1
+        round_scale = True
+        block_size = 32
+
+        for x_dtype in (torch.float16, torch.bfloat16):
+            for d in d_list:
+                split_d = d // 2
+                scale_col = split_d // 32
+                np.random.seed(42)
+                x = torch.tensor(np.random.uniform(-2, 2, (bs, d))).to(x_dtype)
+                x_np = x.float().numpy().astype(np.float32)
+
+                cpu_y_packed, cpu_scale = swiglu_mxfp4_quant_golden(x_np, dst_type)
+
+                x_npu = x.to("npu:%s" % DEVICE_ID)
+                npu_y_out, npu_scale_out, _ = torch.ops.custom.npu_swiglu_group_quant(
+                    x_npu, dst_type=TORCH_FP4_E2M1, quant_mode=quant_mode,
+                    block_size=block_size, round_scale=round_scale)
+
+                npu_y_packed = npu_y_out.view(torch.uint8).cpu().numpy().reshape(bs, -1)
+                npu_scale = npu_scale_out.view(torch.uint8).cpu().numpy().reshape(bs, -1)[:, :scale_col]
+
+                y_diff = np.abs(npu_y_packed.astype(np.int16) - cpu_y_packed.astype(np.int16))
+                y_pass_ratio = np.mean(y_diff == 0)
+                # e8m0 scale per-block +/-1 ordering tolerance, same as the published fp4 cases.
+                scale_close = np.allclose(npu_scale.reshape(-1), cpu_scale.reshape(-1),
+                                          rtol=0, atol=1, equal_nan=True)
+                tag = f"x={x_dtype} d={d}"
+                self.assertTrue(y_pass_ratio > 0.99, f"fp4 tail-d y match too low: {y_pass_ratio} ({tag})")
+                self.assertTrue(scale_close, f"fp4 tail-d scale mismatch ({tag})")
+
+    def test_tail_d_negative_validation(self):
+        # d must be a multiple of 2 * block_size: 64 for mx quant, 256 for block quant.
+        torch_npu.npu.set_device(int(DEVICE_ID))
+        x = torch.randn((2, 96), dtype=torch.float16, device=f"npu:{DEVICE_ID}")
+        with self.assertRaisesRegex(RuntimeError, "divisible"):
+            torch.ops.custom.npu_swiglu_group_quant(
+                x, dst_type=torch.float8_e4m3fn, quant_mode=1, block_size=32, round_scale=True)
+        with self.assertRaisesRegex(RuntimeError, "divisible"):
+            torch.ops.custom.npu_swiglu_group_quant(
+                x, dst_type=torch.float8_e4m3fn, quant_mode=0)
+        # d=64 is the new mx minimum (splitD=32, scaleCol=1) and must work.
+        x_ok = torch.randn((2, 64), dtype=torch.float16, device=f"npu:{DEVICE_ID}")
+        y, scale, _ = torch.ops.custom.npu_swiglu_group_quant(
+            x_ok, dst_type=torch.float8_e4m3fn, quant_mode=1, block_size=32, round_scale=True)
+        self.assertEqual(y.shape, (2, 32))
+        self.assertEqual(scale.view(torch.uint8).numel(), 2 * 2)
+
     def test_group_list_type_general_cases(self):
         """Execute the planned 50 type-1 and 50 type-2 calls on real NPU."""
         torch_npu.npu.set_device(int(DEVICE_ID))

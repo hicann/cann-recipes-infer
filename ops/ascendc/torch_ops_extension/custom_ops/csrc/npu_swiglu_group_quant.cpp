@@ -33,6 +33,7 @@ const int SWIGLU_FACTOR = 2;
 const int PER_BLOCK_FP16 = 128;
 const int PER_MX_FP16 = 32;
 const int BLOCK_QUANT_INPUT_ALIGN = PER_BLOCK_FP16 * SWIGLU_FACTOR;
+const int MX_QUANT_INPUT_ALIGN = PER_MX_FP16 * SWIGLU_FACTOR;
 const int MX_SCALE_ALIGN_FACTOR = 2;
 const int BLOCK_QUANT = 0;
 const int MX_QUANT = 1;
@@ -100,8 +101,11 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> construct_swiglu_group_quant_outp
     int64_t x_last_dim = x.sizes().back();
     TORCH_CHECK(quant_mode == BLOCK_QUANT || quant_mode == MX_QUANT,
         "Unsupported quant mode, only support ", BLOCK_QUANT, " or ", MX_QUANT, ".");
-    TORCH_CHECK(x_last_dim % BLOCK_QUANT_INPUT_ALIGN == 0,
-        "In group quant, the last dim of x should be divisible by ", BLOCK_QUANT_INPUT_ALIGN,
+    // The last dim must be a multiple of 2 * block_size (256 for block quant, 64 for mx quant).
+    const int64_t inputAlign =
+        (quant_mode == MX_QUANT) ? MX_QUANT_INPUT_ALIGN : BLOCK_QUANT_INPUT_ALIGN;
+    TORCH_CHECK(x_last_dim % inputAlign == 0,
+        "In group quant, the last dim of x should be divisible by ", inputAlign,
         ", actual ", x_last_dim, ".");
 
     // Divide the last dimension by 2 (swiglu halves the feature dim). y_last_dim counts output elements.

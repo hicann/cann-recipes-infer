@@ -67,7 +67,6 @@ constexpr uint16_t NEW_MANTISSA = 0x0008;
 // group_list_type = 2: group_index is [E, 2] pairs of [group_id, count]
 constexpr int64_t GROUP_LIST_TYPE_PAIR = 2;
 constexpr int64_t GROUP_INDEX_PAIR_ELE_NUM = 2; // int64 elements per [group_id, count] pair
-constexpr int64_t GROUP_INDEX_COUNT_OFFSET = 1; // count is the second element of a pair
 
 #define FLOAT_OVERFLOW_MODE_CTRL 60
 #ifndef INFINITY
@@ -810,6 +809,10 @@ __aicore__ inline void VFProcessSwigluMxFp8InvScale(const LocalTensor<T0>& yOrig
         MaskReg pregMain1 = CreateMask<T0, MaskPattern::ALL>();
         MaskReg pregMerge = UpdateMask<float>(sreg);
         MaskReg pregMerge1 = UpdateMask<float>(sreg1);
+        MaskReg pregHalf;
+        MaskReg pregLow;
+        MaskReg pregHigh;
+        MaskReg pregInv;
         MaskReg compareMask0;
         Duplicate(one, 1.0f, pregMain0);
         Duplicate(zeroUint32, static_cast<uint32_t>(0), pregMain0);
@@ -825,6 +828,12 @@ __aicore__ inline void VFProcessSwigluMxFp8InvScale(const LocalTensor<T0>& yOrig
                 DataCopy<float, AscendC::MicroAPI::LoadDist::DIST_BRC_B32>(weight, weightLocalAddr + i);
             }
             for (uint16_t j = 0; j < loopCount; j++) {
+                // curCol is a multiple of 32 (tiling guarantees splitD % 32 == 0); the last chunk may be
+                // 32/64/96 elements, so tail lanes are masked out of stores and the scale reduction.
+                uint32_t colRemain = curColNum - static_cast<uint32_t>(j) * vlLen;
+                uint32_t curCol = colRemain < vlLen ? colRemain : vlLen;
+                uint32_t halfSreg = curCol / 2;
+                pregHalf = UpdateMask<float>(halfSreg);
                 DataCopy(x0, x0LocalAddr + i * curColNumAlignT + j * vlLen);
                 DataCopy(x1, x1LocalAddr + i * curColNumAlignT + j * vlLen);
                 Cast<float, T0, traitB16ToB32Layout0>(x0Layout0, x0, pregMain1);
@@ -850,15 +859,25 @@ __aicore__ inline void VFProcessSwigluMxFp8InvScale(const LocalTensor<T0>& yOrig
                 Add(yLayout1, yLayout1, zero, pregMain0);
                 // 合并奇偶位置
                 Interleave(y0, y1, yLayout0, yLayout1);
+                uint32_t lowSreg = curCol < VL_FP32 ? curCol : VL_FP32;
+                pregLow = UpdateMask<float>(lowSreg);
                 if constexpr (hasOutput) {
-                    StoreOutputData<T0>(yOriginLocalAddr, y0, pregMain0, 2 * j * VL_FP32 + i * curColNumAlignT);
-                    StoreOutputData<T0>(yOriginLocalAddr, y1, pregMain0, (2 * j + 1) * VL_FP32 + i * curColNumAlignT);
+                    StoreOutputData<T0>(yOriginLocalAddr, y0, pregLow, 2 * j * VL_FP32 + i * curColNumAlignT);
                 }
-                StoreOutputData<float>(yLocalAddr, y0, pregMain0, 2 * j * VL_FP32 + i * curColNumAlignFloat);
-                StoreOutputData<float>(yLocalAddr, y1, pregMain0, (2 * j + 1) * VL_FP32 + i * curColNumAlignFloat);
+                StoreOutputData<float>(yLocalAddr, y0, pregLow, 2 * j * VL_FP32 + i * curColNumAlignFloat);
+                if (curCol > VL_FP32) {
+                    uint32_t highSreg = curCol - VL_FP32;
+                    pregHigh = UpdateMask<float>(highSreg);
+                    if constexpr (hasOutput) {
+                        StoreOutputData<T0>(
+                            yOriginLocalAddr, y1, pregHigh, (2 * j + 1) * VL_FP32 + i * curColNumAlignT);
+                    }
+                    StoreOutputData<float>(
+                        yLocalAddr, y1, pregHigh, (2 * j + 1) * VL_FP32 + i * curColNumAlignFloat);
+                }
 
-                Abs(yLayout0, yLayout0, pregMain0);
-                Abs(yLayout1, yLayout1, pregMain0);
+                Abs(yLayout0, yLayout0, pregHalf);
+                Abs(yLayout1, yLayout1, pregHalf);
 
                 // fp32场景，32个数对应4个Block；先做一次Max，接着ReduceMaxWithBlock
                 // 然后DeInterLeave并且Max，得到每4个Block的最大值
@@ -885,14 +904,17 @@ __aicore__ inline void VFProcessSwigluMxFp8InvScale(const LocalTensor<T0>& yOrig
                 Cast<uint8_t, int32_t, castTraitU32toU8Even>(tmp5, scale5, pregMerge);
                 Pack(scale7, (RegTensor<uint32_t>&)tmp5);
                 Pack(scale6, scale7);
-                DataCopyUnAlign<uint8_t, PostLiteral::POST_MODE_UPDATE>(scaleLocalAddr, scale6, uReg, 4);
+                uint32_t curScaleNum = CeilDiv(curCol, PER_MX_FP16);
+                DataCopyUnAlign<uint8_t, PostLiteral::POST_MODE_UPDATE>(scaleLocalAddr, scale6, uReg, curScaleNum);
 
                 Sub(scale5, tmp4, scale4, pregMerge); // 127 - exp_scale
                 // ((127 - exp_scale) << 23).view(float32)
                 ShiftLefts((RegTensor<int32_t>&)invScale, scale5, static_cast<int16_t>(23), pregMerge);
                 Interleave(invScale0, invScale1, invScale, invScale);
                 Interleave(invScale1, invScale, invScale0, invScale0);
-                StoreOutputData<float>(invScaleLocalAddr, invScale1, pregMerge1, j * 16 + i * invScaleColNumAlign);
+                uint32_t invSreg = curScaleNum * 4;
+                pregInv = UpdateMask<float>(invSreg);
+                StoreOutputData<float>(invScaleLocalAddr, invScale1, pregInv, j * 16 + i * invScaleColNumAlign);
             }
             DataCopyUnAlignPost(scaleLocalAddr, uReg, 0);
         }
@@ -919,13 +941,18 @@ __aicore__ inline void VFProcessSwigluMxFp8Quant(const LocalTensor<T>& yQuantLoc
         RegTensor<float> invScale;
         RegTensor<float> dupInvScale;
         MaskReg pregMain = CreateMask<float, MaskPattern::ALL>();
+        MaskReg pregLoop;
         for (uint16_t i = 0; i < curRowNum; i++) {
             for (uint16_t j = 0; j < loopCount; j++) {
+                // curColNum is a multiple of 32; the last 64-wide chunk may be a 32-element tail.
+                uint32_t colRemain = curColNum - static_cast<uint32_t>(j) * VL_FP32;
+                uint32_t sregLoop = colRemain < VL_FP32 ? colRemain : VL_FP32;
+                pregLoop = UpdateMask<float>(sregLoop);
                 LoadInputData<float>(y, yLocalAddr, pregMain, i * curColNumAlign + j * VL_FP32);
                 DataCopy<float, AscendC::MicroAPI::LoadDist::DIST_E2B_B32>(
                     invScale, scaleLocalAddr + j * 8 + i * invScaleColNumAlign);
-                Mul(y, y, invScale, pregMain);
-                StoreOutputData<T>(yQuantLocalAddr, y, pregMain, j * VL_FP32 + i * dstCurColNumAlign);
+                Mul(y, y, invScale, pregLoop);
+                StoreOutputData<T>(yQuantLocalAddr, y, pregLoop, j * VL_FP32 + i * dstCurColNumAlign);
             }
         }
     }
@@ -950,20 +977,60 @@ __aicore__ inline void CopyIn(
     DataCopyPad(inputTensor, inputGm, dataCoptExtParams, dataCopyPadExtParams);
 }
 
-// DataCopy block count is hardware-limited. Split sparse pair gathers so large
-// group lists do not silently truncate a transfer at the UB boundary.
-__aicore__ inline void CopyInGroupIndexType2(
-    const GlobalTensor<int64_t>& inputGm, const LocalTensor<int64_t>& inputTensor, uint32_t pairCount)
+// group_list_type=2: group_index is an [E, 2] table of [group_id, count] pairs. The whole table is
+// copied into UB with one contiguous burst (caller side), then the count column is extracted with
+// DeInterleave and reduced on the vector unit. This replaces the previous per-pair MTE2 gather
+// (one 8-byte strided burst per pair), which dominated MTE2 time for large group lists.
+// The count column low words are summed as int32 (counts are non-negative and far below 2^31);
+// the int64 result buffer is written as [sum(low32), 0(high32)].
+template <bool withUbReduce = false>
+__aicore__ inline void VFProcessGroupIndexPair(const LocalTensor<int64_t>& yLocal,
+    const LocalTensor<int64_t>& xLocal, uint32_t pairNum)
 {
-    constexpr uint32_t MAX_BURST_COUNT = 2048;
-    uint32_t copied = 0;
-    while (copied < pairCount) {
-        uint32_t curCount = (pairCount - copied) > MAX_BURST_COUNT
-            ? MAX_BURST_COUNT : (pairCount - copied);
-        // Stride over pairs, taking only the count element of each one.
-        CopyIn(inputGm[copied * GROUP_INDEX_PAIR_ELE_NUM + GROUP_INDEX_COUNT_OFFSET], inputTensor[copied],
-            static_cast<uint16_t>(curCount), 1, 1);
-        copied += curCount;
+    __local_mem__ int64_t* yLocalAddr = (__local_mem__ int64_t*)yLocal.GetPhyAddr();
+    __local_mem__ int32_t* yLocalAddr32 = (__local_mem__ int32_t*)yLocalAddr;
+    __local_mem__ int32_t* xLocalAddr32 = (__local_mem__ int32_t*)xLocal.GetPhyAddr();
+    constexpr uint16_t VL_B32 = REPEAT_SIZE / sizeof(int32_t);
+    // Each pair is two int64 values = [group_id_lo, group_id_hi, count_lo, count_hi] in 32-bit words.
+    uint32_t totalWords = pairNum * GROUP_INDEX_PAIR_ELE_NUM * (sizeof(int64_t) / sizeof(int32_t));
+    uint16_t loopCount = CeilDiv(totalWords, VL_B32);
+    __VEC_SCOPE__
+    {
+        RegTensor<int32_t> words;
+        RegTensor<int32_t> zeroReg;
+        RegTensor<int32_t> evenWords;
+        RegTensor<int32_t> oddWords;
+        RegTensor<int32_t> idWords;
+        RegTensor<int32_t> countWords;
+        RegTensor<int32_t> origin;
+        RegTensor<int32_t> sum;
+        RegTensor<int64_t> zeroReg64;
+        MaskReg pregMain = CreateMask<int32_t, AscendC::MicroAPI::MaskPattern::ALL>();
+        MaskReg pregMerge = CreateMask<int32_t, AscendC::MicroAPI::MaskPattern::VL1>();
+        MaskReg pregMerge64 = CreateMask<int64_t, AscendC::MicroAPI::MaskPattern::VL1>();
+        MaskReg pregLoop;
+        Duplicate(zeroReg, static_cast<int32_t>(0), pregMain);
+        Duplicate(zeroReg64, static_cast<int64_t>(0), pregMain);
+        Duplicate(sum, static_cast<int32_t>(0), pregMain);
+        uint32_t sreg = totalWords;
+        for (uint16_t i = 0; i < loopCount; i++) {
+            pregLoop = UpdateMask<int32_t>(sreg);
+            DataCopy(words, xLocalAddr32 + i * VL_B32);
+            Adds(words, words, static_cast<int32_t>(0), pregLoop);
+            // words = [id_lo, id_hi, count_lo, count_hi, ...]; keep only the count low words.
+            DeInterleave(evenWords, oddWords, words, zeroReg);
+            DeInterleave(idWords, countWords, evenWords, zeroReg);
+            Add(sum, sum, countWords, pregMain);
+        }
+        ReduceSum(sum, sum, pregMain);
+        if (withUbReduce) {
+            DataCopy(origin, yLocalAddr32);
+            Add(sum, sum, origin, pregMerge);
+        }
+        // Write the full aligned 8 bytes (zero high word first, then the int32 sum) so the caller can
+        // read the result as int64; a 4-byte-offset store would be an unaligned UB access.
+        DataCopy(yLocalAddr, zeroReg64, pregMerge64);
+        DataCopy(yLocalAddr32, sum, pregMerge);
     }
 }
 

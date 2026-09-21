@@ -41,7 +41,7 @@ int64_t RoundUp(int64_t x, int64_t y) {
 
 constexpr int64_t BLOCK_SIZE = 32;
 constexpr int64_t REPEAT_SIZE = 256;
-constexpr int64_t D_LIMIT = 256;
+constexpr int64_t SWIGLU_SPLIT_FACTOR = 2;
 constexpr int64_t DOUBLE_BUFFER = 2;
 constexpr int64_t FP8_BYTES = 1;
 constexpr int64_t B16_BYTES = 2;
@@ -51,6 +51,7 @@ constexpr int64_t B16_ALIGN_NUM = BLOCK_SIZE / B16_BYTES;
 constexpr int64_t B32_ALIGN_NUM = BLOCK_SIZE / B32_BYTES;
 constexpr int64_t PER_BLOCK_FP16 = 128;
 constexpr int64_t PER_MX_FP16 = 32;
+constexpr int64_t MX_QUANT_ALIGN = 2 * PER_MX_FP16;  // 2 * block_size of mx quant
 constexpr int64_t FP4_PACK_NUM = 2;
 constexpr int64_t BLOCK_QUANT = 0;
 constexpr int64_t MX_QUANT = 1;
@@ -194,11 +195,21 @@ ge::graphStatus SwigluGroupQuantTiling::GetShapeAttrsInfoInner()
     for (size_t i = 0; i < xDimNum - 1; i++) {
         bs_ = bs_ * xStorageShape.GetDim(i);
     }
+
+    // Parse attrs before validating mode-dependent input shapes. The last-dim limit is
+    // 2 * block_size (256 for block quant, 64 for mx quant), so splitFactor_ is needed first.
+    if (GetAttr() == ge::GRAPH_FAILED) {
+        OPS_LOG_E(context_->GetNodeName(), "Get attr failed.");
+        return ge::GRAPH_FAILED;
+    }
+
     d_ = xStorageShape.GetDim(xDimNum - 1);
-    OPS_ERR_IF((d_ < D_LIMIT || d_ % D_LIMIT != 0),
+    const int64_t dLimit = SWIGLU_SPLIT_FACTOR * splitFactor_;
+    OPS_ERR_IF((d_ < dLimit || d_ % dLimit != 0),
         OPS_LOG_E(context_->GetNodeName(),
-                  "input x last dim should be greater than or equal to %ld and divisible by %ld, got %ld.",
-                  D_LIMIT, D_LIMIT, d_),
+                  "input x last dim should be greater than or equal to %ld (2 * block_size) "
+                  "and divisible by %ld, got %ld.",
+                  dLimit, dLimit, d_),
         return ge::GRAPH_FAILED);
 
     auto weightDesc = context_->GetOptionalInputDesc(INPUT_INDEX_WEIGHT);
@@ -210,12 +221,6 @@ ge::graphStatus SwigluGroupQuantTiling::GetShapeAttrsInfoInner()
                 hasWeight_ = true;
             }
         }
-    }
-
-    // Parse attrs before validating mode-dependent input shapes.
-    if (GetAttr() == ge::GRAPH_FAILED) {
-        OPS_LOG_E(context_->GetNodeName(), "Get attr failed.");
-        return ge::GRAPH_FAILED;
     }
 
     auto groupIndexDesc = context_->GetOptionalInputDesc(INPUT_INDEX_GROUP_INDEX);
@@ -604,6 +609,13 @@ ge::graphStatus SwigluGroupQuantTiling::CalcMxFp4QuantOpTiling()
         rowFactor_ = lo;
     }
 
+    // The mxfp4 data stage mis-writes the packed fp4 output stream when a VF call batches several
+    // rows and the per-row scale count is odd (splitD % 64 == 32, i.e. newly allowed d values like
+    // 64/192/320). Even per-row scale counts (the legacy splitD % 128 == 0 space plus d = 128/384/
+    // ...) are correct with the original rowFactor, so only restrict the odd-scale-count case.
+    if (splitD_ % MX_QUANT_ALIGN != 0) {
+        rowFactor_ = 1;
+    }
     rowLoopOfFormerBlock_ = CeilDiv(rowOfFormerBlock_, rowFactor_);
     rowLoopOfTailBlock_ = CeilDiv(rowOfTailBlock_, rowFactor_);
     tailRowFactorOfFormerBlock_ = rowOfFormerBlock_ % rowFactor_ == 0 ? rowFactor_ : rowOfFormerBlock_ % rowFactor_;

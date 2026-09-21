@@ -49,22 +49,22 @@ public:
             for (int64_t idx = 0; idx < tilingData->gLoop; idx++) {
                 int64_t curGFactor = (idx == tilingData->gLoop - 1) ? tilingData->tailGFactor : tilingData->gFactor;
                 groupIndexLocal = groupIndexQue.template AllocTensor<int64_t>();
-                if (tilingData->groupListType == GROUP_LIST_TYPE_PAIR) {
-                    // Gather the count (second) element of each [group_id, count] pair.
-                    CopyInGroupIndexType2(groupIndexGm[idx * tilingData->gFactor], groupIndexLocal,
-                        curGFactor / GROUP_INDEX_PAIR_ELE_NUM);
-                } else {
-                    CopyIn(groupIndexGm[idx * tilingData->gFactor], groupIndexLocal, 1, curGFactor);
-                }
+                // type=1 is a flat count list; type=2 is the raw [E, 2] pair table. Both are copied
+                // with a single contiguous burst (pair counts are extracted on the vector unit).
+                CopyIn(groupIndexGm[idx * tilingData->gFactor], groupIndexLocal, 1, curGFactor);
                 groupIndexQue.template EnQue(groupIndexLocal);
                 groupIndexLocal = groupIndexQue.template DeQue<int64_t>();
-                // Pair layout reduces only the gathered count column.
-                int64_t groupEleNum = tilingData->groupListType == GROUP_LIST_TYPE_PAIR
-                    ? curGFactor / GROUP_INDEX_PAIR_ELE_NUM : curGFactor;
-                if (idx == 0) {
-                    VFProcessGroupIndex<int64_t, false>(groupSumLocal, groupIndexLocal, groupEleNum);
+                if (tilingData->groupListType == GROUP_LIST_TYPE_PAIR) {
+                    uint32_t pairNum = curGFactor / GROUP_INDEX_PAIR_ELE_NUM;
+                    if (idx == 0) {
+                        VFProcessGroupIndexPair<false>(groupSumLocal, groupIndexLocal, pairNum);
+                    } else {
+                        VFProcessGroupIndexPair<true>(groupSumLocal, groupIndexLocal, pairNum);
+                    }
+                } else if (idx == 0) {
+                    VFProcessGroupIndex<int64_t, false>(groupSumLocal, groupIndexLocal, curGFactor);
                 } else {
-                    VFProcessGroupIndex<int64_t, true>(groupSumLocal, groupIndexLocal, groupEleNum);
+                    VFProcessGroupIndex<int64_t, true>(groupSumLocal, groupIndexLocal, curGFactor);
                 }
                 groupIndexQue.template FreeTensor(groupIndexLocal);
             }

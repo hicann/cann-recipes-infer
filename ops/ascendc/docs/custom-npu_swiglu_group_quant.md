@@ -125,7 +125,7 @@ custom.npu_swiglu_group_quant(
 
 - 输入`x`约束：
   - rank必须大于0。
-  - 最后一维`D`必须大于等于`256`，且必须能被`256`整除。
+  - 最后一维`D`必须大于等于`2 * block_size`且必须能被`2 * block_size`整除，即`quant_mode=0`（block quant，block_size=128）时为`256`的整数倍，`quant_mode=1`（mx quant，block_size=32）时为`64`的整数倍。
   - `D`会被均分为`A`和`B`两部分，因此SwiGLU输出最后一维为`H=D/2`。
   - 数据类型仅支持`float16`和`bfloat16`，格式仅支持ND。
 
@@ -174,7 +174,7 @@ MX FP4 在 SwiGLU 后按每 32 个通道（mx block）共享一个`float8_e8m0`�
 
 ### 已知限制 / 注意事项
 
-- `D`必须能被`256`整除（与其他模式一致）；fp4 packed 末维`D/4`与 e8m0 scale 列数`splitD/32`在该约束下天然满足对齐与打包要求。
+- `D`必须能被`64`整除（`quant_mode=1`要求`D`为`2 * block_size = 64`的整数倍）；fp4 packed 末维`D/4`与 e8m0 scale 列数`splitD/32`在该约束下天然满足对齐与打包要求。
 - 非对齐 / 小`d`场景：当`scaleDFactor = splitD/32`非 16 对齐（如`D=256`→4、`D=512`→8）且单核多行全载（`rowFactor>1`）时，e8m0 scale 的搬出需走`PaddingMode::Compact`通路；当前实现已按此处理，已覆盖`D=256/512`、`bs=64/512`用例验证逐行 scale 正确。
 - 多 d-loop（大`D`单行无法全载，`dLoop>1`）场景：tiling 从最小 mx block 递增选取`dFactor`，并保持`scaleCol`为整行宽度，使每个 d-chunk 的 e8m0 scale 落到正确 GM 偏移；已用`D=49152`（splitD=24576，dLoop>1）验证 y 与 scale 正确。
 - e1m2 无 `ml_dtypes` 对应 dtype，golden 采用按 kernel 反推的均匀网格编码（见 examples 测试）。fp4 比对采用 nibble/packed-byte 匹配率阈值（>0.99），残差来自 bf16 中间计算在 block 边界的舍入，与 e2m1 同量级。
