@@ -2085,11 +2085,15 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
                 )
                 if layer_idx in self.collect_layer_ids:
                     collected_hidden_states.append(hidden_states.mean(dim=1))
+        # MTP consumes the full residual stream before HC reduction and norm.
+        # Keep one row per token across the worker boundary: [T, hc_mult * H].
+        prev_hidden_states = hidden_states.flatten(1)
         hidden_states = self.hc_head(hidden_states, self.hc_head_fn, self.hc_head_scale, self.hc_head_base)
         hidden_states = self.norm(hidden_states)
+        auxiliary_hidden_states = None
         if self.collect_layer_ids:
-            return hidden_states, torch.cat(collected_hidden_states, dim=-1)
-        return hidden_states
+            auxiliary_hidden_states = torch.cat(collected_hidden_states, dim=-1)
+        return hidden_states, prev_hidden_states, auxiliary_hidden_states
 
 
 class DeepseekV3ModelMTPLayer(DeepseekV3Model):
@@ -2128,11 +2132,10 @@ class DeepseekV3ModelMTPLayer(DeepseekV3Model):
         input_ids: Optional[torch.Tensor] = None,
         prefill_moe_global_chunks: Optional[int] = None,
         **kwargs,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         if prefill_moe_global_chunks is None:
             prefill_moe_global_chunks = self.get_prefill_moe_global_chunks(hidden_states, is_prefill)
-        # mhc
-        hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
+        # The MTP projections already provide distinct [T, hc_mult, H] streams.
         hidden_states = self.layers[str(self.mtp_start_layer_idx + mtp_layer_idx)](
             hidden_states,
             attn_metadata=attn_metadata,
@@ -2142,8 +2145,9 @@ class DeepseekV3ModelMTPLayer(DeepseekV3Model):
             input_ids=input_ids,
             prefill_moe_global_chunks=prefill_moe_global_chunks,
         )
+        prev_hidden_states = hidden_states.flatten(1)
         hidden_states = self.hc_head(hidden_states, self.hc_head_fn, self.hc_head_scale, self.hc_head_base)
-        return hidden_states
+        return hidden_states, prev_hidden_states
 
 
 class DeepseekV4CompressedTensorsConfig(CompressedTensorsConfig):
@@ -2779,19 +2783,14 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
 
         self.generate_kernel_metadata(attn_metadata, is_prefill)
 
-        # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
-        outputs = self.model(
+        # Separate the logits input [T, H] from the MTP state [T, hc_mult * H].
+        outputs, prev_hidden_states, auxiliary_hidden_states = self.model(
             input_ids=input_ids,
             position_ids=position_ids,
             attn_metadata=attn_metadata,
             is_prefill=is_prefill,
             cur_topk_list=cur_topk_list,
-        ) # (num_tokens, hidden_size)
-
-        auxiliary_hidden_states = None
-        if isinstance(outputs, tuple):
-            outputs, auxiliary_hidden_states = outputs
-        prev_hidden_states = outputs
+        )
         if auxiliary_hidden_states is not None:
             prev_hidden_states = {
                 "prev_hidden_states": prev_hidden_states,
@@ -3069,13 +3068,18 @@ class DeepseekV3ModelMTP(DeepseekV3ForCausalLM):
         residual = None
 
 
+        num_tokens, hidden_size = hidden_states.shape
+        hc_mult = self.config.hc_mult
+        # Normalize/project each HC stream independently. Use 2-D inputs for
+        # quantized Linear kernels, then restore the HC axis for the decoder.
+        prev_hidden_states = prev_hidden_states.view(num_tokens * hc_mult, hidden_size)
         hidden_states = self.enorm(hidden_states)
         prev_hidden_states = self.hnorm(prev_hidden_states)
         hidden_states_e = self.e_proj(hidden_states)
         hidden_states_h = self.h_proj(prev_hidden_states)
-        hidden_states = hidden_states_e + hidden_states_h
+        hidden_states = hidden_states_e.unsqueeze(1) + hidden_states_h.reshape(num_tokens, hc_mult, hidden_size)
 
-        hidden_states = self.model(
+        hidden_states, prev_hidden_states = self.model(
             hidden_states,
             past_residual=residual,
             attn_metadata=attn_metadata,
@@ -3084,7 +3088,6 @@ class DeepseekV3ModelMTP(DeepseekV3ForCausalLM):
         )
 
         outputs = self.shared_head_norm(hidden_states)
-        prev_hidden_states = outputs
 
         logits = self.forward_lm_head(
             outputs=outputs, kv_len=attn_metadata["actual_seq_q"], is_prefill=is_prefill, \
