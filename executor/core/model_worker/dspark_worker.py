@@ -199,7 +199,16 @@ class DSparkWorker(BaseSpeculativeWorker):
             dtype=torch.float32,
             device=self.device,
         )
-        return self.sampler.random_like_by_request(reference, batch, "exponential")
+        noise = self.sampler.random_like_by_request(reference, batch, "exponential")
+        if self.infer_config.parallel_config.attn_tp_size > 1:
+            comm_manager = self.model_worker.comm_manager
+            attn_tp_group = comm_manager.get_group("attn_tp_group")
+            attn_tp_src = (
+                self.infer_config.parallel_config.global_rank
+                - comm_manager.get_rank("attn_tp_group")
+            )
+            torch.distributed.broadcast(noise, src=attn_tp_src, group=attn_tp_group)
+        return noise
 
     def _verify_decode_tokens(
         self,

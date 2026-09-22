@@ -963,6 +963,30 @@ class ExecutionEngine:
                 logits,
                 eos_token_ids=self.eos_token_ids,
             )
+        else:
+            next_tokens, logprobs_tensors = self.sampler.sample_and_gather_logprobs(
+                batch,
+                selected_logits,
+            )
+
+        # Equal TP logits can still yield different samples with rank-local RNG.
+        # Keep the committed tokens and their verification results consistent.
+        if self.infer_config.parallel_config.attn_tp_size > 1:
+            attn_tp_group = self.comm_manager.get_group("attn_tp_group")
+            attn_tp_rank = self.comm_manager.get_rank("attn_tp_group")
+            attn_tp_src = self.global_rank - attn_tp_rank
+            torch.distributed.broadcast(next_tokens, src=attn_tp_src, group=attn_tp_group)
+            if worker:
+                torch.distributed.broadcast(accepted_num, src=attn_tp_src, group=attn_tp_group)
+            if logprobs_tensors is not None:
+                for tensor in (
+                    logprobs_tensors.logprob_token_ids,
+                    logprobs_tensors.logprobs_tensors,
+                    logprobs_tensors.selected_token_ranks,
+                ):
+                    torch.distributed.broadcast(tensor, src=attn_tp_src, group=attn_tp_group)
+
+        if worker:
             draft_next_tokens = self._prepare_draft_next_tokens(
                 next_tokens,
                 model_inputs,
@@ -974,11 +998,6 @@ class ExecutionEngine:
                 accepted_num=accepted_num,
                 model_inputs_main=model_inputs,
                 prev_hidden_states=prev_hidden_states,
-            )
-        else:
-            next_tokens, logprobs_tensors = self.sampler.sample_and_gather_logprobs(
-                batch,
-                selected_logits,
             )
 
         self.profiler.step()

@@ -207,10 +207,17 @@ docker run -u root -itd --name cann_recipes_infer --ulimit nproc=65535:65535 --i
   | `enable_limit_core` | bool | `false` | 在 Atlas A3 上配合多流使用，对部分算子限制 AI Core 数以提升多流重叠效果；开启时要求 `enable_multi_streams=True`，且不支持 `enable_pypto=True`。 |
   | `enable_pypto` | bool | `false` | 启用 PyPTO 算子路径；当前与 `enable_limit_core` 互斥。 |
   | `moe_chunk_max_len` | int | `65536` | MoE token 分发的最大 chunk 长度，用于长序列 prefill 场景规避 OOM。 |
+  | `low_latency_tp` | bool | `false` | 启用低时延推理模式，适用于单请求、小 batch size 的部署场景。 |
 
   > CANNLab一站式开发平台 A3 场景请使用 `ci_a3/deepseek_v4_flash_rank_16_16ep_w8a8_platform.yaml`，详见[CANNLab一站式开发平台指南](#cannlab一站式开发平台指南)。
 
   > **Note**: 在A3环境下，INT8 W8A8场景支持 4~64卡部署。可分别在config下的yaml文件中修改 `parallel_config.world_size`（chips * 2）配置。
+
+### Ascend 950 低时延 TP 配置
+
+低时延 TP 将 Attention 和 O-Projection 按 TP 切分，减少中间结果的跨卡聚合，适用于低 batch size 的推理场景。该功能默认关闭，仅支持 Ascend 950。
+
+启用时在 `model_config.custom_params` 中设置 `low_latency_tp: True`，并在 `parallel_config` 中显式设置 `attn_tp_size = o_proj_tp_size = moe_tp_size = embed_tp_size = lmhead_tp_size = world_size > 1`、`cp_size = 1`。普通推理和 DSpark 的 4 卡示例见下方启动命令。
 
 ### DSpark投机推理配置
 
@@ -264,6 +271,12 @@ bash executor/scripts/infer.sh --model deepseek_v4 --yaml ci_950/deepseek_v4_fla
 
 # offline 模式，Ascend 950系列，DeepSeek-V4 Flash DSpark
 bash executor/scripts/infer.sh --model deepseek_v4 --yaml ci_950/deepseek_v4_flash_rank_4_4ep_dspark.yaml
+
+# offline 模式，Ascend 950系列，4卡低时延 TP
+bash executor/scripts/infer.sh --model deepseek_v4 --yaml ci_950/deepseek_v4_flash_rank_4_1bs_low_latency_tp.yaml
+
+# offline 模式，Ascend 950系列，4卡低时延 TP + DSpark
+bash executor/scripts/infer.sh --model deepseek_v4 --yaml ci_950/deepseek_v4_flash_rank_4_1bs_low_latency_tp_dspark.yaml
 
 # online PD 模式，暂时只支持A3机型
 bash executor/scripts/infer.sh --model deepseek_v4 --mode online --pd-role prefill --p-yaml-name ci_a3/deepseek_v4_pd/prefill.yaml --d-yaml-name ci_a3/deepseek_v4_pd/decode.yaml

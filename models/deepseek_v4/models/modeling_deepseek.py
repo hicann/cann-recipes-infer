@@ -224,6 +224,9 @@ class DeepseekV3MoE(nn.Module):
         self.intermediate_size = config.moe_intermediate_size
         self.moe_tp_size = self.infer_config.parallel_config.moe_tp_size
         self.moe_ep_size = self.infer_config.parallel_config.moe_ep_size
+        self.low_latency_tp = bool(
+            self.infer_config.model_config.custom_params.get("low_latency_tp", False)
+        )
         self.platform_version = self.infer_config.model_config.platform_version
         self.exe_mode = self.infer_config.model_config.exe_mode
         self.enable_multi_streams = self.infer_config.model_config.custom_params.get("enable_multi_streams", False)
@@ -363,11 +366,13 @@ class DeepseekV3MoE(nn.Module):
     def forward(self, hidden_states, is_prefill=False, cur_topk_list=None, input_ids=None, shared_expert_stream=None,
                 prefill_moe_global_chunks=None):
         _, h = hidden_states.shape
-        if is_prefill:
+        hidden_states_share = None
+        if self.low_latency_tp:
             if self.n_shared_experts > 0:
                 hidden_states_share = self.forward_shared_expert(hidden_states, shared_expert_stream)
-            else:
-                hidden_states_share = None
+        elif is_prefill:    # ep
+            if self.n_shared_experts > 0:
+                hidden_states_share = self.forward_shared_expert(hidden_states, shared_expert_stream)
         else:
             record_stream(self.enable_multi_streams, hidden_states, shared_expert_stream)
             record_event(self.enable_multi_streams, self.npu_events, 0)
@@ -382,12 +387,77 @@ class DeepseekV3MoE(nn.Module):
             topk_idx = cur_topk_list
         topk_idx = topk_idx.to(torch.int32)
 
+        if self.low_latency_tp:
+            return self.moe_infer_tp(hidden_states, topk_idx, topk_weight, hidden_states_share)
+
         # MOE EP
         if is_prefill:
             return self.moe_infer_double_routing(
                 hidden_states, topk_idx, topk_weight, hidden_states_share, prefill_moe_global_chunks)
         else:
             return self.moe_infer_dispatch_combine(hidden_states, topk_idx, topk_weight, shared_expert_stream)
+
+
+    def _build_moe_tp_routing_args(self, x, topk_ids):
+        quant_mode = -1
+        routing_quantizes_input = False
+        if self.gmm_quant_mode in ("w4a8mxfloat8", "w4a8mxfloat4"):
+            quant_mode = 3
+            routing_quantizes_input = True
+
+        routing_args = {
+            "expert_idx": topk_ids,
+            "active_num": x.shape[0] * self.top_k,
+            "expert_num": self.num_experts,
+            "expert_tokens_num_type": 1,
+            "expert_tokens_num_flag": True,
+            "active_expert_range": [0, self.num_experts],
+            "quant_mode": quant_mode,
+        }
+        return routing_args, routing_quantizes_input
+
+    def _build_moe_tp_gmm_args(self, expanded_x, tokens_per_expert, pertoken_scale, routing_quantizes_input):
+        gmm_args = {
+            "x": expanded_x,
+            "expert_tokens": tokens_per_expert,
+            "group_list_type": 1,
+            "swiglu_limit": self.swiglu_limit,
+            "enable_cann_ops_nn": True,
+        }
+        if routing_quantizes_input:
+            pertoken_scale = reshape_mx_scale(pertoken_scale)
+            gmm_args.update({"pertoken_scale": pertoken_scale})
+        return gmm_args
+
+    def moe_infer_tp(self, x, topk_ids, topk_weight, hidden_states_share):
+        """
+        Pure MoE TP strategy. Each rank keeps all experts with TP-sharded
+        expert FFN weights, then sums the per-rank partial outputs.
+        """
+        num_tokens, h = x.shape
+        hidden_states = x.view(-1, h)
+        routing_args, routing_quantizes_input = self._build_moe_tp_routing_args(x, topk_ids)
+        expanded_x, expanded_row_idx, tokens_per_expert, pertoken_scale = torch_npu.npu_moe_init_routing_v2(
+            hidden_states, **routing_args)
+
+        gmm_args = self._build_moe_tp_gmm_args(
+            expanded_x, tokens_per_expert, pertoken_scale, routing_quantizes_input)
+
+        expert_output = self.moe_ffn(**gmm_args)
+
+        hidden_states = torch_npu.npu_moe_finalize_routing(
+            expert_output,
+            skip1=hidden_states_share.view(-1, h) if hidden_states_share is not None else None,
+            skip2=None,
+            bias=None,
+            scales=topk_weight.to(expert_output.dtype),
+            expanded_src_to_dst_row=expanded_row_idx,
+            export_for_source_row=None,
+            drop_pad_mode=2
+        )
+
+        dist.all_reduce(hidden_states, group=self.comm_manager.get_group("moe_tp_group"))
+        return hidden_states.view(num_tokens, h)
 
     def forward_shared_expert(self, hidden_states, shared_expert_stream=None):
         record_stream(self.enable_multi_streams, hidden_states, shared_expert_stream)
@@ -692,6 +762,9 @@ class Attention(nn.Module):
         self.batch_size = self.infer_config.scheduler_config.batch_size
         self.batch_size_per_rank = self.infer_config.scheduler_config.batch_size_per_dp_rank
         self.attn_tp_size = self.infer_config.parallel_config.attn_tp_size
+        self.low_latency_tp = bool(
+            self.infer_config.model_config.custom_params.get("low_latency_tp", False)
+        )
         self.attn_dp_size = self.infer_config.parallel_config.attn_dp_size
         self.oproj_tp_size = self.infer_config.parallel_config.o_proj_tp_size
         if self.oproj_tp_size > config.o_groups:
@@ -741,6 +814,7 @@ class Attention(nn.Module):
         self.dim = config.hidden_size
         self.n_heads = config.num_attention_heads
 
+        self.attn_tp_rank = self.comm_manager.get_rank("attn_tp_group") if self.attn_tp_size > 1 else 0
         self.num_heads_per_rank = self.n_heads // self.attn_tp_size
         self.q_lora_rank = config.q_lora_rank
         self.o_lora_rank = config.o_lora_rank
@@ -755,7 +829,7 @@ class Attention(nn.Module):
         self.window_size = config.sliding_window
         self.eps = config.rms_norm_eps
 
-        self.attn_sink = nn.Parameter(torch.empty(self.num_heads_per_rank, dtype=torch.float32))
+        self.attn_sink = nn.Parameter(torch.empty(self.n_heads, dtype=torch.float32))
         self.wq_a = ReplicatedLinear(self.dim,
                                      self.q_lora_rank,
                                      params_dtype=torch.bfloat16,
@@ -770,8 +844,7 @@ class Attention(nn.Module):
                                         bias=False,
                                         quant_config=config.quant_config,
                                         tp_size=self.attn_tp_size,
-                                        tp_rank=self.comm_manager.get_rank("attn_tp_group") \
-                                            if self.attn_tp_size > 1 else 0,
+                                        tp_rank=self.attn_tp_rank,
                                         prefix=f"{prefix}.wq_b",
                                         )
         self.wkv = ReplicatedLinear(self.dim,
@@ -782,13 +855,8 @@ class Attention(nn.Module):
                                     )
         self.kv_norm = DeepseekV3RMSNorm(self.head_dim, self.eps)
 
-        # consider oproj_tp
-        if self.oproj_tp_size == 1:
-            wo_tp_size = self.attn_tp_size
-            wo_tp_rank = self.comm_manager.get_rank("attn_tp_group") if self.attn_tp_size > 1 else 0
-        else:
-            wo_tp_size = self.oproj_tp_size
-            wo_tp_rank = self.comm_manager.get_rank("oproj_tp_group")
+        wo_tp_size = self.oproj_tp_size
+        self.oproj_tp_rank = self.comm_manager.get_rank("oproj_tp_group") if self.oproj_tp_size > 1 else 0
         quant_config = config.quant_config if self.mm_quant_mode == "w8a8mxfloat8" \
             or self.mm_quant_mode == "w8a8hifloat8" else None
         self.wo_a = ColumnParallelLinear(self.n_heads * self.head_dim // self.n_groups,
@@ -797,13 +865,13 @@ class Attention(nn.Module):
                                         bias=False,
                                         quant_config=quant_config,
                                         tp_size=wo_tp_size,
-                                        tp_rank=wo_tp_rank,
+                                        tp_rank=self.oproj_tp_rank,
                                         prefix=f"{prefix}.wo_a",
                                         )
         self.wo_b = RowParallelLinear(self.n_groups * self.o_lora_rank,
                                     self.dim,
                                     tp_size=wo_tp_size,
-                                    tp_rank=wo_tp_rank,
+                                    tp_rank=self.oproj_tp_rank,
                                     bias=False,
                                     input_is_parallel=True,
                                     quant_config=config.quant_config,
@@ -1043,8 +1111,14 @@ class Attention(nn.Module):
                 dst_dtype=torch_npu.hifloat8)
             return x.view(num_tokens, -1), self.wq_b.scale
         elif self.mm_quant_mode == "w8a8mxfloat8":
-            x = self.q_norm(x)
-            return torch_npu.npu_dynamic_mx_quant(x, dst_type=torch.float8_e4m3fn)
+            # dst_type: 291→e5m2, 292→e4m3fn, 296→e2m1fn_x2, 297→e1m2fn_x2
+            x_quant, x_scale, _ = torch_npu.npu_rms_norm_dynamic_mx_quant(
+                x,
+                self.q_norm.weight,
+                epsilon=self.eps,
+                dst_type=292,
+            )
+            return x_quant, x_scale
         elif self.mm_quant_mode == "w8a8int8":
             if self.platform_version == PlatformVersion.ASCEND_950:
                 x = self.q_norm(x)
@@ -1058,6 +1132,13 @@ class Attention(nn.Module):
                 )
         else:
             return x, None
+
+    def q_b_proj_tp(self, qr, qr_scale):
+        q = self.wq_b(qr, dynamic_scale=qr_scale)
+        # Keep local heads through sparse attention and the output projection.
+        if self.low_latency_tp:
+            return q.view(-1, self.num_heads_per_rank, self.head_dim)
+        return q.unflatten(-1, (self.n_heads, self.head_dim))
 
     def mla_prolog_pypto(
         self,
@@ -1230,7 +1311,7 @@ class Attention(nn.Module):
         qr, qr_scale = self.apply_norm_dynamic_quant(qr)
         wait_event(enable_multi_streams, self.mla_events, 2)
         record_event(enable_multi_streams, self.mla_events, 1)
-        q = self.wq_b(qr, dynamic_scale=qr_scale).unflatten(-1, (self.num_heads_per_rank, self.head_dim))
+        q = self.q_b_proj_tp(qr, qr_scale)
         cur_stream = torch.npu.current_stream()
         with npu_stream_switch(enable_multi_streams, attn_metadata.get('mla_stream', None)):
             wait_event(enable_multi_streams, self.mla_events, 1)
@@ -1331,7 +1412,7 @@ class Attention(nn.Module):
                 record_event(enable_multi_streams, self.mla_events, 2)
 
         wait_event(enable_multi_streams, self.mla_events, 1)
-        q = self.wq_b(qr, dynamic_scale=qr_scale).unflatten(-1, (self.num_heads_per_rank, self.head_dim))
+        q = self.q_b_proj_tp(qr, qr_scale)
 
         # start compressor and li qb stream after wq_b, to run parallel with wkv vectors
         record_event(enable_cmpr_stream, self.cmpr_events, 0)
@@ -1401,6 +1482,9 @@ class Attention(nn.Module):
         win_block_table_str = "full_kv" if is_prefill else "win_kv"
         metadata = attn_metadata["kernel_metadata"][f'c{self.compress_ratio}a_metadata']
         attn_sinks = self.attn_sink
+        if self.low_latency_tp:
+            head_start = self.attn_tp_rank * self.num_heads_per_rank
+            attn_sinks = attn_sinks[head_start:head_start + self.num_heads_per_rank]
 
         cu_seqlens_q = attn_metadata["cu_seq_lens_q"]
         seqused_q = attn_metadata["seq_used_q"]
@@ -1602,7 +1686,9 @@ class Attention(nn.Module):
                 partial_slice=self.partial_slice,
             )
             o = o.view(num_tokens, self.num_groups_per_rank, -1).to(torch.bfloat16)
-        if self.oproj_tp_size > 1:
+        # Full Attention TP already owns the head groups used by local wo_a.
+        # Only the Attention DP path needs to exchange output groups.
+        if self.oproj_tp_size > 1 and not self.low_latency_tp:
             # [num_tokens, tp_size, G/tp_size, ND/G] -> [tp_size, BS, G/tp_size, ND/G]
             o = o.view(num_tokens, self.oproj_tp_size, self.num_groups_per_rank // self.oproj_tp_size, -1)
             o = o.transpose(1, 0).contiguous().view(-1)
@@ -1632,7 +1718,9 @@ class Attention(nn.Module):
                 o = torch.matmul(o.transpose(0, 1), self.wo_a.weight).transpose(0, 1).contiguous()
             else:
                 o = torch_npu.npu_transpose_batchmatmul(o, self.wo_a.weight, perm_x1=(1, 0, 2), perm_y=(1, 0, 2))
-        if self.oproj_tp_size > 1:
+        if self.low_latency_tp:
+            o = o.view(num_tokens, -1)
+        elif self.oproj_tp_size > 1:
             # [oproj_tp_size, num_tokens, num_groups_per_rank // oproj_tp_size * o_lora_rank]
             o = o.view(self.oproj_tp_size, num_tokens, -1)
         else:
@@ -1641,7 +1729,9 @@ class Attention(nn.Module):
         # o_b_proj
         x = self.wo_b(o)
 
-        if self.oproj_tp_size > 1:
+        if self.low_latency_tp:
+            dist.all_reduce(x, group=self.comm_manager.get_group("oproj_tp_group"))
+        elif self.oproj_tp_size > 1:
             # [oproj_tp_size, num_tokens, dim] --> [oproj_tp_size * num_tokens, dim]
             x = x.view(self.oproj_tp_size * num_tokens, -1)
             reduce_scatter_output = torch.empty((num_tokens, x.shape[-1]), dtype=x.dtype, device=x.device)
@@ -2192,6 +2282,9 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
         self.comm_manager = comm_manager
         self.input_max_len = self.infer_config.data_config.input_truncated_len
         self.platform_version = self.infer_config.model_config.platform_version
+        self.low_latency_tp = bool(
+            self.infer_config.model_config.custom_params.get("low_latency_tp", False)
+        )
         self.get_parallel_settings()
         self.experts_per_rank = config.n_routed_experts // self.moe_ep_size
         self.top_k = config.num_experts_per_tok
@@ -2279,6 +2372,7 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
         moe_chunk_max_len = custom_params.get("moe_chunk_max_len", 65536)
         next_n = model_config.next_n
         with_ckpt = model_config.with_ckpt
+        low_latency_tp = bool(custom_params.get("low_latency_tp", False))
 
         if (
             isinstance(moe_chunk_max_len, bool)
@@ -2291,8 +2385,26 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
 
         if exe_mode not in ["eager", "npugraph_ex"]:
             raise ValueError(f"{exe_mode=} does not supported!")
-        if parallel_config.attn_tp_size > 1:
-            raise ValueError(f"{parallel_config.attn_tp_size=} is not supported yet!")
+        if low_latency_tp:
+            if platform_version != PlatformVersion.ASCEND_950:
+                raise ValueError("low_latency_tp only supports Ascend 950.")
+            if parallel_config.attn_tp_size <= 1:
+                raise ValueError("low_latency_tp requires attn_tp_size > 1.")
+            if parallel_config.attn_tp_size != parallel_config.world_size or parallel_config.cp_size != 1:
+                raise ValueError("low_latency_tp requires attn_tp_size == world_size and cp_size == 1.")
+            if parallel_config.o_proj_tp_size != parallel_config.attn_tp_size:
+                raise ValueError("low_latency_tp requires o_proj_tp_size == attn_tp_size.")
+            for tp_name in ("moe_tp_size", "embed_tp_size", "lmhead_tp_size"):
+                if getattr(parallel_config, tp_name) != parallel_config.world_size:
+                    raise ValueError(f"low_latency_tp requires {tp_name} == world_size.")
+            if self.config.num_attention_heads % parallel_config.attn_tp_size != 0:
+                raise ValueError("num_attention_heads must be divisible by attn_tp_size.")
+            if self.config.o_groups % parallel_config.attn_tp_size != 0:
+                raise ValueError("o_groups must be divisible by attn_tp_size.")
+        elif parallel_config.attn_tp_size > 1:
+            raise ValueError(
+                f"{parallel_config.attn_tp_size=} is not supported unless low_latency_tp is enabled."
+            )
 
         dynamo_feat = enable_cache_compile or enable_superkernel
         if exe_mode == "eager" and dynamo_feat:
@@ -2546,24 +2658,25 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
             platform_version=platform_version,
         )
 
-        # used for fullmesh v2
-        moe_ep_mc2_group_type = None if self.platform_version != PlatformVersion.ASCEND_950 else 3
-        # 950 use aiv group for mc2
-        is_full_mesh_v2 = self.platform_version != PlatformVersion.ASCEND_950
-        hccl_buffer_size = calc_moe_hccl_buffer_size(
-            self.infer_config, self.config, is_full_mesh_v2=is_full_mesh_v2
-        )
-        self.comm_manager.register_group(
-            name="moe_ep_group_mc2",
-            group_num=self.moe_tp_size,
-            group_size=self.moe_ep_size,
-            group_stride=self.moe_tp_size,
-            return_name=True,
-            allow_physical_reuse=False,
-            hccl_buffer_size=hccl_buffer_size,
-            group_type=moe_ep_mc2_group_type,
-            platform_version=platform_version,
-        )
+        if not self.low_latency_tp:
+            # used for fullmesh v2
+            moe_ep_mc2_group_type = None if self.platform_version != PlatformVersion.ASCEND_950 else 3
+            # 950 use aiv group for mc2
+            is_full_mesh_v2 = self.platform_version != PlatformVersion.ASCEND_950
+            hccl_buffer_size = calc_moe_hccl_buffer_size(
+                self.infer_config, self.config, is_full_mesh_v2=is_full_mesh_v2
+            )
+            self.comm_manager.register_group(
+                name="moe_ep_group_mc2",
+                group_num=self.moe_tp_size,
+                group_size=self.moe_ep_size,
+                group_stride=self.moe_tp_size,
+                return_name=True,
+                allow_physical_reuse=False,
+                hccl_buffer_size=hccl_buffer_size,
+                group_type=moe_ep_mc2_group_type,
+                platform_version=platform_version,
+            )
         self.comm_manager.register_group(
             name="cp_group",
             group_num=world_size // self.cp_size,
@@ -2683,7 +2796,7 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
             "ori_win_right": 0,
             "layout_q": "TND",
             "layout_kv": "PA_BBND",
-            "num_heads_q": self.config.num_attention_heads,
+            "num_heads_q": self.config.num_attention_heads // self.attn_tp_size,
             "num_heads_kv": 1,
             "head_dim": self.config.kv_lora_rank,
             "has_ori_kv": True,

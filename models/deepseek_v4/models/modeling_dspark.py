@@ -309,6 +309,10 @@ class DSparkAttention(Attention):
             attn_metadata["dspark_fused_fa_metadata"]
 
         compact_kv = self._gather_dspark_kv(attn_metadata["dspark_fused_fa_inputs"])
+        sinks = self.attn_sink
+        if self.low_latency_tp:
+            head_start = self.attn_tp_rank * self.num_heads_per_rank
+            sinks = sinks[head_start:head_start + self.num_heads_per_rank]
 
         return self.dspark_sparse_attn_ops(
             q=q,
@@ -323,7 +327,7 @@ class DSparkAttention(Attention):
             cu_seqlens_cmp_kv=None,
             seqused_q=seqused_q,
             seqused_ori_kv=seqused_ori_kv,
-            sinks=self.attn_sink,
+            sinks=sinks,
             metadata=metadata,
             softmax_scale=self.softmax_scale,
             cmp_ratio=1,
