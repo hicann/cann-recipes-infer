@@ -69,8 +69,8 @@ def _validate_config_keys(config: dict):
 
 def parse_sparse_time_step(value):
     """
-    输入： str，如"20, 30-40, 50"
-    输出： list[int]
+    Input: str, e.g. "20, 30-40, 50"
+    Output: list[int]
     """
     result = []
     parts = [p.strip() for p in value.split(',')]
@@ -108,7 +108,7 @@ class SparsePredictorManager():
         self.sparse_attn_mode = None
         self.config = None
         self.sparse_params = {}
-    
+
     def from_config(self, config_path, sparse_method, sparse_params=None):
         self.config = load_sparse_config_from_file(config_path)
         self.config[sparse_method]['sparse_time_step'] = \
@@ -140,18 +140,18 @@ class BaseSparsePredictor(ABC):
         self.sparse_params = sparse_params or {}
         self.sparse_config = sparse_config
 
-        # ---------- 通用参数 ----------
+        # ---------- Common parameters ----------
         self.block_size_q = int(sparse_config["block_size_Q"])
         self.block_size_k = int(sparse_config["block_size_K"])
 
-        # ---------- 网络结构参数 ----------
+        # ---------- Network structure parameters ----------
         self.double_stream_layers = self.sparse_params.get("double_stream_layers")
         self.single_stream_layers = self.sparse_params.get("single_stream_layers")
         self.attn_layers = self.sparse_params.get("attn_layers")
         self.total_steps = self.sparse_params.get("num_steps")
         self.device = self.sparse_params.get("device")
 
-        # ---------- 层/步计数器 ----------
+        # ---------- Layer/step counters ----------
         self.total_layers_per_step = (
             self.double_stream_layers + self.single_stream_layers
             if self.double_stream_layers is not None and self.single_stream_layers is not None
@@ -161,7 +161,7 @@ class BaseSparsePredictor(ABC):
         self.layer_counter = 0
         self.index_type = torch.int32
 
-        # ---------- 统一状态快照 ----------
+        # ---------- Unified state snapshot ----------
         self.current = {
             "step": self.step,
             "layer": 0,
@@ -368,7 +368,7 @@ class BaseSparsePredictor(ABC):
 
     @staticmethod
     def _merge_sparse_outputs_with_lse(out1, lse1, out2, lse2):
-        # local/other 两路 sparse 输出共享同一套 LSE 归一化和加权逻辑。
+        # The local/other sparse outputs share the same LSE normalization and weighting logic.
         lses = (lse1, lse2)
         valid = [torch.isfinite(lse) for lse in lses]
         any_valid = valid[0] | valid[1]
@@ -412,7 +412,8 @@ class BaseSparsePredictor(ABC):
         if k_mean_override is None:
             sabi = self.get_sabi_v2(q, k)
         else:
-            # overlap 分支复用已聚合的 KV block 均值，只重算当前 query block 的 TopK SABI。
+            # The overlap branch reuses the already-gathered KV block means and only
+            # recomputes the TopK SABI for the current query blocks.
             q_mean = self.pooling_matmul(q, self.block_size_q, block_num_q)
             attn = (q_mean @ k_mean_override.transpose(-2, -1)).softmax(dim=-1)
             sabi = torch.full(
@@ -437,7 +438,8 @@ class BaseSparsePredictor(ABC):
 
         prefix_blocks = math.ceil(max(0, int(q_dense_prefix_len)) / int(self.block_size_q))
         suffix_blocks = math.ceil(max(0, int(q_dense_suffix_len)) / int(self.block_size_q))
-        # sink 前缀和 text 后缀需要保持 dense 语义，因此对应 query block 强制保留全部 KV block。
+        # The sink prefix and text suffix must keep dense semantics, so the
+        # corresponding query blocks forcibly keep all KV blocks.
         if prefix_blocks > 0:
             end = min(prefix_blocks, block_num_q)
             sabi[:, :, :end, :] = full_k.expand(q.shape[0], q.shape[1], end, block_num_k)
@@ -554,13 +556,15 @@ class BaseSparsePredictor(ABC):
         txt_q, txt_k, txt_v = block_args["txt_q"], block_args["txt_k"], block_args["txt_v"]
         k_img_global = self._ring_all_gather_seq(runtime_attn, k_img_local)
         v_img_global = self._ring_all_gather_seq(runtime_attn, v_img_local)
-        # Ring 只切分序列维，TopK 构建 SABI 前需要先聚合完整 KV 序列。
+        # Ring shards only the sequence dim, so the full KV sequence must be
+        # gathered before building the TopK SABI.
         local_sink_len = self._get_ring_local_sink_token_len(
             local_img_token_len=int(q_img_local.shape[1]),
             ring_rank=int(runtime_attn.ring_rank),
             ring_world_size=int(runtime_attn.ring_world_size),
         )
-        # 首帧 sink query 走 dense 回填，稀疏主体先把本地 sink 段移到尾部。
+        # First-frame sink queries are backfilled with dense attention; the sparse
+        # body first moves the local sink segment to the end.
         q_img_exec = torch.cat(
             [q_img_local[:, local_sink_len:, :, :], q_img_local[:, :local_sink_len, :, :]],
             dim=1,
@@ -618,13 +622,15 @@ class BaseSparsePredictor(ABC):
         txt_v_bnsd = pre_attn_layout(txt_v).contiguous()
         world_size = int(runtime_attn.ring_world_size)
         rank = int(runtime_attn.ring_rank)
-        # overlap 版本先算 local KV sparse，同时异步聚合其它 rank 的 KV，最后用 LSE 合并两路输出。
+        # The overlap version first computes sparse attention on local KV while
+        # asynchronously gathering other ranks' KV, then merges the two outputs with LSE.
         local_sink_len = self._get_ring_local_sink_token_len(
             local_img_token_len=int(q_img_local.shape[1]),
             ring_rank=rank,
             ring_world_size=world_size,
         )
-        # Ring overlap 先用本地 KV 计算 sparse attention，同时异步聚合其他 rank 的 KV。
+        # Ring overlap first computes sparse attention with local KV while
+        # asynchronously gathering other ranks' KV.
 
         k_gathered = torch.empty(
             (runtime_attn.ring_world_size, *k_img_local.shape),
@@ -742,8 +748,8 @@ class BaseSparsePredictor(ABC):
         return cached[1] if reverse else cached[0]
 
     def get_effective_indices(self) -> Tuple[int, int]:
-        """获取当前有效的(step, layer)索引"""
-        # 对于无时序模型（如VGGT），始终返回step=0
+        """Get the current effective (step, layer) indices."""
+        # For non-temporal models (e.g. VGGT), always return step=0
         effective_step = self.step if self.total_steps > 1 else 0
         return effective_step, self.layer_counter
 
@@ -915,7 +921,7 @@ class BaseSparsePredictor(ABC):
         elif path.is_dir():
             self.load_directory(path, step_pattern, step_num)
         else:
-            raise FileNotFoundError(f"路径不存在: {path}")
+            raise FileNotFoundError(f"Path does not exist: {path}")
 
     def load_single_file(self, file_path: Path):
         self.sparsity_dict[0] = torch.load(file_path, map_location=self.device)
@@ -929,12 +935,12 @@ class BaseSparsePredictor(ABC):
 
     @staticmethod
     def padding_sabi(selected_indices_tensor: torch.Tensor, max_width: int, pad_value: int = -1):
-        padded_selected_indices_tensor = [F.pad(t, (0, max_width - t.shape[1]), value=pad_value) 
+        padded_selected_indices_tensor = [F.pad(t, (0, max_width - t.shape[1]), value=pad_value)
                                             for t in selected_indices_tensor]
         result = torch.stack(padded_selected_indices_tensor, dim=0)
         return result
 
-    
+
     def get_block_mask(self, q, sabi):
         b, h, n, _ = q.shape
 
@@ -947,7 +953,7 @@ class BaseSparsePredictor(ABC):
         block_mask[b_valid, h_valid, r_valid, col_indices] = False
         return block_mask
 
-    
+
     def get_token_mask(self, block_mask, n):
         mask = block_mask[:, :, :, None, :, None]
         b, h, bq, bk = block_mask.shape
@@ -974,11 +980,11 @@ class BaseSparsePredictor(ABC):
 
     def combined_sabi_tensor_list(self, mid_sabi_list, must_keep_indices_q, must_keep_indices_k, num_blocks_k):
         pass
-    
+
     def combined_sabi_tensor(self, mid_sabi_list, must_keep_indices_q, must_keep_indices_k, num_blocks_k):
         return None
 
-    
+
 
 
 class TopKPredictor(BaseSparsePredictor):
@@ -1070,7 +1076,7 @@ class TopKPredictor(BaseSparsePredictor):
             self.step_layer_inv_head_perm.get((int(step_idx), int(layer_idx))),
         )
 
-    
+
     def get_block_attn(self, q: torch.Tensor, k, block_num_q, block_num_k):
         _, _, n_q, _ = q.shape
         n_k = k.shape[-2]
@@ -1158,16 +1164,16 @@ class TopKPredictor(BaseSparsePredictor):
         k_nums = torch.clamp(k_nums, min=1, max=block_num_k)
         max_k = int(k_nums.max().item())
         _, indices = torch.topk(attn, max_k, dim=-1)
-        
+
         k_nums_expanded = k_nums.view(1, h, 1, 1)
         arange_k = torch.arange(max_k, device=q.device).view(1, 1, 1, max_k)
         mask = arange_k < k_nums_expanded
         new_sabi_tensor[:, :, :, :max_k] = torch.where(mask, indices, -1)
 
         return new_sabi_tensor
- 
+
     def get_final_sabi(self, q: torch.Tensor, k: torch.Tensor, **kwargs):
-        '''sabi连接must_keep的block indices，得到final_sabi'''
+        '''Concatenate the must_keep block indices onto sabi to get final_sabi.'''
         sink_frame_len = kwargs["sink_frame_len"]
         img_token_len = kwargs["img_token_len"]
         sparsity_override = kwargs.get("sparsity_override")
@@ -1179,20 +1185,20 @@ class TopKPredictor(BaseSparsePredictor):
         block_num_k = math.ceil(n_k / self.block_size_k)
 
         sink_txt_blocks_q, must_keep_indices_q, sink_txt_blocks_k, must_keep_indices_k = \
-            self.get_must_keep_blocks_indices(token_len=all_token_len, 
-                                              sink_frame_len=sink_frame_len, 
+            self.get_must_keep_blocks_indices(token_len=all_token_len,
+                                              sink_frame_len=sink_frame_len,
                                               txt_token_len=txt_token_len)
 
         mid_q, mid_k = q[:, :, : (block_num_q - sink_txt_blocks_q) * self.block_size_q, :],\
             k[:, :, : (block_num_k - sink_txt_blocks_k) * self.block_size_k, :]
-        
+
         mid_sabi_list = self.get_sabi(mid_q, mid_k, sparsity_override=sparsity_override)
-        final_sabi = self.combined_sabi_tensor_list(mid_sabi_list, must_keep_indices_q, 
+        final_sabi = self.combined_sabi_tensor_list(mid_sabi_list, must_keep_indices_q,
                         must_keep_indices_k, block_num_k).unsqueeze(0)
         return final_sabi
 
     def get_final_sabi_v2(self, q: torch.Tensor, k: torch.Tensor, **kwargs):
-        '''sabi连接must_keep的block indices，得到final_sabi'''
+        '''Concatenate the must_keep block indices onto sabi to get final_sabi.'''
         sink_frame_len = kwargs["sink_frame_len"]
         img_token_len = kwargs["img_token_len"]
         img_token_len_q = int(kwargs.get("img_token_len_q", img_token_len))
@@ -1221,7 +1227,7 @@ class TopKPredictor(BaseSparsePredictor):
 
         mid_q, mid_k = q[:, :, : (block_num_q - sink_txt_blocks_q) * self.block_size_q, :],\
             k[:, :, : (block_num_k - sink_txt_blocks_k) * self.block_size_k, :]
-        
+
         mid_q = mid_q.contiguous()
         mid_k = mid_k.contiguous()
 
@@ -1231,7 +1237,7 @@ class TopKPredictor(BaseSparsePredictor):
 
 MEMORY_LAYOUT = {
     "TND": (
-        lambda x: x.view(x.shape[0] * x.shape[1], *x.shape[2:]), 
+        lambda x: x.view(x.shape[0] * x.shape[1], *x.shape[2:]),
         lambda x: x,
     ),
     "BNSD": (
@@ -1349,7 +1355,7 @@ class SVGPredictor(BaseSparsePredictor):
         super().__init__(sparse_config, sparse_params)
         svg_config = sparse_config['SVG']
         logger.info(svg_config)
-        
+
         self.sparse_time_step = svg_config['sparse_time_step']
         self.sparsity = svg_config['sparsity']
         self.context_length = svg_config['context_length']
@@ -1365,7 +1371,7 @@ class SVGPredictor(BaseSparsePredictor):
         width_frame = width / frame_size
 
         return width_frame
-    
+
     def sample_mse(self, query, key, value, context_length):
         if context_length > 0:
             key = key[:, :, :-context_length]
@@ -1394,7 +1400,7 @@ class SVGPredictor(BaseSparsePredictor):
                 atten_mask=~sampled_attention_mask
             )[0]
             mse = torch.mean((sampled_hidden_states - sampled_golden_hidden_states) ** 2, dim=(2, 3))
-            
+
             sampled_mses[mask_name[mask_idx]] = mse
         del sampled_attention_mask, sampled_hidden_states
         return sampled_mses
@@ -1405,7 +1411,7 @@ class SVGPredictor(BaseSparsePredictor):
 
         if block_size % block_size_q != 0 or block_size % block_size_k != 0:
             raise ValueError("block_size must be divisible")
-        
+
         q_num_per_block = block_size // block_size_q
         k_num_per_block = block_size // block_size_k
 
@@ -1421,16 +1427,16 @@ class SVGPredictor(BaseSparsePredictor):
         )
         block_thres = frame_size * width_frame
         num_block = math.ceil(num_frame * frame_size / block_size)
-        
+
         idx = torch.arange(num_block, device="cpu")
         band = (idx[:, None] - idx[None, :]).abs() < int(block_thres // block_size)
         block_mask = (~band).repeat_interleave(q_num_per_block, dim=0) \
                             .repeat_interleave(k_num_per_block, dim=1)
-        
+
         pixel_attn_mask = (~block_mask).repeat_interleave(self.block_size_q, dim=0) \
                                         .repeat_interleave(self.block_size_k, dim=1)
         pixel_attn_mask = pixel_attn_mask[:num_frame * frame_size, :num_frame * frame_size]
-      
+
         if mask_name == "spatial":
             attention_mask[:-context_length, :-context_length] = pixel_attn_mask
 
@@ -1453,10 +1459,10 @@ class SVGPredictor(BaseSparsePredictor):
             attention_mask[:, -context_length:] = 1
         attention_mask = attention_mask[:self.sample_mse_max_row].to(device)
         return attention_mask, block_mask
-    
+
     def get_sabi(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_frames: int, frame_size: int):
         b, h, s, _ = q.shape
-        
+
         device = q.device
         self.device = device
         frame_width = self.sparsity_to_width(self.sparsity, num_frames, frame_size)
@@ -1470,7 +1476,7 @@ class SVGPredictor(BaseSparsePredictor):
         )
 
         if self._svg_mask_cache_key != cache_key:
-            spatial_mask, block_mask = self.get_attention_mask("spatial", s, num_frames, 
+            spatial_mask, block_mask = self.get_attention_mask("spatial", s, num_frames,
                                                                 frame_size, frame_width, device=device)
             temporal_mask, _ = self.get_attention_mask("temporal", s, num_frames,
                                                                 frame_size, frame_width, device=device)
@@ -1484,15 +1490,15 @@ class SVGPredictor(BaseSparsePredictor):
             base_sabi_tensor = self.sabi_tensor[0, 0]
             block_num_q, block_num_k = base_sabi_tensor.shape[0], base_sabi_tensor.shape[1]
             self.sabi_tensor = base_sabi_tensor.unsqueeze(0).unsqueeze(0).expand(b, h, block_num_q, block_num_k)
-        
+
         mse_result = self.sample_mse(q, k, v, context_length_cu)
         pattern = (mse_result["spatial"] < mse_result["temporal"]).flatten()
 
         return pattern
-    
- 
+
+
     def get_final_sabi(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_frames: int, frame_size: int):
-        '''sabi连接must_keep的block indices，得到final_sabi'''
+        '''Concatenate the must_keep block indices onto sabi to get final_sabi.'''
         sink_frame_len = 0
 
         all_token_len = q.shape[2]
@@ -1511,10 +1517,10 @@ class HunyuanVideoTopKAdapter(TopKPredictor):
     def __init__(self, sparse_config, sparse_params=None):
         super().__init__(sparse_config, sparse_params)
         self.update_sparse_params(sparse_params)
-        # HyVideo特定参数
-        
+        # HyVideo-specific parameters
+
     def update_sparse_params(self, sparse_params):
-        # HyVideo特定参数
+        # HyVideo-specific parameters
         self.sink_frame_len = sparse_params.get("sink_frame_len", 0)
         self.img_token_len = sparse_params.get("img_token_len", 0)
         self.frame_num = sparse_params.get("frame_num", 0)
@@ -1539,7 +1545,7 @@ class HunyuanVideoTopKAdapter(TopKPredictor):
         multi_last_k_blocks_token_num = (sink_txt_blocks_k - 1) * self.block_size_k + k_num_of_last_block
         if multi_last_k_blocks_token_num < sink_txt_len_k:
             sink_txt_blocks_k += 1
-        
+
         sink_txt_start_indices = num_blocks_k - sink_txt_blocks_k
         must_keep_indices_k = torch.cat([
             torch.arange(sink_txt_start_indices, num_blocks_k)
@@ -1552,7 +1558,7 @@ class HunyuanVideoTopKAdapter(TopKPredictor):
         multi_last_q_blocks_token_num = (sink_txt_blocks_q - 1) * self.block_size_q + q_num_of_last_block
         if multi_last_q_blocks_token_num < sink_txt_len_q:
             sink_txt_blocks_q += 1
-        
+
         sink_txt_start_indices = num_blocks_q - sink_txt_blocks_q
         must_keep_indices_q = torch.cat([
             torch.arange(sink_txt_start_indices, num_blocks_q)
@@ -1703,7 +1709,8 @@ class HunyuanVideoTopKAdapter(TopKPredictor):
         q1_dense_ref = q1
         k1_dense_ref = k1
         v1_dense_ref = v1
-        # 稀疏构造阶段将 sink 移到尾部，计算后再用 dense attention 回填 sink 输出。
+        # During sparse construction the sink is moved to the end; after computation
+        # the sink output is backfilled with dense attention.
         q1, k1, v1 = self._move_sink_qkv_to_end(
             q1, k1, v1, q_sink_len=sink_frame_len_q_eff, kv_sink_len=sink_frame_len_k_eff
         )
@@ -1773,10 +1780,10 @@ class HunyuanVideoSVGAdapter(SVGPredictor):
         self.ring_svg_overlap = bool(sparse_config["SVG"].get("ring_sparse_overlap", False))
         self.ring_sample_mse_rows = int(sparse_config["SVG"].get("ring_sample_mse_rows", 64))
         self.update_sparse_params(sparse_params)
-        # HyVideo特定参数
-        
+        # HyVideo-specific parameters
+
     def update_sparse_params(self, sparse_params):
-        # HyVideo特定参数
+        # HyVideo-specific parameters
         self.sink_frame_len = int(sparse_params.get("sink_frame_len", 0))
         self.img_token_len = int(sparse_params.get("img_token_len", 0))
         self.frame_num = int(sparse_params.get("frame_num", 0))
@@ -1840,7 +1847,8 @@ class HunyuanVideoSVGAdapter(SVGPredictor):
         )
         local_ids = (local_ids + width_start).reshape(-1)
 
-        # 将当前 rank 的局部宽度切片映射回全局时空坐标，再生成 spatial/temporal 两套 SABI 模板。
+        # Map the current rank's local width slice back to global spatiotemporal
+        # coordinates, then build the spatial/temporal SABI templates.
         block_num_q = math.ceil(int(q_len) / int(self.block_size_q))
         block_num_k = math.ceil(int(kv_len) / int(self.block_size_k))
         img_block_num_k = math.ceil(int(img_kv_len) / int(self.block_size_k))
@@ -2034,7 +2042,7 @@ class HunyuanVideoSVGAdapter(SVGPredictor):
         multi_last_k_blocks_token_num = (sink_txt_blocks_k - 1) * self.block_size_k + k_num_of_last_block
         if multi_last_k_blocks_token_num < sink_txt_len:
             sink_txt_blocks_k += 1
-        
+
         sink_txt_start_indices = num_blocks_k - sink_txt_blocks_k
         must_keep_indices_k = torch.cat([
             torch.arange(sink_txt_start_indices, num_blocks_k)
@@ -2046,7 +2054,7 @@ class HunyuanVideoSVGAdapter(SVGPredictor):
         multi_last_q_blocks_token_num = (sink_txt_blocks_q - 1) * self.block_size_q + q_num_of_last_block
         if multi_last_q_blocks_token_num < sink_txt_len:
             sink_txt_blocks_q += 1
-        
+
         sink_txt_start_indices = num_blocks_q - sink_txt_blocks_q
         must_keep_indices_q = torch.cat([
             torch.arange(sink_txt_start_indices, num_blocks_q)
