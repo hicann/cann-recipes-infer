@@ -1,0 +1,21 @@
+diff --git a/csrc/utils/torch_helper.h b/csrc/utils/torch_helper.h
+index c1ecf41..857799d 100644
+--- a/csrc/utils/torch_helper.h
++++ b/csrc/utils/torch_helper.h
+@@ -23,0 +24,9 @@
++// CANN 9.2 renamed graph/error_codes.h's include guard while torch_npu 2.9.1
++// still bundles the same declarations under the old ge_error_codes.h guard.
++// Keep the guards in sync whichever header is reached first, so a translation
++// unit does not define the identical graphStatus constants twice.
++#if defined(INC_EXTERNAL_GRAPH_ERROR_CODES_H_) && \
++    !defined(INC_EXTERNAL_GRAPH_GE_ERROR_CODES_H_)
++#define INC_EXTERNAL_GRAPH_GE_ERROR_CODES_H_
++#endif
++
+@@ -25,0 +35,6 @@
++
++#if defined(INC_EXTERNAL_GRAPH_GE_ERROR_CODES_H_) && \
++    !defined(INC_EXTERNAL_GRAPH_ERROR_CODES_H_)
++#define INC_EXTERNAL_GRAPH_ERROR_CODES_H_
++#endif
++

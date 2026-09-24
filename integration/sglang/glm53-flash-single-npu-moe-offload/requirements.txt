@@ -1,0 +1,20 @@
+# GLM-5.3-Flash single-card runtime dependency lock.
+# triton-ascend==3.2.2 is copied from the validated CANNLab image by
+# guide-scripts/03-python-env.sh because its Python 3.12 wheel is not available
+# from the configured public package index.
+torch==2.9.1
+torch_npu==2.9.1
+numpy==1.26.4
+PyYAML==6.0.1
+pybind11==3.1.0
+decorator==5.1.1
+scipy==1.13.1
+attrs==24.2.0
+psutil==6.0.0
+safetensors==0.8.0
+huggingface_hub==1.31.0
+modelscope==1.40.0
+transformers==5.12.1
+pyarrow==25.0.1
+requests==2.34.2
+gguf==0.19.0

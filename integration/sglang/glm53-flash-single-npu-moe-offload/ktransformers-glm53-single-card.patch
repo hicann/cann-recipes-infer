@@ -1,0 +1,346 @@
+diff --git a/.gitmodules b/.gitmodules
+index 5b4ca91..44d424c 100644
+--- a/.gitmodules
++++ b/.gitmodules
+@@ -13 +13 @@
+-	url = https://github.com/kvcache-ai/sglang.git
++	url = https://github.com/sgl-project/sglang.git
+diff --git a/kt-kernel/tools/mxfp4_gguf/convert_mxfp4_gguf.py b/kt-kernel/tools/mxfp4_gguf/convert_mxfp4_gguf.py
+index 2df0067..d8e6d06 100644
+--- a/kt-kernel/tools/mxfp4_gguf/convert_mxfp4_gguf.py
++++ b/kt-kernel/tools/mxfp4_gguf/convert_mxfp4_gguf.py
+@@ -2 +2,11 @@
+-"""Convert the DeepSeek-V4-Flash MXFP4 MoE weights to the per-layer GGUF set.
++"""Convert a checkpoint's MXFP4 MoE weights to the per-layer GGUF set.
++
++Two source layouts are recognised, by probing the checkpoint's own tensor names:
++
++  DeepSeek-V4-Flash (native)   layers.{L}.ffn.experts.{i}.{w1,w3,w2}.{weight,scale}
++  compressed-tensors mxfp4     model.language_model.layers.{L}.mlp.experts.{i}
++                                   .{gate,up,down}_proj.{weight_packed,weight_scale}
++
++Both store the same thing -- OCP MX-FP4 E2M1 nibbles, `2-per-uint8-low-nibble-first`,
++with a ue8m0 (bias-127) scale per 32 input elements -- so the repack below is shared and
++is a pure byte reordering, never a requantization.
+@@ -16,0 +27 @@ import random
++import re
+@@ -20,0 +32 @@ from pathlib import Path
++from typing import NamedTuple
+@@ -27,8 +38,0 @@ _GGUF_PY = Path(os.environ.get("KT_GGUF_PY", _REPO_ROOT / "third_party" / "llama
+-if not _GGUF_PY.is_dir():
+-    raise SystemExit(
+-        f"gguf-py not found at {_GGUF_PY}.\n"
+-        "Initialize the submodule first:\n"
+-        f"  git -C {_REPO_ROOT} submodule update --init --progress third_party/llama.cpp\n"
+-        "or point KT_GGUF_PY at a gguf-py that knows GGML_TYPE_MXFP4 (id 39)."
+-    )
+-sys.path.insert(0, str(_GGUF_PY))
+@@ -36 +40,38 @@ sys.path.insert(0, str(_GGUF_PY))
+-import gguf  # noqa: E402
++
++def _import_gguf_with_mxfp4():
++    """Return a `gguf` module that knows GGML_TYPE_MXFP4.
++
++    The requirement is the MXFP4 type, not any particular gguf-py.  Upstream gguf-py
++    has carried MXFP4 (id 39, 32 values per 17-byte block) since gpt-oss, so an
++    already-installed one is preferred: it keeps this converter runnable before the
++    llama.cpp submodule is populated.  The vendored gguf-py under third_party is the
++    fallback, and `KT_GGUF_PY` still overrides where that is looked for.
++    """
++    def _usable(mod):
++        t = getattr(mod, "GGMLQuantizationType", None)
++        return t is not None and hasattr(t, "MXFP4") and int(t.MXFP4) == 39
++
++    try:
++        import gguf as _g
++        if _usable(_g):
++            return _g
++    except ImportError:
++        _g = None
++
++    if not _GGUF_PY.is_dir():
++        raise SystemExit(
++            f"No importable gguf knows GGML_TYPE_MXFP4 (id 39), and gguf-py is not at {_GGUF_PY}.\n"
++            "Either install a gguf >= the gpt-oss release, or initialize the submodule:\n"
++            f"  git -C {_REPO_ROOT} submodule update --init --progress third_party/llama.cpp\n"
++            "or point KT_GGUF_PY at a gguf-py that knows GGML_TYPE_MXFP4."
++        )
++    sys.path.insert(0, str(_GGUF_PY))
++    for name in [m for m in list(sys.modules) if m == "gguf" or m.startswith("gguf.")]:
++        del sys.modules[name]
++    import gguf as _g2
++    if not _usable(_g2):
++        raise SystemExit(f"gguf-py at {_GGUF_PY} does not know GGML_TYPE_MXFP4 (id 39).")
++    return _g2
++
++
++gguf = _import_gguf_with_mxfp4()  # noqa: E402
+@@ -40,0 +82,5 @@ MXFP4 = gguf.GGMLQuantizationType.MXFP4
++def _text_config(cfg: dict) -> dict:
++    """GLM-5.3 nests the language-model fields under `text_config`; DeepSeek keeps them flat."""
++    return cfg.get("text_config", cfg)
++
++
+@@ -47,3 +93,35 @@ def _load_weight_map(model_dir: Path) -> dict[str, str]:
+-def _detect_experts_prefix(weight_map: dict[str, str], layer_idx: int) -> str:
+-    """Native V4-Flash keys are stripped of the `model.` prefix: layers.{L}.ffn.experts.{i}.w1..."""
+-    for layer_prefix in (f"model.layers.{layer_idx}.", f"layers.{layer_idx}."):
++class ExpertNaming(NamedTuple):
++    """How one checkpoint family spells its routed-expert tensors."""
++
++    prefix: str        # e.g. "model.language_model.layers.3.mlp.experts"
++    gate: str
++    up: str
++    down: str
++    weight: str        # suffix holding the packed E2M1 nibbles
++    scale: str         # suffix holding the ue8m0 exponents
++
++    def weight_key(self, expert: int, proj: str) -> str:
++        return f"{self.prefix}.{expert}.{proj}.{self.weight}"
++
++    def scale_key(self, expert: int, proj: str) -> str:
++        return f"{self.prefix}.{expert}.{proj}.{self.scale}"
++
++
++# (gate, up, down), weight suffix, scale suffix.  Probed in order; the first whose
++# gate tensor exists for the requested layer wins.
++_NAMING_CANDIDATES: tuple[tuple[tuple[str, str, str], str, str], ...] = (
++    (("w1", "w3", "w2"), "weight", "scale"),                                  # DeepSeek-V4-Flash native
++    (("gate_proj", "up_proj", "down_proj"), "weight_packed", "weight_scale"),  # compressed-tensors mxfp4
++)
++
++
++def _detect_expert_naming(weight_map: dict[str, str], layer_idx: int) -> ExpertNaming:
++    """Probe the checkpoint's own keys rather than trusting a model name.
++
++    Anchored on expert 0's gate tensor.  `.shared_experts` is excluded explicitly: it
++    lives under the same `mlp.`/`ffn.` parent and would otherwise match.  The layer
++    number is matched on a dot boundary so layer 3 does not also match layer 30.
++    """
++    layer_re = re.compile(rf"(?:^|\.)layers\.{layer_idx}\.")
++    for (gate, up, down), wsuf, ssuf in _NAMING_CANDIDATES:
++        needle = f".experts.0.{gate}.{wsuf}"
+@@ -51,2 +129 @@ def _detect_experts_prefix(weight_map: dict[str, str], layer_idx: int) -> str:
+-            if k.startswith(layer_prefix) and ".experts." in k and ".shared_experts" not in k \
+-                    and k.endswith(".w1.weight") and ".experts.0." in k:
++            if needle in k and ".shared_experts" not in k and layer_re.search(k):
+@@ -54,2 +131,5 @@ def _detect_experts_prefix(weight_map: dict[str, str], layer_idx: int) -> str:
+-                return before + ".experts"
+-    raise ValueError(f"No native MXFP4 experts found for layer {layer_idx}")
++                return ExpertNaming(before + ".experts", gate, up, down, wsuf, ssuf)
++    raise ValueError(
++        f"No MXFP4 routed experts found for layer {layer_idx}. Tried "
++        + ", ".join(f"*.experts.0.{g}.{w}" for (g, _, _), w, _ in _NAMING_CANDIDATES)
++    )
+@@ -89 +169 @@ def _repack_consecutive_to_halfblock(w_u8: np.ndarray) -> np.ndarray:
+-def _build_proj_tensor(model_dir, weight_map, experts_prefix, proj_name, num_experts):
++def _build_proj_tensor(model_dir, weight_map, naming, proj_name, num_experts):
+@@ -96,2 +176,2 @@ def _build_proj_tensor(model_dir, weight_map, experts_prefix, proj_name, num_exp
+-        wk = f"{experts_prefix}.{e}.{proj_name}.weight"
+-        sk = f"{experts_prefix}.{e}.{proj_name}.scale"
++        wk = naming.weight_key(e, proj_name)
++        sk = naming.scale_key(e, proj_name)
+@@ -114 +194,2 @@ def convert_layer(model_dir: Path, layer_idx: int, output_path: Path, num_expert
+-                  hidden_size: int, moe_intermediate_size: int) -> None:
++                  hidden_size: int, moe_intermediate_size: int, experts_used: int,
++                  model_name: str = "moe") -> None:
+@@ -116,2 +197,4 @@ def convert_layer(model_dir: Path, layer_idx: int, output_path: Path, num_expert
+-    experts_prefix = _detect_experts_prefix(weight_map, layer_idx)
+-    print(f"[convert] layer={layer_idx} experts_prefix={experts_prefix!r} experts={num_experts} -> MXFP4")
++    naming = _detect_expert_naming(weight_map, layer_idx)
++    print(f"[convert] layer={layer_idx} prefix={naming.prefix!r} "
++          f"proj=({naming.gate},{naming.up},{naming.down}) "
++          f"suffix=({naming.weight},{naming.scale}) experts={num_experts} -> MXFP4")
+@@ -119 +202 @@ def convert_layer(model_dir: Path, layer_idx: int, output_path: Path, num_expert
+-    gate = _build_proj_tensor(model_dir, weight_map, experts_prefix, "w1", num_experts)
++    gate = _build_proj_tensor(model_dir, weight_map, naming, naming.gate, num_experts)
+@@ -121 +204 @@ def convert_layer(model_dir: Path, layer_idx: int, output_path: Path, num_expert
+-    up = _build_proj_tensor(model_dir, weight_map, experts_prefix, "w3", num_experts)
++    up = _build_proj_tensor(model_dir, weight_map, naming, naming.up, num_experts)
+@@ -123 +206 @@ def convert_layer(model_dir: Path, layer_idx: int, output_path: Path, num_expert
+-    down = _build_proj_tensor(model_dir, weight_map, experts_prefix, "w2", num_experts)
++    down = _build_proj_tensor(model_dir, weight_map, naming, naming.down, num_experts)
+@@ -125,0 +209,6 @@ def convert_layer(model_dir: Path, layer_idx: int, output_path: Path, num_expert
++    # `arch` only namespaces the GGUF metadata keys below.  LlamafileMoEWrapper reads the
++    # three tensors by name and takes every shape from its caller, so nothing downstream
++    # parses these -- but they must still be honest, because they are the only record of
++    # what this file holds.  "deepseek2" is kept for every family: it is what the GGUF
++    # metadata namespace has always been here, and changing it would silently orphan any
++    # reader that does look.
+@@ -129 +218 @@ def convert_layer(model_dir: Path, layer_idx: int, output_path: Path, num_expert
+-    writer.add_name(f"dsv4-flash-layer{layer_idx}-moe-mxfp4")
++    writer.add_name(f"{model_name}-layer{layer_idx}-moe-mxfp4")
+@@ -131 +220 @@ def convert_layer(model_dir: Path, layer_idx: int, output_path: Path, num_expert
+-    writer.add_uint32(gguf.Keys.LLM.EXPERT_USED_COUNT.format(arch=arch), 6)
++    writer.add_uint32(gguf.Keys.LLM.EXPERT_USED_COUNT.format(arch=arch), experts_used)
+@@ -150 +239,2 @@ def convert_layer(model_dir: Path, layer_idx: int, output_path: Path, num_expert
+-def _run_one_layer(py, model_dir, layer_idx, output_path, num_experts, hidden_size, moe_intermediate_size):
++def _run_one_layer(py, model_dir, layer_idx, output_path, num_experts, hidden_size,
++                   moe_intermediate_size, experts_used, model_name):
+@@ -158,0 +249,2 @@ def _run_one_layer(py, model_dir, layer_idx, output_path, num_experts, hidden_si
++        "--experts-used", str(experts_used),
++        "--model-name", model_name,
+@@ -169,2 +261 @@ def _verify_sample_paths(paths: list[Path]) -> None:
+-    sys.path.insert(0, str(_GGUF_PY))
+-    from gguf import GGUFReader
++    GGUFReader = gguf.GGUFReader
+@@ -188,3 +279,11 @@ def _layer_main(argv) -> None:
+-    ap.add_argument("--num-experts", type=int, default=256)
+-    ap.add_argument("--hidden-size", type=int, default=4096)
+-    ap.add_argument("--moe-intermediate-size", type=int, default=2048)
++    ap.add_argument("--num-experts", type=int, default=None,
++                    help="Default: n_routed_experts from config.json")
++    ap.add_argument("--hidden-size", type=int, default=None,
++                    help="Default: hidden_size from config.json")
++    ap.add_argument("--moe-intermediate-size", type=int, default=None,
++                    help="Default: moe_intermediate_size from config.json")
++    ap.add_argument("--experts-used", type=int, default=None,
++                    help="Top-k, written to the GGUF metadata. Default: num_experts_per_tok "
++                          "from config.json")
++    ap.add_argument("--model-name", type=str, default=None,
++                    help="Goes into the GGUF `general.name`. Default: the model dir's name")
+@@ -196,0 +296,3 @@ def _layer_main(argv) -> None:
++    # Every shape defaults to the checkpoint's own config rather than to a constant, so a
++    # single-layer run cannot silently disagree with the batch run that surrounds it.
++    tcfg = _text_config(json.loads((model_dir / "config.json").read_text()))
+@@ -198 +300,7 @@ def _layer_main(argv) -> None:
+-                  args.num_experts, args.hidden_size, args.moe_intermediate_size)
++                  args.num_experts if args.num_experts is not None else int(tcfg["n_routed_experts"]),
++                  args.hidden_size if args.hidden_size is not None else int(tcfg["hidden_size"]),
++                  args.moe_intermediate_size if args.moe_intermediate_size is not None
++                  else int(tcfg["moe_intermediate_size"]),
++                  args.experts_used if args.experts_used is not None
++                  else int(tcfg["num_experts_per_tok"]),
++                  args.model_name or model_dir.name.lower())
+@@ -201,2 +309 @@ def _layer_main(argv) -> None:
+-        from gguf import GGUFReader
+-        reader = GGUFReader(str(args.output.expanduser().resolve()))
++        reader = gguf.GGUFReader(str(args.output.expanduser().resolve()))
+@@ -212 +319,2 @@ def _batch_main(argv) -> int:
+-    ap.add_argument("--layer-start", type=int, default=0)
++    ap.add_argument("--layer-start", type=int, default=None,
++                    help="Default: first_k_dense_replace from config.json")
+@@ -220,0 +329,3 @@ def _batch_main(argv) -> int:
++    ap.add_argument("--experts-used", type=int, default=None,
++                    help="Default: num_experts_per_tok from config.json")
++    ap.add_argument("--model-name", type=str, default=None)
+@@ -239 +350 @@ def _batch_main(argv) -> int:
+-    cfg = json.loads(cfg_path.read_text())
++    cfg = _text_config(json.loads(cfg_path.read_text()))
+@@ -242,0 +354,9 @@ def _batch_main(argv) -> int:
++    experts_used = args.experts_used or int(cfg["num_experts_per_tok"])
++    model_name = args.model_name or model_dir.name.lower()
++    # The MoE layers are [first_k_dense_replace, num_hidden_layers).  Both ends matter:
++    # GLM-5.3 has 3 leading dense layers that carry no experts, and its checkpoint also
++    # carries a full 288-expert set for layer 45, the MTP/nextn head, which is one past
++    # num_hidden_layers=45 and is not served here.  DeepSeek-V4-Flash has
++    # first_k_dense_replace=0, so this reproduces its old 0..num_hidden_layers-1 range.
++    layer_start = (args.layer_start if args.layer_start is not None
++                   else int(cfg.get("first_k_dense_replace", 0) or 0))
+@@ -245 +365 @@ def _batch_main(argv) -> int:
+-          f"moe_intermediate={moe_inter} layers={args.layer_start}..{layer_end}")
++          f"moe_intermediate={moe_inter} top_k={experts_used} layers={layer_start}..{layer_end}")
+@@ -251 +371 @@ def _batch_main(argv) -> int:
+-    layers = list(range(args.layer_start, layer_end + 1))
++    layers = list(range(layer_start, layer_end + 1))
+@@ -258 +378,2 @@ def _batch_main(argv) -> int:
+-        tasks.append((py, str(model_dir), lid, str(outp), num_experts, hidden_size, moe_inter))
++        tasks.append((py, str(model_dir), lid, str(outp), num_experts, hidden_size, moe_inter,
++                      experts_used, model_name))
+diff --git a/kt-kernel/tools/mxfp4_gguf/verify_mxfp4_gguf.py b/kt-kernel/tools/mxfp4_gguf/verify_mxfp4_gguf.py
+index 401e6a7..905addc 100644
+--- a/kt-kernel/tools/mxfp4_gguf/verify_mxfp4_gguf.py
++++ b/kt-kernel/tools/mxfp4_gguf/verify_mxfp4_gguf.py
+@@ -27,10 +26,0 @@ import numpy as np
+-_REPO_ROOT = Path(__file__).resolve().parents[3]
+-_GGUF_PY = Path(os.environ.get("KT_GGUF_PY", _REPO_ROOT / "third_party" / "llama.cpp" / "gguf-py"))
+-if not _GGUF_PY.is_dir():
+-    raise SystemExit(
+-        f"gguf-py not found at {_GGUF_PY}.\n"
+-        "Initialize the submodule first:\n"
+-        f"  git -C {_REPO_ROOT} submodule update --init --progress third_party/llama.cpp\n"
+-        "or point KT_GGUF_PY at a gguf-py that knows GGML_TYPE_MXFP4 (id 39)."
+-    )
+-sys.path.insert(0, str(_GGUF_PY))
+@@ -38,0 +29,5 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
++# One resolver for both scripts: whichever gguf actually knows GGML_TYPE_MXFP4 wins, so
++# this runs before the llama.cpp submodule is populated.  Importing it here also fixes
++# sys.path for the bare `import gguf` inside layer_test().
++from convert_mxfp4_gguf import gguf  # noqa: E402,F401
++
+@@ -98 +92,0 @@ def layer_test(gguf_path: Path, model_dir: Path, layer_idx: int, n_experts_check
+-    import gguf
+@@ -101 +95,7 @@ def layer_test(gguf_path: Path, model_dir: Path, layer_idx: int, n_experts_check
+-    from convert_mxfp4_gguf import _load_weight_map, _detect_experts_prefix, _open_shard, _as_u8
++    from convert_mxfp4_gguf import (
++        _as_u8,
++        _detect_expert_naming,
++        _load_weight_map,
++        _open_shard,
++        _text_config,
++    )
+@@ -106 +106 @@ def layer_test(gguf_path: Path, model_dir: Path, layer_idx: int, n_experts_check
+-    prefix = _detect_experts_prefix(weight_map, layer_idx)
++    naming = _detect_expert_naming(weight_map, layer_idx)
+@@ -110 +110 @@ def layer_test(gguf_path: Path, model_dir: Path, layer_idx: int, n_experts_check
+-    cfg = json.loads((model_dir / "config.json").read_text())
++    cfg = _text_config(json.loads((model_dir / "config.json").read_text()))
+@@ -113,3 +113,3 @@ def layer_test(gguf_path: Path, model_dir: Path, layer_idx: int, n_experts_check
+-    projs = [(f"blk.{layer_idx}.ffn_gate_exps.weight", "w1", hidden),
+-             (f"blk.{layer_idx}.ffn_up_exps.weight", "w3", hidden),
+-             (f"blk.{layer_idx}.ffn_down_exps.weight", "w2", inter)]
++    projs = [(f"blk.{layer_idx}.ffn_gate_exps.weight", naming.gate, hidden),
++             (f"blk.{layer_idx}.ffn_up_exps.weight", naming.up, hidden),
++             (f"blk.{layer_idx}.ffn_down_exps.weight", naming.down, inter)]
+@@ -125,2 +125,2 @@ def layer_test(gguf_path: Path, model_dir: Path, layer_idx: int, n_experts_check
+-            wk = f"{prefix}.{e}.{proj}.weight"
+-            sk = f"{prefix}.{e}.{proj}.scale"
++            wk = naming.weight_key(e, proj)
++            sk = naming.scale_key(e, proj)
+@@ -153,0 +154,5 @@ def _set_main(argv) -> int:
++    ap.add_argument("--layer-start", type=int, default=None,
++                    help="First layer index. Default: first_k_dense_replace from --model-dir, else 0. "
++                          "GLM-5.3's expert-bearing layers start at 3; DeepSeek-V4's at 0.")
++    ap.add_argument("--layer-end", type=int, default=None,
++                    help="Last layer index, inclusive. Default: layer-start + expect-layers - 1")
+@@ -170,0 +176,9 @@ def _set_main(argv) -> int:
++    # The converted set is a CONTIGUOUS RANGE of model layer indices, not 0..N-1: a
++    # model with leading dense layers starts higher, and the files are named by the
++    # model's own absolute layer index because that is what --kt-weight-path formats.
++    cfg_d = {}
++    if args.model_dir is not None:
++        cfg_p = args.model_dir.expanduser().resolve() / "config.json"
++        if cfg_p.is_file():
++            raw = json.loads(cfg_p.read_text())
++            cfg_d = raw.get("text_config", raw)
+@@ -172,4 +186,3 @@ def _set_main(argv) -> int:
+-    if n_layers is None and args.model_dir is not None:
+-        cfg = args.model_dir.expanduser().resolve() / "config.json"
+-        if cfg.is_file():
+-            n_layers = int(json.loads(cfg.read_text())["num_hidden_layers"])
++    layer_start = args.layer_start
++    if layer_start is None:
++        layer_start = int(cfg_d.get("first_k_dense_replace", 0) or 0)
+@@ -177,4 +190,11 @@ def _set_main(argv) -> int:
+-    if n_layers is None:
+-        n_layers = len(present)
+-        print(f"[L1] no layer count given; assuming the {n_layers} files present are the full set")
+-    layers = list(range(n_layers))
++    if args.layer_end is not None:
++        layers = list(range(layer_start, args.layer_end + 1))
++        n_layers = len(layers)
++    else:
++        if n_layers is None and cfg_d:
++            n_layers = int(cfg_d["num_hidden_layers"]) - layer_start
++        if n_layers is None:
++            n_layers = len(present)
++            print(f"[L1] no layer count given; assuming the {n_layers} files present are the full set")
++        layers = list(range(layer_start, layer_start + n_layers))
++    print(f"[L1] expecting layers {layers[0]}..{layers[-1]} ({n_layers} files)")
+diff --git a/third_party/sglang b/third_party/sglang
+index 3424f35..5aab054 160000
+--- a/third_party/sglang
++++ b/third_party/sglang
+@@ -1 +1 @@
+-Subproject commit 3424f35d0e60f03b9e75d9b90941f8f4cb944524
++Subproject commit 5aab054ec8ce6b6100fbfb7aafe67d632a7df3aa
