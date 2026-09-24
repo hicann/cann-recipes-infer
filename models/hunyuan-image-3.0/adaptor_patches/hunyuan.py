@@ -1129,9 +1129,14 @@ def causalmm_prepare_model_inputs(
         max_cache_len = output.tokens.shape[1]
     else:
         max_cache_len = output.tokens.shape[1] + default(max_new_tokens, self.generation_config.max_length)
+
+    if self.cfg_parallel_size > 1:
+        per_rank_batch = batch_size
+    else:
+        per_rank_batch = batch_size * cfg_factor[mode]
     cache = HunyuanStaticCache(
         config=self.config,
-        batch_size=batch_size * cfg_factor[mode],
+        batch_size=per_rank_batch,
         max_cache_len=max_cache_len,
         dtype=torch.bfloat16,
         dynamic=mode == "gen_text",
@@ -1140,7 +1145,7 @@ def causalmm_prepare_model_inputs(
     # 7. Build position ids
     batch_input_pos = torch.arange(
         0, output.tokens.shape[1], dtype=torch.long, device=device)[None].expand(
-        batch_size * cfg_factor[mode], -1)  # use expand to share indices to save memory
+        per_rank_batch, -1)  # use expand to share indices to save memory
 
     # 8. Build model input kwargs
     tkw = self._tkwrapper
@@ -1182,8 +1187,8 @@ def causalmm_prepare_model_inputs(
     )
 
     if self.cfg_parallel_size > 1:
-        # There ard some other data needs to be selected for CFG parallel
-        model_input_kwargs["position_ids"] = model_input_kwargs["position_ids"][self.cfgp_rank:self.cfgp_rank + 1]
+        # There are some other data needs to be selected for CFG parallel
+        # position_ids is already built with the per-rank batch size above (no cfg_factor multiplication)
         model_input_kwargs["eos_token_id"] = model_input_kwargs["eos_token_id"][self.cfgp_rank:self.cfgp_rank + 1]
 
     return model_input_kwargs
@@ -1395,7 +1400,7 @@ def causalmm_forward(
     return output
 
 
-def causalmm_generate_image(
+def causal_mm_generate_image(
             self,
             prompt,
             seed=None,
@@ -1582,4 +1587,4 @@ HunyuanImage3ForCausalMM.get_pos_emb = causalmm_get_pos_emb
 HunyuanImage3ForCausalMM.prepare_inputs_for_generation = causalmm_prepare_inputs_for_generation
 HunyuanImage3ForCausalMM._update_model_kwargs_for_generation = causalmm_update_model_kwargs_for_generation
 HunyuanImage3ForCausalMM.prepare_model_inputs = causalmm_prepare_model_inputs
-HunyuanImage3ForCausalMM.generate_image = causalmm_generate_image
+HunyuanImage3ForCausalMM.generate_image = causal_mm_generate_image
