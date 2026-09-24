@@ -1,0 +1,478 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pan-boyi <panboyi@huawei.com>
+Date: Wed, 9 Sep 2026 11:03:15 +0800
+Subject: [PATCH 10/10] =?UTF-8?q?npu:=20=E6=94=BE=E5=BC=80=E5=85=B1?=
+ =?UTF-8?q?=E4=BA=AB=E4=B8=93=E5=AE=B6=E8=9E=8D=E5=90=88=EF=BC=8C=E5=B9=B6?=
+ =?UTF-8?q?=E6=8A=8A=E8=B7=AF=E7=94=B1=E5=99=A8=20logits=20=E6=8F=90?=
+ =?UTF-8?q?=E5=88=B0=20fp32?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+上游禁止 NPU 走共享专家融合，这里放开，并让 top-k 把共享专家当作追加的一个槽位参与选择。topk.py 与 glm5_next.py 必须配套修改，否则共享专家的贡献会静默消失。
+
+非 CUDA 分支的路由器 logits 从 bf16 提到 fp32，避免 top-k 离散选错专家；权重的 fp32 副本按加载事件显式失效。共享专家始终执行模型定义的 SwiGLU 截断，不再提供偏离模型语义的环境开关。
+---
+ .../srt/hardware_backend/npu/moe/topk.py      | 90 +++++++++++++++++--
+ python/sglang/srt/layers/logprob_processor.py |  7 +-
+ .../compressed_tensors_w8a8_int8_moe.py       |  5 ++
+ .../mxfp4_flashinfer_trtllm_moe.py            | 30 ++++---
+ python/sglang/srt/models/deepseek_v2.py       | 86 +++++++++++++++++-
+ python/sglang/srt/models/glm5_next.py         | 71 ++++++++++++++-
+ 6 files changed, 264 insertions(+), 25 deletions(-)
+
+diff --git a/python/sglang/srt/hardware_backend/npu/moe/topk.py b/python/sglang/srt/hardware_backend/npu/moe/topk.py
+index 75085959b8..1c0d160793 100644
+--- a/python/sglang/srt/hardware_backend/npu/moe/topk.py
++++ b/python/sglang/srt/hardware_backend/npu/moe/topk.py
+@@ -30,6 +30,73 @@ def _apply_routed_scaling_after_renorm(
+     return topk_weights
+ 
+ 
++def _append_fused_shared_slot(
++    topk_weights: torch.Tensor,
++    topk_ids: torch.Tensor,
++    num_routed_experts: int,
++    topk_config: "TopKConfig",
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """Append the fused shared expert's slot to a routed-only top-k result.
++
++    The vendor top-k ops (``npu_moe_gating_top_k`` and friends) select from the
++    router's ``num_routed_experts`` logits and know nothing about the extra
++    expert slot that shared-experts fusion appends to the MoE weight tensors.
++    So we ask them for the routed ``top_k`` only and append the shared slot
++    here, rather than the CUDA reference's trick of asking for one extra column
++    and overwriting it (``biased_topk_impl``): overwriting would need the
++    vendor op's renormalisation to run over the wrong column count.
++
++    The weight is chosen so that the fused shared expert ends up contributing
++    with weight exactly 1.0 after ``DeepseekV2MoE.forward_normal`` finishes,
++    matching what the unfused ``shared_experts`` MLP would have added:
++
++      * ``apply_routed_scaling_factor_on_output`` -> the routed weights already
++        carry ``routed_scaling_factor`` and nothing scales the output later, so
++        the shared slot's weight is 1.0.
++      * otherwise (the Ascend default, see FusedMoE.
++        ``should_fuse_routed_scaling_factor_in_topk``) ``forward_normal`` does
++        ``final_hidden_states *= routed_scaling_factor`` on the *combined*
++        output, so the shared slot goes in pre-divided by that factor.
++
++    Same arithmetic as the CUDA path, which writes ``topk_weights[:, -1] =
++    topk_weights[:, :-1].sum(-1) / routed_scaling_factor`` before a
++    renormalisation that divides by exactly that sum.
++    """
++    n_fused = topk_config.num_fused_shared_experts
++    n_tokens = topk_ids.shape[0]
++
++    if n_fused == 1:
++        shared_ids = topk_ids.new_full((n_tokens, 1), num_routed_experts)
++    else:
++        shared_ids = torch.arange(
++            num_routed_experts,
++            num_routed_experts + n_fused,
++            dtype=topk_ids.dtype,
++            device=topk_ids.device,
++        ).expand(n_tokens, n_fused)
++
++    if topk_config.apply_routed_scaling_factor_on_output:
++        shared_weight = 1.0
++    else:
++        shared_weight = 1.0 / float(topk_config.routed_scaling_factor or 1.0)
++
++    # `new_full` + `cat` rather than `torch.nn.functional.pad`, which reads like
++    # the cheaper way to say this.  It is not, and it is not even fewer kernels:
++    # measured on one A3 die, TP1, bs=1, graph on, 42 MoE layers, pad lowers to
++    # 84 MemSet (623.5 us/step) + 84 PadV3 (290.8 us/step) against this pair's
++    # 84 Fill (~129) + 84 ConcatD (148.4) -- same 168 launches, 3.3x the device
++    # time, and 32.357 vs 31.541 ms/step end to end (32.6 vs 31.5 ms/token wall,
++    # at every one of concurrency 1/3/13/16).  Both spellings are bit-identical
++    # in output (teacher-forced max|dlp| = 0.0).
++
++    topk_ids = torch.cat([topk_ids, shared_ids], dim=1)
++    topk_weights = torch.cat(
++        [topk_weights, topk_weights.new_full((n_tokens, n_fused), shared_weight)],
++        dim=1,
++    )
++    return topk_weights, topk_ids
++
++
+ def fused_topk_npu(
+     hidden_states: torch.Tensor,
+     router_logits: torch.Tensor,
+@@ -43,6 +110,12 @@ def fused_topk_npu(
+     renormalize = topk_config.renormalize
+     correction_bias = topk_config.correction_bias
+ 
++    # The vendor top-k ops select among the router's logits only; the fused
++    # shared expert's slot is appended afterwards by
++    # _append_fused_shared_slot.  ``topk_config.top_k`` already includes it.
++    num_fused_shared_experts = topk_config.num_fused_shared_experts
++    routed_top_k = topk_config.top_k - num_fused_shared_experts
++
+     # sqrtsoftplus (DSV4 noaux_tc): top-k over (scores + bias); weights from
+     # un-biased scores. The custom op fuses softplus/sqrt/topk/gather/norm/cast.
+     if topk_config.scoring_func == "sqrtsoftplus":
+@@ -53,7 +126,7 @@ def fused_topk_npu(
+         )
+         topk_weights, topk_ids, _ = torch.ops.custom.npu_moe_gating_top_k(
+             x=router_logits.to(torch.float32),
+-            k=topk_config.top_k,
++            k=routed_top_k,
+             bias=(
+                 correction_bias.to(torch.float32)
+                 if correction_bias is not None
+@@ -70,15 +143,11 @@ def fused_topk_npu(
+     elif not use_grouped_topk and correction_bias is None:
+         topk_weights, topk_ids, _ = torch.ops.npu.npu_moe_gating_top_k_softmax(
+             router_logits,
+-            k=topk_config.top_k,
++            k=routed_top_k,
+         )
+ 
+         if renormalize:
+-            topk_weights = l1_norm(
+-                topk_weights
+-                if topk_config.num_fused_shared_experts == 0
+-                else topk_weights[:, :-1]
+-            )
++            topk_weights = l1_norm(topk_weights)
+         topk_weights = topk_weights.to(torch.float32)
+ 
+     # Support grouped top-k or correction bias or sigmoid or routed_scaling_factor
+@@ -89,7 +158,7 @@ def fused_topk_npu(
+     ):
+         topk_weights, topk_ids, _ = torch.ops.npu.npu_moe_gating_top_k(
+             router_logits.to(torch.float32),
+-            k=topk_config.top_k,
++            k=routed_top_k,
+             bias=(
+                 correction_bias.to(torch.float32)
+                 if correction_bias is not None
+@@ -124,6 +193,11 @@ def fused_topk_npu(
+             expert_location_dispatch_info=expert_location_dispatch_info,
+         )
+ 
++    if num_fused_shared_experts:
++        topk_weights, topk_ids = _append_fused_shared_slot(
++            topk_weights, topk_ids, router_logits.shape[-1], topk_config
++        )
++
+     if expert_location_dispatch_info is not None:
+         topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
+     get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
+diff --git a/python/sglang/srt/layers/logprob_processor.py b/python/sglang/srt/layers/logprob_processor.py
+index 032da6ace3..12b0c2e270 100644
+--- a/python/sglang/srt/layers/logprob_processor.py
++++ b/python/sglang/srt/layers/logprob_processor.py
+@@ -525,7 +525,12 @@ class InputLogprobProcessor:
+         split_len_token_ids = 0
+ 
+         fused_kernel, fused_max_k = None, 0
+-        if self.enable_fast_input_logprobs and pruned_states.is_cuda:
++        # `device.type`, not `.is_cuda`: `torch_npu.contrib.transfer_to_npu`
++        # (imported by hardware_backend/npu/utils.py) makes `.is_cuda` True for
++        # NPU tensors, so this CUDA-only gate admitted NPU and reached a Triton
++        # kernel whose compile SIGSEGVs `bishengir-compile` -- every rank dies,
++        # from a request that merely asked for top_logprobs_num.
++        if self.enable_fast_input_logprobs and pruned_states.device.type == "cuda":
+             from sglang.srt.layers.logsumexp import (
+                 FUSED_TOPK_MAX_K,
+                 row_logsumexp_topk,
+diff --git a/python/sglang/srt/layers/quantization/compressed_tensors/schemes/compressed_tensors_w8a8_int8_moe.py b/python/sglang/srt/layers/quantization/compressed_tensors/schemes/compressed_tensors_w8a8_int8_moe.py
+index 497a6a3a52..e4ec002469 100644
+--- a/python/sglang/srt/layers/quantization/compressed_tensors/schemes/compressed_tensors_w8a8_int8_moe.py
++++ b/python/sglang/srt/layers/quantization/compressed_tensors/schemes/compressed_tensors_w8a8_int8_moe.py
+@@ -118,6 +118,11 @@ class NPUCompressedTensorsW8A8Int8DynamicMoE(CompressedTensorsMoEScheme):
+         layer.w13_input_scale = None
+         layer.w2_input_scale = None
+ 
++        # Symmetric quantization has no zero point, so this scheme never
++        # creates offset parameters. The asymmetric schemes register them.
++        layer.w13_weight_offset = None
++        layer.w2_weight_offset = None
++
+     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+         self.w13_kernel.process_weights_after_loading(layer, "w13")
+         self.w2_kernel.process_weights_after_loading(layer, "w2")
+diff --git a/python/sglang/srt/layers/quantization/mxfp4_flashinfer_trtllm_moe.py b/python/sglang/srt/layers/quantization/mxfp4_flashinfer_trtllm_moe.py
+index f178c5cc80..afa6c05d19 100644
+--- a/python/sglang/srt/layers/quantization/mxfp4_flashinfer_trtllm_moe.py
++++ b/python/sglang/srt/layers/quantization/mxfp4_flashinfer_trtllm_moe.py
+@@ -387,7 +387,6 @@ def maybe_fuse_routed_scale_and_shared_add(
+     # alpha=scale)`. With no shared output, the missing scale is applied
+     # in-place. Otherwise `routed` is already scale-final and we just add
+     # `shared` (or pass through if there is none).
+-    from sglang.srt.layers.quantization.expert_pack import ExpertPackMoEMethod
+     from sglang.srt.layers.quantization.mxfp4_flashinfer_cutlass_moe import (
+         Mxfp4FlashinferCutlassMoEMethod,
+     )
+@@ -395,15 +394,26 @@ def maybe_fuse_routed_scale_and_shared_add(
+         Mxfp4MarlinMoEMethod,
+     )
+ 
+-    fused = isinstance(
+-        experts.quant_method,
+-        (
+-            Mxfp4FlashinferTrtllmMoEMethod,
+-            Mxfp4FlashinferCutlassMoEMethod,
+-            Mxfp4MarlinMoEMethod,
+-            ExpertPackMoEMethod,
+-        ),
+-    )
++    fused_methods = [
++        Mxfp4FlashinferTrtllmMoEMethod,
++        Mxfp4FlashinferCutlassMoEMethod,
++        Mxfp4MarlinMoEMethod,
++    ]
++    try:
++        # expert_pack imports sgl_kernel at module scope, so this raises on any
++        # platform without it -- Ascend, for one. Every MoE forward reaches here
++        # (DeepseekV2MoE.forward_normal calls it at the end), so the unguarded
++        # import made MoE unrunnable there. A method class that cannot be
++        # imported cannot be the type of anything, so leaving it out of the
++        # isinstance tuple is not a behaviour change; where the import succeeds
++        # the tuple is identical.
++        from sglang.srt.layers.quantization.expert_pack import ExpertPackMoEMethod
++    except ImportError:
++        pass
++    else:
++        fused_methods.append(ExpertPackMoEMethod)
++
++    fused = isinstance(experts.quant_method, tuple(fused_methods))
+     if fused:
+         already_scaled = experts.should_fuse_routed_scaling_factor_in_topk
+         if shared is not None:
+diff --git a/python/sglang/srt/models/deepseek_v2.py b/python/sglang/srt/models/deepseek_v2.py
+index 31ee7d6750..2d9015535f 100644
+--- a/python/sglang/srt/models/deepseek_v2.py
++++ b/python/sglang/srt/models/deepseek_v2.py
+@@ -163,6 +163,7 @@ from sglang.srt.models.deepseek_common.attention_forward_methods import (
+     DeepseekMLAFusedRopeRocmForwardMixin,
+     DeepseekMLARocmForwardMixin,
+ )
++from sglang.srt.model_loader.weight_utils import default_weight_loader
+ from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
+     DeepseekV2WeightLoaderMixin,
+ )
+@@ -432,6 +433,25 @@ class DeepseekV2MLP(nn.Module):
+                 )
+ 
+         # Fallback: fused silu+clamp kernel (still faster than unfused)
++        #
++        # The NPU branch below is upstream's. We measured our own two-call form
++        # (npu_swiglu 4.27us + an in-place clamp 2.64us) against npu_clipped_swiglu
++        # (8.22us) on one A3 die and confirmed the outputs are bit-identical at
++        # [1,4096] and [16,4096] -- **with the input scaled 48x so the clamp actually
++        # fires**, against two controls with teeth (the operator's own defaults are
++        # off by max|d|=156, and it differs from *not* clamping by 2.9e4). That
++        # qualifier is the whole check: with real activations max|gate_up| is about
++        # 2.17 against a limit of 10, so an unclamped operator passes an unscaled
++        # comparison. See the same rule in npu/moe/activation.py. Folding 42 shared
++        # experts plus 3 dense layers into
++        # one kernel each costs +65.6us/step while removing 45 kernels, and the
++        # whole-step effect was -0.026 ms, i.e. nothing. So there is no reason to
++        # carry a divergent implementation here.
++        #
++        # ⚠ Do not reach for the sibling `custom::npu_dequant_swiglu_clamp_quant` on
++        # the routed path by analogy -- it silently ignores clamp_limit (see the note
++        # in npu/moe/activation.py). Same family, both named clamp, one honours it
++        # and one does not.
+         elif self.swiglu_limit is not None:
+             if _is_npu:
+                 x = torch.ops.npu.npu_clipped_swiglu(
+@@ -493,12 +513,62 @@ class MoEGate(nn.Module):
+             self.e_score_correction_bias = None
+         if _is_cpu and _is_cpu_amx_available:
+             self.quant_method = PackWeightMethod(weight_names=["weight"])
++        self._weight_fp32_cache: Optional[torch.Tensor] = None
++        self._weight_fp32_key: Optional[tuple] = None
++        # Explicit invalidation for that cache. sglang's loaders write through
++        # `param.data.copy_()`, which moves neither `data_ptr()` nor `_version`,
++        # so the cache key cannot see an in-place update on its own -- and
++        # `/update_weights_from_disk` / `update_weights_from_tensor` are built-in
++        # endpoints, not hypotheticals. Wrap whatever loader is already on the
++        # parameter (PackWeightMethod installs one) instead of replacing it.
++        self._prev_weight_loader = getattr(self.weight, "weight_loader", None)
++        self.weight.weight_loader = self._load_weight_dropping_fp32_cache
+         self.tiny_router_gemm_max_tokens = tiny_router_gemm_max_tokens(
+             num_experts=config.n_routed_experts,
+             hidden_size=config.hidden_size,
+             weight_dtype=self.weight.dtype,
+         )
+ 
++    def _load_weight_dropping_fp32_cache(self, param, loaded_weight, *args, **kwargs):
++        """Load the router weight, then drop the fp32 copy derived from it."""
++        if self._prev_weight_loader is not None:
++            self._prev_weight_loader(param, loaded_weight, *args, **kwargs)
++        else:
++            default_weight_loader(param, loaded_weight)
++        self._weight_fp32_cache = None
++        self._weight_fp32_key = None
++
++    def _weight_fp32(self) -> torch.Tensor:
++        """The router weight in fp32, converted once rather than every forward.
++
++        The branch that needs this casts both operands to fp32 on purpose (a bf16
++        router loses whole experts off the top-k, not just precision -- see the
++        measurement in forward). But the weight is loop-invariant, and re-casting
++        it per layer per step showed up in a kernel profile as its own line:
++        `Cast [16, 4096]`, 42 calls a step, 242 us, 40 vector cores started to
++        move 128 KB. With the model's real 288 experts that is 7 MB a layer, so
++        the cost grows rather than shrinks.
++
++        Keyed on the parameter's storage pointer, version, dtype and shape. Both
++        reads are plain Python -- no kernel, no D2H.
++
++        ⚠ That key alone does NOT catch an in-place weight update: sglang's loaders
++        write through ``param.data.copy_()``, and ``.data`` hands back a fresh view
++        whose version counter starts at zero, so neither ``data_ptr()`` nor
++        ``_version`` moves. Live weight replacement is therefore handled explicitly
++        instead -- ``_load_weight_dropping_fp32_cache`` is installed as the
++        parameter's ``weight_loader`` in ``__init__`` and clears the cache on every
++        load, which covers ``/update_weights_from_disk``,
++        ``update_weights_from_tensor`` and RL weight sync. (LoRA and EPLB do not
++        touch ``MoEGate.weight`` at all.)
++        """
++        w = self.weight
++        key = (w.data_ptr(), w._version, w.dtype, w.shape)
++        if self._weight_fp32_key != key:
++            self._weight_fp32_cache = w.float()
++            self._weight_fp32_key = key
++        return self._weight_fp32_cache
++
+     def forward(
+         self,
+         hidden_states,
+@@ -529,7 +599,17 @@ class MoEGate(nn.Module):
+         elif _use_aiter:
+             logits = aiter_dsv3_router_gemm(hidden_states, self.weight)
+         elif not _is_cuda:
+-            logits = F.linear(hidden_states, self.weight, None)
++            # fp32, like every CUDA branch above: they each go out of their
++            # way for an fp32 result, and this one is the only path that
++            # stops at bf16. It matters more than the magnitude suggests --
++            # the loss lands on a top-k, so it shows up as a discrete wrong
++            # expert rather than a small error. Measured on Ascend at layer
++            # 3 / 8192 tokens: bf16 logits give 0.9929 top-8 set overlap,
++            # 5.65% of tokens picking a different expert set and the worst
++            # of them 34% off; fp32 restores the overlap exactly to the
++            # bf16-input noise floor. Costs +36us at decode bs=16 and
++            # +383us on an 8192 prefill chunk.
++            logits = F.linear(hidden_states.float(), self._weight_fp32(), None)
+         else:
+             # cuBLAS bf16 x bf16 -> fp32 GEMM (torch.mm's out_dtype kwarg is CUDA-only)
+             from sglang.kernels.ops.attention.dsv4 import linear_bf16_fp32
+@@ -1143,7 +1223,9 @@ class DeepseekV2MoE(nn.Module):
+             and not _use_aiter
+             or isinstance(self.experts.quant_method, KTEPWrapperMethod)
+         ):
+-            # fused in biased_grouped_topk so we can skip here
++            # Platforms whose top-k does not fold routed_scaling_factor in apply it
++            # here. (The comment that used to sit on this line claimed the factor was
++            # already fused in biased_grouped_topk -- on the branch that applies it.)
+             final_hidden_states *= self.routed_scaling_factor
+ 
+         if (
+diff --git a/python/sglang/srt/models/glm5_next.py b/python/sglang/srt/models/glm5_next.py
+index f5253cfdf0..8acd2486e9 100644
+--- a/python/sglang/srt/models/glm5_next.py
++++ b/python/sglang/srt/models/glm5_next.py
+@@ -81,6 +81,7 @@ from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
+ from sglang.srt.models.deepseek_common.utils import (
+     _device_sm,
+     _is_cuda,
++    _is_npu,
+     _use_aiter_gfx95,
+ )
+ from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
+@@ -302,6 +303,47 @@ class Glm5NextVisionModel(GlmOcrVisionModel):
+         )
+ 
+ 
++
++#: Every name that has to be unquantized for the fused path to work, for two
++#: different reasons that are easy to conflate:
++#:
++#:   the eight component projections -- if any of them were quantized, merging them
++#:   into one weight would merge two different schemes, so their being ignored is
++#:   what makes fusion *correct*;
++#:
++#:   the fused module names themselves -- `MergedColumnParallelRepeatedLinear` and
++#:   friends resolve their own scheme from their own prefix, so if the fused name
++#:   were not ignored the module would ask for int8 weights that the checkpoint does
++#:   not contain. This one is not obvious from reading the call site.
++_KDA_FUSED_PROJECTIONS = (
++    "q_proj",
++    "k_proj",
++    "v_proj",
++    "b_proj",
++    "f_a_proj",
++    "g_a_proj",
++    "f_b_proj",
++    "g_b_proj",
++    "fused_qkvbfg_a_proj",
++)
++
++
++def _kda_projections_unquantized(quant_config, prefix: str) -> bool:
++    """Whether `quant_config` demonstrably leaves every KDA projection unquantized.
++
++    Deliberately conservative in two ways. It only understands configs that expose a
++    plain `ignore` list (compressed-tensors), and it only accepts exact names -- a
++    regex entry makes this return False. Both failure directions land on today's
++    behaviour (no fusion), which is correct but slower, rather than on fusing a
++    layer whose weights are quantized.
++    """
++    ignore = getattr(quant_config, "ignore", None)
++    if not ignore:
++        return False
++    ignore = set(ignore)
++    return all(f"{prefix}.{name}" in ignore for name in _KDA_FUSED_PROJECTIONS)
++
++
+ class Glm5NextLinearAttention(nn.Module):
+     def __init__(
+         self,
+@@ -336,7 +378,26 @@ class Glm5NextLinearAttention(nn.Module):
+         projection_size = self.head_dim * self.num_heads
+         self.conv_size = config.linear_attn_config["short_conv_kernel_size"]
+ 
+-        self.do_fuse_qkvbfg = quant_config is None and head_shard_size == self.tp_size
++        # The fused path used to be gated on `quant_config is None`, which asks the
++        # wrong question. `MergedColumnParallelRepeatedLinear` takes a quant_config
++        # itself, and the loader carries all six shards of fused_qkvbfg_a_proj plus
++        # both of fused_fg_b_proj -- so what actually matters is whether *these*
++        # projections are quantized, not whether the model has a quant_config at all.
++        #
++        # In GLM-5.3's W8A8 checkpoint none of them are: q/k/v/b/f_a/g_a/f_b/g_b_proj
++        # are all in modules_to_not_convert, and the vendor even lists the fused
++        # module name itself, which reads as having anticipated this path.
++        #
++        # Measured cost of staying unfused (one A3 die, bs=1, INT8, graph on): four
++        # extra small matmuls per KDA layer, 170 launches a step --
++        #   [1,4096;128,4096] f_a+g_a  68/step  ~777 us
++        #   [1,128;8192,128]  f_b+g_b  68/step   482 us
++        #   [1,4096;64,4096]  b_proj   34/step   421 us
++        # all of them launch-bound, none moving more than 2 MiB.
++        self.do_fuse_qkvbfg = head_shard_size == self.tp_size and (
++            quant_config is None
++            or _kda_projections_unquantized(quant_config, prefix)
++        )
+         if self.do_fuse_qkvbfg:
+             self.qkvb_sizes = [
+                 projection_size,
+@@ -1200,9 +1261,11 @@ class Glm5NextForConditionalGeneration(nn.Module):
+         text_config = getattr(hf_config, "text_config", hf_config)
+         if not getattr(text_config, "n_shared_experts", None):
+             return "No shared experts are defined in the config."
+-        if not _is_cuda:
+-            return "Shared experts fusion currently requires CUDA devices."
+-        if _device_sm is not None and _device_sm < 80:
++        if not _is_cuda and not _is_npu:
++            return "Shared experts fusion currently requires CUDA or NPU devices."
++        # get_device_sm() returns 0 off CUDA, so this check has to stay CUDA-only
++        # or it disables the NPU path it is not talking about.
++        if _is_cuda and _device_sm is not None and _device_sm < 80:
+             return "Shared experts fusion requires SM80 or newer GPUs."
+         if get_parallel().moe_ep_size > 1:
+             return (

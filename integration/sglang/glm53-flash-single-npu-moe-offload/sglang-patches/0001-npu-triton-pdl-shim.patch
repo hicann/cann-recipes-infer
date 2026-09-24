@@ -1,0 +1,105 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pan-boyi <panboyi@huawei.com>
+Date: Wed, 9 Sep 2026 11:02:26 +0800
+Subject: [PATCH 01/10] =?UTF-8?q?npu:=20=E7=BB=99=20triton-ascend=20?=
+ =?UTF-8?q?=E8=A1=A5=E4=B8=80=E4=B8=AA=20PDL=20=E5=85=BC=E5=AE=B9=E5=9E=AB?=
+ =?UTF-8?q?=E7=89=87?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+主线有 29 个内核模块引用 tl.extra.cuda。Triton 算 kernel 的 cache_key 时会遍历
+语法树并逐个解析全局属性链，连死 constexpr 分支里的也解析，而 triton-ascend 只
+提供 tl.extra.cann。结果是在哈希阶段就抛 AttributeError，内核体一行没跑——表现
+为服务在捕获解码图时崩溃。
+
+本提交发布一个空的 tl.extra.cuda 子模块，两个 PDL 原语是空的 @triton.jit 函数：
+只需满足语法树遍历，永远不会被调用。PDL 是纯调度优化，不涉及数值。在真有
+tl.extra.cuda 的 CUDA 环境上 install() 直接返回，模块失效。
+---
+ .../srt/hardware_backend/npu/__init__.py      |  7 +++
+ .../hardware_backend/npu/triton_pdl_compat.py | 61 +++++++++++++++++++
+ 2 files changed, 68 insertions(+)
+ create mode 100644 python/sglang/srt/hardware_backend/npu/__init__.py
+ create mode 100644 python/sglang/srt/hardware_backend/npu/triton_pdl_compat.py
+
+diff --git a/python/sglang/srt/hardware_backend/npu/__init__.py b/python/sglang/srt/hardware_backend/npu/__init__.py
+new file mode 100644
+index 0000000000..1836ad9575
+--- /dev/null
++++ b/python/sglang/srt/hardware_backend/npu/__init__.py
+@@ -0,0 +1,7 @@
++"""Ascend NPU hardware backend.
++
++Importing any NPU backend module installs the triton-ascend PDL compatibility
++shim first -- see ``triton_pdl_compat`` for why it is needed and why it is safe.
++"""
++
++from sglang.srt.hardware_backend.npu import triton_pdl_compat  # noqa: F401
+diff --git a/python/sglang/srt/hardware_backend/npu/triton_pdl_compat.py b/python/sglang/srt/hardware_backend/npu/triton_pdl_compat.py
+new file mode 100644
+index 0000000000..3b6a4c81b6
+--- /dev/null
++++ b/python/sglang/srt/hardware_backend/npu/triton_pdl_compat.py
+@@ -0,0 +1,61 @@
++"""Make ``tl.extra.cuda`` resolvable under triton-ascend.
++
++Mainline sglang guards every PDL (programmatic dependent launch) call behind a
++``USE_GDC: tl.constexpr`` that ``is_arch_support_pdl()`` leaves False on Ascend,
++so the calls never execute.  That is not enough.  Triton computes a kernel's
++cache key by walking its AST and *resolving* every global attribute chain it
++finds -- including chains inside dead ``tl.constexpr`` branches
++(``triton/runtime/jit.py``, ``JITFunction.cache_key`` -> ``visit_Attribute`` ->
++``getattr``).  triton-ascend ships ``triton.language.extra.cann`` and no
++``.cuda``, so that walk raises
++
++    AttributeError: module 'triton.language.extra' has no attribute 'cuda'
++
++before a single line of the kernel body runs.  Observed as a scheduler crash
++during decode graph capture, via
++``kernels/ops/attention/fla/fused_sigmoid_gating_recurrent.py``.
++
++29 kernel modules in mainline reference ``tl.extra.cuda``; patching each one
++would be a large diff that conflicts with every upstream touch of those files.
++Publish a ``cuda`` submodule instead, whose two PDL primitives are empty
++``@triton.jit`` functions.  They satisfy the AST walk and can never run: the
++only call sites sit under ``if USE_GDC:`` with USE_GDC False on this platform.
++PDL is a scheduling optimisation, so nothing numerical depends on it.
++
++Not installed when a real ``tl.extra.cuda`` is present -- on CUDA this module
++is inert.
++"""
++
++import sys
++import types
++
++import triton
++import triton.language as tl
++
++_MODULE_NAME = "triton.language.extra.cuda"
++
++
++def install() -> bool:
++    """Publish a no-op ``tl.extra.cuda``. Returns True if it installed one."""
++    extra = getattr(tl, "extra", None)
++    if extra is None or hasattr(extra, "cuda"):
++        return False
++
++    module = types.ModuleType(_MODULE_NAME)
++
++    @triton.jit
++    def gdc_wait():
++        pass
++
++    @triton.jit
++    def gdc_launch_dependents():
++        pass
++
++    module.gdc_wait = gdc_wait
++    module.gdc_launch_dependents = gdc_launch_dependents
++    extra.cuda = module
++    sys.modules[_MODULE_NAME] = module
++    return True
++
++
++install()

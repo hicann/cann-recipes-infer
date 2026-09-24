@@ -1,0 +1,1554 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pan-boyi <panboyi@huawei.com>
+Date: Wed, 9 Sep 2026 11:03:15 +0800
+Subject: [PATCH 06/10] =?UTF-8?q?npu:=20=E6=B5=81=E5=BC=8F=E9=A2=84?=
+ =?UTF-8?q?=E5=A1=AB=E5=85=85=E2=80=94=E2=80=94=E6=95=B4=E5=B1=82=E4=B8=93?=
+ =?UTF-8?q?=E5=AE=B6=E4=BB=8E=E4=B8=BB=E6=9C=BA=E5=86=85=E5=AD=98=E6=B5=81?=
+ =?UTF-8?q?=E8=BF=9B=E4=B8=80=E4=B8=AA=E5=A4=8D=E7=94=A8=E7=9A=84=E6=98=BE?=
+ =?UTF-8?q?=E5=AD=98=E6=A7=BD?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+长预填充时绕开 hybrid（常驻 NPU + CPU）路径。当 KT_PREFILL_STREAM=1 且本次分块的
+token 数不小于 KT_PREFILL_STREAM_THRESHOLD 时，每层把它的全部专家从锁页主机内存
+流进单个复用的显存槽，整层 MoE 在 NPU 上算完，不做提交/同步往返。
+
+几个取舍：单槽串行（双缓冲实测只快 2% 以内，却要两倍显存）；专家池尽量在模型加载
+时建好，否则在第一次符合条件的前向里惰性建；ND 到 NZ 的转换分块进行以限制显存峰值。
+
+这是纯旁路：流式路径从不碰 CPU 包装层，与 hybrid 正交。仅设备 OOM 回退 hybrid，配置、
+依赖和算子错误直接抛出；后台权重池在 checkpoint 的最后一个专家层完成。不设
+KT_PREFILL_STREAM 时整个模块惰性。
+---
+ .../srt/layers/moe/kt_stream_prefill.py       | 1521 +++++++++++++++++
+ 1 file changed, 1521 insertions(+)
+ create mode 100644 python/sglang/srt/layers/moe/kt_stream_prefill.py
+
+diff --git a/python/sglang/srt/layers/moe/kt_stream_prefill.py b/python/sglang/srt/layers/moe/kt_stream_prefill.py
+new file mode 100644
+index 0000000000..1258974250
+--- /dev/null
++++ b/python/sglang/srt/layers/moe/kt_stream_prefill.py
+@@ -0,0 +1,1521 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Streaming prefill for the KT MoE offload: stream ALL routed experts per layer DDR->HBM.
++
++Env-gated bypass of the hybrid (resident-on-NPU + CPU) MoE path.  During a long
++prefill (``KT_PREFILL_STREAM=1`` and chunk token count ``M >=
++KT_PREFILL_STREAM_THRESHOLD``) each layer streams its full expert set from a
++pinned DDR pool into a single reused HBM slot and runs the whole MoE over all
++experts on the NPU -- no CPU experts, no submit/sync round trip.
++
++Design notes:
++- Serial single slot (double buffering measured <=2% for twice the HBM).
++- The pool is built at model-load time when possible, lazily on the first
++  qualifying forward otherwise; the ND->NZ cast is chunked to bound peak HBM.
++- Pure bypass: the streaming path never touches the CPU wrapper, so it is
++  orthogonal to the hybrid path.
++- Device OOM can fall through to the hybrid path; configuration, dependency,
++  shape, dtype, and operator failures are raised. With ``KT_PREFILL_STREAM``
++  unset this module is inert.
++
++Entry points:
++- :func:`maybe_reserve_slot` from ``KTEPWrapperMethod.process_weights_after_loading``
++  (model-load time),
++- :func:`maybe_streaming_forward` from ``FusedMoE.forward_impl``, *before* the
++  dispatcher runs.  It has to sit there rather than inside ``quant_method.apply``
++  because ``AscendTPDispatcher.dispatch`` has already permuted and int8-quantised
++  the hidden states by the time ``apply`` is reached, and because the KT
++  pre-dispatch hook (CPU submit + expert-id masking) must not run for a streamed
++  layer.  A dispatcher hook cannot express that: hooks transform the dispatch
++  inputs, they cannot short-circuit the dispatch.
++
++Environment variables.  All of them are read AT IMPORT and frozen into module globals, so
++setting one after the server is up does nothing -- and neither does setting one in a test
++after this module has been imported.  Vendor-prefixed (``KT_``) rather than routed through
++``srt/environ.py`` because they configure ktransformers, not sglang.
++
++===============================  =========  =====================================
++name                             default    effect
++===============================  =========  =====================================
++KT_PREFILL_STREAM                off        master switch for this module
++KT_PREFILL_STREAM_THRESHOLD      512        min chunk tokens to take the streaming path
++KT_PREFILL_STREAM_CKPT           (none)     W8A8 checkpoint dir; required by that reader
++KT_STREAM_STRICT                 off        re-raise device OOM instead of falling back
++KT_STREAM_WARMUP                 0          warm-up passes before the first real prefill
++KT_DYNAMIC_RESIDENT              off        swap the resident set for this prompt's hot-K
++KT_HOT_TAIL_TOKENS               0          count hot experts over the last N prompt
++                                            tokens only (0 = the whole prefill)
++KT_MXFP4_CKPT                    (none)     MXFP4 checkpoint dir; required by depool
++KT_MXFP4_OP_DIR                  (none)     custom-op vendor dir; required by depool
++KT_MXFP4_PREFETCH                **on**     ping-pong prefetch of the next GGUF layer
++KT_MXFP4_NZ_CHUNK                32         experts per H2D + convert chunk
++KT_MXFP4_GGUF_DEDUP              off        read layers from the CPU MoE's GGUF, no pool
++KT_GGUF_TEMPLATE                 (none)     per-layer GGUF path; required by dedup
++===============================  =========  =====================================
++
++"""
++
++import functools
++import json
++import logging
++import os
++import re
++from typing import NamedTuple, Optional
++
++import torch
++
++from sglang.srt.layers.moe.kt_ep_wrapper import KTEPWrapperMethod
++
++logger = logging.getLogger(__name__)
++
++_KT_PREFILL_STREAM = os.environ.get("KT_PREFILL_STREAM", "") == "1"
++_T = int(os.environ.get("KT_PREFILL_STREAM_THRESHOLD", "512"))
++# KT_STREAM_STRICT=1 (testing): re-raise a device OOM instead of falling back to the hybrid path.
++# All non-OOM failures are always raised.
++_KT_STREAM_STRICT = os.environ.get("KT_STREAM_STRICT", "") == "1"
++# KT_HOT_TAIL_TOKENS=N (opt-in; default 0 = off = whole-prompt selection): pick the decode resident
++# hot pool from only the LAST N prompt tokens' routing instead of the whole prefill.  Decode
++# continues from the prompt tail, so the tail's expert distribution predicts decode routing better
++# -> higher decode hit rate.  Long contexts gain, short prompts (<~2k tokens) regress slightly (a
++# short prompt is already all "recent"), hence default off.  Pure perf knob: it only changes which
++# experts are NPU-resident vs CPU, not the computed output.
++_HOT_TAIL = int(os.environ.get("KT_HOT_TAIL_TOKENS", "0") or "0")
++_CKPT = os.environ.get("KT_PREFILL_STREAM_CKPT", "")
++_ACL_FORMAT_FRACTAL_NZ = 29
++# Experts per H2D + convert chunk on the GGUF-dedup path.  Same variable the AscendC wrapper
++# chunks convert_proj_blk by, so both stay in step.
++_H2D_CHUNK = int(os.environ.get("KT_MXFP4_NZ_CHUNK", "32") or "32")
++
++# The streaming pool is always pinned so H2D remains asynchronous.
++_PIN_MXFP4 = True
++_MXFP4_CKPT = os.environ.get("KT_MXFP4_CKPT", "")
++
++# GGUF DEDUP (KT_MXFP4_GGUF_DEDUP=1, requires KT_MXFP4_DEPOOL=1): read the layer's MXFP4 codes
++# straight from the per-layer GGUF (KT_GGUF_TEMPLATE, block_mxfp4 = e8m0 + half-block-packed codes)
++# that the CPU MoE already holds, instead of ALSO keeping a separate ~137GB pinned codes pool.
++#
++# Sharing is real but partial, so this stays default-off.  kt-kernel does map the GGUF
++# (``kt-kernel/python/utils/loader.py`` hands ``moe.hpp`` a view over an ``np.memmap``), so the
++# reader below and the CPU MoE hit the same page cache and the pinned pool is genuinely recovered.
++# What is NOT recovered is kt-kernel's own copy: ``LLAMA_MOE_TP::load_weights`` memcpys each NUMA
++# subpool's ``intermediate_size / KT_THREADPOOL_COUNT`` slice into node-local buffers, so ~137GB of
++# anonymous DDR stays resident whatever this flag does.  With ``--kt-threadpool-count 8`` that copy
++# is unavoidable -- the zero-copy alias only applies to a single un-split pool -- so enabling this
++# trades a pinned, non-evictable pool for an evictable page cache that must survive alongside those
++# copies.  Enable it only when the box has the headroom to keep the GGUF cached; otherwise every
++# long prefill re-reads it from disk.
++_KT_GGUF_DEDUP = os.environ.get("KT_MXFP4_GGUF_DEDUP", "") == "1"
++_GGUF_TMPL = os.environ.get("KT_GGUF_TEMPLATE", "")
++_GGUF_READERS: dict = {}  # layer_idx -> GGUFReader (memmap)
++_GGUF_BLOCKS: dict = (
++    {}
++)  # layer_idx -> (gate, up, down) np memmap views [E,N,nb*17] block_mxfp4
++
++_MXFP4_POOL: dict = {}  # layer_idx -> (c13, s13, c2, s2) pinned host MXFP4 (codes+e8m0)
++_MXFP4_POOL_BUILT = False  # set once the pool is fully populated
++_MXIDX = None  # cached weight_map of the MXFP4 checkpoint index
++
++# ``npu_moe_init_routing_v2(expert_tokens_num_type=1)`` returns the per-expert token COUNT, which is
++# what ``npu_grouped_matmul(group_list_type=1)`` expects; v1 routing
++# (``npu_moe_compute_expert_tokens``) returns the CUMULATIVE form, which is ``group_list_type=0``.
++# The two must be kept in step: a mismatch is NOT rejected by the operator, it silently computes the
++# wrong result.  This module uses v2 routing, hence 1 -- the same pairing AscendTPDispatcher uses
++# (see token_dispatcher/ascend_tp.py, which sets group_list_type=1 for every v2 variant).
++_GROUP_LIST_TYPE = 1
++
++
++def _require_ckpt_dir(path: str, env_name: str, what: str) -> str:
++    """Return the checkpoint dir, or raise with guidance when the env var is unset."""
++    if not path:
++        raise ValueError(
++            f"{env_name} is not set, but it is required to load the {what} checkpoint. "
++            f"Set {env_name}=/path/to/checkpoint."
++        )
++    return path
++
++
++def _ckpt_dir() -> str:
++    return _require_ckpt_dir(_CKPT, "KT_PREFILL_STREAM_CKPT", "W8A8 (NPU-side)")
++
++
++def _mxfp4_ckpt_dir() -> str:
++    return _require_ckpt_dir(_MXFP4_CKPT, "KT_MXFP4_CKPT", "native MXFP4 (CPU-side)")
++
++
++def _add_sys_path(d: str) -> None:
++    import sys
++
++    if d not in sys.path:
++        sys.path.insert(0, d)
++
++
++def _gguf_reader_cls():
++    """Return the GGUF reader installed by SGLang's locked dependencies."""
++    from gguf import GGUFReader
++
++    return GGUFReader
++
++
++def _gguf_layer_blocks(layer: int):
++    """Return (gate, up, down) block_mxfp4 memmap views [E,N,nb*17] for one layer.
++
++    Lazily opens and caches one GGUFReader per layer; ``t.data`` is a file-backed memmap.
++    """
++    blk = _GGUF_BLOCKS.get(layer)
++    if blk is None:
++        r = _GGUF_READERS.get(layer)
++        if r is None:
++            r = _gguf_reader_cls()(_GGUF_TMPL.format(layer_idx=layer))
++            _GGUF_READERS[layer] = r
++        byname = {t.name: t for t in r.tensors}
++        blk = tuple(
++            byname[f"blk.{layer}.{n}.weight"].data
++            for n in ("ffn_gate_exps", "ffn_up_exps", "ffn_down_exps")
++        )
++        _GGUF_BLOCKS[layer] = blk
++    return blk
++
++
++# ----- prefetch (double-buffered) -----
++# The per-layer CPU memcpy mmap->pinned is device-independent, so a worker thread fills layer L+1's
++# pinned staging while the main thread is blocked in layer L's convert syncs.  Needs PING-PONG
++# buffers (2 per key, alternating by layer parity): a single buffer would race the in-flight H2D.
++# No device event is needed: the main thread is serial and each convert syncs, so layer L-1's H2D
++# (from the buffer the worker reuses for L+1) has finished before L starts.
++_KT_PREFETCH = os.environ.get("KT_MXFP4_PREFETCH", "1") == "1"
++_MX_PP: dict = {}  # key -> [buf0, buf1] pinned ping-pong staging
++_PF = {
++    "ex": None,
++    "futs": {},
++    "next": None,
++}  # worker, layer->future, expected next layer
++
++
++def _pp_buf(key, parity, E, OUT, nb17):
++    bufs = _MX_PP.get(key)
++    if bufs is None:
++        bufs = [None, None]
++        _MX_PP[key] = bufs
++    b = bufs[parity]
++    if b is None or tuple(b.shape) != (E, OUT, nb17):
++        b = torch.empty((E, OUT, nb17), dtype=torch.uint8, pin_memory=True)
++        bufs[parity] = b
++    return b
++
++
++_COPY_POOL = None
++_COPY_NTHREADS = 32
++
++
++def _par_copy(dst, src_np):
++    """Copy ``src_np`` (GGUF memmap) -> ``dst`` (pinned), parallelised over the expert dim.
++
++    ``torch.copy_`` runs single-threaded in the server (the OMP pool is saturated by the
++    kt-cpuinfer threads), which is the whole long-prefill bottleneck on a slow single-core
++    memory path.  Explicit threads each release the GIL inside ``copy_``.
++    The fixed 32-thread pool matches the validated A3 host configuration.
++    """
++    global _COPY_POOL
++    src = torch.from_numpy(src_np)
++    E = src.shape[0]
++    n = _COPY_NTHREADS
++    if n <= 1 or E < n:
++        dst.copy_(src)
++        return
++    if _COPY_POOL is None:
++        import concurrent.futures
++
++        _COPY_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=n)
++    futs = [
++        _COPY_POOL.submit(
++            lambda lo, hi: dst[lo:hi].copy_(src[lo:hi]), E * k // n, E * (k + 1) // n
++        )
++        for k in range(n)
++    ]
++    for f in futs:
++        f.result()
++
++
++def _fill_stage(layer):
++    """Copy this layer's GGUF blocks into its parity's pinned ping-pong buffers.
++
++    ``w13 = cat(gate, up)`` along OUT, ``w2 = down``.  H2D and the de-interleave stay on the
++    main thread / in the kernel.
++    """
++    gate, up, down = _gguf_layer_blocks(layer)
++    par = layer % 2
++    E = gate.shape[0]
++    b13 = _pp_buf("w13", par, E, gate.shape[1] + up.shape[1], gate.shape[2])
++    _par_copy(b13[:, : gate.shape[1]], gate)
++    _par_copy(b13[:, gate.shape[1] :], up)
++    b2 = _pp_buf("w2", par, E, down.shape[1], down.shape[2])
++    _par_copy(b2, down)
++
++
++def _prefetch_ensure(layer):
++    """Ensure ``layer``'s buffers are filled, then kick off the NEXT MoE layer.
++
++    Waits for this layer's prefetch, or fills synchronously on a new prefill / out-of-sequence
++    layer.  Returns ``layer % 2``.
++
++    The successor comes from :func:`_next_moe_layer`, not ``layer + 1`` bounded by
++    ``num_layers``: only the expert-bearing layers have a GGUF, and prefetching a layer that
++    has none raises inside the worker, which surfaces one layer later as a streaming failure.
++    """
++    import concurrent.futures
++
++    if _PF["ex"] is None:
++        _PF["ex"] = concurrent.futures.ThreadPoolExecutor(max_workers=1)
++    if _PF["next"] == layer and layer in _PF["futs"]:
++        _PF["futs"].pop(layer).result()  # warm: the worker already filled it
++    else:
++        _PF["futs"].clear()  # new prefill / resync -> fill this layer now
++        _fill_stage(layer)
++    nxt = _next_moe_layer(layer)
++    if nxt is not None:
++        _PF["futs"][nxt] = _PF["ex"].submit(_fill_stage, nxt)
++    _PF["next"] = nxt
++    return layer % 2
++
++
++def _mxfp4_op_dir_on_path() -> None:
++    """Put the AscendC MXFP4 operator wrapper on ``sys.path``.
++
++    Only ``KT_MXFP4_OP_DIR`` is honoured.  The original patch also guessed the directory from
++    a fixed ``<ktransformers>/third_party/sglang/...`` nesting, which does not exist here --
++    the two repositories are independent clones -- so a wrong guess would silently import
++    nothing useful.
++    """
++    d = os.environ.get("KT_MXFP4_OP_DIR")
++    if not d:
++        raise ValueError(
++            "KT_MXFP4_OP_DIR is not set, but the MXFP4 depool path needs the fused AscendC "
++            "operator wrapper. Set "
++            "KT_MXFP4_OP_DIR=<ktransformers>/kt-kernel/tools/ascendc_mxfp4."
++        )
++    _add_sys_path(d)
++
++
++def _mxfp4_convert_fn():
++    """Lazily import the fused-kernel wrapper (``mxfp4_fused_op.py``)."""
++    _mxfp4_op_dir_on_path()
++    from mxfp4_fused_op import mxfp4_layer_to_nz_slots
++
++    return mxfp4_layer_to_nz_slots
++
++
++def _mxfp4_convert_blk_fn():
++    """Wrapper that converts straight from RAW GGUF blocks (in-kernel de-interleave)."""
++    _mxfp4_op_dir_on_path()
++    from mxfp4_fused_op import mxfp4_layer_to_nz_slots_blk
++
++    return mxfp4_layer_to_nz_slots_blk
++
++
++_KT_BLK_KERNEL = True
++
++_SLOT: dict = {}  # 'w13'/'w2' -> reused NZ HBM slot
++_SLOT_RESERVED = False
++
++# Dynamic decode-resident expert pool.  During a streaming prefill we count per-layer expert
++# activations (device-side bincount, cheap); the per-layer top-K (K = the number of resident slots)
++# then replaces the static-prefix resident set.  Weights are gathered from the pool into the
++# resident params and all routing structures are updated IN PLACE (same storage, so decode graph
++# replay and the C++ side observe them):
++#   1. KTEPWrapperMethod.gpu_experts_mask / logical_to_gpu_index (device tensors)
++#   2. kt_kernel wrapper.gpu_experts_mask (pinned CPU bool, shared with C++ by pointer)
++_KT_DYN_RESIDENT = os.environ.get("KT_DYNAMIC_RESIDENT", "") == "1"
++_REGISTRY: dict = {}  # layer_idx -> (layer_module, ktep_wrapper)
++
++# Incremental build: capture MATERIALISES each expert's int8 weight straight into that layer's FINAL
++# pinned ND buffer as the load loop reads it.  Once a layer's tensors are all in, the layer is
++# NZ-cast IN PLACE (chunked: pinned ND -> HBM -> transpose + format_cast -> bytes back into the SAME
++# pinned region; ND[E,A,B] and NZ[E,B,A] have identical byte counts).  The whole build is spread
++# inside the model-load loop, so the extra peak DDR is zero -- the pinned pool IS the product.
++_CFG: dict = (
++    {}
++)  # E, H, I, num_layers (from the wrapper, or from the checkpoint config.json)
++_LBUF: dict = {}  # layer -> {flat13, flat2 (pinned int8), s13, s2 (cpu fp32), count}
++
++
++def _remember_dims(E: int, H: int, I: int, num_layers: int) -> None:
++    """Cache the MoE dimensions taken from the layer wrapper.
++
++    Preferred over reading them back out of ``config.json``: the GGUF-dedup path needs no
++    safetensors checkpoint at all, so it must not be forced to name one.
++    """
++    if E and H and I and num_layers:
++        _CFG.update(E=E, H=H, I=I, num_layers=num_layers)
++
++
++def _read_ckpt_config() -> dict:
++    """``config.json`` with ``text_config`` flattened one level up.
++
++    GLM-5.3-Flash ships a multimodal config: every text-model field this module reads --
++    ``n_routed_experts``, ``hidden_size``, ``moe_intermediate_size``, ``num_hidden_layers``,
++    ``swiglu_limit`` -- lives under ``text_config``, and a bare ``cfg["..."]`` raises or
++    (worse, for ``swiglu_limit``) silently returns ``None``.  DeepSeek-V4-Flash keeps them
++    at the top level.  Top level wins where both exist, so DeepSeek is unaffected.
++    """
++    cfg = json.load(open(os.path.join(_ckpt_dir(), "config.json")))
++    sub = cfg.get("text_config")
++    if isinstance(sub, dict):
++        merged = dict(sub)
++        merged.update({k: v for k, v in cfg.items() if k != "text_config"})
++        return merged
++    return cfg
++
++
++def _get_cfg():
++    if not _CFG:
++        cfg = _read_ckpt_config()
++        _CFG["E"] = int(cfg["n_routed_experts"])
++        _CFG["H"] = int(cfg["hidden_size"])
++        _CFG["I"] = int(cfg["moe_intermediate_size"])
++        _CFG["num_layers"] = int(cfg["num_hidden_layers"])
++    return _CFG["E"], _CFG["H"], _CFG["I"], _CFG["num_layers"]
++
++
++def _moe_layers() -> tuple:
++    """The layer indices that actually run a KT MoE, taken from the load-time registry.
++
++    ``range(num_layers)`` is only correct when every layer is a MoE layer, which is true
++    for DeepSeek-V4-Flash (``first_k_dense_replace=0``) and false for GLM-5.3-Flash, whose
++    layers 0..2 are dense.  A loop over ``range()`` then asks for expert tensors that do
++    not exist, and -- the silent half -- the "first layer" / "last layer" triggers that
++    reset and flush the dynamic resident set are keyed on 0 and ``num_layers - 1``, so on
++    GLM the reset never fires at all.
++
++    Layers at or past ``num_hidden_layers`` are dropped: GLM's checkpoint carries a full
++    288-expert set for layer 45, the MTP head, which is not served, so a trigger keyed on
++    it would never fire in a real forward pass.
++    """
++    n = int(_CFG.get("num_layers") or 0)
++    ls = tuple(sorted(L for L in _REGISTRY if not n or L < n))
++    return ls or tuple(range(n))
++
++
++def _first_moe_layer():
++    ls = _moe_layers()
++    return ls[0] if ls else None
++
++
++def _next_moe_layer(layer):
++    """The layer that will be streamed after ``layer``, or ``None`` if it is the last."""
++    ls = _moe_layers()
++    try:
++        i = ls.index(layer)
++    except ValueError:
++        return None
++    return ls[i + 1] if i + 1 < len(ls) else None
++
++
++# ----- parallel O_DIRECT pool reader -----
++# The build bottleneck is reading the expert int8 out of the W8A8 checkpoint.  The loader's buffered
++# single-thread reads are the floor; parallel O_DIRECT (bypassing the page cache) plus a per-expert
++# rearrange is several times faster.  Raw O_DIRECT is faster still, but the Python per-expert
++# rearrange (experts are expert-major yet scattered on disk) is then the hard cap.
++_NVME_ALIGN = 4096
++_IDX = None
++
++
++def _shard_header(path):
++    import struct
++
++    with open(path, "rb") as f:
++        n = struct.unpack("<Q", f.read(8))[0]
++        return json.loads(f.read(n)), 8 + n
++
++
++# ----- checkpoint tensor naming: probed, never hardcoded -----
++# The readers below address the checkpoint by tensor name, and the families we serve spell
++# those names differently:
++#
++#   DeepSeek-V4-Flash  W8A8   layers.{L}.ffn.experts.{e}.{w1,w3,w2}.{weight,weight_scale}
++#                     MXFP4   layers.{L}.ffn.experts.{e}.{w1,w3,w2}.{weight,scale}
++#   GLM-5.3-Flash      W8A8   model.language_model.layers.{L}.mlp.experts.{e}.
++#                             {gate,up,down}_proj.{weight,weight_scale}
++#                     MXFP4   ... .{gate,up,down}_proj.{weight_packed,weight_scale}
++#
++# Hardcoding both spellings only moves the problem to the next checkpoint, so probe the
++# checkpoint's own index, exactly as
++# ``kt-kernel/tools/mxfp4_gguf/convert_mxfp4_gguf.py`` already does for the GGUF conversion.
++#
++# That helper is deliberately NOT imported.  It lives in a tools/ script directory of the
++# ktransformers superproject, of which this sglang tree is a git submodule; importing it
++# would invert the dependency and make an sglang module unimportable without ktransformers
++# on sys.path.  Its design is reproduced instead: anchor on expert 0's gate tensor, exclude
++# ``.shared_experts`` (same parent, would otherwise match), and match the layer number on a
++# dot boundary so layer 3 does not also match layer 30.
++
++
++class _ExpertNaming(NamedTuple):
++    """How one checkpoint family spells its routed-expert tensors."""
++
++    prefix_tmpl: str  # e.g. "model.language_model.layers.{L}.mlp.experts"
++    gate: str
++    up: str
++    down: str
++    weight: str  # suffix holding the quantised weight
++    scale: str  # suffix holding its scale
++
++    @property
++    def projs(self) -> tuple:
++        return (self.gate, self.up, self.down)
++
++    def weight_key(self, layer: int, expert: int, proj: str) -> str:
++        return f"{self.prefix_tmpl.format(L=layer)}.{expert}.{proj}.{self.weight}"
++
++    def scale_key(self, layer: int, expert: int, proj: str) -> str:
++        return f"{self.prefix_tmpl.format(L=layer)}.{expert}.{proj}.{self.scale}"
++
++
++_MXFP4_NAMING_CANDIDATES = (
++    (("w1", "w3", "w2"), "weight", "scale"),  # DeepSeek-V4-Flash native MXFP4
++    (
++        ("gate_proj", "up_proj", "down_proj"),
++        "weight_packed",
++        "weight_scale",
++    ),  # compressed-tensors MXFP4 (GLM-5.3)
++)
++
++_NAMING: dict = {}  # "W8A8"/"MXFP4" -> _ExpertNaming
++_LAYER_RE = re.compile(r"(?:^|\.)layers\.(\d+)\.")
++
++
++def _detect_expert_naming(weight_map, candidates, kind: str) -> _ExpertNaming:
++    """Probe ``weight_map`` for the routed-expert spelling; cached per checkpoint kind."""
++    cached = _NAMING.get(kind)
++    if cached is not None:
++        return cached
++    for (gate, up, down), wsuf, ssuf in candidates:
++        needle = f".experts.0.{gate}.{wsuf}"
++        for k in weight_map:
++            if not k.endswith(needle) or ".shared_experts" in k:
++                continue
++            m = _LAYER_RE.search(k)
++            if m is None:
++                continue
++            head = k[: -len(needle)] + ".experts"  # ...layers.{N}.mlp.experts
++            tmpl = head[: m.start(1)] + "{L}" + head[m.end(1) :]
++            naming = _ExpertNaming(tmpl, gate, up, down, wsuf, ssuf)
++            _NAMING[kind] = naming
++            logger.info(
++                "[KT_STREAM] %s expert naming probed from the checkpoint index: "
++                "%s.{e}.(%s|%s|%s).(%s|%s)",
++                kind,
++                tmpl,
++                gate,
++                up,
++                down,
++                wsuf,
++                ssuf,
++            )
++            return naming
++    raise ValueError(
++        f"no routed experts found in the {kind} checkpoint index. Tried "
++        + ", ".join(f"*.experts.0.{g}.{w}" for (g, _, _), w, _ in candidates)
++    )
++
++
++def _expert_layers(weight_map, naming: _ExpertNaming, num_layers: int) -> tuple:
++    """Layers carrying routed experts, restricted to the served range.
++
++    ``range(num_layers)`` over-reaches on GLM-5.3-Flash at both ends: layers 0..2 are dense
++    (``first_k_dense_replace=3``) and the checkpoint also holds a 288-expert set for layer
++    45, the MTP head, one past ``num_hidden_layers`` and never served.  DeepSeek-V4-Flash
++    has neither, so this returns exactly ``range(num_layers)`` there.
++    """
++    return tuple(
++        L
++        for L in range(num_layers)
++        if naming.weight_key(L, 0, naming.gate) in weight_map
++    )
++
++
++def _mxfp4_naming() -> _ExpertNaming:
++    return _detect_expert_naming(_mxfp4_index(), _MXFP4_NAMING_CANDIDATES, "MXFP4")
++
++
++_IS_PREFILL_PROBE_FAILED = False
++
++
++def _is_prefill() -> bool:
++    # Fails OPEN: if we cannot tell, assume prefill -- taking the streaming path during
++    # graph capture is detectable downstream, skipping it silently is not. Logged once, so
++    # a torch_npu that stops answering does not look like normal operation.
++    global _IS_PREFILL_PROBE_FAILED
++    try:
++        return not torch.npu.is_current_stream_capturing()
++    except Exception as e:
++        if not _IS_PREFILL_PROBE_FAILED:
++            _IS_PREFILL_PROBE_FAILED = True
++            logger.warning(
++                "[KT_STREAM] cannot probe stream capture (%s); assuming prefill from here",
++                repr(e)[:160],
++            )
++        return True
++
++
++# ---------------------------------------------------------------------------
++#  DEPOOL: load MXFP4 codes+scale (instead of W8A8) and build a small pinned pool
++# ---------------------------------------------------------------------------
++def _as_u8(t):
++    return (t if t.dtype == torch.uint8 else t.view(torch.uint8)).contiguous()
++
++
++def _load_layer_mxfp4(layer: int, E: int):
++    """Read one layer's E experts of native MXFP4 (codes + e8m0 scale) and build w13 = cat(w1,w3).
++
++    Returns pinned host tensors: c13 [E,2I,H/2] u8, s13 [E,2I,H/32] u8, c2 [E,H,I/2] u8,
++    s2 [E,H,I/32] u8.
++    """
++    from safetensors import safe_open
++
++    idx = _mxfp4_index()
++    nm = _mxfp4_naming()
++    cache: dict = {}
++
++    def _open(k):
++        sh = idx[k]
++        if sh not in cache:
++            cache[sh] = safe_open(os.path.join(_mxfp4_ckpt_dir(), sh), framework="pt")
++        return cache[sh]
++
++    def stack(proj):
++        cs, ss = [], []
++        for e in range(E):
++            wk = nm.weight_key(layer, e, proj)
++            sk = nm.scale_key(layer, e, proj)
++            h = _open(wk)
++            cs.append(_as_u8(h.get_tensor(wk)))
++            ss.append(_as_u8(h.get_tensor(sk)))
++        return torch.stack(cs), torch.stack(ss)
++
++    _pin = (lambda t: t.pin_memory()) if _PIN_MXFP4 else (lambda t: t)
++    c1, s1 = stack(nm.gate)
++    c3, s3 = stack(nm.up)
++    c13 = _pin(torch.cat([c1, c3], dim=1))
++    s13 = _pin(torch.cat([s1, s3], dim=1))
++    c2, s2 = stack(nm.down)
++    return c13, s13, _pin(c2), _pin(s2)
++
++
++def _build_mxfp4_pool(E: int, num_layers: int) -> None:
++    """Serial fallback: fill ``_MXFP4_POOL`` with pinned MXFP4 codes+scale per layer.
++
++    The fast path is the load-time parallel O_DIRECT build
++    (:func:`_start_bg_reads_mxfp4`); this ``safe_open`` reader only runs if that failed or was
++    never started.
++    """
++    global _MXFP4_POOL_BUILT
++    import time
++
++    if _MXFP4_POOL_BUILT:
++        return
++    _MXFP4_POOL.clear()  # drop any partial buffers from a failed parallel build
++    t0 = time.perf_counter()
++    logger.info(
++        "[KT_STREAM][depool] building MXFP4 pool (serial): %d layers from %s",
++        num_layers,
++        _mxfp4_ckpt_dir(),
++    )
++    for L in _expert_layers(_mxfp4_index(), _mxfp4_naming(), num_layers):
++        _MXFP4_POOL[L] = _load_layer_mxfp4(L, E)
++    _MXFP4_POOL_BUILT = True
++    logger.info(
++        "[KT_STREAM][depool] MXFP4 pool built in %.0fs", time.perf_counter() - t0
++    )
++
++
++# ----- load-time parallel O_DIRECT MXFP4 pool reader (mirrors the W8A8 reader) -----
++# The depool pool is just pinned host MXFP4 codes+scale (no NZ cast -- the bytes ARE the product),
++# so building it is purely a read problem.  Reading all layers in parallel with O_DIRECT, started at
++# model-load time, overlaps the rest of the load.  MXFP4 is 4-bit, so the reads are cheap.
++_BG_MX = {"ex": None, "done_q": None, "t_start": 0.0, "started": False, "layers": ()}
++
++
++def _mxfp4_index():
++    global _MXIDX
++    if _MXIDX is None:
++        _MXIDX = json.load(
++            open(os.path.join(_mxfp4_ckpt_dir(), "model.safetensors.index.json"))
++        )["weight_map"]
++    return _MXIDX
++
++
++def _odirect_region(path, base, lo, hi, scratch):
++    """O_DIRECT-read ``[base+lo, base+hi)`` into the page-aligned ``scratch`` mmap.
++
++    Returns a memoryview of exactly the ``[lo, hi)`` payload.
++    """
++    a_lo = ((base + lo) // _NVME_ALIGN) * _NVME_ALIGN
++    skip = (base + lo) - a_lo
++    need = (base + hi) - a_lo
++    fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
++    try:
++        dv = memoryview(scratch)
++        got = 0
++        while got < need:
++            n = os.preadv(fd, [dv[got:]], a_lo + got)
++            if n <= 0:
++                break
++            got += n
++    finally:
++        os.close(fd)
++    return memoryview(scratch)[skip : skip + (hi - lo)]
++
++
++def _mxfp4_layer_buf(L, E, H, I):
++    """Get (or allocate) layer L's pinned destination tensors.
++
++    The pinned buffer IS the pool product (no NZ round trip), so it is filled in place:
++    c13/s13 = cat(w1,w3) along OUT, c2/s2 = w2.
++    """
++    b = _MXFP4_POOL.get(L)
++    if b is None:
++        pin = _PIN_MXFP4
++        b = (
++            torch.empty(
++                E, 2 * I, H // 2, dtype=torch.uint8, pin_memory=pin
++            ),  # c13 codes
++            torch.empty(
++                E, 2 * I, H // 32, dtype=torch.uint8, pin_memory=pin
++            ),  # s13 e8m0
++            torch.empty(E, H, I // 2, dtype=torch.uint8, pin_memory=pin),  # c2 codes
++            torch.empty(E, H, I // 32, dtype=torch.uint8, pin_memory=pin),  # s2 e8m0
++        )
++        _MXFP4_POOL[L] = b
++    return b
++
++
++def _read_layer_mxfp4_odirect(L, E, H, I, scratch) -> None:
++    """Fill ``_MXFP4_POOL[L]`` via O_DIRECT reads + per-expert rearrange.
++
++    Codes (``.weight``) and scales (``.scale``) sit in two separate contiguous on-disk blocks,
++    so each is one tight region read per shard file.  Byte-equivalent to
++    :func:`_load_layer_mxfp4`.
++    """
++    idx = _mxfp4_index()
++    nm = _mxfp4_naming()
++    c13, s13, c2, s2 = _mxfp4_layer_buf(L, E, H, I)
++    for keyfn, (dst13, dst2, w13, w2_n) in (
++        (nm.weight_key, (c13, c2, H // 2, I // 2)),
++        (nm.scale_key, (s13, s2, H // 32, I // 32)),
++    ):
++        byfile = {}
++        for e in range(E):
++            for proj in nm.projs:
++                byfile.setdefault(idx[keyfn(L, e, proj)], []).append((e, proj))
++        for fn, items in byfile.items():
++            path = os.path.join(_mxfp4_ckpt_dir(), fn)
++            hdr, base = _shard_header(path)
++            offs = {
++                (e, proj): hdr[keyfn(L, e, proj)]["data_offsets"] for e, proj in items
++            }
++            lo = min(o[0] for o in offs.values())
++            hi = max(o[1] for o in offs.values())
++            region = _odirect_region(path, base, lo, hi, scratch)
++            for e, proj in items:
++                o0, o1 = offs[(e, proj)]
++                blk = torch.frombuffer(region[o0 - lo : o1 - lo], dtype=torch.uint8)
++                if proj == nm.gate:
++                    dst13[e, 0:I].copy_(blk.view(I, w13))
++                elif proj == nm.up:
++                    dst13[e, I : 2 * I].copy_(blk.view(I, w13))
++                else:
++                    dst2[e].copy_(blk.view(H, w2_n))
++
++
++def _start_bg_reads_mxfp4(E, H, I, num_layers, nworkers=8) -> None:
++    """Submit the O_DIRECT MXFP4 read workers in the BACKGROUND (host-only, no HBM).
++
++    Each worker fills a layer's pinned pool buffers in place; the build is done once all are
++    drained (there is no NZ pass for depool).
++    """
++    import mmap
++    import queue
++    import threading
++    import time
++    from concurrent.futures import ThreadPoolExecutor
++
++    layers = _expert_layers(_mxfp4_index(), _mxfp4_naming(), num_layers)
++    _BG_MX["layers"] = layers
++    _BG_MX["done_q"] = queue.Queue()
++    _BG_MX["t_start"] = time.perf_counter()
++    _BG_MX["ex"] = ThreadPoolExecutor(max_workers=nworkers)
++    _tls = threading.local()
++
++    def rd(L):
++        try:
++            if not hasattr(_tls, "scratch"):
++                _tls.scratch = mmap.mmap(
++                    -1, 4 * 1024**3
++                )  # >= one layer's weight region
++            _read_layer_mxfp4_odirect(L, E, H, I, _tls.scratch)
++            _BG_MX["done_q"].put(L)
++        except Exception as e:
++            _BG_MX["done_q"].put(("ERR", L, repr(e)[:200]))
++
++    for L in layers:
++        _BG_MX["ex"].submit(rd, L)
++    logger.info(
++        "[KT_STREAM][depool] MXFP4 background reads started (%d expert layers %s..%s of "
++        "%d, %d workers), overlapping load",
++        len(layers),
++        layers[0] if layers else "-",
++        layers[-1] if layers else "-",
++        num_layers,
++        nworkers,
++    )
++
++
++def _finish_bg_build_mxfp4() -> None:
++    """Drain the background MXFP4 reads (no NZ pass).
++
++    Raises if any layer read failed, so the caller can fall back to the serial builder.
++    """
++    global _MXFP4_POOL_BUILT
++    import time
++
++    errs = []
++    layers = _BG_MX["layers"]
++    for _ in range(len(layers)):
++        item = _BG_MX["done_q"].get()
++        if isinstance(item, tuple):
++            errs.append(item)
++    _BG_MX["ex"].shutdown()
++    if errs:
++        raise RuntimeError(
++            f"MXFP4 parallel read failed on {len(errs)} layer(s): {errs[:3]}"
++        )
++    _MXFP4_POOL_BUILT = True
++    logger.info(
++        "[KT_STREAM][depool] MXFP4 pool built in %.0fs (parallel O_DIRECT, %d layers)",
++        time.perf_counter() - _BG_MX["t_start"],
++        len(layers),
++    )
++
++
++def reserve_slot_depool(E: int, H: int, I: int, dev) -> None:
++    """Reserve the depool convert-output slot as PLAIN ND ``torch.empty`` (NOT ``format_cast``).
++
++    The depool convert fills it via ``out_nz[c:ce].copy_(nz_chunk)``: an ND-tagged destination
++    takes a raw byte copy of the NZ bytes (which is what the W8A8 operator then consumes),
++    whereas a slice copy into an NZ-FORMATTED destination triggers a full-tensor de-format
++    round trip -- a fresh multi-GB allocation, i.e. OOM on the serving headroom.  Shapes match
++    ``(E,) + nz.shape[1:]``: w13 [E,H,2I], w2 [E,I,H].  Idempotent.
++    """
++    global _SLOT_RESERVED
++    if _SLOT_RESERVED:
++        return
++    _SLOT["w13"] = torch.empty(E, H, 2 * I, dtype=torch.int8, device=dev)
++    _SLOT["w2"] = torch.empty(E, I, H, dtype=torch.int8, device=dev)
++    _SLOT_RESERVED = True
++    logger.info(
++        "[KT_STREAM][depool] reserved ND streaming slot %s+%s (%.2fGB) at model-load time",
++        tuple(_SLOT["w13"].shape),
++        tuple(_SLOT["w2"].shape),
++        (_SLOT["w13"].numel() + _SLOT["w2"].numel()) / 1e9,
++    )
++
++
++def _wrapper_dims(wrapper: KTEPWrapperMethod):
++    E = int(wrapper.global_num_experts or 0)
++    H = int(wrapper.hidden_size or 0)
++    I = int(wrapper.intermediate_size_per_partition or 0)
++    num_layers = int(wrapper.kt_config.num_layers or 0)
++    return E, H, I, num_layers
++
++
++def _remap_resident_params_to_cache(layer: torch.nn.Module, wrapper) -> None:
++    """Move the resident params/masks off the model's loaded-weight memory region.
++
++    Loaded weights live in a flush/coherence-optimised read-only region; writing it at runtime
++    triggers a device coherence flush that stalls the per-layer host syncs.  Cloning makes them
++    ordinary caching-allocator tensors, where the per-prefill rewrite is free.  Done at
++    model-load time, i.e. BEFORE graph capture, so the graph captures the new storage.
++    """
++    for name in ("w13_weight", "w2_weight", "w13_weight_scale", "w2_weight_scale"):
++        p = getattr(layer, name, None)
++        if p is not None:
++            p.data = p.data.clone()
++    for name in ("gpu_experts_mask", "logical_to_gpu_index"):
++        t = getattr(wrapper, name, None)
++        if t is not None and t.device.type == "npu":
++            setattr(wrapper, name, t.clone())
++
++
++def maybe_reserve_slot(wrapper, dev, layer=None) -> None:
++    """Called from ``process_weights_after_loading`` when streaming is enabled.
++
++    Reserves the streaming slot BEFORE KV-pool sizing so the KV pool accounts for it (the pool
++    itself is built here too when the checkpoint layout allows, else lazily on the first long
++    prefill).  Also registers ``(layer, wrapper)`` for the dynamic decode-resident pool.
++    """
++    global _MXFP4_POOL_BUILT
++
++    if not _KT_PREFILL_STREAM or wrapper.tp_rank != 0:
++        return
++    E, H, I, num_layers = _wrapper_dims(wrapper)
++    if not (E and H and I and num_layers):
++        raise RuntimeError(
++            f"KT streaming missing dimensions (E={E} H={H} I={I} L={num_layers})"
++        )
++    _remember_dims(E, H, I, num_layers)
++    if layer is not None:
++        _REGISTRY[wrapper.kt_config.layer_idx] = (layer, wrapper)
++        if _KT_DYN_RESIDENT:
++            _remap_resident_params_to_cache(layer, wrapper)
++    if _KT_GGUF_DEDUP:
++        # GGUF dedup: there is no codes pool to build (each layer is read from the GGUF on
++        # the fly), so mark it built and skip the lazy serial builder.  The convert-output
++        # slot is still reserved so the KV pool is sized around it.
++        if not _GGUF_TMPL:
++            raise ValueError(
++                "KT_MXFP4_GGUF_DEDUP=1 requires KT_GGUF_TEMPLATE"
++            )
++        _MXFP4_POOL_BUILT = True
++        if E and H and I:
++            reserve_slot_depool(E, H, I, dev)
++        return
++    # Reserve the convert-output slot (same reason as the dedup branch) and build the
++    # small MXFP4 pool with parallel O_DIRECT reads started on the first process_weights
++    # call, drained on the last expert layer present in the checkpoint.
++    if E and H and I:
++        reserve_slot_depool(E, H, I, dev)
++    if E and H and I and num_layers and not _MXFP4_POOL_BUILT:
++        if not _BG_MX["started"]:
++            _BG_MX["started"] = True
++            _start_bg_reads_mxfp4(E, H, I, num_layers)
++        layers = _BG_MX["layers"]
++        if not layers:
++            raise RuntimeError(
++                "KT streaming checkpoint has no served MXFP4 expert layers"
++            )
++        if wrapper.kt_config.layer_idx == layers[-1]:
++            _finish_bg_build_mxfp4()
++
++
++_INIT_ROUTING = None
++_FINALIZE_ROUTING = None
++
++
++def _routing_ops():
++    """Build (and cache) the init/finalize routing helpers used by the streaming MoE."""
++    global _INIT_ROUTING, _FINALIZE_ROUTING
++    if _INIT_ROUTING is None:
++        from sglang.srt.hardware_backend.npu.moe.finalize_routing import (
++            NPUFinalizeRouting,
++        )
++        from sglang.srt.hardware_backend.npu.moe.init_routing import (
++            NPUMoEInitRouting_v2,
++        )
++
++        # quant_mode=1 -> the routing op emits int8 activations plus the per-token scale that
++        # gmm1 dequantises with, matching the W8A8 expert weights this module streams.
++        _INIT_ROUTING = NPUMoEInitRouting_v2(quant_mode=1)
++        # drop_pad_mode=2 -> no capacity dropping, same as AscendTPDispatcher.
++        _FINALIZE_ROUTING = NPUFinalizeRouting(drop_pad_mode=2)
++    return _INIT_ROUTING, _FINALIZE_ROUTING
++
++
++_SWIGLU_LOGGED: set[tuple[float, str]] = set()
++
++
++def _log_stream_swiglu_once(limit: float, source: str) -> None:
++    """Report the streaming clamp once per distinct (limit, source)."""
++    key = (limit, source)
++    if key in _SWIGLU_LOGGED:
++        return
++    _SWIGLU_LOGGED.add(key)
++    logger.info(
++        "[KT_STREAM][swiglu] streaming-prefill clamp %s (from %s)",
++        f"ACTIVE limit={limit:.4g}" if limit > 0 else "OFF",
++        source,
++    )
++
++
++@functools.lru_cache(maxsize=1)
++def _swiglu_limit_from_config() -> float:
++    """Fallback: the checkpoint's own swiglu_limit, ``text_config``-aware.
++
++    GLM-5.3-Flash nests it under ``text_config`` and its value is 10.0.  Reading the top
++    level only, as this used to, returned 0.0 -- and 0.0 does not fail, it just skips the
++    clamp, so the streamed experts silently computed a different function from both the
++    resident NPU experts and the CPU MoE, which do clamp.
++    """
++    try:
++        return float(_read_ckpt_config().get("swiglu_limit") or 0.0)
++    except Exception as e:
++        # 0.0 means "no clamp", which is precisely the silent wrong-function failure this
++        # docstring describes. Never return it without saying so.
++        logger.warning(
++            "[KT_STREAM][swiglu] could not read swiglu_limit from the checkpoint config "
++            "(%s); streaming experts will NOT clamp, and will therefore compute a "
++            "different function from the resident NPU experts and the CPU MoE",
++            repr(e)[:160],
++        )
++        return 0.0
++
++
++def _swiglu_limit(layer_idx=None) -> tuple:
++    """(limit, source) for the streamed experts of ``layer_idx``.
++
++    The layer's own ``moe_runner_config.swiglu_limit`` is the authoritative source: it is
++    the exact expression ``kt_ep_wrapper.create_weights`` hands to the CPU kernel and that
++    the resident NPU experts run with, so taking it from there is the only way the three
++    cannot drift apart, whatever the checkpoint calls its fields.  config.json is the
++    fallback for a layer that was never registered (registration needs
++    ``KT_PREFILL_STREAM=1`` at model-load time).
++    """
++    ent = _REGISTRY.get(layer_idx)
++    if ent is not None:
++        rc = getattr(ent[0], "moe_runner_config", None)
++        if rc is not None and hasattr(rc, "swiglu_limit"):
++            return float(rc.swiglu_limit or 0.0), "moe_runner_config"
++    return _swiglu_limit_from_config(), "config.json"
++
++
++def _apply_swiglu_limit_streaming(x: torch.Tensor, layer_idx=None) -> None:
++    """In-place asymmetric clamp on the gate/up halves. Shares the runner's implementation so
++    the streamed experts and the resident ones cannot drift apart."""
++    from sglang.srt.hardware_backend.npu.moe.activation import apply_swiglu_limit_
++
++    limit, source = _swiglu_limit(layer_idx)
++    _log_stream_swiglu_once(limit, source)
++    apply_swiglu_limit_(x, limit)
++
++
++def _streaming_fused_experts(
++    hidden_states: torch.Tensor,
++    w13: torch.Tensor,
++    w13_scale: torch.Tensor,
++    w2: torch.Tensor,
++    w2_scale: torch.Tensor,
++    topk_weights: torch.Tensor,
++    topk_ids: torch.Tensor,
++    top_k: int,
++    num_experts: int,
++    layer_idx=None,
++) -> torch.Tensor:
++    """Run one W8A8 MoE layer over the streamed expert set, end to end.
++
++    This is the whole ``dispatch -> gmm1 -> swiglu -> gmm2 -> combine`` chain that the regular
++    path spreads over ``AscendTPDispatcher`` + ``AscendRunnerCore`` +
++    ``NPUW8A8Int8MoEMethod``, inlined here because the streamed weights are plain tensors, not
++    layer parameters, and because the expert count is the GLOBAL one rather than the resident
++    subset the layer's runner is configured for.
++
++    Argument layout (identical to what ``process_weights_after_loading`` leaves on the layer):
++      w13  FRACTAL_NZ int8 [E, H, 2I]   w13_scale bf16 [E, 2I]
++      w2   FRACTAL_NZ int8 [E, I, H]    w2_scale  bf16 [E, H]
++
++    group_list_type PAIRING -- read before changing the routing version.  ``group_list`` is
++    produced by init routing and consumed by both grouped matmuls, and the two ends must agree
++    on its encoding:
++      * v2 routing (``npu_moe_init_routing_v2``, ``expert_tokens_num_type=1``) yields per-expert
++        COUNTS   -> ``group_list_type=1``   <- what this function uses
++      * v1 routing (``npu_moe_compute_expert_tokens``) yields the CUMULATIVE prefix sums
++        -> ``group_list_type=0``
++    Pairing v2 counts with ``group_list_type=0`` (or vice versa) is accepted by the operator and
++    silently produces wrong numbers -- there is no shape or dtype error to catch it.
++    """
++    init_routing, finalize_routing = _routing_ops()
++    topk_weights = topk_weights.to(hidden_states.dtype)
++    topk_ids = topk_ids.to(torch.int32)
++
++    # 1. dispatch: permute tokens into expert order and quantise them to int8.
++    permuted, expanded_row_idx, expert_tokens, pertoken_scale = (
++        init_routing._init_routing(hidden_states, topk_ids, num_experts, top_k)
++    )
++    # Derived from the PERMUTED tensor, not from hidden_states, so that this matches
++    # AscendRunnerCore.run byte for byte: routing has already quantised to int8 there too, so
++    # the expression always selects bfloat16.
++    output_dtype = torch.float16 if permuted.dtype == torch.float16 else torch.bfloat16
++
++    # 2. gmm1 (gate & up).  The weights are already stored transposed + NZ, so they are passed
++    #    through as-is, exactly like GroupedMatmul(transposed=True).
++    permuted = torch.ops.npu.npu_grouped_matmul(
++        x=[permuted],
++        weight=[w13],
++        scale=[w13_scale],
++        per_token_scale=[pertoken_scale],
++        split_item=2,
++        group_list_type=_GROUP_LIST_TYPE,
++        group_type=0,
++        group_list=expert_tokens,
++        output_dtype=output_dtype,
++    )[0]
++
++    # 3. activation: swiglu plus the re-quantisation gmm2 needs (NPUSwigluQuant).
++    #    The model's own SwiGLU clamp has to be applied here too, or the streamed experts
++    #    would differ numerically from both the CPU MoE and DeepSeek's reference.
++    _apply_swiglu_limit_streaming(permuted, layer_idx)
++    permuted, swiglu_scale = torch.ops.npu.npu_dequant_swiglu_quant(
++        permuted, quant_mode=1, activate_left=True
++    )
++
++    # 4. gmm2 (down).
++    permuted = torch.ops.npu.npu_grouped_matmul(
++        x=[permuted],
++        weight=[w2],
++        scale=[w2_scale],
++        per_token_scale=[swiglu_scale],
++        split_item=2,
++        group_list_type=_GROUP_LIST_TYPE,
++        group_type=0,
++        group_list=expert_tokens,
++        output_dtype=output_dtype,
++    )[0]
++
++    # 5. combine: weighted un-permute back to token order.
++    return finalize_routing._finalize_routing(
++        permuted,
++        topk_weights=topk_weights,
++        expanded_row_idx=expanded_row_idx,
++        topk_ids=topk_ids,
++    )
++
++
++def _convert_blk_chunked(host13, host2, H, I, dev, slot13, slot2):
++    """H2D and convert the layer's GGUF blocks one expert chunk at a time.
++
++    Peak goes from ~3.6 GiB of raw blocks staged whole to ~3.6 * chunk/E, on the same prefill
++    that must also find ~514 MiB of convert transient.  A dim-0 slice of the pinned ping-pong
++    buffer is still contiguous and still pinned, so the DMA path is unchanged.
++
++    Chunk size is KT_MXFP4_NZ_CHUNK, the same variable convert_proj_blk chunks its own loop by,
++    so the kernel sees exactly the launch shape it saw before.
++    """
++    convert = _mxfp4_convert_blk_fn()
++    if slot13 is None or slot2 is None:
++        # No reserved slot (reserve skipped or failed): the convert has to allocate its own
++        # full-size output anyway, so chunking the H2D saves nothing worth a second code path.
++        return convert(
++            host13.to(dev, non_blocking=True), host2.to(dev, non_blocking=True), H, I
++        )
++    E = host13.shape[0]
++    s13b = torch.empty((E, host13.shape[1]), dtype=torch.bfloat16, device=dev)
++    s2b = torch.empty((E, host2.shape[1]), dtype=torch.bfloat16, device=dev)
++    for c in range(0, E, _H2D_CHUNK):
++        ce = min(c + _H2D_CHUNK, E)
++        b13 = host13[c:ce].to(dev, non_blocking=True)
++        b2 = host2[c:ce].to(dev, non_blocking=True)
++        # The slot is PLAIN ND (reserve_slot_depool), not NZ -- deliberately, see its
++        # docstring: an NZ-formatted destination turns each slice copy into a full-tensor
++        # de-format. A dim-0 slice of a contiguous ND tensor is a valid destination for the
++        # kernel's raw NZ bytes, so the chunk converts straight into its final place.
++        _, s13c, _, s2c = convert(
++            b13, b2, H, I, out_w13=slot13[c:ce], out_w2=slot2[c:ce]
++        )
++        s13b[c:ce] = s13c
++        s2b[c:ce] = s2c
++        del b13, b2, s13c, s2c
++    return slot13, s13b, slot2, s2b
++
++
++def _stream_layer_weights(layer_idx: int, dev):
++    """Materialise this layer's full expert weights in the reused HBM slot.
++
++    Returns ``(w13, w13_scale, w2, w2_scale)``.
++    """
++    E, H, I, num_layers = _get_cfg()
++    # Reserved streaming slot (maybe_reserve_slot): the convert writes the full expert set
++    # straight into it, reused across layers, so no per-layer multi-GB output allocation
++    # competes with the KV pool.  None (reserve skipped or failed) -> convert allocates fresh.
++    slot13, slot2 = _SLOT.get("w13"), _SLOT.get("w2")
++    if not _KT_GGUF_DEDUP:
++        # H2D this layer's MXFP4 (4-bit, about half the W8A8 bytes), then convert to W8A8-NZ.
++        c13, s13, c2, s2 = _MXFP4_POOL[layer_idx]
++        w13, s13b, w2, s2b = _mxfp4_convert_fn()(
++            c13.to(dev, non_blocking=True),
++            s13.to(dev, non_blocking=True),
++            c2.to(dev, non_blocking=True),
++            s2.to(dev, non_blocking=True),
++            H,
++            I,
++            out_w13=slot13,
++            out_w2=slot2,
++        )
++        return w13, s13b, w2, s2b
++
++    # GGUF dedup: read this layer's MXFP4 straight from the CPU MoE's GGUF (block_mxfp4).  The
++    # prefetch worker copies the next layer's raw blocks into a pinned ping-pong buffer while
++    # this layer converts.  The raw blocks go to the device and the AscendC kernel
++    # de-interleaves (scale|codes) in UB via Gather; the software
++    # 16-of-17 strided de-interleave it replaces was the prefill bottleneck.
++    if _KT_PREFETCH:
++        par = _prefetch_ensure(layer_idx)
++    else:
++        _fill_stage(layer_idx)
++        par = layer_idx % 2
++    if _KT_BLK_KERNEL:
++        return _convert_blk_chunked(
++            _MX_PP["w13"][par], _MX_PP["w2"][par], H, I, dev, slot13, slot2
++        )
++    blk13 = _MX_PP["w13"][par].to(dev, non_blocking=True)
++    blk2 = _MX_PP["w2"][par].to(dev, non_blocking=True)
++
++    def _di(d):
++        E_, OUT_, n17 = d.shape
++        nbq = n17 // 17
++        b = d.view(E_, OUT_, nbq, 17)
++        return (
++            b[..., 1:17].reshape(E_, OUT_, nbq * 16).contiguous(),
++            b[..., 0].contiguous(),
++        )
++
++    c13d, s13d = _di(blk13)
++    c2d, s2d = _di(blk2)
++    return _mxfp4_convert_fn()(
++        c13d, s13d, c2d, s2d, H, I, packing="halfblock", out_w13=slot13, out_w2=slot2
++    )
++
++
++def _streaming_forward(layer_idx, x, topk_output, top_k, num_experts) -> torch.Tensor:
++    w13, s13b, w2, s2b = _stream_layer_weights(layer_idx, x.device)
++    out = _streaming_fused_experts(
++        hidden_states=x,
++        w13=w13,
++        w13_scale=s13b,
++        w2=w2,
++        w2_scale=s2b,
++        topk_weights=topk_output.topk_weights,
++        topk_ids=topk_output.topk_ids,
++        top_k=top_k,
++        num_experts=num_experts,
++        layer_idx=layer_idx,
++    )
++
++    # Dynamic resident: the W8A8 path gathers from the resident W8A8 pool at the end of the
++    # prefill; the depool path gathers the hot-K experts out of the weights it just converted.
++    if _KT_DYN_RESIDENT:
++        try:
++            _apply_resident_layer_depool(layer_idx, topk_output, w13, s13b, w2, s2b)
++        except Exception as e:
++            # NOT "static set kept": earlier layers in this pass may already have had their
++            # resident weights rewritten.  Commit their masks before falling back, or they
++            # silently compute the wrong experts.  See the commit-protocol note above.
++            logger.warning(
++                "[KT_STREAM] inline resident L%d failed (%s); this layer keeps the "
++                "static set, already-written layers get committed",
++                layer_idx,
++                repr(e)[:140],
++            )
++            _abort_resident_commit(f"inline resident L{layer_idx}: {repr(e)[:80]}")
++            if _KT_STREAM_STRICT:
++                raise
++    return out
++
++
++def _hist_ids(topk_ids):
++    """Flattened routed expert ids used to build the resident-set histogram.
++
++    When ``KT_HOT_TAIL_TOKENS > 0``, restrict to the last N prompt tokens (recency); else use
++    the whole prefill.  ``topk_ids`` is [M_tokens, top_k], so slicing rows keeps the last N
++    tokens' routing.
++    """
++    if _HOT_TAIL > 0 and topk_ids.dim() == 2 and topk_ids.shape[0] > _HOT_TAIL:
++        topk_ids = topk_ids[-_HOT_TAIL:]
++    return topk_ids.reshape(-1)
++
++
++def _pick_resident_top(counts, K):
++    """Pick the K resident experts for a layer: top-K by activation, ascending int64.
++
++    Shared by the inline (depool) and post-pass (W8A8) paths so both agree on the selection.
++    """
++    return counts.topk(K).indices.sort().values
++
++
++def _set_resident_masks(wrap, top_cpu, K, E):
++    """Rewrite the routing structures so the resident set is exactly ``top_cpu``.
++
++    In place, therefore safe for both decode graph replay and the C++ side.
++    """
++    new_mask = torch.zeros(E, dtype=torch.bool)
++    new_mask[top_cpu] = True
++    l2g = torch.full((E,), -1, dtype=torch.int64)
++    l2g[top_cpu] = torch.arange(K, dtype=torch.int64)
++    wrap.gpu_experts_mask.copy_(new_mask.to(wrap.gpu_experts_mask.device))
++    wrap.logical_to_gpu_index.copy_(
++        l2g.to(
++            device=wrap.logical_to_gpu_index.device,
++            dtype=wrap.logical_to_gpu_index.dtype,
++        )
++    )
++    if wrap.wrapper is not None:  # pinned CPU mask, the C++ side reads it live
++        wrap.wrapper.gpu_experts_mask.copy_(new_mask)
++
++
++# ---------------------------------------------------------------------------
++#  Resident-set commit protocol (silent-correctness hazard, see below)
++# ---------------------------------------------------------------------------
++# A layer's resident WEIGHTS are rewritten the moment it is streamed; its MASKS
++# (gpu_experts_mask / logical_to_gpu_index / kt-kernel's pinned C++ mask) are the COMMIT of that
++# write.  If the two are allowed to drift -- masks deferred to the last MoE layer, say, to save a
++# per-layer host sync -- then a pass that ABORTS at layer L (a convert OOM, exactly what an
++# over-budget resident count produces) leaves every layer < L holding expert ``top[i]``'s weights
++# in slot ``i`` under a mask still claiming slot ``i`` is expert ``i``.  Wrong expert computed,
++# expert ``i`` computed nowhere, and NOTHING raises.
++#
++# So every exit from the streaming pass -- normal end, per-layer failure, or the blanket fallback
++# in maybe_streaming_forward -- goes through :func:`_flush_resident_masks`.  Flushing on abort is
++# not a repair hack: the resident set is per layer, so committing the written layers and leaving
++# the rest on the static prefix set is a consistent state.  Restoring prefix weights instead would
++# need a second MXFP4 convert on the path that just ran out of memory.
++_RES_PEND = {}  # L -> (wrap, top_device, counts_device): WRITTEN weights, UNCOMMITTED masks
++_RES_WRITTEN = {}  # L -> top (device tensor): resident set the layer's WEIGHTS currently hold
++_RES_COMMITTED = {}  # L -> tuple(top): resident set the layer's MASKS currently claim
++_RES_TORN = set()  # layers whose weight write itself failed part way: unrepairable
++
++
++def _resident_inconsistent_layers():
++    """Layers whose resident weights and masks disagree -- i.e. layers computing wrong experts.
++
++    Empty is the only correct state outside a streaming pass.  ``_RES_WRITTEN`` is only ever
++    populated by the depool inline path; layers never touched by it are absent from both dicts
++    and are consistent by construction (static prefix weights + static prefix masks).
++    """
++    # ``_RES_WRITTEN`` holds device tensors so the write path pays no host sync; the D2H
++    # happens here, and here runs once per pass (flush) or on an abort, never per layer.
++    bad = [
++        L
++        for L, top in _RES_WRITTEN.items()
++        if _RES_COMMITTED.get(L) != tuple(top.tolist())
++    ]
++    return sorted(set(bad) | _RES_TORN)
++
++
++def _assert_resident_consistent(where=""):
++    """Assert the invariant the whole commit protocol exists to keep.
++
++    Raises rather than logging: a violation means the model is silently computing the wrong
++    experts, which is strictly worse than a crash.
++    """
++    bad = _resident_inconsistent_layers()
++    if bad:
++        raise AssertionError(
++            f"[KT_STREAM] resident weights/masks inconsistent at {where}: layers {bad[:16]}"
++            f"{'...' if len(bad) > 16 else ''} hold hot-expert weights under a stale mask"
++            f"{f'; torn writes at {sorted(_RES_TORN)}' if _RES_TORN else ''}"
++        )
++
++
++def _flush_resident_masks(reason: str = "end of pass"):
++    """Commit every pending layer's mask, making its weights and routing agree again.
++
++    Called at the last MoE layer (the normal path) and from every abort path.  Returns the
++    number of layers committed.  ``_RES_TORN`` is unrepairable by definition -- a partially
++    written layer has no resident set that describes it -- so it raises.
++    """
++    if _RES_TORN:
++        raise RuntimeError(
++            f"[KT_STREAM] resident weight write TORN at layers {sorted(_RES_TORN)} "
++            f"({reason}); the slots hold a mix of two expert sets and no mask describes them. "
++            "Refusing to continue with silently wrong experts."
++        )
++    if not _RES_PEND:
++        return 0
++    E = _get_cfg()[0]
++    share_sum = 0.0
++    n = 0
++    for _LL, (wr, tp, cnt) in sorted(_RES_PEND.items()):
++        top_cpu = tp.cpu()
++        _set_resident_masks(wr, top_cpu, int(wr.num_gpu_experts), E)
++        _RES_COMMITTED[_LL] = tuple(top_cpu.tolist())
++        share_sum += float(cnt[tp].sum().item()) / max(float(cnt.sum().item()), 1.0)
++        n += 1
++    _RES_PEND.clear()
++    logger.info(
++        "[KT_STREAM] inline resident: top-K x %d layers committed (%s), share=%.3f",
++        n,
++        reason,
++        share_sum / max(n, 1),
++    )
++    _assert_resident_consistent("flush")
++    return n
++
++
++def _abort_resident_commit(reason: str):
++    """Abort path: commit whatever was already written so nothing is left inconsistent.
++
++    Deliberately not silent -- a partial streaming pass means the layers past the abort point
++    keep the static prefix set while the ones before it got this prompt's hot set, which is
++    correct but not what was asked for.
++    """
++    try:
++        n = _flush_resident_masks(f"partial pass aborted: {reason}")
++    except RuntimeError:
++        raise
++    except Exception as e:  # committing must not itself hide the original failure
++        logger.error(
++            "[KT_STREAM] resident mask commit FAILED after %s (%s); layers %s may compute "
++            "the wrong experts",
++            reason,
++            repr(e)[:160],
++            _resident_inconsistent_layers()[:16],
++        )
++        raise
++    if n:
++        logger.warning(
++            "[KT_STREAM] streaming aborted after %d layer(s) had their resident weights "
++            "rewritten; their masks were committed so routing stays correct (%s)",
++            n,
++            reason,
++        )
++    return n
++
++
++def _apply_resident_layer_depool(L, topk_output, w13, s13b, w2, s2b):
++    """Depool: populate the decode resident slots from this layer's converted expert set.
++
++    ``index_select`` gathers the hot-K experts of the already-converted weights straight into
++    the resident params (zero-alloc, and a first-dim gather is format-safe on NZ).  The mask
++    updates are deferred to the last layer so no per-layer host sync is needed.  This folds the
++    decode hot-expert update into the streaming prefill at roughly zero cost.
++
++    Prerequisite (see :func:`_remap_resident_params_to_cache`): the resident params must have
++    been remapped to caching-allocator memory at model load, otherwise writing them stalls the
++    per-layer host syncs.
++    """
++    layer, wrap = _REGISTRY[L]
++    K = int(wrap.num_gpu_experts)
++    if K <= 0 or wrap.gpu_experts_mask is None or wrap.logical_to_gpu_index is None:
++        return
++    E, H, I, num_layers = _get_cfg()
++    moe_layers = _moe_layers()
++    if L == moe_layers[0]:
++        # A new pass must not start on top of an uncommitted one: that would mean a previous
++        # pass ended without going through any of the flush paths below, i.e. the very bug this
++        # protocol exists to prevent.  Commit it (correct, just not this prompt's hot set)
++        # rather than silently piling a second set of weight writes on a stale mask.
++        if _RES_PEND:
++            _abort_resident_commit("previous pass left uncommitted layers")
++        _assert_resident_consistent("start of streaming pass")
++    counts = torch.bincount(
++        _hist_ids(topk_output.topk_ids).to(torch.int64), minlength=E
++    )[:E]
++    top = _pick_resident_top(counts, K)
++    # DANGER: index_select(..., out=<param>.data) is a SILENT NO-OP into a destination carrying
++    # an ACL private format (FRACTAL_NZ) -- torch_npu rebinds .data's temporary to a fresh ND
++    # tensor and discards it, touching none of the Parameter's storage.  And it fails PARTIALLY:
++    # the neighbouring scale is ND, so scale, mask and l2g ARE written, leaving slot i with
++    # expert i's weights against expert top[i]'s scale while the CPU skips top[i] as resident.
++    # Use Tensor.copy_, which is format-aware and writes the Parameter's own storage -- the
++    # storage the captured decode graph refers to.
++    #
++    # Order matters for the commit protocol: every allocating op (the four index_selects, which
++    # are what an over-budget resident count makes fail) happens BEFORE the first byte of the
++    # resident params is overwritten, so an OOM here leaves this layer untouched and consistent.
++    g13, g2 = torch.index_select(w13, 0, top), torch.index_select(w2, 0, top)
++    gs13, gs2 = torch.index_select(s13b, 0, top), torch.index_select(s2b, 0, top)
++    # --- commit point: from here the layer's weights no longer match its mask ---
++    _RES_PEND[L] = (wrap, top, counts)
++    _RES_WRITTEN[L] = (
++        top  # device tensor; materialised only by the (per-pass) consistency check
++    )
++    _RES_TORN.add(
++        L
++    )  # cleared once all four writes land; a raise in between is unrepairable
++    layer.w13_weight.data.copy_(g13)
++    layer.w2_weight.data.copy_(g2)
++    layer.w13_weight_scale.data.copy_(gs13)
++    layer.w2_weight_scale.data.copy_(gs2)
++    _RES_TORN.discard(L)
++    if L == moe_layers[-1]:
++        _flush_resident_masks("end of pass")
++
++
++# Run the first N real prefills through the HYBRID path (not streamed) to prime the CPU MoE.
++# Streamed prefills never invoke kt_kernel, so a stream-everything server (low threshold) keeps the
++# CPU MoE cold and decode stays slow until enough hybrid traffic warms it.  The OS page cache is not
++# the issue (the GGUF is already cached); the warming is process-local (kt_kernel threadpool and
++# buffers, first-touch PTEs).  A few hybrid prefills fix it.
++_KT_STREAM_WARMUP = int(os.environ.get("KT_STREAM_WARMUP", "0") or "0")
++_STREAM_WARMUP_STATE: dict = {}
++
++
++def _warmup_consumes(layer_idx: int, num_tokens: int) -> bool:
++    """Return True while the startup warmup budget forces this prefill down the hybrid path.
++
++    MUST be checked BEFORE the token threshold: at a high threshold every sub-threshold prefill
++    (including sglang's own startup warmup) would return at the gate without counting, so the
++    budget would instead land on the first long user prefill and wrongly force it hybrid.
++    """
++    if _KT_STREAM_WARMUP <= 0 or num_tokens <= 1:
++        return False
++    st = _STREAM_WARMUP_STATE
++    # Counted once per prefill on the FIRST MoE layer, not layer 0: layer 0 is dense on
++    # GLM-5.3-Flash and never reaches this function, so a layer-0 test never advances the
++    # counter and the streaming path stays disabled for the whole run.
++    first = _first_moe_layer()
++    if layer_idx == first:
++        st["seen"] = st.get("seen", 0) + 1
++    if st.get("seen", 0) > _KT_STREAM_WARMUP:
++        return False
++    if layer_idx == first:
++        logger.info(
++            "[KT_STREAM] warmup prefill %d/%d -> hybrid (prime the CPU MoE)",
++            st["seen"],
++            _KT_STREAM_WARMUP,
++        )
++    return True
++
++
++def maybe_streaming_forward(
++    quant_method,
++    hidden_states: torch.Tensor,
++    topk_output,
++    tp_reduce_needed: bool = False,
++) -> Optional[torch.Tensor]:
++    """Entry from ``FusedMoE.forward_impl``, before the dispatcher runs.
++
++    Returns the layer's final hidden states when streaming handled this layer, else ``None``
++    (the caller then falls through to the normal dispatch/compute/combine path). Device OOM
++    falls back unless strict mode is enabled; all other failures are raised.
++
++    Returning the finished tensor rather than a ``CombineInput`` is deliberate: the streaming
++    path replaces dispatch, expert compute AND combine in one go, so there is nothing left for
++    the caller's combine step to do.  ``tp_reduce_needed`` therefore disables streaming, since
++    the skipped tail also contains the TP all-reduce.
++    """
++    if not _KT_PREFILL_STREAM or tp_reduce_needed:
++        return None
++    if not isinstance(quant_method, KTEPWrapperMethod) or quant_method.tp_rank != 0:
++        return None
++    if not _is_prefill():
++        return None
++    if _warmup_consumes(quant_method.kt_config.layer_idx, hidden_states.shape[0]):
++        return None
++    if hidden_states.shape[0] < _T:
++        return None
++    try:
++        layer_idx = quant_method.kt_config.layer_idx
++        E, H, I, num_layers = _wrapper_dims(quant_method)
++        if not (E and H and I and num_layers):
++            raise RuntimeError(
++                f"KT streaming missing dimensions (E={E} H={H} I={I} L={num_layers})"
++            )
++        _remember_dims(E, H, I, num_layers)
++        if not _KT_GGUF_DEDUP and not _MXFP4_POOL_BUILT:
++            # Normally built at model-load time (maybe_reserve_slot, parallel O_DIRECT);
++            # this serial builder only runs if that path failed or never started.
++            _build_mxfp4_pool(E, num_layers)
++        top_k = topk_output.topk_ids.shape[1]
++        return _streaming_forward(layer_idx, hidden_states, topk_output, top_k, E)
++    except torch.OutOfMemoryError as e:
++        logger.warning(
++            "[KT_STREAM] streaming OOM (%s) -> hybrid fallback", repr(e)[:160]
++        )
++        # The failure may have landed AFTER earlier layers rewrote their resident weights (a
++        # convert OOM at layer L is the expected shape of this).  Those layers hold hot-expert
++        # weights under a stale prefix mask until their masks are committed, so committing is
++        # not optional here -- it is the difference between a slower answer and a wrong one.
++        _abort_resident_commit(f"streaming forward: {repr(e)[:80]}")
++        if _KT_STREAM_STRICT:
++            raise
++        return None
++    except Exception as e:
++        _abort_resident_commit(f"streaming forward: {repr(e)[:80]}")
++        raise

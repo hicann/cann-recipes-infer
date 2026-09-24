@@ -1,0 +1,293 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pan-boyi <panboyi@huawei.com>
+Date: Wed, 9 Sep 2026 11:02:26 +0800
+Subject: [PATCH 04/10] =?UTF-8?q?npu:=20=E5=A2=9E=E5=8A=A0=E6=98=87?=
+ =?UTF-8?q?=E8=85=BE=20SwiGLU=20=E6=88=AA=E6=96=AD=E5=AE=9E=E7=8E=B0?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+把 gate/up 两半的非对称上下界折成广播边界向量，对整个缓冲区做一次 clamp，而不是分别 clamp 两个跨步视图再拼接；输出逐位相同，边界按宽度、上限、dtype 和 device 缓存。
+
+模型定义的截断在 NPU 常驻专家、流式 prefill、CPU offload 和共享专家四条路径上始终一致，不再提供会偏离模型语义的环境开关。
+---
+ python/sglang/kernels/ops/layernorm/mhc.py    |  46 +++++-
+ .../hardware_backend/npu/moe/activation.py    | 131 +++++++++++++++++-
+ 2 files changed, 172 insertions(+), 5 deletions(-)
+
+diff --git a/python/sglang/kernels/ops/layernorm/mhc.py b/python/sglang/kernels/ops/layernorm/mhc.py
+index 4784ebf0db..e753d488d9 100644
+--- a/python/sglang/kernels/ops/layernorm/mhc.py
++++ b/python/sglang/kernels/ops/layernorm/mhc.py
+@@ -18,10 +18,13 @@ from sglang.srt.environ import envs
+ from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_round_robin_split
+ from sglang.srt.layers.dp_attention import is_allocation_symmetric
+ from sglang.srt.layers.utils.common import strict_contiguous
++from sglang.srt.utils import is_npu
+ from sglang.srt.utils.common import is_gfx1250_supported
+ 
+ logger = logging.getLogger(__name__)
+ 
++_is_npu = is_npu()
++
+ # This module is imported during model-registry discovery. Do not import the real
+ # TileLang package here: it loads native CUDA stubs. The proxy below lets
+ # module-level @tilelang.jit declarations parse, then imports and applies real
+@@ -1835,6 +1838,32 @@ def _mhc_pre_dispatch(
+     norm_eps: float | None = None,
+ ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool]:
+     assert residual.dim() == 3, f"residual must be (s, n, h); got {residual.shape}"
++    if (
++        _is_npu
++        # The kernel folds the factor 2 into post and takes a single hc_eps, so
++        # it only stands in for the reference at those settings.
++        and hc_post_mult_value == 2.0
++        and hc_pre_eps == hc_sinkhorn_eps
++        and residual.shape[0] > 0
++    ):
++        # npu_hc_pre wants x as (b, s, n, h) and its mixing weights in fp32; it
++        # does not fold the output norm, so norm_fused stays False.
++        layer_input, post_mix, comb_mix = torch.ops.custom.npu_hc_pre(
++            residual.unsqueeze(0),
++            fn.float(),
++            hc_scale.float(),
++            hc_base.float(),
++            hc_mult=residual.shape[1],
++            hc_sinkhorn_iters=sinkhorn_repeat,
++            norm_eps=rms_eps,
++            hc_eps=hc_pre_eps,
++        )
++        return (
++            post_mix.squeeze(0),
++            comb_mix.squeeze(0),
++            layer_input.squeeze(0).to(residual.dtype),
++            False,
++        )
+     if not envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
+         post_mix, comb_mix, layer_input = _mhc_pre_torch(
+             residual=residual,
+@@ -1874,6 +1903,12 @@ def _mhc_post_dispatch(
+ ) -> torch.Tensor:
+     assert x.dim() == 2 and residual.dim() == 3
+     assert post_layer_mix.dim() == 3 and comb_res_mix.dim() == 3
++    if _is_npu and x.shape[0] > 0:
++        # npu_hc_post takes post as (s, n); the (s, n, 1) the callers carry is
++        # rejected outright.
++        return torch.ops.custom.npu_hc_post(
++            x, residual, post_layer_mix.squeeze(-1), comb_res_mix
++        )
+     if not envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get():
+         return _mhc_post_torch(x, residual, post_layer_mix, comb_res_mix)
+     return mhc_post(x, residual, post_layer_mix, comb_res_mix)
+@@ -1980,10 +2015,13 @@ def npu_hc_pre(
+         return y, post, comb, False
+ 
+     # Note the return order: (y, post, comb) — y is the (T, hidden)
+-    # mixed activation, post / comb are the hc_post inputs. The
+-    # fused kernel emits y in fp32 (sinkhorn iterates in fp32), so
+-    # cast back to the input dtype before the downstream
+-    # aclnnRmsNorm (which has no x=fp32 / gamma=bf16 overload).
++    # mixed activation, post / comb are the hc_post inputs. Measured
++    # dtypes out of the kernel: y follows x (bf16, *not* fp32 as this
++    # comment used to claim), post and comb are fp32 because sinkhorn
++    # iterates in fp32. The .to(dtype) below is therefore a no-op today
++    # and is kept only so the contract with the downstream aclnnRmsNorm
++    # (which has no x=fp32 / gamma=bf16 overload) survives a kernel that
++    # later starts widening y.
+     y, post, comb = torch.ops.custom.npu_hc_pre(
+         x,
+         hc_fn,
+diff --git a/python/sglang/srt/hardware_backend/npu/moe/activation.py b/python/sglang/srt/hardware_backend/npu/moe/activation.py
+index 3ec8819de5..4f1a4ceb1c 100644
+--- a/python/sglang/srt/hardware_backend/npu/moe/activation.py
++++ b/python/sglang/srt/hardware_backend/npu/moe/activation.py
+@@ -1,3 +1,5 @@
++import functools
++import logging
+ from abc import ABC, abstractmethod
+ from typing import Any, Optional, Tuple
+ 
+@@ -10,6 +12,8 @@ from sglang.srt.distributed.communication_op import (
+ from sglang.srt.layers.activation import GeluAndMul
+ from sglang.srt.runtime_context import get_parallel
+ 
++logger = logging.getLogger(__name__)
++
+ 
+ # =============================================================================
+ # Abstract base for all activation variants
+@@ -21,16 +25,111 @@ class BaseActivation(ABC):
+     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]: ...
+ 
+ 
++# =============================================================================
++# SwiGLU clamp (DeepSeek "swiglu_limit")
++# =============================================================================
++@functools.lru_cache(maxsize=2)
++def _log_swiglu_limit_once(limit: float) -> None:
++    """Positive evidence in the log. A limit that never reaches the runner config silently
++    disables the clamp, which is invisible from the outside -- print it once either way."""
++    if limit > 0:
++        logger.info("[SWIGLU] NPU expert clamp ACTIVE, limit=%.4g", limit)
++    else:
++        logger.info("[SWIGLU] NPU expert clamp OFF (swiglu_limit unset or 0)")
++
++
++@functools.lru_cache(maxsize=8)
++def _swiglu_clamp_bounds(n_gate_up: int, limit: float, dtype: torch.dtype, device: str):
++    """Per-column (min, max) vectors implementing the asymmetric clamp in one pass.
++
++    Clamping the two halves separately means two *strided* passes over the tensor -- the
++    halves of a [rows, 2I] buffer are non-contiguous views -- and measured only 186 GB/s.
++    Folding the asymmetry into broadcast bound vectors turns it into a single contiguous
++    elementwise op: 589 GB/s, 3.2x faster, bit-identical output.
++    """
++    half = n_gate_up // 2
++    lo = torch.cat(
++        [
++            torch.full((half,), float("-inf")),  # gate: no lower bound
++            torch.full((half,), -limit),         # up: two-sided
++        ]
++    ).to(dtype=dtype, device=device)
++    hi = torch.full((n_gate_up,), limit, dtype=dtype, device=device)
++    return lo, hi
++
++
++def apply_swiglu_limit_(hidden_states: torch.Tensor, limit: Optional[float]) -> None:
++    """Clamp the gate/up halves in place, matching DeepSeek's reference Expert.forward.
++
++    The upstream definition (inference/model.py) is asymmetric and applies to routed *and*
++    shared experts alike::
++
++        up   = clamp(up, min=-limit, max=limit)   # two-sided
++        gate = clamp(gate, max=limit)             # upper bound only -- SiLU already
++                                                  # saturates on the negative side
++        x = silu(gate) * up
++
++    Doing it here, before the fused swiglu op, keeps the fusion intact: the kernel then
++    computes silu(clamped_gate) * clamped_up, which is exactly the reference.
++
++    ⚠ There is no fused alternative on this build, and the operator that looks like one
++    is a trap. ``custom::npu_dequant_swiglu_clamp_quant`` **does not clamp at all**:
++    measured 2026-08-30 on A3 at [8, 4096] and [128, 4096] bf16 with an input scaled 48x
++    so the limit actually bites, its int8 output is *bit-identical to not clamping*
++    (0 of 16384 elements differ) and ``swiglu_mode`` 0, 1, 2 and 3 all produce the same
++    result. ``clamp_limit`` and ``swiglu_mode`` are silently ignored.
++
++    This docstring previously said the opposite -- that mode 1 reproduces the reference
++    exactly, so the int8 path could drop the pre-clamp and call it directly. Following
++    that would have silently removed the swiglu clamp from every routed expert, which is
++    part of the model definition. The earlier reading appears to have measured that mode 0
++    ignores ``clamp_limit`` and inferred that mode 1 therefore honours it.
++
++    The reason it passes a casual check: with real activations the clamp never fires
++    (max|gate_up| is about 2.17 against a limit of 10), so the fused op and the reference
++    agree bit for bit until you scale the input up. Any future check of this operator has
++    to force the clamp to trigger, the way ``check_dense_ffn.py --scale-input 48`` does.
++
++    ``custom::npu_swiglu_clip_quant`` is not an input clamp at all: it computes plain
++    silu*up and then clips the *output* to +/- ``group_alpha`` x rowmax(|y|), i.e. a
++    per-token quantization outlier clip. ``npu_swiglu`` takes only a dim.
++
++    ``activate_left=True`` is the convention at every call site, i.e. the left half is the
++    silu input (gate) and the right half is up.
++
++    Note: the reference clamps in fp32 while the gmm1 output reaching us is already bf16, so
++    the clamp happens one rounding later. With a limit that is exactly representable (10.0)
++    the two agree; this is the earliest point in the NPU pipeline where the value exists.
++    """
++    if not limit or limit <= 0:
++        _log_swiglu_limit_once(0.0)
++        return
++    _log_swiglu_limit_once(float(limit))
++    lo, hi = _swiglu_clamp_bounds(
++        hidden_states.shape[-1], float(limit), hidden_states.dtype,
++        str(hidden_states.device),
++    )
++    torch.clamp_(hidden_states, min=lo, max=hi)
++
++
+ # =============================================================================
+ # Concrete activation implementations
+ # =============================================================================
+ class NPUSwiglu(BaseActivation):
++    def __init__(self, swiglu_limit: Optional[float] = None):
++        self._swiglu_limit = swiglu_limit
++
+     def _apply_activation(self, hidden_states: torch.Tensor):
++        apply_swiglu_limit_(hidden_states, self._swiglu_limit)
+         return torch.ops.npu.npu_swiglu(hidden_states), None
+ 
+ 
+ class NPUSwigluQuant(BaseActivation):
++    def __init__(self, swiglu_limit: Optional[float] = None):
++        self._swiglu_limit = swiglu_limit
++
+     def _apply_activation(self, hidden_states: torch.Tensor):
++        apply_swiglu_limit_(hidden_states, self._swiglu_limit)
+         hidden_states, swiglu_out_scale = torch.ops.npu.npu_dequant_swiglu_quant(
+             hidden_states,
+             quant_mode=1,
+@@ -68,17 +167,37 @@ class NPUSwigluDeepEPKernel(BaseActivation):
+     """DeepEP grouped SwiGLU for the Ascend MoE runner; picks ``swiglu_quant`` vs the MiniMax
+     SwiGLU-OAI variant (``swiglu_oai_quant``: ``gate*sigmoid(gate*alpha)*(up+1)`` w/ clamping)
+     based on whether ``alpha``/``limit`` are given. The runner must forward
+-    ``gemm1_alpha``/``gemm1_clamp_limit`` here or experts fall back to wrong SwiGLU."""
++    ``gemm1_alpha``/``gemm1_clamp_limit`` here or experts fall back to wrong SwiGLU.
++
++    ``swiglu_limit`` is the *model's own* clamp (DeepSeek-V4 / GLM-5.3 set 10.0) and is a
++    different knob from the gpt-oss style ``gemm1_clamp_limit``, which this family leaves
++    unset. Without it the routed experts on DeepEP ran unclamped while the shared expert
++    (models/deepseek_v2.py: DeepseekV2MLP.forward) and every non-DeepEP routed path
++    (NPUSwiglu / NPUSwigluQuant above) clamped. The ``swiglu_quant`` kernel has taken ``do_limit`` /
++    ``limit`` all along; nothing was passing them.
++
++    One semantic difference, recorded rather than glossed: the kernel bounds
++    ``silu(gate)``, while the model definition (and ``apply_swiglu_limit_`` above) bounds
++    ``gate`` *before* the silu. The two agree except for ``gate > limit``, where they
++    differ by at most ``limit - silu(limit)`` = 4.5e-4 at limit=10 -- a 4.5e-5 relative
++    difference against a bf16 relative ulp of 3.9e-3, so it is below the output
++    resolution on all but a small fraction of the affected elements. Measured on a real
++    layer-3 gmm1 output (65536x256 rows, 37 elements past the limit): this kernel and
++    ``NPUSwiglu``'s exact pre-silu clamp both land 1.659e-3 from the fp32 reference,
++    against a bf16 noise floor of 2.35e-3; unclamped is 1.335e-2.
++    """
+ 
+     def __init__(
+         self,
+         need_quant: bool = True,
+         alpha: Optional[float] = None,
+         limit: Optional[float] = None,
++        swiglu_limit: Optional[float] = None,
+     ):
+         self.need_quant = need_quant
+         self.alpha = alpha
+         self.limit = limit
++        self.swiglu_limit = None if not swiglu_limit else float(swiglu_limit)
+         self._use_oai = alpha is not None and limit is not None
+         if self._use_oai:
+             from sgl_kernel_npu.activation.swiglu_oai_quant import (
+@@ -90,6 +209,7 @@ class NPUSwigluDeepEPKernel(BaseActivation):
+             from sgl_kernel_npu.activation.swiglu_quant import swiglu_quant
+ 
+             self._kernel = swiglu_quant
++            _log_swiglu_limit_once(self.swiglu_limit or 0.0)
+ 
+     def _apply_activation(
+         self,
+@@ -106,6 +226,15 @@ class NPUSwigluDeepEPKernel(BaseActivation):
+                 group_list=group_list,
+                 group_list_type=group_list_type,
+             )
++        elif self.swiglu_limit is not None:
++            hidden_states, per_token_scale = self._kernel(
++                hidden_states,
++                group_list,
++                group_list_type,
++                need_quant=self.need_quant,
++                do_limit=True,
++                limit=self.swiglu_limit,
++            )
+         else:
+             hidden_states, per_token_scale = self._kernel(
+                 hidden_states, group_list, group_list_type, need_quant=self.need_quant

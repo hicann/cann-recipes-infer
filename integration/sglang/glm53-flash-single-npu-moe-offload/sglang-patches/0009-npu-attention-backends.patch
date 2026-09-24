@@ -1,0 +1,526 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pan-boyi <panboyi@huawei.com>
+Date: Wed, 9 Sep 2026 11:03:15 +0800
+Subject: [PATCH 09/10] =?UTF-8?q?npu:=20=E6=98=87=E8=85=BE=E6=B3=A8?=
+ =?UTF-8?q?=E6=84=8F=E5=8A=9B=E5=90=8E=E7=AB=AF=E7=9A=84=E9=80=82=E9=85=8D?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+KDA 线性注意力后端：钉住 kkt 的 autotune 配置、gate 展平、图捕获时的 seq_len 填充值
+（用 0 而不是基类的 1，因为 0 才是 runner 实际填的）。conv 权重缓存一份 [width, dim]
+的转置——CANN 的 causal_conv1d 要这个布局，且要求权重 dtype 与输入一致，而 KDA 的
+conv 权重是 fp32、输入是 bf16。转置在这里做而不是改参数本身：上游的 CUDA KDA 后端
+要求权重是 fp32 才肯做它的 K3 融合。
+
+另含注意力后端注册、MLA 模块的昇腾分支、混合线性注意力后端的接线。
+---
+ .../npu/attention/ascend_backend.py           |  88 ++++++++++-
+ .../ascend_hybrid_linear_attn_backend.py      |  26 +++
+ .../npu/attention/ascend_kda_backend.py       | 149 +++++++++++++++++-
+ .../modules/deepseek_v2_attention_mla_npu.py  |  31 ++--
+ .../layers/attention/attention_registry.py    |  15 +-
+ 5 files changed, 293 insertions(+), 16 deletions(-)
+
+diff --git a/python/sglang/srt/hardware_backend/npu/attention/ascend_backend.py b/python/sglang/srt/hardware_backend/npu/attention/ascend_backend.py
+index e8d5e13132..2e4fe8468b 100644
+--- a/python/sglang/srt/hardware_backend/npu/attention/ascend_backend.py
++++ b/python/sglang/srt/hardware_backend/npu/attention/ascend_backend.py
+@@ -1060,6 +1060,81 @@ class AscendAttnBackend(AttentionBackend):
+         attn_out = torch.cat([attn_out_prev, attn_out_next], dim=0)
+         return attn_out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+ 
++    # One all-zero rope tensor per (device, dtype, shape), allocated on first
++    # use and shared by every DSA layer -- see _nope_zero_rope.
++    _nope_rope_zeros: dict = {}
++
++    #: The only rope width npu_sparse_flash_attention accepts (measured: None, 0,
++    #: 16, 32 and 128 all raise).
++    NOPE_ROPE_WIDTH = 64
++
++    def _as_pa_bsnd(self, buf: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
++        """View a paged KV buffer the way ``layout_kv="PA_BSND"`` wants it.
++
++        ``MLATokenToKVPool`` allocates ``[num_slots, 1, kv_cache_dim]`` and hands
++        that shape out of ``get_kv_buffer``; ``npu_sparse_flash_attention``
++        rejects it outright -- "When layoutKV is PA_BSND, kvDimNum must be 4"
++        (measured, error 561002) -- and wants ``[num_pages, page_size, N, D]``,
++        which is the same bytes with the page split made explicit.
++
++        Slots beyond the last whole page are dropped: a page id in the block
++        table can only address ``[p*page_size, (p+1)*page_size)``, so nothing
++        reachable lives there.
++        """
++        if buf is None or buf.dim() != 3:
++            return buf
++        n = buf.shape[0] // self.page_size * self.page_size
++        return buf[:n].view(-1, self.page_size, *buf.shape[1:])
++
++    def _nope_zero_rope(self, q_nope: torch.Tensor, k_nope: torch.Tensor):
++        """An all-zero rope for a NoPE model, which the operator insists on.
++
++        ``npu_sparse_flash_attention`` documents ``query_rope`` / ``key_rope`` as
++        optional, but rejects a missing rope, a zero-width one, and every width
++        except 64. A zero rope is free in exact arithmetic -- it contributes 0 to
++        every score -- and against a torch MLA reference the result comes back at
++        rel 3e-3, which is bf16 output rounding.
++
++        A real key rope is a second paged cache holding nothing but zeros.  The
++        stride-0 ``expand`` that used to stand here was meant to avoid paying for
++        it, and it did not: the operator's docs say non-contiguous inputs are
++        unsupported, and torch_npu makes the input contiguous before the call, so
++        the expand was materialised **on every call**.  Measured on one A3 die
++        (2026-08-30, kernel profile of a real decode step): one
++        ``BroadcastTo`` per DSA layer per step, ``[1,64,1,64] -> [19403,64,1,64]``,
++        ``aiv_mte3_ratio`` 0.95 -- 159 MiB of stores to produce zeros, 11 times a
++        step, 0.70 ms of a 42.8 ms step.  Worse, the cost is O(KV pool), not
++        O(batch) or O(sequence): growing the pool to 1.52 M tokens took it to
++        1.34 ms.
++
++        So allocate the zeros once and keep them.  Same bytes on the wire into the
++        operator, but written at startup instead of 11 times per token.  The cache
++        is keyed by the full shape and shared across every DSA layer, so it is one
++        allocation (159 MiB at 1.24 M KV tokens, scaling with the pool), not one
++        per layer.
++        """
++        w = self.NOPE_ROPE_WIDTH
++        return (
++            self._zero_rope((*q_nope.shape[:-1], w), q_nope.dtype, q_nope.device),
++            self._zero_rope((*k_nope.shape[:-1], w), k_nope.dtype, k_nope.device),
++        )
++
++    def _zero_rope(
++        self, shape: tuple, dtype: torch.dtype, device: torch.device
++    ) -> torch.Tensor:
++        """A contiguous all-zero tensor of `shape`, allocated at most once.
++
++        Shared across DSA layers and across decode steps.  Nothing writes to it,
++        so aliasing one buffer everywhere is safe, and handing back the *same*
++        tensor every call is what lets NPU graph capture bake a stable address.
++        """
++        key = (device, dtype, shape)
++        t = self._nope_rope_zeros.get(key)
++        if t is None:
++            t = torch.zeros(shape, dtype=dtype, device=device)
++            self._nope_rope_zeros[key] = t
++        return t
++
+     def forward_sparse(
+         self,
+         q: torch.Tensor,
+@@ -1082,12 +1157,17 @@ class AscendAttnBackend(AttentionBackend):
+ 
+         if save_kv_cache:
+             k = k.view(-1, layer.tp_k_head_num, self.kv_lora_rank)
+-            k_rope = k_rope.view(-1, layer.tp_k_head_num, self.qk_rope_head_dim)
++            if k_rope is not None:
++                k_rope = k_rope.view(-1, layer.tp_k_head_num, self.qk_rope_head_dim)
+             self.token_to_kv_pool.set_kv_buffer(
+                 layer, forward_batch.out_cache_loc, k, k_rope
+             )
+         q_nope, q_pe = q, q_rope
+         k_nope, k_pe = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
++        k_nope = self._as_pa_bsnd(k_nope)
++        k_pe = self._as_pa_bsnd(k_pe)
++        if q_pe is None or q_pe.shape[-1] == 0:
++            q_pe, k_pe = self._nope_zero_rope(q_nope, k_nope)
+ 
+         if is_prefill:
+             if self.forward_metadata.actual_seq_lengths_q is not None:
+@@ -1893,6 +1973,12 @@ class AscendAttnBackend(AttentionBackend):
+                     query_rope=q_rope,
+                     key_rope=k_rope.contiguous(),
+                     num_heads=layer.tp_q_head_num,
++                    # Measured: under TND the num_key_value_heads default of 0
++                    # ("same as num_heads") is honoured in BSND but not here --
++                    # the output matches neither head count and is wrong by two
++                    # orders of magnitude, with no error raised. The decode call
++                    # below always passed it; this one has to as well.
++                    num_key_value_heads=layer.tp_k_head_num,
+                     input_layout="TND",
+                     atten_mask=self.fia_mask,
+                     sparse_mode=3,
+diff --git a/python/sglang/srt/hardware_backend/npu/attention/ascend_hybrid_linear_attn_backend.py b/python/sglang/srt/hardware_backend/npu/attention/ascend_hybrid_linear_attn_backend.py
+index 3e60cd9ed5..f34598354e 100644
+--- a/python/sglang/srt/hardware_backend/npu/attention/ascend_hybrid_linear_attn_backend.py
++++ b/python/sglang/srt/hardware_backend/npu/attention/ascend_hybrid_linear_attn_backend.py
+@@ -226,6 +226,32 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
+     ):
+         super().__init__(full_attn_backend, linear_attn_backend, full_attn_layers)
+ 
++    @property
++    def forward_metadata(self):
++        """The full-attention half's metadata, for the Ascend DSA indexer.
++
++        ``kpool_indexer_npu.forward_npu`` and ``dsa_npu_indexer`` read
++        ``get_attn_backend().forward_metadata`` directly (block_tables,
++        seq_lens, actual_seq_lengths_*).  On a non-hybrid Ascend model
++        ``get_attn_backend()`` *is* the ``AscendAttnBackend`` that owns those
++        fields; on a hybrid model (GLM-5.3-Flash) it is this wrapper, which has
++        no ``forward_metadata`` of its own -- so those reads raised
++        ``AttributeError`` on the very first DSA layer of a hybrid decode.
++        The full-attention half owns the KV block tables, so delegating there
++        hands out the same object the non-hybrid path reads.
++
++        Same shape as ``ShortConvHybridAttnBackend.forward_metadata``
++        (``linear/inkling_sconv_backend.py``), setter included: the eager
++        runner's idle path does ``attn_backend.forward_metadata = None``
++        (``runner/eager_runner.py``) to drop stale metadata, and a read-only
++        property would turn that into an AttributeError.
++        """
++        return self.full_attn_backend.forward_metadata
++
++    @forward_metadata.setter
++    def forward_metadata(self, value):
++        self.full_attn_backend.forward_metadata = value
++
+     def update_mamba_state_after_mtp_verify(
+         self,
+         last_correct_step_indices: torch.Tensor,
+diff --git a/python/sglang/srt/hardware_backend/npu/attention/ascend_kda_backend.py b/python/sglang/srt/hardware_backend/npu/attention/ascend_kda_backend.py
+index e00b27ebfd..f4eace8fae 100644
+--- a/python/sglang/srt/hardware_backend/npu/attention/ascend_kda_backend.py
++++ b/python/sglang/srt/hardware_backend/npu/attention/ascend_kda_backend.py
+@@ -17,6 +17,7 @@ from sgl_kernel_npu.fla.utils import prepare_chunk_indices
+ from sglang.kernels.ops.attention.fla.cumsum import chunk_local_cumsum
+ from sglang.kernels.ops.attention.fla.kda import chunk_kda_scaled_dot_kkt_fwd
+ from sglang.kernels.ops.attention.fla.l2norm import l2norm_fwd
++from sglang.srt.configs.hybrid_arch import glm5_next_config
+ from sglang.srt.layers.attention.linear.kda_backend import (
+     KDAAttnBackend,
+     ragged_verify_dense_scatter_indices,
+@@ -26,6 +27,41 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+ 
+ _LOG2_E = math.log2(math.e)
+ 
++# The kkt kernels' autotune sweep is fatal on Ascend: triton benchmarks every
++# config with do_bench, and on A3 the sweep times out the AI core (507014,
++# "aicore timeout") on the first config it tries, before any config wins. Each
++# config runs fine on its own -- triton skips benchmarking when only one is
++# registered -- so pin one. Measured per config on A3 at T=8192, H=4 (the tp16
++# per-card KDA shape): BK=64 is ~4.0 ms against BK=32's ~4.7 ms, and num_warps /
++# num_stages move it less than 5%.
++_KKT_INTER_PIN = {"BK": 64, "num_warps": 4, "num_stages": 2}
++_KKT_INTRA_PIN = {"num_warps": 4}
++
++
++def _pin_kkt_autotune_configs() -> None:
++    from sglang.kernels.ops.attention.fla import kda as _kda
++
++    for kernel, pin in (
++        (_kda.chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter, _KKT_INTER_PIN),
++        (_kda.chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_intra, _KKT_INTRA_PIN),
++    ):
++        configs = kernel.configs
++        if len(configs) == 1:
++            continue
++        want = dict(pin)
++        warps, stages = want.pop("num_warps", None), want.pop("num_stages", None)
++        chosen = [
++            c
++            for c in configs
++            if all(c.kwargs.get(k) == v for k, v in want.items())
++            and (warps is None or c.num_warps == warps)
++            and (stages is None or c.num_stages == stages)
++        ]
++        kernel.configs = chosen[:1] or configs[:1]
++
++
++_pin_kkt_autotune_configs()
++
+ 
+ class _AscendKDAExtendKernel:
+     """Ascend-only KDA prefill decomposition backed by sgl-kernel-npu."""
+@@ -112,6 +148,35 @@ class _AscendKDAExtendKernel:
+         return out
+ 
+ 
++def _flat_kda_gate(
++    gate: torch.Tensor, layer, *, gate_is_flat: bool
++) -> torch.Tensor:
++    """Hand fused_kda_gate_npu a tensor whose last dim is heads*head_dim.
++
++    Kimi hands the gate over head-split as ``[..., heads, head_dim]``; GLM-5.3
++    hands it over already flat, straight off f_b_proj. Flattening the last two
++    dims unconditionally would fold the token axis into the feature axis for
++    GLM. The layouts are indistinguishable by shape when there is one head per
++    rank, so the caller supplies the layout explicitly. Both branches are views,
++    not copies.
++    """
++    flat_width = layer.A_log.numel() * layer.head_k_dim
++    if gate_is_flat:
++        if gate.shape[-1] != flat_width:
++            raise ValueError(
++                f"flat KDA gate width {gate.shape[-1]} != expected {flat_width}"
++            )
++        return gate
++
++    expected_tail = (layer.A_log.numel(), layer.head_k_dim)
++    if tuple(gate.shape[-2:]) != expected_tail:
++        raise ValueError(
++            f"head-split KDA gate tail {tuple(gate.shape[-2:])} "
++            f"!= expected {expected_tail}"
++        )
++    return gate.flatten(-2)
++
++
+ class AscendKDAAttnBackend(KDAAttnBackend):
+     """Ascend implementation of Kimi Delta Attention.
+ 
+@@ -129,8 +194,29 @@ class AscendKDAAttnBackend(KDAAttnBackend):
+ 
+     supports_speculative_conv_state_snapshots: bool = False
+ 
++    def get_cuda_graph_seq_len_fill_value(self):
++        # 0, not the base class's 1, because 0 is what the runner actually fills
++        # padded seq_lens with on Ascend. The runner asks the *top-level* backend
++        # (AscendHybridLinearAttnBackend -> HybridLinearAttnBackend:1119 -> the
++        # full-attention half -> AscendAttnBackend:792 -> 0), while this backend
++        # caches its own answer in _graph_seq_len_fill_value and compares against
++        # it when counting padded rows (hybrid_linear_attn_backend.py:580).
++        #
++        # That comparison is unreachable today -- build_replay_fb_view always
++        # passes an explicit num_padding -- but when it was forced to run it
++        # counted 0 padded rows out of 3, and the padded rows were then written
++        # to mamba slot 0 as though they were real. What kept that harmless was
++        # MambaSlotAllocator reserving slot 0, not anything here; a pool that
++        # ever handed slot 0 to a real request would lose its state silently.
++        #
++        # AscendMambaAttnBackendBase:212 already returns 0 for the same reason.
++        return 0
++
+     def __init__(self, model_runner):
+         super().__init__(model_runner)
++        self._extend_gate_is_flat = (
++            glm5_next_config(model_runner.model_config) is not None
++        )
+         # The NPU pool is allocated as [layers, pool, window, channels]
+         # (transposed from the shared KDA [channels, window]). Expose the
+         # transposed shape so _init_track_conv_indices reads
+@@ -157,6 +243,20 @@ class AscendKDAAttnBackend(KDAAttnBackend):
+         weight dtype to match the input. KDA keeps conv_weights in FP32
+         while inputs/conv_states are BF16, so the cached FP32 transpose is
+         cast to the caller's dtype here.
++
++        The cast lives here rather than on the parameter itself. GLM pins the
++        conv weights to fp32 (glm5_next.py params_dtype) and the shared CUDA KDA
++        backend refuses its K3 fusion unless the weights are fp32
++        (kda_backend.py). Casting the cached transpose instead keeps this change
++        inside the Ascend backend -- CUDA sees nothing -- at no cost, since this
++        copy is made once per layer anyway.
++
++        `torch.ops.npu.causal_conv1d` rejects fp32 outright ("Only BF16 and FP16
++        are supported") and requires weight, activation and conv state to agree,
++        so the bf16 every caller here asks for is what the operator dictates, not
++        a precision choice we made. Measured against the double reference: 24/24
++        tensors in budget across four goldens, with decode out and the final ssm
++        state improving in all four.
+         """
+         w = getattr(layer, "_conv_weights_t", None)
+         if w is None:
+@@ -182,13 +282,26 @@ class AscendKDAAttnBackend(KDAAttnBackend):
+         cache_indices = self.forward_metadata.mamba_cache_indices
+ 
+         # setting activation_mode to 1 means using SiLU activation after conv.
++        #
++        # cache_indices must be int32: int64 is accepted and silently miscomputes
++        # on the sibling `causal_conv1d_update` op. Padded cuda-graph rows carry
++        # -1 and are skipped on the sign of the index, not on `pad_slot_id`,
++        # which this operator never consults -- so their output lanes hold
++        # garbage rather than zeros and the caller must discard them.
+         qkv = torch.ops.npu.causal_conv1d(
++            # The input has to be contiguous, and on the fused-projection path it is not:
++            # glm5_next splits qkv off the front of one wide fused output, so it is a
++            # last-dim prefix slice -- rows contiguous, row stride wrong. The operator
++            # rejects it with "x must be contiguous" rather than reading it wrong,
++            # which is the good failure mode. No-op when the projections are unfused,
++            # which is why single-layer testing of this call never saw it: the harness
++            # predates the fusion and got a freshly allocated qkv.
+             mixed_qkv.contiguous(),
+             self._get_conv_weights_t(layer, mixed_qkv.dtype),
+             conv_states=conv_states,
+             bias=layer.bias,
+             query_start_loc=query_start_loc,
+-            cache_indices=cache_indices,
++            cache_indices=cache_indices.to(torch.int32),
+             activation_mode=1,
+             pad_slot_id=-1,
+             run_mode=1,
+@@ -276,20 +389,29 @@ class AscendKDAAttnBackend(KDAAttnBackend):
+         has_initial_state = forward_batch.extend_prefix_lens > 0
+ 
+         if self.forward_metadata.has_mamba_track_mask:
++            # `track_conv_indices` gathers window-length runs of raw [tokens,
++            # channels] input, so the rows land in the window-major pool as they
++            # come (the same as AscendGDNAttnBackend does).
+             mixed_qkv_to_track = mixed_qkv[self.forward_metadata.track_conv_indices]
+             conv_states[self.forward_metadata.conv_states_mask_indices] = (
+                 mixed_qkv_to_track
+             )
+ 
++        # Depthwise conv is channel-independent, so one packed call over the
++        # full qkv width replaces three per-block calls.
+         kernel_size = layer.conv_weights.shape[-1]
+         conv_states_for_prefill = conv_states[:, -(kernel_size - 1) :, :].contiguous()
+         mixed_qkv = torch.ops.npu.causal_conv1d(
++            # Contiguous for the same reason as the decode call: the fused
++            # projection hands qkv over as a last-dim prefix slice of one wide
++            # output. No-op when the projections are unfused.
+             mixed_qkv.contiguous(),
+             self._get_conv_weights_t(layer, mixed_qkv.dtype),
+             conv_states=conv_states_for_prefill,
+             bias=layer.bias,
+             query_start_loc=query_start_loc,
+-            cache_indices=cache_indices,
++            # int32 for the same reason as the decode call.
++            cache_indices=cache_indices.to(torch.int32),
+             has_initial_state=has_initial_state,
+             activation_mode=1,
+             pad_slot_id=-1,
+@@ -348,12 +470,19 @@ class AscendKDAAttnBackend(KDAAttnBackend):
+         GPU model/backend paths unchanged.
+         """
+         preactivated_g = fused_kda_gate_npu(
+-            g.flatten(-2),
++            _flat_kda_gate(g, layer, gate_is_flat=self._extend_gate_is_flat),
+             layer.A_log,
+             layer.head_k_dim,
+             gate_bias=layer.dt_bias,
+             lower_bound=layer.lower_bound,
+         )
++        # A caller that hands the gate over flat ([B, T, H*K]) hands beta over
++        # raw: that is exactly the signal the CUDA path keys `beta_is_raw` off
++        # (kda_backend.py's `gate_was_flat`), and chunk_kda sigmoids it inside.
++        # The Ascend extend chain has no such hook, so activate beta here.
++        # Head-split callers (Kimi) already sigmoid it in the model.
++        if self._extend_gate_is_flat:
++            beta = beta.float().sigmoid()
+         return preactivated_g, beta, None, None
+ 
+     def _forward_target_verify(
+@@ -438,7 +567,7 @@ class AscendKDAAttnBackend(KDAAttnBackend):
+         # recurrent kernel to match the checkpoint's verify contract.
+         # This stays in the Ascend backend so shared/GPU model code is unchanged.
+         preactivated_a = fused_kda_gate_npu(
+-            dense_a.flatten(-2),
++            _flat_kda_gate(dense_a, layer, gate_is_flat=True),
+             layer.A_log,
+             layer.head_k_dim,
+             gate_bias=layer.dt_bias,
+@@ -566,8 +695,18 @@ class AscendKDAHybridLinearAttnBackend:
+                     False,
+                 )
+                 if has_conv_snapshots:
++                    # Inert for Ascend KDA today: the backend above sets
++                    # supports_speculative_conv_state_snapshots = False and
++                    # verify writes draft conv states straight into the extended
++                    # window, so nothing populates this scratch. Kept correct for
++                    # any backend that flips the flag back: the scratch is
++                    # channel-major (memory_pool.py's NPU/KDA `dense_conv_shapes`
++                    # swap) while the persistent pool is window-major
++                    # (`_init_npu_conv_state`); the scatter matches shapes and
++                    # then indexes through strides, so a transposed view is
++                    # enough and no copy is needed.
+                     intermediate_conv_window_cache = (
+-                        mamba_caches.intermediate_conv_window[0]
++                        mamba_caches.intermediate_conv_window[0].transpose(-1, -2)
+                     )
+                     speculative_state_scatter_npu(
+                         conv_states,
+diff --git a/python/sglang/srt/hardware_backend/npu/modules/deepseek_v2_attention_mla_npu.py b/python/sglang/srt/hardware_backend/npu/modules/deepseek_v2_attention_mla_npu.py
+index da3f5643cf..789a9ec9cb 100644
+--- a/python/sglang/srt/hardware_backend/npu/modules/deepseek_v2_attention_mla_npu.py
++++ b/python/sglang/srt/hardware_backend/npu/modules/deepseek_v2_attention_mla_npu.py
+@@ -77,6 +77,11 @@ def forward_mha_prepare_npu(
+     kv_a, _ = latent_cache.split([m.kv_lora_rank, m.qk_rope_head_dim], dim=-1)
+     latent_cache = latent_cache.unsqueeze(1)
+ 
++    # NoPE models never reach here, which is why nothing needs the fused
++    # npu_kv_rmsnorm_rope_cache to accept a zero-width rope. They are DSA models,
++    # and handle_attention_ascend routes every DSA layer to DSA_NPU in both
++    # branches, so this whole function is unreachable for them; m.rotary_emb
++    # below is None for them in any case.
+     if m.use_deepseek_yarn_rope:
+         B, S = q.shape[0], 1
+         cos, sin = m.rotary_emb.get_cos_sin_cache(
+@@ -377,7 +382,10 @@ def forward_dsa_prepare_npu(
+         )
+     else:
+         fused_qkv_a_proj_out = m.fused_qkv_a_proj_with_mqa(hidden_states)[0]
+-        if m.rotary_emb.is_neox_style:
++        # NoPE models (GLM-5.3-Flash: qk_rope_head_dim == 0) build no rotary_emb
++        # at all, so the style of a rope that does not exist cannot be asked for.
++        has_rope = m.qk_rope_head_dim > 0
++        if has_rope and m.rotary_emb.is_neox_style:
+             q, latent_cache = fused_qkv_a_proj_out.split(
+                 [m.q_lora_rank, m.kv_lora_rank + m.qk_rope_head_dim], dim=-1
+             )
+@@ -412,7 +420,8 @@ def forward_dsa_prepare_npu(
+                 torch.npu.current_stream().wait_event(q_event)
+         else:
+             if (
+-                fused_qkv_a_proj_out.shape[0] < 65535
++                has_rope
++                and fused_qkv_a_proj_out.shape[0] < 65535
+                 and not dsa_use_prefill_cp(forward_batch)
+                 and not getattr(m, "_disable_npu_fused_split_qk_norm", False)
+             ):
+@@ -447,12 +456,13 @@ def forward_dsa_prepare_npu(
+ 
+         q_nope_out = q_nope_out.transpose(0, 1)
+ 
+-        if m.layer_id == 0:
+-            m.rotary_emb.sin_cos_cache = m.rotary_emb.cos_sin_cache.index_select(
+-                0, positions
+-            )
++        if has_rope:
++            if m.layer_id == 0:
++                m.rotary_emb.sin_cos_cache = m.rotary_emb.cos_sin_cache.index_select(
++                    0, positions
++                )
+ 
+-        q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
++            q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
+ 
+         if dsa_use_prefill_cp(forward_batch):
+             # support allgather+rerrange
+@@ -506,8 +516,11 @@ def forward_dsa_core_npu(
+         k_nope.contiguous(),
+         forward_batch,
+         save_kv_cache=True,  # False if forward_batch.forward_mode.is_extend() else True,
+-        q_rope=q_pe.contiguous(),
+-        k_rope=k_pe.contiguous(),
++        # query_rope / key_rope are Optional on the Ascend sparse attention op;
++        # a NoPE model splits out zero-width tensors, which must be dropped
++        # rather than handed over as empty.
++        q_rope=q_pe.contiguous() if q_pe is not None and q_pe.shape[-1] else None,
++        k_rope=k_pe.contiguous() if k_pe is not None and k_pe.shape[-1] else None,
+         topk_indices=topk_indices,
+     )
+     attn_output = attn_output.view(-1, m.num_local_heads, m.kv_lora_rank)
+diff --git a/python/sglang/srt/layers/attention/attention_registry.py b/python/sglang/srt/layers/attention/attention_registry.py
+index 20a7e2003b..a1b18f6009 100644
+--- a/python/sglang/srt/layers/attention/attention_registry.py
++++ b/python/sglang/srt/layers/attention/attention_registry.py
+@@ -507,7 +507,20 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
+             else:
+                 linear_attn_backend = KDAAttnBackend(runner)
+         elif glm5_next_config(runner.model_config) is not None:
+-            linear_attn_backend = KDAAttnBackend(runner)
++            if _is_npu:
++                # GLM-5.3-Flash's linear attention is KDA with a featurewise
++                # forget gate, which is what the Ascend Kimi backend already
++                # drives through fused_kda_gate_npu (it takes the per-channel
++                # gate and gate_lower_bound the model config supplies).
++                from sglang.srt.hardware_backend.npu.attention.ascend_kda_backend import (
++                    AscendKDAAttnBackend,
++                    AscendKDAHybridLinearAttnBackend,
++                )
++
++                linear_attn_backend = AscendKDAAttnBackend(runner)
++                hybrid_backend_cls = AscendKDAHybridLinearAttnBackend
++            else:
++                linear_attn_backend = KDAAttnBackend(runner)
+         elif hybrid_lightning_config(runner.model_config) is not None:
+             linear_attn_backend = LightningAttentionBackend(runner)
+         else:

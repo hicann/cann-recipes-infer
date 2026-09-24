@@ -1,0 +1,65 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pan-boyi <panboyi@huawei.com>
+Date: Wed, 9 Sep 2026 11:02:26 +0800
+Subject: [PATCH 02/10] =?UTF-8?q?npu:=20=E5=9C=A8=E9=9D=9E=20CUDA=20?=
+ =?UTF-8?q?=E5=B9=B3=E5=8F=B0=E5=85=B3=E6=8E=89=20FP8=20W=5Fo=20GEMM?=
+ =?UTF-8?q?=EF=BC=8C=E5=B9=B6=E5=8E=BB=E6=8E=89=E4=B8=80=E4=B8=AA=E8=A3=85?=
+ =?UTF-8?q?=E4=B8=8D=E4=B8=8A=E7=9A=84=E4=BE=9D=E8=B5=96?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+SGLANG_OPT_FP8_WO_A_GEMM 默认开启，而这条路径会调 DeepGEMM 并 import 只有 CUDA
+才有的内核。在 NPU/XPU/CPU 上一律关掉。判据写成 not (is_cuda or is_hip)——只判
+not is_cuda 会误伤 ROCm，把 gfx950 的决定冲掉。
+
+pyproject_npu.toml 里的 memfabric-zbal==1.2.0 在公开源上不存在（华为云源只有
+1.1.3 与 1.2.21004.post1）。安装是一条 pip install -r，一个装不到的钉子会让全部
+51 个依赖一个都装不上。该包在全树 0 处 import，直接删掉。
+---
+ .gitignore                                   | 1 +
+ python/pyproject_npu.toml                    | 1 -
+ python/sglang/srt/arg_groups/serving_hook.py | 9 ++++++++-
+ 3 files changed, 9 insertions(+), 2 deletions(-)
+
+diff --git a/.gitignore b/.gitignore
+index 581f2c091d..9884e65b74 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -283,3 +283,4 @@ artifacts/
+ 
+ # Internal, non-published docs
+ internal-docs/
++fusion_result.json
+diff --git a/python/pyproject_npu.toml b/python/pyproject_npu.toml
+index 116a5e3e9b..bcf731a6d5 100644
+--- a/python/pyproject_npu.toml
++++ b/python/pyproject_npu.toml
+@@ -67,7 +67,6 @@ dependencies = [
+   "xxhash",
+   "xgrammar==0.2.1",
+   "memfabric-hybrid==1.1.4",
+-  "memfabric-zbal==1.2.0",
+ ]
+ 
+ [project.optional-dependencies]
+diff --git a/python/sglang/srt/arg_groups/serving_hook.py b/python/sglang/srt/arg_groups/serving_hook.py
+index 404509bb3a..a85bd3c2ed 100644
+--- a/python/sglang/srt/arg_groups/serving_hook.py
++++ b/python/sglang/srt/arg_groups/serving_hook.py
+@@ -429,7 +429,14 @@ def handle_environment_variables(server_args: Any):
+     # it, mirroring the forward scale split: the ue8m0 path
+     # (DEEPGEMM_SCALE_UE8M0, true sm100, default on) or an sm90 opt-in
+     # fp32-scale path (use FP4 expert ckpt). Disable in every other case.
+-    if get_platform().is_cuda and envs.SGLANG_OPT_FP8_WO_A_GEMM.get():
++    if not (get_platform().is_cuda or get_platform().is_hip):
++        # This path calls DeepGEMM and imports CUDA-only kernels.  Keep it
++        # disabled on NPU/XPU/CPU even though the environment option defaults
++        # to true.  Guarding on `not is_cuda` alone would also fire on ROCm and
++        # clobber the gfx950 decision that handle_model_specific_adjustments
++        # makes earlier in the pipeline.
++        envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
++    elif get_platform().is_cuda and envs.SGLANG_OPT_FP8_WO_A_GEMM.get():
+         from sglang.srt.layers import deep_gemm_wrapper
+ 
+         sm = get_platform().device_sm

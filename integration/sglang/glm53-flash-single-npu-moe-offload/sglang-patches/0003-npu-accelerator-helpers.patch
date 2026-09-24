@@ -1,0 +1,85 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pan-boyi <panboyi@huawei.com>
+Date: Wed, 9 Sep 2026 11:02:26 +0800
+Subject: [PATCH 03/10] =?UTF-8?q?npu:=20=E5=8A=A0=E4=B8=80=E5=B1=82=20CUDA?=
+ =?UTF-8?q?/=E6=98=87=E8=85=BE=E9=80=9A=E7=94=A8=E7=9A=84=E5=8A=A0?=
+ =?UTF-8?q?=E9=80=9F=E5=99=A8=E5=8A=A9=E6=89=8B?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+流、事件、上下文管理器在两种设备上的写法不同，KT 异构 MoE 的几条路径都要用。
+集中成一个模块，避免每个调用点各写一遍 device.type 分支。
+---
+ python/sglang/srt/utils/kt_accel.py | 62 +++++++++++++++++++++++++++++
+ 1 file changed, 62 insertions(+)
+ create mode 100644 python/sglang/srt/utils/kt_accel.py
+
+diff --git a/python/sglang/srt/utils/kt_accel.py b/python/sglang/srt/utils/kt_accel.py
+new file mode 100644
+index 0000000000..b8bde9cb75
+--- /dev/null
++++ b/python/sglang/srt/utils/kt_accel.py
+@@ -0,0 +1,62 @@
++# SPDX-License-Identifier: Apache-2.0
++"""CUDA / Ascend NPU helpers for KT heterogeneous MoE paths."""
++
++from __future__ import annotations
++
++from contextlib import AbstractContextManager
++from typing import Any, Optional
++
++import torch
++
++
++def _accelerator(device: torch.device) -> Any:
++    if device.type == "cuda":
++        return torch.cuda
++    if device.type == "npu":
++        import torch_npu  # noqa: F401
++
++        return torch.npu
++    raise TypeError(
++        "KT heterogeneous MoE requires a CUDA or NPU device, " f"got {device.type!r}"
++    )
++
++
++def kt_device_synchronize(device: Optional[torch.device] = None) -> None:
++    if device is not None:
++        _accelerator(device).synchronize(device)
++        return
++    if torch.cuda.is_available() and getattr(torch.version, "cuda", None):
++        torch.cuda.synchronize()
++    elif hasattr(torch, "npu") and torch.npu.is_available():
++        torch.npu.synchronize()
++
++
++def kt_current_stream(device: torch.device) -> Any:
++    return _accelerator(device).current_stream(device)
++
++
++def kt_current_stream_handle(device: torch.device) -> int:
++    stream = kt_current_stream(device)
++    if device.type == "npu":
++        return int(stream.npu_stream)
++    return int(stream.cuda_stream)
++
++
++def kt_new_stream(device: torch.device) -> Any:
++    """Create a fresh accelerator stream bound to ``device``."""
++    return _accelerator(device).Stream(device=device)
++
++
++def kt_new_event(device: torch.device) -> Any:
++    """Create a fresh accelerator event usable for cross-stream fork/join."""
++    return _accelerator(device).Event()
++
++
++def kt_stream_context(stream: Any, device: torch.device) -> AbstractContextManager:
++    """Make ``stream`` the current stream for the duration of the block.
++
++    Inside the block ``kt_current_stream`` / ``kt_current_stream_handle`` resolve
++    to ``stream``, so ops enqueued by callees land on it without threading the
++    stream through their signatures.
++    """
++    return _accelerator(device).stream(stream)
