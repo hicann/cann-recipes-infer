@@ -1,0 +1,55 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="700" height="280" viewBox="0 0 700 280" role="img" aria-label="权重内存路径对比：常规路径经 memcpy 产生匿名副本，本方案直接映射页缓存并由两个消费者共用"><rect x="-20" y="-20" width="740" height="320" fill="#FFFFFF"/>
+  <defs>
+    <marker id="mA" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 z" fill="#6B7686"/></marker>
+    <marker id="mB" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 z" fill="#0E7C86"/></marker>
+    <marker id="mC" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 z" fill="#9C2F46"/></marker>
+  </defs>
+  <text x="0" y="20" font-size="11" font-weight="600" fill="#6B7686">常规路径</text>
+  <g font-family="IBM Plex Mono, monospace" font-size="9.5">
+    <rect x="0" y="34" width="84" height="34" rx="2" fill="#FFFFFF" stroke="#D8DEE5"/>
+    <text x="42" y="49" text-anchor="middle" fill="#414B58">GGUF 文件</text>
+    <text x="42" y="61" text-anchor="middle" font-size="8" fill="#6B7686">磁盘</text>
+    <rect x="124" y="34" width="84" height="34" rx="2" fill="#FFFFFF" stroke="#D8DEE5"/>
+    <text x="166" y="55" text-anchor="middle" fill="#414B58">page cache</text>
+    <rect x="270" y="34" width="112" height="34" rx="2" fill="#F5DEE3" stroke="#9C2F46" stroke-width="1.3"/>
+    <text x="326" y="49" text-anchor="middle" font-weight="600" fill="#9C2F46">匿名副本</text>
+    <text x="326" y="61" text-anchor="middle" font-size="8" fill="#9C2F46">≈138 GB</text>
+    <rect x="442" y="20" width="104" height="28" rx="2" fill="#FFFFFF" stroke="#A85C24"/>
+    <text x="494" y="38" text-anchor="middle" fill="#A85C24">CPU MoE</text>
+    <rect x="442" y="54" width="104" height="28" rx="2" fill="#FFFFFF" stroke="#A85C24" stroke-dasharray="3 2"/>
+    <text x="494" y="72" text-anchor="middle" fill="#6B7686">流式 prefill</text>
+    <text x="558" y="45" font-size="9" fill="#9C2F46">各持一份</text>
+  </g>
+  <g stroke="#6B7686" stroke-width="1.3" fill="none">
+    <path d="M86 51 L120 51" marker-end="url(#mA)"/>
+    <path d="M210 51 L266 51" stroke="#9C2F46" stroke-width="1.8" marker-end="url(#mC)"/>
+    <path d="M384 44 L438 34" marker-end="url(#mA)"/>
+    <path d="M384 58 L438 68" marker-end="url(#mA)"/>
+  </g>
+  <text x="238" y="30" text-anchor="middle" font-size="9" font-weight="600" fill="#9C2F46">memcpy</text>
+  <line x1="0" y1="108" x2="660" y2="108" stroke="#D8DEE5" stroke-dasharray="4 4"/>
+  <text x="0" y="136" font-size="11" font-weight="600" fill="#0E7C86">本方案</text>
+  <g font-family="IBM Plex Mono, monospace" font-size="9.5">
+    <rect x="0" y="150" width="84" height="34" rx="2" fill="#FFFFFF" stroke="#D8DEE5"/>
+    <text x="42" y="165" text-anchor="middle" fill="#414B58">GGUF 文件</text>
+    <text x="42" y="177" text-anchor="middle" font-size="8" fill="#6B7686">磁盘</text>
+    <rect x="204" y="146" width="140" height="42" rx="2" fill="#D6ECEE" stroke="#0E7C86" stroke-width="1.5"/>
+    <text x="274" y="163" text-anchor="middle" font-weight="600" fill="#0E7C86">page cache</text>
+    <text x="274" y="177" text-anchor="middle" font-size="8" fill="#0E7C86">唯一副本 · 直接映射</text>
+    <rect x="442" y="136" width="104" height="28" rx="2" fill="#FFFFFF" stroke="#A85C24" stroke-width="1.3"/>
+    <text x="494" y="154" text-anchor="middle" fill="#A85C24">CPU MoE</text>
+    <rect x="442" y="170" width="104" height="28" rx="2" fill="#FFFFFF" stroke="#A85C24" stroke-width="1.3"/>
+    <text x="494" y="188" text-anchor="middle" fill="#A85C24">流式 prefill</text>
+    <text x="558" y="167" font-size="9" font-weight="600" fill="#0E7C86">共用</text>
+  </g>
+  <g stroke-width="1.4" fill="none">
+    <path d="M86 167 L200 167" stroke="#6B7686" marker-end="url(#mA)"/>
+    <path d="M346 160 L438 150" stroke="#0E7C86" marker-end="url(#mB)"/>
+    <path d="M346 174 L438 184" stroke="#0E7C86" marker-end="url(#mB)"/>
+  </g>
+  <path d="M120 150 C120 122 176 122 200 146" stroke="#A85C24" stroke-width="1.6" fill="none" stroke-dasharray="4 3" marker-end="url(#mA)"/>
+  <text x="160" y="126" text-anchor="middle" font-size="9" font-weight="600" fill="#A85C24">madvise 异步预读</text>
+  <rect x="0" y="216" width="660" height="46" rx="3" fill="#EDF0F3"/>
+  <text x="14" y="235" font-size="10.5" fill="#414B58">memcpy 消失的同时也消去了它顺带完成的页缓存预热，故改由 madvise 在加载期发起按页对齐的异步预读，</text>
+  <text x="14" y="252" font-size="10.5" fill="#414B58">内核后台调页，与线程池启动重叠，不占用计算线程时间。</text>
+</svg>

@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="700" height="300" viewBox="0 0 700 300" role="img" aria-label="单个 MoE 层的时间轴：CPU 读取 633 微秒，其中 143.6 被重叠，489.7 暴露；同层可重叠窗口仅 113.8 微秒"><rect x="-20" y="-20" width="740" height="340" fill="#FFFFFF"/>
+        <line x1="100" y1="42" x2="670" y2="42" stroke="#D8DEE5" stroke-width="1"/>
+        <g font-family="IBM Plex Mono, monospace" font-size="9.5" fill="#6B7686" text-anchor="middle">
+          <text x="100" y="34">0</text><text x="250" y="34">200</text>
+          <text x="400" y="34">400</text><text x="550" y="34">600</text><text x="655" y="34">µs</text>
+        </g>
+
+        <text x="0" y="74" font-size="11.5" font-weight="600" fill="#A85C24">host</text>
+        <text x="0" y="87" font-family="IBM Plex Mono, monospace" font-size="9" fill="#6B7686">CPU MoE</text>
+        <text x="0" y="99" font-family="IBM Plex Mono, monospace" font-size="9" fill="#6B7686">95.0 MB/层</text>
+        <rect x="100" y="62" width="475" height="34" fill="#A85C24" opacity="0.42" stroke="#A85C24" stroke-width="1.2"/>
+        <text x="240" y="84" font-family="IBM Plex Mono, monospace" font-size="11.5" font-weight="600" fill="#A85C24">
+          633.3 µs — 等于 150 GB/s 带宽下界
+        </text>
+
+        <text x="0" y="136" font-size="11.5" font-weight="600" fill="#0E7C86">device</text>
+        <text x="0" y="149" font-family="IBM Plex Mono, monospace" font-size="9" fill="#6B7686">compute stream</text>
+        <rect x="100" y="124" width="85" height="34" fill="#0E7C86" opacity="0.5" stroke="#0E7C86" stroke-width="1.2"/>
+        <text x="107" y="146" font-family="IBM Plex Mono, monospace" font-size="10" font-weight="600" fill="#0E7C86">MoE 113.8</text>
+        <rect x="185" y="124" width="390" height="34" fill="none" stroke="#9C2F46" stroke-width="1.4" stroke-dasharray="4 3"/>
+        <text x="380" y="146" text-anchor="middle" font-family="IBM Plex Mono, monospace"
+              font-size="11.5" font-weight="600" fill="#9C2F46">暴露的 stall · 489.7 µs</text>
+
+        <line x1="100" y1="104" x2="208" y2="104" stroke="#0E7C86" stroke-width="2.2"/>
+        <path d="M100 104 l5 -3 v6 z" fill="#0E7C86"/><path d="M208 104 l-5 -3 v6 z" fill="#0E7C86"/>
+        <text x="154" y="118" text-anchor="middle" font-family="IBM Plex Mono, monospace"
+              font-size="9.5" font-weight="600" fill="#0E7C86">重叠 143.6</text>
+
+        <line x1="100" y1="196" x2="655" y2="196" stroke="#414B58" stroke-width="1.6"/>
+        <path d="M100 196 l6 -3.5 v7 z" fill="#414B58"/>
+        <path d="M655 196 l-6 -3.5 v7 z" fill="#414B58"/>
+        <text x="377" y="212" text-anchor="middle" font-size="11.5" font-weight="600" fill="#414B58">
+          整层 NPU 工作量 ≈ 740 µs
+        </text>
+        <text x="377" y="228" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="9.5" fill="#6B7686">
+          跨层流水或提前一层预取可及的窗口
+        </text>
+
+        <rect x="100" y="250" width="555" height="34" rx="3" fill="#EDF0F3"/>
+        <text x="114" y="272" font-size="11.5" fill="#414B58">
+          CPU 侧无浪费——其时间等于带宽下界。<tspan font-weight="600" fill="#161A20">受限项是可重叠窗口。</tspan>
+        </text>
+      </svg>

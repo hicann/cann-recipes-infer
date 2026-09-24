@@ -1,0 +1,54 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="700" height="250" viewBox="0 0 700 250" role="img" aria-label="四个配置的每 token 时延分解，按 NPU 关键路径与暴露的 CPU 时间划分"><rect x="-20" y="-20" width="740" height="290" fill="#FFFFFF"/>
+        <g font-size="11" fill="#161A20" font-weight="600">
+          <text x="0" y="42">GLM · A3 · 混合</text>
+          <text x="0" y="94">GLM · A3 · 动态热专家</text>
+          <text x="0" y="146">DSv4 · A3</text>
+          <text x="0" y="190">DSv4 · A5</text>
+        </g>
+
+        <!-- 1 ms = 8.6 px, 起点 x=175 -->
+        <!-- GLM hybrid 33.3 + 19.2 = 52.5 -->
+        <rect x="175" y="26" width="286" height="24" fill="#0E7C86" opacity="0.5" stroke="#0E7C86"/>
+        <rect x="461" y="26" width="165" height="24" fill="#A85C24" opacity="0.55" stroke="#A85C24"/>
+        <text x="182" y="43" font-family="IBM Plex Mono, monospace" font-size="10" font-weight="600" fill="#0E7C86">NPU 33.3</text>
+        <text x="468" y="43" font-family="IBM Plex Mono, monospace" font-size="10" font-weight="600" fill="#A85C24">19.2</text>
+        <text x="636" y="43" font-family="IBM Plex Mono, monospace" font-size="11" font-weight="600" fill="#161A20">52.5</text>
+
+        <!-- GLM dynhot 33.3 + 9.9 = 43.2 -->
+        <rect x="175" y="78" width="286" height="24" fill="#0E7C86" opacity="0.5" stroke="#0E7C86"/>
+        <rect x="461" y="78" width="85" height="24" fill="#A85C24" opacity="0.55" stroke="#A85C24"/>
+        <text x="182" y="95" font-family="IBM Plex Mono, monospace" font-size="10" font-weight="600" fill="#0E7C86">NPU 33.3</text>
+        <text x="468" y="95" font-family="IBM Plex Mono, monospace" font-size="10" font-weight="600" fill="#A85C24">9.9</text>
+        <text x="636" y="95" font-family="IBM Plex Mono, monospace" font-size="11" font-weight="600" fill="#161A20">43.2</text>
+
+        <!-- DSv4 A3：NPU 37 + 暴露 13 = 50.0，CPU 总 18 -->
+        <rect x="175" y="130" width="318" height="24" fill="#0E7C86" opacity="0.5" stroke="#0E7C86"/>
+        <rect x="493" y="130" width="112" height="24" fill="#A85C24" opacity="0.55" stroke="#A85C24"/>
+        <text x="182" y="147" font-family="IBM Plex Mono, monospace" font-size="10" font-weight="600" fill="#0E7C86">NPU 37</text>
+        <text x="500" y="147" font-family="IBM Plex Mono, monospace" font-size="10" font-weight="600" fill="#A85C24">13</text>
+        <rect x="175" y="157" width="155" height="10" fill="none" stroke="#A85C24" stroke-width="1.1" stroke-dasharray="3 2"/>
+        <text x="336" y="166" font-family="IBM Plex Mono, monospace" font-size="8" fill="#A85C24">CPU 总 18，其中 5 被隐藏</text>
+        <text x="636" y="147" font-family="IBM Plex Mono, monospace" font-size="11" font-weight="600" fill="#161A20">50.0</text>
+
+        <!-- DSv4 A5：device-busy 14.72 + 暴露 5.85 = 20.57 -->
+        <rect x="175" y="176" width="127" height="24" fill="#0E7C86" opacity="0.5" stroke="#0E7C86"/>
+        <rect x="302" y="176" width="50" height="24" fill="#A85C24" opacity="0.55" stroke="#A85C24"/>
+        <text x="182" y="193" font-family="IBM Plex Mono, monospace" font-size="10" font-weight="600" fill="#0E7C86">NPU 14.72</text>
+        <text x="308" y="193" font-family="IBM Plex Mono, monospace" font-size="10" font-weight="600" fill="#A85C24">5.85</text>
+        <text x="360" y="193" font-family="IBM Plex Mono, monospace" font-size="8" fill="#A85C24">CPU 总 6.5，仅约 0.65 被隐藏</text>
+        <text x="636" y="193" font-family="IBM Plex Mono, monospace" font-size="11" font-weight="600" fill="#161A20">20.57</text>
+
+        <text x="636" y="18" text-anchor="end" font-family="IBM Plex Mono, monospace" font-size="9.5" fill="#6B7686">ms/token</text>
+        <line x1="175" y1="220" x2="605" y2="220" stroke="#D8DEE5" stroke-width="1"/>
+        <g font-family="IBM Plex Mono, monospace" font-size="9.5" fill="#6B7686">
+          <text x="175" y="234">0</text>
+          <text x="390" y="234" text-anchor="middle">25</text>
+          <text x="605" y="234" text-anchor="end">50 ms</text>
+        </g>
+        <rect x="175" y="242" width="14" height="8" fill="#0E7C86" opacity="0.5" stroke="#0E7C86"/>
+        <text x="195" y="250" font-size="9.5" fill="#6B7686">NPU 关键路径</text>
+        <rect x="300" y="242" width="14" height="8" fill="#A85C24" opacity="0.55" stroke="#A85C24"/>
+        <text x="320" y="250" font-size="9.5" fill="#6B7686">暴露的 CPU（已扣除重叠）</text>
+        <rect x="470" y="242" width="14" height="8" fill="none" stroke="#A85C24" stroke-width="1.1" stroke-dasharray="3 2"/>
+        <text x="490" y="250" font-size="9.5" fill="#6B7686">CPU 总（含被隐藏部分）</text>
+      </svg>

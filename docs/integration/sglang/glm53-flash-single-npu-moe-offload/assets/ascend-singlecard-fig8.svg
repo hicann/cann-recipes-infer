@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="700" height="300" viewBox="0 0 700 300" role="img" aria-label="prefill 曲线对比：A5 近似线性，A3 近似常数"><rect x="-20" y="-20" width="740" height="340" fill="#FFFFFF"/>
+        <line x1="62" y1="250" x2="660" y2="250" stroke="#D8DEE5" stroke-width="1.2"/>
+        <line x1="62" y1="30"  x2="62"  y2="250" stroke="#D8DEE5" stroke-width="1.2"/>
+        <g font-family="IBM Plex Mono, monospace" font-size="10.5" fill="#6B7686" text-anchor="middle">
+          <text x="62" y="278">0</text><text x="261" y="278">10k</text>
+          <text x="460" y="278">20k</text><text x="659" y="278">30k</text>
+        </g>
+        <text x="360" y="296" font-size="11" fill="#414B58" text-anchor="middle">prompt tokens</text>
+        <g font-family="IBM Plex Mono, monospace" font-size="10.5" fill="#6B7686" text-anchor="end">
+          <text x="55" y="254">0</text><text x="55" y="199">7</text>
+          <text x="55" y="144">14</text><text x="55" y="89">21</text>
+        </g>
+        <text x="20" y="140" font-size="11" fill="#414B58" transform="rotate(-90 20 140)" text-anchor="middle">prefill 秒</text>
+        <g stroke="#E6EAEF" stroke-width="1">
+          <line x1="62" y1="199" x2="660" y2="199"/><line x1="62" y1="144" x2="660" y2="144"/>
+          <line x1="62" y1="89" x2="660" y2="89"/>
+        </g>
+
+        <path d="M78 128 L140 125 L218 121 L372 114 L659 90"
+              fill="none" stroke="#0E7C86" stroke-width="2.6" stroke-linecap="round"/>
+        <g fill="#0E7C86">
+          <circle cx="78" cy="128" r="3.6"/><circle cx="140" cy="125" r="3.6"/>
+          <circle cx="218" cy="121" r="3.6"/><circle cx="372" cy="114" r="3.6"/><circle cx="659" cy="90" r="3.6"/>
+        </g>
+        <text x="300" y="105" font-size="12" font-weight="600" fill="#0E7C86">A3 · 近似常数</text>
+        <text x="300" y="122" font-family="IBM Plex Mono, monospace" font-size="10" fill="#6B7686">
+          15.6 s @801 → 20.4 s @31.5k
+        </text>
+
+        <path d="M62 246 L80 245 L155 236 L433 205 L659 179"
+              fill="none" stroke="#A85C24" stroke-width="2.6" stroke-linecap="round"/>
+        <g fill="#A85C24">
+          <circle cx="80" cy="245" r="3.6"/><circle cx="155" cy="237" r="3.6"/><circle cx="433" cy="205" r="3.6"/>
+        </g>
+        <text x="450" y="233" font-size="12" font-weight="600" fill="#A85C24">A5 · 线性</text>
+        <text x="450" y="249" font-family="IBM Plex Mono, monospace" font-size="10" fill="#6B7686">
+          0.50 s + 0.83 ms/token
+        </text>
+
+        <line x1="62" y1="250" x2="62" y2="128" stroke="#9C2F46" stroke-width="1.4" stroke-dasharray="3 3"/>
+        <text x="70" y="46" font-size="11.5" font-weight="600" fill="#9C2F46">O(1) 权重读取项</text>
+        <text x="70" y="62" font-family="IBM Plex Mono, monospace" font-size="10" fill="#6B7686">A3 ≈ 15 s · A5 ≈ 0.12 s</text>
+      </svg>

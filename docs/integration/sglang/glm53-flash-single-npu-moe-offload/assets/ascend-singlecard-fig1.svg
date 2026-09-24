@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="700" height="250" viewBox="0 0 700 250" role="img" aria-label="A3 上的卸载结构：32 个专家以 INT8 驻留 die，224 个以 MXFP4 GGUF 置于 host，两侧格式不同"><rect x="-20" y="-20" width="740" height="290" fill="#FFFFFF"/>
+        <rect x="0" y="24" width="700" height="86" rx="3" fill="#D6ECEE" opacity="0.5"/>
+        <rect x="0" y="140" width="700" height="94" rx="3" fill="#F3E4D6" opacity="0.55"/>
+        <text x="10" y="42" font-family="IBM Plex Mono, monospace" font-size="10" font-weight="600"
+              letter-spacing="1" fill="#0E7C86">DIE · Ascend A3 · 61.3 GiB HBM</text>
+        <text x="10" y="158" font-family="IBM Plex Mono, monospace" font-size="10" font-weight="600"
+              letter-spacing="1" fill="#A85C24">HOST · Kunpeng ARM · DDR</text>
+
+        <!-- 专家条：32/256 驻留 -->
+        <text x="14" y="76" font-size="11" fill="#414B58">驻留</text>
+        <rect x="56" y="60" width="62.5" height="30" fill="#0E7C86" opacity="0.55" stroke="#0E7C86" stroke-width="1.2"/>
+        <text x="62" y="80" font-family="IBM Plex Mono, monospace" font-size="10.5" font-weight="600" fill="#0E7C86">32</text>
+        <text x="130" y="72" font-family="IBM Plex Mono, monospace" font-size="11" font-weight="600" fill="#0E7C86">INT8 W8A8</text>
+        <text x="130" y="86" font-family="IBM Plex Mono, monospace" font-size="9.5" fill="#6B7686">12.5% · GroupedMatmul</text>
+
+        <text x="14" y="196" font-size="11" fill="#414B58">外置</text>
+        <rect x="56" y="178" width="437.5" height="30" fill="#A85C24" opacity="0.42" stroke="#A85C24" stroke-width="1.2"/>
+        <text x="62" y="198" font-family="IBM Plex Mono, monospace" font-size="10.5" font-weight="600" fill="#A85C24">224</text>
+        <text x="505" y="190" font-family="IBM Plex Mono, monospace" font-size="11" font-weight="600" fill="#A85C24">MXFP4 · GGUF</text>
+        <text x="505" y="204" font-family="IBM Plex Mono, monospace" font-size="9.5" fill="#6B7686">87.5% · LLAMAFILE</text>
+        <text x="505" y="218" font-family="IBM Plex Mono, monospace" font-size="9.5" fill="#6B7686">NEON + dotprod</text>
+
+        <!-- 格式不一致标记 -->
+        <path d="M300 110 L300 178" stroke="#9C2F46" stroke-width="1.6" stroke-dasharray="4 3"/>
+        <path d="M300 178 l-4 -8 h8 z" fill="#9C2F46"/>
+        <path d="M300 110 l-4 8 h8 z" fill="#9C2F46"/>
+        <rect x="318" y="124" width="248" height="30" rx="3" fill="#F5DEE3" stroke="#9C2F46" stroke-width="1"/>
+        <text x="330" y="143" font-size="10.5" font-weight="600" fill="#9C2F46">
+          两侧格式不同 · 专家迁移需 requantization
+        </text>
+
+        <text x="14" y="234" font-family="IBM Plex Mono, monospace" font-size="9.5" fill="#6B7686">
+          离线 GGUF 转换为前置条件（约 138 GiB）
+        </text>
+      </svg>

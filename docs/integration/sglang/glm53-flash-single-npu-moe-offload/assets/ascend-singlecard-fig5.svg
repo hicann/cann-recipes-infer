@@ -1,0 +1,107 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="700" height="475" viewBox="0 0 700 475" role="img" aria-label="A3 的 8 节点拓扑与三种配置的带宽，以及 A5 的双 socket 结构对照"><rect x="-20" y="-20" width="740" height="515" fill="#FFFFFF"/>
+  <!-- ── A3 拓扑 ── -->
+  <text x="0" y="14" font-size="11" font-weight="600" fill="#161A20">A3 开发机 · 8 NUMA node × (40 核 + 230 GB)</text>
+
+  <line x1="60" y1="34" x2="600" y2="34" stroke="#9C2F46" stroke-width="2"/>
+  <text x="330" y="28" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="9" font-weight="600" fill="#9C2F46">跨对互联 34 GB/s @24 GiB · 惩罚随足迹变化 5.0–7.8×</text>
+  <g stroke="#9C2F46" stroke-width="1.4">
+    <line x1="90" y1="34" x2="90" y2="46"/><line x1="240" y1="34" x2="240" y2="46"/>
+    <line x1="390" y1="34" x2="390" y2="46"/><line x1="540" y1="34" x2="540" y2="46"/>
+  </g>
+
+  <g font-family="IBM Plex Mono, monospace" font-size="9">
+    <rect x="30" y="46" width="120" height="40" rx="3" fill="#D6ECEE" stroke="#0E7C86" stroke-width="1.4"/>
+    <text x="90" y="61" text-anchor="middle" font-weight="600" fill="#0E7C86">对 A · node 0,1</text>
+    <text x="90" y="76" text-anchor="middle" font-size="8" fill="#0E7C86">本地 180 · 对内 171 · 免费</text>
+    <rect x="180" y="46" width="120" height="40" rx="3" fill="#FFFFFF" stroke="#D8DEE5"/>
+    <text x="240" y="61" text-anchor="middle" fill="#6B7686">对 B · node 2,3</text>
+    <rect x="330" y="46" width="120" height="40" rx="3" fill="#FFFFFF" stroke="#D8DEE5"/>
+    <text x="390" y="61" text-anchor="middle" fill="#6B7686">对 C · node 4,5</text>
+    <rect x="480" y="46" width="120" height="40" rx="3" fill="#FFFFFF" stroke="#D8DEE5"/>
+    <text x="540" y="61" text-anchor="middle" fill="#6B7686">对 D · node 6,7</text>
+  </g>
+
+  <rect x="0" y="96" width="660" height="22" rx="3" fill="#F5DEE3"/>
+  <text x="12" y="111" font-size="9.5" fill="#9C2F46">
+    固件 SLIT 只有两档：本地 10、其余一律 20——把"对内伙伴"与"跨对"标成等价，而两者差 5 倍
+  </text>
+  <text x="0" y="136" font-family="IBM Plex Mono, monospace" font-size="9" fill="#6B7686">
+    NPU 16 die 的 numa_node = −1，固件不暴露 die↔NUMA 亲和性
+  </text>
+
+  <line x1="0" y1="152" x2="660" y2="152" stroke="#D8DEE5" stroke-dasharray="4 4"/>
+
+  <!-- ── 三种配置 ── -->
+  <text x="0" y="174" font-size="11" font-weight="600" fill="#161A20">三种配置落在哪一档</text>
+
+  <!-- 部署 -->
+  <rect x="0" y="184" width="660" height="52" rx="3" fill="#D6ECEE" opacity="0.45"/>
+  <text x="10" y="200" font-family="IBM Plex Mono, monospace" font-size="9.5" font-weight="600" fill="#0E7C86">部署  NODES=0,1</text>
+  <g font-family="IBM Plex Mono, monospace" font-size="8">
+    <rect x="130" y="192" width="92" height="36" rx="2" fill="#FFFFFF" stroke="#0E7C86" stroke-width="1.3"/>
+    <text x="176" y="206" text-anchor="middle" fill="#0E7C86">node0 · 子池0</text>
+    <text x="176" y="220" text-anchor="middle" fill="#6B7686">16 线程 · 权重前半</text>
+    <rect x="230" y="192" width="92" height="36" rx="2" fill="#FFFFFF" stroke="#0E7C86" stroke-width="1.3"/>
+    <text x="276" y="206" text-anchor="middle" fill="#0E7C86">node1 · 子池1</text>
+    <text x="276" y="220" text-anchor="middle" fill="#6B7686">16 线程 · 权重后半</text>
+  </g>
+  <text x="338" y="207" font-size="9.5" fill="#414B58">2 个内存控制器并行</text>
+  <rect x="470" y="196" width="172" height="26" rx="2" fill="#0E7C86" opacity="0.25"/>
+  <text x="556" y="208" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="9.5" font-weight="600" fill="#0E7C86">上界 ~343 · 达成 230–250</text>
+  <text x="556" y="220" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="9" fill="#6B7686">67–73%</text>
+
+  <!-- 单节点镜像 -->
+  <rect x="0" y="244" width="660" height="52" rx="3" fill="#EDF0F3"/>
+  <text x="10" y="260" font-family="IBM Plex Mono, monospace" font-size="9.5" font-weight="600" fill="#414B58">单节点镜像  NODES=0,0</text>
+  <g font-family="IBM Plex Mono, monospace" font-size="8">
+    <rect x="130" y="252" width="192" height="36" rx="2" fill="#FFFFFF" stroke="#6B7686" stroke-width="1.2"/>
+    <text x="226" y="266" text-anchor="middle" fill="#414B58">node0 · 子池0 + 子池1</text>
+    <text x="226" y="280" text-anchor="middle" fill="#6B7686">各 16 线程，共用 40 核</text>
+  </g>
+  <text x="338" y="267" font-size="9.5" fill="#414B58">仅 1 个内存控制器</text>
+  <rect x="470" y="256" width="172" height="26" rx="2" fill="#6B7686" opacity="0.15"/>
+  <text x="556" y="268" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="9.5" font-weight="600" fill="#414B58">上界 179 · 达成 ≈100%</text>
+  <text x="556" y="280" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="9" fill="#6B7686">已饱和</text>
+
+  <!-- 失效配置 -->
+  <rect x="0" y="304" width="660" height="52" rx="3" fill="#F5DEE3" opacity="0.6"/>
+  <text x="10" y="320" font-family="IBM Plex Mono, monospace" font-size="9.5" font-weight="600" fill="#9C2F46">失效  NODES=0，tp=1</text>
+  <text x="130" y="320" font-size="9.5" fill="#414B58">权重不做本地拷贝，散落全部 8 个节点</text>
+  <text x="130" y="336" font-size="9.5" fill="#414B58">大部分读落在跨对一侧</text>
+  <rect x="470" y="316" width="172" height="26" rx="2" fill="#9C2F46" opacity="0.2"/>
+  <text x="556" y="333" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="10" font-weight="600" fill="#9C2F46">实测 38.5 GB/s</text>
+  <text x="130" y="350" font-family="IBM Plex Mono, monospace" font-size="8" fill="#9C2F46">正好落在 34 GB/s 的断崖上</text>
+
+  <line x1="0" y1="372" x2="660" y2="372" stroke="#D8DEE5" stroke-dasharray="4 4"/>
+
+  <!-- ── A5 对照 ── -->
+  <text x="0" y="394" font-size="11" font-weight="600" fill="#A85C24">A5 对照 · 2 NUMA node × 64 核（8 CCD × 8 核）</text>
+
+  <rect x="0" y="404" width="150" height="44" rx="3" fill="#F3E4D6" stroke="#A85C24" stroke-width="1.4"/>
+  <text x="75" y="418" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="9" font-weight="600" fill="#A85C24">socket 0 · 子池0</text>
+  <g fill="#A85C24" opacity="0.55">
+    <rect x="8" y="424" width="15" height="17" rx="1"/><rect x="26" y="424" width="15" height="17" rx="1"/>
+    <rect x="44" y="424" width="15" height="17" rx="1"/><rect x="62" y="424" width="15" height="17" rx="1"/>
+    <rect x="80" y="424" width="15" height="17" rx="1"/><rect x="98" y="424" width="15" height="17" rx="1"/>
+    <rect x="116" y="424" width="15" height="17" rx="1"/><rect x="134" y="424" width="8" height="17" rx="1"/>
+  </g>
+  <rect x="164" y="404" width="150" height="44" rx="3" fill="#F3E4D6" stroke="#A85C24" stroke-width="1.4"/>
+  <text x="239" y="418" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="9" font-weight="600" fill="#A85C24">socket 1 · 子池1</text>
+  <g fill="#A85C24" opacity="0.55">
+    <rect x="172" y="424" width="15" height="17" rx="1"/><rect x="190" y="424" width="15" height="17" rx="1"/>
+    <rect x="208" y="424" width="15" height="17" rx="1"/><rect x="226" y="424" width="15" height="17" rx="1"/>
+    <rect x="244" y="424" width="15" height="17" rx="1"/><rect x="262" y="424" width="15" height="17" rx="1"/>
+    <rect x="280" y="424" width="15" height="17" rx="1"/><rect x="298" y="424" width="8" height="17" rx="1"/>
+  </g>
+  <text x="157" y="462" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="8" fill="#6B7686">
+    96 线程按 L3 域轮转分布 · 绑核后每层 116.2 → 94.6 µs
+  </text>
+
+  <g font-family="IBM Plex Mono, monospace" font-size="8.5" fill="#6B7686">
+    <text x="336" y="418">单 CCD    76 GB/s</text>
+    <text x="336" y="432">单 socket 246 GB/s</text>
+    <text x="336" y="446">双 socket 495 GB/s</text>
+  </g>
+  <rect x="470" y="418" width="172" height="26" rx="2" fill="#A85C24" opacity="0.22"/>
+  <text x="556" y="435" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="10" font-weight="600" fill="#A85C24">实测 431 / 495 GB/s = 87%</text>
+</svg>
