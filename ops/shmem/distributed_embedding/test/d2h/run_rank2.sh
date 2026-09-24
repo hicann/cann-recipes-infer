@@ -3,19 +3,18 @@ set -euo pipefail
 
 TEST_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
-source "${TEST_DIR}/env.sh"
-bash "${TEST_DIR}/build.sh" test_rank2
-EXE=${BUILD_DIR}/test_rank2
+source "${TEST_DIR}/../env.sh"
+bash "${TEST_DIR}/../build.sh" d2h_rank2
+EXE=${BUILD_DIR}/d2h_rank2
 
 FIRST_DEVICE=${FIRST_DEVICE:-0}
 RANK0_DEVICE=${RANK0_DEVICE:-${FIRST_DEVICE}}
 RANK1_DEVICE=${RANK1_DEVICE:-$((FIRST_DEVICE + 1))}
 SHMEM_IP_PORT=${SHMEM_IP_PORT:-tcp://127.0.0.1:8999}
 TEST_TIMEOUT_SECONDS=${TEST_TIMEOUT_SECONDS:-180}
-LOG_DIR=${LOG_DIR:-${BUILD_DIR}/rank2_logs}
+LOG_DIR=${LOG_DIR:-${BUILD_DIR}/d2h_rank2_logs}
 
 mkdir -p "${LOG_DIR}"
-rm -f "${LOG_DIR}/rank0.log" "${LOG_DIR}/rank1.log"
 
 launch_rank() {
     local rank=$1

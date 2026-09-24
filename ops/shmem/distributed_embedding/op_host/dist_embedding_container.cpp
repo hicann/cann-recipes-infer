@@ -11,6 +11,7 @@
 #include <limits>
 #include <stdexcept>
 #include <type_traits>
+#include <vector>
 
 #include "securec.h"
 #include "tiling/platform/platform_ascendc.h"
@@ -22,7 +23,6 @@
 #include "../op_kernel/distributed_hashtable.cpp"
 
 namespace {
-constexpr uint64_t K_LOCAL_MEM_SIZE = 1024UL * 1024UL * 1024UL;
 constexpr uint32_t K_SHMEM_TIMEOUT = 300;
 
 uint64_t PointerToAddress(uint32_t* pointer)
@@ -39,26 +39,31 @@ uint64_t PointerToAddress(uint32_t* pointer)
 
 template <typename Tkey, typename Tvalue>
 DistEmbeddingContainer<Tkey, Tvalue>::DistEmbeddingContainer(
-    const DistEmbeddingOptions& options)
-    : tableSize_(options.tableSize),
-      myPe_(options.myPe),
-      nPes_(options.nPes),
-      deviceOffset_(options.deviceOffset),
-      maxKeysPerPe_(options.maxKeysPerPe),
-      ipPort_(options.ipPort),
+    uint64_t tableSize, int32_t myPe, int32_t nPes, int32_t deviceOffset,
+    uint32_t maxKeysPerPe, const char* ipPort)
+    : DistEmbeddingContainer(tableSize, 0, myPe, nPes, deviceOffset, maxKeysPerPe, ipPort)
+{
+}
+
+template <typename Tkey, typename Tvalue>
+DistEmbeddingContainer<Tkey, Tvalue>::DistEmbeddingContainer(
+    uint64_t tableSize, uint64_t hostTableSize, int32_t myPe, int32_t nPes,
+    int32_t deviceOffset, uint32_t maxKeysPerPe, const char* ipPort, uint64_t localMemSize)
+    : tableSize_(static_cast<uint64_t>(static_cast<double>(tableSize) / loadFactor)),
+      myPe_(myPe),
+      nPes_(nPes),
+      deviceOffset_(deviceOffset),
+      maxKeysPerPe_(maxKeysPerPe),
+      ipPort_(ipPort),
       tableDevice_(nullptr),
       recvBuffer_(nullptr),
       sendCount_(nullptr),
-      defaultFlagUid_{},
+      tableHost_(nullptr),
+      hostTableSize_(hostTableSize > 0 ? static_cast<uint64_t>(static_cast<double>(hostTableSize) / loadFactor) : 0),
+      localMemSize_(localMemSize),
       stream_(nullptr),
-      realCoreNum_(0)
+      realCoreNum_(defaultAivNum)
 {
-    // Keep the requested number of entries at or below the configured load
-    // factor by sizing the open-addressed table to ceil(entries / loadFactor).
-    if (tableSize_ != 0) {
-        tableSize_ = static_cast<uint64_t>(std::ceil(
-            static_cast<double>(tableSize_) / static_cast<double>(loadFactor)));
-    }
     unusedKey_ = std::numeric_limits<Tkey>::max();
     unusedValue_ = std::numeric_limits<Tvalue>::max();
     const int memsetRet = memset_s(&defaultFlagUid_, sizeof(defaultFlagUid_), 0, sizeof(defaultFlagUid_));
@@ -66,8 +71,8 @@ DistEmbeddingContainer<Tkey, Tvalue>::DistEmbeddingContainer(
         throw std::runtime_error("memset_s failed in DistEmbeddingContainer");
     }
     defaultFlagUid_.version = ACLSHMEM_UNIQUEID_VERSION;
-    defaultFlagUid_.my_pe = options.myPe;
-    defaultFlagUid_.n_pes = options.nPes;
+    defaultFlagUid_.my_pe = myPe;
+    defaultFlagUid_.n_pes = nPes;
 }
 
 template <typename Tkey, typename Tvalue>
@@ -109,9 +114,13 @@ void DistEmbeddingContainer<Tkey, Tvalue>::Init()
     InitHashTable();
     std::cout << "DistEmbeddingContainer::Init: InitHashTable done" << '\n';
 
-    if (nPes_ > 1) {
+    if (nPes_ > 1 || hostTableSize_ > 0) {
         InitRecvBuffer();
         InitSendCount();
+    }
+
+    if (hostTableSize_ > 0) {
+        InitHostHashTable();
     }
     std::cout << "DistEmbeddingContainer::Init: InitRecvBuffer done" << '\n';
     aclshmem_barrier_all();
@@ -133,7 +142,7 @@ void DistEmbeddingContainer<Tkey, Tvalue>::InitShmem()
     attributes.ip_port[ipLen] = '\0';
     attributes.my_pe = myPe_;
     attributes.n_pes = nPes_;
-    attributes.local_mem_size = K_LOCAL_MEM_SIZE;
+    attributes.local_mem_size = localMemSize_;
     int attrVersion = (1 << 16) + sizeof(aclshmemx_init_attr_t);
     attributes.option_attr = {attrVersion, ACLSHMEM_DATA_OP_MTE, K_SHMEM_TIMEOUT, K_SHMEM_TIMEOUT,
                               K_SHMEM_TIMEOUT};
@@ -154,11 +163,19 @@ void DistEmbeddingContainer<Tkey, Tvalue>::AllocSymmetricMemory()
         throw std::runtime_error("aclshmem_malloc failed");
     }
     // 多卡申请 recvBuffer
-    if (nPes_ > 1) {
+    if (nPes_ > 1 || hostTableSize_ > 0) {
         size_t recvBytes = nPes_ * maxKeysPerPe_ * sizeof(pair_type);
         recvBuffer_ = (pair_type*)aclshmemx_malloc(recvBytes, DEVICE_SIDE);
         if (recvBuffer_ == nullptr) {
             throw std::runtime_error("aclshmem_malloc failed");
+        }
+    }
+
+    if (hostTableSize_ > 0) {
+        size_t hostBytes = hostTableSize_ * sizeof(pair_type);
+        tableHost_ = (pair_type*)aclshmemx_malloc(hostBytes, HOST_SIDE);
+        if (tableHost_ == nullptr) {
+            throw std::runtime_error("aclshmemx_malloc host failed");
         }
     }
 }
@@ -177,6 +194,24 @@ void DistEmbeddingContainer<Tkey, Tvalue>::InitHashTable()
     auto ret = aclrtSynchronizeStream(stream_);
     if (ret != ACL_SUCCESS) {
         throw std::runtime_error("aclrtSynchronizeStream failed in InitHashTable: " + std::to_string(ret));
+    }
+}
+
+template <typename Tkey, typename Tvalue>
+void DistEmbeddingContainer<Tkey, Tvalue>::InitHostHashTable()
+{
+    if (tableHost_ == nullptr) {
+        throw std::runtime_error("tableHost_ is nullptr");
+    }
+    pair_type fillPair;
+    fillPair.key = unusedKey_;
+    fillPair.value = unusedValue_;
+    size_t totalBytes = hostTableSize_ * sizeof(pair_type);
+    std::vector<pair_type> initialTable(hostTableSize_, fillPair);
+    const auto ret = aclrtMemcpy(tableHost_, totalBytes, initialTable.data(), totalBytes,
+                                 ACL_MEMCPY_HOST_TO_DEVICE);
+    if (ret != ACL_SUCCESS) {
+        throw std::runtime_error("aclrtMemcpy failed in InitHostHashTable: " + std::to_string(ret));
     }
 }
 
@@ -213,10 +248,14 @@ template <typename Tkey, typename Tvalue>
 void DistEmbeddingContainer<Tkey, Tvalue>::Insert(
     const Tkey* keys, const Tvalue* values, size_t nums)
 {
+    // Each source PE owns maxKeysPerPe_ slots, shared by local staging and remote sends.
+    if ((nPes_ > 1 || hostTableSize_ > 0) && nums > maxKeysPerPe_) {
+        throw std::invalid_argument("Insert requires nums <= maxKeysPerPe on every PE");
+    }
     uint32_t blockNum;
     uint32_t threadNum;
-    CalBlockDim(nums, &blockNum, &threadNum);
-    if (nPes_ == 1) {
+    CalBlockDim(std::max<size_t>(nums, 1), &blockNum, &threadNum);
+    if (nPes_ == 1 && hostTableSize_ == 0) {
         UnorderdHashTableTilingData tiling;
         tiling.threadNum = threadNum;
         tiling.keyNum = nums;
@@ -234,6 +273,11 @@ void DistEmbeddingContainer<Tkey, Tvalue>::Insert(
         tiling.myPe = myPe_;
         tiling.maxKeysPerPe = maxKeysPerPe_;
         tiling.sendCountAddr = PointerToAddress(sendCount_);
+        tiling.hostTableSize = hostTableSize_;
+
+        // Clear stale records, then wait until every PE is ready to receive.
+        InitRecvBuffer();
+        aclshmemx_barrier_all_on_stream(stream_);
 
         uint32_t zero = 0;
         auto ret = aclrtMemcpy(sendCount_, sizeof(uint32_t), &zero, sizeof(uint32_t), ACL_MEMCPY_HOST_TO_DEVICE);
@@ -252,6 +296,13 @@ void DistEmbeddingContainer<Tkey, Tvalue>::Insert(
             tableDevice_, recvBuffer_, tiling, unusedKey_, unusedValue_);
 
         aclshmemx_barrier_all_on_stream(stream_);
+
+        if (hostTableSize_ > 0 && tableHost_ != nullptr) {
+            distributed_hashtable_host_insert_kernel<Tkey, Tvalue><<<blockNum, 0, stream_>>>(
+                tableHost_, recvBuffer_, tiling, unusedKey_, unusedValue_);
+
+            aclshmemx_barrier_all_on_stream(stream_);
+        }
     }
     auto ret = aclrtSynchronizeStream(stream_);
     if (ret != ACL_SUCCESS) {
@@ -266,7 +317,7 @@ void DistEmbeddingContainer<Tkey, Tvalue>::Search(
     uint32_t blockNum;
     uint32_t threadNum;
     CalBlockDim(nums, &blockNum, &threadNum);
-    if (nPes_ == 1) {
+    if (nPes_ == 1 && hostTableSize_ == 0) {
         UnorderdHashTableTilingData tiling;
         tiling.threadNum = threadNum;
         tiling.keyNum = nums;
@@ -283,8 +334,14 @@ void DistEmbeddingContainer<Tkey, Tvalue>::Search(
         tiling.nPes = nPes_;
         tiling.myPe = myPe_;
         tiling.maxKeysPerPe = maxKeysPerPe_;
-        distributed_hashtable_search_kernel<Tkey, Tvalue><<<blockNum, 0, stream_>>>(
-            tableDevice_, keys, values, tiling, unusedKey_, unusedValue_);
+        tiling.hostTableSize = hostTableSize_;
+        if (hostTableSize_ > 0 && tableHost_ != nullptr) {
+            distributed_hashtable_hierarchical_search_kernel<Tkey, Tvalue><<<blockNum, 0, stream_>>>(
+                tableDevice_, tableHost_, keys, values, tiling, unusedKey_, unusedValue_);
+        } else {
+            distributed_hashtable_search_kernel<Tkey, Tvalue><<<blockNum, 0, stream_>>>(
+                tableDevice_, keys, values, tiling, unusedKey_, unusedValue_);
+        }
     }
     auto ret = aclrtSynchronizeStream(stream_);
     if (ret != ACL_SUCCESS) {
@@ -302,6 +359,10 @@ void DistEmbeddingContainer<Tkey, Tvalue>::Finalize()
     if (recvBuffer_ != nullptr) {
         aclshmemx_free(recvBuffer_, DEVICE_SIDE);
         recvBuffer_ = nullptr;
+    }
+    if (tableHost_ != nullptr) {
+        aclshmemx_free(tableHost_, HOST_SIDE);
+        tableHost_ = nullptr;
     }
     if (sendCount_ != nullptr) {
         aclrtFree(sendCount_);

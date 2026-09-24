@@ -5,7 +5,7 @@
 set(DISTRIBUTED_EMBEDDING_NPU_ARCH "dav-3510" CACHE STRING
         "NPU architecture for the distributed embedding kernel")
 set(DISTRIBUTED_EMBEDDING_BISHENG
-        "${ASCEND_CANN_PACKAGE_PATH}/x86_64-linux/ccec_compiler/bin/bisheng")
+        "${BISHENG}")
 set(DISTRIBUTED_EMBEDDING_KERNEL_HEADERS
         ${CMAKE_CURRENT_SOURCE_DIR}/distributed_hashtable.h
         ${CMAKE_CURRENT_SOURCE_DIR}/distributed_hashtable.cpp
@@ -21,9 +21,10 @@ add_custom_command(
                 -std=c++17
                 -O0
                 -DUSE_SIMT
-                -I${ASCEND_CANN_PACKAGE_PATH}/x86_64-linux/include
+                -I${CANN_HOST_DIR}/include
                 -I${ASCEND_CANN_PACKAGE_PATH}/opp/built-in/op_impl/ai_core/tbe/impl/ops_nn/ascendc/common
                 -I${SHMEM_ROOT}/include
+                -I${SHMEM_ROOT}/src
                 -I${SHMEM_ROOT}/src/device
                 -I${SHMEM_ROOT}/src/device_simt
                 -I${CMAKE_CURRENT_SOURCE_DIR}

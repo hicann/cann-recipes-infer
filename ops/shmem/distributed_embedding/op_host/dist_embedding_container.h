@@ -24,11 +24,18 @@ public:
 
     explicit DistEmbeddingContainer(const DistEmbeddingOptions& options);
 
-    template <typename... Args>
-    explicit DistEmbeddingContainer(Args... args)
-        : DistEmbeddingContainer(DistEmbeddingOptions{args...})
-    {
-    }
+    // template <typename... Args>
+    // explicit DistEmbeddingContainer(Args... args)
+    //     : DistEmbeddingContainer(DistEmbeddingOptions{args...})
+    // {
+    // }
+    DistEmbeddingContainer(uint64_t tableSize, int32_t myPe, int32_t nPes,
+                           int32_t deviceOffset, uint32_t maxKeysPerPe,
+                           const char* ipPort);
+    DistEmbeddingContainer(uint64_t tableSize, uint64_t hostTableSize,
+                           int32_t myPe, int32_t nPes,
+                           int32_t deviceOffset, uint32_t maxKeysPerPe,
+                           const char* ipPort, uint64_t localMemSize = 1024ULL * 1024ULL * 1024ULL);
 
     ~DistEmbeddingContainer();
 
@@ -45,6 +52,7 @@ private:
     void InitShmem();
     void AllocSymmetricMemory();
     void InitHashTable();
+    void InitHostHashTable();
     void InitRecvBuffer();
     void InitSendCount();
     void CalBlockDim(size_t nums, uint32_t* blockNum, uint32_t* threadNumPerBlock);
@@ -60,6 +68,10 @@ private:
     pair_type* tableDevice_;
     pair_type* recvBuffer_;
     uint32_t* sendCount_;
+
+    pair_type* tableHost_;
+    uint64_t hostTableSize_;
+    uint64_t localMemSize_;
 
     aclshmemx_uniqueid_t defaultFlagUid_;
     aclrtStream stream_;

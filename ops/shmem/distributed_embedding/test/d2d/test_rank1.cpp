@@ -15,7 +15,7 @@
 
 #include "acl/acl.h"
 
-#include "../op_host/dist_embedding_container.h"
+#include "dist_embedding_container.h"
 
 namespace {
 
@@ -133,9 +133,8 @@ int RunSinglePeTest(int deviceId, const char* ipPort)
     try {
         std::cout << "test_distributed_embedding: deviceId=" << deviceId
                   << ", ipPort=" << ipPort << '\n';
-        DistEmbeddingOptions options{K_TABLE_SIZE, K_SINGLE_PE_RANK, K_SINGLE_PE_COUNT, deviceId,
-                                     K_MAX_KEYS_PER_PE, ipPort};
-        container = std::make_unique<DistEmbeddingContainer<Key, Value>>(options);
+        container = std::make_unique<DistEmbeddingContainer<Key, Value>>(
+            K_TABLE_SIZE, K_SINGLE_PE_RANK, K_SINGLE_PE_COUNT, deviceId, K_MAX_KEYS_PER_PE, ipPort);
         shmemInitAttempted = true;
         container->Init();
         containerInitialized = true;

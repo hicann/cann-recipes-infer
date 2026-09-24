@@ -16,8 +16,8 @@
 
 #include "acl/acl.h"
 
-#include "../op_host/dist_embedding_container.h"
-#include "device_buffer.h"
+#include "dist_embedding_container.h"
+#include "../device_buffer.h"
 
 namespace {
 
@@ -185,9 +185,8 @@ void TransferAndValidate(DistEmbeddingContainer<Key, Value>& container,
 
 void RunRankOperations(int rank, int deviceId, const char* ipPort)
 {
-    DistEmbeddingOptions options{K_TABLE_SIZE, rank, K_WORLD_SIZE, deviceId - rank,
-                                 K_MAX_KEYS_PER_PE, ipPort};
-    DistEmbeddingContainer<Key, Value> container(options);
+    DistEmbeddingContainer<Key, Value> container(
+        K_TABLE_SIZE, rank, K_WORLD_SIZE, deviceId - rank, K_MAX_KEYS_PER_PE, ipPort);
     container.Init();
     const std::vector<Entry> localEntries = MakeRankEntries(rank);
     const std::vector<Entry> expectedEntries = MakeExpectedEntries();

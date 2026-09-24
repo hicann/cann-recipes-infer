@@ -18,6 +18,7 @@ struct DisHashTableTilingData {
     uint32_t myPe;
     uint32_t maxKeysPerPe;
     uint64_t sendCountAddr;
+    uint64_t hostTableSize;
 };
 
 template <typename Tkey, typename Tvalue>

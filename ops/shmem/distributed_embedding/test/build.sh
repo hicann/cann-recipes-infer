@@ -9,6 +9,6 @@ cmake -S "${TEST_DIR}" -B "${BUILD_DIR}" \
     -DSHMEM_ROOT="${SHMEM_ROOT}" \
     -DSHMEM_LIBRARY_DIR="${SHMEM_LIBRARY_DIR}"
 if [[ $# -eq 0 ]]; then
-    set -- test_rank1 test_rank2
+    set -- d2d_rank1 d2d_rank2 d2h_rank1 d2h_rank2
 fi
 cmake --build "${BUILD_DIR}" --target "$@" -j"${BUILD_JOBS}"
