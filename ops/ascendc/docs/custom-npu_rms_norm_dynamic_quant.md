@@ -39,14 +39,14 @@ custom.npu_rms_norm_dynamic_quant(Tensor x, Tensor gamma, *, Tensor? smooth_scal
 ## 参数说明<a name="zh-cn_topic_0000001832267082_section112637109429"></a>
 
 -   **x**（`Tensor`）：公式中的输入x，必选参数，不支持非连续，数据格式支持ND，数据类型支持`float16、bfloat16`。
-    
+
 -   **gamma**（`Tensor`）：公式中的gamma，必选参数，不支持非连续，数据格式支持ND，数据类型支持`float16、bfloat16`，要求是1D的Tensor，数据类型同`x`保持一致，shape同`x`最后一维一致。
 
 - <strong>*</strong>：代表其之前的参数是位置相关的，必须按照顺序输入，属于必选参数；其之后的参数是键值对赋值，与位置无关，属于可选参数（不传入会使用默认值）。
-    
+
 -   **smooth_scale**（`Tensor`）：公式中的smoothScaleOptional，可选参数，不支持非连续，数据格式支持ND，数据类型支持`float16、bfloat16`，要求是1D的Tensor。shape和数据类型同`gamma`保持一致。
 
--   **beta**（`Tensor`）：公式中的beta，表示标准化过程中的偏置项；可选参数，不支持非连续，数据格式支持ND，数据类型支持`float16、bfloat16`，要求是1D的Tensor。shape和数据类型同`gamma`保持一致。。
+-   **beta**（`Tensor`）：公式中的beta，表示标准化过程中的偏置项；可选参数，不支持非连续，数据格式支持ND，数据类型支持`float16、bfloat16`，要求是1D的Tensor。shape和数据类型同`gamma`保持一致。
 
 -   **epsilon**（`float`）：公式中的`epsilon`，表示用于防止除0错误；可选参数，默认值1e-6。
 
