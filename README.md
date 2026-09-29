@@ -21,6 +21,7 @@
 
 ## 📰 最新动态
 
+- [2026/09] DeepSeek-V4.1-Flash 模型在昇腾 950PR/DT 系列上已支持 **单卡推理部署**
 - [2026/09] GLM-5.3-Flash 模型在昇腾 950DT 系列上已支持 **HiF8 推理部署**
 - [2026/09] DeepSeek-V4.1-Flash 模型在昇腾 950PR/DT 系列上已支持 **FP8-FP4 推理部署**，支持多模理解、Engram offload等特性
 - [2026/08] DeepSeek-V4-Flash 模型在昇腾 910B/A3 上已支持 **单卡推理部署**：attention 与热专家基于NPU计算，其余 MoE 专家 offload 到 Kunpeng CPU 并以原生 MXFP4 计算，decode 约 19–22.5 tok/s。**支持CANNLab lite-infer-and-train镜像部署**
@@ -164,6 +165,7 @@ bash infer.sh
 | [DeepSeek-V4](models/deepseek_v4/README.md)             |支持Atlas A3和950PR/DT多代际昇腾芯片，兼具1M长序列推理能力与超低交互时延表现，为DeepSeek模型支持Agentic应用提供计算底座，满足千行百业灵活要求。
 | [DeepSeek-V4-Flash 单卡（NPU + CPU MoE offload）](integration/sglang/dsv4-flash-single-npu-moe-offload/README.md) |基于SGLang框架，在**单张**Atlas A3（或910B）+ Kunpeng CPU上完成DeepSeek-V4-Flash推理：attention/shared/router/热专家走NPU W8A8，其余专家offload到CPU并以原生MXFP4计算，使能动态热专家常驻、长序列流式prefill、AscendC MXFP4算子在线转换、CPU↔NPU多流overlap等优化，A3实测decode约19–22.5 tok/s。端到端部署步骤见[使用指南](docs/integration/sglang/dsv4-flash-single-npu-moe-offload/dsv4_flash_single_card_inference_guide.md)。
 | [GLM-5.3-Flash 单卡（NPU + CPU MoE offload）](integration/sglang/glm53-flash-single-npu-moe-offload/README.md) |基于SGLang框架，在**单张**Atlas A3 die + Kunpeng CPU上完成GLM-5.3-Flash推理：attention/dense层/常驻专家走NPU INT8 W8A8，其余路由专家offload到主机DDR并以MXFP4计算，使能流式prefill与动态热专家常驻。**两个补丁均基于上游主线**（ktransformers `6d460cc1` / sglang `5aab054e`）。困惑度32窗实测3.5888，验收11/11全过。端到端步骤见[样例 README](integration/sglang/glm53-flash-single-npu-moe-offload/README.md#1-配置文件)，技术实现见[设计文档](docs/integration/sglang/glm53-flash-single-npu-moe-offload/glm53_flash_single_card_design.md)。
+| [DeepSeek-V4.1-Flash 单卡（NPU + CPU MoE offload）](integration/vllm/dsv41-flash-single-npu-moe-offload/README.md) |基于vLLM框架，在**单张**Ascend 950PR + x86 CPU上完成DeepSeek-V4.1-Flash推理：attention/稠密层/100个常驻专家走NPU，其余路由专家offload到主机内存并以原生MXFP4计算，layers.1与layers.14的engram表以只读映射常驻/dev/shm。**三棵源码树均按40位提交号固定，kt-kernel的定制改动从ktransformers主仓基线（`105359b4`）以10个patch方式应用，应用后git write-tree逐位校验**。端到端步骤见[样例 README](integration/vllm/dsv41-flash-single-npu-moe-offload/README.md#1-配置)，技术实现见[设计文档](docs/models/deepseek_v4_1/dsv41-flash-950-single-card.md)。
 | [Qwen3.5](models/qwen3_5/README.md)                 |基于Transformers库，在Atlas A3环境中完成Qwen3.5模型文生文通路适配优化，支持TP/EP并行部署，使能融合算子、图模式编译等优化特性。
 | [HunyuanVideo](models/hunyuan-video/README.md)          |基于xDiT框架，在Atlas A2环境中采用了Ulysses序列并行和RingAttention序列并行策略，同时适配了FBCache和TeaCache加速。
 | [Qwen Dense (Qwen3-8B / Qwen2.5-7B-Instruct)](models/qwen/README.md)|基于Transformers库，在Atlas A2/A3环境中完成Qwen2/Qwen3 Dense模型推理适配，通过config自动识别模型变体，使能融合算子、图模式编译、Packed Sequence（TND格式）、Page Attention等优化特性。
@@ -241,6 +243,7 @@ bash infer.sh
 │   │   └── qwen3-next
 │   └── vllm                                    # vLLM 框架集成
 │       ├── deepseek-ocr-2
+│       ├── dsv41-flash-single-npu-moe-offload
 │       ├── minimax_m2.5_mxfp4
 │       └── pd-hybrid-dp-ep
 ├── models                                      # 模型脚本目录
