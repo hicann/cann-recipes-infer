@@ -517,12 +517,18 @@ class MergedColumnParallelLinear(LinearBase):
                  quant_config: Optional = None,
                  prefix: str = "",
                  return_bias: bool = False,
+                 shard_full_size: Optional[int] = None,
+                 shard_offset: Optional[int] = None,
                  ):
         self.output_sizes = output_sizes
         self.tp_size = tp_size
         if not all(output_size % tp_size == 0 for output_size in output_sizes):
             raise RuntimeError("All output_sizes must be divisible by tp_size")
         self.tp_rank = tp_rank
+        # Non-uniform TP: per-rank checkpoint offset in the weight_loader
+        # (replaces tp_rank * shard_size).
+        self.shard_full_size = shard_full_size
+        self.shard_offset = shard_offset
         self.quant_config = quant_config
         output_size = sum(output_sizes)
         super().__init__(input_size,
@@ -646,7 +652,12 @@ class MergedColumnParallelLinear(LinearBase):
 
             param_data = param_data.narrow(output_dim, shard_offset,
                                            shard_size)
-            start_idx = self.tp_rank * shard_size
+            if self.shard_offset is not None:
+                start_idx = (self.shard_offset
+                             * loaded_weight.shape[output_dim]
+                             // self.shard_full_size)
+            else:
+                start_idx = self.tp_rank * shard_size
             # bitsandbytes loads the weights of the specific portion
             # no need to narrow here
             if not use_bitsandbytes_4bit:
@@ -709,7 +720,10 @@ class RowParallelLinear(LinearBase):
                  params_dtype: Optional[torch.dtype] = None,
                  quant_config: Optional = None,
                  prefix: str = "",
-                 return_bias: bool = False):
+                 return_bias: bool = False,
+                 shard_full_size: Optional[int] = None,
+                 shard_offset: Optional[int] = None,
+                 ):
         super().__init__(input_size,
                          output_size,
                          skip_bias_add,
@@ -725,6 +739,9 @@ class RowParallelLinear(LinearBase):
 
         self.tp_size = tp_size
         self.tp_rank = tp_rank
+        # Non-uniform TP: see MergedColumnParallelLinear.
+        self.shard_full_size = shard_full_size
+        self.shard_offset = shard_offset
         # Divide the weight matrix along the last dimension.
         self.input_size_per_partition = divide(input_size, self.tp_size)
         self.output_size_per_partition = output_size
@@ -758,7 +775,12 @@ class RowParallelLinear(LinearBase):
         # no need to narrow here
         if input_dim is not None and not use_bitsandbytes_4bit:
             shard_size = param_data.shape[input_dim]
-            start_idx = self.tp_rank * shard_size
+            if self.shard_offset is not None:
+                start_idx = (self.shard_offset
+                             * loaded_weight.shape[input_dim]
+                             // self.shard_full_size)
+            else:
+                start_idx = self.tp_rank * shard_size
             loaded_weight = loaded_weight.narrow(input_dim, start_idx,
                                                  shard_size)
 

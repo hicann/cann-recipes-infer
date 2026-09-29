@@ -46,6 +46,7 @@ Packed Sequence 的代价是请求边界无法再由张量维度直接区分，�
 model_inputs（框架与模型的边界）
 ├── input_ids: [T]
 ├── position_ids: [T]
+├── visual_embeddings: [V, H]（可选，多模态 Prefill）
 └── forward_metadata：阶段、长度、请求边界和 Cache 元数据
     ├── is_prefill
     ├── actual_seq_lengths_*
@@ -82,13 +83,16 @@ model.forward(input_ids, position_ids, forward_metadata, **kwargs)
 
 在一次 Prefill 或 Decode 执行中，框架将当前批次的输入整理为 `model_inputs`，并在调用模型的 `forward()` 时按字段传入。对于 Packed Sequence，模型需要关注其中的 token、位置信息，以及描述请求长度和边界的元数据。
 
-`ExecutionEngine._build_model_inputs()` 构造 `model_inputs`，其与 Packed Sequence 相关的顶层字段如下：
+`ExecutionEngine._build_model_inputs()` 构造基础输入，`forward_batch()` 在多模态 Prefill 时补入视觉结果。与 Packed Sequence 相关的顶层字段如下：
 
 | 字段 | 类型 | 有效部分形状 | 含义 |
 |---|---|---|---|
 | `input_ids` | `torch.Tensor` | `[T]` | 按请求顺序排列的当前 step 输入 token。 |
 | `position_ids` | `torch.Tensor` | `[T]` | 每个 token 在所属请求序列中的位置整数索引。 |
+| `visual_embeddings` | `torch.Tensor`（可选） | `[V, H]` | 当前 Prefill batch 按请求顺序拼接的视觉 embedding；`V` 为视觉行数，`H` 为 embedding 维度。 |
 | `forward_metadata` | `ForwardMetaData` | — | 当前 forward 所需的阶段、长度、边界和 Cache 信息。 |
+
+多模态请求使用 Processor 展开后的最终 `input_ids` 参与 packed 拼接；`visual_embeddings` 从 `MMEmbeddingStore` 按当前请求顺序取出，模型负责将视觉行映射到对应的 token 位置及 CP 分片。该参数不放入 `ForwardMetaData`，Encoder 内部的图片布局也不由文本 packed 契约规定，详见 [MM Encode 机制](mm_encode_design.md)。
 
 `ForwardMetaData` 中与 Packed Sequence 相关的主要字段如下：
 

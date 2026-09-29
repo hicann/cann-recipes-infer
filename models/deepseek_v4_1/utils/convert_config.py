@@ -31,12 +31,23 @@ def generate_ignore_item(num_layers, compress_ratios, kv_source_layers=None, ind
     Generate a list of layer names to be ignored during quantization.
     """
     ignore = []
+    if num_layers is None or compress_ratios is None:
+        raise ValueError("num_hidden_layers and compress_ratios are required")
+    if len(compress_ratios) < num_layers:
+        raise ValueError(
+            f"compress_ratios has {len(compress_ratios)} entries, "
+            f"but num_hidden_layers is {num_layers}"
+        )
     if kv_source_layers is not None or index_source_layers is not None:
         for i in (index_source_layers or []):
+            if i < 0 or i >= num_layers:
+                raise ValueError(f"index source layer {i} is out of range")
             ignore.append(f"layers.{i}.attn.indexer.weights_proj")
             ignore.append(f"layers.{i}.attn.indexer.compressor.wgate")
             ignore.append(f"layers.{i}.attn.indexer.compressor.wkv")
         for i in (kv_source_layers or []):
+            if i < 0 or i >= num_layers:
+                raise ValueError(f"KV source layer {i} is out of range")
             ignore.append(f"layers.{i}.attn.compressor.wgate")
             ignore.append(f"layers.{i}.attn.compressor.wkv")
         ignore.append('head')
@@ -117,8 +128,8 @@ def main(fp8_path, is_mx=False):
     fields = config.get("text_config") or config
     num_layers = fields['num_hidden_layers']
     compress_ratios = fields['compress_ratios']
-    kv_source_layers = fields.get('kv_source_layers')
-    index_source_layers = fields.get('index_source_layers')
+    kv_source_layers = fields.get('kv_source_layers', fields.get('kv_source_layer_ids'))
+    index_source_layers = fields.get('index_source_layers', fields.get('index_source_layer_ids'))
     cache_scheme = {"kv_cache_scheme": {"num_bits": NUM_BITS_8, "type": "float"},
                     "comp_cache_scheme": {"num_bits": NUM_BITS_4, "type": "float"},
                     "li_cache_scheme": {"num_bits": NUM_BITS_4, "type": "float"}}
@@ -142,8 +153,8 @@ def main(fp8_path, is_mx=False):
 if __name__ == "__main__":
     parser = ArgumentParser()
     parser.add_argument("--input_fp8_hf_path", type=str, required=True)
-    parser.add_argument("--is_mx", action="store_true", 
-                         help="generate MX group-quantized (group_size 32) config " 
+    parser.add_argument("--is_mx", action="store_true",
+                         help="generate MX group-quantized (group_size 32) config "
                               "instead of the default block fp8 config")
     args = parser.parse_args()
     main(args.input_fp8_hf_path, is_mx=args.is_mx)

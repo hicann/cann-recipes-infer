@@ -1,4 +1,27 @@
-## built-in
+# coding=utf-8
+# Adapted from
+# https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/main/inference/model.py
+# https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/main/inference/engram.py
+# Copyright (c) 2026 Huawei Technologies Co., Ltd.
+# Copyright 2023 DeepSeek-AI and The HuggingFace Inc. team. All rights reserved.
+#
+# This code is based on EleutherAI's GPT-NeoX library and the GPT-NeoX
+# and OPT implementations in this library. It has been modified from its
+# original forms to accommodate minor architectural differences compared
+# to GPT-NeoX and OPT used by the Meta AI team that trained the model.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from typing import List
 import math
 from dataclasses import dataclass
@@ -15,6 +38,17 @@ from transformers import AutoTokenizer
 from tokenizers import normalizers, Regex
 from executor.core.config import InferenceConfig, CommManager, PlatformVersion
 from module.linear import VocabParallelEmbedding, ReplicatedLinear, set_weight_attrs
+
+
+def _get_engram_kernel(infer_config: InferenceConfig) -> str:
+    kernel_config = infer_config.model_config.custom_params.get("kernel_config", {})
+    kernel = kernel_config.get("engram", "native")
+    if kernel not in ("native", "tilelang"):
+        raise ValueError(
+            f"Unsupported kernel implementation {kernel!r} for 'engram'. "
+            "Expected 'native' or 'tilelang'."
+        )
+    return kernel
 
 
 def build_compressed_token_map(tokenizer) -> tuple[list[int], int]:
@@ -158,6 +192,7 @@ class NgramHashState(nn.Module):
         self.layout = layout
         self.config = config
         self.infer_config = infer_config
+        self.engram_kernel = _get_engram_kernel(infer_config)
         self.max_ngram_size = layout.max_ngram_size
         # every hash multiplier derives from the compressed vocab size, so a mismatch there would
         # silently rehash the whole table
@@ -178,6 +213,7 @@ class NgramHashState(nn.Module):
         input_ids: torch.Tensor,
         prefix_input_ids: torch.Tensor = None,
         ngram_shift_mask: torch.Tensor = None,
+        is_prefill: bool = False,
     ) -> torch.Tensor:
         x = input_ids
         B, T = x.shape
@@ -221,6 +257,19 @@ class NgramHashState(nn.Module):
             shift_stack = torch.where(mask, shift_stack, pad_value)
         tokens = shift_stack
 
+        if is_prefill and self.engram_kernel == "tilelang":
+            from tile_kernels.engram import engram_hash
+
+            ngram_token_ids = tokens.reshape(-1, self.max_ngram_size).to(torch.int32)
+            hashes_out = engram_hash(
+                ngram_token_ids,
+                self.multipliers,
+                self.primes.to(torch.int32),
+                self.offsets.to(torch.int32),
+            )
+            # [n_engram_layers, T, num_out_cols] -> [1, T, n_engram_layers, num_out_cols]
+            return hashes_out.permute(1, 0, 2).unsqueeze(0)
+
         # XOR the multiplied ids together one lookback at a time, so the running value after step i
         # is the hash of the (i+1)-gram; each lands in its own prime-sized bucket range
         products = tokens.unsqueeze(2) * self.multipliers  # [B, L, n_engram_layers, max_ngram_size]
@@ -239,15 +288,34 @@ class NgramHashState(nn.Module):
         if is_prefill:
             input_ids = input_ids.unsqueeze(0)
         else:
-            input_ids = input_ids.view(-1, 1) # not support speculative decoding
+            if prefix_input_ids is None:
+                input_ids = input_ids.view(-1, 1)
+            else:
+                # Speculative verification packs B * Q query tokens into one
+                # dimension, while Engram history remains [B, ngram_size - 1].
+                # Restore [B, Q] so prefix and query rows describe the same
+                # requests and n-grams may continue across the whole query block.
+                batch_size = prefix_input_ids.shape[0]
+                if input_ids.numel() % batch_size != 0:
+                    raise ValueError(
+                        "Engram decode input cannot be reshaped to the prefix batch: "
+                        f"input_ids.numel()={input_ids.numel()}, batch_size={batch_size}"
+                    )
+                input_ids = input_ids.reshape(batch_size, -1)
         return self._get_ngram_hashes(
             input_ids,
             prefix_input_ids=prefix_input_ids,
             ngram_shift_mask=ngram_shift_mask,
+            is_prefill=is_prefill,
         )
 
 
 class MultiHeadEmbedding(VocabParallelEmbedding):
+    def reset_parameters(self):
+        # The loader fully overwrites this shared (zero_ + copy),
+        # so skip nn.Embedding's normal_ init.
+        pass
+
     def __init__(
         self,
         num_embeddings: int,
@@ -284,6 +352,9 @@ class MultiHeadEmbedding(VocabParallelEmbedding):
             else 0
         )
         self._engram_offloaded = False
+        self._mxfp8_shard = None
+        self._mxfp8_sf = None
+        self._mxfp8_block_size = 0
         padded_total_N = (
             (num_embeddings + self.engram_tp_size - 1) // self.engram_tp_size
         ) * self.engram_tp_size
@@ -318,7 +389,7 @@ class MultiHeadEmbedding(VocabParallelEmbedding):
         super().weight_loader(param, loaded_weight)
 
     def fp8_weight_loader(self, param, quant_weight, scale):
-        """Dequantize and load only this rank's Engram embedding shard."""
+        """Load an Engram FP8 shard or prepare it for offload."""
         if quant_weight.ndim != 2 or scale.ndim != 2:
             raise ValueError(
                 "Engram FP8 weight and scale must both be two-dimensional, "
@@ -345,6 +416,27 @@ class MultiHeadEmbedding(VocabParallelEmbedding):
                 f"parameter={tuple(param.shape)}, expected={(shard_rows, cols)}"
             )
 
+        if self.engram_offload:
+            if scale.dtype != torch.float8_e8m0fnu:
+                raise TypeError(
+                    "Engram MXFP8 offload requires an E8M0 scale table, "
+                    f"got dtype={scale.dtype}"
+                )
+            mxfp8_shard = torch.zeros(
+                self.input_size_per_partition, cols, dtype=quant_weight.dtype
+            )
+            if shard_start < shard_end:
+                mxfp8_shard[:shard_end - shard_start].copy_(
+                    quant_weight[shard_start:shard_end]
+                )
+            self._mxfp8_shard = mxfp8_shard
+            padded_rows = self.input_size_per_partition * self.engram_tp_size
+            sf_full = torch.full((padded_rows, scale_cols), 127, dtype=torch.uint8)
+            sf_full[:scale_rows].copy_(scale.view(torch.uint8))
+            self._mxfp8_sf = sf_full.view(torch.float8_e8m0fnu)
+            self._mxfp8_block_size = block_size
+            return
+
         param.data.zero_()
         if shard_start < shard_end:
             local_scale = scale[shard_start:shard_end].to(
@@ -358,20 +450,29 @@ class MultiHeadEmbedding(VocabParallelEmbedding):
             param.data[:shard_end - shard_start].copy_(dequant_weight)
 
     def offload_weights(self):
-        """Move the loaded local BF16 embedding shard into host storage."""
+        """Move the loaded local embedding shard into host storage."""
         from cann_ops_transformer.ops import ElasticBuffer
 
         if not self.engram_offload:
             raise RuntimeError("offload_weight_loader is only valid in offload mode")
         if self._engram_offloaded:
             return
-        if self.weight.dtype != torch.bfloat16:
+        if self._mxfp8_shard is not None:
+            storage = self._mxfp8_shard
+            sf = (
+                self._mxfp8_sf.view(torch.uint8)
+                .to(torch.device("npu", torch.npu.current_device()))
+                .view(torch.float8_e8m0fnu)
+            )
+        elif self.weight.dtype == torch.bfloat16:
+            storage, sf = self.weight, None
+        else:
             raise TypeError(
-                "ElasticBuffer only accepts BF16 Engram embeddings, "
+                "ElasticBuffer only accepts BF16 or MXFP8 Engram embeddings, "
                 f"but the loaded shard has dtype={self.weight.dtype}"
             )
         num_cpu_bytes = ElasticBuffer.get_engram_storage_size_hint(
-            self.input_size_per_partition, self.embedding_dim, torch.bfloat16
+            self.input_size_per_partition, self.embedding_dim, storage.dtype
         )
         self.engram_buffer = ElasticBuffer(
             self.engram_tp_group,
@@ -381,7 +482,10 @@ class MultiHeadEmbedding(VocabParallelEmbedding):
         # Safetensors are yielded from CPU. ElasticBuffer's device-side write
         # API consumes an NPU tensor, so keep this transfer temporary and do
         # not retain a second copy as a module member.
-        self.engram_buffer.engram_write(self.weight)
+        self.engram_buffer.engram_write(storage, sf=sf)
+        if self._mxfp8_shard is not None:
+            self._mxfp8_shard = None
+            self._mxfp8_sf = None
         del self.weight
         self._engram_offloaded = True
 
@@ -429,6 +533,17 @@ class MultiHeadEmbedding(VocabParallelEmbedding):
                 flat_input_ids.reshape(-1).to(torch.int32)
             )
             output = wait_callable()
+            if isinstance(output, tuple):
+                fetched, fetched_sf = output
+                sf = (
+                    (fetched_sf.view(torch.uint8).to(torch.int32) << 23)
+                    .view(torch.float32)
+                )
+                output = (
+                    fetched.to(torch.float32)
+                    .unflatten(-1, (-1, self._mxfp8_block_size))
+                    * sf.unsqueeze(-1)
+                ).flatten(-2).to(torch.bfloat16)
             return output.view(*shape, self.embedding_dim)
         if self.engram_tp_group is None or self.engram_tp_size == 1:
             return (
@@ -461,6 +576,7 @@ class Engram(nn.Module):
         self.layer_id = layer_id
         self.config = config
         self.infer_config = infer_config
+        self.engram_kernel = _get_engram_kernel(infer_config)
         self.comm_manager = comm_manager
         self.hidden_size = config.hidden_size
         self.hc_mult = config.hc_mult
@@ -486,16 +602,9 @@ class Engram(nn.Module):
         self.k_weight = nn.Parameter(torch.ones(config.hc_mult, self.hidden_size))
         self.clamp_value = 1e-6
 
-    def forward(self, hidden_states, engram_hash, is_prefill=False, engram_metadata=None, image_mask=None):
-        """
-        Forward pass for Engram layer.
-        hidden_states: [T, HC_MULT, D]
-        engram_metadata: preprocessed Engram runtime tensors from attention metadata.
-        image_mask: True at image spans, where the gate shuts for pass-through.
-        """
-        engram_metadata = engram_metadata or {}
-
-        embeddings = self.multi_head_embedding(
+    def precompute_embeddings(self, engram_hash, is_prefill=False):
+        """Stage 1: embedding lookup — does not depend on hidden_states."""
+        return self.multi_head_embedding(
             engram_hash,
             is_prefill=is_prefill,
         ).reshape(
@@ -504,10 +613,76 @@ class Engram(nn.Module):
             * self.n_hash_cols
         )
 
+    def precompute_kv(self, embeddings, is_prefill=False):
+        """Stage 2: wkv projection — Cube-heavy, does not depend on hidden_states.
+
+        For prefill with the TileLang backend: return (kv_bf16, weight_fused) where
+        kv_bf16 is [T, hc)mult+1, D] bfloat16 (unsplit) and weight_fused is
+        [hc_mult, D] float32 (from fused_weight kernel).
+        Otherwise returns (key, value, weight) through the native PyTorch path.
+        """
         kv = self.wkv(embeddings)
+        if is_prefill and self.engram_kernel == "tilelang":
+            from tile_kernels.engram import fused_weight
+
+            kv = kv.reshape(-1, self.hc_mult + 1, self.hidden_size)
+            if kv.dtype != torch.bfloat16:
+                kv = kv.to(torch.bfloat16)
+            weight_fused = fused_weight(
+                self.q_weight.to(torch.bfloat16),
+                self.k_weight.to(torch.bfloat16),
+            )
+            return kv, weight_fused
         key, value = kv.split([self.hc_mult * self.hidden_size, self.hidden_size], dim=-1)
         key = key.float().unflatten(-1, (self.hc_mult, self.hidden_size))
-        weight = self.q_weight.float() * self.k_weight.float()  # only ever used as a product
+        weight = self.q_weight.float() * self.k_weight.float()
+        return key, value, weight
+
+    def precompute(self, engram_hash, is_prefill=False):
+        """Run Stage 1 + Stage 2 together.  Returns (key, value, weight)
+        for decode or (kv_bf16, weight_fused) for prefill."""
+        embeddings = self.precompute_embeddings(engram_hash, is_prefill=is_prefill)
+        return self.precompute_kv(embeddings, is_prefill=is_prefill)
+
+    def forward(self, hidden_states, engram_hash=None, is_prefill=False,
+                engram_metadata=None, image_mask=None, precomputed=None):
+        """Stage 3: gating — depends on hidden_states.
+
+        hidden_states: [T, HC_MULT, D]
+        precomputed: optional (key, value, weight) from the native backend,
+                     or (kv_bf16, weight_fused) from TileLang prefill.
+        image_mask: True at image spans, where the gate shuts for pass-through.
+        """
+        if is_prefill and self.engram_kernel == "tilelang":
+            from tile_kernels.engram import engram_gate_fwd
+
+            if precomputed is not None:
+                kv, weight_fused = precomputed
+            else:
+                embeddings = self.precompute_embeddings(engram_hash, is_prefill=is_prefill)
+                kv, weight_fused = self.precompute_kv(embeddings, is_prefill=is_prefill)
+
+            output, _, _, _, _ = engram_gate_fwd(
+                hidden_states,
+                kv,
+                weight_fused,
+                self.eps,
+                self.clamp_value,
+                save_for_backward=False,
+                image_token_mask = image_mask,
+                inplace=False,
+            )
+            return output
+
+        # Native PyTorch path for decode and for prefill without TileLang.
+        engram_metadata = engram_metadata or {}
+
+        if precomputed is not None:
+            key, value, weight = precomputed
+        else:
+            embeddings = self.precompute_embeddings(engram_hash, is_prefill=is_prefill)
+            key, value, weight = self.precompute_kv(embeddings)
+
         h, eps = hidden_states.float(), self.eps
         # normalized per (token, hc copy) over `dim`, NOT jointly over the copies
         rstd = torch.rsqrt(h.square().mean(-1) + eps) * torch.rsqrt(key.square().mean(-1) + eps)

@@ -80,6 +80,9 @@ speculative_config:
 - `max_prefill_tokens`: 单次 prefill batch 的最大 prompt token 预算（默认 0）。
   当设置为 0 时，框架默认按 `input_truncated_len * batch_size_per_dp_rank` 计算预算。
   在 executor-core 支持的模型中，prefill 默认采用 packed sequence 方式执行，该参数用于限制 packed 后单批次的 token 总量。
+- `max_mm_encode_tokens`: 单次 MM Encode 的全局多模态 token 打包目标（默认 0）。
+  设置为 0 或负数时不限制该目标；正数时，每个 Prefill DP 副本使用 `ceil_div(max_mm_encode_tokens, cp_prefill_dp_size)` 作为本地目标。
+  调度器按 FIFO 累计 `Request.mm_token_count`，整请求入批；队头请求可单独超过目标，因此该参数不是单请求长度限制或严格的内存上限。
 - `batch_size_per_dp_rank`: **不支持配置**。每个 Rank 的 Batch Size。推导方式：`batch_size // attn_dp_size`。
 - `mem_fraction_static`: 静态内存分配比例（默认 0.85），用于控制推理阶段可用于静态占用的设备内存比例。
 - `block_size`: 单个 KV Cache block 可容纳的 token 数（默认 128），用于控制 Paged Attention 的 block 粒度。

@@ -28,12 +28,12 @@ apart. The IMAGE slots are filled with aligner rows in reading order.
 
 import base64
 import io
-import math
 import json
+import math
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 from urllib.request import urlopen
-from urllib.parse import unquote, urlparse
+
 import numpy as np
 import torch
 from PIL import Image, ImageOps
@@ -87,15 +87,16 @@ def image_token_types(n_llm_h: int, n_llm_w: int) -> torch.Tensor:
     types.append(IMAGE_END)
     return torch.tensor(types, dtype=torch.int64)
 
+
 def plan_image_grid(
-        width: int,
-        height: int,
-        patch_size: int,
-        downsample_ratio: int,
-        max_n_token: int,
-        min_pixels: int,
-        max_wh_ratio: int | None,
-        ):
+    width: int,
+    height: int,
+    patch_size: int,
+    downsample_ratio: int,
+    max_n_token: int,
+    min_pixels: int,
+    max_wh_ratio: int | None,
+):
     """Resize plan for an image of the given original size; a pure function of its arguments."""
     if max_wh_ratio is not None and width > height * max_wh_ratio:
         width = height * max_wh_ratio
@@ -105,7 +106,16 @@ def plan_image_grid(
         height = int(height * ratio)
     best_width = math.ceil(width / patch_size) * patch_size
     best_height = math.ceil(height / patch_size) * patch_size
-    return safe_resize(height, width, best_height, best_width, patch_size, downsample_ratio, max_n_token)
+    return safe_resize(
+        height,
+        width,
+        best_height,
+        best_width,
+        patch_size,
+        downsample_ratio,
+        max_n_token,
+    )
+
 
 class DeepseekV41ImageProcessor(BaseMMProcessor):
     """Expand image placeholders and materialize vision inputs."""
@@ -119,7 +129,12 @@ class DeepseekV41ImageProcessor(BaseMMProcessor):
         vision = config["vision_config"]
         self.vision_patch_size = int(vision["patch_size"])
         self.vision_downsample_ratio = int(vision["downsample_ratio"])
-        self.vision_max_n_token = int(vision["max_num_tokens"])
+        max_image_tokens = vision.get("max_num_tokens", vision.get("max_image_tokens"))
+        if max_image_tokens is None:
+            raise KeyError(
+                "vision_config must define max_image_tokens (or legacy max_num_tokens)"
+            )
+        self.vision_max_n_token = int(max_image_tokens)
         self.vision_min_pixels = int(vision["min_pixels"])
         self.vision_max_wh_ratio = vision.get("max_wh_ratio")
         self.vision_enabled = int(vision["num_hidden_layers"]) > 0
@@ -184,18 +199,29 @@ class DeepseekV41ImageProcessor(BaseMMProcessor):
         p = self.vision_patch_size
         image = self._load_image(record)
         n_llm_h, n_llm_w, best_height, best_width = plan_image_grid(
-            image.width,image.height, p,
-            self.vision_downsample_ratio, self.vision_max_n_token,
-            self.vision_min_pixels, self.vision_max_wh_ratio,
+            image.width,
+            image.height,
+            p,
+            self.vision_downsample_ratio,
+            self.vision_max_n_token,
+            self.vision_min_pixels,
+            self.vision_max_wh_ratio,
         )
         n_vit_h, n_vit_w = best_height // p, best_width // p
-        if self.vision_max_wh_ratio is not None and image.width >= self.vision_max_wh_ratio * image.height:
+        if (
+            self.vision_max_wh_ratio is not None
+            and image.width >= self.vision_max_wh_ratio * image.height
+        ):
             image = image.resize((best_width, best_height))
         else:
             image = ImageOps.pad(image, (best_width, best_height), color=(127, 127, 127))
         x = torch.from_numpy(np.asarray(image, dtype=np.float32)).permute(2, 0, 1) / 255
         x = ((x - 0.5) / 0.5).to(torch.bfloat16)
-        patches = x.reshape(3, n_vit_h, p, n_vit_w, p).permute(1, 3, 0, 2, 4).reshape(n_vit_h * n_vit_w, 3, p, p)
+        patches = (
+            x.reshape(3, n_vit_h, p, n_vit_w, p)
+            .permute(1, 3, 0, 2, 4)
+            .reshape(n_vit_h * n_vit_w, 3, p, p)
+        )
         return patches, n_vit_h, n_vit_w, n_llm_h, n_llm_w
 
     def process(self, request) -> None:
@@ -216,7 +242,10 @@ class DeepseekV41ImageProcessor(BaseMMProcessor):
                 f"Found {placeholder_count} image tokens but got {len(image_records)} images"
             )
         if not self.vision_enabled:
-            raise ValueError("The model config has no vision tower (vision_n_layers == 0) but the prompt contains images")
+            raise ValueError(
+                "The model config has no vision tower (vision_n_layers == 0) "
+                "but the prompt contains images"
+            )
 
         tokens = []
         images = []

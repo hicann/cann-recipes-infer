@@ -255,6 +255,7 @@ class SpeculativeConfig:
     draft_model_path: str | None = None
     confidence_threshold: float = 0.0
     draft_temperature: float | None = None
+    markov_lmhead_tp_size: int = 1
 
     @property
     def enabled(self) -> bool:
@@ -281,6 +282,9 @@ class SpeculativeConfig:
                 if speculative_config_dict.get("draft_temperature") is not None
                 else None
             ),
+            markov_lmhead_tp_size=int(
+                speculative_config_dict.get("markov_lmhead_tp_size", 1)
+            ),
         )
         config.validate()
         return config
@@ -306,6 +310,11 @@ class SpeculativeConfig:
             raise ValueError(
                 "speculative_config.draft_temperature must be non-negative, "
                 f"got {self.draft_temperature}"
+            )
+        if isinstance(self.markov_lmhead_tp_size, bool) or self.markov_lmhead_tp_size <= 0:
+            raise ValueError(
+                "speculative_config.markov_lmhead_tp_size must be a positive integer, "
+                f"got {self.markov_lmhead_tp_size}"
             )
         if not self.enabled:
             return

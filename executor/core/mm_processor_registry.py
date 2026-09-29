@@ -19,7 +19,7 @@ import importlib
 
 
 _MM_PROCESSOR_SPECS: dict[str, tuple[str, str]] = {
-    "deepseek_v4_1":(
+    "deepseek_v4_1": (
         "models.deepseek_v4_1.utils.image_processor",
         "DeepseekV41ImageProcessor",
     ),

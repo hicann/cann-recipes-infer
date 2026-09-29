@@ -277,6 +277,30 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         return {"sliding_window": next(iter(sliding_windows))}
 
 
+class RingCacheManager(SingleTypeKVCacheManager):
+    """Manager for one fixed-capacity circular cache block per request."""
+
+    def pre_allocate_blocks(
+        self,
+        request_id: int,
+        num_tokens: int,
+        reserved_tokens: int = 0,
+    ) -> tuple:
+        """Claim one block on admission and reuse it until the request ends."""
+        if num_tokens < 0:
+            raise ValueError("num_tokens must be non-negative")
+        need_block_num = 0 if self.req_to_blocks.get(request_id) else 1
+        return need_block_num, need_block_num <= self.get_num_free_blocks()
+
+    def get_num_skipped_tokens(self, _num_computed_tokens: int) -> int:
+        """Ring slots are overwritten without releasing the request's block."""
+        return 0
+
+    @staticmethod
+    def validate_and_build_kwargs(group_entries: List[CacheEntry]) -> Dict[str, object]:
+        return {}
+
+
 class MambaManager(SingleTypeKVCacheManager):
     """Manager for fixed-size Mamba state cache."""
 
@@ -332,6 +356,7 @@ class MambaManager(SingleTypeKVCacheManager):
 ATTN_TYPE_MANAGER_MAP: Dict[str, Type[SingleTypeKVCacheManager]] = {
     "FullAttention": FullAttentionManager,
     "SlidingWindow": SlidingWindowManager,
+    "RingCache": RingCacheManager,
     "Mamba": MambaManager,
 }
 

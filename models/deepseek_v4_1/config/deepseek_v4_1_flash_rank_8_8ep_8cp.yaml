@@ -1,0 +1,57 @@
+model_config:
+  model_name: "deepseek_v4_1"
+  model_path: "/data/models/deepseek_v4_1_hybrid_mxfp8_mxfp4"
+  platform_version: "950"
+  dtype: "bfloat16"
+  with_ckpt: True
+  exe_mode: "npugraph_ex"
+  enable_static_kernel: False
+  enable_dynamic_graph: False
+  enable_profiler: True
+  force_eplb: False
+  enable_cache_compile: False
+  enable_weight_nz: True
+  custom_params:
+    kernel_config:
+      # Options: ascendc (indexer_prologue_qw fused op) or native (original op chain).
+      indexer_prolog_qw: ascendc
+      megamoe: ascendc  # ascendc or deepgemm (DeepSeek opensource MegaMoE kernel)
+      gate_topk: ascendc
+      hc_post: ascendc
+    enable_multi_streams: True
+    # Only applies to npugraph_ex; leave unset or False for eager/ge_graph.
+    unsafe_skip_npugraph_capture_validation: False
+    enable_mega_moe: True
+    enable_superkernel: False
+    enable_engram_offload: True
+    engram_tp_size: 8
+
+speculative_config:  # Speculative decoding
+  num_speculative_tokens: 5  # Maximum draft tokens per proposal
+  method: "dspark"  # ["mtp", "dspark"]
+  markov_lmhead_tp_size: 1
+  draft_model_path: ""  # Empty: reuse model_path
+  confidence_threshold: 0.0  # 0 disables confidence truncation
+  draft_temperature:  # Empty: inherit request temperature
+
+data_config:
+  dataset: "InfiniteBench"
+  input_truncated_len: 131072
+  temperature: 0
+
+parallel_config:
+  world_size: 8
+  attn_tp_size: 1
+  dense_tp_size: 1
+  moe_tp_size: 1
+  embed_tp_size: 1
+  lmhead_tp_size: 8
+  o_proj_tp_size: 1
+  cp_size: 8
+
+scheduler_config:
+  block_size: 128
+  max_new_tokens: 256
+  max_prefill_tokens: 131072
+  batch_size: 8
+  cp_mini_batch: 1

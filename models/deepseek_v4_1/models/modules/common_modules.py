@@ -1,6 +1,6 @@
 # coding=utf-8
 # Adapted from
-# https://huggingface.co/deepseek-ai/DeepSeek-V3/blob/main/modeling_deepseek.py
+# https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/main/inference/model.py
 # Copyright (c) 2026 Huawei Technologies Co., Ltd.
 # Copyright 2023 DeepSeek-AI and The HuggingFace Inc. team. All rights reserved.
 #
@@ -34,6 +34,7 @@ from functools import lru_cache
 
 import torch_npu
 import cann_ops_transformer
+import cann_ops_transformer_experimental
 from transformers.modeling_attn_mask_utils import (
     AttentionMaskConverter,
     _prepare_4d_attention_mask,
@@ -49,7 +50,7 @@ from transformers.utils import (
     logging,
 )
 
-from ..configuration_deepseek import DeepseekV3Config
+from ..configuration_deepseek import DeepseekV41Config
 from executor.utils import align_up
 from executor.core.config import PlatformVersion
 
@@ -62,22 +63,88 @@ except ImportError:
     _torch_fx_available = False
 
 
-# FP8 KV caches use a packed record (nope + rope + scales + padding), stored as raw bytes.
+# Quantized KV records contain all-head data, BF16 group scales and padding.
 PACKED_KV_STORAGE_DTYPE = torch.uint8
 PACKED_KV_COMPUTE_DTYPE = torch.float8_e4m3fn
 
 
-def is_packed_kv_layout(kv_cache_quant_mode: str) -> bool:
-    # Only the FP8 record has the extra packed fields and needs a FLOAT8 view.
-    return kv_cache_quant_mode == "float8"
+def has_cp_decode_requests(cp_metadata: dict) -> bool:
+    """True when this rank owns the persistent cache of at least one request in this step."""
+    decode_token_indices = cp_metadata.get("decode_token_indices")
+    return decode_token_indices is not None and decode_token_indices.numel() > 0
 
 
-def get_kv_cache_dim(head_dim: int, rope_head_dim: int, kv_cache_quant_mode: str) -> int:
-    if not is_packed_kv_layout(kv_cache_quant_mode):
-        return head_dim
-    nope_head_dim = head_dim - rope_head_dim
-    # nope(fp8 1B) + rope(bf16 2B) + scales(bf16 2B per group, group_size=64)
-    return align_up(nope_head_dim + 2 * rope_head_dim + 2 * nope_head_dim // 64, 32)
+def get_cp_tmp_cache(attn_metadata: dict, compress_ratio: int):
+    """Full-length temporary cache of this ratio, used by offline CP prefill; None otherwise."""
+    if not (attn_metadata["is_prefill"] and attn_metadata.get("cp_metadata")):
+        return None
+    return attn_metadata["cp_metadata"]["cp_tmp_cache"].get(f"{compress_ratio}")
+
+
+def get_cmp_block_table(attn_metadata: dict, compress_ratio: int,
+                        suffix: str = "cmp_kv") -> torch.Tensor:
+    """Block table of a compressed cache: the temporary one under offline CP prefill, else the scheduled one."""
+    block_table_key = f"c{compress_ratio}a_{suffix}"
+    tmp_block_table = attn_metadata.get("tmp_block_table")
+    if tmp_block_table:
+        return tmp_block_table[block_table_key]
+    return attn_metadata["block_table"][block_table_key]
+
+
+def select_cp_segments(per_token_tensor: torch.Tensor, cp_metadata: dict) -> torch.Tensor:
+    """Keep the two zigzag segments this rank owns, for any tensor with one entry per token."""
+    segments = torch.split(per_token_tensor, cp_metadata["split_list"], dim=0)
+    return torch.cat([segments[i] for i in cp_metadata["zigzag_idx"]], dim=0)
+
+
+def scatter_cache_rows(cache: torch.Tensor, slot_mapping: torch.Tensor, rows: torch.Tensor) -> None:
+    """Write already quantized cache rows by slot, without going through the quantizing writer.
+
+    A padding slot carries -1. Those rows are sent to block 0, which BlockPool keeps as the null
+    block and never hands out, so the write lands where nothing reads it.
+    """
+    slots = slot_mapping.reshape(-1)
+    torch_npu.npu_scatter_nd_update_(
+        cache.view(-1, cache.shape[-1]),
+        torch.where(slots >= 0, slots, torch.zeros_like(slots)).reshape(-1, 1).to(torch.int32),
+        rows,
+    )
+
+
+def gather_cp_segments(local_rows: torch.Tensor, cp_metadata: dict, cp_group) -> torch.Tensor:
+    """Gather both zigzag segments from every rank and restore the sequence order.
+
+    Every rank sends two segments padded to the same length, so the gathered buffer is
+    ordered by rank and reverse_index maps it back to segment order.
+    """
+    row_dim = local_rows.shape[-1]
+    cp_size = dist.get_world_size(cp_group)
+    gathered = local_rows.new_empty([local_rows.shape[0] * cp_size, row_dim])
+    dist.all_gather_into_tensor(gathered, local_rows, group=cp_group)
+    gathered = gathered.view(-1, local_rows.shape[0] // 2, row_dim)[cp_metadata["reverse_index"]]
+    return gathered.flatten(0, 1)
+
+
+def pick_request_tail(all_rows: torch.Tensor, cp_metadata: dict, request: int, window: int) -> torch.Tensor:
+    """Last window of one request, joined with the previous segment when its last segment is partial.
+
+    all_rows holds one window per segment per request, shaped [segment, request, window, dim].
+    """
+    last_segment = cp_metadata["last_segment_idx"][request]
+    last_kv_len = cp_metadata["last_kv_len"][request]
+    if last_kv_len >= window or last_segment == 0:
+        return all_rows[last_segment, request]
+    return torch.cat([
+        all_rows[last_segment - 1, request][last_kv_len - window:],
+        all_rows[last_segment, request][:last_kv_len],
+    ], dim=0)
+
+
+def get_kv_cache_dim(head_dim: int, *, is_compressed: bool = False) -> int:
+    data_bytes = head_dim // 2 if is_compressed else head_dim
+    quant_group_size = 16 if is_compressed else 32
+    # FP8/FP4 data followed by one BF16 scale per quantization group.
+    return align_up(data_bytes + 2 * (head_dim // quant_group_size), 32)
 
 
 def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor, inverse: bool = False) -> torch.Tensor:
@@ -139,13 +206,13 @@ if _torch_fx_available:
 
 logger = logging.get_logger(__name__)
 
-_CONFIG_FOR_DOC = "DeepseekV3Config"
+_CONFIG_FOR_DOC = "DeepseekV41Config"
 
 
-class DeepseekV3RMSNorm(nn.Module):
+class DeepseekV41RMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
         """
-        DeepseekV3RMSNorm is equivalent to T5LayerNorm
+        DeepseekV41RMSNorm is equivalent to T5LayerNorm
         """
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size, dtype=torch.bfloat16))
@@ -169,14 +236,14 @@ class DeepseekV3RMSNorm(nn.Module):
             return (y, x)
         else:
             raise NotImplementedError(
-                f"insupportable DeepseekV3RMSNorm for input_args len as (include hid): {len(args) + 1}"
+                f"insupportable DeepseekV41RMSNorm for input_args len as (include hid): {len(args) + 1}"
             )
 
 
-ALL_LAYERNORM_LAYERS.append(DeepseekV3RMSNorm)
+ALL_LAYERNORM_LAYERS.append(DeepseekV41RMSNorm)
 
 
-class DeepseekV3RotaryEmbedding(nn.Module):
+class DeepseekV41RotaryEmbedding(nn.Module):
     def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None):
         super().__init__()
 
@@ -223,9 +290,9 @@ class DeepseekV3RotaryEmbedding(nn.Module):
         )
 
 
-# Copied from transformers.models.llama.modeling_llama.LlamaLinearScalingRotaryEmbedding with Llama->DeepseekV3
-class DeepseekV3LinearScalingRotaryEmbedding(DeepseekV3RotaryEmbedding):
-    """DeepseekV3RotaryEmbedding extended with linear scaling. Credits to the Reddit user /u/kaiokendev"""
+# Copied from transformers.models.llama.modeling_llama.LlamaLinearScalingRotaryEmbedding with Llama->DeepseekV41
+class DeepseekV41LinearScalingRotaryEmbedding(DeepseekV41RotaryEmbedding):
+    """DeepseekV41RotaryEmbedding extended with linear scaling. Credits to the Reddit user /u/kaiokendev"""
 
     def __init__(
         self,
@@ -252,10 +319,10 @@ class DeepseekV3LinearScalingRotaryEmbedding(DeepseekV3RotaryEmbedding):
         self.register_buffer("sin_cached", emb.sin().to(dtype), persistent=False)
 
 
-# Copied from transformers.models.llama.modeling_llama.LlamaDynamicNTKScalingRotaryEmbedding with Llama->DeepseekV3
-class DeepseekV3DynamicNTKScalingRotaryEmbedding(DeepseekV3RotaryEmbedding):
+# Copied from transformers.models.llama.modeling_llama.LlamaDynamicNTKScalingRotaryEmbedding with Llama->DeepseekV41
+class DeepseekV41DynamicNTKScalingRotaryEmbedding(DeepseekV41RotaryEmbedding):
     """
-    DeepseekV3RotaryEmbedding extended with Dynamic NTK scaling.
+    DeepseekV41RotaryEmbedding extended with Dynamic NTK scaling.
     Credits to the Reddit users /u/bloc97 and /u/emozilla
     """
 
@@ -331,7 +398,7 @@ def yarn_linear_ramp_mask(min, max, dim):
     return ramp_func
 
 
-class DeepseekV3YarnRotaryEmbedding(DeepseekV3RotaryEmbedding):
+class DeepseekV41YarnRotaryEmbedding(DeepseekV41RotaryEmbedding):
 
     def __init__(
         self,
@@ -488,7 +555,7 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 def _init_rope(self):
     if self.config.rope_scaling is None:
-        self.rotary_emb = DeepseekV3RotaryEmbedding(
+        self.rotary_emb = DeepseekV41RotaryEmbedding(
             self.config.qk_rope_head_dim,
             max_position_embeddings=self.config.max_position_embeddings,
             base=self.config.rope_theta,
@@ -497,14 +564,14 @@ def _init_rope(self):
         scaling_type = self.config.rope_scaling["rope_type"]
         scaling_factor = self.config.rope_scaling["factor"]
         if scaling_type == "linear":
-            self.rotary_emb = DeepseekV3LinearScalingRotaryEmbedding(
+            self.rotary_emb = DeepseekV41LinearScalingRotaryEmbedding(
                 self.config.qk_rope_head_dim,
                 max_position_embeddings=self.config.max_position_embeddings,
                 scaling_factor=scaling_factor,
                 base=self.config.rope_theta,
             )
         elif scaling_type == "dynamic":
-            self.rotary_emb = DeepseekV3DynamicNTKScalingRotaryEmbedding(
+            self.rotary_emb = DeepseekV41DynamicNTKScalingRotaryEmbedding(
                 self.config.qk_rope_head_dim,
                 max_position_embeddings=self.config.max_position_embeddings,
                 scaling_factor=scaling_factor,
@@ -521,7 +588,7 @@ def _init_rope(self):
                 ]
                 if key in self.config.rope_scaling
             }
-            self.rotary_emb = DeepseekV3YarnRotaryEmbedding(
+            self.rotary_emb = DeepseekV41YarnRotaryEmbedding(
                 self.config.qk_rope_head_dim,
                 max_position_embeddings=self.config.max_position_embeddings,
                 scaling_factor=scaling_factor,
@@ -531,7 +598,7 @@ def _init_rope(self):
                 **kwargs,
             )
             if self.config.compress_rope_theta is not None:
-                self.compress_rotary_emb = DeepseekV3YarnRotaryEmbedding(
+                self.compress_rotary_emb = DeepseekV41YarnRotaryEmbedding(
                 self.config.qk_rope_head_dim,
                 max_position_embeddings=self.config.max_position_embeddings,
                 scaling_factor=scaling_factor,
@@ -544,7 +611,7 @@ def _init_rope(self):
             raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
 
 
-DEEPSEEKV3_START_DOCSTRING = r"""
+DEEPSEEKV41_START_DOCSTRING = r"""
     This model inherits from [`PreTrainedModel`]. Check the superclass documentation for the generic methods the
     library implements for all its model (such as downloading or saving, resizing the input embeddings, pruning heads
     etc.)
@@ -554,7 +621,7 @@ DEEPSEEKV3_START_DOCSTRING = r"""
     and behavior.
 
     Parameters:
-        config ([`DeepseekV3Config`]):
+        config ([`DeepseekV41Config`]):
             Model configuration class with all the parameters of the model. Initializing with a config file does not
             load the weights associated with the model, only the configuration. Check out the
             [`~PreTrainedModel.from_pretrained`] method to load the model weights.
@@ -562,14 +629,14 @@ DEEPSEEKV3_START_DOCSTRING = r"""
 
 
 @add_start_docstrings(
-    "The bare DeepseekV3 Model outputting raw hidden-states without any specific head on top.",
-    DEEPSEEKV3_START_DOCSTRING,
+    "The bare DeepseekV41 Model outputting raw hidden-states without any specific head on top.",
+    DEEPSEEKV41_START_DOCSTRING,
 )
-class DeepseekV3PreTrainedModel(PreTrainedModel):
-    config_class = DeepseekV3Config
+class DeepseekV41PreTrainedModel(PreTrainedModel):
+    config_class = DeepseekV41Config
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
-    _no_split_modules = ["DeepseekV3DecoderLayer"]
+    _no_split_modules = ["DeepseekV41DecoderLayer"]
     _skip_keys_device_placement = "past_key_values"
     _supports_flash_attn_2 = True
     _supports_cache_class = True
@@ -578,7 +645,7 @@ class DeepseekV3PreTrainedModel(PreTrainedModel):
         pass
 
 
-DEEPSEEKV3_INPUTS_DOCSTRING = r"""
+DEEPSEEKV41_INPUTS_DOCSTRING = r"""
     Args:
         input_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`):
             Indices of input sequence tokens in the vocabulary. Padding will be ignored by default should you provide

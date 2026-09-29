@@ -23,6 +23,13 @@
   - `parallel_config.world_size`
   - 根据切分方式配置 `parallel_config.attn_tp_size`、`moe_tp_size`、`embed_tp_size`、`lmhead_tp_size` 等。
 
+### 1.1 多模态模型接入（适用时）
+
+接口与执行流程见[多模态编码设计文档](../design/mm_encode_design.md)。
+
+- [ ] 注册模型的 Processor，实现 `encode_multimodal()`，并在 Prefill 中消费框架传入的 `visual_embeddings`。
+- [ ] 提供合法的多模态 warm-up 输入，验证编码与 Prefill 的完整预热链路。
+
 ## 2. KV Cache 管理
 
 - [ ] 参考 [KV Cache 管理设计文档](../design/kv_cache_design.md)，选择 `KVCacheManager` 管理（推荐使用）或模型自行维护 Cache 的方式，并完成对应 Cache 管理适配。

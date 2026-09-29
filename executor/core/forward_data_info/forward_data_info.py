@@ -441,7 +441,8 @@ class Batch:
             accepted_count = None
 
             if self.draft_info:
-                state = self.draft_info.select(output_idx)
+                # Draft state follows the request order, unlike the tensors the engine already selected.
+                state = self.draft_info.select(request_idx)
                 accepted_count = int(state.accepted_num.item()) if state.accepted_num is not None else None
                 state.update_request(request, is_prefill)
                 computed_lens = self.draft_info.progress_base(total_lens, is_prefill)

@@ -19,9 +19,24 @@ function launch()
 
 function check_launch()
 {
+    # Single-server PD: prefill and decode server processes run concurrently on
+    # the same host, so an online launch filters the check by its own role
+    # instead of blocking on any server.py process. The router process is
+    # started by the prefill node, so it counts as the prefill role.
+    local pattern
+    if [ -n "${PD_ROLE}" ]; then
+        if [ "${PD_ROLE}" == "prefill" ]; then
+            pattern='python.*[ /]server\.py.*--role (prefill|router)'
+        else
+            pattern='python.*[ /]server\.py.*--role decode'
+        fi
+    else
+        pattern='python.*[ /](infer|server)\.py'
+    fi
+
     if command -v pgrep >/dev/null 2>&1; then
         # pgrep command works
-        if pgrep -f "python.*[ /](infer|server)\.py" > /dev/null 2>&1; then
+        if pgrep -f "$pattern" > /dev/null 2>&1; then
             echo "A Python process executing infer.py or server.py was detected to be running, and the script was interrupted and exited."
             exit 1
         else
@@ -29,7 +44,7 @@ function check_launch()
         fi
     else
         # fall back to ps when pgrep is unavailable
-        if ps aux | grep -E "python.*[ /](infer|server)\.py" | grep -v grep > /dev/null 2>&1; then
+        if ps aux | grep -E "$pattern" | grep -v grep > /dev/null 2>&1; then
             echo "A Python process executing infer.py or server.py was detected to be running, and the script was interrupted and exited."
             exit 1
         else

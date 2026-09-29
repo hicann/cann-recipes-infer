@@ -1,0 +1,50 @@
+# Based on the existing 8-rank multimodal example. Verify model_path on the host.
+# Full TP with paired MLA/Indexer ranks; SWA and MoE retain all eight ranks.
+model_config:
+  model_name: "deepseek_v4_1"
+  model_path: "/data/models/deepseek_v4_1_hybrid_mxfp8_mxfp4"
+  platform_version: "950"
+  with_ckpt: True
+  exe_mode: "npugraph_ex"
+  next_n: 0
+  enable_static_kernel: False
+  enable_dynamic_graph: False
+  enable_profiler: False
+  force_eplb: False
+  enable_cache_compile: False
+  custom_params:
+    # Only applies to npugraph_ex; leave unset or False for eager/ge_graph.
+    unsafe_skip_npugraph_capture_validation: False
+    low_latency_tp: True
+    kernel_config:
+      indexer_prolog_qw: ascendc
+    enable_engram: True
+    enable_multi_streams: False
+    enable_mega_moe: False
+    enable_engram_offload: True
+    engram_tp_size: 8
+    # Routing emits the sparse [E, 2] (expert_id, count) grouplist directly;
+    # GMM/swiglu consume group_list_type=2. Requires an op package with the
+    # KEY_VALUE empty-expert fix.
+    enable_grouplist_type2: False
+
+data_config:
+  dataset: "default_multimodal"
+  input_truncated_len: 2048
+  temperature: 0.0
+
+parallel_config:
+  world_size: 8
+  attn_tp_size: 8
+  dense_tp_size: 1
+  moe_tp_size: 8
+  embed_tp_size: 1
+  lmhead_tp_size: 8
+  o_proj_tp_size: 8
+  cp_size: 1
+
+scheduler_config:
+  block_size: 128
+  max_new_tokens: 256
+  max_prefill_tokens: 2048
+  batch_size: 1

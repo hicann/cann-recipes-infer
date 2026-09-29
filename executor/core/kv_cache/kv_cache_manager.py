@@ -112,7 +112,10 @@ class KVCacheManager:
     def get_block_table_max_lens(self, max_model_len: int) -> Dict[str, int]:
         """Return block-table width keyed by manager key."""
         return {
-            manager.manager_key: (max_model_len + manager.block_size - 1) // manager.block_size
+            manager.manager_key: (
+                1 if manager.attn_type == "RingCache"
+                else (max_model_len + manager.block_size - 1) // manager.block_size
+            )
             for manager in self.single_type_managers
         }
 

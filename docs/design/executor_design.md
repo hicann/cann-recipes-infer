@@ -10,6 +10,7 @@
 - [KV Cache 管理](kv_cache_design.md)
 - [MTP 投机采样执行流程](mtp_design.md)
 - [在线推理（PD 分离）执行机制](online_inference_design.md)
+- [多模态编码（MM Encode）](mm_encode_design.md)
 
 ---
 
@@ -79,7 +80,7 @@ flowchart TB
     ON --> SCH
     ON --> ENG
 
-    SCH -->|run_step 调用 engine.forward_batch| ENG
+    SCH -->|run_step 调用 forward_batch 或 encode_mm_batch| ENG
     SCH --> IC
     ENG --> MW
     ENG --> IC
@@ -141,17 +142,18 @@ InferenceConfig
 - 图编译后的执行图（`self.model_compiled`，graph 模式下）
 
 核心方法：
-- `init(model_cls, config_cls)`：初始化顺序为，加载 `hf_config` → 构造 `CommManager` → 加载权重
+- `init(model_cls, config_cls)`：初始化顺序为，加载 `hf_config` 和 Tokenizer → 构造 `CommManager` → 加载权重
 - `init_kvcache()`：分配 KV Cache
 - `compile_model()`：图模式下编译执行图，由 `ExecutionEngine.warm_up()` 在执行完 dummy prefill 后调用
 - `inference(model_inputs, is_prefill)`：执行单次 forward，返回 `(output, infer_time)`
+- `encode_multimodal(mm_inputs)`：调用模型编码接口，返回与请求顺序对应的 embedding 列表及耗时
 
 **模型加载流程：**
 
 ```mermaid
 flowchart TB
     A[ModelWorker.init] --> E[加载 HF Config]
-    E --> H[构造 CommManager]
+    E --> T[加载 Tokenizer] --> H[构造 CommManager]
     H --> B{with_ckpt?}
     B -->|Yes| C[DefaultModelLoader]
     B -->|No| D[DummyModelLoader]
@@ -169,7 +171,10 @@ flowchart TB
 
 ```mermaid
 flowchart LR
-    A[warm_up] --> B[执行 Prefill]
+    A[warm_up] --> MM{启用 MM 并提供预热输入?}
+    MM -->|是| EN[执行 MM Encode]
+    EN --> B[执行 Prefill]
+    MM -->|否| B
     B --> C{exe_mode?}
     C -->|ge_graph / npugraph_ex| D[compile_model]
     C -->|eager| E[跳过编译]
@@ -182,22 +187,21 @@ flowchart LR
 框架的核心驱动层，连接 `Scheduler` 与 `ModelWorker`：
 - `_build_model_inputs(batch)`：将 requests 拼装为 tensor 并构建 `position_ids` 与 `ForwardMetaData`；启用 paged KV cache 时（`kvcache_manager` 非空）额外通过 `prepare_block_tables` / `prepare_slot_mapping` 写入 `block_table` / `slot_mapping`
 - `forward_batch(batch)`：依次调用 `_build_model_inputs` → `ModelWorker.inference` → `_sample_tokens` → `Batch.update_requests_from_batch`，把采样结果回写到 `Request`，并返回包含 `next_tokens` / `logits` / 推理耗时的 dict
-- `warm_up()`：执行一次 dummy prefill + decode 触发算子预热；图模式下在 dummy prefill 后 dummy decode 前调用 `ModelWorker.compile_model` 编译 decode 阶段的执行图，减少运行时开销
+- `encode_mm_batch(batch)`：执行独立多模态编码，将逐请求结果保存到 `MMEmbeddingStore`；Prefill 在 `forward_batch()` 中取出本批结果，以 `visual_embeddings` 传给模型
+- `warm_up()`：执行 dummy prefill + decode 触发算子预热；启用 MM Encode 且模型提供合法预热输入时，先执行 Encode 并将结果交给 Prefill。图模式仍在 dummy prefill 后、dummy decode 前调用 `ModelWorker.compile_model`
 
 > 日志：`executor/utils/logging_config.py` 中 `setup_logging()` 是统一入口，环境变量 `CANN_RECIPES_LOG_LEVEL`（默认 `INFO`）控制级别。
 
 ### 3.5 Scheduler
 
-请求生命周期管理：
+请求在 `add_request()` 中依次完成 `_prepare_request_prompt()`、可选的 `mm_processor.process(request)`、最终 `prompt_tokens` 统计和长度校验。下图描述基础计算队列的生命周期；Online P 还需完成传输握手才能进入计算队列，见 [PD Scheduler](online_inference_design.md#6-pd-scheduler)：
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Waiting: add_request(prompt)
-
-    state Waiting {
-        [*] --> Queued
-        Queued --> Tokenized: _schedule_prefill_batch()<br/>→ _prepare_request_prompt()（按需 tokenize）
-    }
+    [*] --> MMWaiting: 准入通过，启用 MM Encode
+    [*] --> Waiting: 准入通过，未启用 MM Encode
+    MMWaiting --> Encoding: 选入 MMEncodeBatch
+    Encoding --> Waiting: 编码结果写入 Store，清空 mm_inputs
 
     Waiting --> Prefilling: 选入 prefill batch
 
@@ -225,9 +229,12 @@ stateDiagram-v2
 
 | 转换 | 代码位置 |
 |------|----------|
-| Waiting → Prefilling | `_schedule_prefill_batch()`：从 `waiting_queue` 取出，按需 tokenize，创建 Batch |
+| MMWaiting → Encoding → Waiting | `_schedule_mm_encode_batch()` 取请求，`encode_mm_batch()` 写入 Store，`_process_mm_encode_output()` 转入 `waiting_queue` |
+| Waiting → Prefilling | `_schedule_prefill_batch()`：从 `waiting_queue` 取出已准备好的请求，创建 Batch |
 | Prefilling → Running | `_process_batch_output()` → `_on_prefill_complete()`：`is_prefill_done=True`，加入 `running_requests` |
 | Running → Finished | `_process_batch_output()` → `_should_finish()`：命中后设 `is_finished=True`、出 `running_requests`、入 `finished_requests`，并调用 `kvcache_manager.free(rid)` 与 `_on_request_finished` |
+
+Offline 优先执行 Prefill-ready 请求，其次 MM Encode，最后 Decode。MM Encode 与 Prefill 分别组批，详细规则和 Store 生命周期见 [多模态编码设计](mm_encode_design.md)。
 
 `_should_finish` 在 decode 阶段每步检查两类结束条件：
 
@@ -252,11 +259,12 @@ KV cache 采用 paged attention 三层结构，定义在 `executor/core/kv_cache
 
 ### 3.7 Tokenizer Registry
 
-Tokenizer 负责文本和 token ID 之间的转换，框架将 tokenizer 管理拆成两层：
+Tokenizer 负责文本和 token ID 之间的转换，加载与复用的职责如下：
 
 | 层级 | 职责 |
 |------|------|
-| `ExecutionEngine` | 负责 tokenizer 的生命周期管理。在初始化阶段根据 `model_config.model_name` 和 `model_config.model_path` 请求 tokenizer，并把加载后的对象交给 `Scheduler` 复用 |
+| `ModelWorker` | 初始化时调用 `get_tokenizer()`，将结果保存到 `hf_config.tokenizer` |
+| `ExecutionEngine` | 复用 `hf_config.tokenizer`，交给 `Scheduler` 及可选的 MM Processor |
 | `TokenizerRegistry` | 负责 tokenizer 实现的选择。它维护模型名到 tokenizer 实现的映射，对外提供统一入口 `get_tokenizer()`，屏蔽默认加载和自定义加载之间的差异 |
 
 这种分层让调度和执行流程只依赖统一的 tokenizer 对象，具体加载策略分为两类：
@@ -318,14 +326,14 @@ bash executor/scripts/infer.sh --model <model> [--mode offline] [--yaml <name>]
             │       └─ ProfilerManager()                    #   profiler 配置
             │
             ├─ ExecutionEngine.init(config_cls, main_model_cls, mtp_model_cls=None)  # Phase 2: 真正装载
-            │       ├─ main_worker.init()                   #   加载 hf_config + 权重 → 构造 CommManager
-            │       ├─ get_tokenizer()                      #   加载默认或自定义 tokenizer
+            │       ├─ main_worker.init()                   #   config/Tokenizer → CommManager → 权重
+            │       ├─ 复用 hf_config.tokenizer             #   创建可选 MM Processor/Store
             │       └─ if cache_info: _init_cache_manager() #   paged：建 KVCacheManager + 块池
             │            else:        main_worker.init_kvcache()  # legacy：非paged方法分配 kv_cache
             │
-            ├─ engine.warm_up()                             # dummy prefill + decode；图模式触发 compile_model
+            ├─ engine.warm_up()                             # 可选 MM Encode → prefill → decode
             │
-            └─ Scheduler.__init__(tokenizer, config)        # 初始化请求队列
+            └─ Scheduler.__init__(..., mm_processor, enable_mm_encode) # 注入接口，初始化请求队列
 ```
 
 ### 4.3 运行时时序图
@@ -333,19 +341,23 @@ bash executor/scripts/infer.sh --model <model> [--mode offline] [--yaml <name>]
 ```
 [OfflineInference.generate(prompts)]
     │
-    ├─ scheduler.add_request(prompt)  ×N   # 将所有 prompt 加入 waiting_queue
+    ├─ scheduler.add_request(prompt)  ×N   # prepare → Processor → 最终长度校验 → 对应等待队列
     │
     └─ 推理循环（while scheduler.has_work()）
             │
             ├─ scheduler.run_step(engine)
             │       │
-            │       ├─ _schedule_batch()             # 优先 prefill，无 prefill 则 decode
+            │       ├─ 若选中 MM Encode：_schedule_mm_encode_batch()
+            │       │       └─ engine.encode_mm_batch() → Store → waiting_queue，结束本 step
+            │       │
+            │       ├─ 否则 _schedule_batch()         # Prefill-ready 优先于 MM Encode，Decode 最后
             │       │       └─ 选择 requests → 创建 Batch 对象（不构建 tensors）
             │       │
             │       ├─ engine.forward_batch(batch)
             │       │       ├─ _build_model_inputs(batch)
             │       │       │       ├─ build_tensors_from_requests()  # 拼装 input_ids、seq_lens
             │       │       │       └─ 构建 position_ids、ForwardMetaData（内部调用 set_forward_metadata）
+            │       │       ├─ Prefill：从 Store 取本批 visual_embeddings（启用 MM 时）
             │       │       ├─ ModelWorker.inference()  # 调用 model.forward()
             │       │       └─ _sample_tokens()            # argmax 采样
             │       │
@@ -355,6 +367,8 @@ bash executor/scripts/infer.sh --model <model> [--mode offline] [--yaml <name>]
 ```
 
 **关键数据流：**
+
+下图为语言 Token 路径；多模态 Prefill 另从 Store 取得 `visual_embeddings`，作为模型参数传入，不加入 `ForwardMetaData`。
 
 ```
 waiting_queue[Request]
@@ -529,6 +543,8 @@ evalscope eval \
 
 3. `load_weights(weights_iterator)`：从 `DefaultModelLoader` 提供的 `(name, tensor)` 迭代器读权重并写入模型参数；自定义分片 / 格式转换在此完成。`ModelConfig.with_ckpt=False` 时启用 `DummyModelLoader`，跳过该调用并随机初始化。
 
+多模态模型还需注册 Processor、实现 `encode_multimodal(mm_inputs_list)`，并在 forward 中接收 `visual_embeddings` 完成回填；可选提供 `build_multimodal_warmup_inputs(seq_len)`。接口及输入输出约定见 [多模态编码设计](mm_encode_design.md)。
+
 ### 6.2 框架提供的能力
 
 | 能力 | 使用方式 |
@@ -536,5 +552,6 @@ evalscope eval \
 | 通信域管理 | 模型通过 `CommManager.register_group()` 声明所需 HCCL 通信域及建域配置；`CommManager` 统一处理通信域创建与物理复用，维护通信域对象、组内 rank 和 HCCL comm name等信息，并提供强制独立建域能力 |
 | Paged KV cache | `KVCacheManager` 按 `cache_info` 申请块；attention forward 按 `block_table` / `slot_mapping` 索引 |
 | Packed Sequence | `Batch` 按请求顺序组织有效 token；`ExecutionEngine` 构造与 token 对齐的 `position_ids`，并通过 `ForwardMetaData` 提供请求长度边界和可选 KV Cache 索引，详见 [Packed Sequence 机制](packed_sequence_design.md) |
+| MM Encode | 按独立批次执行媒体编码，通过请求级 Store 将结果传给 Prefill，详见 [多模态编码设计](mm_encode_design.md) |
 | 图编译 | `ModelConfig.exe_mode ∈ {ge_graph, npugraph_ex}` 开启；`ExecutionEngine.warm_up()` 在 dummy prefill 后调用 `compile_model()`；模型需保证输入 shape 静态 |
 | Profiler | `ModelConfig.enable_profiler=True` 开启；`ProfilerManager` 自动插入 profiling 桩 |

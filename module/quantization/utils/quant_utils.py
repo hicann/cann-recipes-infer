@@ -6,6 +6,9 @@
 from collections.abc import Mapping
 from types import MappingProxyType
 
+import torch
+
+
 
 def is_layer_skipped(
     prefix: str,
@@ -46,7 +49,14 @@ def is_layer_skipped(
 
 def reshape_mx_scale(scale_tensor):
     """
-    Reshape the last dimension of 2D/3D tensor into (original_size // 2, 2) for GMM/MM operators.
+    Reshape the last dimension into pairs for GMM/MM operators; an odd
+    group count gets one zero tail slot for the pair view.
     """
-    # Keep all dims except last, then split last into (n // 2, 2)
-    return scale_tensor.view(*scale_tensor.shape[:-1], scale_tensor.size(-1) // 2, 2)
+    import torch
+    num_groups = scale_tensor.size(-1)
+    if num_groups % 2:
+        pad = torch.zeros((*scale_tensor.shape[:-1], 1), dtype=scale_tensor.dtype,
+                          device=scale_tensor.device)
+        scale_tensor = torch.cat((scale_tensor, pad), dim=-1)
+        num_groups += 1
+    return scale_tensor.view(*scale_tensor.shape[:-1], num_groups // 2, 2)

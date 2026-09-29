@@ -86,7 +86,14 @@ def load_mmmu_dataset(data_path, max_samples=0):
             sample_id = str(d["id"])
             question = d["question"]
             options = d.get("options") or ""
-
+            if isinstance(options, str) and options.strip():
+                try:
+                    import ast
+                    parsed = ast.literal_eval(options)
+                    if isinstance(parsed, list):
+                        options = parsed
+                except (ValueError, SyntaxError):
+                    pass
             if isinstance(options, list):
                 options = "\n".join(
                     f"({chr(65 + index)}) {option}"
@@ -109,6 +116,8 @@ def load_mmmu_dataset(data_path, max_samples=0):
                 img.save(img_path)
                 image_urls.append(Path(img_path).resolve().as_uri())
             text = question + (f"\n{options}" if options.strip() else "")
+            if options.strip():
+                text += "\n\nAnswer with the option's letter from the given choices directly"
             content= [{"type":"image_url", "image_url":{"url":url}} for url in image_urls]
             content.append({"type": "text","text":text})
             prompts.append([{"role": "user","content":content}])
@@ -140,7 +149,7 @@ def load_mmmu_dataset(data_path, max_samples=0):
             f"({failed_subjects})"
         )
     return prompts,sample_ids,ground_truths
- 
+
 def export_mmmu_results(results, sample_ids, ground_truths, output_path, suffix=""):
     """Write MMMU predictions and references as a JSON array."""
     mmmu_results=[]

@@ -115,6 +115,8 @@ class FusedMoeWeightScaleSupported(Enum):
 
 
 class FusedMoEGMM(torch.nn.Module):
+    TP_INTERMEDIATE_ALIGN = 128
+
     def __init__(
         self,
         num_experts: int,
@@ -137,7 +139,29 @@ class FusedMoEGMM(torch.nn.Module):
         self.ep_size = ep_size
         self.ep_rank = ep_rank
         self.experts_per_rank = num_experts // ep_size
-        self.intermediate_size_per_partition = intermediate_size // self.tp_size
+        self.intermediate_size = intermediate_size
+        gmm_quant_mode = getattr(quant_config, "gmm_quant_mode", None) if quant_config is not None else None
+        self.enable_nonuniform_tp_split = (
+            tp_size > 1
+            and gmm_quant_mode is not None
+            and "mxfloat" in gmm_quant_mode
+            and intermediate_size % self.TP_INTERMEDIATE_ALIGN == 0
+            and (intermediate_size // tp_size) % self.TP_INTERMEDIATE_ALIGN != 0)
+        if self.enable_nonuniform_tp_split:
+            split_sizes = self.split_intermediate_aligned(
+                intermediate_size, tp_size, self.TP_INTERMEDIATE_ALIGN)
+            if min(split_sizes) == 0:
+                import warnings
+                warnings.warn(
+                    f"intermediate_size={intermediate_size} cannot fill tp_size={tp_size} "
+                    f"ranks at {self.TP_INTERMEDIATE_ALIGN}-alignment: "
+                    f"{intermediate_size // self.TP_INTERMEDIATE_ALIGN} ranks get a non-empty "
+                    f"shard and the rest an empty one; reduce tp_size.")
+            self.intermediate_size_per_partition = split_sizes[tp_rank]
+            self.intermediate_offset = sum(split_sizes[:tp_rank])
+        else:
+            self.intermediate_size_per_partition = intermediate_size // self.tp_size
+            self.intermediate_offset = (intermediate_size // self.tp_size) * tp_rank
         if quant_config is None:
             self.quant_method: Optional[QuantizeMethodBase] = (
                 UnquantizedFusedMoEGMMMethod())
@@ -151,6 +175,16 @@ class FusedMoEGMM(torch.nn.Module):
             intermediate_size_per_partition=self.intermediate_size_per_partition,
             params_dtype=params_dtype,
             weight_loader=self.weight_loader)
+        self.gmm1_events = None
+
+    @staticmethod
+    def split_intermediate_aligned(total: int, parts: int, align: int) -> list[int]:
+        units = total // align
+        base, rem = divmod(units, parts)
+        return [(base + 1) * align if r < rem else base * align for r in range(parts)]
+
+    def _intermediate_shard_offset(self, loaded_weight: torch.Tensor, shard_dim: int) -> int:
+        return self.intermediate_offset * loaded_weight.shape[shard_dim] // self.intermediate_size
 
     def forward(self, x: torch.Tensor,
                 expert_tokens: torch.Tensor,
@@ -361,7 +395,11 @@ class FusedMoEGMM(torch.nn.Module):
         # Index the loaded weight for tp sharding.
         # gate_up_proj: "MergedColumnParallel", so tp sharding on output_dim
         shard_size = expert_data.shape[shard_dim] // 2
-        loaded_weight = loaded_weight.narrow(shard_dim, shard_size * tp_rank,
+        if self.enable_nonuniform_tp_split:
+            shard_offset = self._intermediate_shard_offset(loaded_weight, shard_dim)
+        else:
+            shard_offset = shard_size * tp_rank
+        loaded_weight = loaded_weight.narrow(shard_dim, shard_offset,
                                              shard_size)
         # Narrow parameter and load.
         # w1, gate_proj: Load into first logical weight of w13.
@@ -386,8 +424,12 @@ class FusedMoEGMM(torch.nn.Module):
         # Narrow parameter and load.
         shard_size = expert_data.shape[shard_dim]
         if not load_full:
+            if self.enable_nonuniform_tp_split:
+                shard_offset = self._intermediate_shard_offset(loaded_weight, shard_dim)
+            else:
+                shard_offset = shard_size * tp_rank
             loaded_weight = loaded_weight.narrow(shard_dim,
-                                                 shard_size * tp_rank,
+                                                 shard_offset,
                                                  shard_size)
         # w2, down_proj: Load into only logical weight of w2.
         expert_data.copy_(loaded_weight)

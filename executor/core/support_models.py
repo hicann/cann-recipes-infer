@@ -40,7 +40,7 @@ _specs: dict[str, list[tuple[str, str]]] = {
     ],
     "deepseek_v4_1": [
         ("models.deepseek_v4_1.models.modeling_deepseek", "DeepseekV41VisionForCausalLM"),
-        ("models.deepseek_v4_1.models.configuration_deepseek", "DeepseekV3Config"),
+        ("models.deepseek_v4_1.models.configuration_deepseek", "DeepseekV41Config"),
     ],
     "deepseek_v2_lite": [
         ("models.deepseek_r1.models.modeling_deepseek", "DeepseekV3ForCausalLM"),
@@ -120,6 +120,10 @@ _speculative_specs: dict[tuple[str, str], tuple[tuple[str, str], tuple[str, str]
     ("deepseek_v4", "dspark"): (
         ("models.deepseek_v4.models.modeling_dspark", "DeepseekV4DSparkProposalModel"),
         ("models.deepseek_v4.models.configuration_deepseek", "DeepseekV3Config"),
+    ),
+    ("deepseek_v4_1", "dspark"): (
+        ("models.deepseek_v4_1.models.modeling_dspark", "DeepseekV41DSparkProposalModel"),
+        ("models.deepseek_v4_1.models.configuration_deepseek", "DeepseekV41Config"),
     ),
 }
 

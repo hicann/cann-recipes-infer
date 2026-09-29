@@ -75,11 +75,18 @@ def convert_quantization_config(config):
     fields = config.get("text_config") or config
     num_layers = fields.get("num_hidden_layers")
     compress_ratios = fields.get("compress_ratios")
-    kv_source_layers = fields.get("kv_source_layers")
-    index_source_layers = fields.get("index_source_layers")
+    kv_source_layers = fields.get("kv_source_layers", fields.get("kv_source_layer_ids"))
+    index_source_layers = fields.get("index_source_layers", fields.get("index_source_layer_ids"))
     if not kv_source_layers or not index_source_layers:
         sys.exit("config.json: kv_source_layers / index_source_layers are required "
                  "to generate the quantization ignore list")
+    if num_layers is None or compress_ratios is None:
+        sys.exit("config.json: num_hidden_layers / compress_ratios are required")
+    if len(compress_ratios) < num_layers:
+        sys.exit(
+            f"config.json: compress_ratios has {len(compress_ratios)} entries, "
+            f"but num_hidden_layers is {num_layers}"
+        )
     cache_scheme = {"kv_cache_scheme": {"num_bits": NUM_BITS_8, "type": "float"},
                     "comp_cache_scheme": {"num_bits": NUM_BITS_4, "type": "float"},
                     "li_cache_scheme": {"num_bits": NUM_BITS_4, "type": "float"}}
@@ -104,7 +111,7 @@ def main(fp8_path, output_path):
     and saves the converted checkpoint to output_path. It also replaces the fp8
     quantization_config of config.json with a compressed-tensors config generated
     via convert_config.py, preserving the nested text_config / vision_config structure.
-    
+
     Args:
     fp8_path (str): The path to the directory containing the input checkpoint
         shards, model.safetensors.index.json and config.json.

@@ -54,6 +54,9 @@ def compile_model_forward(
     exe_mode = model_config.exe_mode
     enable_cache_compile = model_config.enable_cache_compile
     enable_dynamic_graph = model_config.enable_dynamic_graph
+    unsafe_skip_npugraph_capture_validation = model_config.custom_params.get(
+        "unsafe_skip_npugraph_capture_validation", False
+    )
     cache_dir = os.path.join(model_config.output_path, "compile_cache")
     if cache_namespace:
         cache_dir = os.path.join(cache_dir, cache_namespace)
@@ -66,8 +69,10 @@ def compile_model_forward(
             "frozen_parameter": True,
             "static_kernel_compile": enable_static_kernel,
             "super_kernel_optimize": enable_superkernel,
-            "super_kernel_optimize_options": {"dcci_disable_on_kernel": [".*"]}
+            "super_kernel_optimize_options": {"dcci_disable_on_kernel": [".*"]},
         }
+        if unsafe_skip_npugraph_capture_validation:
+            compile_options["unsafe_skip_npugraph_capture_validation"] = True
         if enable_cache_compile:
             compiled = torch.npu.npugraph_ex.inference.cache_compile(model_forward, cache_dir=cache_dir,
                                                                      dynamic=enable_dynamic_graph,

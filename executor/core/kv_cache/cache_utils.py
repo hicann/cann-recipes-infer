@@ -30,7 +30,7 @@ from .single_type_kv_cache_manager import ATTN_TYPE_MANAGER_MAP, MambaManager
 # Cache types with fixed block count (independent of seq_len),
 # e.g., sliding-window attention and Mamba state caches. Distinguished
 # from paged attention types where block count scales with sequence length.
-FIXED_BLOCK_ATTN_TYPES = {"SlidingWindow", "Mamba"}
+FIXED_BLOCK_ATTN_TYPES = {"SlidingWindow", "RingCache", "Mamba"}
 SUPPORTED_CACHE_LAYOUTS = {"BnBsND", "BnNBsD"}
 
 
@@ -92,7 +92,7 @@ def validate_cache_info(cache_info: ModelCacheInfo) -> None:
                         f"attn_type='Mamba' and must be a MambaCacheEntry, "
                         f"but got {type(cache).__name__}"
                     )
-            elif cache.attn_type in ["FullAttention", "SlidingWindow"]:
+            elif cache.attn_type in ["FullAttention", "SlidingWindow", "RingCache"]:
                 if cache.num_head <= 0:
                     raise ValueError(
                         f"cache {cache.cache_name} in layer {layer_info.layer_idx} must have positive num_head, "
@@ -153,7 +153,7 @@ def allocate_cache_tensors(device, cache_info: ModelCacheInfo, block_num_by_type
 
             block_num = block_num_by_type[group_key]
             allocator = CacheAllocator(cache.allocator)
-            if cache.attn_type in ["FullAttention", "SlidingWindow"]:
+            if cache.attn_type in ["FullAttention", "SlidingWindow", "RingCache"]:
                 block_size = cache.storage_block_size
                 dims = cache.dim if isinstance(cache.dim, list) else [cache.dim]
                 if cache.cache_layout == "BnNBsD":
@@ -233,6 +233,12 @@ def calculate_fixed_block_memory_bytes(infer_config, cache_info: ModelCacheInfo)
                 tmp_memory_bytes = 0
                 if CacheAllocator(cache.allocator) == CacheAllocator.HBM:
                     tmp_memory_bytes = fixed_block_num * cache.cache_dim_numel() * dtype_itemsize(cache.dtype)
+            elif cache.attn_type == "RingCache":
+                fixed_block_num = max_concurrency + 1  # One block per request, plus the null block.
+                tmp_memory_bytes = 0
+                if CacheAllocator(cache.allocator) == CacheAllocator.HBM:
+                    tmp_memory_bytes = fixed_block_num * cache.block_size * cache.num_head \
+                        * cache.cache_dim_numel() * dtype_itemsize(cache.dtype)
             else:
                 raise AttributeError(
                         f"If other attention types {cache.attn_type} are added to FIXED_BLOCK_ATTN_TYPES, "
@@ -554,6 +560,15 @@ def prepare_slot_mapping(
             start_idx = 0 if idx == 0 else actual_seq_lengths_cu_q[idx - 1].item()
             end_idx = actual_seq_lengths_cu_q[idx].item()
             tmp_position_ids = position_ids[start_idx: end_idx]
+
+            if manager.attn_type == "RingCache":
+                block_id = block_table[idx, 0]
+                temp_slot_mapping = block_id * cur_block_size + tmp_position_ids % cur_block_size
+                # Only the current tail survives; older writes would collide after wrapping.
+                temp_slot_mapping[:-cur_block_size] = -1
+                temp_slot_mapping.masked_fill_(block_id == manager.block_pool.get_null_block(), -1)
+                slot_mappings.append(temp_slot_mapping)
+                continue
 
             # Compute block indices and offsets from position_ids
             block_indices = tmp_position_ids // cur_block_size

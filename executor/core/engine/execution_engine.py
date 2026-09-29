@@ -766,8 +766,11 @@ class ExecutionEngine:
                     "for the warmup phase. Please check that the model's config.json contains a valid "
                     "vocab_size field."
                 )
+            # Only the first request gets visual embeddings, so the filler must not contain
+            # image tokens.
+            vocab_limit = getattr(self.hf_config, "image_token_id", self.hf_config.vocab_size)
             dummy_input_ids = torch.randint(
-                0, self.hf_config.vocab_size,
+                0, vocab_limit,
                 (prefill_batch_size * seq_len,), dtype=torch.long, device=self.device,
             )
             warmup_request = None
@@ -969,8 +972,9 @@ class ExecutionEngine:
                 selected_logits,
             )
 
-        # Equal TP logits can still yield different samples with rank-local RNG.
-        # Keep the committed tokens and their verification results consistent.
+        # Sampling uses rank-local RNG state even when TP logits are equal.
+        # Synchronize the complete sampling result before draft inference so all
+        # ranks use the same token, acceptance decision and reported logprobs.
         if self.infer_config.parallel_config.attn_tp_size > 1:
             attn_tp_group = self.comm_manager.get_group("attn_tp_group")
             attn_tp_rank = self.comm_manager.get_rank("attn_tp_group")
@@ -979,12 +983,12 @@ class ExecutionEngine:
             if worker:
                 torch.distributed.broadcast(accepted_num, src=attn_tp_src, group=attn_tp_group)
             if logprobs_tensors is not None:
-                for tensor in (
+                for logprobs_tensor in (
                     logprobs_tensors.logprob_token_ids,
                     logprobs_tensors.logprobs_tensors,
                     logprobs_tensors.selected_token_ranks,
                 ):
-                    torch.distributed.broadcast(tensor, src=attn_tp_src, group=attn_tp_group)
+                    torch.distributed.broadcast(logprobs_tensor, src=attn_tp_src, group=attn_tp_group)
 
         if worker:
             draft_next_tokens = self._prepare_draft_next_tokens(

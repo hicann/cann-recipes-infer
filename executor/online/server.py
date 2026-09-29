@@ -26,6 +26,7 @@ import threading
 import time
 import uuid
 from typing import List, Optional
+import json
 
 import yaml
 from fastapi import Depends, FastAPI, HTTPException
@@ -177,6 +178,26 @@ def worker_main(  # pylint: disable=too-many-arguments
         f"Worker global_rank={global_rank}, local_rank={local_rank}/{world_size} "
         f"starting, leader={leader_addr}"
     )
+
+    if disagg_config is not None and disagg_config.engine_backend == "mooncake":
+        # Load the per-device HIXL endpoint configuration for Mooncake.
+        raw = os.environ.get("ASCEND_RT_VISIBLE_DEVICES", "")
+        devices = [int(x) for x in raw.replace(" ", "").split(",") if x != ""]
+        # Fall back to the logical device index when visibility is not set.
+        physical_device = devices[local_rank] if devices else local_rank
+        local_comm_res_file = os.path.join("/etc/hixlep", f"ub_endpoint_npu_{physical_device}.json")
+        try:
+            with open(local_comm_res_file) as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            raise FileNotFoundError(
+                f"Endpoint config file not found: {local_comm_res_file}. "
+                "Ensure that the HIXL endpoint configuration is available under /etc/hixlep."
+            )
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Failed to parse endpoint config file: {local_comm_res_file}") from e
+
+        os.environ["ASCEND_LOCAL_COMM_RES"] = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
 
     from executor.core.config import InferenceConfig
     from executor.online.online_inference import OnlineInference
@@ -411,7 +432,7 @@ def create_app(dispatcher, server_config: ServerAppConfig):
         if disagg_mode == ROLE_PREFILL:
             return result
         return {"status": "success", "result": result}
-    
+
     def _generate_completions_logprobs(output_logprobs: list, top_logprobs: int) -> dict:
         text_offset = []
         token_logprobs = []
@@ -490,7 +511,7 @@ def create_app(dispatcher, server_config: ServerAppConfig):
             "choices": choices,
             "usage": totals,
         }
-    
+
     def _generate_chat_logprobs(output_logprobs: list, top_logprobs: int) -> dict:
         # "logprobs": {"content": [{"token":xx, "logprob":xx, "bytes":xx, "top_logprobs":[xxxxxxxxxx]},
         #                          {"token":xx, "logprob":xx, "bytes":xx, "top_logprobs":[xxxxxxxxxx]},

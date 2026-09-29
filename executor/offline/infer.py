@@ -173,8 +173,8 @@ def main():
     mmmu_ids = None
     mmmu_ground_truths = None
     if config.data_config.dataset == "MMMU":
-        if cp_size>1:
-                raise ValueError(
+        if cp_size > 1:
+            raise ValueError(
                 "MMMU dataset does not support cp_size>1"
             )
         mmmu_path = os.path.abspath(os.path.join(dataset_path, "MMMU"))
@@ -185,17 +185,18 @@ def main():
         prompts, mmmu_ids, mmmu_ground_truths = load_mmmu_dataset(mmmu_source, batch_size)
         global_dp_rank = 0
         if attn_dp_size > 1:
-            if batch_size % attn_dp_size !=0:
+            if batch_size % attn_dp_size != 0:
                 raise ValueError(
-                f"batch_size ({batch_size}) must be divisible by attn_dp_size ({attn_dp_size})"
-            )
+                    f"batch_size ({batch_size}) must be divisible by "
+                    f"attn_dp_size ({attn_dp_size})"
+                )
             per_rank = config.scheduler_config.batch_size_per_dp_rank
             global_dp_rank = _get_prompt_dp_rank(config, global_rank)
             lo = global_dp_rank * per_rank
-            hi = (global_dp_rank+1)* per_rank
-            prompts =prompts[lo:hi]
+            hi = (global_dp_rank + 1) * per_rank
+            prompts = prompts[lo:hi]
             mmmu_ids = mmmu_ids[lo:hi]
-            mmmu_ground_truths =mmmu_ground_truths[lo:hi]
+            mmmu_ground_truths = mmmu_ground_truths[lo:hi]
     elif cp_size > 1:
         if batch_size % attn_dp_size != 0:
             raise ValueError(f"batch_size ({batch_size}) must be divisible by attn_dp_size ({attn_dp_size})")
@@ -243,8 +244,15 @@ def main():
     )
 
     if config.data_config.dataset == "MMMU" and mmmu_ids is not None:
-        suffix = f"_dp{global_dp_rank}" if attn_dp_size>1 else ""
-        export_mmmu_results(results, mmmu_ids, mmmu_ground_truths,config.model_config.output_path, suffix=suffix)
+        suffix = f"_dp{global_dp_rank}" if attn_dp_size > 1 else ""
+        export_mmmu_results(
+            results,
+            mmmu_ids,
+            mmmu_ground_truths,
+            config.model_config.output_path,
+            suffix=suffix,
+        )
+
 
 if __name__ == "__main__":
     main()

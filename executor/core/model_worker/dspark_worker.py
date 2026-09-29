@@ -82,6 +82,7 @@ class DSparkWorker(BaseSpeculativeWorker):
                 "set_auxiliary_hidden_layers(layer_ids)."
             )
         configure_layers(self.model.dspark_target_layer_ids)
+        self.main_model = main_model
 
     def warm_up_prefill(
         self,
@@ -374,6 +375,7 @@ class DSparkWorker(BaseSpeculativeWorker):
         if not batch.draft_info:
             batch.draft_info = DSparkInfo()
         batch.draft_info.accepted_num = accepted_num
+        accepted_num_clone = accepted_num.clone()
         batch.draft_info.is_prefill = batch.is_prefill
         batch.draft_info.spec_tokens = None
 
@@ -427,25 +429,40 @@ class DSparkWorker(BaseSpeculativeWorker):
         )
         proposal_model_worker = self.dspark_model_worker
         if proposal_model_worker.force_eplb:
-            if proposal_model_worker.decode_topk_list is None:
-                # Force EPLB counts logical proposal positions. HC lanes are
-                # handled inside the proposal MoE.
+            if batch.is_prefill:
                 proposal_tokens = (
                     proposal_input_ids.shape[0]
                     * int(draft_model.dspark_block_size)
                 )
-                proposal_model_worker.decode_topk_list = (
+                proposal_model_worker.prefill_topk_list = (
                     proposal_model_worker.gen_force_eplb_topk_idx(
                         is_prefill=False,
                         total_tokens=proposal_tokens,
                     )
                 )
-            proposal_inputs["cur_topk_list"] = proposal_model_worker.decode_topk_list
+
+                proposal_inputs["cur_topk_list"] = proposal_model_worker.prefill_topk_list
+            else:
+                if proposal_model_worker.decode_topk_list is None:
+                    # Force EPLB counts logical proposal positions. HC lanes are
+                    # handled inside the proposal MoE.
+                    proposal_tokens = (
+                        proposal_input_ids.shape[0]
+                        * int(draft_model.dspark_block_size)
+                    )
+                    proposal_model_worker.decode_topk_list = (
+                        proposal_model_worker.gen_force_eplb_topk_idx(
+                            is_prefill=False,
+                            total_tokens=proposal_tokens,
+                        )
+                    )
+                proposal_inputs["cur_topk_list"] = proposal_model_worker.decode_topk_list
         prepared_inputs = self._prepare_proposal_inputs(
             proposal_inputs,
             proposal_input_ids if not batch.is_prefill else main_next_tokens,
             target_hidden_states,
         )
+        batch.draft_info.accepted_num = accepted_num_clone
         proposal, infer_time = self.dspark_model_worker.execute_model_call(
             self.model.propose, prepared_inputs,
         )
@@ -466,14 +483,45 @@ class DSparkWorker(BaseSpeculativeWorker):
         # Main prefill uses packed tokens. Restore batch rows and let the
         # proposal model populate its framework SlidingWindow KV entries.
         seq_lens = batch.seq_lens.to(device=self.device, dtype=torch.long)
+        target_hidden_states = target_hidden_states.to(self.device).view(-1, target_hidden_states.shape[-1])
+        cp_metadata = getattr(model_inputs_main.get("forward_metadata"), "cp_metadata", None)
+        if cp_metadata is not None and cp_metadata.enabled:
+            # Prefill CP splits the prompt across ranks, so the main model hands over only the
+            # sliding window each request ends with. Everything else follows that tail.
+            return self._build_prefill_proposal_tails(input_ids, seq_lens, target_hidden_states)
         total_tokens = int(seq_lens.sum().item())
         input_ids = input_ids.view(-1)[:total_tokens]
         position_ids = model_inputs_main["position_ids"].to(self.device).view(-1)[:total_tokens]
-        target_hidden_states = target_hidden_states.to(self.device).view(-1, target_hidden_states.shape[-1])
         proposal_input_ids = self._pack_prefill_to_dense(input_ids, seq_lens)
         target_hidden_states = self._pack_prefill_to_dense(target_hidden_states[:total_tokens], seq_lens)
         target_hidden_positions = self._pack_prefill_to_dense(position_ids, seq_lens, pad_value=-1)
         return proposal_input_ids, target_hidden_states, target_hidden_positions
+
+    def _build_prefill_proposal_tails(
+        self,
+        input_ids: torch.Tensor,
+        seq_lens: torch.Tensor,
+        target_hidden_states: torch.Tensor,
+    ):
+        """Assemble the proposal inputs from the per-request tail window handed over by prefill CP."""
+        window = self.main_model.cp_prefill_tail_tokens
+        tail_lens = seq_lens.clamp(max=window)
+        input_ids = input_ids.view(-1)
+        id_tails, position_tails, start = [], [], 0
+        for seq_len, tail_len in zip(seq_lens.tolist(), tail_lens.tolist()):
+            id_tails.append(input_ids[start + seq_len - tail_len:start + seq_len])
+            position_tails.append(torch.arange(
+                seq_len - tail_len, seq_len, device=self.device, dtype=torch.long))
+            start += seq_len
+        target_hidden_states = torch.cat([
+            target_hidden_states[request * window:request * window + tail_len]
+            for request, tail_len in enumerate(tail_lens.tolist())
+        ], dim=0)
+        return (
+            self._pack_prefill_to_dense(torch.cat(id_tails, dim=0), tail_lens),
+            self._pack_prefill_to_dense(target_hidden_states, tail_lens),
+            self._pack_prefill_to_dense(torch.cat(position_tails, dim=0), tail_lens, pad_value=-1),
+        )
 
     def _build_decode_proposal_inputs(
         self,
@@ -531,6 +579,11 @@ class DSparkWorker(BaseSpeculativeWorker):
         """
         metadata_kv_len = get_forward_metadata().kv_len
         if batch.is_prefill:
+            cp_metadata = getattr(model_inputs_main.get("forward_metadata"), "cp_metadata", None)
+            if cp_metadata is not None and cp_metadata.enabled:
+                # Forward metadata has been narrowed to the requests this rank owns, while the
+                # draft prefills the whole batch.
+                return batch.seq_lens.to(self.device) - 1
             return metadata_kv_len
 
         verify_positions = model_inputs_main["position_ids"].to(

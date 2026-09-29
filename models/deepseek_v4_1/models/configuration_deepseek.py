@@ -1,5 +1,5 @@
 # coding=utf-8
-# This code is copied from the DeepSeekV3 implementations. (https://huggingface.co/deepseek-ai/DeepSeek-V3)
+# This code is copied from the DeepSeekV41 implementations. (https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash)
 # Copyright 2023 DeepSeek-AI team. All rights reserved.
 
 from transformers.configuration_utils import PretrainedConfig
@@ -26,11 +26,11 @@ DEFAULT_ROPE_SCALING = {
     "type": "yarn",
 }
 
-class DeepseekV3Config(PretrainedConfig):
+class DeepseekV41Config(PretrainedConfig):
     r"""
-    This is the configuration class to store the configuration of a [`DeepseekV3Model`]. It is used to instantiate an DeepSeek
+    This is the configuration class to store the configuration of a [`DeepseekV41Model`]. It is used to instantiate an DeepSeek
     model according to the specified arguments, defining the model architecture. Instantiating a configuration with the
-    defaults will yield a similar configuration to that of the DeepSeek-V3.
+    defaults will yield a similar configuration to that of the DeepSeek-V41.
 
     Configuration objects inherit from [`PretrainedConfig`] and can be used to control the model outputs. Read the
     documentation from [`PretrainedConfig`] for more information.
@@ -39,7 +39,7 @@ class DeepseekV3Config(PretrainedConfig):
     Args:
         vocab_size (`int`, *optional*, defaults to 129280):
             Vocabulary size of the Deep model. Defines the number of different tokens that can be represented by the
-            `inputs_ids` passed when calling [`DeepseekV3Model`]
+            `inputs_ids` passed when calling [`DeepseekV41Model`]
         hidden_size (`int`, *optional*, defaults to 5120):
             Dimension of the hidden representations.
         intermediate_size (`int`, *optional*, defaults to 11008):
@@ -49,7 +49,7 @@ class DeepseekV3Config(PretrainedConfig):
         num_hidden_layers (`int`, *optional*, defaults to 40):
             Number of hidden layers in the Transformer decoder.
         num_nextn_predict_layers (`int`, *optional*, defaults to 1):
-            Number of nextn predict layers in the DeepSeekV3 Model.
+            Number of nextn predict layers in the DeepSeekV41 Model.
         num_attention_heads (`int`, *optional*, defaults to 32):
             Number of attention heads for each attention layer in the Transformer decoder.
         n_shared_experts (`int`, *optional*, defaults to 1):
@@ -119,10 +119,10 @@ class DeepseekV3Config(PretrainedConfig):
             The dropout ratio for the attention probabilities.
 
     ```python
-    >>> from transformers import DeepseekV3Model, DeepseekV3Config
+    >>> from transformers import DeepseekV41Model, DeepseekV41Config
 
-    >>> # Initializing a Deepseek-V3 style configuration
-    >>> configuration = DeepseekV3Config()
+    >>> # Initializing a Deepseek-V41 style configuration
+    >>> configuration = DeepseekV41Config()
 
     >>> # Accessing the model configuration
     >>> configuration = model.config
@@ -134,13 +134,57 @@ class DeepseekV3Config(PretrainedConfig):
     @classmethod
     def get_config_dict(cls, pretrained_model_name_or_path, **kwargs):
         config_dict, kwargs = super().get_config_dict(pretrained_model_name_or_path, **kwargs)
-        # Flatten text fields before Transformers selects a nested model config,
-        # so the sibling quantization_config remains available to the loader.
+        # The released V4.1 checkpoint stores language-model fields under
+        # ``text_config``.  The CANN model consumes a flat config, so normalize
+        # the upstream names before constructing this config object.
         text_config = config_dict.pop("text_config", {})
         config_dict.update(text_config)
-        # Flatten vision configs and add prefix.
+        rope_scaling = config_dict.get("rope_scaling")
+        if rope_scaling:
+            rope_scaling = dict(rope_scaling)
+            if "rope_type" not in rope_scaling and "type" in rope_scaling:
+                rope_scaling["rope_type"] = rope_scaling["type"]
+            if (
+                "original_max_position_embeddings" not in rope_scaling
+                and "origin_max_position_embeddings" in rope_scaling
+            ):
+                rope_scaling["original_max_position_embeddings"] = rope_scaling[
+                    "origin_max_position_embeddings"
+                ]
+            config_dict["rope_scaling"] = rope_scaling
+        if "kv_source_layers" not in config_dict and "kv_source_layer_ids" in config_dict:
+            config_dict["kv_source_layers"] = config_dict["kv_source_layer_ids"]
+        if "index_source_layers" not in config_dict and "index_source_layer_ids" in config_dict:
+            config_dict["index_source_layers"] = config_dict["index_source_layer_ids"]
+        if (
+            "candidate_source_layer" not in config_dict
+            and "candidate_source_layer_id" in config_dict
+        ):
+            config_dict["candidate_source_layer"] = config_dict[
+                "candidate_source_layer_id"
+            ]
+        if "engram_pad_id" not in config_dict and "engram_pad_token_id" in config_dict:
+            config_dict["engram_pad_id"] = config_dict["engram_pad_token_id"]
+        if (
+            "dspark_n_activated_experts" not in config_dict
+            and "dspark_num_experts_per_tok" in config_dict
+        ):
+            config_dict["dspark_n_activated_experts"] = config_dict[
+                "dspark_num_experts_per_tok"
+            ]
+
+        # Flatten vision fields and prefix their names with vision_.  HF renamed
+        # max_num_tokens to max_image_tokens in the V4.1 release.
         vision_config = config_dict.pop("vision_config", None)
         if vision_config:
+            max_image_tokens = vision_config.get(
+                "max_num_tokens", vision_config.get("max_image_tokens")
+            )
+            if max_image_tokens is None:
+                raise ValueError(
+                    "vision_config must define max_image_tokens "
+                    "(or legacy max_num_tokens)"
+                )
             config_dict.update(
                 vision_n_layers=vision_config["num_hidden_layers"],
                 vision_dim=vision_config["hidden_size"],
@@ -149,7 +193,7 @@ class DeepseekV3Config(PretrainedConfig):
                 vision_patch_size=vision_config["patch_size"],
                 vision_rope_theta=vision_config.get("rope_theta", 10000.0),
                 vision_downsample_ratio=vision_config["downsample_ratio"],
-                vision_max_n_token=vision_config["max_num_tokens"],
+                vision_max_n_token=max_image_tokens,
                 vision_min_pixels=vision_config["min_pixels"],
                 vision_max_wh_ratio=vision_config.get("max_wh_ratio"),
             )
@@ -175,6 +219,8 @@ class DeepseekV3Config(PretrainedConfig):
         index_source_layers=(2, 8, 14, 20, 24, 28, 32, 36),
         n_shared_experts=1,
         n_routed_experts=384,
+        dspark_n_routed_experts=0,
+        dspark_n_activated_experts=0,
         ep_size=1,
         routed_scaling_factor=1.5,
         kv_lora_rank=512,
@@ -233,6 +279,8 @@ class DeepseekV3Config(PretrainedConfig):
         self.index_source_layers = list(index_source_layers)
         self.n_shared_experts = n_shared_experts
         self.n_routed_experts = n_routed_experts
+        self.dspark_n_routed_experts = dspark_n_routed_experts
+        self.dspark_n_activated_experts = dspark_n_activated_experts
         self.ep_size = ep_size
         self.routed_scaling_factor = routed_scaling_factor
         self.kv_lora_rank = kv_lora_rank
@@ -283,7 +331,7 @@ class DeepseekV3Config(PretrainedConfig):
         )
 
 
-class DeepseekV3IndexConfig(DeepseekV3Config):
+class DeepseekV41IndexConfig(DeepseekV41Config):
     r"""
     Args:
         compress_block_size (`int`, defaults to 32):

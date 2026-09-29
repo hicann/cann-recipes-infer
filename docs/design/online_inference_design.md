@@ -284,10 +284,10 @@ flowchart LR
 
 1. **Client 发起请求**：Client 把 prompt + 采样参数封装成 JSON，`POST /generate` 到 Router 监听的 `ROUTER_HTTP_PORT`（8000，运行在 prefill-node-0 上）。Client 不感知 PD 拓扑——对它而言 Router 就是单一服务入口。请求可显式携带 `bootstrap_room`（用于幂等重试或外部追踪），未携带时由 Router 自动生成 uuid64。
 2. **Router 注入与双发**：`Router` 按 `bootstrap_room % N` 选一个 Prefill 实例和一个 Decode 实例，注入 `bootstrap_room / bootstrap_host / bootstrap_port` 与预算好的 `disagg_prefill_dp_rank`，`asyncio.gather` 并发 POST 给两端 leader。
-3. **Prefill 接入**：Prefill leader 父进程 FastAPI handler 收到请求，DPDispatcher 通过 ZMQ 分发到对应 dp rank 的 worker；`PrefillDisaggScheduler.add_request` 创建 `sender`，sender 触发 `POST /bootstrap/register_dp_rank` 把 `bootstrap_room → dp_rank` 写入 bootstrap。
-4. **Decode 接入**：Decode leader 父进程 FastAPI handler 收到请求，DPDispatcher 分发到 worker；`DecodeDisaggScheduler.add_request` 把请求放入 `DecodePreallocQueue`。Decode 端 `KVTransferManager.try_ensure_parallel_info(bootstrap_addr)` 首次拉 `GET /bootstrap/route` 得 `PrefillServerInfo`，本地推导 `TargetRankMapping`（缓存后跳过）。
+3. **Prefill 接入**：Prefill leader 父进程 FastAPI handler 收到请求，DPDispatcher 通过 ZMQ 分发到对应 dp rank 的 worker。DP Leader tokenize 后向组内广播原始 prompt 和初始 IDs；各 rank 在 `add_request()` 中复用 IDs，调用已注册的 MM Processor，再按最终长度校验。准入后创建 `sender`，触发 `POST /bootstrap/register_dp_rank` 写入 `bootstrap_room → dp_rank`，请求进入 `bootstrap_queue`。
+4. **Decode 接入**：Decode leader 父进程 FastAPI handler 收到请求，DPDispatcher 分发到 worker；同样经过 tokenize、可选 MM processing 和最终长度校验。`DecodeDisaggScheduler.add_request()` 清空 `mm_inputs`，把准入请求放入 `DecodePreallocQueue`，D 侧不执行 MM Encode。Decode 端 `KVTransferManager.try_ensure_parallel_info(bootstrap_addr)` 首次拉 `GET /bootstrap/route` 得 `PrefillServerInfo`，本地推导 `TargetRankMapping`（缓存后跳过）。
 5. **握手发起**：`DecodePreallocQueue.pop_preallocated` 通过入场控制后，分配本地 KV 块，构造 `receiver`；调用 `receiver.init(prefill_dp_rank)` 与 `receiver.send_metadata(...)`，通过 ZMQ PUSH 把目标布局/ready 信号发到对应 prefill rank 的 PULL socket。
-6. **Prefill 准入与执行**：Prefill worker 主循环通过 `sender.poll()` 看到状态从 `Bootstrapping` 推进到 `WaitingForInput`，`PrefillDisaggScheduler._schedule_prefill_batch` 将该请求纳入 prefill batch，模型执行算 KV。
+6. **Prefill 调度与执行**：`advance_queues_consensus()` 通过 `sender.poll_and_all_reduce()` 确认组内请求均达到 `WaitingForInput`，再将请求从 `bootstrap_queue` 移入计算队列。启用 MM Encode 时先进入 `mm_waiting_queue`，编码结果写入 Store 后转入 `waiting_queue`；未启用时直接进入 `waiting_queue`。随后 `_schedule_prefill_batch()` 选取请求，`forward_batch()` 按需取出对应视觉结果并执行语言 Prefill，生成 KV。
 7. **KV 传输**：Prefill 完成后 `_on_prefill_complete` 构造 `send_metadata`，调用 `sender.send(...)` 把任务交给 `AscendTransferEngine`；后者经 RDMA / HCCL 把 KV 块与 metadata 直写到 decode 端的物理块池与 `MetadataBufferPool`。Prefill 释放本地 KV，HTTP 响应给 Router（被丢弃）。
 8. **Decode 完成确认**：Decode worker 主循环通过 `DecodeTransferQueue.pop_transferred` 轮询 `MetadataBufferPool` 的 64 B 槽，检测到 metadata 到齐后把 `DecodeRequest` 转成 `Req` 推入 `running_requests`。
 9. **Decode 输出与 Client 响应**：Decode 端进入 decode 循环采样 `next_token`，每步走 `DPDispatcher` ZMQ 回收到 leader 父进程；FastAPI handler 把完整响应回 Router；Router 透传 decode 的 200 + body 给 Client。Client 在阻塞 `httpx.post` 处一次性拿到 `{request_id, bootstrap_room, output, ...}`，完成本次请求生命周期。
@@ -321,15 +321,18 @@ sequenceDiagram
     par 并发
       R->>P: POST /generate
       P->>PW: DPDispatcher → dp leader
+      Note over PW: tokenize + broadcast；可选 MM Processor → 最终长度校验
       PW->>BS: POST /bootstrap/register_dp_rank (room → dp_rank)
       PW-->>P: accepted=true
       P-->>R: 200 + {request_id, bootstrap_room, accepted}
     and
       R->>D: POST /generate
       D->>DW: DPDispatcher → dp leader
+      Note over DW: tokenize + broadcast；可选 MM Processor → 最终长度校验；不执行 Encode
       DW->>BS: GET /bootstrap/route（缓存命中则跳过）
       Note over DW: 已注入 disagg_prefill_dp_rank → 跳过 query_dp_ranks
       DW->>PW: ZMQ PUSH metadata (tcp://prefill_rank_ip:port)
+      Note over PW: bootstrap 共识 → 可选 MM Encode / Store → Prefill
       PW->>DW: KV transfer via AscendTransferEngine（RDMA / HCCL）
       DW-->>D: decode output
       D-->>R: 200 + {output}
@@ -561,8 +564,8 @@ PD 模式下 base `Scheduler` 被 `PrefillDisaggScheduler` / `DecodeDisaggSchedu
 |---|---|
 | `add_request(request_dict)` | 接入 PD 请求；建立 sender；写 bootstrap `room → dp_rank` |
 | `_create_sender(request)` | 在 KVTransferManager 上注册一个 sender，绑定到 `bootstrap_room` |
-| `advance_queues_consensus(engine)` | TP 内 Gloo poll-and-all-reduce，确保所有 rank 对队列推进达成一致后再走全局 forward |
-| `_schedule_prefill_batch(engine)` | 选 prefill batch；与 base 不同点：被选中的请求要保证它的 sender 已 bootstrap ready |
+| `advance_queues_consensus(engine)` | 组内 Gloo poll-and-all-reduce，bootstrap ready 后将请求推进到 `mm_waiting_queue` 或 `waiting_queue` |
+| `_schedule_prefill_batch(engine)` | 复用基类，从 `waiting_queue` 选取 Prefill batch |
 | `_on_prefill_complete(request)` | prefill 完成后构建 `send_metadata`，触发 KVTransferManager 把 KV 经 RDMA 直发 decode；释放 KV 块 |
 | `_log_step` | 输出 `kv=used/total`、传输队列深度等 PD 专属指标 |
 
@@ -574,7 +577,7 @@ PD 模式下 base `Scheduler` 被 `PrefillDisaggScheduler` / `DecodeDisaggSchedu
 
 | 方法 | 作用 |
 |---|---|
-| `add_request(request_dict)` | 接入请求 → `DecodePreallocQueue` |
+| `add_request(prompt, request_id=None, sampling_params=None, input_ids=None)` | 准入处理后清空 `mm_inputs`，进入 `DecodePreallocQueue` |
 | `run_step(engine, phase)` | `DecodeDisaggScheduler.run_step` 固定以 `phase="decode"` 调入基类 `Scheduler`；在基类 `_schedule_batch` 中跳过 `_schedule_prefill_batch` 分支 |
 | `_schedule_decode_batch(engine)` | 基类返回空但 `running_requests` 非空时，触发 retraction |
 | `_retract_one()` | 选 `min(running_requests, key=(len(output_ids), -prompt_tokens))` 驱逐，标记 `is_finished=True, finish_reason='abort_oom' or 'preempted_oom'`，释放 KV 后再调度 |
@@ -598,6 +601,12 @@ PD 模式下 base `Scheduler` 被 `PrefillDisaggScheduler` / `DecodeDisaggSchedu
 ### 6.5 Per-step 日志钩子
 
 base `Scheduler.run_step` 在 `forward_batch` 后调用 `_log_step(output)` 钩子，捕获 `output['inference_time']` 与累计步数 `_step`；PD 角色 override `_log_step` 输出统一格式状态行，包含 `kv=used/total`（来自 `kv_cache_manager.get_usage()`），便于联机观察 KV 水位与吞吐。
+
+### 6.6 阶段协商
+
+每轮主循环先接收请求、推进传输队列，再调用 `OnlineInference._negotiate_phase()`。各 DP Leader 同步 `(has_mm_pending, has_prefill_ready, has_decode)`，按 `prefill > mm_encode > decode` 选择阶段，再向组内 TP/CP rank 广播。协商范围是单个服务实例：P 侧执行 Prefill 或 MM Encode，D 侧只执行 Decode。
+
+全局选中 MM Encode 而本地没有请求时，Scheduler 构造空的 `MMEncodeBatch(is_dummy=True)`，仍进入 Worker 的同步与计时流程，但不调用模型 Encoder、不写 Store，也不更新请求状态。Prefill/Decode 继续沿用原有 dummy token batch；全局无计算任务时返回 `phase=None`。MM 队列、选批和 Store 生命周期详见 [MM Encode 机制](mm_encode_design.md)。
 
 ---
 
@@ -698,4 +707,3 @@ class DisaggConfig:
 字段全部由 `server.py main()` 在 `args.role / args.node_index / args.ips / ...` 中显式构造（YAML 不含 `disagg_config`）。
 
 `store_url` 在 prefill 与 decode 全部 rank 必须一致，由 router/launch 脚本以 `tcp://<PREFILL_IPS[0]>:<port>` 形式生成下发。
-

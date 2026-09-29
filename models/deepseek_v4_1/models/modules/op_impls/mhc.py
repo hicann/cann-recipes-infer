@@ -1,6 +1,6 @@
 # coding=utf-8
 # Adapted from
-# https://huggingface.co/deepseek-ai/DeepSeek-V3/blob/main/modeling_deepseek.py
+# https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/main/inference/model.py
 # Copyright (c) 2026 Huawei Technologies Co., Ltd.
 # Copyright 2023 DeepSeek-AI and The HuggingFace Inc. team. All rights reserved.
 #
@@ -24,7 +24,7 @@
 from dataclasses import dataclass
 
 import torch
-import torch.nn.functional as F
+import custom_ops
 from ..registry import register_op_impl
 
 
@@ -54,77 +54,24 @@ class _HCPreParams:
     hc_eps: float
 
 
-def hc_split_sinkhorn_torch(
-        mixes: torch.Tensor,
-        hc_scale: torch.Tensor,
-        hc_base: torch.Tensor,
-        hc_mult: int = 4,
-        sinkhorn_iters: int = 20,
-        eps: float = 1e-6):
-    # mixes: [T, mix_hc], hc_scale: [3], hc_base: [mix_hc]
-    # mix_hc = (hc + 2) * hc
-    lead_dims = (1,) * (mixes.dim() - 1)
-    pre, post, comb = mixes.split([hc_mult, hc_mult, hc_mult * hc_mult], dim=-1)
-    comb = comb.unflatten(-1, (hc_mult, hc_mult))
-
-    pre = F.sigmoid(pre * hc_scale[0] + hc_base[:hc_mult].view(*lead_dims, hc_mult)) + eps
-    post = 2 * F.sigmoid(post * hc_scale[1] + hc_base[hc_mult:2 * hc_mult].view(*lead_dims, hc_mult))
-    comb = comb * hc_scale[2] + hc_base[2 * hc_mult:].view(*lead_dims, hc_mult, hc_mult)
-
-    comb = comb.softmax(-1) + eps
-    col_sum = comb.sum(-2, keepdim=True)
-    comb = comb / (col_sum + eps)
-    for _ in range(sinkhorn_iters - 1):
-        row_sum = comb.sum(-1, keepdim=True)
-        comb = comb / (row_sum + eps)
-        col_sum = comb.sum(-2, keepdim=True)
-        comb = comb / (col_sum + eps)
-    return pre, post, comb
-
-
-# hc_pre currently support Native, AscendC
-# TODO: change to mhc_pre fusion kernel
-# @register_op_impl(op_type="hc_pre", func_key="hc_pre_ascendc")
-# def hc_pre_ascendc(x, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, hc_sinkhorn_iters, norm_eps, hc_eps):
-#     x = x.unsqueeze(1)
-#     y, post, comb, pre, _, _, _, _, _ = torch.ops.cann_ops_transformer.mhc_pre_sinkhorn(
-#         x=x,
-#         pre_mix=pre_mix,
-#         phi=hc_fn,
-#         alpha=hc_scale,
-#         bias=hc_base,
-#         hcMult=hc_mult,
-#         numIters=hc_sinkhorn_iters,
-#         hcEps=hc_eps,
-#         normEps=norm_eps,
-#         outFlag=False,
-#     )
-#     comb = comb.unflatten(-1, (hc_mult, hc_mult))
-#     return y.squeeze(1), post.squeeze(1), comb.squeeze(1), pre
-
-
-@register_op_impl(op_type="hc_pre")
-def hc_pre_native(x, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, hc_sinkhorn_iters, norm_eps, hc_eps):
-    shape, dtype = x.size(), x.dtype
-    x = x.flatten(1).float()
-    rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + norm_eps)
-    mixes = F.linear(x, hc_fn) * rsqrt
-
-    pre, post, comb = hc_split_sinkhorn_torch(mixes, hc_scale, hc_base, hc_mult, hc_sinkhorn_iters, hc_eps)
-    y = torch.sum(pre_mix.unsqueeze(-1) * x.view(shape), dim=1)
-    y = y.to(dtype)
+@register_op_impl(op_type="hc_pre", func_key="hc_pre_ascendc")
+def hc_pre_ascendc(x, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, hc_sinkhorn_iters, norm_eps, hc_eps):
+    # x: [T, hc_mult, H], pre_mix: [T, hc_mult], y: [T, H]
+    y, post, comb, pre = torch.ops.custom.npu_hc_pre_v2(
+        x=x,
+        hc_fn=hc_fn,
+        hc_scale=hc_scale,
+        hc_base=hc_base,
+        pre_mix=pre_mix,
+        hc_mult=hc_mult,
+        hc_sinkhorn_iters=hc_sinkhorn_iters,
+        norm_eps=norm_eps,
+        hc_eps=hc_eps
+    )
     return y, post, comb, pre
 
 
-# hc_post currently support Native and AscendC version
-# @register_op_impl(op_type="hc_post", func_key="hc_post_ascendc")
-# def hc_post_ascendc(x, residual, post, comb):
-#     y = torch.ops.cann_ops_transformer.mhc_post(residual, comb, x, post)
-#     return y
-
-
-@register_op_impl(op_type="hc_post")
-def hc_post_native(x, residual, post, comb):
-    y = post.unsqueeze(-1) * x.unsqueeze(-2) + torch.sum(comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=x.dim() - 1)
-    y = y.type_as(x)
+@register_op_impl(op_type="hc_post", func_key="hc_post_ascendc")
+def hc_post_ascendc(x, residual, post, comb, is_prefill=False):
+    y = torch.ops.cann_ops_transformer.mhc_post(residual, comb, x, post)
     return y

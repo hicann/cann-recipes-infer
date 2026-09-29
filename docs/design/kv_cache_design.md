@@ -63,9 +63,11 @@ graph TD
     B --> C1[FullAttentionManager]
     B --> C2[SlidingWindowManager]
     B --> C3[MambaManager]
+    B --> C4[RingCacheManager]
     C1 --> D1[BlockPool]
     C2 --> D2[BlockPool]
     C3 --> D3[BlockPool]
+    C4 --> D4[BlockPool]
 ```
 
 #### 2.2 第一层：KVCacheManager
@@ -146,16 +148,18 @@ graph TD
 ATTN_TYPE_MANAGER_MAP = {
     "FullAttention": FullAttentionManager,
     "SlidingWindow": SlidingWindowManager,
+    "RingCache": RingCacheManager,
     "Mamba": MambaManager,
 }
 ```
-目前已实现三类具体的**派生类型**：
+目前已实现四类具体的**派生类型**：
 
 | 类名 | 说明 | 定义位置 |
 |------|------|----------|
 | `FullAttentionManager` | 全注意力，块随序列增长线性追加 | [single_type_kv_cache_manager.py](../../executor/core/kv_cache/single_type_kv_cache_manager.py) |
 | `SlidingWindowManager` | 滑动窗口注意力，支持过期块回收 | [single_type_kv_cache_manager.py](../../executor/core/kv_cache/single_type_kv_cache_manager.py) |
 | `MambaManager` | Mamba 循环状态，每请求使用固定数量的状态块 | [single_type_kv_cache_manager.py](../../executor/core/kv_cache/single_type_kv_cache_manager.py) |
+| `RingCacheManager` | 每请求固定一个 block，块内按绝对位置循环复用 | [single_type_kv_cache_manager.py](../../executor/core/kv_cache/single_type_kv_cache_manager.py) |
 
 ##### 2.3.1 FullAttentionManager
 
@@ -207,6 +211,28 @@ ATTN_TYPE_MANAGER_MAP = {
 - `validate_and_build_kwargs()`：校验同组 `MambaCacheEntry.next_n` 一致。
 
 模型侧的元数据和使用限制见 [Mamba 适配规则](#511-确定每个-cache-的-attn_type)。
+
+##### 2.3.4 RingCacheManager
+
+`RingCache` 使用现有 `CacheEntry`，以 `block_size` 表示环形容量 C，`compress_ratio` 必须为 1。普通 `BnBsND` 布局为 `[block_num, C, num_head, *dim]`，不新增容量或游标字段。
+
+每个请求首次申请一个物理 block，之后不随序列长度增加 block；请求结束时归还该 block。类中仅重写：
+
+- `pre_allocate_blocks()`：未持有 block 时需要 1 个，已持有时需要 0 个；不使用未来 token 增长的 `reserved_tokens` 预算。
+- `get_num_skipped_tokens()`：返回 0，块内覆盖不等于释放整个 block。
+- `validate_and_build_kwargs()`：确认 `compress_ratio=1`，不增加其他类型参数。
+
+实际领取、查询、释放和回收入口均继承基类。`BlockPool` 仍只管理唯一的物理 block ID，不感知 ring 游标。
+
+公共框架提供 `block_table[manager_key]`，形状为 `[B, 1]`，以及 `slot_mapping[manager_key]`，形状为 `[T]`。对于请求内绝对位置 p：
+
+```text
+slot = block_table[request_index, 0] * C + p % C
+```
+
+同一步的输入超过 C 条时，仅末尾 C 条保留有效写槽，之前的条目置为 -1，避免并行写入重复槽位；null block 请求的写槽也全部为 -1。模型的 writer 必须跳过 -1。该映射描述持久缓存的最终写入，不替代本轮 Attention/Compressor 所需的完整输入或临时计算缓存。
+
+CP 沿用现有计算视图与持久缓存视图：持久写槽在切分前使用请求的绝对位置生成，再通过已有的持久索引选择传递。模型仍负责跨 segment 的输入依赖、最终尾部选择及同步，不能将 CP 全序列计算页表作为 Ring 的单列物理 block 表使用。Ring 类型本身不改变 CP owner 分配策略。
 
 #### 2.4 第三层：BlockPool
 
@@ -391,7 +417,7 @@ graph TD
 它会先按 cache 的 `attn_type` 区分固定 block 与非固定 block 类型，再按 `cache.group_key` 汇总 `block_size` 和每块字节数，最终返回 `Dict[manager_key, block_num]`：
 
 **1. 固定 block 数的 `attn_type`**
-   这类 `attn_type` 需要的 cache 数据不随着请求总长度线性增长。当前 `FIXED_BLOCK_ATTN_TYPES = {"SlidingWindow", "Mamba"}`：`SlidingWindow` 只保留窗口范围内的 cache；`Mamba` 保存每个请求固定尺寸的循环状态。
+   这类 `attn_type` 需要的 cache 数据不随着请求总长度线性增长。当前 `FIXED_BLOCK_ATTN_TYPES = {"SlidingWindow", "RingCache", "Mamba"}`：`SlidingWindow` 只保留窗口范围内的 cache；`RingCache` 每请求占用一个固定容量 block；`Mamba` 保存每个请求固定尺寸的循环状态。
    **SlidingWindow**：
    `SlidingWindow` 的 `block_num` 计算思路是按 `manager_key` 先为单个请求估算“窗口内最多需要保留多少真实 block”，再乘以最大并发数 `batch_size_per_dp_rank`。具体计算为：
    ```text
@@ -411,6 +437,13 @@ graph TD
    state_memory_bytes = fixed_block_num * prod(shape) * dtype_size
    ```
    `prod(shape)` 是一个 `MambaCacheEntry` 状态块的元素数，最后的 `+1` 同样用于 `null_block`。所有 Mamba cache entry 的 `state_memory_bytes` 会累计到固定块缓存的总预留内存中。
+
+   **RingCache**：每个并发请求使用一个容量为 C 的 block：
+   ```text
+   fixed_block_num = max_concurrency + 1
+   memory_bytes = fixed_block_num * C * num_head * prod(dim) * dtype_size
+   ```
+   最后的 `+1` 为 null block。按 manager key 规划块数，按各个 HBM cache entry 累加字节预算；同组不同层或不同 Tensor 不重复增加请求可用块数。
 
 **2. 非固定 block 数的 `attn_type`**
    这类 `attn_type` 需要的 cache 数据随着请求总长度线性增长，例如 `FullAttention`，MLA、MHA、GQA等全注意力都属于`FullAttention`。
@@ -448,6 +481,8 @@ graph TD
 
 `slot_mapping` 仅针对需要逐 token 写入寻址的 manager 构造。`attn_type="Mamba"` 的 manager 只构造 `block_table`（循环状态按整块寻址，没有 token 内偏移的概念）；`compress_ratio > 1` 的 manager 也会跳过 `slot_mapping` 构造。模型侧读取 `slot_mapping[manager_key]` 前应确认对应类型需要该条目，详见 5.1.1 节。
 
+`RingCache` 的页表宽度固定为 1，不能使用 `position_ids // block_size` 查询后续逻辑页。`prepare_slot_mapping()` 对该类型使用单列 block ID 加环形偏移，并屏蔽本步超出保留容量的较早记录和 null block，详见 2.3.4 节。
+
 ---
 
 ### 5. 新模型适配 Cache 管理的 Checklist
@@ -465,6 +500,7 @@ graph TD
 | `FullAttention` | `FullAttentionManager` | 全注意力，cache 随序列增长线性追加 |
 | `SlidingWindow` | `SlidingWindowManager` | 滑动窗口注意力，支持过期块回收 |
 | `Mamba` | `MambaManager` | 线性注意力 / Mamba 类循环状态，每请求固定尺寸的整块状态，不随序列增长 |
+| `RingCache` | `RingCacheManager` | 每请求固定一个 block，`block_size` 为环形容量，框架同时提供 block table 和 slot mapping |
 
 `Mamba` 类型与前两者有三点契约差异，模型侧接入时必须注意：
 
@@ -479,6 +515,7 @@ graph TD
 ATTN_TYPE_MANAGER_MAP: Dict[str, Type[SingleTypeKVCacheManager]] = {
     "FullAttention": FullAttentionManager,
     "SlidingWindow": SlidingWindowManager,
+    "RingCache": RingCacheManager,
     "Mamba": MambaManager,
 }
 ```
@@ -598,7 +635,7 @@ self.block_size = infer_config.scheduler_config.block_size
 | 函数名 | 说明 |
 |-------|------|
 | `pre_allocate_blocks(request_id, num_tokens, reserved_tokens=0)` | 计算本次需要新增多少 block，并返回 `(need_block_num, status)`；若沿用基类实现，则自动带有每请求 decode 预留准入逻辑，预留量来自 `num_reserved_decode_tokens` |
-| `allocate_new_blocks(request_id, block_num_to_allocate, num_tokens)` | 执行真实 block 分配，更新 `req_to_blocks` |
+| `allocate_new_blocks(request_id, block_num_to_allocate, num_tokens)` | 执行真实 block 分配，更新 `req_to_blocks`；如基类追加逻辑适用，可直接继承 |
 | `get_num_skipped_tokens(num_computed_tokens)` | 计算可跳过分配的 token 数 |
 | `remove_skipped_blocks(request_id, total_computed_tokens)` | 【可选】重写，用于特殊回收机制 |
 | `validate_and_build_kwargs(group_entries)` | 【静态方法】用于从 `CacheEntry` 提取和校验类型特定参数 |
@@ -613,6 +650,7 @@ self.block_size = infer_config.scheduler_config.block_size
 ATTN_TYPE_MANAGER_MAP: Dict[str, Type[SingleTypeKVCacheManager]] = {
     "FullAttention": FullAttentionManager,
     "SlidingWindow": SlidingWindowManager,
+    "RingCache": RingCacheManager,
     "Mamba": MambaManager,
     "NewAttentionType": NewAttentionManager,  # 新增
 }
@@ -635,7 +673,7 @@ ATTN_TYPE_MANAGER_MAP: Dict[str, Type[SingleTypeKVCacheManager]] = {
 若新增固定 block 类型，首先在[cache_utils.py](../../executor/core/kv_cache/cache_utils.py) 的 `FIXED_BLOCK_ATTN_TYPES`中新增该 `attn_type`：
 
 ```python
-FIXED_BLOCK_ATTN_TYPES = {"SlidingWindow", "Mamba", "NewFixedBlockType"}  # 新增
+FIXED_BLOCK_ATTN_TYPES = {"SlidingWindow", "RingCache", "Mamba", "NewFixedBlockType"}  # 新增
 ```
 
 然后需要在[cache_utils.py](../../executor/core/kv_cache/cache_utils.py) 的 `calculate_fixed_block_memory_bytes()`函数中补充计算逻辑：
