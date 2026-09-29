@@ -1,0 +1,158 @@
+From 7c27ddf746c40437749b268c547d79d537730338 Mon Sep 17 00:00:00 2001
+From: dsv41-integration <soc.yuan@gmail.com>
+Date: Thu, 24 Sep 2026 14:34:58 +0000
+Subject: [PATCH 10/10] =?UTF-8?q?[fix](amx):=20=E9=9B=B6=E6=8B=B7=E8=B4=9D?=
+ =?UTF-8?q?=E5=9B=9E=E8=90=BD=E6=94=B9=E6=8A=9B=E9=94=99=EF=BC=9B=E9=A1=BA?=
+ =?UTF-8?q?=E5=B8=A6=E7=B2=BE=E7=AE=80=E6=B3=A8=E9=87=8A?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+1) fp4-moe.hpp：KT_ZEROCOPY_WEIGHTS=1 但本层没有 per-expert 源指针时抛错，
+   不再静默回落到拷贝路径。调用侧的内存账是按零拷贝算的（node0 只留了
+   零拷贝那一份），回落要多 ~84.4 GiB 匿名内存，而原先唯一的提示是一条
+   混在 40 层加载里的 printf。
+
+2) 注释按"只留不看就会改错的那一两句"精简（用户 2026-09-24 要求）：
+   common.hpp −42 行、zerocopy_weights.hpp −18 行、fp4-moe.hpp 的那段 −11 行。
+   删掉的是历史考证和实测读数，那些在本线的计划文档和提交信息里。
+
+新 .so md5 0c9b83582516b99166da521046f3d31d，已换入 staging/stream2-kt_site_zc。
+（0351cffe / 3164f7cd 作废。）
+
+按路径 add，未含 third_party 两个 gitlink：见上一提交的说明。
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01GbzqQvkLZdVKvY1FMYHUZY
+---
+ kt-kernel/operators/amx/fp4-moe.hpp      | 15 +++++++--
+ kt-kernel/operators/common.hpp           | 42 ++++++------------------
+ kt-kernel/operators/zerocopy_weights.hpp | 18 +++-------
+ 3 files changed, 28 insertions(+), 47 deletions(-)
+
+diff --git a/kt-kernel/operators/amx/fp4-moe.hpp b/kt-kernel/operators/amx/fp4-moe.hpp
+index 77f905b..24c274b 100644
+--- a/kt-kernel/operators/amx/fp4-moe.hpp
++++ b/kt-kernel/operators/amx/fp4-moe.hpp
+@@ -15,6 +15,8 @@
+ #ifndef CPUINFER_OPERATOR_AMX_FP4_MOE_H
+ #define CPUINFER_OPERATOR_AMX_FP4_MOE_H
+ 
++#include <stdexcept>  // std::runtime_error -- was only ever pulled in transitively
++
+ #include "../zerocopy_weights.hpp"  // KT_ZEROCOPY_WEIGHTS switch + page placement/pinning
+ #include "la/amx_raw_buffers.hpp"  // BufferABF16Impl
+ #include "moe_base.hpp"
+@@ -1365,9 +1367,18 @@ class TP_MOE<AMX_FP4_MOE_TP<K>> : public TP_MOE<AMX_MOE_BASE<K, AMX_FP4_MOE_TP<K
+     // hidden / 2 bytes, 3.2 GiB per node for DeepSeek-V4.1-Flash) is not
+     // allocated at all. The SCALE staging stays: scales are converted, never
+     // aliased. Origin: dsv41 stream-prefill, CPU-MoE weight zero-copy.
+-    const bool zero_copy = kt_zerocopy::enabled() && use_per_expert_ptrs;
++    // 🔴 Throw, do not fall back: the caller sized node0 for zero-copy
++    // (kt_offload_gate.py), and the copy path needs ~84.4 GiB more anonymous
++    // memory than it was granted. The old fallback was a printf lost in a
++    // 40-layer load.
+     if (kt_zerocopy::enabled() && !use_per_expert_ptrs)
+-      printf("[kt zero-copy] KT_ZEROCOPY_WEIGHTS=1 ignored: this layer has no per-expert source pointers\n");
++      throw std::runtime_error(
++          "kt-kernel: KT_ZEROCOPY_WEIGHTS=1 but this layer has no per-expert source pointers "
++          "(config.gate_projs is empty), so the weights cannot be consumed in place. Refusing to "
++          "fall back to the copy path: the caller's memory account was computed for zero-copy and "
++          "the copy path needs ~84.4 GiB more anonymous memory than it was granted. Either pass "
++          "per-expert pointers or unset KT_ZEROCOPY_WEIGHTS.");
++    const bool zero_copy = kt_zerocopy::enabled() && use_per_expert_ptrs;
+     // KT_ZEROCOPY_SCOPE=w13: gate/up are consumed in place, down is NOT, so its
+     // TP-sliced staging (1/3 of the weight staging) still has to be built here.
+     const bool stage_down_weights = zero_copy && kt_zerocopy::scope_w13_only();
+diff --git a/kt-kernel/operators/common.hpp b/kt-kernel/operators/common.hpp
+index 7850f44..147992c 100644
+--- a/kt-kernel/operators/common.hpp
++++ b/kt-kernel/operators/common.hpp
+@@ -69,34 +69,16 @@ inline bool kt_moe_phase_timing() {
+   return enabled;
+ }
+ 
+-// ---------------------------------------------------------------------------
+ // Checked host allocation.
+ //
+-// kt's worker pool pins every worker thread to one NUMA node with
+-// hwloc_set_membind(BIND | STRICT | THREAD) (cpu_backend/worker_pool.h:49) and
+-// never resets that bind -- by design. STRICT means the allocation is not
+-// allowed to spill to another node, so once the bound node is full
+-// std::aligned_alloc returns nullptr instead of succeeding elsewhere.
+-//
+-// An unchecked nullptr from there used to disappear completely: it was handed
+-// straight to the BufferB constructors, whose only guard is
+-// assert(ptr % 64 == 0) (operators/amx/la/amx_raw_buffers.hpp) -- 0 passes that
+-// test, and a Release build defines NDEBUG, which removes the assert outright.
+-// The first write then took SIGSEGV, and with kernel.print-fatal-signals=0 and
+-// core_pattern piped to apport that signal leaves neither a dmesg line nor a
+-// core file: the process simply vanishes. (Observed 2026-09-24 10:41:21 --
+-// EngineCore gone with no output at all, machine-wide global_oom two minutes
+-// later.)
+-//
+-// These helpers do not prevent the failure; they make it say what happened.
+-// The byte count says how much was asked for, and the NUMA binding of the
+-// calling thread is what identifies the hard bind as the reason a machine with
+-// free memory elsewhere could still fail to allocate -- without it that is
+-// guesswork.
+-// Origin: dsv4.1 single-card line, 2026-09-24.
+-
+-// One line describing where the calling thread runs and what its memory policy
+-// allows. Only ever called on a failure path, so the /sys reads are free.
++// Worker threads are hard-bound with hwloc_set_membind(BIND|STRICT|THREAD)
++// (cpu_backend/worker_pool.h) and never unbound, so a full node makes
++// std::aligned_alloc return nullptr instead of spilling. nullptr then passes
++// BufferB's assert(ptr % 64 == 0) -- which NDEBUG removes anyway -- and the
++// first write is a SIGSEGV with no dmesg line and no core. These helpers do
++// not prevent that; they make it say what happened.
++
++// Where the calling thread runs and what its mempolicy allows. Failure path only.
+ inline std::string kt_thread_numa_binding(bool* hard_bound = nullptr) {
+   if (hard_bound != nullptr) *hard_bound = false;
+   std::ostringstream oss;
+@@ -155,12 +137,8 @@ inline std::string kt_thread_numa_binding(bool* hard_bound = nullptr) {
+   return oss.str();
+ }
+ 
+-// std::aligned_alloc that never returns nullptr: on failure it prints and
+-// throws (via ASSERT_RELEASE, so NDEBUG cannot compile the check away) a
+-// message carrying the requested size and the calling thread's NUMA binding.
+-// `what` names the buffer, `index` is an optional expert id (-1 = none).
+-// The thrown type is std::runtime_error, which pybind11 surfaces to Python as
+-// RuntimeError with this message intact.
++// std::aligned_alloc that throws std::runtime_error (via ASSERT_RELEASE, which
++// NDEBUG cannot remove) instead of returning nullptr. `index` = expert id or -1.
+ inline void* kt_checked_aligned_alloc(size_t alignment, size_t size, const char* what, long long index = -1) {
+   void* ptr = std::aligned_alloc(alignment, size);
+   if (ptr == nullptr) {
+diff --git a/kt-kernel/operators/zerocopy_weights.hpp b/kt-kernel/operators/zerocopy_weights.hpp
+index 30a5535..a35d20b 100644
+--- a/kt-kernel/operators/zerocopy_weights.hpp
++++ b/kt-kernel/operators/zerocopy_weights.hpp
+@@ -105,20 +105,12 @@ inline Scope scope() {
+ inline bool scope_w13_only() { return scope() == Scope::kW13; }
+ 
+ // KT_ZEROCOPY_MLOCK=0 turns off the pinning (placement + mlock) while keeping
+-// the zero-copy pointers, so the two effects can be measured apart.
++// the zero-copy pointers.
+ //
+-// 🔴 THIS ONE DEFAULTS *ON*, unlike every other switch in this file, and that
+-// is deliberate -- do not "make it consistent" with env_flag() by flipping the
+-// default. Pinning is what the zero-copy path was built to do; unset has always
+-// meant pinned, and a build that silently stopped pinning would change what the
+-// measured arms mean. What IS shared with env_flag() is the parse: "" and unset
+-// (= on, here), "0" off, "1" on, and anything else throws. A lax parse in this
+-// particular switch is the dangerous direction, because every typo lands on the
+-// ON side: KT_ZEROCOPY_MLOCK=false / =off / =no used to read as "pin", i.e. it
+-// would mlock 84.4 GiB onto node0 -- the node with 4-8 GiB free -- while the
+-// operator believed they had turned it off. vllm_ascend/kt_offload/layer.py
+-// exports exactly "0" so today's runs are unaffected; this closes the shape,
+-// not a live bug. (decode majflt = 0 measured: the pin is not needed there.)
++// 🔴 Defaults ON, unlike every other switch here, deliberately -- do not "make
++// it consistent". The parse is strict because every typo would otherwise land
++// on the ON side, mlocking 84.4 GiB onto the node with 4-8 GiB free while the
++// operator believes it is off.
+ inline bool mlock_enabled() {
+   const char* v = std::getenv("KT_ZEROCOPY_MLOCK");
+   if (v == nullptr || v[0] == '\0') return true;  // unset/empty = pinned (see above)

@@ -1,0 +1,106 @@
+From 4ff48b77eeaed0cb66b204233ffb70d3dfd83f4e Mon Sep 17 00:00:00 2001
+From: dsv41-moe-offload <soc.yuan@gmail.com>
+Date: Tue, 22 Sep 2026 16:49:49 +0000
+Subject: [PATCH 05/10] =?UTF-8?q?[feat](kt-kernel):=20worker=20=E5=BF=99?=
+ =?UTF-8?q?=E7=AD=89=E6=97=B6=E9=95=BF=E6=94=B9=E6=88=90=20KT=5FWORKER=5FS?=
+ =?UTF-8?q?PIN=5FMS=EF=BC=88=E9=BB=98=E8=AE=A4=E4=BB=8D=2050=20=E2=87=92?=
+ =?UTF-8?q?=20=E8=A1=8C=E4=B8=BA=E4=B8=8D=E5=8F=98=EF=BC=89?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+InNumaPool::worker_thread 与 NumaJobDistributor::worker_thread 干完活后忙等 50 ms 才睡
+condvar。decode 每层几百 µs 就有新活 ⇒ 稳态下这 96 条线程全程自旋，而每条都被
+kt_bind_worker 硬绑到单个 PU。自旋换来的是唤醒便宜，代价是同机的 ACL 报告线程（host
+callback 框架里唯一一条派发线程）要和它们抢核：dsv4-a5 单卡 offload §4.20 实测整网
+A+F 78.0 µs/层，同一台机器上 kt 池空闲（已睡进 condvar）的微基准只有 56.8 µs。
+
+这里只把那个写死的 50 变成可读环境变量，**默认、空值、非法值都仍是 50**，所以不设变量时
+逐字节还是原来的行为；非法值退回 50 而不是 0（打错字不能把自旋静默关掉——那会改性能而
+没有任何东西会说出来）。解析拆成 kt_parse_spin_ms() 以便不起线程池就能测。
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_011rvwJMwDwJQ4XJFPgkXUDe
+---
+ kt-kernel/cpu_backend/worker_pool.cpp | 36 +++++++++++++++++++++++++--
+ kt-kernel/cpu_backend/worker_pool.h   |  6 +++++
+ 2 files changed, 40 insertions(+), 2 deletions(-)
+
+diff --git a/kt-kernel/cpu_backend/worker_pool.cpp b/kt-kernel/cpu_backend/worker_pool.cpp
+index 194f356..9578a80 100644
+--- a/kt-kernel/cpu_backend/worker_pool.cpp
++++ b/kt-kernel/cpu_backend/worker_pool.cpp
+@@ -29,6 +29,38 @@
+ 
+ thread_local int WorkerPool::thread_local_id = -1;
+ 
++// ---------------------------------------------------------------------------
++// How long a worker keeps spinning after it finishes a job before it sleeps on
++// its condvar. The historical value is 50 ms, and it stays the default: with
++// decode handing this pool new work every few hundred µs, every worker is a
++// runnable spinner hard-bound to one PU for the whole run, which is exactly
++// what makes the wake-up cheap. It is also what the ACL report thread of a
++// host-callback framework has to compete with (dsv4-a5 single-card offload,
++// §4.20: whole-net A+F 78.0 µs/layer against 56.8 µs with the same pool idle
++// and asleep). KT_WORKER_SPIN_MS makes that trade measurable without a second
++// build: unset or invalid = 50 = byte-for-byte the old behaviour, 0 = sleep
++// immediately. Read once.
++// ---------------------------------------------------------------------------
++long kt_parse_spin_ms(const char* v) {
++  if (v == nullptr || *v == '\0') return 50L;
++  char* end = nullptr;
++  long parsed = std::strtol(v, &end, 10);
++  if (end == v || *end != '\0' || parsed < 0) {
++    fprintf(stderr, "[kt] KT_WORKER_SPIN_MS=%s is not a non-negative integer; keeping the default 50 ms\n", v);
++    return 50L;
++  }
++  return parsed;
++}
++
++static long kt_worker_spin_ms() {
++  static const long spin_ms = [] {
++    long parsed = kt_parse_spin_ms(std::getenv("KT_WORKER_SPIN_MS"));
++    printf("[kt] worker spin before condvar sleep: %ld ms\n", parsed);
++    return parsed;
++  }();
++  return spin_ms;
++}
++
+ // ---------------------------------------------------------------------------
+ // Core selection for worker binding.
+ //
+@@ -331,7 +363,7 @@ void InNumaPool::worker_thread(int thread_id, int numa_id) {
+     } else if (status == ThreadStatus::WAITING) {
+       auto now = std::chrono::high_resolution_clock::now();
+       auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
+-      if (duration > 50) {
++      if (duration > kt_worker_spin_ms()) {
+         std::unique_lock<std::mutex> lock(thread_state_[thread_id].mutex);
+         thread_state_[thread_id].cv.wait(lock, [&] {
+           return thread_state_[thread_id].status.load(std::memory_order_acquire) != ThreadStatus::WAITING;
+@@ -492,7 +524,7 @@ void NumaJobDistributor::worker_thread(int numa_id) {
+     } else if (stat == ThreadStatus::WAITING) {
+       auto now = std::chrono::high_resolution_clock::now();
+       auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
+-      if (duration > 50) {
++      if (duration > kt_worker_spin_ms()) {
+         std::unique_lock<std::mutex> lock(*mutexes[numa_id]);
+         cvs[numa_id]->wait(lock, [&] {
+           return status[numa_id]->load(std::memory_order_acquire) != ThreadStatus::WAITING;
+diff --git a/kt-kernel/cpu_backend/worker_pool.h b/kt-kernel/cpu_backend/worker_pool.h
+index 72c9b63..27b1097 100644
+--- a/kt-kernel/cpu_backend/worker_pool.h
++++ b/kt-kernel/cpu_backend/worker_pool.h
+@@ -129,6 +129,12 @@ class NumaJobDistributor {
+   void worker_thread(int);
+ };
+ 
++// Milliseconds a worker spins after finishing a job before it sleeps on its
++// condvar, parsed from KT_WORKER_SPIN_MS. Default (unset, empty or invalid)
++// is the historical 50. Exposed so the parsing can be tested without starting
++// a pool (test/cpp/test_worker_spin_ms.cpp).
++long kt_parse_spin_ms(const char* value);
++
+ struct WorkerPoolConfig {
+   int subpool_count;
+   std::vector<int> subpool_numa_map;

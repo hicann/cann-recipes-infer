@@ -1,0 +1,117 @@
+From 6499021e57f2836acb5e36009cb51ef581d13a75 Mon Sep 17 00:00:00 2001
+From: dsv41-moe-offload <soc.yuan@gmail.com>
+Date: Fri, 18 Sep 2026 10:32:39 +0000
+Subject: [PATCH 03/10] [feat](kt-kernel): let the host framework inject the
+ graph-capture probe
+
+_wait_device skipped its device synchronize under capture only via
+torch.npu.is_current_stream_capturing() and sglang's global flag. A host
+other than sglang (vLLM-Ascend) never sets that flag, so the sync could hit a
+captured stream (107027/107030). set_capture_probe(fn) installs the host's
+probe (KTMoEWrapper.set_capture_probe forwards to it); None keeps the sglang
+default. An installed probe's exceptions propagate instead of reading as
+'not capturing'.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01J2WSYMgzkciGYida1FxV2o
+---
+ kt-kernel/python/experts.py      | 10 ++++++++
+ kt-kernel/python/experts_base.py | 43 ++++++++++++++++++++++++++++----
+ 2 files changed, 48 insertions(+), 5 deletions(-)
+
+diff --git a/kt-kernel/python/experts.py b/kt-kernel/python/experts.py
+index 1b9a958..2840870 100644
+--- a/kt-kernel/python/experts.py
++++ b/kt-kernel/python/experts.py
+@@ -277,6 +277,16 @@ class KTMoEWrapper:
+         """
+         BaseMoEWrapper.set_capture_batch_sizes(capture_bs)
+ 
++    @staticmethod
++    def set_capture_probe(probe):
++        """Install the host framework's graph-capture probe (None = sglang default).
++
++        See ``experts_base.set_capture_probe``.
++        """
++        from .experts_base import set_capture_probe
++
++        set_capture_probe(probe)
++
+     @staticmethod
+     def get_capture_batch_sizes() -> List[int]:
+         """
+diff --git a/kt-kernel/python/experts_base.py b/kt-kernel/python/experts_base.py
+index 3da3870..89886e7 100644
+--- a/kt-kernel/python/experts_base.py
++++ b/kt-kernel/python/experts_base.py
+@@ -10,7 +10,7 @@ This module contains base classes and utilities shared across all backend implem
+ from __future__ import annotations
+ 
+ import torch
+-from typing import Dict, List, Optional, Tuple
++from typing import Callable, Dict, List, Optional, Tuple
+ from abc import ABC, abstractmethod
+ import ctypes
+ import logging
+@@ -124,6 +124,38 @@ def _sglang_is_capture_mode() -> bool:
+         return False
+ 
+ 
++# Caller-supplied "is a graph being captured right now?" probe. None = the
++# sglang default above, so existing sglang deployments behave as before. A
++# host framework other than sglang (e.g. vLLM-Ascend) installs its own, since
++# the sglang flag is never set there and torch.npu.is_current_stream_capturing()
++# alone is not trusted during torch_npu capture (see _wait_device).
++_capture_probe: Optional[Callable[[], bool]] = None
++
++
++def set_capture_probe(probe: Optional[Callable[[], bool]]) -> None:
++    """Install the host framework's capture-state probe; None restores the sglang default.
++
++    Unlike the default probe, an installed probe's exceptions propagate: a
++    probe that cannot answer must not be read as "not capturing", because the
++    consequence is a device synchronize on a captured stream (107027/107030).
++    """
++    global _capture_probe
++    if probe is not None and not callable(probe):
++        raise TypeError(f"capture probe must be callable or None, got {type(probe).__name__}")
++    _capture_probe = probe
++
++
++def get_capture_probe() -> Optional[Callable[[], bool]]:
++    return _capture_probe
++
++
++def _is_capture_mode() -> bool:
++    """True while the host framework is capturing a device graph."""
++    if _capture_probe is not None:
++        return bool(_capture_probe())
++    return _sglang_is_capture_mode()
++
++
+ def _wait_device(device: torch.device) -> None:
+     """Block until pending async copies on `device`'s current stream finish.
+ 
+@@ -143,9 +175,10 @@ def _wait_device(device: torch.device) -> None:
+         # raises) while capturing, the synchronize() below would attempt a
+         # stream sync on a captured stream and crash (107027/107030). Mirror the
+         # capture detection used by kt_ep_wrapper._npu_use_graph_host_callback by
+-        # also consulting sglang's global capture flag, which model_capture_mode()
+-        # sets reliably around the whole capture loop.
+-        if _sglang_is_capture_mode():
++        # also consulting the host framework's capture probe (default: sglang's
++        # global flag, which model_capture_mode() sets reliably around the whole
++        # capture loop; see set_capture_probe).
++        if _is_capture_mode():
+             return
+         torch.npu.synchronize(device)
+     elif device.type == "cuda":
+@@ -154,7 +187,7 @@ def _wait_device(device: torch.device) -> None:
+                 return
+         except Exception:
+             pass
+-        if _sglang_is_capture_mode():
++        if _is_capture_mode():
+             return
+         torch.cuda.synchronize(device)
+ 

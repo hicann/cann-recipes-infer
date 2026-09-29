@@ -1,0 +1,1457 @@
+From e7255b59108569343bce27a4f23ea9ea487503a0 Mon Sep 17 00:00:00 2001
+From: dsv41-integration <soc.yuan@gmail.com>
+Date: Thu, 24 Sep 2026 08:15:59 +0000
+Subject: [PATCH 08/10] =?UTF-8?q?[feat](amx):=20=E9=9B=B6=E6=8B=B7?=
+ =?UTF-8?q?=E8=B4=9D=E6=9D=83=E9=87=8D=20=E2=80=94=E2=80=94=20w13=20?=
+ =?UTF-8?q?=E6=8C=87=E5=90=91=20checkpoint=20=E9=A1=B5=E7=BC=93=E5=AD=98?=
+ =?UTF-8?q?=EF=BC=8Cw2=20=E4=BF=9D=E7=95=99=E6=8B=B7=E8=B4=9D?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+新开关 KT_ZEROCOPY_WEIGHTS / KT_ZEROCOPY_SCOPE / KT_ZEROCOPY_POLICY，
+默认全关；不设开关时行为与改动前逐字节一致。
+
+为什么是混合而不是全量零拷贝：
+w13 [inter, hidden] 按 inter 切 TP ⇒ 每个 part 拿整行、字节连续 ⇒ 按页落点 100% 本地；
+w2 [hidden, inter] 按 inter 切 ⇒ 每个 part 拿每行的列片 ⇒ 一页横跨多行、两个 part 都要读
+⇒ 按页落点对 w2 最多 1/tp 本地。实测全量零拷贝 +30%，w13-only −4.4%（比拷贝路径还快一点），
+匿名内存省掉的正好是权重字节的 2/3。
+
+落点用 move_pages(MPOL_MF_MOVE_ALL) 而不是 mbind：
+mbind 只管内核当场分配的新页，已在 page cache 的页原地复用。实测热文件上
+bind:0 只拿到 node0 2.96% 而 policy_failures=0（冷文件上是 100%，所以早前那个
+阳性对照是假的）。move_pages 对已缓存页每次都成；不带 MOVE_ALL 会有 -EBUSY。
+
+policy_failures 改成逐页 status[] 判定 —— 只看 syscall 返回值就是上面那个假绿的根因。
+新增 needed_move（迁移前不在目标 node 的页数）用来断言变异确实施加上了。
+
+权重加载改用 _mm_loadu_si128：checkpoint 张量只有 8 字节对齐，而原来编出的是
+vmovdqa（本文件汇编里 17 条），直接零拷贝会 #GP。改完 0 条，实测无代价。
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01GbzqQvkLZdVKvY1FMYHUZY
+---
+ kt-kernel/operators/amx/fp4-moe.hpp        | 356 ++++++++++++-
+ kt-kernel/operators/amx/la/amx_buffers.hpp |  85 +++-
+ kt-kernel/operators/zerocopy_weights.hpp   | 565 +++++++++++++++++++++
+ kt-kernel/python/utils/amx.py              |  21 +
+ kt-kernel/python/utils/loader.py           |  94 +++-
+ 5 files changed, 1087 insertions(+), 34 deletions(-)
+ create mode 100644 kt-kernel/operators/zerocopy_weights.hpp
+
+diff --git a/kt-kernel/operators/amx/fp4-moe.hpp b/kt-kernel/operators/amx/fp4-moe.hpp
+index 7b22b0a..77f905b 100644
+--- a/kt-kernel/operators/amx/fp4-moe.hpp
++++ b/kt-kernel/operators/amx/fp4-moe.hpp
+@@ -15,6 +15,7 @@
+ #ifndef CPUINFER_OPERATOR_AMX_FP4_MOE_H
+ #define CPUINFER_OPERATOR_AMX_FP4_MOE_H
+ 
++#include "../zerocopy_weights.hpp"  // KT_ZEROCOPY_WEIGHTS switch + page placement/pinning
+ #include "la/amx_raw_buffers.hpp"  // BufferABF16Impl
+ #include "moe_base.hpp"
+ 
+@@ -135,6 +136,19 @@ struct GemmKernel224MXFP4SmallKGroup {
+     }
+   };
+ 
++  // Load one 32-weight FP4 group. Plain `w[g]` on a `const __m128i*` is a
++  // 16-byte *aligned* load (GCC emits `vmovdqa`; verified in the generated
++  // assembly of this very file), so it faults when BufferB::b points straight
++  // at the checkpoint mapping: on DeepSeek-V4.1-Flash every expert tensor
++  // starts at `ptr % 64 == 56`, i.e. 8-byte aligned, because safetensors only
++  // pads its header to 8 bytes. `loadu` costs nothing extra when the address
++  // is in fact aligned, which is the case for every owned (aligned_alloc'd)
++  // BufferB, so the default path keeps its timings.
++  // Origin: dsv41 stream-prefill, CPU-MoE weight zero-copy.
++  __attribute__((always_inline)) static inline __m128i ldw(const __m128i* w, int g) {
++    return _mm_loadu_si128(w + g);
++  }
++
+   struct DequantizedWeight {
+ #if defined(__AVX512BF16__)
+     __m512bh d;
+@@ -221,8 +235,11 @@ struct GemmKernel224MXFP4SmallKGroup {
+   struct BufferB : public BufferBInt4KGroupImpl<GemmKernel224MXFP4SmallKGroup> {
+     using Base = BufferBInt4KGroupImpl<GemmKernel224MXFP4SmallKGroup>;
+     using Base::b;
++    using Base::b_row_stride_bytes;
+     using Base::d;
++    using Base::external_b;
+     using Base::get_submat;
++    using Base::set_external_weights;
+     using Base::k;
+     using Base::k_group_count;
+     using Base::k_group_size;
+@@ -247,8 +264,28 @@ struct GemmKernel224MXFP4SmallKGroup {
+              sizeof(uint8_t) * static_cast<size_t>(n) * (k / k_group_size);
+     }
+ 
++    // Zero-copy sizing: the weights are served from the checkpoint mapping, so
++    // only the scale region is allocated (1/16 of the expert in compact mode,
++    // 1/4 in FP32 mode). Origin: dsv41 stream-prefill, CPU-MoE weight zero-copy.
++    static size_t required_size_scale_only(int n, int k, int k_group_size, bool compact) {
++      if (!compact) return Base::required_size_scale_only(n, k, k_group_size);
++      return sizeof(uint8_t) * static_cast<size_t>(n) * (k / k_group_size);
++    }
++
+     BufferB(int n_, int k_, int k_group_size_, void* ptr) : BufferB(n_, k_, k_group_size_, ptr, false) {}
+ 
++    // Scale-only: `scale_ptr` owns the scales, `b` is set later by
++    // set_external_weights(). `d`/`scale_e8` are independent of `b` here --
++    // the checkpoint stores the weight and the scale as two separate tensors.
++    BufferB(int n_, int k_, int k_group_size_, void* scale_ptr, bool compact_, typename Base::ScaleOnly tag)
++        : Base(n_, k_, k_group_size_, scale_ptr, tag), compact(compact_) {
++      scale_e8 = reinterpret_cast<uint8_t*>(d);
++      if (compact) {
++        d = nullptr;
++        scale_e8_valid = true;
++      }
++    }
++
+     BufferB(int n_, int k_, int k_group_size_, void* ptr, bool compact_)
+         : Base(n_, k_, k_group_size_, ptr), compact(compact_) {
+       // The compact bytes replace the FP32 contents in-place after validation.
+@@ -395,10 +432,10 @@ struct GemmKernel224MXFP4SmallKGroup {
+ 
+         for (int g = 0; g < kg_count; g++) {
+           const ActivationBF16 a(a_row[g]);
+-          const DequantizedWeight d0(w0[g]);
+-          const DequantizedWeight d1(w1[g]);
+-          const DequantizedWeight d2(w2[g]);
+-          const DequantizedWeight d3(w3[g]);
++          const DequantizedWeight d0(ldw(w0, g));
++          const DequantizedWeight d1(ldw(w1, g));
++          const DequantizedWeight d2(ldw(w2, g));
++          const DequantizedWeight d3(ldw(w3, g));
+           acc0 = _mm512_fmadd_ps(_mm512_set1_ps(s0[g]), mxfp4_dot_bf16(d0, a), acc0);
+           acc1 = _mm512_fmadd_ps(_mm512_set1_ps(s1[g]), mxfp4_dot_bf16(d1, a), acc1);
+           acc2 = _mm512_fmadd_ps(_mm512_set1_ps(s2[g]), mxfp4_dot_bf16(d2, a), acc2);
+@@ -413,7 +450,7 @@ struct GemmKernel224MXFP4SmallKGroup {
+         __m512 acc = _mm512_setzero_ps();
+         for (int g = 0; g < kg_count; g++) {
+           const ActivationBF16 a(a_row[g]);
+-          const DequantizedWeight d(w[g]);
++          const DequantizedWeight d(ldw(w, g));
+           acc = _mm512_fmadd_ps(_mm512_set1_ps(s[g]), mxfp4_dot_bf16(d, a), acc);
+         }
+         c_row[n_pos - n_start] = _mm512_reduce_add_ps(acc);
+@@ -494,10 +531,10 @@ struct GemmKernel224MXFP4SmallKGroup {
+       __m512 acc3 = _mm512_setzero_ps();
+       auto accumulate_group = [&](int g) __attribute__((always_inline)) {
+         const __m512bh a = activation[g];
+-        const __m512bh d0 = (__m512bh)mxfp4_to_bf16_32_natural(w0[g]);
+-        const __m512bh d1 = (__m512bh)mxfp4_to_bf16_32_natural(w1[g]);
+-        const __m512bh d2 = (__m512bh)mxfp4_to_bf16_32_natural(w2[g]);
+-        const __m512bh d3 = (__m512bh)mxfp4_to_bf16_32_natural(w3[g]);
++        const __m512bh d0 = (__m512bh)mxfp4_to_bf16_32_natural(ldw(w0, g));
++        const __m512bh d1 = (__m512bh)mxfp4_to_bf16_32_natural(ldw(w1, g));
++        const __m512bh d2 = (__m512bh)mxfp4_to_bf16_32_natural(ldw(w2, g));
++        const __m512bh d3 = (__m512bh)mxfp4_to_bf16_32_natural(ldw(w3, g));
+         acc0 = _mm512_fmadd_ps(_mm512_set1_ps(s0[g]), _mm512_dpbf16_ps(_mm512_setzero_ps(), a, d0), acc0);
+         acc1 = _mm512_fmadd_ps(_mm512_set1_ps(s1[g]), _mm512_dpbf16_ps(_mm512_setzero_ps(), a, d1), acc1);
+         acc2 = _mm512_fmadd_ps(_mm512_set1_ps(s2[g]), _mm512_dpbf16_ps(_mm512_setzero_ps(), a, d2), acc2);
+@@ -541,7 +578,7 @@ struct GemmKernel224MXFP4SmallKGroup {
+       }
+       __m512 acc = _mm512_setzero_ps();
+       auto accumulate_group = [&](int g) __attribute__((always_inline)) {
+-        const __m512bh d = (__m512bh)mxfp4_to_bf16_32_natural(w[g]);
++        const __m512bh d = (__m512bh)mxfp4_to_bf16_32_natural(ldw(w, g));
+         acc = _mm512_fmadd_ps(_mm512_set1_ps(scales[g]), _mm512_dpbf16_ps(_mm512_setzero_ps(), activation[g], d), acc);
+       };
+       auto prefetch_group = [&](int g) __attribute__((always_inline)) {
+@@ -614,10 +651,10 @@ struct GemmKernel224MXFP4SmallKGroup {
+ 
+         for (int g = 0; g < kg_count; g++) {
+           // 4 行权重解码一次, MB 个 token 共享
+-          const DequantizedWeight d0(w0[g]);
+-          const DequantizedWeight d1(w1[g]);
+-          const DequantizedWeight d2(w2[g]);
+-          const DequantizedWeight d3(w3[g]);
++          const DequantizedWeight d0(ldw(w0, g));
++          const DequantizedWeight d1(ldw(w1, g));
++          const DequantizedWeight d2(ldw(w2, g));
++          const DequantizedWeight d3(ldw(w3, g));
+           const __m512 sv0 = _mm512_set1_ps(s0[g]);
+           const __m512 sv1 = _mm512_set1_ps(s1[g]);
+           const __m512 sv2 = _mm512_set1_ps(s2[g]);
+@@ -651,7 +688,7 @@ struct GemmKernel224MXFP4SmallKGroup {
+           __m512 acc = _mm512_setzero_ps();
+           for (int g = 0; g < kg_count; g++) {
+             const ActivationBF16 a(a_rows[i][g]);
+-            const DequantizedWeight d(w[g]);
++            const DequantizedWeight d(ldw(w, g));
+             acc = _mm512_fmadd_ps(_mm512_set1_ps(s[g]), mxfp4_dot_bf16(d, a), acc);
+           }
+           c_row[n_pos - n_start] = _mm512_reduce_add_ps(acc);
+@@ -675,10 +712,10 @@ struct GemmKernel224MXFP4SmallKGroup {
+         __m512 a0 = _mm512_setzero_ps(), a1 = _mm512_setzero_ps(), a2 = _mm512_setzero_ps(), a3 = _mm512_setzero_ps();
+         for (int g = 0; g < kg_count; g++) {
+           const ActivationBF16 a(a_row[g]);
+-          const DequantizedWeight d0(w0[g]);
+-          const DequantizedWeight d1(w1[g]);
+-          const DequantizedWeight d2(w2[g]);
+-          const DequantizedWeight d3(w3[g]);
++          const DequantizedWeight d0(ldw(w0, g));
++          const DequantizedWeight d1(ldw(w1, g));
++          const DequantizedWeight d2(ldw(w2, g));
++          const DequantizedWeight d3(ldw(w3, g));
+           a0 = _mm512_fmadd_ps(_mm512_set1_ps(s0[g]), mxfp4_dot_bf16(d0, a), a0);
+           a1 = _mm512_fmadd_ps(_mm512_set1_ps(s1[g]), mxfp4_dot_bf16(d1, a), a1);
+           a2 = _mm512_fmadd_ps(_mm512_set1_ps(s2[g]), mxfp4_dot_bf16(d2, a), a2);
+@@ -692,7 +729,7 @@ struct GemmKernel224MXFP4SmallKGroup {
+         __m512 acc = _mm512_setzero_ps();
+         for (int g = 0; g < kg_count; g++) {
+           const ActivationBF16 a(a_row[g]);
+-          const DequantizedWeight d(w[g]);
++          const DequantizedWeight d(ldw(w, g));
+           acc = _mm512_fmadd_ps(_mm512_set1_ps(s[g]), mxfp4_dot_bf16(d, a), acc);
+         }
+         c_row[n_pos - n_start] = _mm512_reduce_add_ps(acc);
+@@ -760,9 +797,46 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
+ 
+   ~AMX_FP4_MOE_TP() = default;
+ 
++  // Zero-copy is only possible with per-expert source pointers (gate_projs):
++  // the flat gate_proj buffer is already a kt-owned staging copy, so pointing
++  // at it would save nothing. Default off (KT_ZEROCOPY_WEIGHTS).
++  // Origin: dsv41 stream-prefill, CPU-MoE weight zero-copy.
++  bool zero_copy_weights() const { return kt_zerocopy::enabled() && !config_.gate_projs.empty(); }
++
++  // KT_ZEROCOPY_SCOPE=w13 keeps w2/down on the copy path. See the long note at
++  // kt_zerocopy::scope(): w13 is a contiguous row block per TP part and places
++  // 100% local, w2 is a column slice of every row and can never exceed
++  // 1/tp_count local under any per-page placement.
++  bool zero_copy_down() const { return zero_copy_weights() && !kt_zerocopy::scope_w13_only(); }
++
++  // Which of the three BufferB's this (n, k) is. moe_base.hpp builds them as
++  //   gate/up : (n = intermediate_size, k = hidden_size)
++  //   down    : (n = hidden_size,       k = intermediate_size)
++  // and hands the derived class nothing else to go on, so the shape IS the
++  // discriminator. With hidden_size == intermediate_size (per TP part) the two
++  // are indistinguishable -- refuse rather than guess, because guessing wrong
++  // means down gets a scale-only allocation and its weights are never loaded.
++  bool is_down_buffer(size_t n, size_t k) const {
++    if ((size_t)config_.hidden_size == (size_t)config_.intermediate_size)
++      throw std::runtime_error(
++          "KT_ZEROCOPY_SCOPE=w13 cannot tell the gate/up BufferB from the down BufferB when hidden_size == "
++          "intermediate_size (per TP part); pass an explicit tensor kind before using this shape");
++    return n == (size_t)config_.hidden_size && k == (size_t)config_.intermediate_size;
++  }
++
++  // True when THIS BufferB is served from the mapping (scale region only).
++  bool zero_copy_buffer(size_t n, size_t k) const {
++    if (!zero_copy_weights()) return false;
++    if (!kt_zerocopy::scope_w13_only()) return true;
++    return !is_down_buffer(n, k);
++  }
++
+   // BufferA: raw BF16, no group_size needed
+   size_t buffer_a_required_size_impl(size_t m, size_t k) const { return T::BufferA::required_size(m, k); }
+   size_t buffer_b_required_size_impl(size_t n, size_t k) const {
++    if (zero_copy_buffer(n, k))
++      return T::BufferB::required_size_scale_only(n, k, config_.quant_config.group_size,
++                                                  config_.compact_mxfp4_scales);
+     return T::BufferB::required_size(n, k, config_.quant_config.group_size, config_.compact_mxfp4_scales);
+   }
+   size_t buffer_c_required_size_impl(size_t m, size_t n) const { return T::BufferC::required_size(m, n); }
+@@ -771,6 +845,10 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
+     return std::make_shared<typename T::BufferA>(m, k, data);
+   }
+   std::shared_ptr<typename T::BufferB> make_buffer_b_impl(size_t n, size_t k, void* data) const {
++    if (zero_copy_buffer(n, k))
++      return std::make_shared<typename T::BufferB>(n, k, config_.quant_config.group_size, data,
++                                                   config_.compact_mxfp4_scales,
++                                                   typename T::BufferB::Base::ScaleOnly{});
+     return std::make_shared<typename T::BufferB>(n, k, config_.quant_config.group_size, data,
+                                                  config_.compact_mxfp4_scales);
+   }
+@@ -864,6 +942,40 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
+       throw std::runtime_error("MXFP4 MoE only support KGroup FP4.");
+     if (config_.gate_scale == nullptr) throw std::runtime_error("MXFP4 MoE only support load native weight.");
+ 
++    if (zero_copy_weights()) {
++      load_weights_zero_copy();
++      // KT_ZEROCOPY_SCOPE=w13: down stayed an OWNING BufferB, so it is filled
++      // the ordinary way, out of the down_proj staging the wrapper did allocate
++      // for exactly this case. This is the whole point of the partial scope:
++      // w2's bytes end up memcpy'd into memory first-touched by THIS sub-pool's
++      // threads, i.e. node-local, which is the locality the copy path gets for
++      // free and no per-page placement of the shared source can reproduce.
++      if (!zero_copy_down()) {
++        if (config_.down_proj == nullptr)
++          throw std::runtime_error("KT_ZEROCOPY_SCOPE=w13: down_proj staging was not allocated");
++        int nth_down = T::recommended_nth(config_.hidden_size);
++        pool->do_work_stealing_job(
++            nth_down * config_.expert_num, nullptr,
++            [this, nth_down, physical_to_logical_map](int task_id) {
++              uint64_t expert_idx = task_id / nth_down;
++              if (config_.lacks_cpu_weights((int64_t)expert_idx)) return;
++              uint64_t logical_expert_id = expert_map(physical_to_logical_map, expert_idx);
++              int ith = task_id % nth_down;
++              down_bb_[expert_idx]->from_raw_mat(
++                  (uint8_t*)config_.down_proj +
++                      ((logical_expert_id * config_.hidden_size * config_.intermediate_size) >> 1),
++                  ith, nth_down);
++            },
++            nullptr);
++      }
++      // Scales still come from the (small) TP-sliced staging buffers below;
++      // they are NOT zero-copyable: the checkpoint ships ue8m0 bytes and this
++      // BufferB stores either FP32 or compacted E8M0 exponents, i.e. the scale
++      // region is always a converted copy (load_scales_bf16 / finalize_scale_e8).
++      load_scales_from_staging();
++      return;
++    }
++
+     int nth = T::recommended_nth(config_.intermediate_size);
+     pool->do_work_stealing_job(
+         nth * config_.expert_num, nullptr,
+@@ -898,6 +1010,17 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
+         },
+         nullptr);
+ 
++    load_scales_from_staging();
++  }
++
++  // The scale region is always owned and always converted (bf16 ue8m0 in the
++  // checkpoint -> FP32 or compacted E8M0 byte here), so it is loaded the same
++  // way in both modes, from the TP-sliced staging buffers the outer wrapper
++  // built. Split out of load_weights() so the zero-copy path can reuse it
++  // verbatim. Origin: dsv41 stream-prefill, CPU-MoE weight zero-copy.
++  void load_scales_from_staging() {
++    const uint64_t* physical_to_logical_map = (const uint64_t*)config_.physical_to_logical_map;
++    auto pool = config_.pool->get_subpool(tp_part_idx);
+     pool->do_work_stealing_job(
+         config_.expert_num, nullptr,
+         [this, physical_to_logical_map](int task_id) {
+@@ -915,6 +1038,121 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
+         nullptr);
+   }
+ 
++  // Zero-copy weights: BufferB::b is pointed at the checkpoint mapping and the
++  // pages are placed + pinned by this sub-pool's own threads.
++  //
++  // Layout, per logical expert, with tp_count parts and this part = tp_part_idx:
++  //   w1/w3 source [full_inter, hidden/2] row-major. This part owns rows
++  //     [tp*inter_tp, (tp+1)*inter_tp) -- a CONTIGUOUS block, so the view is
++  //     base + tp*inter_tp*hidden/2 with the source row stride hidden/2,
++  //     which is exactly this BufferB's own k/2. No stride needed.
++  //   w2   source [hidden, full_inter/2] row-major. This part owns a COLUMN
++  //     SLICE of every row: bytes [tp*inter_tp/2, (tp+1)*inter_tp/2). That is
++  //     a strided view: base + tp*inter_tp/2, row stride full_inter/2, row
++  //     length inter_tp/2 = this BufferB's k/2. Hence b_row_stride_bytes.
++  // Origin: dsv41 stream-prefill, CPU-MoE weight zero-copy.
++  void load_weights_zero_copy() {
++    const uint64_t* physical_to_logical_map = (const uint64_t*)config_.physical_to_logical_map;
++    auto pool = config_.pool->get_subpool(tp_part_idx);
++    const int tp_count = config_.pool->config.subpool_count;
++    const size_t inter_tp = (size_t)config_.intermediate_size;
++    const size_t hidden = (size_t)config_.hidden_size;
++    const size_t full_inter = inter_tp * (size_t)tp_count;
++
++    if (config_.gate_projs.empty() || config_.gate_projs[0].empty())
++      throw std::runtime_error("zero-copy weights: config.gate_projs is empty");
++
++    // 🔴 Placement is not a nice-to-have here. The copy path gets per-socket
++    // locality for free: each TP part memcpy's its own slice into its own
++    // node-local BufferB. Zero-copy has ONE physical copy, so unless the pages
++    // are deliberately placed, both sockets read from whichever node the page
++    // cache happened to use -- measured 2.45x slower at m=1, tp=2 with the
++    // pages unplaced. Hence "segment" (this part's pages -> this part's node)
++    // is the default.
++    //
++    // 🔴 Placement is done by MIGRATING the pages (move_pages MPOL_MF_MOVE_ALL),
++    // not by an allocation policy. set_mempolicy/mbind only steer pages the
++    // kernel allocates on the spot, and a checkpoint page that is already in
++    // the page cache is reused in place -- which is exactly the production case,
++    // since the point of zero-copy is to share the cache with streaming prefill.
++    // Measured falsification of the old mechanism, and of the migration that
++    // replaced it, in zerocopy_weights.hpp above policy_targets().
++    std::vector<int> nodes = config_.pool->config.subpool_numa_map;
++    if (nodes.empty()) nodes.push_back(0);
++    const int own_node = tp_part_idx < (int)nodes.size() ? nodes[tp_part_idx] : nodes[0];
++    // Parsed once per part: it throws on an unknown KT_ZEROCOPY_POLICY, and a
++    // throw out of a work-stealing task is a much worse place to find that out.
++    const std::vector<int> targets = kt_zerocopy::policy_targets(nodes, own_node);
++
++    const bool do_pin = kt_zerocopy::mlock_enabled();
++    // KT_ZEROCOPY_SCOPE=w13 -> false: down keeps its own owning BufferB and is
++    // filled by the copy pass in load_weights().
++    const bool down_zero_copy = zero_copy_down();
++    const size_t w13_bytes = inter_tp * hidden / 2;
++    const size_t w2_row_bytes = inter_tp / 2;
++    const size_t w2_src_stride = full_inter / 2;
++    // w2 row band this part pins (and therefore places on its own node). Every
++    // part READS every row -- it owns a column slice, not a row slice -- so the
++    // best any placement can do for w2 is 1/tp_count local. Splitting by rows
++    // makes that exactly 1/tp_count for everyone and covers all rows once.
++    const size_t w2_rows_per_part = hidden / (size_t)tp_count;
++
++    pool->do_work_stealing_job(
++        config_.expert_num, nullptr,
++        [&, this](int task_id) {
++          uint64_t expert_idx = (uint64_t)task_id;
++          if (config_.lacks_cpu_weights((int64_t)expert_idx)) return;
++          uint64_t lid = expert_map(physical_to_logical_map, expert_idx);
++          if (lid >= config_.gate_projs[0].size() || lid >= config_.up_projs[0].size() ||
++              lid >= config_.down_projs[0].size())
++            throw std::runtime_error("zero-copy weights: logical expert id out of range");
++          uint8_t* src_gate = (uint8_t*)config_.gate_projs[0][lid];
++          uint8_t* src_up = (uint8_t*)config_.up_projs[0][lid];
++          uint8_t* src_down = (uint8_t*)config_.down_projs[0][lid];
++          if (src_gate == nullptr || src_up == nullptr || src_down == nullptr)
++            throw std::runtime_error("zero-copy weights: null source pointer for a CPU-resident expert");
++
++          kt_zerocopy::check_mapping_is_shared_readonly(src_gate);
++
++          uint8_t* gate_view = src_gate + (size_t)tp_part_idx * w13_bytes;
++          uint8_t* up_view = src_up + (size_t)tp_part_idx * w13_bytes;
++
++          gate_bb_[expert_idx]->set_external_weights(gate_view, hidden / 2);
++          up_bb_[expert_idx]->set_external_weights(up_view, hidden / 2);
++          if (down_zero_copy) {
++            uint8_t* down_view = src_down + (size_t)tp_part_idx * w2_row_bytes;
++            down_bb_[expert_idx]->set_external_weights(down_view, w2_src_stride);
++          }
++
++          if (!do_pin) return;
++          // w13: this part's rows are exactly this part's segment -> fully local.
++          kt_zerocopy::pin_range(gate_view, w13_bytes, targets);
++          kt_zerocopy::pin_range(up_view, w13_bytes, targets);
++          // w2: each part places (and pins) its own row band; together the parts
++          // cover the whole [hidden, full_inter/2] tensor exactly once.
++          //
++          // Under KT_ZEROCOPY_SCOPE=w13 nothing reads w2 from the mapping, so
++          // placing or pinning it there would be pure cost -- and worse, it
++          // would blur the arm: the H reading has to be "w13 placed", not
++          // "w13 placed plus a w2 migration pass nobody consumes".
++          if (!down_zero_copy) return;
++          const size_t band_begin = (size_t)tp_part_idx * w2_rows_per_part;
++          const size_t band_rows = (tp_part_idx == tp_count - 1) ? (hidden - band_begin) : w2_rows_per_part;
++          kt_zerocopy::pin_range(src_down + band_begin * w2_src_stride, band_rows * w2_src_stride, targets);
++        },
++        nullptr);
++
++    // 🔴 The stats are one global set, and this runs once per TP part, so with
++    // tp_count=2 you get TWO lines and the second is the grand total -- not
++    // "part 0" and "part 1". Say so in the tag: read the wrong way, the pair
++    // looks like a per-part breakdown and every percentage in it is misread.
++    if (do_pin) {
++      char tag[96];
++      snprintf(tag, sizeof(tag), "after load [cumulative over all TP parts; tp%d just finished]", tp_part_idx);
++      kt_zerocopy::print_stats(tag);
++    }
++  }
++
+   static inline void fast_memcpy(void* __restrict dst, const void* __restrict src, size_t bytes) {
+     uint8_t* d = (uint8_t*)dst;
+     const uint8_t* s = (const uint8_t*)src;
+@@ -997,9 +1235,14 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
+               size_t gpu_weight_slice_offset = local_idx * weight_per_col;
+               size_t gpu_scale_slice_offset = local_idx * scale_per_col;
+ 
++              // Under zero-copy the down BufferB is a column slice of the
++              // source rows, so the distance between two of its rows is the
++              // SOURCE row, not weight_per_col. Reading `b + col*weight_per_col`
++              // there would silently return the wrong expert's bytes.
++              const size_t down_row_stride = down_bb_[expert_id]->b_row_stride_bytes;
+               for (size_t col = col_start; col < col_end; col++) {
+                 fast_memcpy(w2_weight_dst + col * gpu_weight_stride + gpu_weight_slice_offset,
+-                            (uint8_t*)down_bb_[expert_id]->b + col * weight_per_col, weight_per_col);
++                            (uint8_t*)down_bb_[expert_id]->b + col * down_row_stride, weight_per_col);
+                 down_bb_[expert_id]->copy_scale_to_bf16(w2_scale_dst + col * gpu_scale_stride + gpu_scale_slice_offset,
+                                                         col * scale_per_col, scale_per_col);
+               }
+@@ -1068,9 +1311,10 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
+               size_t weight_per_gpu_col = (config_.intermediate_size / gpu_tps_per_cpu_tp) >> 1;
+               size_t scale_per_gpu_col = (config_.intermediate_size / gpu_tps_per_cpu_tp) / group_size;
+ 
++              const size_t down_row_stride = down_bb_[expert_id]->b_row_stride_bytes;
+               for (size_t col = col_start; col < col_end; col++) {
+-                size_t col_offset_weight = (col * config_.intermediate_size / 2) +
+-                                           (local_gpu_idx * data_per_gpu_tp_weight / config_.hidden_size);
++                size_t col_offset_weight =
++                    (col * down_row_stride) + (local_gpu_idx * data_per_gpu_tp_weight / config_.hidden_size);
+                 size_t col_offset_scale = (col * (config_.intermediate_size / group_size)) +
+                                           (local_gpu_idx * data_per_gpu_tp_scale / config_.hidden_size);
+ 
+@@ -1116,19 +1360,71 @@ class TP_MOE<AMX_FP4_MOE_TP<K>> : public TP_MOE<AMX_MOE_BASE<K, AMX_FP4_MOE_TP<K
+ 
+     int& group_size = config.quant_config.group_size;
+ 
++    // Zero-copy: the inner parts point BufferB straight at the checkpoint
++    // mapping, so the per-NUMA weight staging (3 x expert_num x inter_tp x
++    // hidden / 2 bytes, 3.2 GiB per node for DeepSeek-V4.1-Flash) is not
++    // allocated at all. The SCALE staging stays: scales are converted, never
++    // aliased. Origin: dsv41 stream-prefill, CPU-MoE weight zero-copy.
++    const bool zero_copy = kt_zerocopy::enabled() && use_per_expert_ptrs;
++    if (kt_zerocopy::enabled() && !use_per_expert_ptrs)
++      printf("[kt zero-copy] KT_ZEROCOPY_WEIGHTS=1 ignored: this layer has no per-expert source pointers\n");
++    // KT_ZEROCOPY_SCOPE=w13: gate/up are consumed in place, down is NOT, so its
++    // TP-sliced staging (1/3 of the weight staging) still has to be built here.
++    const bool stage_down_weights = zero_copy && kt_zerocopy::scope_w13_only();
++    if (zero_copy)
++      printf("[kt zero-copy] scope=%s (w13 zero-copy, w2 %s)\n", stage_down_weights ? "w13" : "all",
++             stage_down_weights ? "copied into node-local BufferB" : "zero-copy");
++
+     pool->dispense_backend()->do_numa_job([&, this](int i) {
+       auto& tpc = tps[i]->config_;
+       size_t weight_elem_count = tpc.intermediate_size * tpc.hidden_size;
+       size_t scales_elem_count = (tpc.hidden_size / group_size) * tpc.intermediate_size;
+ 
+-      tpc.gate_proj = new uint8_t[(tpc.expert_num * weight_elem_count) / 2];
+-      tpc.up_proj = new uint8_t[(tpc.expert_num * weight_elem_count) / 2];
+-      tpc.down_proj = new uint8_t[(tpc.expert_num * weight_elem_count) / 2];
++      if (!zero_copy) {
++        tpc.gate_proj = new uint8_t[(tpc.expert_num * weight_elem_count) / 2];
++        tpc.up_proj = new uint8_t[(tpc.expert_num * weight_elem_count) / 2];
++        tpc.down_proj = new uint8_t[(tpc.expert_num * weight_elem_count) / 2];
++      } else if (stage_down_weights) {
++        tpc.down_proj = new uint8_t[(tpc.expert_num * weight_elem_count) / 2];
++      }
+       tpc.gate_scale = new ggml_bf16_t[tpc.expert_num * scales_elem_count];
+       tpc.up_scale = new ggml_bf16_t[tpc.expert_num * scales_elem_count];
+       tpc.down_scale = new ggml_bf16_t[tpc.expert_num * scales_elem_count];
+ 
+-      if (use_per_expert_ptrs) {
++      if (zero_copy) {
++        // Only the scales are staged here; the weights are consumed in place.
++        pool->get_subpool(i)->do_work_stealing_job(
++            tpc.expert_num, nullptr,
++            [&, i](int expert_id_) {
++              if (config.lacks_cpu_weights(expert_id_)) return;
++              size_t expert_id = expert_map(physical_to_logical_map, expert_id_);
++              ggml_bf16_t* src_gate_scale = (ggml_bf16_t*)config.gate_scales[0][expert_id];
++              ggml_bf16_t* src_up_scale = (ggml_bf16_t*)config.up_scales[0][expert_id];
++              ggml_bf16_t* src_down_scale = (ggml_bf16_t*)config.down_scales[0][expert_id];
++              memcpy((ggml_bf16_t*)tpc.gate_scale + (expert_id * scales_elem_count),
++                     src_gate_scale + (i * scales_elem_count), sizeof(ggml_bf16_t) * scales_elem_count);
++              memcpy((ggml_bf16_t*)tpc.up_scale + (expert_id * scales_elem_count),
++                     src_up_scale + (i * scales_elem_count), sizeof(ggml_bf16_t) * scales_elem_count);
++              // Under scope=w13 the down WEIGHTS are staged here too, by the
++              // same column-slice walk the copy path uses -- byte for byte the
++              // `use_per_expert_ptrs` branch below, just without gate/up.
++              uint8_t* src_down = stage_down_weights ? (uint8_t*)config.down_projs[0][expert_id] : nullptr;
++              if (stage_down_weights && src_down == nullptr)
++                throw std::runtime_error("KT_ZEROCOPY_SCOPE=w13: null down_projs pointer for a CPU-resident expert");
++              for (size_t col = 0; col < config.hidden_size; col++) {
++                if (stage_down_weights)
++                  memcpy((uint8_t*)tpc.down_proj + ((expert_id * weight_elem_count + col * tpc.intermediate_size) >> 1),
++                         src_down + ((col * config.intermediate_size + i * tpc.intermediate_size) >> 1),
++                         (tpc.intermediate_size >> 1));
++                memcpy((ggml_bf16_t*)tpc.down_scale +
++                           (expert_id * scales_elem_count + col * (tpc.intermediate_size / group_size)),
++                       src_down_scale +
++                           (col * (config.intermediate_size / group_size) + i * (tpc.intermediate_size / group_size)),
++                       sizeof(ggml_bf16_t) * (tpc.intermediate_size / group_size));
++              }
++            },
++            nullptr);
++      } else if (use_per_expert_ptrs) {
+         pool->get_subpool(i)->do_work_stealing_job(
+             tpc.expert_num, nullptr,
+             [&, i](int expert_id_) {
+@@ -1218,14 +1514,20 @@ class TP_MOE<AMX_FP4_MOE_TP<K>> : public TP_MOE<AMX_MOE_BASE<K, AMX_FP4_MOE_TP<K
+ 
+     pool->dispense_backend()->do_numa_job([&, this](int i) {
+       auto& tpc = tps[i]->config_;
++      // Under zero-copy these were never allocated (and must never be freed:
++      // they would be the checkpoint mapping).
+       delete[] (uint8_t*)(tpc.gate_proj);
+       delete[] (uint8_t*)(tpc.up_proj);
+       delete[] (uint8_t*)(tpc.down_proj);
++      tpc.gate_proj = tpc.up_proj = tpc.down_proj = nullptr;
+       delete[] (ggml_bf16_t*)(tpc.gate_scale);
+       delete[] (ggml_bf16_t*)(tpc.up_scale);
+       delete[] (ggml_bf16_t*)(tpc.down_scale);
++      tpc.gate_scale = tpc.up_scale = tpc.down_scale = nullptr;
+     });
+ 
++    if (zero_copy && kt_zerocopy::audit_enabled()) kt_zerocopy::audit_report(/*stride=*/16);
++
+     this->weights_loaded = true;
+   }
+ 
+diff --git a/kt-kernel/operators/amx/la/amx_buffers.hpp b/kt-kernel/operators/amx/la/amx_buffers.hpp
+index af7e718..d455311 100644
+--- a/kt-kernel/operators/amx/la/amx_buffers.hpp
++++ b/kt-kernel/operators/amx/la/amx_buffers.hpp
+@@ -1,6 +1,7 @@
+ #ifndef AMX_BUFFERS_HPP
+ #define AMX_BUFFERS_HPP
+ #include <algorithm>
++#include <atomic>
+ #include <cassert>
+ #include <cstdint>
+ #include <cstdio>
+@@ -1085,6 +1086,21 @@ struct BufferBInt4KGroupImpl {
+   float* d;  // scales only (no mins/zero-points), row majored
+   int n, k, k_group_size, k_group_count;
+ 
++  // Byte distance between two consecutive rows of `b`. Equal to k/2 for an
++  // owned (packed) buffer; larger when `b` is a *strided view* into somebody
++  // else's rows -- which is what the zero-copy weight path needs for w2/down,
++  // where this TP part owns only a 576-byte column slice of each 1152-byte
++  // source row. Every read of `b` must go through get_submat(), never through
++  // `n_begin * k / 2` arithmetic of its own.
++  // Origin: dsv41 stream-prefill, CPU-MoE weight zero-copy.
++  size_t b_row_stride_bytes = 0;
++  // True when `b` points at memory this BufferB does not own (the checkpoint
++  // mapping). from_raw_mat() is then a no-op: there is nothing to copy.
++  bool external_b = false;
++
++  // Tag for the scale-only constructor (weights live elsewhere).
++  struct ScaleOnly {};
++
+   static constexpr int N_STEP = K::N_STEP;
+   static constexpr int K_STEP = K::K_STEP;
+   static constexpr bool SCALE = true;
+@@ -1094,24 +1110,81 @@ struct BufferBInt4KGroupImpl {
+     return sizeof(int8_t) * n * k / 2 + sizeof(float) * n * (k / k_group_size);
+   }
+ 
+-  BufferBInt4KGroupImpl(int n, int k, int k_group_size, void* ptr) : n(n), k(k), k_group_size(k_group_size) {
+-    assert(reinterpret_cast<intptr_t>(ptr) % 64 == 0);
+-    assert(n % N_STEP == 0);
+-    assert(k % K_STEP == 0);
++  // Scale-only: the weights are served from an external mapping, so the owned
++  // allocation shrinks to the scale region alone.
++  static size_t required_size_scale_only(int n, int k, int k_group_size) {
++    return sizeof(float) * n * (k / k_group_size);
++  }
++
++  void check_shape() const {
+     if (n % N_STEP || k % K_STEP || k % k_group_size) {
+       printf("BufferBInt4KGroupImpl: n: %d, k: %d, N_STEP: %d, K_STEP: %d, k_group_size: %d\n", n, k, N_STEP, K_STEP,
+              k_group_size);
+       throw std::runtime_error("n or k is not aligned to N_STEP or K_STEP");
+     }
++  }
++
++  BufferBInt4KGroupImpl(int n, int k, int k_group_size, void* ptr) : n(n), k(k), k_group_size(k_group_size) {
++    assert(reinterpret_cast<intptr_t>(ptr) % 64 == 0);
++    assert(n % N_STEP == 0);
++    assert(k % K_STEP == 0);
++    check_shape();
+     k_group_count = k / k_group_size;
++    b_row_stride_bytes = static_cast<size_t>(k) / 2;
+     b = reinterpret_cast<dt*>(ptr);
+     d = reinterpret_cast<float*>(offset_pointer(b, n * k / 2));
+   }
+ 
++  // Scale-only construction. `scale_ptr` owns ONLY the scales; `b` stays null
++  // until set_external_weights() points it at the checkpoint mapping. `d` is
++  // therefore an independent pointer, not `b + n*k/2` -- in the checkpoint the
++  // weights and the scales are two separate tensors and are not adjacent.
++  BufferBInt4KGroupImpl(int n, int k, int k_group_size, void* scale_ptr, ScaleOnly)
++      : n(n), k(k), k_group_size(k_group_size) {
++    assert(reinterpret_cast<intptr_t>(scale_ptr) % 64 == 0);
++    check_shape();
++    k_group_count = k / k_group_size;
++    b = nullptr;
++    external_b = true;
++    b_row_stride_bytes = static_cast<size_t>(k) / 2;
++    d = reinterpret_cast<float*>(scale_ptr);
++  }
++
++  // Point `b` at externally owned rows. `row_stride_bytes` is the byte
++  // distance between consecutive rows *in the source*, which is k/2 for a
++  // contiguous row block (w13) and the full source row for a column slice (w2).
++  //
++  // 🔴 Alignment: this used to be a *correctness* requirement. Plain `w[g]` on
++  // a `const __m128i*` is a 16-byte ALIGNED load (GCC emits `vmovdqa`; counted
++  // 17 of them in the generated assembly of fp4-moe.hpp), and DeepSeek-V4.1-
++  // Flash hands out tensors at `ptr % 64 == 56` -- safetensors only pads its
++  // header to 8 bytes -- so zero-copy would have #GP'd. The FP4 weight loads
++  // were changed to `_mm_loadu_si128` (GemmKernel224MXFP4SmallKGroup::ldw);
++  // the same assembly now has 0 such loads. What is left is a *performance*
++  // question only -- an 8-byte-aligned stream splits a cache line on 1 of
++  // every 4 16-byte loads -- so this warns once and continues.
++  void set_external_weights(void* weights, size_t row_stride_bytes) {
++    if (!external_b) throw std::runtime_error("set_external_weights on an owning BufferB");
++    if (weights == nullptr) throw std::runtime_error("set_external_weights: null weight pointer");
++    if (row_stride_bytes < static_cast<size_t>(k) / 2)
++      throw std::runtime_error("set_external_weights: row stride smaller than the row");
++    if (reinterpret_cast<uintptr_t>(weights) % 64 != 0 || row_stride_bytes % 64 != 0) {
++      static std::atomic<bool> warned{false};
++      if (!warned.exchange(true)) {
++        printf("[kt zero-copy] ⚠ external weights are not 64-byte aligned: ptr%%64=%u stride%%64=%zu -- correct "
++               "(all weight loads are unaligned) but every 4th 16-byte load splits a cache line\n",
++               (unsigned)(reinterpret_cast<uintptr_t>(weights) % 64), row_stride_bytes % 64);
++      }
++    }
++    b = reinterpret_cast<dt*>(weights);
++    b_row_stride_bytes = row_stride_bytes;
++  }
++
+   // Load from packed signed int4 format
+   // Input: proj is packed int4 weights (2 int4 values per byte)
+   // Each int4 value is in range [-8, 7] (signed)
+   void from_raw_mat(uint8_t* proj, int ith, int nth) {
++    if (external_b) return;  // zero-copy: `b` already points at the source bytes
+     auto [n_start, n_end] = K::split_range_n(n, ith, nth);
+     if (n_start >= n_end) {
+       return;
+@@ -1125,8 +1198,8 @@ struct BufferBInt4KGroupImpl {
+ 
+   // Get pointer to submatrix for computation
+   dt* get_submat(int n, int k, int n_begin, int k_begin) {
+-    const size_t row_bytes = static_cast<size_t>(k) / 2;
+-    const size_t row_offset = static_cast<size_t>(n_begin) * row_bytes;
++    (void)k;  // the row stride is a property of the buffer, not of this call
++    const size_t row_offset = static_cast<size_t>(n_begin) * b_row_stride_bytes;
+     const size_t col_offset = static_cast<size_t>(k_begin) / 2;
+     return reinterpret_cast<dt*>(reinterpret_cast<uint8_t*>(b) + row_offset + col_offset);
+   }
+diff --git a/kt-kernel/operators/zerocopy_weights.hpp b/kt-kernel/operators/zerocopy_weights.hpp
+new file mode 100644
+index 0000000..4a52659
+--- /dev/null
++++ b/kt-kernel/operators/zerocopy_weights.hpp
+@@ -0,0 +1,565 @@
++/**
++ * Zero-copy CPU-MoE weights: switch, residency and the audit that proves it.
++ *
++ * WHY
++ *   Streaming prefill and the CPU MoE consume the *same* expert bytes. Today
++ *   each keeps its own copy: the checkpoint pages sit in the page cache while
++ *   kt memcpy's 268.9 GiB of them into anonymous BufferB memory. Pointing
++ *   BufferB straight at the mapping removes the duplicate and lets both
++ *   consumers share one locked page-cache copy.
++ *
++ * WHAT THIS FILE DOES NOT DO
++ *   It does not create the mapping. It can only pin what it is handed, and the
++ *   kind of mapping decides whether pinning helps at all -- see
++ *   check_mapping_is_shared_readonly() below, which is the load-bearing guard.
++ *
++ * Origin: dsv41 stream-prefill, CPU-MoE weight zero-copy.
++ */
++#ifndef KT_ZEROCOPY_WEIGHTS_H
++#define KT_ZEROCOPY_WEIGHTS_H
++
++#include <errno.h>
++#include <stdio.h>
++#include <string.h>
++#include <sys/mman.h>
++#include <sys/syscall.h>
++#include <unistd.h>
++
++#include <algorithm>
++#include <atomic>
++#include <chrono>
++#include <cstdint>
++#include <cstdlib>
++#include <map>
++#include <mutex>
++#include <stdexcept>
++#include <string>
++#include <utility>
++#include <vector>
++
++namespace kt_zerocopy {
++
++#ifndef MPOL_DEFAULT
++#define MPOL_DEFAULT 0
++#define MPOL_PREFERRED 1
++#define MPOL_BIND 2
++#define MPOL_INTERLEAVE 3
++#endif
++
++// Strict three-state parse, same convention as KT_FULLSET_LOAD in
++// python/utils/amx.py: unset/"0" off, "1" on, anything else is an error rather
++// than a silent off. A switch that fails quietly is worse than no switch: the
++// run looks like it took the new path and the readings say otherwise.
++inline bool env_flag(const char* name) {
++  const char* v = std::getenv(name);
++  if (v == nullptr || v[0] == '\0' || std::string(v) == "0") return false;
++  if (std::string(v) == "1") return true;
++  throw std::runtime_error(std::string(name) + " must be \"\", \"0\" or \"1\", got \"" + v + "\"");
++}
++
++// KT_ZEROCOPY_WEIGHTS=1 makes the AMX MXFP4 BufferB point at the checkpoint
++// mapping instead of owning a memcpy'd copy. Default OFF.
++inline bool enabled() {
++  static const bool v = env_flag("KT_ZEROCOPY_WEIGHTS");
++  return v;
++}
++
++// KT_ZEROCOPY_SCOPE picks WHICH of the three expert tensors are served from the
++// mapping. Default "all" -- unset behaves exactly as before this switch existed.
++//
++// 🔴 WHY A PARTIAL SCOPE EXISTS AT ALL. The two tensor families do not behave
++// the same under a per-page placement, and it is a property of their layout,
++// not of the code:
++//   w13 (gate/up)  source [full_inter, hidden/2] row-major, TP splits `inter`
++//                  => this part owns a CONTIGUOUS ROW BLOCK. Its bytes are one
++//                  unbroken extent, every 4 KiB page belongs to exactly one
++//                  part, so "this part's pages -> this part's node" reaches
++//                  100% local. Zero-copy costs nothing here.
++//   w2  (down)     source [hidden, full_inter/2] row-major, TP still splits
++//                  `inter` => this part owns a COLUMN SLICE OF EVERY ROW. With
++//                  full_inter/2 = 1024 B the row is a quarter of a page, so a
++//                  single page carries rows from BOTH parts and both sockets
++//                  must read it. No per-page placement can do better than
++//                  1/tp_count local for w2, ever.
++// So "w13" means: gate/up zero-copy (+ placed), down goes back to the ordinary
++// memcpy into this part's own node-local BufferB. It keeps the 2/3 of the
++// weight bytes that zero-copy can hold without a locality penalty and pays the
++// remaining 1/3 in memory to keep w2 node-local.
++enum class Scope { kAll, kW13 };
++
++inline Scope scope() {
++  static const Scope s = [] {
++    const char* v = std::getenv("KT_ZEROCOPY_SCOPE");
++    const std::string p = v == nullptr ? "" : v;
++    if (p.empty() || p == "all") return Scope::kAll;
++    if (p == "w13") return Scope::kW13;
++    // Same rule as env_flag(): an unrecognised value is an error, never a
++    // silent fallback to the default. A run that silently took "all" while the
++    // operator asked for "w13" produces a reading nobody can tell apart.
++    throw std::runtime_error(std::string("KT_ZEROCOPY_SCOPE must be \"\", \"all\" or \"w13\", got \"") + p + "\"");
++  }();
++  return s;
++}
++
++// True when w2/down must NOT be zero-copied (it keeps the copy path).
++inline bool scope_w13_only() { return scope() == Scope::kW13; }
++
++// KT_ZEROCOPY_MLOCK=0 turns off the pinning (placement + mlock) while keeping
++// the zero-copy pointers, so the two effects can be measured apart.
++inline bool mlock_enabled() {
++  const char* v = std::getenv("KT_ZEROCOPY_MLOCK");
++  if (v != nullptr && std::string(v) == "0") return false;
++  return true;
++}
++
++// KT_ZEROCOPY_AUDIT=1 prints per-node page counts and residency at the end of
++// the load. Costs one move_pages()/mincore() sweep over the pinned bytes.
++inline bool audit_enabled() {
++  static const bool v = env_flag("KT_ZEROCOPY_AUDIT");
++  return v;
++}
++
++// The measured hazard, not a hypothetical one: mlock() on a PRIVATE WRITABLE
++// file mapping (`rw-p`, which is what safetensors' own safe_open() produces)
++// breaks COW and materialises an anonymous copy of every page. Measured on
++// this machine over 1 GiB of DeepSeek-V4.1-Flash:
++//     rw-p mapping : dRssAnon +1024 MiB, dRssFile -0.1 MiB, dCached +1022 MiB
++//     r--s mapping : dRssAnon     0 MiB, dRssFile +1024 MiB, dCached +1024 MiB
++// So pinning an `rw-p` mapping gives you TWO copies instead of zero. Refuse.
++inline bool allow_private_writable() {
++  const char* v = std::getenv("KT_ZEROCOPY_ALLOW_PRIVATE_WRITABLE");
++  return v != nullptr && std::string(v) == "1";
++}
++
++struct Stats {
++  std::atomic<uint64_t> ranges{0};
++  std::atomic<uint64_t> bytes_requested{0};
++  std::atomic<uint64_t> bytes_locked{0};
++  std::atomic<uint64_t> mlock_failures{0};
++  std::atomic<uint64_t> last_mlock_errno{0};
++  // Placement (move_pages migration). `policy_pages` is every page handed to
++  // move_pages; `policy_failures` counts pages whose RETURNED per-page status
++  // is not the node we asked for -- see migrate_range() for why the syscall
++  // return value alone is worthless here.
++  std::atomic<uint64_t> policy_calls{0};
++  std::atomic<uint64_t> policy_pages{0};
++  std::atomic<uint64_t> policy_moved{0};
++  std::atomic<uint64_t> policy_retried{0};
++  std::atomic<uint64_t> policy_failures{0};
++  std::atomic<uint64_t> policy_ns{0};
++  std::atomic<int64_t> last_page_status{0};
++  std::atomic<uint64_t> last_policy_errno{0};
++};
++
++inline Stats& stats() {
++  static Stats s;
++  return s;
++}
++
++// Ranges kept for the audit sweep (address, bytes). Only filled when the audit
++// is on, so the normal path allocates nothing here.
++inline std::vector<std::pair<uintptr_t, size_t>>& audit_ranges() {
++  static std::vector<std::pair<uintptr_t, size_t>> v;
++  return v;
++}
++inline std::mutex& audit_mutex() {
++  static std::mutex m;
++  return m;
++}
++
++inline long page_size() {
++  static const long ps = sysconf(_SC_PAGESIZE);
++  return ps;
++}
++
++// One line of /proc/self/maps for `addr`, or "" if none.
++inline std::string maps_line_for(uintptr_t addr) {
++  FILE* f = fopen("/proc/self/maps", "r");
++  if (f == nullptr) return "";
++  char line[1024];
++  std::string hit;
++  while (fgets(line, sizeof(line), f) != nullptr) {
++    unsigned long lo = 0, hi = 0;
++    if (sscanf(line, "%lx-%lx", &lo, &hi) != 2) continue;
++    if (addr >= lo && addr < hi) {
++      hit = line;
++      break;
++    }
++  }
++  fclose(f);
++  return hit;
++}
++
++// perms field of the maps line, e.g. "r--s" / "rw-p".
++inline std::string maps_perms_for(uintptr_t addr) {
++  std::string line = maps_line_for(addr);
++  if (line.empty()) return "";
++  size_t sp = line.find(' ');
++  if (sp == std::string::npos || line.size() < sp + 5) return "";
++  return line.substr(sp + 1, 4);
++}
++
++// Checked once per distinct mapping. Throws on `rw-p` (see above) unless the
++// escape hatch is set; also refuses a mapping that is not file backed.
++inline void check_mapping_is_shared_readonly(const void* addr) {
++  static std::mutex m;
++  static std::map<uintptr_t, bool> seen;
++  const uintptr_t a = reinterpret_cast<uintptr_t>(addr);
++  std::string line = maps_line_for(a);
++  if (line.empty()) throw std::runtime_error("zero-copy weights: pointer is in no mapping of /proc/self/maps");
++  unsigned long lo = 0, hi = 0;
++  sscanf(line.c_str(), "%lx-%lx", &lo, &hi);
++  {
++    std::lock_guard<std::mutex> g(m);
++    if (seen.count(lo)) return;
++    seen[lo] = true;
++  }
++  const std::string perms = maps_perms_for(a);
++  const bool writable = perms.size() > 1 && perms[1] == 'w';
++  const bool shared = perms.size() > 3 && perms[3] == 's';
++  printf("[kt zero-copy] source mapping %s", line.c_str());
++  if (writable && !shared) {
++    if (!allow_private_writable()) {
++      throw std::runtime_error(
++          "zero-copy weights: the source mapping is PRIVATE+WRITABLE (" + perms +
++          "). mlock() would break COW and allocate an anonymous copy of every page -- measured +1024 MiB RssAnon per "
++          "1 GiB on this machine -- so this gives two copies, not zero. Map the checkpoint PROT_READ|MAP_SHARED "
++          "(`r--s`) instead. Set KT_ZEROCOPY_ALLOW_PRIVATE_WRITABLE=1 only to reproduce that measurement.");
++    }
++    printf("[kt zero-copy] 🔴 PRIVATE+WRITABLE mapping accepted by KT_ZEROCOPY_ALLOW_PRIVATE_WRITABLE=1; "
++           "mlock will COW into anonymous memory\n");
++  }
++}
++
++// ---------------------------------------------------------------------------
++// Placement: move_pages(2) MIGRATION, not an allocation policy.
++//
++// 🔴🔴 WHY THE PREVIOUS MECHANISM WAS WRONG, AND HOW IT LIED.
++// This used to call set_mempolicy(MPOL_BIND) on each loader thread. An
++// allocation policy only decides where the kernel puts a page it is allocating
++// *right now*. A checkpoint page that is ALREADY in the page cache is reused in
++// place: no allocation happens, so no policy is consulted, and the page stays
++// wherever it landed the first time anybody read the file. Measured 2026-09-24:
++//   model-00004-of-00048.safetensors, 66.5% resident, 91.8% of those on node1.
++//   KT_ZEROCOPY_POLICY=bind:0, --layers 1 --tp 2 --nodes 0,1 --n-cpu 256
++//     -> audit node0=2.96% / node1=97.04%   with policy_failures=0
++// The earlier "bind:0 -> 100.00% node0" positive control passed only because
++// the file was COLD at the time, i.e. it measured the one case production never
++// sees: the whole point of zero-copy is to share the page cache with streaming
++// prefill, so in production those pages are always already cached.
++// Two lessons are burned into the code below:
++//   (a) the mechanism must MIGRATE existing pages, not steer new allocations;
++//   (b) policy_failures must come from the PER-PAGE status[] array. The old
++//       code only looked at the syscall return value, which is why it could
++//       report policy_failures=0 while placing exactly nothing.
++//
++// move_pages(2) (x86_64 nr 279) with MPOL_MF_MOVE_ALL migrates page-cache pages
++// that are already resident and already mapped here. Measured on this machine:
++//   1 GiB sample 21.65%/78.35% -> 100.00% node0
++//   4 GiB sample 28.92%/71.08% -> 100.00% node1 in 0.55 s single thread
++//                                 (~1.16 GiB actually moved => ~2.1 GiB/s)
++//   MPOL_MF_MOVE (without ALL) returned -EBUSY for 15229 pages of that same
++//   4 GiB sample; MPOL_MF_MOVE_ALL moved all of them. Hence ALL, always.
++// Precondition: the page must be mapped in THIS process's page table, or
++// move_pages reports -ENOENT and leaves it alone. Being in the page cache is
++// not enough -- hence the touch loop in migrate_range().
++//
++// KT_ZEROCOPY_POLICY (switch names and meanings unchanged):
++//   "segment"    (default) every page of this TP part's slice -> `own_node`,
++//                the node of the sub-pool that reads those bytes. This is what
++//                recreates the per-socket locality the copy path gets for free
++//                by memcpy'ing each part's slice into its own node-local buffer.
++//   "interleave" round-robin over `nodes` BY PAGE. With migration this is now
++//                genuinely deterministic 50/50 -- it no longer goes through
++//                MPOL_INTERLEAVE, which was only a hint and was measured being
++//                dropped wholesale (100% node1) once node0 got tight.
++//   "bind:<n>"   everything on node <n>. The control: on a hot file it must
++//                still reach ~100% on node n, and if it reads the same as the
++//                segment arm the measurement is broken, not the placement.
++// Two values were ADDED, both only so the arms can be told apart; neither
++// changes what the three above mean:
++//   "none"        pin, do not place (KT_ZEROCOPY_MLOCK=0 turns off both).
++//   "antisegment" segment with the node flipped -- the negative control.
++// ---------------------------------------------------------------------------
++#ifndef MPOL_MF_MOVE
++#define MPOL_MF_MOVE (1 << 1)
++#endif
++#ifndef MPOL_MF_MOVE_ALL
++#define MPOL_MF_MOVE_ALL (1 << 2)
++#endif
++
++// Per-page target nodes, round-robined over the pages of a range. Empty means
++// "do not place" (no valid target).
++inline std::vector<int> policy_targets(const std::vector<int>& nodes, int own_node) {
++  const char* pol = std::getenv("KT_ZEROCOPY_POLICY");
++  const std::string p = pol == nullptr ? "" : pol;
++  if (p.rfind("bind:", 0) == 0) {
++    int n = atoi(p.c_str() + 5);
++    if (n < 0 || n >= 1024) throw std::runtime_error("KT_ZEROCOPY_POLICY=bind:<node>: node out of range");
++    return std::vector<int>{n};
++  }
++  // "none": pin but do not place. Added so the compute arms can separate the
++  // two effects -- KT_ZEROCOPY_MLOCK=0 turns off BOTH, which would leave any
++  // "placement helps" reading confounded with "pinning costs/helps".
++  if (p == "none") return {};
++  if (p == "interleave") {
++    std::vector<int> t;
++    for (int n : nodes)
++      if (n >= 0) t.push_back(n);
++    if (t.empty()) t.push_back(0);
++    return t;
++  }
++  if (p.empty() || p == "segment") {
++    if (own_node < 0) return {};
++    return std::vector<int>{own_node};
++  }
++  // "antisegment": segment with the target node flipped. The negative control
++  // for the compute arms, and the only one that is airtight: it migrates the
++  // SAME ranges, the SAME number of pages, through the SAME syscalls as
++  // "segment", and differs only in which node they land on. If segment is fast
++  // and antisegment is slow, the win is placement and cannot be a side effect
++  // of the migration pass itself (warmed TLB, populated PTEs, ...).
++  // "bind:<n>" cannot do that job here: measured 2026-09-24, torch had already
++  // put every synthetic weight page on node0, so bind:0 reported
++  // needed_move=0 -- a control that moves nothing proves nothing.
++  if (p == "antisegment") {
++    if (own_node < 0) return {};
++    for (int n : nodes)
++      if (n >= 0 && n != own_node) return std::vector<int>{n};
++    return std::vector<int>{own_node};
++  }
++  throw std::runtime_error("KT_ZEROCOPY_POLICY must be \"segment\", \"antisegment\", \"interleave\", \"bind:<node>\" or \"none\"");
++}
++
++// Migrate [start, start+span) page by page onto `targets` (round-robin).
++// Called from the sub-pool's worker threads, one range at a time, so the
++// parallelism is whatever the sub-pool has (32 threads in the check runs).
++inline void migrate_range(uintptr_t start, size_t span, const std::vector<int>& targets) {
++  if (targets.empty() || span == 0) return;
++  const size_t ps = static_cast<size_t>(page_size());
++  const size_t npages = span / ps;
++  if (npages == 0) return;
++  // 32768 pages = 128 MiB of payload per syscall; the three arrays cost 320 KiB
++  // of thread-local scratch, which stays in L2 and is reused across ranges.
++  constexpr size_t kBatch = 32768;
++  static thread_local std::vector<void*> pages;
++  static thread_local std::vector<int> want;
++  static thread_local std::vector<int> status;
++
++  for (size_t base = 0; base < npages; base += kBatch) {
++    const size_t n = std::min(kBatch, npages - base);
++    pages.resize(n);
++    want.resize(n);
++    status.assign(n, 0);
++    for (size_t i = 0; i < n; ++i) {
++      void* a = reinterpret_cast<void*>(start + (base + i) * ps);
++      // Map it into our page table. A page that is only in the page cache is
++      // reported -ENOENT by move_pages and is silently left where it is.
++      (void)*reinterpret_cast<volatile const unsigned char*>(a);
++      pages[i] = a;
++      want[i] = targets[(base + i) % targets.size()];
++    }
++    // Query first: this is what lets a reading say "the mutation really was
++    // applied" -- without it, a 100%-on-target result after migration is
++    // indistinguishable from pages that were already there.
++    long qrc = syscall(SYS_move_pages, 0, (unsigned long)n, pages.data(), (int*)nullptr, status.data(), 0);
++    uint64_t needed = 0;
++    if (qrc == 0)
++      for (size_t i = 0; i < n; ++i)
++        if (status[i] != want[i]) ++needed;
++
++    const auto t0 = std::chrono::steady_clock::now();
++    long rc = syscall(SYS_move_pages, 0, (unsigned long)n, pages.data(), want.data(), status.data(),
++                      MPOL_MF_MOVE_ALL);
++    const auto t1 = std::chrono::steady_clock::now();
++
++    stats().policy_calls.fetch_add(1);
++    stats().policy_pages.fetch_add(n);
++    stats().policy_moved.fetch_add(needed);
++    stats().policy_ns.fetch_add(
++        (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
++    if (rc < 0) {
++      // Whole-call failure. Every page of this batch is a failure.
++      stats().policy_failures.fetch_add(n);
++      stats().last_policy_errno.store((uint64_t)errno);
++      continue;
++    }
++    // 🔴 rc >= 0 says nothing about placement: move_pages returns 0 while
++    // reporting -ENOENT/-EBUSY/-EACCES per page in status[]. Count the pages
++    // that did NOT end up on the node we asked for -- errors and
++    // silently-unmoved alike.
++    //
++    // One retry for those, because a few per-page -ENOENT are expected and
++    // transient: pin_range rounds its range out to page boundaries, so adjacent
++    // experts share a first/last page, and while another worker thread is
++    // migrating that page its PTE is a migration entry -- follow_page finds
++    // nothing and move_pages reports -ENOENT. Measured 344 of 1.1M pages
++    // (0.031%) on the bind:0 control run, all -ENOENT. Retried pages are
++    // counted separately; only what still misses after the retry is a failure.
++    std::vector<size_t> redo;
++    for (size_t i = 0; i < n; ++i)
++      if (status[i] != want[i]) redo.push_back(i);
++    if (!redo.empty()) {
++      stats().policy_retried.fetch_add(redo.size());
++      std::vector<void*> rp(redo.size());
++      std::vector<int> rw(redo.size());
++      std::vector<int> rs(redo.size(), 0);
++      for (size_t j = 0; j < redo.size(); ++j) {
++        (void)*reinterpret_cast<volatile const unsigned char*>(pages[redo[j]]);
++        rp[j] = pages[redo[j]];
++        rw[j] = want[redo[j]];
++      }
++      long rrc = syscall(SYS_move_pages, 0, (unsigned long)rp.size(), rp.data(), rw.data(), rs.data(),
++                         MPOL_MF_MOVE_ALL);
++      uint64_t bad = 0;
++      if (rrc < 0) {
++        bad = rp.size();
++        stats().last_policy_errno.store((uint64_t)errno);
++      } else {
++        for (size_t j = 0; j < rp.size(); ++j)
++          if (rs[j] != rw[j]) {
++            ++bad;
++            stats().last_page_status.store(rs[j]);
++          }
++      }
++      if (bad) stats().policy_failures.fetch_add(bad);
++    }
++  }
++}
++
++// Fault the range in, place it, and pin it there.
++//
++// readahead(2) would be the direct expression of "get these bytes cached", but
++// it needs an fd + file offset and kt only ever sees a virtual address, so the
++// address-based equivalent is used: MADV_WILLNEED, which for a file mapping is
++// the same force_page_cache_readahead() path. Chunked at 128 KiB to keep the
++// queue full instead of asking for one huge readahead the kernel will clamp.
++//
++// Order is load bearing: readahead -> migrate -> mlock.
++//   * migrate before mlock, because mlock's own populate pass is not what makes
++//     the pages movable (the touch loop inside migrate_range is), and doing the
++//     migration on pages that are not yet locked keeps this off the
++//     "mlocked page" path in the kernel entirely.
++//   * mlock last, so what gets pinned is the page as finally placed.
++inline void pin_range(const void* addr, size_t len, const std::vector<int>& targets) {
++  if (addr == nullptr || len == 0) return;
++  const uintptr_t ps = static_cast<uintptr_t>(page_size());
++  const uintptr_t start = reinterpret_cast<uintptr_t>(addr) & ~(ps - 1);
++  const uintptr_t end = (reinterpret_cast<uintptr_t>(addr) + len + ps - 1) & ~(ps - 1);
++  const size_t span = static_cast<size_t>(end - start);
++
++  stats().ranges.fetch_add(1);
++  stats().bytes_requested.fetch_add(span);
++
++  constexpr size_t kChunk = 128 * 1024;
++  for (uintptr_t off = start; off < end; off += kChunk) {
++    const size_t n = static_cast<size_t>(std::min<uintptr_t>(kChunk, end - off));
++    madvise(reinterpret_cast<void*>(off), n, MADV_WILLNEED);
++  }
++  migrate_range(start, span, targets);
++  if (::mlock(reinterpret_cast<void*>(start), span) == 0) {
++    stats().bytes_locked.fetch_add(span);
++  } else {
++    stats().mlock_failures.fetch_add(1);
++    stats().last_mlock_errno.store(static_cast<uint64_t>(errno));
++  }
++  if (audit_enabled()) {
++    std::lock_guard<std::mutex> g(audit_mutex());
++    audit_ranges().emplace_back(start, span);
++  }
++}
++
++inline void print_stats(const char* tag) {
++  const Stats& s = stats();
++  const uint64_t pages = s.policy_pages.load();
++  const uint64_t moved = s.policy_moved.load();
++  const uint64_t fail = s.policy_failures.load();
++  const double ps_gib = page_size() / 1073741824.0;
++  const double sec = s.policy_ns.load() / 1e9;  // summed over threads, not wall clock
++  printf("[kt zero-copy] %s: ranges=%llu requested=%.3f GiB locked=%.3f GiB mlock_failures=%llu (errno=%llu)\n",
++         tag, (unsigned long long)s.ranges.load(), s.bytes_requested.load() / 1073741824.0,
++         s.bytes_locked.load() / 1073741824.0, (unsigned long long)s.mlock_failures.load(),
++         (unsigned long long)s.last_mlock_errno.load());
++  // needed_move = pages that were NOT already on their target when we looked.
++  // It is the "the mutation was actually applied" assertion: a placement
++  // reading with needed_move=0 proves nothing about the mechanism.
++  printf("[kt zero-copy] %s placement: move_pages calls=%llu pages=%llu (%.3f GiB) needed_move=%llu (%.2f%%) "
++         "retried=%llu failed_pages=%llu (%.4f%%) last_status=%lld cpu_time=%.2fs\n",
++         tag, (unsigned long long)s.policy_calls.load(), (unsigned long long)pages, pages * ps_gib,
++         (unsigned long long)moved, pages ? 100.0 * moved / pages : 0.0,
++         (unsigned long long)s.policy_retried.load(), (unsigned long long)fail,
++         pages ? 100.0 * fail / pages : 0.0, (long long)s.last_page_status.load(), sec);
++  if (fail != 0)
++    printf("[kt zero-copy] 🔴 %llu of %llu pages did not land on the requested node (last per-page status %lld, "
++           "syscall errno %llu). Placement readings from this run are not trustworthy.\n",
++           (unsigned long long)fail, (unsigned long long)pages, (long long)s.last_page_status.load(),
++           (unsigned long long)s.last_policy_errno.load());
++}
++
++// move_pages(2) in query mode + mincore(2) over everything that was pinned.
++// Sampled by `stride` pages so the sweep stays cheap on 268 GiB.
++//
++// 🔴 The stride is forced ODD. Measured 2026-09-24: with stride=16 the
++// KT_ZEROCOPY_POLICY=interleave arm audited as "node0=100.00%", because
++// interleave assigns node by page index parity and a stride of 16 only ever
++// samples even indices. The sampler was resonating with the thing it measured
++// and reported a perfect result for a 50/50 placement. Any even stride aliases
++// the same way; an odd one visits both parities.
++inline void audit_report(int stride = 1) {
++  if (stride > 1 && (stride % 2) == 0) stride += 1;
++  std::vector<std::pair<uintptr_t, size_t>> ranges;
++  {
++    std::lock_guard<std::mutex> g(audit_mutex());
++    ranges = audit_ranges();
++  }
++  if (ranges.empty()) {
++    printf("[kt zero-copy audit] no ranges recorded\n");
++    return;
++  }
++  const uintptr_t ps = static_cast<uintptr_t>(page_size());
++  std::map<int, uint64_t> per_node;
++  uint64_t sampled = 0, resident = 0, mincore_pages = 0;
++  constexpr size_t kBatch = 4096;
++  std::vector<void*> pages;
++  std::vector<int> status;
++  pages.reserve(kBatch);
++  status.resize(kBatch);
++  auto flush = [&]() {
++    if (pages.empty()) return;
++    long rc = syscall(SYS_move_pages, 0, (unsigned long)pages.size(), pages.data(), nullptr, status.data(), 0);
++    if (rc != 0) {
++      per_node[-1000] += pages.size();
++    } else {
++      for (size_t i = 0; i < pages.size(); ++i) per_node[status[i]]++;
++    }
++    sampled += pages.size();
++    pages.clear();
++  };
++  std::vector<unsigned char> vec;
++  for (const auto& r : ranges) {
++    const uint64_t npages = r.second / ps;
++    for (uint64_t i = 0; i < npages; i += static_cast<uint64_t>(stride)) {
++      pages.push_back(reinterpret_cast<void*>(r.first + i * ps));
++      if (pages.size() == kBatch) flush();
++    }
++    vec.assign(npages, 0);
++    if (mincore(reinterpret_cast<void*>(r.first), r.second, vec.data()) == 0) {
++      for (uint64_t i = 0; i < npages; ++i) {
++        mincore_pages++;
++        if (vec[i] & 1) resident++;
++      }
++    }
++  }
++  flush();
++  printf("[kt zero-copy audit] move_pages sampled=%llu pages (stride=%d):", (unsigned long long)sampled, stride);
++  for (const auto& kv : per_node) {
++    printf("  node%d=%llu (%.2f%%)", kv.first, (unsigned long long)kv.second,
++           sampled ? 100.0 * kv.second / sampled : 0.0);
++  }
++  printf("\n[kt zero-copy audit] mincore resident=%llu/%llu pages (%.4f%%)\n", (unsigned long long)resident,
++         (unsigned long long)mincore_pages, mincore_pages ? 100.0 * resident / mincore_pages : 0.0);
++}
++
++}  // namespace kt_zerocopy
++
++#endif  // KT_ZEROCOPY_WEIGHTS_H
+diff --git a/kt-kernel/python/utils/amx.py b/kt-kernel/python/utils/amx.py
+index f335e9f..41e25be 100644
+--- a/kt-kernel/python/utils/amx.py
++++ b/kt-kernel/python/utils/amx.py
+@@ -67,6 +67,17 @@ _AVXVNNI256_PACKED_GPTQ_INT4_MAX_GROUP_SIZE = 2048
+ _AVXVNNI256_RAW_INT4_MAX_GROUP_SIZE = 256
+ 
+ 
++def _zero_copy_weights_requested() -> bool:
++    """KT_ZEROCOPY_WEIGHTS, parsed exactly like KT_FULLSET_LOAD.
++
++    "" / "0" -> False, "1" -> True, anything else raises rather than being read
++    as off. Origin: dsv41 stream-prefill, CPU-MoE weight zero-copy.
++    """
++    from .loader import zero_copy_weights_enabled
++
++    return zero_copy_weights_enabled()
++
++
+ def _fullset_load_requested() -> bool:
+     """KT_FULLSET_LOAD=1: load every expert's CPU weights even with a resident mask.
+ 
+@@ -1031,6 +1042,16 @@ class NativeMoEWrapper(BaseMoEWrapper):
+         # BufferB is allocated and loaded for every expert.
+         # Origin: dsv41 stream-prefill F2-3.
+         moe_config.skip_gpu_expert_weights = bool(load_kwargs)
++        # KT_ZEROCOPY_WEIGHTS is implemented only in the AMX MXFP4 load path
++        # (operators/amx/fp4-moe.hpp). Every other backend would ignore it and
++        # quietly keep memcpy'ing, i.e. the run would look like it took the new
++        # path. Refuse instead. Origin: dsv41 stream-prefill, CPU-MoE weight
++        # zero-copy.
++        if _zero_copy_weights_requested() and self.method != "MXFP4":
++            raise RuntimeError(
++                f"KT_ZEROCOPY_WEIGHTS=1 with method={self.method!r}: only the AMX MXFP4 backend "
++                "serves CPU weights directly from the checkpoint mapping"
++            )
+         if _fullset_load_requested() and self.num_gpu_experts > 0 and self.method != "MXFP4":
+             # Other backends skip masked experts in their load paths by
+             # should_skip_expert(), ignoring skip_gpu_expert_weights: the
+diff --git a/kt-kernel/python/utils/loader.py b/kt-kernel/python/utils/loader.py
+index a8bbe06..a1b9d1e 100644
+--- a/kt-kernel/python/utils/loader.py
++++ b/kt-kernel/python/utils/loader.py
+@@ -8,7 +8,10 @@ This module provides loaders for:
+ 
+ from __future__ import annotations
+ 
++import json as _json
++import mmap as _mmap
+ import os
++import struct as _struct
+ import numpy as np
+ import torch
+ from enum import IntEnum
+@@ -17,6 +20,79 @@ from gguf.gguf_reader import GGUFReader
+ from typing import Optional, Sequence
+ 
+ 
++def zero_copy_weights_enabled() -> bool:
++    """KT_ZEROCOPY_WEIGHTS: same three-state parse as the C++ side.
++
++    "" / "0" -> off, "1" -> on, anything else raises. A switch that is silently
++    ignored is worse than no switch: the run looks like it took the new path.
++    Origin: dsv41 stream-prefill, CPU-MoE weight zero-copy.
++    """
++    v = os.environ.get("KT_ZEROCOPY_WEIGHTS", "")
++    if v in ("", "0"):
++        return False
++    if v == "1":
++        return True
++    raise ValueError(f'KT_ZEROCOPY_WEIGHTS must be "", "0" or "1", got {v!r}')
++
++
++# Read-only SHARED mappings of the checkpoint shards, kept alive for the whole
++# process when zero-copy is on: the C++ BufferB points straight into them, so
++# unmapping is a use-after-free. Keyed by absolute path.
++#
++# 🔴 Why not reuse safetensors' own mapping: safe_open() maps the shard `rw-p`
++# (PRIVATE + WRITABLE). Measured on this machine, mlock() over 1 GiB of such a
++# mapping gives dRssAnon +1024 MiB / dRssFile -0.1 MiB -- every page is COW'd
++# into anonymous memory, i.e. two copies instead of zero, and auto NUMA
++# balancing is free to migrate them. Our own PROT_READ|MAP_SHARED mapping
++# measured dRssAnon 0 / dRssFile +1024 MiB on the same bytes.
++_RO_SHARED_MAPS: dict = {}
++_ST_HEADERS: dict = {}
++
++
++def _ro_shared_map(path: str):
++    """mmap(PROT_READ, MAP_SHARED) of `path`, cached and never unmapped."""
++    path = os.path.abspath(path)
++    mm = _RO_SHARED_MAPS.get(path)
++    if mm is None:
++        fd = os.open(path, os.O_RDONLY)
++        try:
++            mm = _mmap.mmap(fd, 0, flags=_mmap.MAP_SHARED, prot=_mmap.PROT_READ)
++        finally:
++            os.close(fd)
++        _RO_SHARED_MAPS[path] = mm
++    return mm
++
++
++def _st_header(path: str):
++    """(data_start, header_dict) of a safetensors file."""
++    path = os.path.abspath(path)
++    hdr = _ST_HEADERS.get(path)
++    if hdr is None:
++        with open(path, "rb") as f:
++            n = _struct.unpack("<Q", f.read(8))[0]
++            hdr = (8 + n, _json.loads(f.read(n)))
++        _ST_HEADERS[path] = hdr
++    return hdr
++
++
++def ro_shared_tensor_view(path: str, key: str) -> torch.Tensor:
++    """A uint8 torch view of `key`'s bytes inside our own read-only mapping.
++
++    No copy at any step: mmap -> memoryview slice -> np.frombuffer -> from_numpy.
++    torch.from_numpy (not torch.frombuffer) because torch_npu's
++    transfer_to_npu redirects the latter to the NPU.
++    """
++    data_start, hdr = _st_header(path)
++    info = hdr.get(key)
++    if info is None:
++        raise KeyError(f"{key} not in {path}")
++    begin, end = info["data_offsets"]
++    mm = _ro_shared_map(path)
++    off = data_start + begin
++    arr = np.frombuffer(mm, dtype=np.uint8, count=end - begin, offset=off)
++    return torch.from_numpy(arr)
++
++
+ class GGMLQuantizationType(IntEnum):
+     """GGML quantization type enumeration"""
+ 
+@@ -158,6 +234,10 @@ class SafeTensorLoader:
+             folder_path = os.path.dirname(file_path)
+         else:
+             folder_path = file_path
++        # Needed to rebuild the absolute shard path: tensor_file_map only keeps
++        # the basename. Origin: dsv41 stream-prefill, CPU-MoE weight zero-copy.
++        self.safetensor_folder = folder_path
++        self.shard_path_map = {}  # basename -> absolute path
+         self.file_handle_map = {}
+         self.tensor_file_map = {}
+         self.tensor_type_map = {}
+@@ -170,6 +250,7 @@ class SafeTensorLoader:
+                 if file.endswith(".safetensors"):
+                     found_safetensor = True
+                     file_path = os.path.join(root, file)
++                    self.shard_path_map[file] = file_path
+                     if file not in self.file_handle_map:
+                         try:
+                             handle = safe_open(file_path, framework="pt")
+@@ -1280,13 +1361,24 @@ class MXFP4SafeTensorLoader(SafeTensorLoader):
+         up_scales = [None] * expert_count
+         down_scales = [None] * expert_count
+ 
++        # Zero-copy: hand out uint8 views of OUR read-only shared mapping so the
++        # C++ BufferB can point at them and mlock them without COW. The scales
++        # below are still materialised (ue8m0 -> bf16 is a conversion, and the
++        # kernel stores yet another encoding), so only the weights are aliased.
++        # Origin: dsv41 stream-prefill, CPU-MoE weight zero-copy.
++        zero_copy = zero_copy_weights_enabled()
+         for exp_id in wanted:
+             for proj, dst in (
+                 (gate_name, gate_weights),
+                 (up_name, up_weights),
+                 (down_name, down_weights),
+             ):
+-                w = self.load_tensor(f"{prefix}.{exp_id}.{proj}.weight", device).contiguous()
++                key = f"{prefix}.{exp_id}.{proj}.weight"
++                if zero_copy:
++                    shard = self.shard_path_map[self.tensor_file_map[key]]
++                    dst[exp_id] = ro_shared_tensor_view(shard, key)
++                    continue
++                w = self.load_tensor(key, device).contiguous()
+                 if w.dtype != torch.uint8:
+                     w = w.view(torch.uint8)
+                 dst[exp_id] = w

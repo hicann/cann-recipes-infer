@@ -1,0 +1,315 @@
+From b7999bb148f8958758f1a97eeffe30de4faf0ab3 Mon Sep 17 00:00:00 2001
+From: dsv41-integration <soc.yuan@gmail.com>
+Date: Thu, 24 Sep 2026 13:16:53 +0000
+Subject: [PATCH 09/10] =?UTF-8?q?[fix](amx):=20aligned=5Falloc=20=E5=A4=B1?=
+ =?UTF-8?q?=E8=B4=A5=E4=B8=8D=E5=86=8D=E9=9D=99=E9=BB=98=20+=20KT=5FZEROCO?=
+ =?UTF-8?q?PY=5FMLOCK=20=E4=B8=A5=E6=A0=BC=E4=B8=89=E6=80=81?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+两处都是"失效形态无声"的收口，不是修一个正在犯的错。
+
+1) kt_checked_aligned_alloc（operators/common.hpp，9 个调用点：
+   amx/moe_base.hpp 3、amx/sft_moe.hpp 6）
+
+   worker_pool.h:49 用 hwloc_set_membind(BIND|STRICT|THREAD) 把每个 worker
+   硬绑到一个 node 且从不复位（设计如此）。STRICT 意味着绑定 node 满了就
+   返回 nullptr，不会溢出到别的 node。而 nullptr 交给 BufferB 构造函数后，
+   唯一的守卫是 assert(ptr % 64 == 0) —— 0 能通过，且 Release 构建
+   定义了 NDEBUG，assert 本身被编掉。首次写入吃 SIGSEGV；本机
+   kernel.print-fatal-signals=0、core_pattern 管到 apport，于是既没有
+   dmesg 行也没有 core：进程凭空消失。
+   （2026-09-24 10:41:21 观察到的正是这个形态，未复现、未定性，
+   这段改动只保证下次它会说话，不声称修好了它。）
+
+   失败路径上打印申请字节数 + 调用线程的 NUMA 绑定（sched_getcpu /
+   get_mempolicy / numa_node_size64），并区分"硬绑定所以别处有内存也没用"
+   与"全机或 cgroup 短缺"。走 ASSERT_RELEASE 抛 std::runtime_error，
+   NDEBUG 编不掉，pybind11 原样透给 Python。
+
+2) mlock_enabled() 改严格三态（operators/zerocopy_weights.hpp）
+
+   🔴 这个开关默认 ON，与本文件其它开关相反，且是**故意的** —— 别为了
+   "一致性"把默认翻过去。原先 `!= "0"` 的宽松解析让每一个笔误都落在 ON 侧：
+   KT_ZEROCOPY_MLOCK=false/off/no 都会被读成"钉"，即把 84.4 GiB mlock 到
+   只剩 4-8 GiB 的 node0，而操作者以为自己关掉了。现在 ""/unset=ON、
+   "0"=OFF、"1"=ON，其余抛。layer.py 导出的正是 "0"，今天的读数不受影响。
+
+🔴 本次提交按路径 add，未包含 third_party/llama.cpp 与 pybind11 的 gitlink：
+   那两个子模块在本机是 provisioning 打的 "pinned submodule snapshot"，
+   HEAD 记录的 a94e6ff / bb05e08 在本地根本不存在（cat-file 报 could not
+   get object info），还原不了，也不是本线造成的。
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01GbzqQvkLZdVKvY1FMYHUZY
+---
+ kt-kernel/operators/amx/moe_base.hpp     |  16 ++-
+ kt-kernel/operators/amx/sft_moe.hpp      |  16 +--
+ kt-kernel/operators/common.hpp           | 123 +++++++++++++++++++++++
+ kt-kernel/operators/zerocopy_weights.hpp |  20 +++-
+ 4 files changed, 162 insertions(+), 13 deletions(-)
+
+diff --git a/kt-kernel/operators/amx/moe_base.hpp b/kt-kernel/operators/amx/moe_base.hpp
+index 1c35802..379e3c4 100644
+--- a/kt-kernel/operators/amx/moe_base.hpp
++++ b/kt-kernel/operators/amx/moe_base.hpp
+@@ -148,15 +148,21 @@ class AMX_MOE_BASE {
+         continue;
+       }
+ 
+-      void* gate_bb_ptr =
+-          std::aligned_alloc(64, buffer_b_required_size(config_.intermediate_size, config_.hidden_size));
++      // Checked: on a node-bound worker thread a full node makes these return
++      // nullptr, and nullptr passes the BufferB assert(ptr % 64 == 0) that
++      // NDEBUG removes anyway -- the crash then lands on the first write, with
++      // no dmesg line and no core. kt_checked_aligned_alloc reports the size
++      // and the thread's NUMA bind instead. See operators/common.hpp.
++      void* gate_bb_ptr = kt_checked_aligned_alloc(
++          64, buffer_b_required_size(config_.intermediate_size, config_.hidden_size), "AMX gate BufferB", (long long)i);
+       gate_bb_.push_back(make_buffer_b(config_.intermediate_size, config_.hidden_size, gate_bb_ptr));
+ 
+-      void* up_bb_ptr = std::aligned_alloc(64, buffer_b_required_size(config_.intermediate_size, config_.hidden_size));
++      void* up_bb_ptr = kt_checked_aligned_alloc(
++          64, buffer_b_required_size(config_.intermediate_size, config_.hidden_size), "AMX up BufferB", (long long)i);
+       up_bb_.push_back(make_buffer_b(config_.intermediate_size, config_.hidden_size, up_bb_ptr));
+ 
+-      void* down_bb_ptr =
+-          std::aligned_alloc(64, buffer_b_required_size(config_.hidden_size, config_.intermediate_size));
++      void* down_bb_ptr = kt_checked_aligned_alloc(
++          64, buffer_b_required_size(config_.hidden_size, config_.intermediate_size), "AMX down BufferB", (long long)i);
+       down_bb_.push_back(make_buffer_b(config_.hidden_size, config_.intermediate_size, down_bb_ptr));
+     }
+     // TODO: need update to all *.hpp
+diff --git a/kt-kernel/operators/amx/sft_moe.hpp b/kt-kernel/operators/amx/sft_moe.hpp
+index a045315..f97865b 100644
+--- a/kt-kernel/operators/amx/sft_moe.hpp
++++ b/kt-kernel/operators/amx/sft_moe.hpp
+@@ -27,6 +27,7 @@
+ #include <vector>
+ 
+ #include "../../cpu_backend/worker_pool.h"
++#include "../common.hpp"  // kt_checked_aligned_alloc
+ #include "../sft_profile.hpp"
+ #include "ggml.h"
+ #include "la/amx_kernels.hpp"
+@@ -2726,9 +2727,12 @@ class AMX_SFT_MOE_TP : public BaseMOE<T> {
+     size_t down_b_size = static_cast<size_t>(config_.expert_num) * lora_rank_ * config_.hidden_size;
+ 
+     // Allocate all transposed buffers at once
+-    gate_lora_b_transposed_ = (ggml_bf16_t*)aligned_alloc(64, gate_up_b_size * sizeof(ggml_bf16_t));
+-    up_lora_b_transposed_ = (ggml_bf16_t*)aligned_alloc(64, gate_up_b_size * sizeof(ggml_bf16_t));
+-    down_lora_b_transposed_ = (ggml_bf16_t*)aligned_alloc(64, down_b_size * sizeof(ggml_bf16_t));
++    gate_lora_b_transposed_ = (ggml_bf16_t*)kt_checked_aligned_alloc(64, gate_up_b_size * sizeof(ggml_bf16_t),
++                                                                     "SFT transposed gate LoRA-B");
++    up_lora_b_transposed_ = (ggml_bf16_t*)kt_checked_aligned_alloc(64, gate_up_b_size * sizeof(ggml_bf16_t),
++                                                                   "SFT transposed up LoRA-B");
++    down_lora_b_transposed_ = (ggml_bf16_t*)kt_checked_aligned_alloc(64, down_b_size * sizeof(ggml_bf16_t),
++                                                                     "SFT transposed down LoRA-B");
+   }
+ 
+   /**
+@@ -3164,7 +3168,7 @@ class AMX_SFT_MOE_TP : public BaseMOE<T> {
+ 
+     // If pool not yet allocated (Mode 1 init), allocate per-instance for save/load path
+     if (backward_bb_pool_ == nullptr && backward_bb_pool_bytes_ > 0) {
+-      backward_bb_pool_ = aligned_alloc(64, backward_bb_pool_bytes_);
++      backward_bb_pool_ = kt_checked_aligned_alloc(64, backward_bb_pool_bytes_, "SFT backward BufferB pool");
+       init_backward_bb_pointers();
+       backward_bb_locally_owned_ = true;
+     }
+@@ -3639,7 +3643,7 @@ class AMX_SFT_MOE_TP : public BaseMOE<T> {
+ 
+     // LoRA BB pool (persistent - stores converted LoRA weights, not seqlen-dependent)
+     if (lora_bb_pool_bytes_ > 0) {
+-      lora_bb_pool_ = aligned_alloc(64, lora_bb_pool_bytes_);
++      lora_bb_pool_ = kt_checked_aligned_alloc(64, lora_bb_pool_bytes_, "SFT LoRA BufferB pool");
+     }
+ 
+     // ★ Backward pass working buffers are allocated on-demand in backward() and freed after use ★
+@@ -3656,7 +3660,7 @@ class AMX_SFT_MOE_TP : public BaseMOE<T> {
+       backward_bb_locally_owned_ = false;
+     } else {
+       if (backward_bb_pool_bytes_ > 0) {
+-        backward_bb_pool_ = aligned_alloc(64, backward_bb_pool_bytes_);
++        backward_bb_pool_ = kt_checked_aligned_alloc(64, backward_bb_pool_bytes_, "SFT backward BufferB pool");
+       }
+       backward_bb_locally_owned_ = true;
+     }
+diff --git a/kt-kernel/operators/common.hpp b/kt-kernel/operators/common.hpp
+index fb8b2c2..7850f44 100644
+--- a/kt-kernel/operators/common.hpp
++++ b/kt-kernel/operators/common.hpp
+@@ -15,9 +15,16 @@
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
++#include <sstream>
+ #include <stdexcept>
++#include <string>
+ #include <type_traits>
+ 
++#if defined(__linux__)
++#include <numaif.h>
++#include <sched.h>
++#endif
++
+ // #define FORWARD_TIME_PROFILE
+ // #define FORWARD_TIME_REPORT
+ 
+@@ -62,6 +69,122 @@ inline bool kt_moe_phase_timing() {
+   return enabled;
+ }
+ 
++// ---------------------------------------------------------------------------
++// Checked host allocation.
++//
++// kt's worker pool pins every worker thread to one NUMA node with
++// hwloc_set_membind(BIND | STRICT | THREAD) (cpu_backend/worker_pool.h:49) and
++// never resets that bind -- by design. STRICT means the allocation is not
++// allowed to spill to another node, so once the bound node is full
++// std::aligned_alloc returns nullptr instead of succeeding elsewhere.
++//
++// An unchecked nullptr from there used to disappear completely: it was handed
++// straight to the BufferB constructors, whose only guard is
++// assert(ptr % 64 == 0) (operators/amx/la/amx_raw_buffers.hpp) -- 0 passes that
++// test, and a Release build defines NDEBUG, which removes the assert outright.
++// The first write then took SIGSEGV, and with kernel.print-fatal-signals=0 and
++// core_pattern piped to apport that signal leaves neither a dmesg line nor a
++// core file: the process simply vanishes. (Observed 2026-09-24 10:41:21 --
++// EngineCore gone with no output at all, machine-wide global_oom two minutes
++// later.)
++//
++// These helpers do not prevent the failure; they make it say what happened.
++// The byte count says how much was asked for, and the NUMA binding of the
++// calling thread is what identifies the hard bind as the reason a machine with
++// free memory elsewhere could still fail to allocate -- without it that is
++// guesswork.
++// Origin: dsv4.1 single-card line, 2026-09-24.
++
++// One line describing where the calling thread runs and what its memory policy
++// allows. Only ever called on a failure path, so the /sys reads are free.
++inline std::string kt_thread_numa_binding(bool* hard_bound = nullptr) {
++  if (hard_bound != nullptr) *hard_bound = false;
++  std::ostringstream oss;
++#if defined(__linux__)
++  const int cpu = sched_getcpu();
++  const int cpu_node = cpu >= 0 ? numa_node_of_cpu(cpu) : -1;
++  oss << "cpu " << cpu;
++  if (numa_available() >= 0) {
++    oss << " on node " << cpu_node;
++
++    int mode = -1;
++    unsigned long mask[16] = {0};  // 1024 nodes
++    if (get_mempolicy(&mode, mask, sizeof(mask) * 8, nullptr, 0) == 0) {
++      const char* mode_name = "MPOL_?";
++      switch (mode) {
++        case MPOL_DEFAULT: mode_name = "MPOL_DEFAULT (not bound)"; break;
++        case MPOL_PREFERRED: mode_name = "MPOL_PREFERRED"; break;
++        case MPOL_BIND:
++          mode_name = "MPOL_BIND (hard-bound)";
++          if (hard_bound != nullptr) *hard_bound = true;
++          break;
++        case MPOL_INTERLEAVE: mode_name = "MPOL_INTERLEAVE"; break;
++        default: break;
++      }
++      oss << ", mempolicy " << mode_name << " nodes {";
++      const int max_node = numa_max_node();
++      bool first = true;
++      for (int n = 0; n <= max_node && n < 1024; n++) {
++        if (!((mask[n / 64] >> (n % 64)) & 1ULL)) continue;
++        if (!first) oss << ",";
++        first = false;
++        long long free_bytes = 0;
++        const long long total_bytes = numa_node_size64(n, &free_bytes);
++        oss << n << ":free " << (free_bytes >> 20) << "/" << (total_bytes >> 20) << " MiB";
++      }
++      // An empty mask means the policy names no node (MPOL_DEFAULT): report the
++      // node this thread actually runs on, so the numbers are never missing.
++      if (first && cpu_node >= 0) {
++        long long free_bytes = 0;
++        const long long total_bytes = numa_node_size64(cpu_node, &free_bytes);
++        oss << "all; local node " << cpu_node << ":free " << (free_bytes >> 20) << "/" << (total_bytes >> 20)
++            << " MiB";
++      } else if (first) {
++        oss << "-";
++      }
++      oss << "}";
++    } else {
++      oss << ", mempolicy unavailable (get_mempolicy failed)";
++    }
++  } else {
++    oss << ", libnuma reports no NUMA support";
++  }
++#else
++  oss << "unknown (non-Linux build)";
++#endif
++  return oss.str();
++}
++
++// std::aligned_alloc that never returns nullptr: on failure it prints and
++// throws (via ASSERT_RELEASE, so NDEBUG cannot compile the check away) a
++// message carrying the requested size and the calling thread's NUMA binding.
++// `what` names the buffer, `index` is an optional expert id (-1 = none).
++// The thrown type is std::runtime_error, which pybind11 surfaces to Python as
++// RuntimeError with this message intact.
++inline void* kt_checked_aligned_alloc(size_t alignment, size_t size, const char* what, long long index = -1) {
++  void* ptr = std::aligned_alloc(alignment, size);
++  if (ptr == nullptr) {
++    bool hard_bound = false;
++    const std::string binding = kt_thread_numa_binding(&hard_bound);
++    std::ostringstream oss;
++    oss << "kt-kernel: allocation of " << what;
++    if (index >= 0) oss << " for expert " << index;
++    oss << " failed: std::aligned_alloc(" << alignment << ", " << size << ") returned nullptr (" << size
++        << " bytes = " << (size >> 20) << " MiB). Calling thread: " << binding << ". ";
++    if (hard_bound) {
++      oss << "That thread is hard-bound to the node(s) above (hwloc_set_membind BIND|STRICT|THREAD, "
++             "cpu_backend/worker_pool.h) and kt never resets the bind, so this allocation could not fall back "
++             "to another node however much memory the rest of the machine has.";
++    } else {
++      oss << "That thread is not node-bound, so this is a machine-wide or cgroup/rlimit shortage rather than a "
++             "NUMA bind (kt's worker threads, unlike this one, are hard-bound in cpu_backend/worker_pool.h).";
++    }
++    const std::string msg = oss.str();
++    ASSERT_RELEASE(ptr != nullptr, msg.c_str());
++  }
++  return ptr;
++}
++
+ template <typename T, typename std::enable_if<std::is_integral<T>::value, int>::type = 0>
+ inline T div_up(T x, T y) {
+   return (x + y - 1) / y;
+diff --git a/kt-kernel/operators/zerocopy_weights.hpp b/kt-kernel/operators/zerocopy_weights.hpp
+index 4a52659..30a5535 100644
+--- a/kt-kernel/operators/zerocopy_weights.hpp
++++ b/kt-kernel/operators/zerocopy_weights.hpp
+@@ -106,10 +106,26 @@ inline bool scope_w13_only() { return scope() == Scope::kW13; }
+ 
+ // KT_ZEROCOPY_MLOCK=0 turns off the pinning (placement + mlock) while keeping
+ // the zero-copy pointers, so the two effects can be measured apart.
++//
++// 🔴 THIS ONE DEFAULTS *ON*, unlike every other switch in this file, and that
++// is deliberate -- do not "make it consistent" with env_flag() by flipping the
++// default. Pinning is what the zero-copy path was built to do; unset has always
++// meant pinned, and a build that silently stopped pinning would change what the
++// measured arms mean. What IS shared with env_flag() is the parse: "" and unset
++// (= on, here), "0" off, "1" on, and anything else throws. A lax parse in this
++// particular switch is the dangerous direction, because every typo lands on the
++// ON side: KT_ZEROCOPY_MLOCK=false / =off / =no used to read as "pin", i.e. it
++// would mlock 84.4 GiB onto node0 -- the node with 4-8 GiB free -- while the
++// operator believed they had turned it off. vllm_ascend/kt_offload/layer.py
++// exports exactly "0" so today's runs are unaffected; this closes the shape,
++// not a live bug. (decode majflt = 0 measured: the pin is not needed there.)
+ inline bool mlock_enabled() {
+   const char* v = std::getenv("KT_ZEROCOPY_MLOCK");
+-  if (v != nullptr && std::string(v) == "0") return false;
+-  return true;
++  if (v == nullptr || v[0] == '\0') return true;  // unset/empty = pinned (see above)
++  const std::string p = v;
++  if (p == "0") return false;
++  if (p == "1") return true;
++  throw std::runtime_error("KT_ZEROCOPY_MLOCK must be \"\", \"0\" or \"1\", got \"" + p + "\"");
+ }
+ 
+ // KT_ZEROCOPY_AUDIT=1 prints per-node page counts and residency at the end of

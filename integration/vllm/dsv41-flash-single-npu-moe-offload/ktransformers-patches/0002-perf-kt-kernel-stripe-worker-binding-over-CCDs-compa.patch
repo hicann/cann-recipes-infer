@@ -1,0 +1,626 @@
+From b5e0f8b2c09b1d0c4428aed999e450fd13b70dc3 Mon Sep 17 00:00:00 2001
+From: dsv4-a5 <soc.yuan@gmail.com>
+Date: Sun, 6 Sep 2026 13:14:58 +0000
+Subject: [PATCH 02/10] [perf](kt-kernel): stripe worker binding over CCDs,
+ compact MXFP4 E8M0 scales, runtime phase timing
+
+Three independent CPU-side changes for the single-card A5 DeepSeek-V4-Flash
+offload, all measured standalone (no NPU touched) on 2x EPYC 9575F (Zen5,
+2 NUMA, 8 CCDs per socket, AVX512-BF16, no AMX).
+
+1. worker_pool.cpp: bind workers striped over L3 domains instead of packed.
+
+   hwloc's "logical core i inside the NUMA cpuset" is dense, so the first 8
+   workers of a node all land on CCD0. A single CCD sustains ~76 GB/s on this
+   host while the socket does ~246 and both sockets do ~495. MXFP4 decode
+   dispatches only nth*experts*2 tasks (16 for the modal k=2 at E=96) and
+   `worker_count = min(restricted, task_num)` wakes exactly that many workers,
+   so the decode path systematically confined itself to CCD0/CCD1.
+
+   Worker i now goes to L3 domain (i % ndomains), slot (i / ndomains);
+   over-subscription falls onto SMT siblings instead of leaving the thread
+   unbound. KT_CPU_BIND=pack restores the historical order for A/B without a
+   rebuild. The cache holds duplicated bitmaps rather than hwloc objects
+   because each call site loads its own topology.
+
+   Measured, E=96 / 96 threads / tp=2 / qlen=1, back-to-back A/B:
+     per-layer expected cost  116.2 -> 94.6 us   (-18.6%, = -0.93 ms/token
+                                                  over 43 MoE layers)
+     T(k=1)  92.9/94.9 -> 59.1/59.9 us  (-36%)
+     T(k=2) 117.6/119.5 -> 91.6/97.3 us (-20%)
+     T(k=6) unchanged: 48 tasks already cover all 8 CCDs either way.
+   The whole win lands in the gate/up phase (78.0 -> 49.5 us at k=2), which is
+   exactly the phase with the fewest tasks. Larger at low thread counts:
+   -33% at 16 threads, -25% at 32.
+
+2. fp4-moe.hpp / common.hpp: store E8M0 scales as one byte per k-group.
+
+   BufferB reserved one FP32 per 32 weights, but finalize_scale_e8() has
+   always compacted those to one exponent byte in place right after loading
+   and the kernel only ever reads the byte (get_scale_e8). The remaining 3
+   bytes were resident and never touched: 2.25 of 15.014 MiB per expert per
+   layer, 15.0%.
+
+   Allocation happens before the data is known, so the FP32 fallback cannot be
+   chosen after the fact; this is therefore opt-in via the new
+   GeneralMOEConfig::compact_mxfp4_scales (default false, same style as
+   skip_gpu_expert_weights). In compact mode `d` is set to null so any FP32
+   scale read is a null dereference rather than an out-of-bounds one, and the
+   new load_scales_bf16() takes the exponent straight from the BF16 bit
+   pattern, throwing (with the KT_MXFP4_COMPACT_SCALES=0 escape hatch named in
+   the message) if a scale is not a positive power of two. The non-compact
+   path is byte-for-byte the previous sequence. python/utils/amx.py turns it
+   on for method="MXFP4".
+
+   Measured resident memory, one layer, 256 logical experts:
+     marginal MiB/expert/layer  15.013 -> 12.758   (-15.0%, matches
+                                n*k/2 + n*k/32 = 12.75 exactly)
+     43-layer projection  E=96: 61.33 -> 52.25 GiB,  E=128: 81.77 -> 69.66
+   At a fixed host-RAM budget this extends the reachable offload:
+     80 GiB: 126 -> 149 experts;  100 GiB: 158 -> 186;  115 GiB: 182 -> 214.
+
+   Numerics on DeepSeek-V4-Flash-0731 layer 3, non-prefix mask {0,2,4,6}
+   resident, against an independent float32 dequantisation: rel Frobenius
+   3.922e-03 / 3.860e-03 / 3.798e-03 at tokens=1/8/64 with the compaction on,
+   and identical to every printed digit with it off -- the compact byte is the
+   same byte finalize_scale_e8 used to extract, and the kernel takes the same
+   fp4_mat_vec_kgroup_natural_impl<true> path either way. Negative control
+   (nibble swap) still fails at 1.408.
+
+3. moe_base.hpp: make the forward_decode phase timing a runtime switch.
+
+   FORWARD_TIME_PROFILE was a compile-time macro that ships off, so the phase
+   breakdown was unavailable in a built wheel. KT_MOE_PHASE_TIMING=1 now
+   enables it; resolution moved from microseconds to nanoseconds because a
+   bs=1 phase is single-digit microseconds. The guard is one function-local
+   static and only protects work already outside the per-task inner loops.
+
+     [kt-phase] layer 3 numa 0 activated 2 | q_input 2.5 | up_gate 49.5 |
+                act 0.9 | q_down 1.6 | down 25.8 | weight 2.1 | total 82.8 us
+
+   91% of a decode step is the two GEMM phases; the routing prep, activation,
+   weighted sum and cross-NUMA merge together are under 10%.
+
+Build gate 8/8 PASS after a clean rebuild (no AMX tile instructions, AVX512-BF16
+and MXFP4 kernel present, no -march=native).
+
+Analysis and the thread/NUMA/offload sweeps are in docs_cpu_optimization.md of
+the deployment tree.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01WChjzZ4PiJ9vWGQjMnAGSj
+(cherry picked from commit 05a78ed89aa3bd182b6ebf3e90aeabbc26ff1bc5)
+---
+ kt-kernel/cpu_backend/worker_pool.cpp | 155 ++++++++++++++++++++------
+ kt-kernel/ext_bindings.cpp            |   3 +
+ kt-kernel/operators/amx/fp4-moe.hpp   |  76 ++++++++++---
+ kt-kernel/operators/amx/moe_base.hpp  |  57 ++++------
+ kt-kernel/operators/common.hpp        |  24 ++++
+ kt-kernel/python/utils/amx.py         |  10 ++
+ 6 files changed, 247 insertions(+), 78 deletions(-)
+
+diff --git a/kt-kernel/cpu_backend/worker_pool.cpp b/kt-kernel/cpu_backend/worker_pool.cpp
+index 05d7066..194f356 100644
+--- a/kt-kernel/cpu_backend/worker_pool.cpp
++++ b/kt-kernel/cpu_backend/worker_pool.cpp
+@@ -18,12 +18,131 @@
+ #include <cassert>
+ #include <chrono>
+ #include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <map>
++#include <mutex>
+ #include <stdexcept>
++#include <vector>
+ 
+ #include "hwloc.h"
+ 
+ thread_local int WorkerPool::thread_local_id = -1;
+ 
++// ---------------------------------------------------------------------------
++// Core selection for worker binding.
++//
++// The historical order is hwloc's "logical index inside the NUMA cpuset",
++// which is dense: worker i lands on core i, so the first 8 workers of a node
++// all land on the first L3 domain.  On Zen5 (EPYC 9575F) an L3 domain is one
++// CCD of 8 cores and a single CCD saturates at ~76 GB/s while the socket
++// sustains ~246 GB/s, so a dense order caps a low-thread MoE forward at a
++// third of the achievable read bandwidth.  MXFP4 decode is a pure streaming
++// read, and it dispatches only nth*experts*2 tasks (8 tasks for one activated
++// expert), so it lives exactly in that low-thread regime.
++//
++// Default order therefore round-robins over L3 domains: worker i goes to
++// domain (i % ndomains), slot (i / ndomains).  Set KT_CPU_BIND=pack to get the
++// old dense order back (A/B without a rebuild).
++// Origin: dsv4-a5 single-card offload (CPU-side optimisation pass).
++// ---------------------------------------------------------------------------
++static bool kt_cpu_bind_striped() {
++  static const bool striped = [] {
++    const char* v = std::getenv("KT_CPU_BIND");
++    if (v == nullptr) return true;
++    if (std::strcmp(v, "pack") == 0 || std::strcmp(v, "dense") == 0 || std::strcmp(v, "0") == 0) return false;
++    return true;
++  }();
++  return striped;
++}
++
++// Cores of `numa_obj`, ordered so that consecutive indices land on different
++// L3 domains.  Falls back to the dense order when the topology exposes no
++// usable L3 grouping.  The cache holds duplicated bitmaps, not hwloc objects,
++// because each caller here loads its own topology and the two lifetimes are
++// unrelated.
++static const std::vector<hwloc_bitmap_t>& kt_striped_cores(hwloc_topology_t topology, hwloc_obj_t numa_obj,
++                                                           int numa_id) {
++  static std::mutex cache_mutex;
++  static std::map<int, std::vector<hwloc_bitmap_t>> cache;
++  std::lock_guard<std::mutex> guard(cache_mutex);
++  auto it = cache.find(numa_id);
++  if (it != cache.end()) return it->second;
++
++  std::vector<std::vector<hwloc_obj_t>> domains;
++  int l3_count = hwloc_get_nbobjs_inside_cpuset_by_type(topology, numa_obj->cpuset, HWLOC_OBJ_L3CACHE);
++  for (int d = 0; d < l3_count; d++) {
++    hwloc_obj_t l3 = hwloc_get_obj_inside_cpuset_by_type(topology, numa_obj->cpuset, HWLOC_OBJ_L3CACHE, d);
++    if (l3 == nullptr) continue;
++    std::vector<hwloc_obj_t> cores;
++    int core_count = hwloc_get_nbobjs_inside_cpuset_by_type(topology, l3->cpuset, HWLOC_OBJ_CORE);
++    for (int c = 0; c < core_count; c++) {
++      hwloc_obj_t core = hwloc_get_obj_inside_cpuset_by_type(topology, l3->cpuset, HWLOC_OBJ_CORE, c);
++      if (core != nullptr) cores.push_back(core);
++    }
++    if (!cores.empty()) domains.push_back(std::move(cores));
++  }
++
++  std::vector<hwloc_obj_t> ordered_objs;
++  if (domains.size() <= 1) {
++    int core_count = hwloc_get_nbobjs_inside_cpuset_by_type(topology, numa_obj->cpuset, HWLOC_OBJ_CORE);
++    for (int c = 0; c < core_count; c++) {
++      hwloc_obj_t core = hwloc_get_obj_inside_cpuset_by_type(topology, numa_obj->cpuset, HWLOC_OBJ_CORE, c);
++      if (core != nullptr) ordered_objs.push_back(core);
++    }
++  } else {
++    size_t deepest = 0;
++    for (auto& d : domains) deepest = std::max(deepest, d.size());
++    for (size_t slot = 0; slot < deepest; slot++) {
++      for (auto& d : domains) {
++        if (slot < d.size()) ordered_objs.push_back(d[slot]);
++      }
++    }
++  }
++  std::vector<hwloc_bitmap_t> order;
++  order.reserve(ordered_objs.size());
++  for (hwloc_obj_t core : ordered_objs) order.push_back(hwloc_bitmap_dup(core->cpuset));
++  printf("[kt] NUMA %d core order: %zu L3 domains, %zu cores, mode=%s\n", numa_id, domains.size(), order.size(),
++         kt_cpu_bind_striped() ? "stripe" : "pack");
++  return cache.emplace(numa_id, std::move(order)).first->second;
++}
++
++// Bind `handle` to the core that logical worker `index` of `numa_obj` owns.
++// Over-subscription (index >= core count) wraps onto SMT siblings instead of
++// leaving the thread unbound, but only in striped mode; pack mode keeps the
++// historical behaviour byte for byte.
++static bool kt_bind_worker(hwloc_topology_t topology, hwloc_obj_t numa_obj, int numa_id, int index,
++                           pthread_t handle) {
++  hwloc_const_cpuset_t core_cpuset = nullptr;
++  int pu_slot = 0;
++  if (kt_cpu_bind_striped()) {
++    const auto& order = kt_striped_cores(topology, numa_obj, numa_id);
++    if (order.empty()) return false;
++    core_cpuset = order[index % order.size()];
++    pu_slot = index / static_cast<int>(order.size());
++  } else {
++    hwloc_obj_t core_obj = hwloc_get_obj_inside_cpuset_by_type(topology, numa_obj->cpuset, HWLOC_OBJ_CORE, index);
++    if (core_obj == nullptr) return false;
++    core_cpuset = core_obj->cpuset;
++  }
++  if (core_cpuset == nullptr) return false;
++
++  hwloc_bitmap_t cpuset = hwloc_bitmap_alloc();
++  hwloc_bitmap_copy(cpuset, core_cpuset);
++  if (pu_slot > 0) {
++    // Over-subscribed: fall onto this core's SMT siblings in order.
++    int pu_count = hwloc_get_nbobjs_inside_cpuset_by_type(topology, core_cpuset, HWLOC_OBJ_PU);
++    hwloc_obj_t pu = pu_count > 0
++                         ? hwloc_get_obj_inside_cpuset_by_type(topology, core_cpuset, HWLOC_OBJ_PU, pu_slot % pu_count)
++                         : nullptr;
++    if (pu != nullptr) hwloc_bitmap_copy(cpuset, pu->cpuset);
++  }
++  hwloc_bitmap_singlify(cpuset);
++  int res = hwloc_set_thread_cpubind(topology, handle, cpuset, HWLOC_CPUBIND_STRICT);
++  hwloc_bitmap_free(cpuset);
++  return res == 0;
++}
++
+ InNumaPool::InNumaPool(int max_thread_num) {
+   printf("In Numa Worker Pool at NUMA %d, %d threads\n", numa_node_of_cpu(sched_getcpu()), max_thread_num);
+   total_worker_count = max_thread_num;
+@@ -41,8 +160,7 @@ InNumaPool::InNumaPool(int max_thread_num) {
+ InNumaPool::InNumaPool(int max_thread_num, int numa_id, int threads_id_start) {
+   printf("===========In NumaPool============\n");
+   hwloc_topology_t topology;
+-  hwloc_obj_t numa_obj, core_obj;
+-  hwloc_bitmap_t cpuset;
++  hwloc_obj_t numa_obj;
+   hwloc_topology_init(&topology);
+   hwloc_topology_load(topology);
+   printf("In Numa Worker Pool at NUMA %d, %d threads\n", numa_node_of_cpu(sched_getcpu()), max_thread_num);
+@@ -77,18 +195,8 @@ InNumaPool::InNumaPool(int max_thread_num, int numa_id, int threads_id_start) {
+       // throw std::runtime_error("NUMA node not found");
+       continue;
+     }
+-    core_obj = hwloc_get_obj_inside_cpuset_by_type(topology, numa_obj->cpuset, HWLOC_OBJ_CORE, i + threads_id_start);
+-    if (!core_obj) {
+-      fprintf(stderr, "Core %d inside NUMA node %d not found\n", i, numa_id);
+-      // throw std::runtime_error("Core not found inside NUMA node");
+-      continue;
+-    }
+-    cpuset = hwloc_bitmap_alloc();
+-    hwloc_bitmap_copy(cpuset, core_obj->cpuset);
+-    hwloc_bitmap_singlify(cpuset);
+-    auto res = hwloc_set_thread_cpubind(topology, native_handle, cpuset, HWLOC_CPUBIND_STRICT);
+-    if (res != 0) {
+-      fprintf(stderr, "Failed to set thread CPU binding: %s\n", strerror(errno));
++    if (!kt_bind_worker(topology, numa_obj, numa_id, i + threads_id_start, native_handle)) {
++      fprintf(stderr, "Failed to bind worker %d inside NUMA node %d\n", i + threads_id_start, numa_id);
+     }
+   }
+ }
+@@ -299,23 +407,8 @@ void NumaJobDistributor::init(std::vector<int> numa_ids, std::vector<int> thread
+       // throw std::runtime_error("NUMA node not found");
+       continue;
+     }
+-    core_obj = hwloc_get_obj_inside_cpuset_by_type(topology, numa_obj->cpuset, HWLOC_OBJ_CORE, start_id);
+-    if (!core_obj) {
+-      fprintf(stderr, "Core %d inside NUMA node %d not found\n", 0, this_numa);
+-      // throw std::runtime_error("Core not found inside NUMA node");
+-      continue;
+-    }
+-    // 精简 cpuset
+-    auto cpuset_simple = hwloc_bitmap_alloc();
+-    hwloc_bitmap_copy(cpuset_simple, core_obj->cpuset);
+-    hwloc_bitmap_singlify(cpuset_simple);
+-    // 打印绑定的具体的 CPU 物理索引
+-    unsigned long i_in;
+-    // hwloc_bitmap_foreach_begin(i_in, cpuset_simple) { printf("Thread %d bound to CPU %ld\n", start_id, i_in); }
+-    // hwloc_bitmap_foreach_end();
+-    auto res = hwloc_set_thread_cpubind(topology, native_handle, cpuset_simple, HWLOC_CPUBIND_STRICT);
+-    if (res != 0) {
+-      fprintf(stderr, "Failed to set thread CPU binding: %s\n", strerror(errno));
++    if (!kt_bind_worker(topology, numa_obj, this_numa, start_id, native_handle)) {
++      fprintf(stderr, "Failed to bind distributor worker %d inside NUMA node %d\n", start_id, this_numa);
+     }
+     // 检查线程是否绑定到指定的 核上了
+     hwloc_cpuset_t cpuset = hwloc_bitmap_alloc();
+diff --git a/kt-kernel/ext_bindings.cpp b/kt-kernel/ext_bindings.cpp
+index 9f97206..21703f6 100644
+--- a/kt-kernel/ext_bindings.cpp
++++ b/kt-kernel/ext_bindings.cpp
+@@ -872,6 +872,9 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
+       // false. MXFP4 only; see GeneralMOEConfig::skip_gpu_expert_weights.
+       // Origin: dsv4-a5 single-card offload (stage 0.6).
+       .def_readwrite("skip_gpu_expert_weights", &GeneralMOEConfig::skip_gpu_expert_weights)
++      // MXFP4 only: store E8M0 scales as one byte per k-group instead of one
++      // FP32. Default false; see GeneralMOEConfig::compact_mxfp4_scales.
++      .def_readwrite("compact_mxfp4_scales", &GeneralMOEConfig::compact_mxfp4_scales)
+       .DEF_PTR_PROPERTY(GeneralMOEConfig, physical_to_logical_map)
+ 
+       .DEF_PTR_PROPERTY(GeneralMOEConfig, gate_proj)
+diff --git a/kt-kernel/operators/amx/fp4-moe.hpp b/kt-kernel/operators/amx/fp4-moe.hpp
+index 52ec56d..7b22b0a 100644
+--- a/kt-kernel/operators/amx/fp4-moe.hpp
++++ b/kt-kernel/operators/amx/fp4-moe.hpp
+@@ -230,14 +230,63 @@ struct GemmKernel224MXFP4SmallKGroup {
+ 
+     uint8_t* scale_e8;
+     bool scale_e8_valid = false;
++    // True when the buffer was sized for one exponent byte per k-group instead
++    // of one FP32. Native MXFP4 scales are E8M0 by construction, so the FP32
++    // slot is dead weight: 4 -> 1 byte per 32 weights is 15.0% of the resident
++    // MXFP4 expert (2.25 of 15.014 MiB per expert per layer). In this mode `d`
++    // is null and every FP32 scale path is unreachable; loading a scale that is
++    // not a positive power of two throws instead of silently degrading.
++    // Origin: dsv4-a5 single-card offload (CPU-side optimisation pass).
++    bool compact = false;
+ 
+     static size_t required_size(int n, int k, int k_group_size) { return Base::required_size(n, k, k_group_size); }
+ 
+-    BufferB(int n_, int k_, int k_group_size_, void* ptr) : Base(n_, k_, k_group_size_, ptr) {
++    static size_t required_size(int n, int k, int k_group_size, bool compact) {
++      if (!compact) return Base::required_size(n, k, k_group_size);
++      return sizeof(int8_t) * static_cast<size_t>(n) * k / 2 +
++             sizeof(uint8_t) * static_cast<size_t>(n) * (k / k_group_size);
++    }
++
++    BufferB(int n_, int k_, int k_group_size_, void* ptr) : BufferB(n_, k_, k_group_size_, ptr, false) {}
++
++    BufferB(int n_, int k_, int k_group_size_, void* ptr, bool compact_)
++        : Base(n_, k_, k_group_size_, ptr), compact(compact_) {
+       // The compact bytes replace the FP32 contents in-place after validation.
+       // Forward compression is overlap-safe: byte i is always written below
+       // the first byte of every not-yet-read float j > i.
+       scale_e8 = reinterpret_cast<uint8_t*>(d);
++      if (compact) {
++        // Nothing was allocated past the exponent bytes; make every FP32 read
++        // a null dereference rather than an out-of-bounds one.
++        d = nullptr;
++        scale_e8_valid = true;
++      }
++    }
++
++    // Fill the scale region from the loader's BF16 source. In compact mode the
++    // exponent byte is taken straight from the BF16 bit pattern (a positive
++    // power of two is exponent<<7 with a zero mantissa), so no FP32 ever
++    // materialises. In the legacy mode this is exactly the previous sequence
++    // (convert to FP32, then compact in place).
++    void load_scales_bf16(const ggml_bf16_t* source, size_t count) {
++      if (!compact) {
++        convert_or_copy(d, source, count);
++        finalize_scale_e8();
++        return;
++      }
++      for (size_t i = 0; i < count; ++i) {
++        const uint16_t bits = source[i].bits;
++        const uint16_t exponent = static_cast<uint16_t>((bits >> 7) & 0xFFu);
++        const bool is_positive_power_of_two =
++            (bits & 0x8000u) == 0 && (bits & 0x007Fu) == 0 && exponent != 0 && exponent != 0xFFu;
++        if (!is_positive_power_of_two) {
++          throw std::runtime_error(
++              "MXFP4 compact scales: scale " + std::to_string(i) +
++              " is not a positive power of two (bf16 bits 0x" + std::to_string(bits) +
++              "). Set KT_MXFP4_COMPACT_SCALES=0 to fall back to the FP32 scale slot.");
++        }
++        scale_e8[i] = static_cast<uint8_t>(exponent);
++      }
+     }
+ 
+     void finalize_scale_e8() {
+@@ -269,7 +318,10 @@ struct GemmKernel224MXFP4SmallKGroup {
+     }
+ 
+     float* get_scale(int n_, int n_begin, int k_, int k_begin) {
+-      if (!scale_e8_valid) return Base::get_scale(n_, n_begin, k_, k_begin);
++      if (!scale_e8_valid) {
++        assert(!compact);
++        return Base::get_scale(n_, n_begin, k_, k_begin);
++      }
+       constexpr int max_group_count = K_BLOCK / 32;
+       const int group_count = k_ / k_group_size;
+       assert(group_count <= max_group_count);
+@@ -711,7 +763,7 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
+   // BufferA: raw BF16, no group_size needed
+   size_t buffer_a_required_size_impl(size_t m, size_t k) const { return T::BufferA::required_size(m, k); }
+   size_t buffer_b_required_size_impl(size_t n, size_t k) const {
+-    return T::BufferB::required_size(n, k, config_.quant_config.group_size);
++    return T::BufferB::required_size(n, k, config_.quant_config.group_size, config_.compact_mxfp4_scales);
+   }
+   size_t buffer_c_required_size_impl(size_t m, size_t n) const { return T::BufferC::required_size(m, n); }
+ 
+@@ -719,7 +771,8 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
+     return std::make_shared<typename T::BufferA>(m, k, data);
+   }
+   std::shared_ptr<typename T::BufferB> make_buffer_b_impl(size_t n, size_t k, void* data) const {
+-    return std::make_shared<typename T::BufferB>(n, k, config_.quant_config.group_size, data);
++    return std::make_shared<typename T::BufferB>(n, k, config_.quant_config.group_size, data,
++                                                 config_.compact_mxfp4_scales);
+   }
+   std::shared_ptr<typename T::BufferC> make_buffer_c_impl(size_t m, size_t n, void* data) const {
+     return std::make_shared<typename T::BufferC>(m, n, data);
+@@ -852,15 +905,12 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
+           if (config_.lacks_cpu_weights((int64_t)expert_idx)) return;
+           uint64_t logical_expert_id = expert_map(physical_to_logical_map, expert_idx);
+           size_t scale_elem_count = (config_.hidden_size * config_.intermediate_size) / config_.quant_config.group_size;
+-          convert_or_copy(gate_bb_[expert_idx]->d,
+-                          (ggml_bf16_t*)config_.gate_scale + (logical_expert_id * scale_elem_count), scale_elem_count);
+-          convert_or_copy(up_bb_[expert_idx]->d,
+-                          (ggml_bf16_t*)config_.up_scale + (logical_expert_id * scale_elem_count), scale_elem_count);
+-          convert_or_copy(down_bb_[expert_idx]->d,
+-                          (ggml_bf16_t*)config_.down_scale + (logical_expert_id * scale_elem_count), scale_elem_count);
+-          gate_bb_[expert_idx]->finalize_scale_e8();
+-          up_bb_[expert_idx]->finalize_scale_e8();
+-          down_bb_[expert_idx]->finalize_scale_e8();
++          gate_bb_[expert_idx]->load_scales_bf16(
++              (const ggml_bf16_t*)config_.gate_scale + (logical_expert_id * scale_elem_count), scale_elem_count);
++          up_bb_[expert_idx]->load_scales_bf16(
++              (const ggml_bf16_t*)config_.up_scale + (logical_expert_id * scale_elem_count), scale_elem_count);
++          down_bb_[expert_idx]->load_scales_bf16(
++              (const ggml_bf16_t*)config_.down_scale + (logical_expert_id * scale_elem_count), scale_elem_count);
+         },
+         nullptr);
+   }
+diff --git a/kt-kernel/operators/amx/moe_base.hpp b/kt-kernel/operators/amx/moe_base.hpp
+index 9bd864f..1c35802 100644
+--- a/kt-kernel/operators/amx/moe_base.hpp
++++ b/kt-kernel/operators/amx/moe_base.hpp
+@@ -472,11 +472,13 @@ class AMX_MOE_BASE {
+   void forward_decode(int k, const int64_t* expert_ids, const float* weights, const void* input, void* output) {
+     int qlen = 1;
+     auto pool = config_.pool->get_subpool(tp_part_idx);
+-#ifdef FORWARD_TIME_PROFILE
++    // Per-phase decode timing, enabled at runtime with KT_MOE_PHASE_TIMING=1.
++    // Nanoseconds, because the phases of a bs=1 step are single-digit
++    // microseconds. Origin: dsv4-a5 single-card offload.
++    const bool phase_timing = kt_moe_phase_timing();
+     auto start_time = std::chrono::high_resolution_clock::now();
+     auto last = start_time;
+     long q_input_time = 0, up_gate_time = 0, act_time = 0, q_down_time = 0, down_time = 0, weight_time = 0;
+-#endif
+ 
+     int activated_expert = 0;
+     std::fill(m_local_num_.begin(), m_local_num_.end(), 0);
+@@ -555,13 +557,11 @@ class AMX_MOE_BASE {
+       derived()->prepare_decode_gate_input(expert_idx, qlen, input);
+     }
+ 
+-#ifdef FORWARD_TIME_PROFILE
+-    {
++    if (phase_timing) [[unlikely]] {
+       auto now_time = std::chrono::high_resolution_clock::now();
+-      q_input_time = std::chrono::duration_cast<std::chrono::microseconds>(now_time - last).count();
++      q_input_time = std::chrono::duration_cast<std::chrono::nanoseconds>(now_time - last).count();
+       last = now_time;
+     }
+-#endif
+ 
+     int nth = T::recommended_nth(config_.intermediate_size);
+     pool->do_work_stealing_job(
+@@ -581,23 +581,19 @@ class AMX_MOE_BASE {
+         },
+         nullptr);
+ 
+-#ifdef FORWARD_TIME_PROFILE
+-    {
++    if (phase_timing) [[unlikely]] {
+       auto now_time = std::chrono::high_resolution_clock::now();
+-      up_gate_time = std::chrono::duration_cast<std::chrono::microseconds>(now_time - last).count();
++      up_gate_time = std::chrono::duration_cast<std::chrono::nanoseconds>(now_time - last).count();
+       last = now_time;
+     }
+-#endif
+ 
+     derived()->apply_decode_activation(activated_expert, nth, qlen);
+ 
+-#ifdef FORWARD_TIME_PROFILE
+-    {
++    if (phase_timing) [[unlikely]] {
+       auto now_time = std::chrono::high_resolution_clock::now();
+-      act_time = std::chrono::duration_cast<std::chrono::microseconds>(now_time - last).count();
++      act_time = std::chrono::duration_cast<std::chrono::nanoseconds>(now_time - last).count();
+       last = now_time;
+     }
+-#endif
+ 
+     pool->do_work_stealing_job(
+         activated_expert, nullptr,
+@@ -607,13 +603,11 @@ class AMX_MOE_BASE {
+         },
+         nullptr);
+ 
+-#ifdef FORWARD_TIME_PROFILE
+-    {
++    if (phase_timing) [[unlikely]] {
+       auto now_time = std::chrono::high_resolution_clock::now();
+-      q_down_time = std::chrono::duration_cast<std::chrono::microseconds>(now_time - last).count();
++      q_down_time = std::chrono::duration_cast<std::chrono::nanoseconds>(now_time - last).count();
+       last = now_time;
+     }
+-#endif
+ 
+     nth = T::recommended_nth(config_.hidden_size);
+     pool->do_work_stealing_job(
+@@ -626,13 +620,11 @@ class AMX_MOE_BASE {
+         },
+         nullptr);
+ 
+-#ifdef FORWARD_TIME_PROFILE
+-    {
++    if (phase_timing) [[unlikely]] {
+       auto now_time = std::chrono::high_resolution_clock::now();
+-      down_time = std::chrono::duration_cast<std::chrono::microseconds>(now_time - last).count();
++      down_time = std::chrono::duration_cast<std::chrono::nanoseconds>(now_time - last).count();
+       last = now_time;
+     }
+-#endif
+ 
+     for (int e = 0; e < config_.hidden_size; e += 32) {
+       __m512 x0 = _mm512_setzero_ps();
+@@ -654,20 +646,17 @@ class AMX_MOE_BASE {
+       f32out[1] = x1;
+     }
+ 
+-#ifdef FORWARD_TIME_PROFILE
+-    {
++    if (phase_timing) [[unlikely]] {
+       auto now_time = std::chrono::high_resolution_clock::now();
+-      weight_time = std::chrono::duration_cast<std::chrono::microseconds>(now_time - last).count();
+-      last = now_time;
++      weight_time = std::chrono::duration_cast<std::chrono::nanoseconds>(now_time - last).count();
++      auto forward_total_time = std::chrono::duration_cast<std::chrono::nanoseconds>(now_time - start_time).count();
++      printf(
++          "[kt-phase] layer %d numa %d activated %d | q_input %.1f | up_gate %.1f | act %.1f | "
++          "q_down %.1f | down %.1f | weight %.1f | total %.1f us\n",
++          config_.layer_idx, tp_part_idx, activated_expert, q_input_time / 1000.0, up_gate_time / 1000.0,
++          act_time / 1000.0, q_down_time / 1000.0, down_time / 1000.0, weight_time / 1000.0,
++          forward_total_time / 1000.0);
+     }
+-    auto end_time = std::chrono::high_resolution_clock::now();
+-    auto forward_total_time = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
+-    printf(
+-        "Profiling Results (numa[%d]): activated_expert: %d, q_input: %ld us, "
+-        "up_gate: %ld us, act: %ld us, q_down: %ld us, down: %ld us, weight: %ld us, total: %ld us\n",
+-        tp_part_idx, activated_expert, q_input_time, up_gate_time, act_time, q_down_time, down_time, weight_time,
+-        forward_total_time);
+-#endif
+   }
+ 
+  protected:
+diff --git a/kt-kernel/operators/common.hpp b/kt-kernel/operators/common.hpp
+index 260bf99..fb8b2c2 100644
+--- a/kt-kernel/operators/common.hpp
++++ b/kt-kernel/operators/common.hpp
+@@ -13,6 +13,7 @@
+ #include <chrono>
+ #include <cmath>
+ #include <cstdio>
++#include <cstdlib>
+ #include <cstring>
+ #include <stdexcept>
+ #include <type_traits>
+@@ -47,6 +48,20 @@
+ 
+ #define expert_map(m, x) (m != nullptr ? m[(x)] : (x))
+ 
++// Runtime switch for the per-phase decode timing in
++// operators/amx/moe_base.hpp::forward_decode. Off by default; the check is one
++// predictable load of a function-local static, and it only guards work that is
++// already outside the per-task inner loops.
++//   KT_MOE_PHASE_TIMING=1 ./your_run   ->  one line per layer per NUMA node
++// Origin: dsv4-a5 single-card offload (CPU-side optimisation pass).
++inline bool kt_moe_phase_timing() {
++  static const bool enabled = [] {
++    const char* v = std::getenv("KT_MOE_PHASE_TIMING");
++    return v != nullptr && v[0] != '\0' && std::strcmp(v, "0") != 0;
++  }();
++  return enabled;
++}
++
+ template <typename T, typename std::enable_if<std::is_integral<T>::value, int>::type = 0>
+ inline T div_up(T x, T y) {
+   return (x + y - 1) / y;
+@@ -260,6 +275,15 @@ struct GeneralMOEConfig {
+   // Origin: dsv4-a5 single-card offload (stage 0.6).
+   bool skip_gpu_expert_weights = false;
+ 
++  // When true, the MXFP4 BufferB stores one E8M0 exponent byte per k-group
++  // instead of one FP32, shrinking a resident expert from 0.625 to 0.53125
++  // bytes per weight element (15.014 -> 12.76 MiB per expert per layer, i.e.
++  // 15.0% less host RAM). Native MXFP4 checkpoints are E8M0 by construction;
++  // a scale that is not a positive power of two now throws at load time
++  // instead of silently taking the FP32 fallback, so this stays opt-in.
++  // Origin: dsv4-a5 single-card offload (CPU-side optimisation pass).
++  bool compact_mxfp4_scales = false;
++
+   // Pure residency test: true iff `expert_id` lives on the accelerator and has
+   // no CPU-side weights. No bounds handling, so it is safe to drive allocation
+   // loops (0 <= expert_id < expert_num by construction there).
+diff --git a/kt-kernel/python/utils/amx.py b/kt-kernel/python/utils/amx.py
+index 2ed70a2..5316aa1 100644
+--- a/kt-kernel/python/utils/amx.py
++++ b/kt-kernel/python/utils/amx.py
+@@ -962,6 +962,16 @@ class NativeMoEWrapper(BaseMoEWrapper):
+         # skips are implemented in the MXFP4 load path alone.
+         # Origin: dsv4-a5 single-card offload (stage 0.6).
+         moe_config.skip_gpu_expert_weights = bool(load_kwargs)
++        # Store the E8M0 scale as one byte per k-group instead of one FP32.
++        # Native MXFP4 checkpoints (DeepSeek-V4-Flash) carry F8_E8M0 scales, so
++        # the FP32 slot never holds anything but a power of two -- 15.0% of the
++        # resident expert (2.25 of 15.014 MiB per expert per layer) is dead.
++        # Opt out with KT_MXFP4_COMPACT_SCALES=0 if a checkpoint ever ships a
++        # scale that is not a positive power of two (the loader throws then).
++        # Origin: dsv4-a5 single-card offload (CPU-side optimisation pass).
++        moe_config.compact_mxfp4_scales = self.method == "MXFP4" and os.environ.get(
++            "KT_MXFP4_COMPACT_SCALES", "1"
++        ) not in ("0", "false", "False")
+ 
+         # Use gate_projs instead of gate_proj for per-expert pointers
+         moe_config.gate_projs = gate_ptrs

@@ -1,0 +1,319 @@
+From 5ff7514244bc03ae5b9918275e707b2de05ad634 Mon Sep 17 00:00:00 2001
+From: dsv41-moe-offload <soc.yuan@gmail.com>
+Date: Tue, 22 Sep 2026 16:59:31 +0000
+Subject: [PATCH 06/10] =?UTF-8?q?[feat](kt-kernel):=20CPUInfer.run=5Finlin?=
+ =?UTF-8?q?e=20=E2=80=94=E2=80=94=20=E5=9B=BE=E8=B7=AF=E5=BE=84=E4=B8=8B?=
+ =?UTF-8?q?=E4=B8=8D=E8=B5=B0=20TaskQueue=20=E7=BA=BF=E7=A8=8B=E6=8F=A1?=
+ =?UTF-8?q?=E6=89=8B=EF=BC=88KT=5FCPUINFER=5FINLINE=EF=BC=8C=E9=BB=98?=
+ =?UTF-8?q?=E8=AE=A4=E5=85=B3=EF=BC=89?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+NPU 图路径上一层 MoE = host-func 回调里的一次 submit+sync，而 submit 是一次完整的线程交接：
+enqueue（new Node + mutex + notify）→ worker 线程醒来执行 → 它的 notify 唤醒 sync 的 cv.wait。
+本机微基准（tools/kt_offload/prof/bench/tq_bench.cpp，空任务）：队列往返中位 11.3–12.9 µs，
+内联同一个任务 + sync 只要 0.101–0.110 µs ⇒ 40 层就是 0.45–0.52 ms/token 的纯线程跳。
+
+做法：TaskQueue::run_inline() 在调用线程上执行任务，异常按 worker 的老路径存进 first_exception，
+由**下一次 sync() 抛出**——kt 的调用方一直是在 sync 处得知任务失败的，提前抛是另一套契约，
+而把它吞掉会让算错的一层变成静默的陈旧输出。CPUInfer::run_inline() 置一个 thread_local 深度位，
+enqueue() 看见就直接跑；所有算子的 binding 都经 enqueue，因此不用一个个改。
+
+两条护栏（都读真实状态，不靠「图路径不会 defer」这句话）：
+- 队列非空就退回 submit（TaskQueue::pending_tasks()）——内联任务插到排队任务前面 = 静默乱序；
+- Python 侧 run_pinned_forward_sync 只有在「上一层没留 deferred（incremental=False）」且
+  「本层 deferred id 全是 -1（读缓冲，不是看 max_deferred>0）」时才走内联，否则原样 submit。
+
+开关在 C++ 侧读（KT_CPUINFER_INLINE，未设/空/0 = 关 ⇒ 行为逐字节不变，非法值退回关并告警），
+打开时打印一行，一发日志据此自证在哪条臂上。没有 gil_scoped_release，与 submit/sync 保持一致：
+今天调用方本来就在整个 submit+sync 期间持有 GIL，内联不移动任何 GIL 边界。
+
+🔴 未做、留给上卡：本改动尚未重建 wheel，整网 A/B（关/开内联，主判据是 seam 埋点的 E 段与 submit 段）
+未跑；ext_bindings.cpp 整个 TU 已用原构建参数 -fsyntax-only 编过。
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_011rvwJMwDwJQ4XJFPgkXUDe
+---
+ kt-kernel/cpu_backend/cpuinfer.h     | 43 ++++++++++++++++++++
+ kt-kernel/cpu_backend/task_queue.cpp | 60 ++++++++++++++++++++++++++++
+ kt-kernel/cpu_backend/task_queue.h   | 18 +++++++++
+ kt-kernel/ext_bindings.cpp           |  8 ++++
+ kt-kernel/python/experts_base.py     | 39 ++++++++++++++++++
+ 5 files changed, 168 insertions(+)
+
+diff --git a/kt-kernel/cpu_backend/cpuinfer.h b/kt-kernel/cpu_backend/cpuinfer.h
+index 227187d..7c83b5f 100644
+--- a/kt-kernel/cpu_backend/cpuinfer.h
++++ b/kt-kernel/cpu_backend/cpuinfer.h
+@@ -76,6 +76,13 @@ class CPUInfer {
+ 
+   template <typename Func, typename Obj, typename... Args>
+   void enqueue(Func f, Obj* obj, Args... args) {
++    if (inline_depth_ > 0) {
++      // We are inside run_inline() on this very thread: run the task here
++      // rather than posting it. Every op's binding funnels through enqueue(),
++      // so nothing else has to know about the inline path.
++      task_queue_->run_inline([=]() { std::invoke(f, *obj, args...); });
++      return;
++    }
+     task_queue_->enqueue([=]() { std::invoke(f, *obj, args...); });
+   }
+ 
+@@ -85,6 +92,37 @@ class CPUInfer {
+     *((CPUInfer**)args) = this;
+     func(args);
+   }
++
++  // Same task, executed on the calling thread (DSV4.1 offload §4.22 P2).
++  //
++  // Returns true iff it really ran inline. It falls back to submit() -- the
++  // ordinary queue -- when the switch is off, and also when the queue still
++  // holds anything: a task that jumps ahead of a pending one would silently
++  // reorder two layers' work, and "the caller says there is no deferred task"
++  // is not something to take on trust when the queue can be asked.
++  //
++  // The GIL is not released here, exactly as for submit()/sync(): today the
++  // Python caller holds it across the whole submit+sync anyway, so inlining
++  // moves no GIL boundary. A task that throws is stored and rethrown by the
++  // next sync(), which is what the queued path does.
++  bool run_inline(std::pair<intptr_t, intptr_t> params) {
++    if (!kt_cpuinfer_inline_enabled() || task_queue_->pending_tasks() != 0) {
++      submit(params);
++      return false;
++    }
++    void (*func)(void*) = (void (*)(void*))params.first;
++    void* args = (void*)params.second;
++    *((CPUInfer**)args) = this;
++    inline_depth_ += 1;
++    try {
++      func(args);
++    } catch (...) {
++      inline_depth_ -= 1;
++      throw;
++    }
++    inline_depth_ -= 1;
++    return true;
++  }
+ #ifndef KTRANSFORMERS_CPU_ONLY
+   void submit_with_cuda_stream(intptr_t user_cuda_stream, std::pair<intptr_t, intptr_t> params) {
+ #if defined(KTRANSFORMERS_USE_CUDA) || defined(KTRANSFORMERS_USE_CUDA_HOST_CALLBACKS) || \
+@@ -125,6 +163,11 @@ class CPUInfer {
+  public:
+   WorkerPool* backend_;
+   TaskQueue* task_queue_;
++
++ private:
++  // Per thread: only the thread inside run_inline() takes the inline branch,
++  // so a submit from any other thread keeps using the queue.
++  static inline thread_local int inline_depth_ = 0;
+ };
+ 
+ #endif
+diff --git a/kt-kernel/cpu_backend/task_queue.cpp b/kt-kernel/cpu_backend/task_queue.cpp
+index b38f360..84826b6 100644
+--- a/kt-kernel/cpu_backend/task_queue.cpp
++++ b/kt-kernel/cpu_backend/task_queue.cpp
+@@ -13,9 +13,47 @@
+ #include <sched.h>
+ 
+ #include <chrono>
++#include <cstdio>
++#include <cstring>
++#include <cstdlib>
+ #include <iostream>
+ #include <thread>
+ 
++// ---------------------------------------------------------------------------
++// KT_CPUINFER_INLINE: run a submitted task on the calling thread instead of
++// handing it to the TaskQueue worker.
++//
++// Why it exists: on the DSV4.1 NPU-offload path one MoE layer is one
++// submit+sync from inside a graph host-func callback, and the hand-off is a
++// full thread round trip -- enqueue (new Node + mutex + notify), the worker
++// waking up, and the worker's notify waking the sync. Measured empty-task
++// round trip on this box: 10.44 us median (p90 11.0), against 0.04 us for
++// running the same task inline; 40 layers per token makes that 0.42 ms.
++//
++// Unset, empty or "0" = off = byte-for-byte the old path. Read once, and the
++// one line it prints when on is how a run's log says which arm it was.
++// ---------------------------------------------------------------------------
++bool kt_parse_inline_flag(const char* value) {
++  if (value == nullptr || *value == '\0') return false;
++  if (std::strcmp(value, "0") == 0) return false;
++  if (std::strcmp(value, "1") == 0) return true;
++  fprintf(stderr, "[kt] KT_CPUINFER_INLINE=%s is not 0 or 1; keeping the default (off)\n", value);
++  return false;
++}
++
++bool kt_cpuinfer_inline_enabled() {
++  static const bool enabled = [] {
++    bool on = kt_parse_inline_flag(std::getenv("KT_CPUINFER_INLINE"));
++    if (on) {
++      printf("[kt] CPUInfer: inline execution ON (KT_CPUINFER_INLINE=1): a submitted task runs on the calling "
++             "thread and the TaskQueue worker is bypassed; it still falls back to the queue while anything is "
++             "pending\n");
++    }
++    return on;
++  }();
++  return enabled;
++}
++
+ TaskQueue::TaskQueue() : done(false), pending(0) {
+   Node* dummy = new Node();
+   head.store(dummy, std::memory_order_relaxed);
+@@ -50,6 +88,28 @@ void TaskQueue::enqueue(std::function<void()> task) {
+   cv.notify_one();
+ }
+ 
++void TaskQueue::run_inline(const std::function<void()>& task) {
++  std::exception_ptr task_exception;
++  if (task) {
++    try {
++      task();
++    } catch (...) {
++      task_exception = std::current_exception();
++    }
++  }
++  if (task_exception) {
++    // Same slot the worker uses, so sync() rethrows it exactly as it would
++    // have for a queued task. Dropping it here would turn a failed MoE layer
++    // into silently stale output.
++    std::lock_guard<std::mutex> lock(mtx);
++    if (!first_exception) {
++      first_exception = task_exception;
++    }
++  }
++}
++
++size_t TaskQueue::pending_tasks() const { return pending.load(std::memory_order_acquire); }
++
+ void TaskQueue::sync(size_t allow_n_pending) {
+   std::exception_ptr task_exception;
+   {
+diff --git a/kt-kernel/cpu_backend/task_queue.h b/kt-kernel/cpu_backend/task_queue.h
+index cbcd2e6..22392b7 100644
+--- a/kt-kernel/cpu_backend/task_queue.h
++++ b/kt-kernel/cpu_backend/task_queue.h
+@@ -19,6 +19,11 @@
+ #include <thread>
+ #include <vector>
+ 
++// KT_CPUINFER_INLINE, parsed and read once (task_queue.cpp explains the why).
++// The parse is exposed so it can be checked without starting a queue.
++bool kt_parse_inline_flag(const char* value);
++bool kt_cpuinfer_inline_enabled();
++
+ class TaskQueue {
+  public:
+   TaskQueue();
+@@ -26,6 +31,19 @@ class TaskQueue {
+ 
+   void enqueue(std::function<void()>);
+ 
++  // Run the task on THIS thread instead of handing it to the worker
++  // (DSV4.1 offload §4.22 P2: the hand-off costs a measured 10.44 us of pure
++  // thread ping-pong per layer). The exception path is kept identical to the
++  // worker's: a throwing task is stored and rethrown by the next sync(), not
++  // here -- kt's callers have always learnt about a failed task at sync time
++  // and a task that raised earlier than that would be a different contract.
++  // Only safe while nothing is queued; the caller checks pending_tasks().
++  void run_inline(const std::function<void()>&);
++
++  // Tasks enqueued and not yet finished. Reading it is the only way to know
++  // that running a task inline would jump the queue.
++  size_t pending_tasks() const;
++
+   void sync(size_t allow_n_pending);
+ 
+  private:
+diff --git a/kt-kernel/ext_bindings.cpp b/kt-kernel/ext_bindings.cpp
+index 21703f6..2bd9d81 100644
+--- a/kt-kernel/ext_bindings.cpp
++++ b/kt-kernel/ext_bindings.cpp
+@@ -639,6 +639,9 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
+   m.def("is_ascend_callback_worker_running", &kt::ascend::callback_worker_running,
+         "True iff the ACL callback worker is started and dispatching reports.");
+ #endif
++  m.def("cpuinfer_inline_enabled", &kt_cpuinfer_inline_enabled,
++        "True iff KT_CPUINFER_INLINE=1: CPUInfer.run_inline runs the task on the calling thread.");
++
+   py::class_<WorkerPool>(m, "WorkerPool").def(py::init<int>());
+   py::class_<WorkerPoolConfig>(m, "WorkerPoolConfig")
+       .def(py::init<>())
+@@ -650,6 +653,11 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
+       .def(py::init<int>())
+       .def(py::init<WorkerPoolConfig>())
+       .def("submit", &CPUInfer::submit)
++      // Runs the task on the calling thread when KT_CPUINFER_INLINE=1 and the
++      // queue is empty; returns whether it did. Off or queue non-empty, it is
++      // submit(). No gil_scoped_release, for the same reason submit/sync have
++      // none: the caller holds the GIL across submit+sync today either way.
++      .def("run_inline", &CPUInfer::run_inline)
+       .def("sync", &CPUInfer::sync, py::arg("allow_n_pending") = 0)
+       .def_readwrite("backend_", &CPUInfer::backend_)
+ #ifndef KTRANSFORMERS_CPU_ONLY
+diff --git a/kt-kernel/python/experts_base.py b/kt-kernel/python/experts_base.py
+index 2272971..0834977 100644
+--- a/kt-kernel/python/experts_base.py
++++ b/kt-kernel/python/experts_base.py
+@@ -46,6 +46,9 @@ logger = logging.getLogger(__name__)
+ _ascend_worker_degraded: Optional[bool] = None
+ 
+ 
++_cpuinfer_inline: bool | None = None
++
++
+ def _ascend_callback_worker_running() -> Optional[bool]:
+     """Probe the C++ callback worker; None when the build predates the probe."""
+     probe = getattr(kt_kernel_ext, "is_ascend_callback_worker_running", None)
+@@ -86,6 +89,25 @@ def _uses_external_npu_report_subscriber() -> bool:
+     return os.environ.get("KT_EXTERNAL_NPU_REPORT_SUBSCRIBER", "") == "1"
+ 
+ 
++def _cpuinfer_inline_enabled() -> bool:
++    """True iff this build was asked to run submitted tasks on the calling thread.
++
++    The switch itself lives in C++ (KT_CPUINFER_INLINE, cpu_backend/
++    task_queue.cpp): one reader, one printed line, and a build without the
++    feature simply has no probe and answers False -- the queue path then runs
++    byte for byte as before. Memoized: the env is read once over there too,
++    and this sits on the per-layer forward path.
++    """
++    global _cpuinfer_inline
++    if _cpuinfer_inline is None:
++        probe = getattr(kt_kernel_ext, "cpuinfer_inline_enabled", None)
++        try:
++            _cpuinfer_inline = bool(probe()) if probe is not None else False
++        except Exception:
++            _cpuinfer_inline = False
++    return _cpuinfer_inline
++
++
+ def _ensure_ascend_callback_worker() -> None:
+     """Start kt-kernel ACL callback worker (idempotent)."""
+     if _uses_external_npu_report_subscriber():
+@@ -751,6 +773,23 @@ class BaseMoEWrapper(_MoEBase, ABC):
+             output_cpu[current_slot].data_ptr(),
+             incremental,
+         )
++        if _cpuinfer_inline_enabled() and hasattr(self.cpu_infer, "run_inline"):
++            # Inline is only sound while this layer is the whole content of the
++            # queue, so both deferred state bits are *read*, not assumed:
++            # ``incremental`` says the previous layer left a task pending, and
++            # the deferred ids of this slot say this layer will leave one. Both
++            # are 0 on the NPU graph path (cross-layer deferral is refused
++            # there), but a wrapper that ever produced one must keep the queue.
++            has_deferred = (
++                self.max_deferred_experts_per_token > 0 and (deferred_experts_ids_cpu[current_slot] >= 0).any().item()
++            )
++            if not incremental and not has_deferred:
++                # run_inline falls back to submit() by itself if the queue is
++                # not empty after all; either way the sync below drains it.
++                self.cpu_infer.run_inline(immediate_task)
++                BaseMoEWrapper._layer_has_pending_deferred[self.layer_idx] = False
++                self.cpu_infer.sync(0)
++                return
+         self.cpu_infer.submit(immediate_task)
+         BaseMoEWrapper._layer_has_pending_deferred[self.layer_idx] = False
+         has_deferred = (
