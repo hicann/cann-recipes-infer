@@ -212,6 +212,8 @@ bash infer.sh
 |       ├── deepseek_v4_1
 │       └── ...
 ├── accelerator                                 # 加速算法样例
+├── benchmark                                   # 基于 EvalScope 的在线推理精度评测指南与脚本
+│   └── evalscope_scripts                       # EvalScope 评测脚本（LongBench 长上下文评测）
 ├── dataset                                     # 数据集和默认 prompt
 ├── executor                                    # 推理执行框架
 │   ├── core                                    # 核心模块
@@ -280,6 +282,13 @@ bash infer.sh
 │   ├── ascendc                                 # AscendC 算子（HC、Indexer、MoE 等）
 │   ├── pypto                                   # PyPTO 算子（Lightning Indexer 等）
 │   └── ...
+├── scripts                                     # 仓库工具脚本（Agent 客户端初始化等）
+├── tests                                       # 核心推理模块与在线服务测试（调度、KV 传输等）
+│   ├── core                                    # 核心模块测试（序列打包、连续批处理、PD 请求字段）
+│   └── online                                  # 在线推理服务测试
+│       ├── kv_transfer                         # KV 传输、元数据缓冲与引导服务测试
+│       ├── scheduler                           # Prefill/Decode 分离调度器测试
+│       └── server                              # 服务端辅助函数、PD 路由与 DP 分发测试
 ├── AGENTS.md                                   # Agent 使用说明
 ├── CONTRIBUTION.md                             # 贡献指南
 ├── DISCLAIMER.md                               # 免责声明
