@@ -122,6 +122,10 @@ class DeepseekV3SharedExpert(nn.Module):
         self.swiglu_limit = config.swiglu_limit if hasattr(config, "swiglu_limit") else None
         self.moe_tp_size = self.infer_config.parallel_config.moe_tp_size
         self.moe_ep_size = self.infer_config.parallel_config.moe_ep_size
+        # SwiGLU via the repo custom op when its package is deployed in the
+        # image; falls back to the mainline op otherwise.
+        kernel_config = self.infer_config.model_config.custom_params.get("kernel_config", {})
+        self.enable_custom_swiglu = kernel_config.get("swiglu", "custom") == "custom"
         self.config = config
         self.hidden_size = config.hidden_size
         self.is_moe_layer = is_moe_layer
@@ -183,14 +187,25 @@ class DeepseekV3SharedExpert(nn.Module):
         swiglu_limit_args = {}
         if self.swiglu_limit is not None:
             swiglu_limit_args["clamp_limit"] = self.swiglu_limit
-        intermediate_hidden_states, pergroup_scale, _ = torch.ops.cann_ops_nn.swiglu_group_quant(
-            merged_x,
-            dst_type=torch.float8_e4m3fn,
-            round_scale=True if "mx" in self.mm_quant_mode or "hif" in self.mm_quant_mode else False,
-            # 1: dynamic quantization; 0: static quantization.
-            quant_mode=1 if "mx" in self.mm_quant_mode or "hif" in self.mm_quant_mode else 0,
-            **swiglu_limit_args,
-            )
+        is_mx = "mx" in self.mm_quant_mode or "hif" in self.mm_quant_mode
+        d_limit = 64 if "mx" in self.mm_quant_mode else 256
+        if self.enable_custom_swiglu and merged_x.shape[-1] % d_limit == 0:
+            intermediate_hidden_states, pergroup_scale, _ = torch.ops.custom.npu_swiglu_group_quant(
+                merged_x,
+                dst_type=torch.float8_e4m3fn,
+                round_scale=is_mx,
+                # 1: dynamic quantization; 0: static quantization.
+                quant_mode=1 if is_mx else 0,
+                clamp_limit=self.swiglu_limit,
+                )
+        else:
+            intermediate_hidden_states, pergroup_scale, _ = torch.ops.cann_ops_nn.swiglu_group_quant(
+                merged_x,
+                dst_type=torch.float8_e4m3fn,
+                round_scale=is_mx,
+                quant_mode=1 if is_mx else 0,
+                **swiglu_limit_args,
+                )
         wait_event(enable_decode_stream, shared_expert_event, 0)
         return self.down_proj(intermediate_hidden_states, pergroup_scale)
 
@@ -247,6 +262,8 @@ class DeepseekV3MoE(nn.Module):
         self.n_shared_experts = config.n_shared_experts
         self.n_routed_experts = config.n_routed_experts
         self.experts_per_rank = config.n_routed_experts // self.moe_ep_size
+        kernel_config = self.infer_config.model_config.custom_params.get("kernel_config", {})
+        self.enable_custom_swiglu = kernel_config.get("swiglu", "custom") == "custom"
         self.experts = FusedMoEGMM(
             num_experts=config.n_routed_experts,
             hidden_size=self.hidden_dim,
@@ -259,6 +276,9 @@ class DeepseekV3MoE(nn.Module):
             ep_size=self.moe_ep_size,
             ep_rank=self.comm_manager.get_rank("moe_ep_group") if self.moe_ep_size > 1 else 0,
             prefix=f"{prefix}.experts",
+            swiglu_limit=self.swiglu_limit,
+            enable_cann_ops_nn=True,
+            enable_custom_swiglu=self.enable_custom_swiglu,
         )
         self.gmm_int_quant = "a8" in self.gmm_quant_mode and "float" not in self.gmm_quant_mode
         self.moe_ffn = self.experts_w4a8int4 if self.gmm_quant_mode == "w4a8int4" else self.experts
@@ -422,7 +442,6 @@ class DeepseekV3MoE(nn.Module):
             "expert_tokens": tokens_per_expert,
             "group_list_type": 1,
             "swiglu_limit": self.swiglu_limit,
-            "enable_cann_ops_nn": True,
         }
         if routing_quantizes_input:
             pertoken_scale = reshape_mx_scale(pertoken_scale)
@@ -486,7 +505,6 @@ class DeepseekV3MoE(nn.Module):
             "expert_tokens": tokens_per_local_expert,
             "group_list_type": 1,
             "swiglu_limit": self.swiglu_limit,
-            "enable_cann_ops_nn": True,
         }
 
         if "a16" not in self.gmm_quant_mode:
@@ -705,7 +723,6 @@ class DeepseekV3MoE(nn.Module):
             "expert_tokens": expert_token_num,
             "group_list_type": 1,
             "swiglu_limit": self.swiglu_limit,
-            "enable_cann_ops_nn": True
         }
 
         if dynamic_scale is not None and "a16" not in self.gmm_quant_mode:

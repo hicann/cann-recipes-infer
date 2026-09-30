@@ -132,8 +132,16 @@ class FusedMoEGMM(torch.nn.Module):
         params_dtype: Optional[torch.dtype] = None,
         quant_config: Optional = None,
         prefix: str = "",
+        swiglu_limit: Optional[float] = None,
+        enable_cann_ops_nn: bool = False,
+        enable_custom_swiglu: bool = False,
     ):
         super().__init__()
+        # Static kernel-path options resolved once at construction; the
+        # quant methods read them off the layer instead of per-step kwargs.
+        self.swiglu_limit = swiglu_limit
+        self.enable_cann_ops_nn = enable_cann_ops_nn
+        self.enable_custom_swiglu = enable_custom_swiglu
         self.tp_size = tp_size
         self.tp_rank = tp_rank
         self.ep_size = ep_size

@@ -47,6 +47,28 @@ def is_layer_skipped(
     return is_skipped
 
 
+def swiglu_group_quant(x, *, dst_type, round_scale=False, quant_mode,
+                       clamp_limit=None, group_index=None, group_list_type=1,
+                       prefer_custom=False):
+    """SwiGLU + group quant. prefer_custom selects the repo custom op
+    (64-element mx tail, type-2 group lists); otherwise the mainline
+    cann_ops_nn kernel is used (count-list group index, 256-aligned tail)."""
+    if group_list_type == 2 and not prefer_custom:
+        raise RuntimeError(
+            "group_list_type=2 requires prefer_custom (the repo custom op)")
+    if prefer_custom:
+        return torch.ops.custom.npu_swiglu_group_quant(
+            x, dst_type=dst_type, round_scale=round_scale,
+            quant_mode=quant_mode, clamp_limit=clamp_limit,
+            group_index=group_index, output_origin=False,
+            group_list_type=group_list_type)
+    if clamp_limit is None:
+        clamp_limit = -1.0
+    return torch.ops.cann_ops_nn.swiglu_group_quant(
+        x, dst_type=dst_type, round_scale=round_scale, quant_mode=quant_mode,
+        clamp_limit=clamp_limit, group_index=group_index)
+
+
 def reshape_mx_scale(scale_tensor):
     """
     Reshape the last dimension into pairs for GMM/MM operators; an odd

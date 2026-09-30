@@ -25,7 +25,7 @@ from torch.nn import Parameter
 import math
 from module.quantization import QuantizationMethods, QuantizeMethodBase, QuantizationConfig
 from module.linear import LinearBase, LinearMethodBase, UnquantizedLinearMethod
-from module.quantization.utils.quant_utils import is_layer_skipped, reshape_mx_scale
+from module.quantization.utils.quant_utils import is_layer_skipped, reshape_mx_scale, swiglu_group_quant
 from module.fuse_moe_gmm import FusedMoEGMM, FusedMoeWeightScaleSupported
 from module.utils import set_weight_attrs
 from executor.utils.stream_utils import record_event
@@ -36,10 +36,6 @@ BEFORE_INIT = 0
 AFTER_INIT = 1
 BLOCK_K = 32
 PACK_FACTOR = 2
-
-
-def _get_swiglu_clamp_limit(swiglu_limit):
-    return swiglu_limit if swiglu_limit is not None else -1.0
 
 
 def transpose_packed_fp4(weight: torch.Tensor) -> torch.Tensor:
@@ -169,33 +165,20 @@ class W4A8MxFp4MoEGMMMethod(QuantizeMethodBase):
         )[0]
 
         record_event(layer.gmm1_events is not None, layer.gmm1_events, 0)
-        swiglu_limit = kwargs.get("swiglu_limit", None)
-        enable_cann_ops_nn = kwargs.get("enable_cann_ops_nn", False)
-        if enable_cann_ops_nn and kwargs.get("low_latency_tp", False):
-            # Low-latency TP path: repo custom op (separately deployed package).
-            import custom_ops
-            group_quant_kwargs = {}
-            if swiglu_limit is not None:
-                group_quant_kwargs["clamp_limit"] = swiglu_limit
+        swiglu_limit = getattr(layer, "swiglu_limit", None)
+        if swiglu_limit is None:
+            swiglu_limit = kwargs.get("swiglu_limit", None)
+        enable_cann_ops_nn = getattr(layer, "enable_cann_ops_nn", False) \
+            or kwargs.get("enable_cann_ops_nn", False)
+        if enable_cann_ops_nn:
             swiglu_expert_tokens = kwargs.get("swiglu_expert_tokens")
             glt = 2 if swiglu_expert_tokens is not None else 1
             swiglu_group_index = swiglu_expert_tokens if swiglu_expert_tokens is not None else expert_tokens
-            group_quant_kwargs["group_index"] = swiglu_group_index
-            group_quant_kwargs["dst_type"] = torch.float8_e4m3fn
-            group_quant_kwargs["quant_mode"] = 1
-            group_quant_kwargs["block_size"] = 32
-            group_quant_kwargs["round_scale"] = True
-            group_quant_kwargs["output_origin"] = False
-            group_quant_kwargs["group_list_type"] = glt
-            intermediate_h, pertoken_scale, _ = torch.ops.custom.npu_swiglu_group_quant(mm1_mm3, **group_quant_kwargs)
-        elif enable_cann_ops_nn:
-            intermediate_h, pertoken_scale, _ = torch.ops.cann_ops_nn.swiglu_group_quant(
-                mm1_mm3,
-                dst_type=torch.float8_e4m3fn,
-                round_scale=True,
-                quant_mode=1,
-                clamp_limit=_get_swiglu_clamp_limit(swiglu_limit),
-                group_index=expert_tokens)
+            intermediate_h, pertoken_scale, _ = swiglu_group_quant(
+                mm1_mm3, dst_type=torch.float8_e4m3fn, round_scale=True,
+                quant_mode=1, clamp_limit=swiglu_limit,
+                group_index=swiglu_group_index, group_list_type=glt,
+                prefer_custom=getattr(layer, "enable_custom_swiglu", False))
         else:
             intermediate_h, pertoken_scale = torch_npu.npu_swiglu_mx_quant(
                                                 mm1_mm3,
@@ -545,33 +528,20 @@ class UpGateW4A4DownW4A8MxFp4MoEGMMMethod(W4A8MxFp4MoEGMMMethod):
         )[0]
 
         record_event(layer.gmm1_events is not None, layer.gmm1_events, 0)
-        swiglu_limit = kwargs.get("swiglu_limit", None)
-        enable_cann_ops_nn = kwargs.get("enable_cann_ops_nn", False)
-        if enable_cann_ops_nn and kwargs.get("low_latency_tp", False):
-            # Low-latency TP path: repo custom op (separately deployed package).
-            import custom_ops
-            group_quant_kwargs = {}
-            if swiglu_limit is not None:
-                group_quant_kwargs["clamp_limit"] = swiglu_limit
+        swiglu_limit = getattr(layer, "swiglu_limit", None)
+        if swiglu_limit is None:
+            swiglu_limit = kwargs.get("swiglu_limit", None)
+        enable_cann_ops_nn = getattr(layer, "enable_cann_ops_nn", False) \
+            or kwargs.get("enable_cann_ops_nn", False)
+        if enable_cann_ops_nn:
             swiglu_expert_tokens = kwargs.get("swiglu_expert_tokens")
             glt = 2 if swiglu_expert_tokens is not None else 1
             swiglu_group_index = swiglu_expert_tokens if swiglu_expert_tokens is not None else expert_tokens
-            group_quant_kwargs["group_index"] = swiglu_group_index
-            group_quant_kwargs["dst_type"] = torch.float8_e4m3fn
-            group_quant_kwargs["quant_mode"] = 1
-            group_quant_kwargs["block_size"] = 32
-            group_quant_kwargs["round_scale"] = True
-            group_quant_kwargs["output_origin"] = False
-            group_quant_kwargs["group_list_type"] = glt
-            intermediate_h, pertoken_scale, _ = torch.ops.custom.npu_swiglu_group_quant(mm1_mm3, **group_quant_kwargs)
-        elif enable_cann_ops_nn:
-            intermediate_h, pertoken_scale, _ = torch.ops.cann_ops_nn.swiglu_group_quant(
-                mm1_mm3,
-                dst_type=torch.float8_e4m3fn,
-                round_scale=True,
-                quant_mode=1,
-                clamp_limit=_get_swiglu_clamp_limit(swiglu_limit),
-                group_index=expert_tokens)
+            intermediate_h, pertoken_scale, _ = swiglu_group_quant(
+                mm1_mm3, dst_type=torch.float8_e4m3fn, round_scale=True,
+                quant_mode=1, clamp_limit=swiglu_limit,
+                group_index=swiglu_group_index, group_list_type=glt,
+                prefer_custom=getattr(layer, "enable_custom_swiglu", False))
         else:
             mm1_mm3 = torch_npu.npu_swiglu(mm1_mm3)
             intermediate_h, pertoken_scale = torch_npu.npu_dynamic_mx_quant(mm1_mm3, dst_type=torch.float8_e4m3fn)
