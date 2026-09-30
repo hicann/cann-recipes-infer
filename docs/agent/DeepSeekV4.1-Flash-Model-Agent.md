@@ -96,5 +96,7 @@ bash scripts/init-agent.sh --opencode
 
 模型Agent 工具链已在多个开源模型上走完整条链路，各阶段的分析、实施与验证记录随模型样例一并开放，可作为新模型接入时的参照；覆盖的模型与优化特性持续扩展。
 
+- 相关知识库：[cannbot-knowledge](https://gitcode.com/cann/cannbot-knowledge)。该知识库聚焦 CANN 领域，整理了模型迁移、推理优化及相关算子开发的可追溯实践，可为模型Agent在并行化、KV Cache、融合算子、量化适配和图模式等环节的方案分析与问题定位提供知识检索支持。
+
 - Agent 完整覆盖模型部署优化样例：[hy3](../../models/hy3/agentic)、[gemma_4](../../models/gemma_4/agentic)、[longcat_flash_lite](../../models/longcat_flash_lite/agentic)
 - 工作流与技能的设计说明：[model-infer-optimize-design.md](model-infer-optimize-design.md)、[sota-approach-skill-design.md](sota-approach-skill-design.md)
