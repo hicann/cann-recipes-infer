@@ -1,4 +1,4 @@
-# Adapted from 
+# Adapted from
 # https://github.com/vipshop/cache-dit.
 # Copyright (c) Huawei Technologies Co., Ltd. 2026.
 # Copyright (c) 2025 Cache-DiT Authors. All Rights Reserved
@@ -118,49 +118,6 @@ def _maybe_unpad_qkv_head(
     """
     # Only the last rank may have padding
     if h_pad > 0 and local_rank == world_size - 1:
-        x = x[:, :, :-h_pad, :]
-    return x.contiguous()
-
-
-def _maybe_pad_o_head(
-    x: torch.Tensor,
-    h: int,
-    world_size: int,
-    rank: int,
-) -> Tuple[torch.Tensor, int]:
-    r"""Maybe pad the head dimension to be divisible by world_size.
-    x: torch.Tensor, shape (b, S_GLOBAL, h_LOCAL, d)
-    h: int, original global head num
-    return: Tuple[torch.Tensor, int], padded tensor (b, S_GLOBAL, h_LOCAL + h_pad, d) and h_pad
-    """
-    if h is None:
-        return x, 0
-    h_pad = 0
-    # Only the last rank may need padding
-    if h % world_size != 0:
-        # We need to broadcast h_pad to all ranks to keep consistency
-        # in unpadding step later for all ranks.
-        h_pad = world_size - (h % world_size)
-        new_h_local = (h + h_pad) // world_size
-        if h_pad >= new_h_local:
-            raise ValueError(
-                f"Padding head num {h_pad} should be less than new local head num {new_h_local}"
-            )
-        if rank == world_size - 1:
-            x = F.pad(x, (0, 0, 0, h_pad)).contiguous()
-    return x, h_pad
-
-
-def _maybe_unpad_o_head(
-    x: torch.Tensor,
-    h_pad: int,
-) -> torch.Tensor:
-    r"""Maybe unpad the head dimension.
-    x: torch.Tensor, shape (b, s_local, h_GLOBAL + h_pad, d)
-    h_pad: int, head padding num
-    return: torch.Tensor, unpadded tensor (b, s_local, H_GLOBAL, d)
-    """
-    if h_pad > 0:
         x = x[:, :, :-h_pad, :]
     return x.contiguous()
 
