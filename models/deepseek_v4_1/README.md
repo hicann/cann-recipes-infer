@@ -48,7 +48,7 @@ docker run -u root -itd --name cann_recipes_infer --ulimit nproc=65535:65535 --i
     -v /etc/localtime:/etc/localtime \
     -v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
     -v /etc/ascend_install.info:/etc/ascend_install.info -v /var/log/npu/:/usr/slog \
-    -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi -v /sys/fs/cgroup:/sys/fs/cgroup:ro \
+    -v /usr/local/sbin/npu-smi:/usr/local/sbin/npu-smi -v /sys/fs/cgroup:/sys/fs/cgroup:ro \
     -v /usr/local/dcmi:/usr/local/dcmi -v /usr/local/sbin:/usr/local/sbin \
     -v /etc/hccn.conf:/etc/hccn.conf -v /root/.pip:/root/.pip \
     -v /etc/hosts:/etc/hosts -v /usr/bin/hostname:/usr/bin/hostname \
