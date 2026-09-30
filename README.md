@@ -21,6 +21,7 @@
 
 ## 📰 最新动态
 
+- [2026/09] 新增 DeepSeek-V4 Attention-FFN 分离样例：基于 vLLM 和 afd-plugin，提供昇腾 A5 上的 P2P 同步与 Window 异步方案，支持双 microbatch、ACLGraph 和 DSpark
 - [2026/09] DeepSeek-V4.1-Flash 模型在昇腾 950PR/DT 系列上已支持 **单卡推理部署**
 - [2026/09] GLM-5.3-Flash 模型在昇腾 950DT 系列上已支持 **HiF8 推理部署**
 - [2026/09] DeepSeek-V4.1-Flash 模型在昇腾 950PR/DT 系列上已支持 **FP8-FP4 推理部署**，支持多模理解、Engram offload等特性
@@ -163,6 +164,7 @@ bash infer.sh
 | [Ling-2.5](models/bailing_2_5/README.md)                |基于Transformers库，在昇腾950DT环境中完成Ling-2.5混合注意力MoE模型的推理部署，GLA线性注意力与MLA全注意力按层交替，Linear采用MXFP w8a8量化、MoE路由专家采用MXFP w4a8量化，使能图模式编译与多流并行等优化特性。
 | [GLM-5.2](models/glm_5_2/README.md)                     |基于Transformers库，沿用 DSA + MoE + MTP 结构，新增 IndexShare（跨层 top-k 复用），支持 W8A8 量化与 KV Offload 长序列部署。
 | [DeepSeek-V4](models/deepseek_v4/README.md)             |支持Atlas A3和950PR/DT多代际昇腾芯片，兼具1M长序列推理能力与超低交互时延表现，为DeepSeek模型支持Agentic应用提供计算底座，满足千行百业灵活要求。
+| [DeepSeek-V4 AFD（Attention-FFN 分离）](integration/vllm/dsv4-afd/deepseek_v4_afd_deployment_guide.md) |基于 vLLM、vLLM-Ascend 和 afd-plugin，在昇腾 A5 上分别部署 Attention 与 FFN，提供 P2P 同步和 Window 异步启动配置，支持双 microbatch、ACLGraph 和 DSpark。方案设计见[方案说明](docs/models/deepseek_v4/deepseek_v4_afd_guide.md)。|
 | [DeepSeek-V4-Flash 单卡（NPU + CPU MoE offload）](integration/sglang/dsv4-flash-single-npu-moe-offload/README.md) |基于SGLang框架，在**单张**Atlas A3（或910B）+ Kunpeng CPU上完成DeepSeek-V4-Flash推理：attention/shared/router/热专家走NPU W8A8，其余专家offload到CPU并以原生MXFP4计算，使能动态热专家常驻、长序列流式prefill、AscendC MXFP4算子在线转换、CPU↔NPU多流overlap等优化，A3实测decode约19–22.5 tok/s。端到端部署步骤见[使用指南](docs/integration/sglang/dsv4-flash-single-npu-moe-offload/dsv4_flash_single_card_inference_guide.md)。
 | [GLM-5.3-Flash 单卡（NPU + CPU MoE offload）](integration/sglang/glm53-flash-single-npu-moe-offload/README.md) |基于SGLang框架，在**单张**Atlas A3 die + Kunpeng CPU上完成GLM-5.3-Flash推理：attention/dense层/常驻专家走NPU INT8 W8A8，其余路由专家offload到主机DDR并以MXFP4计算，使能流式prefill与动态热专家常驻。**两个补丁均基于上游主线**（ktransformers `6d460cc1` / sglang `5aab054e`）。困惑度32窗实测3.5888，验收11/11全过。端到端步骤见[样例 README](integration/sglang/glm53-flash-single-npu-moe-offload/README.md#1-配置文件)，技术实现见[设计文档](docs/integration/sglang/glm53-flash-single-npu-moe-offload/glm53_flash_single_card_design.md)。
 | [DeepSeek-V4.1-Flash 单卡（NPU + CPU MoE offload）](integration/vllm/dsv41-flash-single-npu-moe-offload/README.md) |基于vLLM框架，在**单张**Ascend 950PR + x86 CPU上完成DeepSeek-V4.1-Flash推理：attention/稠密层/100个常驻专家走NPU，其余路由专家offload到主机内存并以原生MXFP4计算，layers.1与layers.14的engram表以只读映射常驻/dev/shm。**三棵源码树均按40位提交号固定，kt-kernel的定制改动从ktransformers主仓基线（`105359b4`）以10个patch方式应用，应用后git write-tree逐位校验**。端到端步骤见[样例 README](integration/vllm/dsv41-flash-single-npu-moe-offload/README.md#1-配置)，技术实现见[设计文档](docs/models/deepseek_v4_1/dsv41-flash-950-single-card.md)。
@@ -243,6 +245,7 @@ bash infer.sh
 │   │   └── qwen3-next
 │   └── vllm                                    # vLLM 框架集成
 │       ├── deepseek-ocr-2
+│       ├── dsv4-afd                             # DeepSeek-V4 AFD 部署与启动指南
 │       ├── dsv41-flash-single-npu-moe-offload
 │       ├── minimax_m2.5_mxfp4
 │       └── pd-hybrid-dp-ep
