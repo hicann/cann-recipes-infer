@@ -22,7 +22,7 @@ docker load -i cann9.2.0.pt2.13.0_dsv4.1_aarch_a5_image_custom_20260930.tar
 
 ### DeepSeek 高性能算子库
 
-DeepSeek 官方开源了 [TileKernels](https://github.com/deepseek-ai/TileKernels) 和 [DeepGEMM](https://github.com/deepseek-ai/DeepGEMM) 高性能算子库，本实践已提供相应的使用样例支持。TileKernels 依赖的 TileLang 及相关算子已编译并集成在本节提供的预置镜像中，无需额外安装；DeepGEMM 未集成在镜像中，如需使用，请按照 [DeepGEMM 官方 README](https://github.com/deepseek-ai/DeepGEMM/blob/main/README.md) 自行编译安装。具体算子实现请参考对应的官方开源仓库。
+DeepSeek 官方开源了 [TileKernels](https://github.com/deepseek-ai/TileKernels) 和 [DeepGEMM](https://github.com/deepseek-ai/DeepGEMM-Ascend) 高性能算子库，本实践已提供相应的使用样例支持。TileKernels 依赖的 TileLang 及相关算子已编译并集成在本节提供的预置镜像中，无需额外安装；DeepGEMM 未集成在镜像中，如需使用，请按照 [DeepGEMM 官方 README](https://github.com/deepseek-ai/DeepGEMM-Ascend/blob/main/README.md) 自行编译安装。具体算子实现请参考对应的官方开源仓库。
 
 ### 拉起 docker 容器
 

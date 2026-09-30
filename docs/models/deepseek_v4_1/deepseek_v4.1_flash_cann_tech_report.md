@@ -14,7 +14,7 @@ CANN 已实现对 DeepSeek-V4.1-Flash 的推理支持，并开源了相关算子
 
 - **高性能推理部署**：基于 Ascend 950DT 单机 16 卡部署，支持最长 1M 序列的高性能推理。兼顾时延与吞吐，叠加 dspark 投机推理实现低于 5 ms 的时延下单卡吞吐 2727 的高性能表现。极低时延性能达成单请求 2.48 ms，[优化实践与推理代码](deepseek_v4.1_low_latency_tp_guide.md)已开源。同时提供基于 vLLM 服务化框架下的高性能推理实践，相关实现和[推理镜像](../../../models/deepseek_v4_1/README.md)已开源。
 
-- **DeepSeek 官方开源高性能 Kernel 实践**：DeepSeek 官方于[TileKernels](https://github.com/deepseek-ai/TileKernels)、[DeepEP](https://github.com/deepseek-ai/DeepEP)、[DeepGEMM](https://github.com/deepseek-ai/DeepGEMM)、[FlashMLA](https://github.com/deepseek-ai/FlashMLA)、[DeepSelect](https://github.com/deepseek-ai/DeepSelect) 等仓库中开源了基于 AscendC 和 Tilelang 的高性能算子仓库，本实践提供了基于 DeepSeek 官方开源算子的使用示例，提升整体性能。
+- **DeepSeek 官方开源高性能 Kernel 实践**：DeepSeek 官方于[TileKernels](https://github.com/deepseek-ai/TileKernels)、[DeepEP](https://github.com/deepseek-ai/DeepEP-Ascend)、[DeepGEMM](https://github.com/deepseek-ai/DeepGEMM-Ascend)、[FlashMLA](https://github.com/deepseek-ai/FlashMLA)、[DeepSelect](https://github.com/deepseek-ai/DeepSelect) 等仓库中开源了基于 AscendC 和 Tilelang 的高性能算子仓库，本实践提供了基于 DeepSeek 官方开源算子的使用示例，提升整体性能。
 
 - **高性能融合算子原生支持 FP8/FP4 混合精度**：开源支持稀疏Attention、LightningIndexer、LI_Prolog、MegaMoE等 CANN 原生融合算子，attention 系列融合算子支持 FP8、FP4 混合精度 KV Cache 输入，加速训推性能，并提供应用样例及[技术解析](deepseek_v4.1_cannbotdsl_operator_guide.md)
 
@@ -193,7 +193,7 @@ MegaMoE 与 Double Routing 路径的 8 卡耗时对比如下。对照组为关�
 
 #### DEEPGEMM MegaMoE
 
-DeepSeek 官方开源了 [DEEPGEMM MegaMoE 融合算子](https://github.com/deepseek-ai/DeepGEMM)，其融合范围与上述的 AscendC 算子有一些差别，需在算子外对输入进行量化，并对权重做了重新排布。
+DeepSeek 官方开源了 [DEEPGEMM MegaMoE 融合算子](https://github.com/deepseek-ai/DeepGEMM-Ascend)，其融合范围与上述的 AscendC 算子有一些差别，需在算子外对输入进行量化，并对权重做了重新排布。
 
 本样例同时接入了上述两种 MegaMoE 后端，可在 kernel_config 进行配置。
 
@@ -543,4 +543,4 @@ DeepSeek-V4.1 模型的推理天然分为三个工作负载特征迥异的阶段
 - Tilelang 算子将在近期支持 `npugraph_ex` 入图，进一步扩大应用场景，支持高性能训推。
 - Prefill CED 独立部署：支持 CED 架构下，encoder-decoder 分离部署，提升端到端性价比。
 - SWA Cache pool 独立淘汰机制支持：节省池化内存占用，提升服务性价比。
-- MindSpore FxRT + GERT：面向 prefill 动态 shape 短序列长街，提供 MindSpore RxRT + GERT 图执行器，通过 C++ Runtime、符号 shape 机制、运行时 CodeGen 技术解决 host-bound 问题。
+- MindSpore FxRT + GERT：面向 prefill 动态 shape 短序列场景，提供 MindSpore FxRT + GERT 图执行器，通过 C++ Runtime、符号 shape 机制、运行时 CodeGen 技术解决 host-bound 问题。
