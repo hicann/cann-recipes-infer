@@ -30,40 +30,16 @@ __simt_callee__ inline void ShmemPutScalar(__gm__ T *dst, T value, int32_t pe)
     }
 }
 
-// 类型安全的shmem 单标量远程读取辅助函数
-template <typename T>
-__simt_callee__ inline T ShmemGetScalar(__gm__ T *src, int32_t pe)
+// Copy one remote pair into caller-provided UB storage.
+template <typename pair_type>
+__simt_callee__ inline void ShmemGetPairToUb(
+    __ubuf__ pair_type *dst, __gm__ pair_type *src, int32_t pe)
 {
-    if constexpr (sizeof(T) == sizeof(uint32_t))
-    {
-        return simt::aclshmem_uint32_g(reinterpret_cast<__gm__ uint32_t *>(src), pe);
-    } else if constexpr (sizeof(T) == sizeof(uint64_t))
-    {
-        return simt::aclshmem_uint64_g(reinterpret_cast<__gm__ uint64_t *>(src), pe);
+    if constexpr (sizeof(pair_type) == 16) {
+        simt::aclshmem_get128(dst, src, 1, pe);
     } else {
-        static_assert(sizeof(T) == sizeof(uint32_t) || sizeof(T) == sizeof(uint64_t),
-                      "ShmemGetScalar only supports uint32_t and uint64_t");
+        simt::aclshmem_getmem(dst, src, sizeof(pair_type), pe);
     }
-}
-
-// Transfer the fields separately, as in the remote receive-buffer path.
-// These helpers do not provide an atomic snapshot or update of the pair.
-template <typename Tkey, typename Tvalue>
-__simt_callee__ inline BucketPair<Tkey, Tvalue> ShmemGetPair(
-    __gm__ BucketPair<Tkey, Tvalue> *src, int32_t pe)
-{
-    BucketPair<Tkey, Tvalue> pair;
-    pair.key = ShmemGetScalar<Tkey>(&src->key, pe);
-    pair.value = ShmemGetScalar<Tvalue>(&src->value, pe);
-    return pair;
-}
-
-template <typename Tkey, typename Tvalue>
-__simt_callee__ inline void ShmemPutPair(
-    __gm__ BucketPair<Tkey, Tvalue> *dst, BucketPair<Tkey, Tvalue> pair, int32_t pe)
-{
-    ShmemPutScalar<Tkey>(&dst->key, pair.key, pe);
-    ShmemPutScalar<Tvalue>(&dst->value, pair.value, pe);
 }
 
 // The device atomic CAS overloads use the fixed-width C types. In particular,
@@ -606,7 +582,8 @@ __simt_vf__ __launch_bounds__(THREAD_COUNT) inline void SimtLocalInsertFromRecv(
         uint64_t base = static_cast<uint64_t>(pe) * maxKeysPerPe;
         for (uint32_t slot = blockIdx * threadNum + threadIdx; slot < maxKeysPerPe; slot += blockNum * threadNum) {
             uint64_t idx = base + slot;
-            pair_type pair = LoadPairVectorized<Tkey, Tvalue>(recvBuffer + idx);
+            // pair_type pair = LoadPairVectorized<Tkey, Tvalue>(recvBuffer + idx);
+            pair_type pair = { recvBuffer[idx].key, recvBuffer[idx].value };
             if (pair.key == unusedKey) { continue; }
 
             uint32_t hashVal = MurmurHash3<Tkey>(&recvBuffer[idx].key, sizeof(Tkey), 0);
@@ -685,12 +662,7 @@ __simt_vf__ __launch_bounds__(THREAD_COUNT) inline void SimtDistHashTableSearch(
             // Each thread owns one UB slot within its block and reuses it for successive probes.
             auto *localPair = searchBuffer + threadIdx;
             while (true) {
-                if constexpr (sizeof(pair_type) == 16) {
-                    simt::aclshmem_get128(localPair, hashTable + hashIdx, 1, static_cast<int32_t>(targetPe));
-                } else {
-                    simt::aclshmem_getmem(
-                        localPair, hashTable + hashIdx, sizeof(pair_type), static_cast<int32_t>(targetPe));
-                }
+                ShmemGetPairToUb(localPair, hashTable + hashIdx, static_cast<int32_t>(targetPe));
                 pair_type pair = {localPair->key, localPair->value};
                 if (pair.key == unusedKey) { break; }
                 if (pair.key == key) {
@@ -723,6 +695,80 @@ __global__ __vector__ void distributed_hashtable_search_kernel(
 }
 
 template<typename Tkey, typename Tvalue, typename pair_type = BucketPair<Tkey, Tvalue>>
+__simt_callee__ inline void InsertHostPair(
+    __gm__ pair_type *hostHashTable, Tkey insertKey, Tvalue insertVal,
+    uint32_t hashVal, uint64_t hostTblSize, uint32_t targetPe, Tkey unusedKey)
+{
+    size_t currIdx = static_cast<size_t>(hashVal) % hostTblSize;
+    size_t counts = 0;
+    while (true) {
+        if (counts++ >= hostTblSize) {
+            break;
+        }
+        // SHMEM SIMT CAS maps the HOST_SIDE symmetric address internally.
+        Tkey oldKey;
+        if constexpr (sizeof(Tkey) == sizeof(uint32_t)) {
+            oldKey = static_cast<Tkey>(simt::aclshmem_uint32_atomic_compare_swap(
+                reinterpret_cast<__gm__ uint32_t *>(&hostHashTable[currIdx].key),
+                static_cast<uint32_t>(unusedKey), static_cast<uint32_t>(insertKey),
+                static_cast<int32_t>(targetPe)));
+        } else {
+            oldKey = static_cast<Tkey>(simt::aclshmem_int64_atomic_compare_swap(
+                reinterpret_cast<__gm__ int64_t *>(&hostHashTable[currIdx].key),
+                static_cast<int64_t>(unusedKey), static_cast<int64_t>(insertKey),
+                static_cast<int32_t>(targetPe)));
+        }
+        if (oldKey == unusedKey || oldKey == insertKey) {
+            ShmemPutScalar<Tvalue>(&hostHashTable[currIdx].value, insertVal, static_cast<int32_t>(targetPe));
+            break;
+        }
+        currIdx = (currIdx + 1) % hostTblSize;
+    }
+}
+
+// Single-PE D2H consumes the original input arrays without receive-buffer staging.
+template<typename Tkey, typename Tvalue, typename pair_type = BucketPair<Tkey, Tvalue>>
+__simt_vf__ __launch_bounds__(THREAD_COUNT) inline void SimtSinglePeInsert(
+    __gm__ pair_type *devHashTable, __gm__ pair_type *hostHashTable,
+    const __gm__ Tkey *keys, const __gm__ Tvalue *values, uint64_t keyNum,
+    uint64_t tableSize, uint64_t hostTblSize, uint32_t myPe, Tkey unusedKey,
+    uint32_t blockIdx, uint32_t blockNum)
+{
+    uint32_t threadIdx = Simt::GetThreadIdx();
+    uint32_t threadNum = Simt::GetThreadNum();
+    for (uint64_t idx = blockIdx * threadNum + threadIdx; idx < keyNum; idx += blockNum * threadNum) {
+        Tkey key = keys[idx];
+        if (key == unusedKey) {
+            continue;
+        }
+        Tvalue value = values[idx];
+        uint32_t hashVal = MurmurHash3<Tkey>(keys + idx, sizeof(Tkey), 0);
+        uint64_t bucket = static_cast<uint64_t>(hashVal) % tableSize;
+        for (uint64_t step = 0; step < tableSize; ++step) {
+            Tkey oldKey = AtomicCasKey(&devHashTable[bucket].key, unusedKey, key);
+            if (oldKey == unusedKey || oldKey == key) {
+                devHashTable[bucket].value = value;
+                break;
+            }
+            bucket = (bucket + 1) % tableSize;
+        }
+        // Preserve the full Host copy even when the Device table is full.
+        InsertHostPair<Tkey, Tvalue>(hostHashTable, key, value, hashVal, hostTblSize, myPe, unusedKey);
+    }
+}
+
+template<typename Tkey, typename Tvalue, typename pair_type = BucketPair<Tkey, Tvalue>>
+__global__ __vector__ void single_pe_hashtable_insert_kernel(
+    __gm__ pair_type *devHashTable, __gm__ pair_type *hostHashTable,
+    const __gm__ Tkey *keys, const __gm__ Tvalue *values, UnorderdHashTableTilingData tilingData,
+    uint64_t hostTblSize, uint32_t myPe, Tkey unusedKey)
+{
+    Simt::VF_CALL<SimtSinglePeInsert<Tkey, Tvalue>>(
+        cce::dim3(tilingData.threadNum), devHashTable, hostHashTable, keys, values, tilingData.keyNum,
+        tilingData.tableSize, hostTblSize, myPe, unusedKey, GetBlockIdx(), GetBlockNum());
+}
+
+template<typename Tkey, typename Tvalue, typename pair_type = BucketPair<Tkey, Tvalue>>
 __simt_vf__ __launch_bounds__(THREAD_COUNT) inline void SimtHostTableInsertFromRecv(
     __gm__ pair_type *hostHashTable, __gm__ pair_type *recvBuffer,
     uint32_t nPes, uint32_t myPe, uint32_t maxKeysPerPe,
@@ -746,33 +792,8 @@ __simt_vf__ __launch_bounds__(THREAD_COUNT) inline void SimtHostTableInsertFromR
                 continue;
             }
 
-            Tkey insertKey = pair.key;
-            Tvalue insertVal = pair.value;
-            size_t currIdx = static_cast<size_t>(hashVal) % hostTblSize;
-            size_t counts = 0;
-            while (true) {
-                if (counts++ >= hostTblSize) {
-                    break;
-                }
-                // SHMEM SIMT CAS maps the HOST_SIDE symmetric address internally.
-                Tkey oldKey;
-                if constexpr (sizeof(Tkey) == sizeof(uint32_t)) {
-                    oldKey = static_cast<Tkey>(simt::aclshmem_uint32_atomic_compare_swap(
-                        reinterpret_cast<__gm__ uint32_t *>(&hostHashTable[currIdx].key),
-                        static_cast<uint32_t>(unusedKey), static_cast<uint32_t>(insertKey),
-                        static_cast<int32_t>(targetPe)));
-                } else {
-                    oldKey = static_cast<Tkey>(simt::aclshmem_int64_atomic_compare_swap(
-                        reinterpret_cast<__gm__ int64_t *>(&hostHashTable[currIdx].key),
-                        static_cast<int64_t>(unusedKey), static_cast<int64_t>(insertKey),
-                        static_cast<int32_t>(targetPe)));
-                }
-                if (oldKey == unusedKey || oldKey == insertKey) {
-                    ShmemPutScalar<Tvalue>(&hostHashTable[currIdx].value, insertVal, static_cast<int32_t>(targetPe));
-                    break;
-                }
-                currIdx = (currIdx + 1) % hostTblSize;
-            }
+            InsertHostPair<Tkey, Tvalue>(hostHashTable, pair.key, pair.value,
+                                        hashVal, hostTblSize, targetPe, unusedKey);
         }
     }
 }
@@ -793,12 +814,14 @@ __global__ __vector__ void distributed_hashtable_host_insert_kernel(
 template<typename Tkey, typename Tvalue, typename pair_type = BucketPair<Tkey, Tvalue>>
 __simt_vf__ __launch_bounds__(THREAD_COUNT) inline void SimtHierarchicalSearchTable(
     __gm__ pair_type *devHashTable, __gm__ pair_type *hostHashTable, const __gm__ Tkey *keys,
-    __gm__ Tvalue *values, uint32_t keyNum,
+    __gm__ Tvalue *values, __ubuf__ pair_type *searchBuffer, uint32_t keyNum,
     uint32_t tableSize, uint32_t hostTblSize, uint32_t nPes, uint32_t myPe,
     uint32_t blockIdx, uint32_t blockNum, Tkey unusedKey, Tvalue unusedValue)
 {
     uint32_t threadIdx = Simt::GetThreadIdx();
     uint32_t threadNum = Simt::GetThreadNum();
+    // Each thread reuses its own UB slot for device and host table probes.
+    auto *localPair = searchBuffer + threadIdx;
     for (int64_t i = threadIdx + blockIdx * threadNum; i < keyNum; i += blockNum * threadNum) {
         Tkey key = keys[i];
         uint32_t hashVal = MurmurHash3<Tkey>(keys + i, sizeof(Tkey), 0);
@@ -811,20 +834,15 @@ __simt_vf__ __launch_bounds__(THREAD_COUNT) inline void SimtHierarchicalSearchTa
             for (uint32_t step = 0; step < tableSize; ++step) {
                 Tkey storedKey = devHashTable[hashIdx].key;
                 if (storedKey == unusedKey) { break; }
-                if (storedKey == key) {
-                    outVal = devHashTable[hashIdx].value;
-                    break;
-                }
+                if (storedKey == key) { outVal = devHashTable[hashIdx].value; break; }
                 hashIdx = (hashIdx + 1) % tableSize;
             }
         } else {
             for (uint32_t step = 0; step < tableSize; ++step) {
-                pair_type remotePair = ShmemGetPair<Tkey, Tvalue>(devHashTable + hashIdx, (int32_t)targetPe);
+                ShmemGetPairToUb(localPair, devHashTable + hashIdx, static_cast<int32_t>(targetPe));
+                pair_type remotePair = {localPair->key, localPair->value};
                 if (remotePair.key == unusedKey) { break; }
-                if (remotePair.key == key) {
-                    outVal = remotePair.value;
-                    break;
-                }
+                if (remotePair.key == key) { outVal = remotePair.value; break; }
                 hashIdx = (hashIdx + 1) % tableSize;
             }
         }
@@ -833,12 +851,10 @@ __simt_vf__ __launch_bounds__(THREAD_COUNT) inline void SimtHierarchicalSearchTa
         if (outVal == unusedValue && hostTblSize > 0) {
             uint32_t hashIdx = hashVal % static_cast<uint32_t>(hostTblSize);
             for (uint32_t step = 0; step < hostTblSize; ++step) {
-                pair_type remotePair = ShmemGetPair<Tkey, Tvalue>(hostHashTable + hashIdx, (int32_t)targetPe);
+                ShmemGetPairToUb(localPair, hostHashTable + hashIdx, static_cast<int32_t>(targetPe));
+                pair_type remotePair = {localPair->key, localPair->value};
                 if (remotePair.key == unusedKey) { break; }
-                if (remotePair.key == key) {
-                    outVal = remotePair.value;
-                    break;
-                }
+                if (remotePair.key == key) { outVal = remotePair.value; break; }
                 hashIdx = (hashIdx + 1) % hostTblSize;
             }
         }
@@ -854,8 +870,11 @@ __global__ __vector__ void distributed_hashtable_hierarchical_search_kernel(
 {
     uint32_t blockIdx = GetBlockIdx();
     uint32_t blockNum = GetBlockNum();
+    // Reserve one bucket per thread; uint4 storage provides alignment for get128.
+    __ubuf__ uint4 searchStorage[(THREAD_COUNT * sizeof(pair_type) + sizeof(uint4) - 1) / sizeof(uint4)];
+    auto *searchBuffer = reinterpret_cast<__ubuf__ pair_type *>(searchStorage);
     Simt::VF_CALL<SimtHierarchicalSearchTable<Tkey, Tvalue>>(
-        cce::dim3(tilingData.threadNum), devHashTable, hostHashTable, keys, values, tilingData.keyNum,
+        cce::dim3(tilingData.threadNum), devHashTable, hostHashTable, keys, values, searchBuffer, tilingData.keyNum,
         tilingData.tableSize, tilingData.hostTableSize, tilingData.nPes, tilingData.myPe,
         blockIdx, blockNum, unusedKey, unusedValue);
 }

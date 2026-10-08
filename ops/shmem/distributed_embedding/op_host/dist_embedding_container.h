@@ -24,11 +24,6 @@ public:
 
     explicit DistEmbeddingContainer(const DistEmbeddingOptions& options);
 
-    // template <typename... Args>
-    // explicit DistEmbeddingContainer(Args... args)
-    //     : DistEmbeddingContainer(DistEmbeddingOptions{args...})
-    // {
-    // }
     DistEmbeddingContainer(uint64_t tableSize, int32_t myPe, int32_t nPes,
                            int32_t deviceOffset, uint32_t maxKeysPerPe,
                            const char* ipPort);
@@ -55,6 +50,8 @@ private:
     void InitHostHashTable();
     void InitRecvBuffer();
     void InitSendCount();
+    void InsertMultiPes(const Tkey* keys, const Tvalue* values, size_t nums,
+                        uint32_t blockNum, uint32_t threadNum);
     void CalBlockDim(size_t nums, uint32_t* blockNum, uint32_t* threadNumPerBlock);
 
     uint64_t tableSize_;

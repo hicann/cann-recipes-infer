@@ -2,6 +2,8 @@
 
 基于 Ascend C SIMT 和 SHMEM 的分布式哈希表容器，提供 `Init`、`Insert`、`Search` 和 `Finalize` 接口。单卡在本地哈希表完成插入和查询，多卡按 key 的哈希值分区，通过 SHMEM 访问对应 PE。
 
+单卡模式配置 `hostTableSize > 0` 时，直接从 Device 输入 `keys/values` 写入 Device 表和 Host 表，不分配或使用 `recvBuffer`、`sendCount`，输入数不受 `maxKeysPerPe` 限制。Host 表保存全部有效输入，查询先查 Device 表，未命中再查 Host 表。
+
 多卡模式配置 `hostTableSize > 0` 时，本卡负责的本地输入与其他 PE 发来的输入都会写入本卡 host 哈希表（需保证 host 表容量足够）。每个 PE 每轮 `Insert` 的输入数须不超过 `maxKeysPerPe`，本地暂存与远程发送共用该容量；调用前应确保所有 PE 都满足此限制。接收缓冲区在每轮发送前清空并同步，避免重放旧记录。host 插入阶段使用多核、多线程，通过对映射后的 host 桶 key 执行 SIMT CAS 原子占桶，避免不同 key 的哈希冲突覆盖。key 占桶后单独写入 value，查询须在插入完成后进行；同一轮重复 key 的不同 value 不保证写入顺序。
 
 算子原位于 `ops/ascendc/src/distributed_embedding`，现使用独立 CMake 工程构建，入口为本目录或 `test` 目录。
@@ -41,7 +43,7 @@ RANK0_DEVICE=0 RANK1_DEVICE=1 bash test/d2d/run_rank2.sh
 
 构建产物默认位于 `test/build`。可用 `BUILD_DIR`、`BUILD_JOBS` 分别指定构建目录和编译并行度；用 `SHMEM_LIBRARY_DIR` 覆盖 SHMEM 库目录；用 `SHMEM_IP_PORT` 指定通信地址。双卡运行的超时由 `TEST_TIMEOUT_SECONDS` 控制（默认 180 秒），日志位于 `test/build/d2d_rank2_logs` 或 `test/build/d2h_rank2_logs`。
 
-单卡测试检查初始化、插入、命中和未命中查询、资源释放，成功输出 `PASS: Init, Insert, Search, and Finalize succeeded`。双卡测试为每个 PE 构造本地和远端 key，检查跨 PE 插入和查询。
+D2D 单卡和双卡测试共用参数化功能用例，运行脚本默认分别测试 32 位和 64 位 key。覆盖空表查询、命中/未命中、哈希冲突、跨表尾探测、多轮插入、更新、同值重复 key，以及 key/value 和输入规模边界。可用 `D2D_KEY_BITS=32` 或 `64` 选择类型。详细覆盖范围见 [D2D 用例说明](test/d2d/README.md)。
 
 D2H 用例位于 `test/d2h`，将 Device 表限制为 1 个槽位，并启用 Host 对称表。插入的数据超过 Device 表容量，查询必须回退到 Host 表才能全部命中。单卡还检查未命中返回值，双卡覆盖两个 PE 的本地和远端分区。SHMEM 必须启用 HOST_SIDE 支持；当前 Ascend 950 环境使用 `bash scripts/build.sh -soc_type Ascend950 -cann` 构建 SHMEM。
 

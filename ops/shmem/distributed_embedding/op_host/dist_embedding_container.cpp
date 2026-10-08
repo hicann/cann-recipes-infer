@@ -114,7 +114,7 @@ void DistEmbeddingContainer<Tkey, Tvalue>::Init()
     InitHashTable();
     std::cout << "DistEmbeddingContainer::Init: InitHashTable done" << '\n';
 
-    if (nPes_ > 1 || hostTableSize_ > 0) {
+    if (nPes_ > 1) {
         InitRecvBuffer();
         InitSendCount();
     }
@@ -163,7 +163,7 @@ void DistEmbeddingContainer<Tkey, Tvalue>::AllocSymmetricMemory()
         throw std::runtime_error("aclshmem_malloc failed");
     }
     // 多卡申请 recvBuffer
-    if (nPes_ > 1 || hostTableSize_ > 0) {
+    if (nPes_ > 1) {
         size_t recvBytes = nPes_ * maxKeysPerPe_ * sizeof(pair_type);
         recvBuffer_ = (pair_type*)aclshmemx_malloc(recvBytes, DEVICE_SIDE);
         if (recvBuffer_ == nullptr) {
@@ -249,64 +249,78 @@ void DistEmbeddingContainer<Tkey, Tvalue>::Insert(
     const Tkey* keys, const Tvalue* values, size_t nums)
 {
     // Each source PE owns maxKeysPerPe_ slots, shared by local staging and remote sends.
-    if ((nPes_ > 1 || hostTableSize_ > 0) && nums > maxKeysPerPe_) {
+    if (nPes_ > 1 && nums > maxKeysPerPe_) {
         throw std::invalid_argument("Insert requires nums <= maxKeysPerPe on every PE");
     }
     uint32_t blockNum;
     uint32_t threadNum;
     CalBlockDim(std::max<size_t>(nums, 1), &blockNum, &threadNum);
-    if (nPes_ == 1 && hostTableSize_ == 0) {
+    if (nPes_ == 1) {
         UnorderdHashTableTilingData tiling;
         tiling.threadNum = threadNum;
         tiling.keyNum = nums;
         tiling.tableSize = tableSize_;
-        // static_assert(std::is_same_v<Tkey, uint32_t> && std::is_same_v<Tvalue, uint32_t>,
-        //               "distributed embedding host launch currently supports uint32 key/value");
-        unordered_hashtable_insert_kernel<Tkey, Tvalue><<<blockNum, 0, stream_>>>(
-            tableDevice_, keys, values, tiling, unusedKey_);
+        if (hostTableSize_ == 0) {
+            // static_assert(std::is_same_v<Tkey, uint32_t> && std::is_same_v<Tvalue, uint32_t>,
+            //               "distributed embedding host launch currently supports uint32 key/value");
+            unordered_hashtable_insert_kernel<Tkey, Tvalue><<<blockNum, 0, stream_>>>(
+                tableDevice_, keys, values, tiling, unusedKey_);
+        } else {
+            // Read device inputs directly; single-PE D2H needs no receive staging.
+            single_pe_hashtable_insert_kernel<Tkey, Tvalue><<<blockNum, 0, stream_>>>(
+                tableDevice_, tableHost_, keys, values, tiling, hostTableSize_, myPe_, unusedKey_);
+        }
     } else {
-        DisHashTableTilingData tiling;
-        tiling.threadNum = threadNum;
-        tiling.keyNum = nums;
-        tiling.tableSize = tableSize_;
-        tiling.nPes = nPes_;
-        tiling.myPe = myPe_;
-        tiling.maxKeysPerPe = maxKeysPerPe_;
-        tiling.sendCountAddr = PointerToAddress(sendCount_);
-        tiling.hostTableSize = hostTableSize_;
-
-        // Clear stale records, then wait until every PE is ready to receive.
-        InitRecvBuffer();
-        aclshmemx_barrier_all_on_stream(stream_);
-
-        uint32_t zero = 0;
-        auto ret = aclrtMemcpy(sendCount_, sizeof(uint32_t), &zero, sizeof(uint32_t), ACL_MEMCPY_HOST_TO_DEVICE);
-        if (ret != ACL_SUCCESS) {
-            throw std::runtime_error("aclrtMemcpy failed in Insert: " + std::to_string(ret));
-        }
-        distributed_hashtable_dispatch_kernel<Tkey, Tvalue><<<blockNum, 0, stream_>>>(
-            tableDevice_, recvBuffer_, keys, values, tiling, unusedKey_, unusedValue_);
-
-        aclshmemx_barrier_all_on_stream(stream_);
-
-        uint64_t recvBufSize = static_cast<uint64_t>(nPes_) * maxKeysPerPe_;
-        CalBlockDim(recvBufSize, &blockNum, &threadNum);
-        tiling.threadNum = threadNum;
-        distributed_hashtable_local_insert_kernel<Tkey, Tvalue><<<blockNum, 0, stream_>>>(
-            tableDevice_, recvBuffer_, tiling, unusedKey_, unusedValue_);
-
-        aclshmemx_barrier_all_on_stream(stream_);
-
-        if (hostTableSize_ > 0 && tableHost_ != nullptr) {
-            distributed_hashtable_host_insert_kernel<Tkey, Tvalue><<<blockNum, 0, stream_>>>(
-                tableHost_, recvBuffer_, tiling, unusedKey_, unusedValue_);
-
-            aclshmemx_barrier_all_on_stream(stream_);
-        }
+        InsertMultiPes(keys, values, nums, blockNum, threadNum);
     }
     auto ret = aclrtSynchronizeStream(stream_);
     if (ret != ACL_SUCCESS) {
         throw std::runtime_error("aclrtSynchronizeStream failed in Insert: " + std::to_string(ret));
+    }
+}
+
+template <typename Tkey, typename Tvalue>
+void DistEmbeddingContainer<Tkey, Tvalue>::InsertMultiPes(
+    const Tkey* keys, const Tvalue* values, size_t nums,
+    uint32_t blockNum, uint32_t threadNum)
+{
+    DisHashTableTilingData tiling;
+    tiling.threadNum = threadNum;
+    tiling.keyNum = nums;
+    tiling.tableSize = tableSize_;
+    tiling.nPes = nPes_;
+    tiling.myPe = myPe_;
+    tiling.maxKeysPerPe = maxKeysPerPe_;
+    tiling.sendCountAddr = PointerToAddress(sendCount_);
+    tiling.hostTableSize = hostTableSize_;
+
+    // Clear stale records, then wait until every PE is ready to receive.
+    InitRecvBuffer();
+    aclshmemx_barrier_all_on_stream(stream_);
+
+    uint32_t zero = 0;
+    auto ret = aclrtMemcpy(sendCount_, sizeof(uint32_t), &zero, sizeof(uint32_t), ACL_MEMCPY_HOST_TO_DEVICE);
+    if (ret != ACL_SUCCESS) {
+        throw std::runtime_error("aclrtMemcpy failed in Insert: " + std::to_string(ret));
+    }
+    distributed_hashtable_dispatch_kernel<Tkey, Tvalue><<<blockNum, 0, stream_>>>(
+        tableDevice_, recvBuffer_, keys, values, tiling, unusedKey_, unusedValue_);
+
+    aclshmemx_barrier_all_on_stream(stream_);
+
+    uint64_t recvBufSize = static_cast<uint64_t>(nPes_) * maxKeysPerPe_;
+    CalBlockDim(recvBufSize, &blockNum, &threadNum);
+    tiling.threadNum = threadNum;
+    distributed_hashtable_local_insert_kernel<Tkey, Tvalue><<<blockNum, 0, stream_>>>(
+        tableDevice_, recvBuffer_, tiling, unusedKey_, unusedValue_);
+
+    aclshmemx_barrier_all_on_stream(stream_);
+
+    if (hostTableSize_ > 0 && tableHost_ != nullptr) {
+        distributed_hashtable_host_insert_kernel<Tkey, Tvalue><<<blockNum, 0, stream_>>>(
+            tableHost_, recvBuffer_, tiling, unusedKey_, unusedValue_);
+
+        aclshmemx_barrier_all_on_stream(stream_);
     }
 }
 
@@ -316,14 +330,12 @@ void DistEmbeddingContainer<Tkey, Tvalue>::Search(
 {
     uint32_t blockNum;
     uint32_t threadNum;
-    CalBlockDim(nums, &blockNum, &threadNum);
+    CalBlockDim(std::max<size_t>(nums, 1), &blockNum, &threadNum);
     if (nPes_ == 1 && hostTableSize_ == 0) {
         UnorderdHashTableTilingData tiling;
         tiling.threadNum = threadNum;
         tiling.keyNum = nums;
         tiling.tableSize = tableSize_;
-        // static_assert(std::is_same_v<Tkey, uint32_t> && std::is_same_v<Tvalue, uint32_t>,
-        //               "distributed embedding host launch currently supports uint32 key/value");
         unordered_hashtable_search_kernel<Tkey, Tvalue><<<blockNum, 0, stream_>>>(
             tableDevice_, keys, values, tiling, unusedKey_, unusedValue_);
     } else {

@@ -21,26 +21,27 @@ launch_rank() {
     local device_id=$2
     local log_file=$3
     timeout --foreground "${TEST_TIMEOUT_SECONDS}s" \
-        env RANK_ID="${rank}" DEVICE_ID="${device_id}" SHMEM_IP_PORT="${SHMEM_IP_PORT}" \
+        env RANK_ID="${rank}" DEVICE_ID="${device_id}" SHMEM_IP_PORT="${SHMEM_IP_PORT}" D2D_KEY_BITS="${bits}" \
         "${EXE}" >"${log_file}" 2>&1 &
     RANK_PID=$!
 }
 
-launch_rank 0 "${RANK0_DEVICE}" "${LOG_DIR}/rank0.log"
-rank0_pid=${RANK_PID}
-launch_rank 1 "${RANK1_DEVICE}" "${LOG_DIR}/rank1.log"
-rank1_pid=${RANK_PID}
-
 status=0
-for pid in "${rank0_pid}" "${rank1_pid}"; do
-    if ! wait "${pid}"; then
-        status=1
-    fi
-done
+for bits in ${D2D_KEY_BITS:-32 64}; do
+    launch_rank 0 "${RANK0_DEVICE}" "${LOG_DIR}/key${bits}_rank0.log"
+    rank0_pid=${RANK_PID}
+    launch_rank 1 "${RANK1_DEVICE}" "${LOG_DIR}/key${bits}_rank1.log"
+    rank1_pid=${RANK_PID}
 
-for rank in 0 1; do
-    echo "===== rank ${rank} log ====="
-    cat "${LOG_DIR}/rank${rank}.log"
-done
+    for pid in "${rank0_pid}" "${rank1_pid}"; do
+        if ! wait "${pid}"; then
+            status=1
+        fi
+    done
 
+    for rank in 0 1; do
+        echo "===== key_bits=${bits} rank=${rank} log ====="
+        cat "${LOG_DIR}/key${bits}_rank${rank}.log"
+    done
+done
 exit "${status}"
