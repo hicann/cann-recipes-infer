@@ -72,11 +72,11 @@
   <text x="1200" y="92" class="subhead" text-anchor="end">once per Attention / MLP slot</text>
 
   <rect x="825" y="125" width="350" height="205" rx="9" class="merge"/>
-  <text x="1000" y="158" class="label">block_attn_res_update</text>
+  <text x="1000" y="158" class="label">Update + RMSNorm (Decode)</text>
   <text x="1000" y="198" class="small">partial += previous sublayer delta (FP32)</text>
   <text x="1000" y="228" class="small">RMS-normalized score for current partial</text>
   <text x="1000" y="258" class="small">online-Softmax merge with (N, m, Z)</text>
-  <text x="1000" y="298" class="small">returns AttnRes input + updated partial</text>
+  <text x="1000" y="298" class="small">BF16 rounding, then output RMSNorm</text>
 
   <rect x="870" y="385" width="260" height="60" rx="8" class="state"/>
   <text x="1000" y="407" class="label">running partial residual</text>
@@ -95,13 +95,13 @@
   <text x="1285" y="92" class="section">Sequential layer execution</text>
 
   <rect x="1300" y="130" width="235" height="70" rx="8" class="io"/>
-  <text x="1417.5" y="156" class="label">AttnRes output</text>
+  <text x="1417.5" y="156" class="label">Normalized hidden</text>
   <text x="1417.5" y="181" class="small">Attention or MLP input</text>
   <path d="M1175 205 H1300" class="flow" marker-end="url(#arrow)"/>
 
   <rect x="1300" y="255" width="235" height="90" rx="8" class="compute"/>
   <text x="1417.5" y="286" class="label">Attention / FFN / MoE</text>
-  <text x="1417.5" y="317" class="small">sublayer computation is not fused</text>
+  <text x="1417.5" y="317" class="small">Attention / FFN computation</text>
   <path d="M1417.5 200 V255" class="flow" marker-end="url(#arrow)"/>
 
   <rect x="1330" y="395" width="175" height="55" rx="8" class="input"/>
@@ -110,4 +110,5 @@
 
   <!-- The produced delta feeds the next slot's Phase 2 update. -->
   <path d="M1330 422 H1245 V500 H800 V285 H825" class="dashed" marker-end="url(#arrow-gray)"/>
+<text x="800" y="548" class="small">Prefill and hidden-collection slots: Update + separate RMSNorm; block-entry Attention has no Phase 2.</text>
 </svg>

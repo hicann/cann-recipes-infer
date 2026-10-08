@@ -13,7 +13,10 @@ source "${FUNCTION_ABS_PATH}"
 
 export MODEL_DIR=$(basename "${SCRIPT_PATH}")
 export YAML_PARENT_PATH="${SCRIPT_PATH}/config"
-export YAML_FILE_NAME="${YAML_FILE_NAME:-kimi_k3_rank_32_mxfp4_npugraph_ex.yaml}"
+export YAML_FILE_NAME="${YAML_FILE_NAME:-kimi_k3_rank_32P_100k_1batch.yaml}"
 export YAML="${YAML_PARENT_PATH}/${YAML_FILE_NAME}"
+
+cp -- "${SCRIPT_PATH}/examples/dspark_rulerv2_100k/default_prompt.json" \
+    "${SCRIPT_PATH}/../../dataset/default_prompt.json" || exit 1
 
 launch

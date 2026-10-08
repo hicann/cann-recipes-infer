@@ -22,3 +22,6 @@ export PYTHONPATH=$PYTHONPATH:$RECIPES_PATH
 cann_path="your_cann_pkgs_path"
 source $cann_path/bin/setenv.bash
 export ASCEND_HOME_PATH=$cann_path
+export HCCL_OP_EXPANSION_MODE=CCU_MS
+export HCCL_HOST_SOCKET_PORT_RANGE="auto"
+source "${ASCEND_HOME_PATH}/opp/vendors/customize/bin/set_env.bash"

@@ -15,14 +15,16 @@
 # limitations under the License.
 from __future__ import annotations
 
+import importlib.util
 import logging
 import math
 import os
 import re
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Iterable, NamedTuple, Optional, Tuple
 
-# mega_moe fused operator (prefill and decode paths, controlled by enable_mega_moe)
+# MegaMoE fused operator, enabled independently for Prefill and Decode.
 import cann_ops_transformer.ops
 import torch
 import torch.distributed as dist
@@ -31,7 +33,11 @@ import torch.nn.functional as F
 import torch_npu
 from cann_ops_transformer.ops import get_symm_buffer_for_mega_moe, mega_moe
 
-from executor.utils import calc_moe_hccl_buffer_size, init_comm_group
+from executor.utils import (
+    calc_moe_hccl_buffer_size,
+    init_comm_group,
+    init_comm_group_by_ranks,
+)
 from executor.utils.stream_utils import (
     npu_stream_switch,
     record_event,
@@ -47,42 +53,100 @@ from module.linear import (
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
+    UnquantizedLinearMethod,
     VocabParallelEmbedding,
 )
 from module.quantization import QuantizeMethodBase
+from module.quantization.compressed_tensors.compressed_tensors import CompressedTensorsConfig
+from module.quantization.compressed_tensors.utils import should_ignore_layer
 from module.quantization.mxfp4 import W4A8MxFp4MoEGMMMethod
 from module.quantization.utils.quant_utils import reshape_mx_scale
 
-from .configuration_kimi_k3 import KimiLinearConfig
+from .configuration_kimi_k3 import KimiLinearConfig, mla_uses_mxfp8
+from .dspark_registry import DSPARK_DRAFT_MODEL_TYPES
+from .eplb import build_rank_local_eplb_topk
+from .weight_loader import is_local_expert_weight
 from .modules import (
     AttnMetaData,
     all_gather_first_dim,
     distributed_argmax,
     dp_to_tp_all_to_all,
     reduce_scatter_first_dim,
+    validate_mega_kda_replayssm_switch,
     vocab_tp_to_owner,
 )
 
+_flash_kda_import_error = None
 try:
-    from ops.cannbot_dsl.flash_kda import flash_kda as _flash_kda_impl
-    from ops.cannbot_dsl.fused_recurrent_kda import (
+    from ops.flash_kda import flash_kda as _flash_kda_impl
+    from ops.flash_kda_metadata import flash_kda_metadata as _flash_kda_metadata_impl
+except ImportError as error:
+    _flash_kda_import_error = error
+    _flash_kda_impl = None
+    _flash_kda_metadata_impl = None
+
+_recurrent_kda_import_error = None
+try:
+    from ops.fused_recurrent_kda_snapshot import (
         fused_recurrent_kda_op as _recurrent_kda_impl,
     )
-    from ops.cannbot_dsl import (
+except ImportError as error:
+    _recurrent_kda_import_error = error
+    _recurrent_kda_impl = None
+
+_attn_res_import_error = None
+try:
+    from cann_ops_transformer.ops import (
         block_attn_res_prepare as _block_attn_res_prepare_impl,
         block_attn_res_update as _block_attn_res_update_impl,
     )
 
-except ImportError:
-    _flash_kda_impl = None
-    _recurrent_kda_impl = None
+except ImportError as error:
+    _attn_res_import_error = error
     _block_attn_res_prepare_impl = None
     _block_attn_res_update_impl = None
 
 logger = logging.getLogger(__name__)
 
+try:
+    from ops.mega_recurrent_kda import mega_recurrent_kda as _mega_kda_impl
+except ImportError:
+    _mega_kda_impl = None
+
+_mega_kda_replayssm_import_error = None
+try:
+    from ops.mega_recurrent_kda_replayssm import (
+        mega_recurrent_kda_replayssm as _mega_kda_replayssm_impl,
+    )
+    from ops.commit_recurrent_kda_replayssm import (
+        commit_recurrent_kda_replayssm as _commit_recurrent_kda_replayssm_impl,
+    )
+except ImportError as error:
+    _mega_kda_replayssm_import_error = error
+    _mega_kda_replayssm_impl = None
+    _commit_recurrent_kda_replayssm_impl = None
+
+try:
+    from ops.block_attn_res_update_rms_norm import (
+        block_attn_res_update_rms_norm_op as _block_attn_res_update_rms_norm_impl,
+    )
+except ImportError:
+    _block_attn_res_update_rms_norm_impl = None
+
 ForwardMetaData = dict
 InferenceConfig = SimpleNamespace
+
+
+def _load_situ_fusion_op() -> None:
+    """Load the installed sparse SiTU Torch extension."""
+    package = importlib.util.find_spec("custom_ops")
+    if package is None or package.origin is None:
+        raise RuntimeError("Kimi K3 requires the installed custom_ops package")
+    package_dir = Path(package.origin).parent
+    libraries = tuple(package_dir.glob("custom_ops_lib*.so"))
+    if not libraries:
+        raise RuntimeError(f"custom_ops library is missing from {package_dir}")
+    torch.ops.load_library(str(libraries[0]))
 
 
 def _global_rank() -> int:
@@ -102,14 +166,25 @@ def _offline_infer_config(settings):
         if prefill_mini_batch_size > 0
         else data.get("batch_size_per_rank", data.get("batch_size", 1))
     )
+    prefill_chunk_size = model.get("prefill_chunk_size", 0)
+    max_prefill_len = (
+        min(data.get("input_max_len", 128), prefill_chunk_size)
+        if prefill_chunk_size > 0
+        else data.get("input_max_len", 128)
+    )
     return SimpleNamespace(
         model_config=SimpleNamespace(
             custom_params=model.get("custom_params", {}),
             exe_mode=settings.get("exe_mode", "eager"),
-            enable_weight_nz=model.get("enable_weight_nz", False),
+             enable_static_kernel=model.get("enable_static_kernel", False),
+             enable_weight_nz=model.get("enable_weight_nz", True),
+            platform_version=model.get("platform_version", "950"),
             next_n=model.get("next_n", 0),
             draft_model_type=model.get("draft_model_type", "none"),
+            dspark_tp_size=model.get("dspark_tp_size", 8),
+            force_eplb=model.get("force_eplb", False),
             prefill_mini_batch_size=prefill_mini_batch_size,
+            prefill_chunk_size=prefill_chunk_size,
         ),
         parallel_config=SimpleNamespace(
             world_size=settings.get("world_size", int(os.getenv("WORLD_SIZE", "1"))),
@@ -131,7 +206,7 @@ def _offline_infer_config(settings):
             # Total packed tokens before Prefill sequence-parallel sharding.
             # KimiLinearModel derives its rank-local resident buffer by
             # ceil-dividing this value by attn_tp_size.
-            max_prefill_tokens=prefill_batch_size * data.get("input_max_len", 128),
+            max_prefill_tokens=prefill_batch_size * max_prefill_len,
             batch_size_per_dp_rank=data.get("batch_size_per_rank", data.get("batch_size", 1)),
         ),
         data_config=SimpleNamespace(
@@ -151,6 +226,7 @@ class _OfflineCommManager:
         self.world_size = int(os.getenv("WORLD_SIZE", str(settings.get("world_size", 1))))
         self.global_rank = _global_rank()
         self.platform_version = settings.get("model_config", {}).get("platform_version", "950")
+        self.default_hccl_buffer_size = int(os.environ.get("HCCL_BUFFSIZE", 200))
         self.groups = {}
         self.group_names = {}
         self.group_sizes = {}
@@ -164,19 +240,41 @@ class _OfflineCommManager:
         return_name=False,
         hccl_buffer_size=None,
         group_type=None,
+        allow_physical_reuse=True,
         **kwargs,
     ):
-        result = init_comm_group(
-            global_rank=self.global_rank,
-            group_num=group_num,
-            world_size=self.world_size,
-            group_stride=group_stride,
-            group_name=name,
-            hccl_buffer_size=hccl_buffer_size,
-            return_name=return_name,
-            group_type=group_type,
-            platform_version=self.platform_version,
-        )
+        if hccl_buffer_size is not None:
+            self._has_explicit_hccl_buffer_size = True
+        elif getattr(self, "_has_explicit_hccl_buffer_size", False):
+            hccl_buffer_size = self.default_hccl_buffer_size
+        if group_type not in (None, 0) or not allow_physical_reuse:
+            result = None
+            for group_id in range(group_num):
+                start_rank = group_id * group_size if group_stride == 1 else group_id
+                ranks = [start_rank + i * group_stride for i in range(group_size)]
+                current = init_comm_group_by_ranks(
+                    ranks,
+                    global_rank=self.global_rank,
+                    group_name=name,
+                    hccl_buffer_size=hccl_buffer_size,
+                    group_type=group_type,
+                    platform_version=self.platform_version,
+                    return_name=return_name,
+                )
+                if self.global_rank in ranks:
+                    result = current
+        else:
+            result = init_comm_group(
+                global_rank=self.global_rank,
+                group_num=group_num,
+                world_size=self.world_size,
+                group_stride=group_stride,
+                group_name=name,
+                hccl_buffer_size=hccl_buffer_size,
+                return_name=return_name,
+                group_type=group_type,
+                platform_version=self.platform_version,
+            )
         if return_name:
             group, group_name = result
             self.group_names[name] = group_name
@@ -205,8 +303,10 @@ _MOE_GATING_MAX_EXPERTS = 2048
 
 # Inner dimension of the NZ block layout, fixed by the 16-bit cache dtype.
 _KV_CACHE_NZ_DIM = 16
-
-_KDA_CHUNK_SIZE = 64
+_FIA_FP8_CACHE_NZ_DIM = 32
+_FIA_FP8_SUPPORTED_HEAD_COUNTS = frozenset(
+    (1, 2, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128)
+)
 
 # Default gathered-token ceiling for the MoE prefill routing buffers.
 _DEFAULT_MOE_CHUNK_MAX_LEN = 65536
@@ -223,7 +323,7 @@ class KdaInputs(NamedTuple):
 class KdaGateParams(NamedTuple):
     a_log: torch.Tensor
     dt_bias: torch.Tensor
-    lower_bound: Optional[float]
+    lower_bound: float
 
 
 def _moe_chunk_plan(local_tokens: int, moe_ep_size: int, moe_chunk_max_len: int) -> list[int]:
@@ -249,109 +349,16 @@ def _moe_chunk_plan(local_tokens: int, moe_ep_size: int, moe_chunk_max_len: int)
     return plan
 
 
-def _softplus(x: torch.Tensor) -> torch.Tensor:
-    return torch.relu(x) + torch.log1p(torch.exp(-torch.abs(x)))
+def _super_kernel_scope_begin(name: Optional[str], enabled: bool) -> None:
+    """Mark the start of a SuperKernel fusion scope (no-op when disabled)."""
+    if enabled:
+        torch.npu.super_kernel_scope_begin(name)
 
 
-def _l2_normalize(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    return x * torch.rsqrt((x.float() * x.float()).sum(dim=-1, keepdim=True) + eps)
-
-
-def _torch_chunk_kda(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    decay: torch.Tensor,
-    beta: torch.Tensor,
-    initial_state: torch.Tensor,
-    transition_mask: torch.Tensor,
-    attention_mask: torch.Tensor,
-    identity: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Run FLA's Torch chunk KDA on one right-padded request."""
-    # Adapted from FLA naive_chunk_kda (MIT), copyright 2023-2026 Songlin Yang,
-    # Yu Zhang, Zhiyuan Li:
-    # https://github.com/fla-org/flash-linear-attention/blob/0a9b9f222e86b9a895c2447767e9b4cce6c8d530/fla/ops/kda/naive.py#L69
-    output_dtype = value.dtype
-    batch, tokens, heads, key_dim = query.shape
-    value_dim = value.shape[-1]
-    pad_len = (-tokens) % _KDA_CHUNK_SIZE
-    if pad_len:
-        query, key, value, decay = (
-            F.pad(tensor, (0, 0, 0, 0, 0, pad_len))
-            for tensor in (query, key, value, decay)
-        )
-        beta = F.pad(beta, (0, 0, 0, pad_len))
-
-    chunk_count = query.shape[1] // _KDA_CHUNK_SIZE
-
-    def chunked(tensor: torch.Tensor) -> torch.Tensor:
-        return tensor.reshape(
-            batch, chunk_count, _KDA_CHUNK_SIZE, heads, *tensor.shape[3:]
-        ).permute(0, 3, 1, 2, *range(4, tensor.ndim + 1)).float()
-
-    q = chunked(_l2_normalize(query)) / math.sqrt(key_dim)
-    k = chunked(_l2_normalize(key))
-    v = chunked(value)
-    g = chunked(decay).cumsum(dim=-2)
-    b = chunked(beta)
-
-    transition = torch.zeros(
-        *g.shape[:-1], _KDA_CHUNK_SIZE, dtype=torch.float32, device=q.device
-    )
-    for index in range(_KDA_CHUNK_SIZE):
-        key_i = k[..., index, :]
-        decay_i = g[..., index : index + 1, :]
-        transition[..., index] = torch.matmul(
-            k * (g - decay_i).exp(), key_i.unsqueeze(-1)
-        ).squeeze(-1)
-    transition = -(transition * b[..., None]).masked_fill(transition_mask, 0)
-    for index in range(1, _KDA_CHUNK_SIZE):
-        transition[..., index, :index] = transition[
-            ..., index, :index
-        ].clone() + (
-            transition[..., index, :, None].clone()
-            * transition[..., :, :index].clone()
-        ).sum(-2)
-    transition = (transition + identity) * b[..., None, :]
-
-    corrected_key = transition @ (g.exp() * k)
-    corrected_value = transition @ v
-    state = initial_state
-    output = torch.zeros_like(v)
-    for index in range(chunk_count):
-        q_i = q[:, :, index]
-        k_i = k[:, :, index]
-        v_i = corrected_value[:, :, index]
-        g_i = g[:, :, index]
-        w_i = corrected_key[:, :, index]
-        attention = torch.zeros(
-            batch,
-            heads,
-            _KDA_CHUNK_SIZE,
-            _KDA_CHUNK_SIZE,
-            dtype=torch.float32,
-            device=q.device,
-        )
-        for token_index in range(_KDA_CHUNK_SIZE):
-            key_j = k_i[:, :, token_index]
-            decay_j = g_i[:, :, token_index : token_index + 1]
-            attention[..., token_index] = torch.matmul(
-                q_i * (g_i - decay_j).exp(), key_j.unsqueeze(-1)
-            ).squeeze(-1)
-        attention = attention.masked_fill(attention_mask, 0)
-        v_i = v_i - w_i @ state
-        output[:, :, index] = (q_i * g_i.exp()) @ state + attention @ v_i
-        final_decay = g_i[:, :, -1]
-        state = state * final_decay.exp().unsqueeze(-1)
-        state = state + (
-            (final_decay.unsqueeze(-2) - g_i).exp() * k_i
-        ).transpose(-1, -2) @ v_i
-
-    output = output.permute(0, 2, 3, 1, 4).reshape(
-        batch, -1, heads, value_dim
-    )
-    return output[:, :tokens].to(output_dtype), state
+def _super_kernel_scope_end(name: Optional[str], enabled: bool) -> None:
+    """Mark the end of a SuperKernel fusion scope (no-op when disabled)."""
+    if enabled:
+        torch.npu.super_kernel_scope_end(name)
 
 
 class KimiRMSNorm(nn.Module):
@@ -373,33 +380,40 @@ class KimiRMSNorm(nn.Module):
 
 
 class SituAndMul(nn.Module):
-    """The checkpoint's SiTU gated activation."""
+    """The checkpoint's SiTU activation using the sparse op in BF16 mode."""
 
-    def __init__(self, beta: float = 1.0, linear_beta: Optional[float] = None, enable_moe_bf16_mode=False) -> None:
+    def __init__(
+        self,
+        beta: float = 1.0,
+        linear_beta: Optional[float] = None,
+    ) -> None:
         super().__init__()
         self.beta = float(beta)
         self.linear_beta = None if linear_beta is None else float(linear_beta)
-        self.enable_moe_bf16_mode = enable_moe_bf16_mode
+        if self.beta <= 0 or self.linear_beta is None or self.linear_beta <= 0:
+            raise ValueError("sparse SiTU requires positive beta and linear_beta")
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate, up = x.chunk(2, dim=-1)
-        if not self.enable_moe_bf16_mode:
-            up = up.float()
-            gate = gate.float()
-        gate = self.beta * torch.tanh(gate / self.beta) * torch.sigmoid(gate)
-        if self.linear_beta is not None:
-            up = self.linear_beta * torch.tanh(up / self.linear_beta)
-        if not self.enable_moe_bf16_mode:
-            return (gate * up).to(x.dtype)
-        return (gate * up)
+    def forward(
+        self,
+        x: torch.Tensor,
+        expert_tokens: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if expert_tokens is None:
+            raise ValueError("sparse SiTU requires expert_tokens")
+        return torch.ops.custom.npu_situ_and_mul_sparse(
+            x,
+            expert_tokens,
+            beta=self.beta,
+            alpha=self.linear_beta,
+            high_precision=False,
+        )
 
 
-def _activation(config: KimiLinearConfig, enable_moe_bf16_mode):
+def _activation(config: KimiLinearConfig):
     if config.hidden_act == "situ":
         return SituAndMul(
             beta=getattr(config, "activation_situ_beta", None) or 1.0,
             linear_beta=getattr(config, "activation_situ_linear_beta", None),
-            enable_moe_bf16_mode=enable_moe_bf16_mode,
         )
     return None
 
@@ -434,6 +448,17 @@ def _dense_tp(parallel, comm_manager) -> tuple[int, int, object]:
     )
 
 
+def _fused_linear_quant_config(quant_config, prefix):
+    """Resolve checkpoint shard ignore entries for a K3 fused Linear."""
+    if isinstance(quant_config, CompressedTensorsConfig) and should_ignore_layer(
+        layer_name=prefix,
+        ignore=quant_config.ignore,
+        fused_mapping=quant_config.packed_modules_mapping,
+    ):
+        return None
+    return quant_config
+
+
 class KimiMLP(nn.Module):
     """Dense feed-forward network, also used as the MoE shared expert.
 
@@ -452,7 +477,6 @@ class KimiMLP(nn.Module):
         tp_rank: int = 0,
         tp_group=None,
         prefix: str = "",
-        enable_moe_bf16_mode: bool = False,
     ) -> None:
         super().__init__()
         self.config = config
@@ -461,6 +485,8 @@ class KimiMLP(nn.Module):
         hidden_size = hidden_size or config.hidden_size
         intermediate_size = intermediate_size or config.intermediate_size
         quant_config = getattr(config, "quant_config", None)
+        if quant_config is not None:
+            quant_config.packed_modules_mapping["gate_up_proj"] = ["gate_proj", "up_proj"]
         # Gate first, then up, matching SituAndMul's chunk order.
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
@@ -468,7 +494,7 @@ class KimiMLP(nn.Module):
             bias=False,
             tp_size=tp_size,
             tp_rank=tp_rank,
-            quant_config=quant_config,
+            quant_config=_fused_linear_quant_config(quant_config, f"{prefix}.gate_up_proj"),
             prefix=f"{prefix}.gate_up_proj",
         )
         self.down_proj = RowParallelLinear(
@@ -481,20 +507,45 @@ class KimiMLP(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.down_proj",
         )
-        self.situ = _activation(config, enable_moe_bf16_mode)
+        self.situ = _activation(config)
+        self.register_buffer(
+            "_all_rows_expert_tokens",
+            torch.tensor([torch.iinfo(torch.int64).max], dtype=torch.int64),
+            persistent=False,
+        )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def all_gather(self, x: torch.Tensor) -> torch.Tensor:
+        return all_gather_first_dim(x, self.tp_group, self.tp_size)
+
+    def gate_up(
+        self, x: torch.Tensor, limit_core_num: bool = False
+    ) -> torch.Tensor:
+        if limit_core_num:
+            with torch_npu.npu.npugraph_ex.scope.limit_core_num(32, 1):
+                return self.gate_up_proj(x)
+        return self.gate_up_proj(x)
+
+    def activation(self, gate_up: torch.Tensor) -> torch.Tensor:
+        if self.situ is not None:
+            return self.situ(gate_up, self._all_rows_expert_tokens)
+        split = gate_up.shape[-1] // 2
+        return F.silu(gate_up[..., :split]) * gate_up[..., split:]
+
+    def project_down(self, activated: torch.Tensor) -> torch.Tensor:
+        return self.down_proj(activated)
+
+    def reduce_scatter(self, output: torch.Tensor) -> torch.Tensor:
+        return reduce_scatter_first_dim(output, self.tp_group, self.tp_size)
+
+    def forward(self, x: torch.Tensor, limit_core_num: bool = False) -> torch.Tensor:
         # Every rank holds a different token slice but the same column shards,
         # so the tokens must be whole before the projections.
-        x = all_gather_first_dim(x, self.tp_group, self.tp_size)
-        gate_up = self.gate_up_proj(x)
-        if self.situ is not None:
-            activated = self.situ(gate_up)
-        else:
-            activated = F.silu(gate_up[..., : gate_up.shape[-1] // 2]) * gate_up[..., gate_up.shape[-1] // 2 :]
-        output = self.down_proj(activated)
+        x = self.all_gather(x)
+        gate_up = self.gate_up(x, limit_core_num=limit_core_num)
+        activated = self.activation(gate_up)
+        output = self.project_down(activated)
         # Sum the row-parallel partials and scatter the tokens back.
-        return reduce_scatter_first_dim(output, self.tp_group, self.tp_size)
+        return self.reduce_scatter(output)
 
 
 def _mxfp4_expert_quantization(config: KimiLinearConfig) -> bool:
@@ -534,16 +585,7 @@ def _validate_kimi_k3_architecture(config: KimiLinearConfig) -> None:
 
 
 class _SituMoEGMMMethod(QuantizeMethodBase):
-    """FusedMoEGMM method preserving Kimi K3's exact SiTU activation.
-
-    Both the BF16 and the MXFP4 base methods fuse their activation into the
-    span between the two grouped matmuls -- ``npu_swiglu`` for BF16 and
-    ``npu_swiglu_mx_quant`` for MXFP4 -- and neither implements SiTU's
-    ``beta``/``linear_beta`` double tanh. The activation is therefore always
-    unfused here; on the quantized path that also means re-quantizing the
-    intermediate explicitly, which the fused operator would otherwise have
-    done as part of the activation.
-    """
+    """Use BF16-mode SiTU, fused with MXFP8 quantization for MXFP4 experts."""
 
     def __init__(
         self,
@@ -561,28 +603,18 @@ class _SituMoEGMMMethod(QuantizeMethodBase):
     def process_weights_after_loading(self, layer, **kwargs) -> None:
         self._base.process_weights_after_loading(layer, **kwargs)
 
-    def apply(
+    def gmm1(
         self,
         layer: nn.Module,
         x: torch.Tensor,
         expert_tokens: torch.Tensor,
         group_list_type: int,
         pertoken_scale: Optional[torch.Tensor] = None,
-        final_output_dtype: torch.dtype = torch.bfloat16,
-        **kwargs,
     ) -> torch.Tensor:
         if not self.quantized:
-            gate_up = torch_npu.npu_grouped_matmul(
+            return torch_npu.npu_grouped_matmul(
                 [x],
                 [layer.w13_weight],
-                group_list=expert_tokens,
-                group_type=0,
-                group_list_type=group_list_type,
-                split_item=3,
-            )[0]
-            return torch_npu.npu_grouped_matmul(
-                [self.situ(gate_up)],
-                [layer.w2_weight],
                 group_list=expert_tokens,
                 group_type=0,
                 group_list_type=group_list_type,
@@ -591,10 +623,8 @@ class _SituMoEGMMMethod(QuantizeMethodBase):
 
         # W4A8: MXFP4 weights, activations quantized to MXFP8 on the fly.
         if pertoken_scale is None:
-            x, pertoken_scale = torch_npu.npu_dynamic_mx_quant(
-                x, dst_type=torch.float8_e4m3fn
-            )
-        gate_up = torch_npu.npu_grouped_matmul(
+            x, pertoken_scale = torch_npu.npu_dynamic_mx_quant(x, dst_type=torch.float8_e4m3fn)
+        return torch_npu.npu_grouped_matmul(
             [x],
             [layer.w13_weight.transpose(1, 2)],
             antiquant_scale=[layer.w13_weight_scale.transpose(1, 2)],
@@ -608,11 +638,41 @@ class _SituMoEGMMMethod(QuantizeMethodBase):
             per_token_scale_dtype=torch_npu.float8_e8m0fnu,
             tuning_config=[0],
         )[0]
-        # npu_swiglu_mx_quant would have activated and re-quantized in one op;
-        # SiTU has no fused counterpart, so do both steps explicitly.
-        activated, pertoken_scale = torch_npu.npu_dynamic_mx_quant(
-            self.situ(gate_up), dst_type=torch.float8_e4m3fn
-        )
+
+    def activate_and_quant(
+        self,
+        gate_up: torch.Tensor,
+        expert_tokens: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        if self.quantized:
+            return torch.ops.custom.grouped_situ_mx_quant(
+                gate_up,
+                expert_tokens,
+                beta=self.situ.beta,
+                alpha=self.situ.linear_beta,
+                high_precision=False,
+            )
+        return self.situ(gate_up, expert_tokens), None
+
+    def gmm2(
+        self,
+        layer: nn.Module,
+        activated: torch.Tensor,
+        expert_tokens: torch.Tensor,
+        group_list_type: int,
+        pertoken_scale: Optional[torch.Tensor] = None,
+        final_output_dtype: torch.dtype = torch.bfloat16,
+    ) -> torch.Tensor:
+        if not self.quantized:
+            return torch_npu.npu_grouped_matmul(
+                [activated],
+                [layer.w2_weight],
+                group_list=expert_tokens,
+                group_type=0,
+                group_list_type=group_list_type,
+                split_item=3,
+            )[0]
+
         return torch_npu.npu_grouped_matmul(
             [activated],
             [layer.w2_weight.transpose(1, 2)],
@@ -628,6 +688,27 @@ class _SituMoEGMMMethod(QuantizeMethodBase):
             tuning_config=[0],
         )[0]
 
+    def apply(
+        self,
+        layer: nn.Module,
+        x: torch.Tensor,
+        expert_tokens: torch.Tensor,
+        group_list_type: int,
+        pertoken_scale: Optional[torch.Tensor] = None,
+        final_output_dtype: torch.dtype = torch.bfloat16,
+        **kwargs,
+    ) -> torch.Tensor:
+        gate_up = self.gmm1(layer, x, expert_tokens, group_list_type, pertoken_scale)
+        activated, activated_scale = self.activate_and_quant(gate_up, expert_tokens)
+        return self.gmm2(
+            layer,
+            activated,
+            expert_tokens,
+            group_list_type,
+            activated_scale,
+            final_output_dtype,
+        )
+
 
 class KimiSituMoEGMM(FusedMoEGMM):
     """Packed local experts with the checkpoint-compatible SiTU formula."""
@@ -638,7 +719,6 @@ class KimiSituMoEGMM(FusedMoEGMM):
         hidden_size: int,
         ep_size: int,
         ep_rank: int,
-        enable_moe_bf16_mode: bool = False,
     ) -> None:
         self.quantized = _mxfp4_expert_quantization(config)
         super().__init__(
@@ -653,7 +733,7 @@ class KimiSituMoEGMM(FusedMoEGMM):
             params_dtype=torch.get_default_dtype(),
             quant_config=None,
         )
-        self.situ = _activation(config, enable_moe_bf16_mode)
+        self.situ = _activation(config)
         if self.situ is None:
             raise RuntimeError("Kimi K3 routed experts require the SiTU activation")
         base_method = self.quant_method
@@ -674,6 +754,37 @@ class KimiSituMoEGMM(FusedMoEGMM):
             )
         self.quant_method = _SituMoEGMMMethod(base_method, self.situ, self.quantized)
 
+    def gmm1(
+        self,
+        x: torch.Tensor,
+        expert_tokens: torch.Tensor,
+        group_list_type: int = 1,
+        pertoken_scale: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        return self.quant_method.gmm1(self, x, expert_tokens, group_list_type, pertoken_scale)
+
+    def activate_and_quant(
+        self, gate_up: torch.Tensor, expert_tokens: torch.Tensor
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        return self.quant_method.activate_and_quant(gate_up, expert_tokens)
+
+    def gmm2(
+        self,
+        activated: torch.Tensor,
+        expert_tokens: torch.Tensor,
+        group_list_type: int = 1,
+        pertoken_scale: Optional[torch.Tensor] = None,
+        final_output_dtype: torch.dtype = torch.bfloat16,
+    ) -> torch.Tensor:
+        return self.quant_method.gmm2(
+            self,
+            activated,
+            expert_tokens,
+            group_list_type,
+            pertoken_scale,
+            final_output_dtype,
+        )
+
 
 class KimiMoEGate(nn.Module):
     def __init__(self, config: KimiLinearConfig) -> None:
@@ -689,11 +800,11 @@ class KimiMoEGate(nn.Module):
         self.activation = config.moe_router_activation_func
         self.num_expert_group = config.num_expert_group
         self.topk_group = config.topk_group
-        # Router logits are computed in FP32. Keep the weight FP32 so loading
-        # converts it once instead of casting it on every forward.
+        # Router logits accumulate in FP32 via torch.mm out_dtype in forward;
+        # load_weights casts the checkpoint tensor to this bf16 parameter once.
         self.weight = nn.Parameter(
             torch.empty(
-                self.num_experts, config.hidden_size, dtype=torch.float32
+                self.num_experts, config.hidden_size, dtype=torch.bfloat16
             )
         )
         # The correction bias is also FP32 because it feeds the top-k
@@ -703,8 +814,25 @@ class KimiMoEGate(nn.Module):
         )
         nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
 
-    def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        logits = F.linear(hidden_states.float(), self.weight)
+    def router_linear(
+        self, hidden_states: torch.Tensor, limit_core_num: bool = False
+    ) -> torch.Tensor:
+        if limit_core_num:
+            # For the tuned Decode shapes, limit vec usage so MatMul selects
+            # the Cube path and leaves vec resources for concurrent work.
+            with torch_npu.npu.npugraph_ex.scope.limit_core_num(32, 1):
+                return torch.mm(
+                    hidden_states,
+                    self.weight.t(),
+                    out_dtype=torch.float32,
+                )
+        return torch.mm(
+            hidden_states,
+            self.weight.t(),
+            out_dtype=torch.float32,
+        )
+
+    def topk(self, logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         topk_weight, topk_idx, _ = torch_npu.npu_moe_gating_top_k(
             logits,
             k=self.top_k,
@@ -720,14 +848,66 @@ class KimiMoEGate(nn.Module):
         )
         return topk_idx, topk_weight
 
+    def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.topk(self.router_linear(hidden_states))
+
+
+class MLAContext:
+    """Share streams/events across sequential MLA layers, outside ModuleList."""
+
+    def __init__(self, infer_config: InferenceConfig) -> None:
+        enable = infer_config.model_config.custom_params.get("enable_multi_streams", False)
+        exe_mode = infer_config.model_config.exe_mode
+        self.gate_stream = create_stream('mla_gate', exe_mode) if enable else None
+        # Each MLA joins its gate work before returning. The next MLA may
+        # reuse these events; metadata completion spans all layers separately.
+        self.gate_events = tuple(create_event(exe_mode, enable) for _ in range(4))
+        self.metadata_events = None
+
+
+class ReplaySSMContext:
+    """Share the ReplaySSM Commit stream across sequential KDA layers."""
+
+    def __init__(self, infer_config: InferenceConfig) -> None:
+        custom_params = infer_config.model_config.custom_params
+        exe_mode = infer_config.model_config.exe_mode
+        # The native Event wrappers are no-ops in GE graph mode, so keep that
+        # path serial until a graph-native Commit-to-Verify dependency exists.
+        self.enabled = bool(
+            custom_params.get("enable_multi_streams", False)
+            and custom_params.get("enable_mega_kda_replayssm", False)
+            and exe_mode != "ge_graph"
+        )
+        self.exe_mode = exe_mode
+        self.commit_stream = (
+            create_stream("replayssm_commit", exe_mode) if self.enabled else None
+        )
+        self.commit_events = tuple(
+            create_event(exe_mode, self.enabled) for _ in range(2)
+        )
+
 
 class MoEContext:
     """Per-model shared resources for MoE inference.
 
     Created once at model init; passed through the forward chain so every
-    MoE block reads the same shared_stream and mega_sym_buffer instances.
+    MoE block reads the same streams, buffers, and current routing indices.
     """
-    __slots__ = ("shared_stream", "mega_sym_buffer")
+    __slots__ = (
+        "shared_stream",
+        "shared_comm_stream",
+        "router_stream",
+        "events",
+        "mega_sym_buffer",
+        "cur_topk_list",
+        "decode_topk_list",
+        "force_eplb",
+        "attn_tp_size",
+        "moe_ep_size",
+        "moe_ep_rank",
+        "num_experts",
+        "top_k",
+    )
 
     def __init__(
         self,
@@ -735,38 +915,104 @@ class MoEContext:
         infer_config: Optional[InferenceConfig] = None,
         comm_manager: Optional[CommManager] = None,
     ) -> None:
-        enable_multi_streams =  infer_config.model_config.custom_params.get("enable_multi_streams", False)
+        custom_params = infer_config.model_config.custom_params
+        _load_situ_fusion_op()
+        enable_multi_streams = custom_params.get("enable_multi_streams", False)
         exe_mode = infer_config.model_config.exe_mode
         # All MoE layers share this stream for multi-stream computation of shared experts.
         self.shared_stream = create_stream('shared', exe_mode) if enable_multi_streams else None
+        # Split Decode uses the same communication stream with or without
+        # SuperKernel, keeping shared collectives outside the fusion scope.
+        self.shared_comm_stream = (
+            create_stream('shared_comm', exe_mode)
+            if enable_multi_streams
+            else None
+        )
+        self.router_stream = (
+            create_stream('router', exe_mode) if enable_multi_streams else None
+        )
+        # One shared pool sized for the largest consumer so every decode path
+        # reads the same tuple: split Decode uses slots 0-10,
+        # prefill uses slots 0-3.
+        event_count = 11
+        self.events = tuple(
+            create_event(exe_mode, enable_multi_streams) for _ in range(event_count)
+        )
         # mega_moe sym_buffer: allocated immediately after communication-domain registration
         # and reused throughout the entire inference cycle.
         self.mega_sym_buffer = None
+        self.cur_topk_list = None
 
-        enable_mega_moe = infer_config.model_config.custom_params.get("enable_mega_moe", False)
-        moe_ep_size = infer_config.parallel_config.moe_ep_size
+        parallel = infer_config.parallel_config
+        self.force_eplb = getattr(infer_config.model_config, "force_eplb", False)
+        self.attn_tp_size = parallel.attn_tp_size
+        self.moe_ep_size = parallel.moe_ep_size
+        self.moe_ep_rank = comm_manager.get_rank("moe_ep_group") if self.moe_ep_size > 1 else 0
+        self.num_experts = config.num_experts
+        self.top_k = config.num_experts_per_token
+        scheduler = infer_config.scheduler_config
+        decode_tokens = scheduler.batch_size_per_dp_rank * (
+            infer_config.model_config.next_n + 1
+        )
+        decode_local_tokens = (
+            decode_tokens + self.attn_tp_size - 1
+        ) // self.attn_tp_size
+        self.decode_topk_list = None
+        if self.force_eplb:
+            device = torch.device("npu", torch.npu.current_device())
+            self.decode_topk_list = build_rank_local_eplb_topk(
+                self.moe_ep_size,
+                self.moe_ep_rank,
+                decode_local_tokens,
+                self.top_k,
+                self.num_experts,
+                device,
+            )
 
-        if enable_mega_moe and moe_ep_size > 1:
-            max_prefill_tokens = infer_config.scheduler_config.max_prefill_tokens
-            moe_chunk_max_len = infer_config.model_config.custom_params.get(
-                        "moe_chunk_max_len", _DEFAULT_MOE_CHUNK_MAX_LEN
-                    )
-            max_token_per_chunk = (
-                min(moe_chunk_max_len, max_prefill_tokens)
+        enable_prefill_mega_moe = custom_params.get("enable_prefill_mega_moe", False)
+        moe_ep_size = parallel.moe_ep_size
+
+        if enable_prefill_mega_moe and moe_ep_size > 1:
+            moe_chunk_max_len = custom_params.get(
+                "moe_chunk_max_len", _DEFAULT_MOE_CHUNK_MAX_LEN
+            )
+            max_prefill_tokens_per_rank = (
+                scheduler.max_prefill_tokens + self.attn_tp_size - 1
+            ) // self.attn_tp_size
+            max_prefill_tokens_per_chunk = (
+                min(max_prefill_tokens_per_rank, moe_chunk_max_len // moe_ep_size)
                 if moe_chunk_max_len > 0
-                else max_prefill_tokens
-            ) // moe_ep_size
+                else max_prefill_tokens_per_rank
+            )
             group = comm_manager.get_group("megamoe_ep_group")
             self.mega_sym_buffer = get_symm_buffer_for_mega_moe(
                 group,
                 num_experts=config.num_experts,
-                num_max_tokens_per_rank=max_token_per_chunk,
+                num_max_tokens_per_rank=max(1, max_prefill_tokens_per_chunk),
                 num_topk=config.num_experts_per_token,
                 hidden=config.routed_expert_hidden_size,
                 intermediate_hidden=2 * config.moe_intermediate_size,
                 dispatch_quant_mode=4, # 4: MXFP quantization (A8W4)
                 dispatch_quant_out_dtype=torch.float8_e4m3fn,
             )
+
+    def prepare_eplb(self, token_count: int, is_prefill: bool, device: torch.device) -> None:
+        if not self.force_eplb:
+            self.cur_topk_list = None
+            return
+        if not is_prefill:
+            self.cur_topk_list = self.decode_topk_list
+            return
+
+        local_tokens = (token_count + self.attn_tp_size - 1) // self.attn_tp_size
+        self.cur_topk_list = build_rank_local_eplb_topk(
+            self.moe_ep_size,
+            self.moe_ep_rank,
+            local_tokens,
+            self.top_k,
+            self.num_experts,
+            device,
+        )
 
 
 
@@ -781,14 +1027,19 @@ class KimiSparseMoeBlock(nn.Module):
         super().__init__()
         self.config = config
         self.num_experts = config.num_experts
+        # Kept for unique per-layer SuperKernel scope names.
+        self.prefix = prefix
         parallel = None if infer_config is None else infer_config.parallel_config
         self.moe_ep_size = 1 if parallel is None else parallel.moe_ep_size
         self.moe_ep_rank = comm_manager.get_rank("moe_ep_group")
         self.moe_ep_group = comm_manager.get_group("moe_ep_group")
         self.moe_ep_group_mc2_name = comm_manager.get_group_name("moe_ep_group_mc2")
-        self.enable_multi_streams =  infer_config.model_config.custom_params.get("enable_multi_streams", False)
+        custom_params = infer_config.model_config.custom_params
+        self.enable_multi_streams = custom_params.get("enable_multi_streams", False)
+        self.enable_superkernel = custom_params.get("enable_superkernel", False)
+        self.force_eplb = getattr(infer_config.model_config, "force_eplb", False)
         self.exe_mode = infer_config.model_config.exe_mode
-        self.moe_chunk_max_len = infer_config.model_config.custom_params.get(
+        self.moe_chunk_max_len = custom_params.get(
             "moe_chunk_max_len", _DEFAULT_MOE_CHUNK_MAX_LEN
         )
         if self.moe_chunk_max_len > 0 and self.moe_chunk_max_len < self.moe_ep_size:
@@ -803,25 +1054,33 @@ class KimiSparseMoeBlock(nn.Module):
                 f"num_experts={self.num_experts} must be divisible by "
                 f"moe_ep_size={self.moe_ep_size}"
             )
-        self.enable_mega_moe = infer_config.model_config.custom_params.get(
-            "enable_mega_moe", False)
-        self.enable_moe_bf16_mode = infer_config.model_config.custom_params.get(
-            "enable_moe_bf16_mode", False)
-        self.prefill_func = (
-            self._moe_mega_w4a8
-            if self.enable_mega_moe and self.moe_ep_size > 1
-            else self.moe_infer_double_routing
-        )
+        self.enable_prefill_mega_moe = custom_params.get("enable_prefill_mega_moe", False)
         self.local_expert_count = self.num_experts // self.moe_ep_size
         self.local_expert_start = self.moe_ep_rank * self.local_expert_count
         expert_hidden = config.routed_expert_hidden_size
+        quant_config = getattr(config, "quant_config", None)
+        # K3 latent projections use MXFP8 only when Linear explicitly declares
+        # that scheme. Otherwise keep the existing floating-point path, even
+        # when a broad Linear target describes MXFP4 routed experts.
+        linear_scheme = getattr(quant_config, "target_scheme_map", {}).get("Linear", {})
+        weight_quant = linear_scheme.get("weights")
+        input_quant = linear_scheme.get("input_activations")
+        latent_quant_config = None
+        if (
+            weight_quant is not None
+            and input_quant is not None
+            and input_quant.type == "float"
+            and input_quant.group_size == 32
+            and quant_config.is_dynamic_group_w8a8_mxfp8(weight_quant, input_quant)
+        ):
+            # Pass the original config so per-layer ignore still takes effect.
+            latent_quant_config = quant_config
         self.gate = KimiMoEGate(config)
         self.experts = KimiSituMoEGMM(
             config,
             hidden_size=expert_hidden,
             ep_size=self.moe_ep_size,
             ep_rank=self.moe_ep_rank,
-            enable_moe_bf16_mode=self.enable_moe_bf16_mode
         )
         self.shared_experts = None
         if config.num_shared_experts > 0:
@@ -835,30 +1094,44 @@ class KimiSparseMoeBlock(nn.Module):
                 tp_rank=dense_tp_rank,
                 tp_group=dense_tp_group,
                 prefix=f"{prefix}.shared_experts",
-                enable_moe_bf16_mode=self.enable_moe_bf16_mode,
             )
-        self.routed_expert_down_proj = nn.Linear(config.hidden_size, expert_hidden, bias=False)
-        self.routed_expert_norm = KimiRMSNorm(
+        self.routed_expert_down_proj = ReplicatedLinear(
+            config.hidden_size,
             expert_hidden,
-            config.rms_norm_eps,
+            bias=False,
+            quant_config=latent_quant_config,
+            prefix=f"{prefix}.routed_expert_down_proj",
         )
-        self.routed_expert_up_proj = nn.Linear(expert_hidden, config.hidden_size, bias=False)
-
-        self.npu_events = tuple(create_event(self.exe_mode, self.enable_multi_streams) for i in range(2))
+        self.routed_expert_norm = KimiRMSNorm(expert_hidden, config.rms_norm_eps)
+        self.routed_expert_up_proj = ReplicatedLinear(
+            expert_hidden,
+            config.hidden_size,
+            bias=False,
+            quant_config=latent_quant_config,
+            prefix=f"{prefix}.routed_expert_up_proj",
+        )
 
         self.top_k = config.num_experts_per_token
         self.moe_intermediate_size = config.moe_intermediate_size
 
+    def _routed_expert_up(self, routed_output: torch.Tensor) -> torch.Tensor:
+        if isinstance(self.routed_expert_up_proj.quant_method, UnquantizedLinearMethod):
+            routed_output = self.routed_expert_norm(routed_output)
+            return self.routed_expert_up_proj(routed_output)
 
-    def _forward_shared_expert(self, switch, main, stream, identity):
-        # -- Shared experts on side stream ------------------------------------
-        record_event(switch, self.npu_events, 0, self.exe_mode)
-        with npu_stream_switch(switch, stream, exe_mode=self.exe_mode):
-            wait_event(switch, self.npu_events, 0, self.exe_mode)
-            shared_out = self.shared_experts(identity)
-            record_event(switch, self.npu_events, 1, self.exe_mode)
-        record_stream(switch, shared_out, main, self.exe_mode)
-        return shared_out
+        gamma = self.routed_expert_norm.weight.to(dtype=routed_output.dtype)
+        routed_output, routed_scale, _ = torch_npu.npu_rms_norm_dynamic_mx_quant(
+            routed_output,
+            gamma,
+            beta=None,
+            epsilon=self.routed_expert_norm.variance_epsilon,
+            round_mode="rint",
+            dst_type=torch.float8_e4m3fn,
+        )
+        return self.routed_expert_up_proj(
+            routed_output,
+            dynamic_scale=routed_scale,
+        )
 
     @torch.no_grad()
     def forward(
@@ -867,105 +1140,377 @@ class KimiSparseMoeBlock(nn.Module):
         is_prefill: bool = True,
         moe_ctx: Optional[MoEContext] = None,
     ) -> torch.Tensor:
-
-        shared_stream = moe_ctx.shared_stream if moe_ctx is not None else None
-        switch = self.enable_multi_streams and not is_prefill
-        main_stream = torch.npu.current_stream()
-        # make sure hidden_states be reserved for sharedstream
-        record_stream(switch, hidden_states, shared_stream, self.exe_mode)
-
-        topk_idx, topk_weight = self.gate(hidden_states)
-        routed_states = self.routed_expert_down_proj(hidden_states)
-
-        if self.shared_experts is not None:
-            shared_output = self._forward_shared_expert(switch, main_stream, shared_stream, hidden_states)
-
         if is_prefill:
-            # Prefill EP: the supported multi-card path uses MXFP4 experts, so
-            # quantize the activation before routing so x and its MX scale are
-            # routed together. Otherwise experts would quantize `expanded_x`,
-            # whose active_expert_range drop rows are undefined.
-            routed_output = self._moe_prefill(routed_states, topk_idx, topk_weight, moe_ctx)
-        else:
-            # Decode uses MegaMoE when enabled; otherwise MC2 dispatch/combine
-            # routes each token precisely to its experts without drop rows.
-            if self.enable_mega_moe and self.moe_ep_size > 1:
-                routed_output = self._moe_mega_w4a8(
-                    routed_states, topk_idx, topk_weight, moe_ctx
-                )
-            else:
-                routed_output = self._moe_mc2_decode(
-                    routed_states, topk_idx, topk_weight
-                )
+            return self.prefill(hidden_states, moe_ctx)
+        return self.decode(hidden_states, moe_ctx)
 
-        routed_output = self.routed_expert_norm(routed_output)
-        routed_output = self.routed_expert_up_proj(routed_output)
+    def prefill(
+        self,
+        hidden_states: torch.Tensor,
+        moe_ctx: Optional[MoEContext] = None,
+    ) -> torch.Tensor:
+        shared_stream = moe_ctx.shared_stream if moe_ctx is not None else None
+        events = moe_ctx.events if moe_ctx is not None else None
+        switch = False # OOM while 128K 32TP, switch on later
+        main_stream = torch.npu.current_stream()
+        shared_output = None
+        # Overlap the shared all-gather with router computation on the main stream.
         if self.shared_experts is not None:
-            wait_event(switch, self.npu_events, 1, self.exe_mode)
-            moe_output = routed_output + shared_output
-        else:
-            moe_output = routed_output
-        return moe_output
+            record_stream(switch, hidden_states, shared_stream, self.exe_mode)
+            record_event(switch, events, 0, self.exe_mode)
+            with npu_stream_switch(switch, shared_stream, exe_mode=self.exe_mode):
+                wait_event(switch, events, 0, self.exe_mode)
+                shared_states = self.shared_experts.all_gather(hidden_states)
+                record_event(switch, events, 1, self.exe_mode)
 
-    def _moe_prefill(self, routed_states, topk_idx, topk_weight, moe_ctx):
-        """Prefill EP, MXFP4 experts: double routing or MegaMoE.
+        topk_idx, topk_weight = self._route(hidden_states, moe_ctx)
 
-        Quantizes the activation to MXFP8 BEFORE routing so x and its per-token
-        MX scale route together, and the experts receive that scale rather than
-        re-quantizing ``expanded_x`` (whose active_expert_range drop rows are
-        undefined and NaN on real weights). ``routed_states`` is this rank's token
-        shard of the latent activation.
+        if self.shared_experts is not None:
+            wait_event(switch, events, 1, self.exe_mode)
+            with npu_stream_switch(switch, shared_stream, exe_mode=self.exe_mode):
+                wait_event(switch, events, 1, self.exe_mode)
+                shared_states = self.shared_experts.gate_up(shared_states)
+                shared_states = self.shared_experts.activation(shared_states)
+                shared_states = self.shared_experts.project_down(shared_states)
+                record_event(switch, events, 2, self.exe_mode)
 
-        When the gathered batch exceeds ``self.moe_chunk_max_len``, the
-        pipeline is run in chunks to bound the peak expanded_x and
-        finalize-table allocations.  Chunk boundaries are identical on every
-        rank in the EP group, so collective ordering is preserved and the
-        per-chunk outputs concatenate to the full result.
-        """
-        plan = _moe_chunk_plan(
-            routed_states.shape[0], self.moe_ep_size, self.moe_chunk_max_len
-        )
-        if len(plan) == 1:
-            return self.prefill_func(routed_states, topk_idx, topk_weight, moe_ctx)
+            # Overlap shared reduce-scatter with routed down projection, then join before chunks.
+            wait_event(switch, events, 2, self.exe_mode)
+            with npu_stream_switch(switch, shared_stream, exe_mode=self.exe_mode):
+                shared_output = self.shared_experts.reduce_scatter(shared_states)
+                record_event(switch, events, 3, self.exe_mode)
 
-        # Verify all EP ranks computed the same chunk count
-        # An SP-pad imbalance would give this rank a different plan, causing
-        # the per-chunk collectives to deadlock with no error. The MAX-reduce
-        # turns that into a clean RuntimeError so the cluster can be reset.
-        if self.moe_ep_size > 1:
-            plan_len = torch.tensor([len(plan)], dtype=torch.int32,
-                                    device=routed_states.device)
-            dist.all_reduce(plan_len, op=dist.ReduceOp.MAX,
-                            group=self.moe_ep_group)
-            if plan_len.item() != len(plan):
-                raise RuntimeError(
-                    f"MoE chunk plan diverged: rank has {len(plan)} chunks "
-                    f"({routed_states.shape[0]} local tokens), EP max is "
-                    f"{plan_len.item()}.  Check that SP padding is identical "
-                    f"on every rank in this EP group."
-                )
+        routed_states = self.routed_expert_down_proj(hidden_states)
+        if shared_output is not None:
+            wait_event(switch, events, 3, self.exe_mode)
+            record_stream(switch, shared_output, main_stream, self.exe_mode)
 
-        local_tokens, h = routed_states.shape
-        output = routed_states.new_empty(local_tokens, h)
+        plan = _moe_chunk_plan(routed_states.shape[0], self.moe_ep_size, self.moe_chunk_max_len)
+        routed_output = torch.empty_like(routed_states) if len(plan) > 1 else None
         offset = 0
         for chunk_len in plan:
             end = offset + chunk_len
-            chunk = self.prefill_func(
-                routed_states[offset:end],
-                topk_idx[offset:end],
-                topk_weight[offset:end],
-                moe_ctx
-            )
-            output[offset:end] = chunk
+            chunk_states = routed_states[offset:end]
+            chunk_idx = topk_idx[offset:end]
+            chunk_weight = topk_weight[offset:end]
+            chunk_output = self.forward_prefill_chunk(chunk_states, chunk_idx, chunk_weight, moe_ctx)
+            if routed_output is None:
+                routed_output = chunk_output
+            else:
+                routed_output[offset:end] = chunk_output
             offset = end
-        return output
 
-    def _moe_mega_w4a8(self, routed_states, topk_idx, topk_weight, moe_ctx):
-        """Run routed experts through the MegaMoE dispatch/compute/combine path.
+        routed_output = self._routed_expert_up(routed_output)
+        if shared_output is None:
+            return routed_output
+        return routed_output + shared_output
+
+    def decode(
+        self,
+        hidden_states: torch.Tensor,
+        moe_ctx: Optional[MoEContext] = None,
+    ) -> torch.Tensor:
+        """Run split Decode with independent fusion and multi-stream controls."""
+        switch = self.enable_superkernel
+        multi_streams = self.enable_multi_streams
+        main_stream = torch.npu.current_stream()
+        shared_stream = moe_ctx.shared_stream if moe_ctx is not None else None
+        comm_stream = moe_ctx.shared_comm_stream if moe_ctx is not None else None
+        events = moe_ctx.events if moe_ctx is not None else None
+        has_shared = self.shared_experts is not None
+        shared_output = None
+
+        # AG stays outside the scope and overlaps route/down projection.
+        if has_shared:
+            record_stream(multi_streams, hidden_states, comm_stream, self.exe_mode)
+            record_event(multi_streams, events, 0, self.exe_mode)
+            with npu_stream_switch(multi_streams, comm_stream, exe_mode=self.exe_mode):
+                wait_event(multi_streams, events, 0, self.exe_mode)
+                shared_states = self.shared_experts.all_gather(hidden_states)
+                record_stream(multi_streams, shared_states, shared_stream, self.exe_mode)
+                record_event(multi_streams, events, 1, self.exe_mode)
+
+        scope = f"{self.prefix}_1.moe"
+        # Include router/gating and latent down in the same SuperKernel while
+        # keeping the shared-expert AG on the dedicated communication stream.
+        _super_kernel_scope_begin(scope, switch)
+
+        topk_idx, topk_weight, routed_states = self._decode_routed_front(
+            hidden_states, multi_streams, moe_ctx, router_event_base=2
+        )
+        ids = topk_idx.to(torch.int32)
+
+        # Shared mm1 must wait the AG result (event 1) but may otherwise start
+        # as soon as the AG completes, which can precede the routed front.  To
+        # keep dispatch and shared mm1 launched together instead, event 5 fires
+        # right before dispatch is issued and mm1 waits it in addition to the
+        # AG, while SiTU still waits for dispatch completion (event 6).
+        if has_shared:
+            record_event(multi_streams, events, 5, self.exe_mode)
+        (
+            expand_x,
+            dynamic_scale,
+            expand_idx,
+            expert_token_num,
+            ep_recv_counts,
+            tp_recv_counts,
+        ) = self._dispatch_split_moe_decode(routed_states, ids)
+        if has_shared:
+            record_event(multi_streams, events, 6, self.exe_mode)
+            with npu_stream_switch(multi_streams, shared_stream, exe_mode=self.exe_mode):
+                wait_event(multi_streams, events, 1, self.exe_mode)
+                wait_event(multi_streams, events, 5, self.exe_mode)
+                shared_states = self.shared_experts.gate_up(
+                    shared_states, limit_core_num=True
+                )
+                wait_event(multi_streams, events, 6, self.exe_mode)
+                shared_states = self.shared_experts.activation(shared_states)
+                record_event(multi_streams, events, 7, self.exe_mode)
+
+            # GMM1 also uses AIV, so it starts only after shared SiTU completes.
+            wait_event(multi_streams, events, 7, self.exe_mode)
+        routed_gate_up = self.experts.gmm1(
+            expand_x, expert_token_num, pertoken_scale=dynamic_scale
+        )
+        if has_shared:
+            record_event(multi_streams, events, 8, self.exe_mode)
+            with npu_stream_switch(multi_streams, shared_stream, exe_mode=self.exe_mode):
+                wait_event(multi_streams, events, 8, self.exe_mode)
+                shared_states = self.shared_experts.project_down(shared_states)
+                record_stream(multi_streams, shared_states, comm_stream, self.exe_mode)
+                record_event(multi_streams, events, 9, self.exe_mode)
+
+        routed_activated, routed_scale = self.experts.activate_and_quant(
+            routed_gate_up, expert_token_num
+        )
+        expert_output = self.experts.gmm2(
+            routed_activated, expert_token_num, pertoken_scale=routed_scale
+        )
+
+        if has_shared:
+            # Exclude shared ReduceScatter from fusion while retaining the
+            # named scope around routed compute and combine.
+            _super_kernel_scope_begin(None, switch)
+            with npu_stream_switch(multi_streams, comm_stream, exe_mode=self.exe_mode):
+                wait_event(multi_streams, events, 9, self.exe_mode)
+                shared_output = self.shared_experts.reduce_scatter(shared_states)
+                record_stream(multi_streams, shared_output, main_stream, self.exe_mode)
+                record_event(multi_streams, events, 10, self.exe_mode)
+            _super_kernel_scope_end(None, switch)
+
+        routed_output = self._combine_split_moe_decode(
+            expert_output,
+            ids,
+            expand_idx,
+            ep_recv_counts,
+            tp_recv_counts,
+            topk_weight,
+        )
+
+        routed_output = self._routed_expert_up(routed_output)
+
+        _super_kernel_scope_end(scope, switch)
+        if has_shared:
+            wait_event(multi_streams, events, 10, self.exe_mode)
+            routed_output = routed_output + shared_output
+        return routed_output
+
+    def _route(
+        self,
+        hidden_states: torch.Tensor,
+        moe_ctx: Optional[MoEContext],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        topk_idx, topk_weight = self._route_topk(
+            self.gate.router_linear(hidden_states), moe_ctx
+        )
+        return topk_idx, topk_weight
+
+    def _route_topk(
+        self,
+        logits: torch.Tensor,
+        moe_ctx: Optional[MoEContext],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        topk_idx, topk_weight = self.gate.topk(logits)
+        if self.force_eplb:
+            topk_idx = moe_ctx.cur_topk_list
+        return topk_idx, topk_weight
+
+    def _decode_routed_front(
+        self,
+        hidden_states: torch.Tensor,
+        enable_streams: bool,
+        moe_ctx: Optional[MoEContext] = None,
+        router_event_base: int = 0,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+
+        if not enable_streams:
+            topk_idx, topk_weight = self._route(hidden_states, moe_ctx)
+            quantized, dynamic_scale = self._routed_expert_down_quant(hidden_states)
+            routed_states = self.routed_expert_down_proj(
+                quantized, dynamic_scale=dynamic_scale
+            )
+            return topk_idx, topk_weight, routed_states
+
+        main_stream = torch.npu.current_stream()
+        router_stream = moe_ctx.router_stream
+        router_events = moe_ctx.events[router_event_base : router_event_base + 3]
+
+        record_stream(True, hidden_states, router_stream, self.exe_mode)
+        record_event(True, router_events, 0, self.exe_mode)
+        with npu_stream_switch(True, router_stream, exe_mode=self.exe_mode):
+            wait_event(True, router_events, 0, self.exe_mode)
+            router_logits = self.gate.router_linear(
+                hidden_states, limit_core_num=True
+            )
+            record_event(True, router_events, 1, self.exe_mode)
+            topk_idx, topk_weight = self._route_topk(router_logits, moe_ctx)
+            record_event(True, router_events, 2, self.exe_mode)
+
+        quantized, dynamic_scale = self._routed_expert_down_quant(hidden_states)
+        wait_event(True, router_events, 1, self.exe_mode)
+        routed_states = self.routed_expert_down_proj(
+            quantized, dynamic_scale=dynamic_scale
+        )
+        wait_event(True, router_events, 2, self.exe_mode)
+        record_stream(True, topk_idx, main_stream, self.exe_mode)
+        record_stream(True, topk_weight, main_stream, self.exe_mode)
+        return topk_idx, topk_weight, routed_states
+
+    def _routed_expert_down_quant(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Quantize routed input before the latent down projection."""
+        if isinstance(
+            self.routed_expert_down_proj.quant_method, UnquantizedLinearMethod
+        ):
+            return hidden_states, None
+        quantized, scale = torch_npu.npu_dynamic_mx_quant(
+            hidden_states, dst_type=torch.float8_e4m3fn
+        )
+        return quantized, scale
+
+    def _split_moe_common_kwargs(self) -> dict:
+        group_name = self.moe_ep_group_mc2_name
+        return dict(
+            moe_expert_num=self.num_experts,
+            global_bs=0,
+            x_active_mask=None,
+            group_ep=group_name,
+            group_tp=group_name,
+            ep_world_size=self.moe_ep_size,
+            ep_rank_id=self.moe_ep_rank,
+            tp_world_size=1,
+            tp_rank_id=0,
+            expert_shard_type=0,
+            shared_expert_num=0,
+            shared_expert_rank_num=0,
+        )
+
+    def _dispatch_split_moe_decode(
+        self, routed_states: torch.Tensor, expert_ids: torch.Tensor
+    ):
+        dispatch = torch_npu.npu_moe_distribute_dispatch_v2(
+            x=routed_states,
+            expert_ids=expert_ids,
+            quant_mode=4,
+            y_dtype=torch.float8_e4m3fn,
+            **self._split_moe_common_kwargs(),
+        )
+        tp_recv_counts = dispatch[5] if len(dispatch) > 5 else None
+        return (
+            dispatch[0],
+            reshape_mx_scale(dispatch[1]),
+            dispatch[2],
+            dispatch[3],
+            dispatch[4],
+            tp_recv_counts,
+        )
+
+    def _combine_split_moe_decode(
+        self,
+        expert_output: torch.Tensor,
+        expert_ids: torch.Tensor,
+        expand_idx: torch.Tensor,
+        ep_recv_counts: torch.Tensor,
+        tp_recv_counts: Optional[torch.Tensor],
+        topk_weight: torch.Tensor,
+    ) -> torch.Tensor:
+        return torch_npu.npu_moe_distribute_combine_v2(
+            expert_output,
+            expert_ids,
+            expand_idx,
+            ep_recv_counts,
+            topk_weight,
+            tp_send_counts=tp_recv_counts,
+            expand_scales=None,
+            comm_quant_mode=0,
+            **self._split_moe_common_kwargs(),
+        )
+
+    def forward_prefill_chunk(
+        self,
+        chunk_states: torch.Tensor,
+        chunk_idx: torch.Tensor,
+        chunk_weight: torch.Tensor,
+        moe_ctx: Optional[MoEContext] = None,
+    ) -> torch.Tensor:
+        if self.enable_prefill_mega_moe and self.moe_ep_size > 1:
+            return self._run_megamoe(chunk_states, chunk_idx, chunk_weight, moe_ctx)
+
+        chunk_weight = chunk_weight.bfloat16()
+        local_tokens = chunk_states.shape[0]
+        x_q, scale = torch_npu.npu_dynamic_mx_quant(chunk_states, dst_type=torch.float8_e4m3fn)
+        routing_kwargs = dict(
+            expert_idx=chunk_idx.to(torch.int32),
+            active_num=chunk_idx.shape[0] * chunk_idx.shape[1],
+            expert_num=self.num_experts,
+            expert_tokens_num_type=1,
+            expert_tokens_num_flag=True,
+            active_expert_range=[0, self.num_experts],
+            quant_mode=-1,
+        )
+        expanded_x, row_idx, tokens_per_expert, _ = (
+            torch_npu.npu_moe_init_routing_v2(
+                x_q.view(torch.bfloat16), **routing_kwargs
+            )
+        )
+        expanded_x = expanded_x.view(x_q.dtype)
+        expanded_scale, _, _, _ = torch_npu.npu_moe_init_routing_v2(
+            scale.reshape(local_tokens, -1).to(torch.bfloat16),
+            **routing_kwargs,
+        )
+        pertoken_scale = expanded_scale.to(scale.dtype).view(-1, *scale.shape[1:])
+        (
+            owner_counts,
+            owner_x,
+            owner_scale,
+            input_splits,
+            output_splits,
+        ) = self.dispatch_double_routing(
+            tokens_per_expert, expanded_x, pertoken_scale
+        )
+        owner_output = self.forward_expert(owner_x, owner_counts, owner_scale)
+        local_output = self.forward_combine_double_routing(
+            owner_output, expanded_x, input_splits, output_splits
+        )
+        return torch_npu.npu_moe_finalize_routing(
+            local_output,
+            skip1=None,
+            skip2=None,
+            bias=None,
+            scales=chunk_weight,
+            expanded_src_to_dst_row=row_idx,
+            export_for_source_row=None,
+            drop_pad_mode=2,
+        ).to(chunk_states.dtype)
+
+
+
+    def _run_megamoe(self, routed_states, topk_idx, topk_weight, moe_ctx):
+        """Run Prefill routed experts through MegaMoE dispatch/compute/combine.
 
         Dispatch + GMM1 + SiTU + GMM2 + Combine are completed by a single mega_moe
-        operator, replacing the double-routing pipeline used by Prefill and the
-        MC2 dispatch/combine pipeline used by Decode.
+        operator, replacing Prefill's double-routing pipeline.
 
         sym_buffer is allocated once by KimiLinearForCausalLM after communication-domain
         registration, passed through MoEContext, and reused throughout inference.
@@ -1028,23 +1573,21 @@ class KimiSparseMoeBlock(nn.Module):
         return owner_counts, owner_x, owner_scale, input_splits, output_splits
 
     def forward_expert(self, owner_x, owner_counts, owner_scale):
-        """Re-route owner inputs, run local experts, then restore source order."""
-        ordered_x, ordered_scale, unsort_idx, local_counts = torch_npu.npu_moe_re_routing(
-            owner_x,
-            owner_counts.view(self.moe_ep_size, -1),
-            per_token_scales=owner_scale,
+        """Run local experts in expert order and restore owner-token order."""
+        ordered_x, ordered_scale, unsort_idx, local_counts = (
+            torch_npu.npu_moe_re_routing(
+                owner_x,
+                owner_counts.view(self.moe_ep_size, -1),
+                per_token_scales=owner_scale,
+            )
         )
-
-        ordered = self.experts(
+        ordered_output = self.experts(
             ordered_x,
             local_counts,
             group_list_type=1,
             pertoken_scale=ordered_scale,
         )
-        owner_output = torch.index_select(
-            ordered, 0, unsort_idx.float().argsort().int()
-        )
-        return owner_output
+        return torch.index_select(ordered_output, 0, unsort_idx.float().argsort().int())
 
     def forward_combine_double_routing(
         self, owner_output, expanded_x, input_splits, output_splits
@@ -1059,109 +1602,6 @@ class KimiSparseMoeBlock(nn.Module):
             group=self.moe_ep_group,
         )
         return local_output
-
-    def moe_infer_double_routing(
-        self, routed_states, topk_idx, topk_weight, moe_ctx
-    ):
-        """Run one Prefill chunk through the V3.2-style double-routing path."""
-        _ = moe_ctx
-        if self.enable_moe_bf16_mode:
-            topk_weight = topk_weight.bfloat16()
-        local_tokens = routed_states.shape[0]
-        x_q, scale = torch_npu.npu_dynamic_mx_quant(
-            routed_states, dst_type=torch.float8_e4m3fn
-        )
-        routing_kwargs = dict(
-            expert_idx=topk_idx.to(torch.int32),
-            active_num=topk_idx.shape[0] * topk_idx.shape[1],
-            expert_num=self.num_experts,
-            expert_tokens_num_type=1,
-            expert_tokens_num_flag=True,
-            active_expert_range=[0, self.num_experts],
-            quant_mode=-1,
-        )
-        expanded_x, row_idx, tokens_per_expert, _ = torch_npu.npu_moe_init_routing_v2(
-            x_q.view(torch.bfloat16), **routing_kwargs
-        )
-        expanded_x = expanded_x.view(x_q.dtype)
-        exp_scale, _, _, _ = torch_npu.npu_moe_init_routing_v2(
-            scale.reshape(local_tokens, -1).to(torch.bfloat16), **routing_kwargs
-        )
-        pertoken_scale = exp_scale.to(scale.dtype).view(-1, *scale.shape[1:])
-        owner_counts, owner_x, owner_scale, input_splits, output_splits = (
-            self.dispatch_double_routing(
-                tokens_per_expert, expanded_x, pertoken_scale
-            )
-        )
-        owner_output = self.forward_expert(owner_x, owner_counts, owner_scale)
-        local_output = self.forward_combine_double_routing(
-            owner_output, expanded_x, input_splits, output_splits
-        )
-        hidden = torch_npu.npu_moe_finalize_routing(
-            local_output.float() if not self.enable_moe_bf16_mode else local_output,
-            skip1=None, skip2=None, bias=None,
-            scales=topk_weight.float() if not self.enable_moe_bf16_mode else topk_weight,
-            expanded_src_to_dst_row=row_idx,
-            export_for_source_row=None,
-            drop_pad_mode=2,
-        )
-        return hidden.to(routed_states.dtype)
-
-    def _moe_mc2_decode(self, routed_states, topk_idx, topk_weight):
-        """Decode EP via MC2 dispatch/combine.
-
-        ``routed_states`` holds this rank's own decode tokens (DP), not a shard
-        of a shared sequence, so no all_gather/reduce_scatter is needed. The
-        dispatch routes each token precisely to its experts and quantizes the
-        latent activation to MXFP8 before communication. The routed MX scale is
-        reshaped to the layout required by the MXFP4 expert GMM.
-        """
-        group_name = self.moe_ep_group_mc2_name
-        ids = topk_idx.to(torch.int32)
-        common_kwargs = dict(
-            moe_expert_num=self.num_experts,
-            global_bs=0,
-            x_active_mask=None,
-            group_ep=group_name,
-            group_tp=group_name,
-            ep_world_size=self.moe_ep_size,
-            ep_rank_id=self.moe_ep_rank,
-            tp_world_size=1,
-            tp_rank_id=0,
-            expert_shard_type=0,
-            shared_expert_num=0,
-            shared_expert_rank_num=0,
-        )
-        # quant_mode=4 performs MX dynamic quantization before communicating
-        # the MXFP8 activations and E8M0 scales.
-        dispatch = torch_npu.npu_moe_distribute_dispatch_v2(
-            x=routed_states,
-            expert_ids=ids,
-            quant_mode=4,
-            y_dtype=torch.float8_e4m3fn,
-            **common_kwargs,
-        )
-        expand_x = dispatch[0]
-        dynamic_scale = reshape_mx_scale(dispatch[1])
-        expand_idx = dispatch[2]
-        expert_token_num = dispatch[3]
-        ep_recv_counts = dispatch[4]
-        tp_recv_counts = dispatch[5] if len(dispatch) > 5 else None
-
-        expert_output = self.experts(
-            expand_x,
-            expert_token_num,
-            group_list_type=1,
-            pertoken_scale=dynamic_scale,
-        )
-        return torch_npu.npu_moe_distribute_combine_v2(
-            expert_output, ids, expand_idx, ep_recv_counts,
-            topk_weight,
-            tp_send_counts=tp_recv_counts,
-            expand_scales=None,
-            comm_quant_mode=0,
-            **common_kwargs,
-        )
 
 
 def _uninitialized(module_cls, *args, **kwargs):
@@ -1195,6 +1635,8 @@ def _sp_pad_metadata(metadata: ForwardMetaData, pad_len: int) -> ForwardMetaData
     # keeps it as the placeholder, so no request is ever given it and a slot
     # below block_size can only belong to the pad. check_model_settings keeps
     # block_size at or above attn_tp, which bounds pad_len.
+    if metadata.get("is_chunked_prefill", False):
+        return metadata
     padded = dict(metadata)
     padded["actual_seq_lengths_q"] = torch.cat((
         metadata["actual_seq_lengths_q"],
@@ -1245,13 +1687,15 @@ class KimiShortConvolution(nn.Module):
         is_prefill: bool,
         query_start_loc: Optional[torch.Tensor] = None,
         num_accepted_tokens: Optional[torch.Tensor] = None,
+        has_initial_state: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor]:
         if is_prefill:
-            has_initial_state = torch.zeros(
-                size=[query_start_loc.shape[0] - 1],
-                dtype=torch.int32,
-                device=x.device,
-            )
+            if has_initial_state is None:
+                has_initial_state = torch.zeros(
+                    size=[query_start_loc.shape[0] - 1],
+                    dtype=torch.int32,
+                    device=x.device,
+                )
             y = torch.ops.cann_ops_transformer.causal_conv1d_fn(
                 x=x,
                 conv_states=cache,
@@ -1306,37 +1750,49 @@ class KimiDeltaAttention(nn.Module):
             if self.attn_tp_size == 1
             else comm_manager.get_group("attn_tp_group")
         )
+        self.attn_reduce_scatter_group = (
+            None
+            if self.attn_tp_size == 1
+            else comm_manager.get_group("attn_reduce_scatter_group")
+        )
         self.attn_tp_rank = (
             0 if self.attn_tp_size == 1 else comm_manager.get_rank("attn_tp_group")
         )
         quant_config = getattr(config, "quant_config", None)
-        self.use_flash_kda = infer_config.model_config.custom_params.get("enable_flash_kda", True)
-        if self.use_flash_kda and _flash_kda_impl is None:
-            raise ImportError("enable_flash_kda=True but ops.cannbot_dsl.flash_kda is not available")
-        self.use_fused_recurrent_kda = infer_config.model_config.custom_params.get("enable_fused_recurrent_kda", True)
-        if self.use_fused_recurrent_kda and _recurrent_kda_impl is None:
-            raise ImportError("enable_fused_recurrent_kda=True but fused_recurrent_kda is not available")
+        if quant_config is not None:
+            quant_config.packed_modules_mapping["qkv_proj"] = ["q_proj", "k_proj", "v_proj"]
+        if _flash_kda_impl is None:
+            raise ImportError(
+                "KimiDeltaAttention requires ops.flash_kda and ops.flash_kda_metadata"
+            ) from _flash_kda_import_error
+        self.use_mega_kda = infer_config.model_config.custom_params.get("enable_mega_kda", False)
+        if not isinstance(self.use_mega_kda, bool):
+            raise TypeError("enable_mega_kda must be a boolean")
+        self.use_mega_kda_replayssm = infer_config.model_config.custom_params.get(
+            "enable_mega_kda_replayssm", False
+        )
+        validate_mega_kda_replayssm_switch(
+            infer_config.model_config.custom_params,
+            infer_config.model_config.draft_model_type,
+            infer_config.model_config.next_n,
+        )
+        if self.use_mega_kda_replayssm and (
+            _mega_kda_replayssm_impl is None
+            or _commit_recurrent_kda_replayssm_impl is None
+        ):
+            raise ImportError(
+                "enable_mega_kda_replayssm=True requires both ReplaySSM "
+                "MegaKDA operator packages"
+            ) from _mega_kda_replayssm_import_error
+        if self.use_mega_kda and not self.use_mega_kda_replayssm and _mega_kda_impl is None:
+            raise ImportError("enable_mega_kda=True but ops.mega_recurrent_kda is not available")
+        if not self.use_mega_kda and _recurrent_kda_impl is None:
+            raise ImportError(
+                "KimiDeltaAttention requires ops.fused_recurrent_kda_snapshot"
+            ) from _recurrent_kda_import_error
         # Between layers, Prefill holds a token-SP shard while Decode holds a
         # request-DP shard. Attention gathers either layout for head TP and
         # reduce-scatters the projected result back to the owning ranks.
-        self.register_buffer(
-            "kda_transition_mask",
-            torch.triu(torch.ones(_KDA_CHUNK_SIZE, _KDA_CHUNK_SIZE, dtype=torch.bool)),
-            persistent=False,
-        )
-        self.register_buffer(
-            "kda_attention_mask",
-            torch.triu(
-                torch.ones(_KDA_CHUNK_SIZE, _KDA_CHUNK_SIZE, dtype=torch.bool),
-                diagonal=1,
-            ),
-            persistent=False,
-        )
-        self.register_buffer(
-            "kda_identity",
-            torch.eye(_KDA_CHUNK_SIZE, dtype=torch.float32),
-            persistent=False,
-        )
         projection_size = self.head_dim * self.num_heads
         self.projection_size = projection_size
         self.qkv_projection_size = 3 * projection_size
@@ -1352,12 +1808,24 @@ class KimiDeltaAttention(nn.Module):
             skip_bias_add=False,
             tp_size=self.attn_tp_size,
             tp_rank=self.attn_tp_rank,
-            quant_config=None,
-            prefix="self_attn.qkv_proj",
+            quant_config=_fused_linear_quant_config(quant_config, f"{prefix}.qkv_proj"),
+            prefix=f"{prefix}.qkv_proj",
             return_bias=False,
         )
         kernel_size = linear["short_conv_kernel_size"]
         self.qkv_conv1d = KimiShortConvolution(self.qkv_projection_size, kernel_size)
+        self.register_buffer("_mega_conv_weight", None, persistent=False)
+        for name in ("qkv", "fa", "fb", "beta", "output_gate", "output_projection"):
+            self.register_buffer(f"_mega_{name}_weight", None, persistent=False)
+        for replay_weight_name in (
+            "_mega_replayssm_qkv_weight",
+            "_mega_replayssm_decay_a_weight",
+            "_mega_replayssm_decay_b_weight",
+            "_mega_replayssm_beta_weight",
+            "_mega_replayssm_output_gate_weight",
+            "_mega_replayssm_output_weight",
+        ):
+            self.register_buffer(replay_weight_name, None, persistent=False)
         # The checkpoint stores 96 logical per-head values followed by 32 zero
         # padding values. load_weights removes the padding and shards the heads.
         self.A_log = nn.Parameter(
@@ -1392,7 +1860,7 @@ class KimiDeltaAttention(nn.Module):
             prefix=f"{prefix}.b_proj",
         )
         self.use_full_rank_gate = linear.get("use_full_rank_gate", False)
-        self.gate_lower_bound = linear.get("gate_lower_bound")
+        self.gate_lower_bound = linear["gate_lower_bound"]
         if self.use_full_rank_gate:
             self.g_proj = ColumnParallelLinear(
                 config.hidden_size,
@@ -1438,6 +1906,33 @@ class KimiDeltaAttention(nn.Module):
 
         self.attn_type = "Mamba"
 
+        if self.use_mega_kda:
+            # Legacy snapshot MegaKDA uses the kernel's fixed output RMSNorm
+            # epsilon. ReplaySSM receives config.rms_norm_eps explicitly.
+            if not self.use_full_rank_gate:
+                raise ValueError("MegaKDA requires a full-rank output gate")
+
+    def prepare_mega_kda_weights(self) -> set[nn.Module]:
+        """Share NZ roots with MegaKDA and transpose views with Prefill."""
+        prepared = set()
+        if not self.use_mega_kda:
+            return prepared
+        for name, linear in (
+            ("qkv", self.qkv_proj),
+            ("fa", self.f_a_proj),
+            ("fb", self.f_b_proj),
+            ("beta", self.b_proj),
+            ("output_gate", self.g_proj),
+            ("output_projection", self.o_proj),
+        ):
+            if linear.weight.dtype != torch.bfloat16:
+                raise ValueError(f"MegaKDA requires BF16 {name} projection weights")
+            weight = torch_npu.npu_format_cast(linear.weight.detach().contiguous(), 29)
+            setattr(self, f"_mega_{name}_weight", weight)
+            linear.weight.data = weight.transpose(0, 1)
+            prepared.add(linear)
+        return prepared
+
     def _state_block_ids(
         self, forward_metadata: ForwardMetaData, cache_kind: str = "KDAConv"
     ) -> torch.Tensor:
@@ -1447,114 +1942,29 @@ class KimiDeltaAttention(nn.Module):
             return block_table
         return block_table[:, 0]
 
-    def _chunk_kda_dispatch(
-        self,
-        inputs: KdaInputs,
-        gate_params: KdaGateParams,
-        initial_state: torch.Tensor,
-        query_boundaries: list[int],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        # Prefill: dispatch to flash_kda or torch reference by use_flash_kda.
-        # Returns: output [tokens, H, D] bf16, final_state [batch, H, D, D] fp32.
-        if self.use_flash_kda and gate_params.lower_bound is not None:
-            return self._prefill_flash_kda(
-                inputs, gate_params, initial_state, query_boundaries,
-            )
-        return self._prefill_torch_kda(
-            inputs, gate_params, initial_state, query_boundaries,
-        )
-
-    def _slice_request_inputs(
-        self,
-        inputs: KdaInputs,
-        start: int,
-        end: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        query, key, value, raw_gate, raw_beta = inputs
-        return (
-            query[start:end].unsqueeze(0),
-            key[start:end].unsqueeze(0),
-            value[start:end].unsqueeze(0),
-            raw_gate[start:end].unsqueeze(0),
-            raw_beta[start:end].unsqueeze(0),
-        )
-
     def _prefill_flash_kda(
         self,
         inputs: KdaInputs,
         gate_params: KdaGateParams,
         initial_state: torch.Tensor,
-        query_boundaries: list[int],
+        query_start_loc: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # Prefill flash_kda: fuses L2 norm + gate activation + beta sigmoid, per-request chunked.
-        # Returns: output [tokens, H, D] bf16, final_state [batch, H, D, D] fp32.
-        outputs = []
-        final_states = []
-        for request, (start, end) in enumerate(
-            zip(query_boundaries, query_boundaries[1:])
-        ):
-            q, k, v, g, b = self._slice_request_inputs(inputs, start, end)
-            tokens, key_dim = q.shape[1], q.shape[3]
-            pad_len = (-tokens) % _KDA_CHUNK_SIZE
-            if pad_len:
-                q, k, v = (
-                    F.pad(t, (0, 0, 0, 0, 0, pad_len)) for t in (q, k, v)
-                )
-                g = F.pad(g, (0, 0, 0, 0, 0, pad_len), value=float('-inf'))
-                b = F.pad(b, (0, 0, 0, pad_len), value=float('-inf'))
-            q, k, v, g, b = (t.contiguous() for t in (q, k, v, g, b))
-            output, state = _flash_kda_impl(
-                q, k, v, g=g, beta=b,
-                scale=1.0 / math.sqrt(key_dim),
-                initial_state=initial_state[request:request + 1],
-                A_log=gate_params.a_log.data,
-                dt_bias=gate_params.dt_bias,
-                lower_bound=gate_params.lower_bound,
-                layout_qkv="BSND",
-            )
-            if pad_len:
-                output = output[:, :tokens].contiguous()
-            outputs.append(output.squeeze(0))
-            final_states.append(state.squeeze(0))
-        return torch.cat(outputs), torch.stack(final_states)
-
-    def _prefill_torch_kda(
-        self,
-        inputs: KdaInputs,
-        gate_params: KdaGateParams,
-        initial_state: torch.Tensor,
-        query_boundaries: list[int],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        # Prefill torch reference: Python-side L2 norm + gate/beta activation, pure Python chunk loop.
-        # Returns: output [tokens, H, D] bf16, final_state [batch, H, D, D] fp32.
-        outputs = []
-        final_states = []
-        gate_scale = gate_params.a_log.exp().view(-1, 1)
-        for request, (start, end) in enumerate(
-            zip(query_boundaries, query_boundaries[1:])
-        ):
-            q_src, k_src, v_src, gate_raw, beta_raw = self._slice_request_inputs(inputs, start, end)
-            gate_raw = gate_raw.float()
-            beta_raw = beta_raw.float()
-            gate_input = gate_raw + gate_params.dt_bias
-            if gate_params.lower_bound is not None:
-                g = float(gate_params.lower_bound) * torch.sigmoid(gate_scale * gate_input)
-            else:
-                g = -gate_scale * _softplus(gate_input)
-            b = beta_raw.sigmoid()
-            torch_initial_state = initial_state[
-                request:request + 1
-            ].transpose(-1, -2).contiguous()
-            output, state = _torch_chunk_kda(
-                q_src, k_src, v_src, g, b, torch_initial_state,
-                self.kda_transition_mask,
-                self.kda_attention_mask,
-                self.kda_identity,
-            )
-            state = state.transpose(-1, -2).contiguous()
-            outputs.append(output.squeeze(0))
-            final_states.append(state.squeeze(0))
-        return torch.cat(outputs), torch.stack(final_states)
+        # TND consumes the real packed tokens and existing int32 request offsets.
+        # The kernel handles tail chunks; no per-request padding or launch is needed.
+        q, k, v, g, b = (tensor.contiguous() for tensor in inputs)
+        metadata = _flash_kda_metadata_impl(
+            q, v, initial_state, layout_qkv="TND", cu_seqlens=query_start_loc,
+        )
+        return _flash_kda_impl(
+            q, k, v, g=g, beta=b,
+            scale=1.0 / math.sqrt(q.shape[-1]),
+            initial_state=initial_state,
+            A_log=gate_params.a_log.data,
+            dt_bias=gate_params.dt_bias,
+            lower_bound=gate_params.lower_bound,
+            layout_qkv="TND",
+            metadata=metadata,
+        )
 
     def forward(
         self,
@@ -1563,7 +1973,12 @@ class KimiDeltaAttention(nn.Module):
         layer_cache: dict,
         query_start_loc: Optional[torch.Tensor] = None,
         query_boundaries: Optional[list[int]] = None,
+        replayssm_ctx: Optional[ReplaySSMContext] = None,
     ) -> torch.Tensor:
+        if self.use_mega_kda and not forward_metadata["is_prefill"]:
+            return self._decode_mega_kda(
+                hidden_states, forward_metadata, layer_cache, replayssm_ctx
+            )
         # Keep the gathered hidden and KDA projection temporaries inside the
         # core call. Only the narrow per-head gate and KDA output cross this
         # boundary, so the full [tokens, hidden] tensor is released before
@@ -1576,6 +1991,133 @@ class KimiDeltaAttention(nn.Module):
             query_boundaries,
         )
         return self._project_out(gate, output)
+
+    def _decode_mega_kda(
+        self,
+        hidden_states: torch.Tensor,
+        forward_metadata: ForwardMetaData,
+        layer_cache: dict,
+        replayssm_ctx: Optional[ReplaySSMContext] = None,
+    ) -> torch.Tensor:
+        replayssm_multistream = bool(
+            self.use_mega_kda_replayssm
+            and replayssm_ctx is not None
+            and replayssm_ctx.enabled
+        )
+        replayssm_stream = (
+            replayssm_ctx.commit_stream if replayssm_ctx is not None else None
+        )
+        replayssm_events = (
+            replayssm_ctx.commit_events if replayssm_ctx is not None else None
+        )
+        replayssm_exe_mode = (
+            replayssm_ctx.exe_mode if replayssm_ctx is not None else None
+        )
+        num_accepted_tokens = None
+        if self.use_mega_kda_replayssm:
+            num_accepted_tokens = forward_metadata[
+                "replay_num_accepted_tokens"
+            ].to(dtype=torch.int32).contiguous()
+            record_stream(
+                replayssm_multistream,
+                num_accepted_tokens,
+                replayssm_stream,
+                replayssm_exe_mode,
+            )
+            record_event(
+                replayssm_multistream,
+                replayssm_events,
+                0,
+                replayssm_exe_mode,
+            )
+            with npu_stream_switch(
+                replayssm_multistream,
+                replayssm_stream,
+                exe_mode=replayssm_exe_mode,
+            ):
+                wait_event(
+                    replayssm_multistream,
+                    replayssm_events,
+                    0,
+                    replayssm_exe_mode,
+                )
+                _commit_recurrent_kda_replayssm_impl(
+                    layer_cache["recurrent_state"],
+                    layer_cache["replay_u"],
+                    layer_cache["replay_k"],
+                    layer_cache["replay_decay"],
+                    num_accepted_tokens,
+                )
+                record_event(
+                    replayssm_multistream,
+                    replayssm_events,
+                    1,
+                    replayssm_exe_mode,
+                )
+
+        hidden_states = all_gather_first_dim(
+            hidden_states, self.attn_tp_group, self.attn_tp_size
+        )
+        batch = forward_metadata["actual_seq_lengths_q"].shape[0]
+        hidden_states = hidden_states.view(batch, -1, hidden_states.shape[-1])
+        if self.use_mega_kda_replayssm:
+            wait_event(
+                replayssm_multistream,
+                replayssm_events,
+                1,
+                replayssm_exe_mode,
+            )
+            output = _mega_kda_replayssm_impl(
+                hidden_states,
+                self._mega_replayssm_qkv_weight,
+                self._mega_replayssm_decay_a_weight,
+                self._mega_replayssm_decay_b_weight,
+                self._mega_replayssm_beta_weight,
+                self._mega_replayssm_output_gate_weight,
+                self.o_norm.weight.detach(),
+                self._mega_replayssm_output_weight,
+                self._mega_conv_weight,
+                layer_cache["conv_state"],
+                layer_cache["recurrent_state"],
+                layer_cache["replay_u"],
+                layer_cache["replay_k"],
+                layer_cache["replay_decay"],
+                self._state_block_ids(forward_metadata, "KDAConv"),
+                forward_metadata["conv_num_accepted_tokens"],
+                self.A_log.detach(),
+                self.dt_bias.view(self.num_heads, self.head_dim),
+                self.head_dim**-0.5,
+                float(self.gate_lower_bound),
+                float(self.o_norm.variance_epsilon),
+            )
+        else:
+            output = _mega_kda_impl(
+                hidden_states,
+                self._mega_qkv_weight,
+                self._mega_fa_weight,
+                self._mega_fb_weight,
+                self._mega_beta_weight,
+                self._mega_output_gate_weight,
+                self.o_norm.weight.detach(),
+                self._mega_output_projection_weight,
+                self._mega_conv_weight,
+                layer_cache["conv_state"],
+                layer_cache["recurrent_state"],
+                self._state_block_ids(forward_metadata, "KDAConv"),
+                forward_metadata["ssm_state_indices"],
+                forward_metadata["conv_num_accepted_tokens"],
+                forward_metadata["num_accepted_tokens"],
+                self.A_log.detach(),
+                self.dt_bias.view(self.num_heads, self.head_dim),
+                self.head_dim**-0.5,
+                self.gate_lower_bound,
+                rms_norm_eps=1e-6,
+            )
+        return reduce_scatter_first_dim(
+            output.view(-1, hidden_states.shape[-1]),
+            self.attn_reduce_scatter_group,
+            self.attn_tp_size,
+        )
 
     def _forward_core(
         self,
@@ -1624,57 +2166,50 @@ class KimiDeltaAttention(nn.Module):
             forward_metadata["is_prefill"],
             query_start_loc,
             num_accepted_tokens,
+            forward_metadata.get("prefill_has_initial_state"),
         )
-        q, k, v = mixqkv.split(self.projection_size, dim=-1)
+
 
         shape = (*input_states.shape[:-1], self.num_heads, self.head_dim)
-        q, k, v = q.view(shape), k.view(shape), v.view(shape)
         raw_decay = self.f_b_proj(self.f_a_proj(input_states)).view(shape)
         raw_beta = self.b_proj(input_states)
         dt_bias = self.dt_bias.view(self.num_heads, self.head_dim)
 
         if forward_metadata["is_prefill"]:
-            initial_state = torch.zeros(
-                len(query_boundaries) - 1, self.num_heads,
-                self.head_dim, self.head_dim,
-                dtype=torch.float32, device=q.device,
-            )
-            output, state = self._chunk_kda_dispatch(
-                KdaInputs(q, k, v, raw_decay, raw_beta),
-                KdaGateParams(self.A_log, dt_bias, self.gate_lower_bound),
-                initial_state, query_boundaries,
-            )
+            q, k, v = mixqkv.split(self.projection_size, dim=-1)
+            q, k, v = q.view(shape), k.view(shape), v.view(shape)
             recurrent_state_ids = self._state_block_ids(
                 forward_metadata, "KDARecurrent"
             )[:, 0]
+            if forward_metadata.get("is_chunked_prefill", False):
+                initial_state = layer_cache["recurrent_state"].index_select(
+                    0, recurrent_state_ids.to(torch.long)
+                )
+            else:
+                initial_state = torch.zeros(
+                    len(query_boundaries) - 1, self.num_heads,
+                    self.head_dim, self.head_dim,
+                    dtype=torch.float32, device=q.device,
+                )
+            output, state = self._prefill_flash_kda(
+                KdaInputs(q, k, v, raw_decay, raw_beta),
+                KdaGateParams(self.A_log, dt_bias, self.gate_lower_bound),
+                initial_state,
+                query_start_loc,
+            )
             self.update_mamba_cache(
                 recurrent_state_ids, state, layer_cache["recurrent_state"]
             )
             output = _pad_kda_output(output, sp_pad_len)
         else:
-            if self.use_fused_recurrent_kda:
-                output = self._decode_fused_kda(
-                    KdaInputs(q, k, v, raw_decay, raw_beta),
-                    KdaGateParams(self.A_log, dt_bias, self.gate_lower_bound),
-                    forward_metadata,
-                    layer_cache["recurrent_state"],
-                )
-            else:
-                gate_input = raw_decay + dt_bias
-                gate_scale = self.A_log.float().exp().view(self.num_heads, 1)
-                use_safe_gate = self.gate_lower_bound is not None
-                if use_safe_gate:
-                    decay = float(self.gate_lower_bound) * torch.sigmoid(
-                        gate_scale * gate_input
-                    )
-                else:
-                    decay = -gate_scale * _softplus(gate_input)
-                beta = raw_beta.float().sigmoid()
-                output = self._decode_gdr(
-                    KdaInputs(q, k, v, decay, beta),
-                    forward_metadata,
-                    layer_cache["recurrent_state"],
-                )
+            output = self._decode_fused_kda(
+                mixqkv,
+                raw_decay,
+                raw_beta,
+                KdaGateParams(self.A_log, dt_bias, self.gate_lower_bound),
+                forward_metadata,
+                layer_cache["recurrent_state"],
+            )
             output = output.view(tokens, *output.shape[2:])
         return gate, output
 
@@ -1686,85 +2221,118 @@ class KimiDeltaAttention(nn.Module):
             values = values.to(device=cache.device, dtype=cache.dtype)
         torch_npu.npu_scatter_nd_update_(cache, indices.view(-1, 1), values)
 
+    def prepare_mega_replayssm_weights(self) -> None:
+        """Prepare the same KDA weights in ReplaySSM's required ABI format.
+
+        ``prepare_mega_kda_weights`` has already converted the six checkpoint
+        weights to FRACTAL_NZ allocation roots and made the Prefill Linear
+        parameters transpose views of those roots. Reusing the roots here is
+        required: transposing a FRACTAL_NZ Linear view and casting it again
+        leaves a view of FRACTAL_NZ storage, which the ReplaySSM graph ABI
+        rejects.
+        """
+        if not self.use_mega_kda_replayssm:
+            return
+
+        roots = (
+            (
+                "qkv",
+                self._mega_qkv_weight,
+                (self.qkv_projection_size, self.qkv_proj.input_size),
+            ),
+            (
+                "decay-a",
+                self._mega_fa_weight,
+                (self.head_dim, self.f_a_proj.input_size),
+            ),
+            (
+                "decay-b",
+                self._mega_fb_weight,
+                (self.projection_size, self.head_dim),
+            ),
+            (
+                "beta",
+                self._mega_beta_weight,
+                (self.num_heads, self.b_proj.input_size),
+            ),
+            (
+                "output-gate",
+                self._mega_output_gate_weight,
+                (self.projection_size, self.g_proj.input_size),
+            ),
+            (
+                "output",
+                self._mega_output_projection_weight,
+                (self.o_proj.output_size, self.projection_size),
+            ),
+        )
+        replay_names = (
+            "_mega_replayssm_qkv_weight",
+            "_mega_replayssm_decay_a_weight",
+            "_mega_replayssm_decay_b_weight",
+            "_mega_replayssm_beta_weight",
+            "_mega_replayssm_output_gate_weight",
+            "_mega_replayssm_output_weight",
+        )
+        for (label, root, expected_shape), replay_name in zip(roots, replay_names):
+            if root is None:
+                raise RuntimeError(
+                    f"MegaKDA ReplaySSM {label} weight root was not prepared"
+                )
+            if tuple(root.shape) != expected_shape:
+                raise RuntimeError(
+                    f"MegaKDA ReplaySSM {label} weight has shape "
+                    f"{tuple(root.shape)}, expected {expected_shape}"
+                )
+            fmt = torch_npu.get_npu_format(root)
+            fmt_id = fmt.value if hasattr(fmt, "value") else int(fmt)
+            if fmt_id != 29:
+                raise RuntimeError(
+                    f"MegaKDA ReplaySSM {label} weight must be FRACTAL_NZ, "
+                    f"got format={fmt_id}"
+                )
+            if root.dtype != torch.bfloat16:
+                raise TypeError(
+                    "MegaKDA ReplaySSM requires BF16 projection weights, got "
+                    f"{root.dtype} for {label}"
+                )
+            setattr(self, replay_name, root)
+
     def _decode_fused_kda(
         self,
-        inputs: KdaInputs,
+        mixqkv: torch.Tensor,
+        raw_gate: torch.Tensor,
+        raw_beta: torch.Tensor,
         gate_params: KdaGateParams,
         forward_metadata: ForwardMetaData,
         recurrent_state_cache: torch.Tensor,
     ) -> torch.Tensor:
-        # Decode fused_recurrent_kda: fuses L2 norm + gate activation + beta sigmoid, per-token recurrent.
+        # Decode fused_recurrent_kda consumes the ShortConv mixed QKV directly
+        # and fuses Q/K split + L2 norm + gate/beta activation + recurrence.
         # State updates recurrent_state_cache in-place, returns out [B, S, H, D] bf16.
-        query, key, value, g, raw_beta = inputs
-        query = query.contiguous()
-        key = key.contiguous()
-        value = value.contiguous()
-        g = g.contiguous()
-        batch, seq, _, key_dim = query.shape
-        scale = 1 / math.sqrt(key_dim)
+        mixqkv = mixqkv.contiguous()
+        raw_gate = raw_gate.contiguous()
+        scale = 1 / math.sqrt(raw_gate.shape[-1])
+        # The packaged Snapshot ABI uses int32 indices and accepted lengths.
         ssm_state_indices = forward_metadata["ssm_state_indices"]
-        if ssm_state_indices.numel() != batch * seq:
-            raise RuntimeError(
-                "KDA recurrent state indices must match the fixed Verify width"
-            )
         b = raw_beta.unsqueeze(-1).contiguous()
+        num_accepted_tokens = forward_metadata.get("num_accepted_tokens")
+        if num_accepted_tokens is not None:
+            num_accepted_tokens = num_accepted_tokens.to(torch.int32)
         out = _recurrent_kda_impl(
-            query, key, value,
+            mixqkv,
             state=recurrent_state_cache,
             beta=b,
-            g=g,
+            g=raw_gate,
             scale=scale,
             A_log=gate_params.a_log.data,
             dt_bias=gate_params.dt_bias,
             lower_bound=gate_params.lower_bound,
             layout_qkv="BSND",
             ssm_state_indices=ssm_state_indices.contiguous(),
-            num_accepted_tokens=forward_metadata.get("num_accepted_tokens"),
+            num_accepted_tokens=num_accepted_tokens,
         )
         return out
-
-    def _decode_gdr(
-        self,
-        inputs: KdaInputs,
-        forward_metadata: ForwardMetaData,
-        recurrent_state_cache: torch.Tensor,
-    ) -> torch.Tensor:
-        # Decode gdr: Python-side L2 norm + gate/beta activation, calls npu_recurrent_gated_delta_rule.
-        # State updates recurrent_state_cache in-place, returns out [B, S, H, D] bf16.
-        # inputs carries already-activated decay and sigmoid'd beta for the gdr path.
-        query, key, value, decay, beta = inputs
-        batch, seq, num_heads, key_dim = query.shape
-        value_dim = value.shape[-1]
-        tokens = batch * seq
-        scale = 1 / math.sqrt(key_dim)
-        ssm_state_indices = forward_metadata["ssm_state_indices"]
-        if ssm_state_indices.numel() != batch * seq:
-            raise RuntimeError(
-                "GDR state indices must match the fixed Verify width"
-            )
-        q = _l2_normalize(query).reshape(tokens, num_heads, key_dim).to(
-            torch.bfloat16
-        )
-        k = _l2_normalize(key).view(tokens, num_heads, key_dim).to(
-            torch.bfloat16
-        )
-        v = value.view(tokens, num_heads, value_dim).to(torch.bfloat16)
-        b = beta.view(tokens, num_heads).to(torch.bfloat16)
-        gk = decay.view(tokens, num_heads, key_dim).float()
-        core_attn_out = torch_npu.npu_recurrent_gated_delta_rule(
-            q,
-            k,
-            v,
-            recurrent_state_cache,
-            beta=b,
-            scale=scale,
-            actual_seq_lengths=forward_metadata["actual_seq_lengths_q"],
-            ssm_state_indices=ssm_state_indices,
-            num_accepted_tokens=forward_metadata.get("num_accepted_tokens"),
-            g=None,
-            gk=gk,
-        )
-        return core_attn_out.view(batch, seq, num_heads, value_dim)
 
     def _project_gate(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return (
@@ -1777,11 +2345,56 @@ class KimiDeltaAttention(nn.Module):
         self, gate: torch.Tensor, output: torch.Tensor
     ) -> torch.Tensor:
         gate = gate.view(output.shape)
-        output = self.o_norm(output) * torch.sigmoid(gate.float()).to(output.dtype)
+        output = self.o_norm(output) * torch.sigmoid(gate)
         output = self.o_proj(output.view(output.shape[0], -1))
         return reduce_scatter_first_dim(
-            output, self.attn_tp_group, self.attn_tp_size
+            output, self.attn_reduce_scatter_group, self.attn_tp_size
         )
+
+
+def view_bf16_nz(weight):
+    """Expose Linear's NZ storage as [N/16, K, 16] without copying weights."""
+    if weight.dtype != torch.bfloat16 or weight.ndim != 2:
+        raise ValueError("BF16 MLA Prolog requires a two-dimensional BF16 weight")
+    k, output = weight.shape
+    if (torch_npu.get_npu_format(weight) != 29 or k % 16 or output % 16
+            or weight.storage_offset() != 0 or not weight.is_contiguous()):
+        raise ValueError("BF16 MLA Prolog requires an aligned, contiguous NZ weight root")
+    # NZ physical [N/16, K/16, 16, 16] is exactly [N/16, K, 16].
+    # set_ retains the Storage and its NZ descriptor used by Prefill MatMul.
+    return torch.empty(0, dtype=weight.dtype, device=weight.device).set_(
+        weight.untyped_storage(), 0, (output // 16, k, 16), (k * 16, 16, 1),
+    )
+
+
+def pack_mxfp8_nz(weight):
+    """Checkpoint [O, K] E4M3 -> explicit [O/32, K, 32]."""
+    output, k = weight.shape
+    return weight.view(torch.uint8).reshape(output // 32, 32, k).transpose(1, 2).contiguous().view(weight.dtype)
+
+
+def logical_mx_scale(scale, output, k):
+    """Keep the actual E8M0 bytes: one exponent for each group of 32 K."""
+    return scale.view(torch.uint8).reshape(output, k // 64, 2).contiguous().view(torch.float8_e8m0fnu)
+
+
+def write_fp8_cache(merged, cache, slots, descale):
+    """Write both 512 latent and 64 auxiliary dimensions into FP8 PA_NZ.
+
+    Upstream's qscale_kv is a divisor, despite its name: fp8 = value / scale.
+    FA uses that same scale to dequantize. Negative padded slots are skipped.
+    Prefill is eager; chunked Prefill's separate scratch cache stays BF16.
+    """
+    slots = slots.reshape(-1).to(torch.int64)
+    valid = slots >= 0
+    slots = slots[valid]
+    rows = (merged[valid].float() / descale).clamp(-448, 448).to(torch.float8_e4m3fn).view(torch.uint8)
+    block_size, width = cache.shape[1], cache.shape[-1]
+    tiles = width // 32
+    indices = ((slots // block_size)[:, None] * tiles * block_size
+               + torch.arange(tiles, device=slots.device)[None, :] * block_size
+               + (slots % block_size)[:, None]).reshape(-1)
+    torch_npu.npu_scatter_nd_update_(cache.view(torch.uint8).view(-1, 32), indices.view(-1, 1), rows.reshape(-1, 32))
 
 
 class KimiMLAAttention(nn.Module):
@@ -1794,6 +2407,9 @@ class KimiMLAAttention(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        if config.q_lora_rank is None or config.q_lora_rank <= 0:
+            raise ValueError("Kimi K3 MLA requires a positive q_lora_rank")
+        self.config = config
         self.layer_idx = layer_idx
         parallel = None if infer_config is None else infer_config.parallel_config
         self.attn_tp_size = 1 if parallel is None else parallel.attn_tp_size
@@ -1811,6 +2427,17 @@ class KimiMLAAttention(nn.Module):
             if self.attn_tp_size == 1
             else comm_manager.get_group("attn_tp_group")
         )
+        self.attn_reduce_scatter_group = (
+            None
+            if self.attn_tp_size == 1
+            else comm_manager.get_group("attn_reduce_scatter_group")
+        )
+        custom_params = infer_config.model_config.custom_params
+        self.enable_multi_streams = custom_params.get("enable_multi_streams", False)
+        self.use_w8a8c8 = mla_uses_mxfp8(config)
+        self.mla_decode_tp_group = self.attn_tp_group
+        if self.enable_multi_streams and self.attn_tp_size > 1:
+            self.mla_decode_tp_group = comm_manager.get_group("mla_decode_tp_group")
         # Prefill gathers token SP before attention TP. Decode stays request-DP
         # through attention and gathers only at the output-gate TP boundary.
         self.q_lora_rank = config.q_lora_rank
@@ -1823,52 +2450,32 @@ class KimiMLAAttention(nn.Module):
         )
         self.q_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         self.scaling = self.q_head_dim ** -0.5
-        if self.q_lora_rank is not None:
-            self.q_a_proj = ReplicatedLinear(
-                config.hidden_size,
-                self.q_lora_rank,
-                bias=False,
-                quant_config=quant_config,
-                prefix=f"{prefix}.q_a_proj",
-            )
-            self.q_a_layernorm = KimiRMSNorm(self.q_lora_rank)
-            self.q_b_proj = ColumnParallelLinear(
-                self.q_lora_rank,
-                self.total_num_heads * self.q_head_dim,
-                bias=False,
-                tp_size=self.attn_tp_size,
-                tp_rank=self.attn_tp_rank,
-                quant_config=quant_config,
-                prefix=f"{prefix}.q_b_proj",
-            )
-            self.q_b_proj_decode = ColumnParallelLinear(
-                self.q_lora_rank,
-                self.total_num_heads * self.q_head_dim,
-                bias=False,
-                tp_size=1,
-                tp_rank=0,
-                quant_config=quant_config,
-                prefix=f"{prefix}.q_b_proj",
-            )
-        else:
-            self.q_proj = ColumnParallelLinear(
-                config.hidden_size,
-                self.total_num_heads * self.q_head_dim,
-                bias=False,
-                tp_size=self.attn_tp_size,
-                tp_rank=self.attn_tp_rank,
-                quant_config=quant_config,
-                prefix=f"{prefix}.q_proj",
-            )
-            self.q_proj_decode = ColumnParallelLinear(
-                config.hidden_size,
-                self.total_num_heads * self.q_head_dim,
-                bias=False,
-                tp_size=1,
-                tp_rank=0,
-                quant_config=quant_config,
-                prefix=f"{prefix}.q_proj",
-            )
+        self.q_a_proj = ReplicatedLinear(
+            config.hidden_size,
+            self.q_lora_rank,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.q_a_proj",
+        )
+        self.q_a_layernorm = KimiRMSNorm(self.q_lora_rank)
+        self.q_b_proj = ColumnParallelLinear(
+            self.q_lora_rank,
+            self.total_num_heads * self.q_head_dim,
+            bias=False,
+            tp_size=self.attn_tp_size,
+            tp_rank=self.attn_tp_rank,
+            quant_config=quant_config,
+            prefix=f"{prefix}.q_b_proj",
+        )
+        self.q_b_proj_decode = ColumnParallelLinear(
+            self.q_lora_rank,
+            self.total_num_heads * self.q_head_dim,
+            bias=False,
+            tp_size=1,
+            tp_rank=0,
+            quant_config=quant_config,
+            prefix=f"{prefix}.q_b_proj",
+        )
         self.kv_a_proj_with_mqa = ReplicatedLinear(
             config.hidden_size,
             self.kv_lora_rank + self.qk_rope_head_dim,
@@ -1918,54 +2525,289 @@ class KimiMLAAttention(nn.Module):
         )
 
         # ---- Framework paged (PageAttention) KV cache ----
-        # Caches the compressed latent rather than the expanded per-head K/V:
-        #     nope_cache  dim = kv_lora_rank     (512)
-        #     rope_cache  dim = qk_rope_head_dim (64)
-        # Both carry one KV head (MQA), replicated across attn_tp ranks. Decode
-        # absorbs kv_b_proj into the attention; prefill expands on read.
+        # Non-C8 MLA stores the compressed latent and auxiliary key together:
+        #     kv_cache  dim = kv_lora_rank + qk_rope_head_dim (576)
+        # Decode absorbs kv_b_proj into attention; ordinary Prefill expands
+        # K/V on read. MXFP8 uses the same merged geometry in FP8 storage.
         #
-        # K3's MLA is NoPE: FA's query_rope/key_rope parameters carry one more D
-        # segment concatenated into the QK dot product, and the cache write is
-        # handed cos=1 / sin=0.
+        # K3's MLA is NoPE. The merged 576-wide Q/K representation still
+        # contains the auxiliary 64-wide segment expected by Flash MLA, but
+        # no rotary tensors are supplied to either operator.
         self.attn_type = "FullAttention"
         self.block_size = (
             None if infer_config is None else infer_config.scheduler_config.block_size
         )
         # Split out of kv_b_proj once the checkpoint is loaded; see
         # KimiLinearForCausalLM.process_weights_after_loading.
-        self.kv_b_proj_w_k = None
+        self.register_buffer("kv_b_proj_w_k", None)
         self.kv_b_proj_w_v = None
-        self.kv_b_proj_decode_w_k = None
+        self.register_buffer("kv_b_proj_decode_w_k", None)
         self.kv_b_proj_decode_w_v = None
-        self.enable_multi_streams = infer_config.model_config.custom_params.get("enable_multi_streams", False)
         self.exe_mode = None if infer_config is None else infer_config.model_config.exe_mode
-        self.npu_events_kv = tuple(create_event(self.exe_mode, self.enable_multi_streams) for i in range(2))
-        self.npu_events_mla_gate = tuple(create_event(self.exe_mode, self.enable_multi_streams) for i in range(2))
+
+    def prepare_prolog_weights(self) -> None:
+        """Prepare DSL Prolog weights once, outside graph capture."""
+        if self.use_w8a8c8:
+            from ops.quant_mla_prolog import quant_mla_prolog_op
+
+            self.mla_prolog_op = quant_mla_prolog_op
+        else:
+            from ops.mla_prolog_bf16 import mla_prolog_bf16_op
+
+            self.mla_prolog_op = mla_prolog_bf16_op
+        for name, linear in (("qa", self.q_a_proj), ("qb", self.q_b_proj_decode),
+                             ("kva", self.kv_a_proj_with_mqa)):
+            weight = linear.weight.detach()
+            if self.use_w8a8c8:
+                packed = pack_mxfp8_nz(weight)
+                self.register_buffer(f"mla_s_{name}", logical_mx_scale(
+                    linear.weight_scale.detach(), *weight.shape,
+                ))
+            else:
+                packed = view_bf16_nz(weight)
+            self.register_buffer(f"mla_w_{name}", packed)
+        self.register_buffer("mla_gamma_qa", self.q_a_layernorm.weight.detach().float().contiguous())
+        self.register_buffer("mla_gamma_kva", self.kv_a_layernorm.weight.detach().float().contiguous())
+        if self.use_w8a8c8:
+            self.register_buffer("mla_kv_scale", torch.tensor(
+                [1.0], dtype=torch.float32, device=self.q_a_proj.weight.device,
+            ))
+
+    def _flash_mla_attention(
+        self,
+        q: torch.Tensor,
+        kv_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        q_len: int,
+        attention_mask: Optional[torch.Tensor] = None,
+        metadata: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Run Flash MLA against the combined PA_NZ latent cache."""
+        # Prolog's absorbed query uses the latent KV width (512), not the
+        # regular per-head qk_nope width used by q_b_proj (for Kimi K3 that
+        # width is typically 128).  Flash MLA then consumes the 64-wide rope
+        # segment as part of the same 576-wide QK vector.
+        merged_qk_dim = self.kv_lora_rank + self.qk_rope_head_dim
+        kv_cache_nz = self._pa_nz_cache_view(kv_cache, merged_qk_dim)
+        mask_mode = 0 if q_len == 1 else 3
+        attn_mask = attention_mask if mask_mode == 3 else None
+        if metadata is None:
+            metadata = torch.ops.cann_ops_transformer.flash_mla_with_kvcache_metadata(
+                cache_seqlens,
+                num_heads_q=q.shape[1],
+                num_heads_kv=1,
+                cu_seqlens_q=cu_seqlens_q,
+                seqused_q=None,
+                max_seqlen_q=q_len,
+                max_seqlen_kv=-1,
+                head_dim_qk=576,
+                head_dim_v=512,
+                mask_mode=mask_mode,
+                layout_q="TND",
+            )
+        output, _ = torch.ops.cann_ops_transformer.flash_mla_with_kvcache(
+            q.contiguous(),
+            kv_cache_nz,
+            block_table=block_table,
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_q=cu_seqlens_q,
+            seqused_q=None,
+            attn_mask=attn_mask,
+            metadata=metadata,
+            head_dim_v=512,
+            softmax_scale=self.scaling,
+            mask_mode=mask_mode,
+            max_seqlen_q=-1,
+            max_seqlen_kv=-1,
+            layout_q="TND",
+            layout_kv="PA_NZ",
+            layout_out="TND",
+            return_softmax_lse=False,
+        )
+        return output
+
+    def _launch_gate_allgather(self, hidden_states, gate_stream, gate_events):
+        """Start gate AllGather after the current main-stream work completes."""
+        record_stream(
+            self.enable_multi_streams, hidden_states, gate_stream, self.exe_mode
+        )
+        record_event(self.enable_multi_streams, gate_events, 0, self.exe_mode)
+        with npu_stream_switch(
+            self.enable_multi_streams, gate_stream, exe_mode=self.exe_mode
+        ):
+            wait_event(self.enable_multi_streams, gate_events, 0, self.exe_mode)
+            full_hidden = all_gather_first_dim(
+                hidden_states, self.mla_decode_tp_group, self.attn_tp_size
+            )
+            record_event(self.enable_multi_streams, gate_events, 3, self.exe_mode)
+        return full_hidden
+
+    def _forward_decode_flash(
+        self,
+        hidden_states: torch.Tensor,
+        forward_metadata: ForwardMetaData,
+        layer_cache: dict,
+        metadata_events=None,
+        gate_stream=None,
+        gate_events=None,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Run Prolog, then overlap gate AllGather with Flash MLA attention."""
+        tokens = hidden_states.shape[0]
+        block_table = forward_metadata["block_table"][self.attn_type]
+        cache_seqlens = forward_metadata["actual_seq_lengths_kv"]
+        # Flash MLA expects the B+1 prefix-sum form with a leading zero.  The
+        # legacy actual_seq_lengths_cu_q field stores only segment ends.
+        cu_seqlens_q = forward_metadata["query_start_loc"]
+        q_len = tokens // block_table.shape[0]
+        x = hidden_states.contiguous()
+        cache = layer_cache["kv_cache"]
+        slots = forward_metadata["slot_mapping"][self.attn_type].reshape(-1).to(torch.int64).contiguous()
+        if self.use_w8a8c8:
+            x, sx = torch_npu.npu_dynamic_mx_quant(x, dst_type=torch.float8_e4m3fn)
+            sx = sx.view(torch.uint8).reshape(tokens, hidden_states.shape[-1] // 64, 2).view(torch.float8_e8m0fnu)
+            outs = self.mla_prolog_op(
+                x, self.mla_w_qa, self.mla_w_qb, self.mla_w_kva,
+                self.kv_b_proj_decode_w_k, sx, self.mla_s_qa, self.mla_s_qb, self.mla_s_kva,
+                self.mla_gamma_qa, self.mla_gamma_kva, cache, slots, self.mla_kv_scale,
+                norm_eps=1e-6, quant_mode_aw=1, quant_mode_c=1,
+            )
+            q, q_descale = outs[0], outs[1]
+        else:
+            q = self.mla_prolog_op(
+                x, self.mla_w_qa, self.mla_w_qb, self.mla_w_kva,
+                self.kv_b_proj_decode_w_k, self.mla_gamma_qa, self.mla_gamma_kva,
+                cache, slots, self.q_a_layernorm.variance_epsilon,
+            )
+        full_hidden = None
+        if self.use_output_gate and self.enable_multi_streams:
+            # Wait for Prolog on device before starting AllGather on the gate
+            # stream. Flash MLA continues on the main stream without waiting
+            # for AllGather, so these two operations can overlap.
+            full_hidden = self._launch_gate_allgather(
+                hidden_states, gate_stream, gate_events
+            )
+        if forward_metadata.get("flash_mla_metadata_async", False):
+            wait_event(
+                self.enable_multi_streams,
+                metadata_events,
+                1,
+                self.exe_mode,
+            )
+        if self.use_w8a8c8:
+            blocks, block_size, _, width = cache.shape
+            output, _ = torch.ops.cann_ops_transformer.quant_flash_mla_with_kvcache(
+                q, cache.view(blocks, 1, width // 32, block_size, 32),
+                q_descale, self.mla_kv_scale, block_table, cache_seqlens, 1,
+                cu_seqlens_q=cu_seqlens_q,
+                # Constructed once with model inputs; shared by all MLA layers.
+                seqused_q=forward_metadata["actual_seq_lengths_q"],
+                metadata=forward_metadata["flash_mla_metadata"],
+                head_dim_v=self.kv_lora_rank,
+                attn_mask=forward_metadata.get("flash_attention_mask") if q_len > 1 else None,
+                softmax_scale=self.scaling, mask_mode=3 if q_len > 1 else 0,
+                max_seqlen_q=q_len,
+                layout_q="TND", layout_kv="PA_NZ", layout_out="TND",
+            )
+        else:
+            output = self._flash_mla_attention(
+                q,
+                cache,
+                block_table,
+                cache_seqlens,
+                cu_seqlens_q,
+                q_len,
+                forward_metadata.get("flash_attention_mask"),
+                forward_metadata.get("flash_mla_metadata"),
+            )
+        output = output.to(device=self.kv_b_proj_decode_w_v.device)
+        output = torch_npu.npu_transpose_batchmatmul(
+            output,
+            self.kv_b_proj_decode_w_v,
+            bias=None,
+            scale=None,
+            perm_x1=(1, 0, 2),
+            perm_x2=(0, 1, 2),
+            perm_y=(1, 0, 2),
+            batch_split_factor=self.attn_tp_size,
+        )
+        if self.attn_tp_size > 1:
+            # Contiguous [TP, local_tokens, heads * v_dim / TP], ready for
+            # AllToAll. Keep destination rank first; do not flatten as tokens.
+            return output, full_hidden
+        return output.reshape(tokens, self.total_num_heads * self.v_head_dim), full_hidden
 
     def _write_latent_cache(
         self,
         compressed: torch.Tensor,
         slot_mapping: torch.Tensor,
         layer_cache: dict,
+        cache_prefix: str = "",
     ):
         """RMSNorm this step's latent and scatter it into the paged blocks.
 
-        Writes the NZ layout the absorbed decode reads back. K3 is NoPE, so the
-        extra 64 key channels are cached without rotation or permutation.
+        Resident caches use the writer's logical 4D PA shape. Non-C8 writes
+        scatter individual NZ tiles; the C8 writer uses cache_mode="PA_NZ" to
+        update the backing storage in NZ.
         """
         k_nope, k_rope = torch.split(
             compressed, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
         )
+        merged_cache = layer_cache.get(f"{cache_prefix}kv_cache")
+        if merged_cache is not None:
+            # Non-C8 MLA keeps ckv and ckr in one PA_NZ cache.
+            # Writes from the regular Prefill projection update the same
+            # storage that cannbot Prolog uses during Decode.
+            k_nope = self.kv_a_layernorm(k_nope)
+            merged = torch.cat((k_nope, k_rope), dim=-1).contiguous()
+            if self.use_w8a8c8 and not cache_prefix:
+                write_fp8_cache(merged, merged_cache, slot_mapping, self.mla_kv_scale)
+                return
+            block_size = merged_cache.shape[1]
+            tile_count = merged.shape[-1] // _KV_CACHE_NZ_DIM
+            slots = slot_mapping.reshape(-1).to(torch.int64)
+            block_ids = torch.div(slots, block_size, rounding_mode="floor")
+            offsets = torch.remainder(slots, block_size)
+            tile_indices = torch.arange(
+                tile_count, dtype=torch.int64, device=slots.device
+            )
+            tile_indices = (
+                block_ids[:, None] * tile_count * block_size
+                + tile_indices[None, :] * block_size
+                + offsets[:, None]
+            ).reshape(-1)
+            nz_cache = merged_cache.view(-1, _KV_CACHE_NZ_DIM)
+            torch_npu.npu_scatter_nd_update_(
+                nz_cache,
+                tile_indices.view(-1, 1),
+                merged.view(-1, _KV_CACHE_NZ_DIM),
+            )
+            return
+        nope_cache = layer_cache[f"{cache_prefix}nope_cache"]
+        rope_cache = layer_cache[f"{cache_prefix}rope_cache"]
         k_nope = self.kv_a_layernorm(k_nope)
-        nope_cache = layer_cache["nope_cache"]
-        rope_cache = layer_cache["rope_cache"]
-        block_num, block_size = nope_cache.shape[:2]
         torch_npu.npu_scatter_pa_kv_cache(
             k_nope.unsqueeze(1),
             k_rope.unsqueeze(1),
-            nope_cache.view(block_num, self.kv_lora_rank // _KV_CACHE_NZ_DIM, block_size, _KV_CACHE_NZ_DIM),
-            rope_cache.view(block_num, self.qk_rope_head_dim // _KV_CACHE_NZ_DIM, block_size, _KV_CACHE_NZ_DIM),
-            slot_mapping.view(-1),
+            nope_cache,
+            rope_cache,
+            slot_mapping.reshape(-1),
+            cache_mode="Norm",
+        )
+
+    @staticmethod
+    def _pa_nz_cache_view(
+        kv_cache: torch.Tensor, merged_dim: int
+    ) -> torch.Tensor:
+        """View logical Prolog PA storage as Flash MLA's physical NZ layout."""
+        block_num, block_size, num_kv, cache_dim = kv_cache.shape
+        return kv_cache.view(
+            block_num,
+            num_kv,
+            cache_dim // _KV_CACHE_NZ_DIM,
+            block_size,
+            _KV_CACHE_NZ_DIM,
         )
 
     def _prepare_query_inputs(
@@ -2001,36 +2843,20 @@ class KimiMLAAttention(nn.Module):
                 forward_metadata["slot_mapping"][self.attn_type],
                 layer_cache=layer_cache,
             )
+        if forward_metadata.get("is_chunked_prefill", False):
+            self._write_latent_cache(
+                compressed,
+                forward_metadata["slot_mapping"]["PrefillFullAttention"],
+                layer_cache,
+                cache_prefix="prefill_",
+            )
+            return self._prefill_chunk_attention(
+                query_nope, query_rope, tokens, forward_metadata, layer_cache
+            )
         return self._prefill_attention(
             query_nope, query_rope, k_nope, k_rope, tokens, forward_metadata
         )
 
-    def _forward_decode(
-            self,
-            query: torch.Tensor,
-            forward_metadata: ForwardMetaData,
-            layer_cache: dict,
-            kv_stream: Optional[torch.npu.Stream],
-    ) -> torch.Tensor:
-        """Attend against the cached latent with kv_b_proj absorbed in."""
-        tokens = query.shape[0]
-        query_nope, query_rope = self._prepare_query_inputs(query)
-        block_table = forward_metadata["block_table"][self.attn_type]
-
-        actual_seq_qlen = forward_metadata["actual_seq_lengths_cu_list_q"]
-        actual_seq_kvlen = forward_metadata["actual_seq_lengths_list_kv"]
-
-        return self._decode_attention(
-            query_nope,
-            query_rope,
-            tokens,
-            block_table,
-            actual_seq_qlen,
-            actual_seq_kvlen,
-            forward_metadata.get("attention_mask"),
-            layer_cache,
-            kv_stream,
-        )
 
     def _prefill_attention(
         self,
@@ -2073,193 +2899,202 @@ class KimiMLAAttention(nn.Module):
         )
         return output.reshape(tokens, self.num_heads * self.v_head_dim)
 
-    def _decode_attention(
+    def _prefill_chunk_attention(
         self,
         query_nope: torch.Tensor,
         query_rope: torch.Tensor,
         tokens: int,
-        block_table: torch.Tensor,
-        actual_seq_qlen,
-        actual_seq_kvlen,
-        attention_mask,
+        forward_metadata: ForwardMetaData,
         layer_cache: dict,
-        kv_stream: Optional[torch.npu.Stream],
     ) -> torch.Tensor:
-        """Attend against the cached latent with kv_b_proj absorbed in."""
-        # W_UK folds into the query: [T, N, qk_nope] x [N, qk_nope, kv_lora]
         query_latent = torch_npu.npu_transpose_batchmatmul(
             query_nope,
-            self.kv_b_proj_decode_w_k,
+            self.kv_b_proj_w_k,
             bias=None,
             scale=None,
             perm_x1=(1, 0, 2),
             perm_x2=(0, 1, 2),
             perm_y=(1, 0, 2),
-        ).view(tokens, self.total_num_heads, self.kv_lora_rank)
-
-        nope_nz, rope_nz = self._nz_cache_views(layer_cache)
-        wait_event(self.enable_multi_streams, self.npu_events_kv, 1, self.exe_mode)
-        batch = block_table.shape[0]
-        q_len = tokens // batch
-        sparse_mode = 0 if q_len == 1 else 3
-        causal_mask = None if q_len == 1 else attention_mask
+        ).view(tokens, self.num_heads, self.kv_lora_rank)
+        nope_cache, rope_cache = self._nz_cache_inputs(layer_cache, cache_prefix="prefill_")
         output, _ = torch_npu.npu_fused_infer_attention_score_v2(
             query_latent,
-            nope_nz,
-            nope_nz,
+            nope_cache,
+            nope_cache,
             query_rope=query_rope,
-            key_rope=rope_nz,
-            num_query_heads=query_latent.shape[1],
+            key_rope=rope_cache,
+            num_query_heads=self.num_heads,
             num_key_value_heads=1,
             softmax_scale=self.scaling,
             input_layout="TND_NTD",
-            sparse_mode=sparse_mode,
-            atten_mask=causal_mask,
-            actual_seq_qlen=actual_seq_qlen,
-            actual_seq_kvlen=actual_seq_kvlen,
-            block_table=block_table,
+            sparse_mode=3,
+            atten_mask=forward_metadata["attention_mask"],
+            actual_seq_qlen=forward_metadata["actual_seq_lengths_cu_list_q"],
+            actual_seq_kvlen=forward_metadata["actual_seq_lengths_list_kv"],
+            block_table=forward_metadata["block_table"]["PrefillFullAttention"],
             block_size=self.block_size,
         )
-        # TND_NTD names the output layout: [N, T, kv_lora_rank]. W_UV maps the
-        # unpadded heads back to [T, N, v_head_dim].
         output = torch_npu.npu_transpose_batchmatmul(
-            output[: self.total_num_heads],
-            self.kv_b_proj_decode_w_v,
+            output[: self.num_heads],
+            self.kv_b_proj_w_v,
             bias=None,
             scale=None,
             perm_x1=(0, 1, 2),
             perm_x2=(0, 1, 2),
             perm_y=(1, 0, 2),
-        ).reshape(tokens, self.total_num_heads * self.v_head_dim)
-        return output
-
-    def _nz_cache_views(self, layer_cache: dict) -> tuple[torch.Tensor, torch.Tensor]:
-        """View the latent blocks in the NZ layout the absorbed FA expects."""
-        nope_cache = layer_cache["nope_cache"]
-        rope_cache = layer_cache["rope_cache"]
-        blocks, block_size = nope_cache.shape[:2]
-        nz = _KV_CACHE_NZ_DIM
-        return (
-            nope_cache.view(blocks, 1, self.kv_lora_rank // nz, block_size, nz),
-            rope_cache.view(blocks, 1, self.qk_rope_head_dim // nz, block_size, nz),
         )
+        return output.reshape(tokens, self.num_heads * self.v_head_dim)
 
-    def _forward_kv_attention(
-            self,
-            tokens: int,
-            hidden_states: torch.Tensor,
-            forward_metadata: ForwardMetaData,
-            layer_cache: dict,
-            kv_stream: Optional[torch.npu.Stream] = None,
-    ) -> None:
-        slot_mapping = forward_metadata["slot_mapping"][self.attn_type]
-        record_stream(
-            self.enable_multi_streams, slot_mapping, kv_stream, self.exe_mode
+
+    def _nz_cache_inputs(
+        self, layer_cache: dict, cache_prefix: str = ""
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return cache tensors in the layout expected by the attention path."""
+        nope_cache = layer_cache[f"{cache_prefix}nope_cache"]
+        rope_cache = layer_cache[f"{cache_prefix}rope_cache"]
+
+        block_num, block_size, num_kv_heads, nope_dim = nope_cache.shape
+        rope_block_num, rope_block_size, rope_num_kv_heads, rope_dim = (
+            rope_cache.shape
         )
-        with npu_stream_switch(self.enable_multi_streams, kv_stream, exe_mode=self.exe_mode):
-            wait_event(self.enable_multi_streams, self.npu_events_kv, 0, self.exe_mode)
-            compressed = self.kv_a_proj_with_mqa(hidden_states)
-            self._write_latent_cache(
-                compressed, slot_mapping, layer_cache=layer_cache
+        if (
+            block_num != rope_block_num
+            or block_size != rope_block_size
+            or num_kv_heads != 1
+            or rope_num_kv_heads != 1
+        ):
+            raise RuntimeError(
+                "resident MLA caches must share [Block, BlockSize, 1] dimensions"
             )
-            record_event(self.enable_multi_streams, self.npu_events_kv, 1, self.exe_mode)
+        nope_nz_dim = (
+            _KV_CACHE_NZ_DIM
+        )
+        if nope_dim % nope_nz_dim or rope_dim % _KV_CACHE_NZ_DIM:
+            raise RuntimeError("resident MLA cache widths must align to PA_NZ tiles")
+
+        # Writers receive logical [Block, BlockSize, N, D]. With PA_NZ they
+        # update the backing storage as [Block, D/tile, BlockSize, N, tile].
+        # FIA reads that same storage as [Block, N, D/tile, BlockSize, tile].
+        return (
+            nope_cache.view(
+                block_num,
+                num_kv_heads,
+                nope_dim // nope_nz_dim,
+                block_size,
+                nope_nz_dim,
+            ),
+            rope_cache.view(
+                block_num,
+                rope_num_kv_heads,
+                rope_dim // _KV_CACHE_NZ_DIM,
+                block_size,
+                _KV_CACHE_NZ_DIM,
+            ),
+        )
+
 
     def forward(
             self,
             hidden_states: torch.Tensor,
             forward_metadata: ForwardMetaData,
             layer_cache: dict,
-            kv_stream: Optional[torch.npu.Stream] = None
+            mla_ctx: Optional[MLAContext] = None,
     ) -> torch.Tensor:
         is_prefill = forward_metadata["is_prefill"]
+        gate_stream = mla_ctx.gate_stream if mla_ctx is not None else None
+        gate_events = mla_ctx.gate_events if mla_ctx is not None else None
+        chunked_prefill = forward_metadata.get("is_chunked_prefill", False)
+        sp_pad_len = 0
         if is_prefill:
             hidden_states = all_gather_first_dim(
                 hidden_states, self.attn_tp_group, self.attn_tp_size
             )
+            if chunked_prefill:
+                sp_pad_len = hidden_states.shape[0] - forward_metadata["prompt_tokens"]
+                if sp_pad_len:
+                    hidden_states = hidden_states[:-sp_pad_len]
         tokens = hidden_states.shape[0]
 
         main_stream = torch.npu.current_stream()
         gate = None
-        normalized_q = self.q_a_layernorm(self.q_a_proj(hidden_states))
+        full_hidden = None
         if is_prefill:
-            query = (
-                self.q_b_proj(normalized_q)
-                if self.q_lora_rank is not None
-                else self.q_proj(hidden_states)
-            ).view(tokens, self.num_heads, self.q_head_dim)
+            normalized_q = self.q_a_layernorm(self.q_a_proj(hidden_states))
+            query = self.q_b_proj(normalized_q).view(
+                tokens, self.num_heads, self.q_head_dim
+            )
             compressed = self.kv_a_proj_with_mqa(hidden_states)
             output = self._forward_prefill(
                 query, compressed, forward_metadata, layer_cache
             )
         else:
-            query = (
-                self.q_b_proj_decode(normalized_q)
-                if self.q_lora_rank is not None
-                else self.q_proj_decode(hidden_states)
-            ).view(tokens, self.total_num_heads, self.q_head_dim)
-            record_stream(self.enable_multi_streams, hidden_states, kv_stream, self.exe_mode)
-            record_event(self.enable_multi_streams, self.npu_events_kv, 0, self.exe_mode)
-            self._forward_kv_attention(
-                tokens, hidden_states, forward_metadata, layer_cache, kv_stream
+            output, full_hidden = self._forward_decode_flash(
+                hidden_states, forward_metadata, layer_cache,
+                metadata_events=mla_ctx.metadata_events if mla_ctx is not None else None,
+                gate_stream=gate_stream, gate_events=gate_events,
             )
-            output = self._forward_decode(
-                query, forward_metadata, layer_cache, kv_stream
-            )
+            record_event(self.enable_multi_streams, gate_events, 2, self.exe_mode)
+
+        if not is_prefill:
+            if self.use_output_gate and self.enable_multi_streams:
+                wait_event(
+                    self.enable_multi_streams,
+                    gate_events,
+                    3,
+                    self.exe_mode,
+                )
             output = dp_to_tp_all_to_all(
                 output,
-                self.attn_tp_group,
+                self.mla_decode_tp_group,
                 self.attn_tp_size,
                 forward_metadata["oproj_output_rows"],
                 self.o_proj_channel_width,
+                input_is_tp_packed=True,
             )
 
         if self.use_output_gate:
             if not is_prefill:
-                record_stream(
-                    self.enable_multi_streams, hidden_states, kv_stream, self.exe_mode
-                )
-                record_event(
-                    self.enable_multi_streams,
-                    self.npu_events_mla_gate,
-                    0,
-                    self.exe_mode,
-                )
-                with npu_stream_switch(
-                    self.enable_multi_streams, kv_stream, exe_mode=self.exe_mode
-                ):
+                if self.enable_multi_streams:
+                    with npu_stream_switch(
+                        self.enable_multi_streams,
+                        gate_stream,
+                        exe_mode=self.exe_mode,
+                    ):
+                        wait_event(
+                            self.enable_multi_streams,
+                            gate_events,
+                            2,
+                            self.exe_mode,
+                        )
+                        gate = torch.sigmoid(self.g_proj(full_hidden))
+                        record_event(
+                            self.enable_multi_streams,
+                            gate_events,
+                            1,
+                            self.exe_mode,
+                        )
                     wait_event(
                         self.enable_multi_streams,
-                        self.npu_events_mla_gate,
-                        0,
-                        self.exe_mode,
-                    )
-                    full_hidden = all_gather_first_dim(
-                        hidden_states, self.attn_tp_group, self.attn_tp_size
-                    )
-                    gate = torch.sigmoid(
-                        self.g_proj(full_hidden).float()
-                    ).to(hidden_states.dtype)
-                    record_event(
-                        self.enable_multi_streams,
-                        self.npu_events_mla_gate,
+                        gate_events,
                         1,
                         self.exe_mode,
                     )
-                wait_event(
-                    self.enable_multi_streams,
-                    self.npu_events_mla_gate,
-                    1,
-                    self.exe_mode,
-                )
-                record_stream(
-                    self.enable_multi_streams, gate, main_stream, self.exe_mode
-                )
+                    record_stream(
+                        self.enable_multi_streams, gate, main_stream, self.exe_mode
+                    )
+                else:
+                    full_hidden = all_gather_first_dim(
+                        hidden_states, self.attn_tp_group, self.attn_tp_size
+                    )
+                    gate = torch.sigmoid(self.g_proj(full_hidden))
             else:
-                gate = torch.sigmoid(self.g_proj(hidden_states).float()).to(hidden_states.dtype)
+                gate = torch.sigmoid(self.g_proj(hidden_states))
             output = output * gate
         output = self.o_proj(output)
+        if sp_pad_len:
+            output = F.pad(output, (0, 0, 0, sp_pad_len))
         return reduce_scatter_first_dim(
-            output, self.attn_tp_group, self.attn_tp_size
+            output, self.attn_reduce_scatter_group, self.attn_tp_size
         )
 
 
@@ -2307,68 +3142,6 @@ class AttnResPhase2Slot(NamedTuple):
     inter_numerator: torch.Tensor
     inter_max: torch.Tensor
     inter_exp_sum: torch.Tensor
-
-
-def _prepare_attn_res_phase1(
-    block_residual: torch.Tensor,
-    effective_queries: torch.Tensor,
-    valid_blocks: torch.Tensor,
-    epsilon: torch.Tensor,
-) -> AttnResPhase1Stats:
-    """Prepare FP32 Online Softmax statistics for every slot in one block."""
-    values_float = block_residual.float()
-    inv_rms = torch.rsqrt(values_float.square().mean(dim=-1) + epsilon)
-    inter_logits = torch.matmul(
-        values_float, effective_queries.transpose(0, 1)
-    ).permute(2, 0, 1) * inv_rms.unsqueeze(0)
-    valid_mask = (
-        torch.arange(block_residual.shape[1], device=block_residual.device)
-        < valid_blocks
-    )
-    inter_logits = inter_logits.masked_fill(
-        ~valid_mask.view(1, 1, -1), float("-inf")
-    )
-    inter_max = inter_logits.max(dim=2).values
-    inter_exp = torch.exp(inter_logits - inter_max.unsqueeze(2))
-    inter_exp_sum = inter_exp.sum(dim=2)
-    inter_numerator = torch.matmul(
-        inter_exp.permute(1, 0, 2), values_float
-    ).permute(1, 0, 2)
-    return AttnResPhase1Stats(
-        inter_numerator=inter_numerator,
-        inter_max=inter_max,
-        inter_exp_sum=inter_exp_sum,
-    )
-
-
-def _update_attn_res_phase2(
-    partial_block: torch.Tensor,
-    partial_delta: torch.Tensor,
-    slot: AttnResPhase2Slot,
-    epsilon: torch.Tensor,
-) -> torch.Tensor:
-    """Update partial in place, then merge one selected slot with Online Softmax."""
-    partial_updated = (partial_block.float() + partial_delta.float()).to(
-        partial_block.dtype
-    )
-    partial_block.copy_(partial_updated)
-    partial_float = partial_block.float()
-    input_logit = (
-        torch.matmul(partial_float, slot.effective_query)
-        * torch.rsqrt(partial_float.square().mean(dim=-1) + epsilon)
-    )
-
-    merged_max = torch.maximum(slot.inter_max, input_logit)
-    inter_scale = torch.exp(slot.inter_max - merged_max)
-    input_scale = torch.exp(input_logit - merged_max)
-    merged_exp_sum = inter_scale * slot.inter_exp_sum + input_scale
-    merged_numerator = (
-        inter_scale.unsqueeze(-1) * slot.inter_numerator
-        + input_scale.unsqueeze(-1) * partial_float
-    )
-    return (
-        merged_numerator / merged_exp_sum.unsqueeze(-1)
-    ).to(partial_block.dtype)
 
 
 class KimiDecoderLayer(nn.Module):
@@ -2420,12 +3193,6 @@ class KimiDecoderLayer(nn.Module):
         self.post_attention_layernorm = KimiRMSNorm(
             config.hidden_size, config.rms_norm_eps
         )
-        self.attn_res_block_size = config.attn_res_block_size
-        self.completed_blocks = (
-            layer_idx + self.attn_res_block_size - 1
-        ) // self.attn_res_block_size
-        self.starts_new_block = layer_idx % self.attn_res_block_size == 0
-        self.block_slot = layer_idx // self.attn_res_block_size
         self.self_attention_res_norm = KimiRMSNorm(
             config.hidden_size, config.rms_norm_eps
         )
@@ -2442,10 +3209,12 @@ class KimiDecoderLayer(nn.Module):
             layer_cache: dict = None,
             query_start_loc: Optional[torch.Tensor] = None,
             query_boundaries: Optional[list[int]] = None,
-            kv_stream: Optional[torch.npu.Stream] = None
+            mla_ctx: Optional[MLAContext] = None,
+            replayssm_ctx: Optional[ReplaySSMContext] = None,
+            input_normalized: bool = False,
     ) -> torch.Tensor:
         """Run the attention delta for the selected attention type."""
-        normalized_states = self.input_layernorm(hidden_states)
+        normalized_states = hidden_states if input_normalized else self.input_layernorm(hidden_states)
         if self.is_linear_attn:
             return self.self_attn(
                 normalized_states,
@@ -2453,6 +3222,7 @@ class KimiDecoderLayer(nn.Module):
                 layer_cache,
                 query_start_loc,
                 query_boundaries,
+                replayssm_ctx,
             )
         mla_metadata = (
             forward_metadata
@@ -2460,7 +3230,7 @@ class KimiDecoderLayer(nn.Module):
             else forward_metadata["mla_decode_metadata"]
         )
         return self.self_attn(
-            normalized_states, mla_metadata, layer_cache, kv_stream
+            normalized_states, mla_metadata, layer_cache, mla_ctx
         )
 
     def forward_mlp(
@@ -2468,69 +3238,16 @@ class KimiDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         forward_metadata: ForwardMetaData = None,
         moe_ctx: Optional[MoEContext] = None,
+        input_normalized: bool = False,
     ) -> torch.Tensor:
         """Run the original MLP/MoE delta without changing EP or SP behavior."""
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        if not input_normalized:
+            hidden_states = self.post_attention_layernorm(hidden_states)
         if hasattr(self, "block_sparse_moe"):
             return self.block_sparse_moe(
                 hidden_states, forward_metadata["is_prefill"], moe_ctx
             )
         return self.mlp(hidden_states)
-
-    def forward(
-            self,
-            hidden_states: torch.Tensor,
-            block_residual: torch.Tensor,
-            forward_metadata: ForwardMetaData = None,
-            cache_data: tuple[dict, ...] = None,
-            query_start_loc: Optional[torch.Tensor] = None,
-            query_boundaries: Optional[list[int]] = None,
-            moe_ctx: Optional[MoEContext] = None,
-            kv_stream: Optional[torch.npu.Stream] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        prefix_sum = hidden_states
-        if self.completed_blocks > 0:
-            hidden_states = _apply_attn_res(
-                prefix_sum,
-                block_residual,
-                self.self_attention_res_proj,
-                self.self_attention_res_norm,
-                valid_blocks=self.completed_blocks,
-            )
-        attention_input = hidden_states
-        if self.starts_new_block:
-            if self.block_slot >= block_residual.shape[1]:
-                raise RuntimeError("AttnRes fixed buffer is smaller than the layer table")
-            block_indices = (
-                    torch.arange(block_residual.shape[0], device=block_residual.device)
-                    * block_residual.shape[1]
-                    + self.block_slot
-            )
-            torch_npu.npu_scatter_nd_update_(
-                block_residual.view(-1, block_residual.shape[-1]),
-                block_indices.view(-1, 1),
-                prefix_sum,
-            )
-            prefix_sum = None
-
-        attention_output = self.forward_attention(
-            hidden_states,
-            forward_metadata,
-            cache_data[self.layer_idx],
-            query_start_loc,
-            query_boundaries,
-            kv_stream
-        )
-        prefix_sum = attention_output if prefix_sum is None else prefix_sum + attention_output
-        mlp_input = _apply_attn_res(
-            prefix_sum,
-            block_residual,
-            self.mlp_res_proj,
-            self.mlp_res_norm,
-            valid_blocks=self.completed_blocks + int(self.starts_new_block),
-        )
-        mlp_output = self.forward_mlp(mlp_input, forward_metadata, moe_ctx)
-        return prefix_sum + mlp_output, block_residual, attention_input
 
 
 class KimiLinearModel(nn.Module):
@@ -2543,17 +3260,16 @@ class KimiLinearModel(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
-        self.attn_res_mode = (
-            config.attn_res_mode
-            if config.attn_res_mode in ("original", "fused")
-            else "two_phase"
-        )
+        if _block_attn_res_prepare_impl is None:
+            raise ImportError(
+                "Kimi K3 requires cann_ops_transformer.ops fused AttnRes operators"
+            ) from _attn_res_import_error
         self.uses_dspark_draft = (
             infer_config is not None
-            and infer_config.model_config.draft_model_type == "dspark"
+            and infer_config.model_config.draft_model_type
+            in DSPARK_DRAFT_MODEL_TYPES
         )
         self.dspark_target_layer_ids = ()
-        logger.info("Kimi K3 AttnRes mode: %s", self.attn_res_mode)
         parallel = None if infer_config is None else infer_config.parallel_config
         self.attn_tp_size = 1 if parallel is None else parallel.attn_tp_size
         # Prefill shards packed tokens; Decode shards requests (DP-TP-DP).
@@ -2572,10 +3288,20 @@ class KimiLinearModel(nn.Module):
         self.embed_tp_group = (
             comm_manager.get_group("embed_tp_group") if self.embed_tp_size > 1 else None
         )
+        self.embed_reduce_scatter_group = None
+        if self.embed_tp_size == self.attn_tp_size and self.embed_tp_size > 1:
+            scatter_group = comm_manager.get_group("attn_reduce_scatter_group")
+            # Equal sizes alone do not guarantee identical token ownership.
+            if scatter_group is not None and (
+                dist.get_process_group_ranks(self.embed_tp_group)
+                == dist.get_process_group_ranks(self.attn_tp_group)
+                == dist.get_process_group_ranks(scatter_group)
+            ):
+                self.embed_reduce_scatter_group = scatter_group
         if self.embed_tp_size > 1:
             # Vocab-parallel embedding: each rank holds vocab/embed_tp rows,
-            # embeds only its own id range and all_reduces to reassemble the full
-            # hidden (see forward). Saves the replicated vocab*hidden table.
+            # then sums contributions using ReduceScatter when its rank layout
+            # matches attention, or AllReduce before the token split otherwise.
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
@@ -2590,9 +3316,8 @@ class KimiLinearModel(nn.Module):
             )
 
 
-        enable_multi_streams =  infer_config.model_config.custom_params.get("enable_multi_streams", False)
-        exe_mode = infer_config.model_config.exe_mode
-        self._kv_stream = create_stream('kv', exe_mode) if enable_multi_streams else None
+        self.mla_ctx = MLAContext(infer_config)
+        self.replayssm_ctx = ReplaySSMContext(infer_config)
 
         # MoEContext creates the shared stream and sym_buffer used by mega_moe.
         # All MoE layers share this MoEContext for multi-stream computation of shared experts.
@@ -2639,13 +3364,13 @@ class KimiLinearModel(nn.Module):
         else:
             self.decode_attn_res_tokens = None
             self.max_attn_res_tokens = None
-        self.block_residual_buffer: Optional[torch.Tensor] = None
-        self.decode_block_residual_buffer: Optional[torch.Tensor] = None
+        self.register_buffer("block_residual_buffer", None, persistent=False)
+        self.register_buffer("decode_block_residual_buffer", None, persistent=False)
+        self.register_buffer("decode_attn_res_block_indices", None, persistent=False)
         self.register_buffer(
             "attn_res_effective_queries", None, persistent=False
         )
         self.register_buffer("attn_res_valid_blocks", None, persistent=False)
-        self.register_buffer("attn_res_epsilon", None, persistent=False)
         self.output_attn_res_norm = KimiRMSNorm(
             config.hidden_size,
             config.rms_norm_eps,
@@ -2655,12 +3380,18 @@ class KimiLinearModel(nn.Module):
             config.hidden_size,
             config.rms_norm_eps,
         )
+        self.attn_metadata = None
+
+    def bind_attn_metadata(self, metadata) -> None:
+        """Bind request metadata so Flash MLA preparation follows embedding."""
+        self.attn_metadata = metadata
+        self.mla_ctx.metadata_events = metadata.metadata_events
 
     def init_block_residual(self, device, dtype) -> torch.Tensor:
         """Allocate the resident AttnRes buffer outside any captured graph.
 
-        Called from the first (eager) prefill, so by the time decode is
-        captured the tensor already exists with a stable object id / address.
+        Called during post-load runtime initialization, so both Prefill and
+        Decode see tensors with stable object ids and addresses.
         """
         if self.max_attn_res_tokens is None:
             raise RuntimeError(
@@ -2674,33 +3405,46 @@ class KimiLinearModel(nn.Module):
             device=device,
         )
         torch._dynamo.mark_static(self.block_residual_buffer)
-        if self.attn_res_mode == "fused":
-            self.decode_block_residual_buffer = torch.zeros(
-                self.decode_attn_res_tokens,
-                self.max_attn_res_blocks,
-                self.config.hidden_size,
-                dtype=dtype,
-                device=device,
-            )
-            torch._dynamo.mark_static(self.decode_block_residual_buffer)
-        if self.attn_res_mode != "original":
-            self.attn_res_valid_blocks = torch.arange(
-                1,
-                self.max_attn_res_blocks + 1,
-                dtype=torch.int64,
-                device=device,
-            )
-            self.attn_res_epsilon = torch.tensor(
-                self.config.rms_norm_eps,
-                dtype=torch.float32,
-                device=device,
-            )
+        self.decode_block_residual_buffer = torch.zeros(
+            self.decode_attn_res_tokens,
+            self.max_attn_res_blocks,
+            self.config.hidden_size,
+            dtype=dtype,
+            device=device,
+        )
+        torch._dynamo.mark_static(self.decode_block_residual_buffer)
+        # Reuse contiguous [T, 1] scatter indices for fused decode.
+        self.decode_attn_res_block_indices = (
+            torch.arange(self.decode_attn_res_tokens, device=device).view(1, -1, 1)
+            * self.max_attn_res_blocks
+            + torch.arange(self.max_attn_res_blocks, device=device).view(-1, 1, 1)
+        )
+        torch._dynamo.mark_static(self.decode_attn_res_block_indices)
+        self.attn_res_valid_blocks = torch.arange(
+            1,
+            self.max_attn_res_blocks + 1,
+            dtype=torch.int64,
+            device=device,
+        ).to(torch.uint64)
         return self.block_residual_buffer
+
+    def initialize_runtime_buffers(self) -> None:
+        """Create fixed AttnRes buffers before any model forward is compiled."""
+        if self.block_residual_buffer is not None:
+            if (
+                self.decode_block_residual_buffer is None
+                or self.decode_attn_res_block_indices is None
+            ):
+                raise RuntimeError(
+                    "fused AttnRes decode buffers are only partially initialized"
+                )
+            return
+
+        reference_weight = self.embed_tokens.weight
+        self.init_block_residual(reference_weight.device, torch.float32)
 
     def prepare_attn_res_effective_queries(self) -> None:
         """Precompute q * RMSNorm gain once after checkpoint loading."""
-        if self.attn_res_mode == "original":
-            return
         first_weight = self.layers[0].self_attention_res_norm.weight
         effective_queries = torch.empty(
             2 * len(self.layers),
@@ -2723,38 +3467,36 @@ class KimiLinearModel(nn.Module):
             )
         self.attn_res_effective_queries = effective_queries
 
-    def _get_block_residual(self, tokens: int, like: torch.Tensor) -> torch.Tensor:
-        target_dtype = (
-            torch.float32 if self.attn_res_mode == "fused" else like.dtype
-        )
+    def _get_block_residual(self, tokens: int) -> torch.Tensor:
         buffer = self.block_residual_buffer
         if buffer is None:
-            # Only taken on the first forward (eager prefill), never inside the
-            # decode graph.
-            buffer = self.init_block_residual(like.device, target_dtype)
+            raise RuntimeError(
+                "AttnRes buffers must be initialized before model forward"
+            )
         if tokens > buffer.shape[0]:
             raise RuntimeError(
                 f"AttnRes buffer holds {buffer.shape[0]} tokens but this step needs "
                 f"{tokens}; raise scheduler_config.max_prefill_tokens"
             )
-        block_residual = buffer[:tokens]
-        if self.attn_res_mode != "fused":
-            block_residual.zero_()
-        return block_residual
+        return buffer[:tokens]
 
-    def _embed(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """Embed the full token stream, vocab-parallel when embed_tp > 1.
-
-        Each rank owns vocab/embed_tp rows: shift ids into its window, zero the
-        out-of-range ids, embed, then all_reduce so every rank holds the full
-        hidden. Runs before the prefill-SP/decode-DP split.
-        """
+    def _embed(
+        self, input_ids: torch.Tensor, *, shard_output: bool = False, pad_len: int = 0
+    ) -> torch.Tensor:
+        """Sum vocab-shard contributions, optionally producing local token rows."""
         if self.embed_tp_size <= 1:
             return self.embed_tokens(input_ids)
         vocab_per_rank = self.config.vocab_size // self.embed_tp_size
         local_ids = input_ids - self.embed_tp_rank * vocab_per_rank
         mask = (local_ids >= 0) & (local_ids < vocab_per_rank)
         embeds = self.embed_tokens(local_ids * mask) * mask.unsqueeze(-1)
+        if shard_output:
+            # Pad hidden rows with zeros, not token IDs with a real embedding.
+            if pad_len:
+                embeds = F.pad(embeds, (0, 0, 0, pad_len))
+            return reduce_scatter_first_dim(
+                embeds, self.embed_reduce_scatter_group, self.attn_tp_size
+            )
         dist.all_reduce(embeds, group=self.embed_tp_group)
         return embeds
 
@@ -2767,13 +3509,27 @@ class KimiLinearModel(nn.Module):
         query_start_loc: Optional[torch.Tensor] = None,
         query_boundaries: Optional[list[int]] = None,
     ) -> torch.Tensor:
+        embed_sharded = False
+        embed_pad_len = 0
         if inputs_embeds is None:
             if input_ids is None:
                 raise ValueError("input_ids or inputs_embeds must be provided")
-            hidden_states = self._embed(input_ids)
+            embed_sharded = self.embed_reduce_scatter_group is not None and (
+                forward_metadata["is_prefill"] or input_ids.shape[0] % self.attn_tp_size == 0
+            )
+            if embed_sharded and forward_metadata["is_prefill"]:
+                embed_pad_len = -input_ids.shape[0] % self.attn_tp_size
+            hidden_states = self._embed(
+                input_ids, shard_output=embed_sharded, pad_len=embed_pad_len
+            )
         else:
             hidden_states = inputs_embeds
-        if self.attn_tp_size > 1:
+        if self.attn_metadata is not None:
+            self.attn_metadata.prepare_flash_mla_metadata(forward_metadata)
+        if embed_sharded:
+            if embed_pad_len:
+                forward_metadata = _sp_pad_metadata(forward_metadata, embed_pad_len)
+        elif self.attn_tp_size > 1:
             if forward_metadata["is_prefill"]:
                 pad_len = -hidden_states.shape[0] % self.attn_tp_size
                 if pad_len:
@@ -2787,43 +3543,23 @@ class KimiLinearModel(nn.Module):
                 # Materialize the shard so that storage can die before layer 0.
                 hidden_states = hidden_states.clone()
         tokens = hidden_states.shape[0]
-        if self.attn_res_mode == "fused" and not forward_metadata["is_prefill"]:
+        if not forward_metadata["is_prefill"]:
             block_residual = self.decode_block_residual_buffer
-        else:
-            block_residual = self._get_block_residual(tokens, hidden_states)
-        collected_target_hidden = []
-        if self.attn_res_mode != "original":
-            hidden_states, collected_target_hidden = self._forward_attn_res(
-                hidden_states,
-                block_residual,
-                forward_metadata,
-                cache_data,
-                query_start_loc,
-                query_boundaries,
-            )
-        else:
-            for layer_idx, layer in enumerate(self.layers):
-                hidden_states, block_residual, attention_input = layer(
-                    hidden_states,
-                    block_residual,
-                    forward_metadata,
-                    cache_data,
-                    query_start_loc,
-                    query_boundaries,
-                    self.moe_ctx,
-                    self._kv_stream
+            if block_residual is None:
+                raise RuntimeError(
+                    "fused AttnRes decode buffer must be initialized before "
+                    "model forward"
                 )
-                target_layer_id = layer_idx - 1
-                if (
-                    self.uses_dspark_draft
-                    and target_layer_id in self.dspark_target_layer_ids
-                ):
-                    collected_target_hidden.append(
-                        (
-                            target_layer_id,
-                            attention_input,
-                        )
-                    )
+        else:
+            block_residual = self._get_block_residual(tokens)
+        hidden_states, collected_target_hidden = self._forward_attn_res(
+            hidden_states,
+            block_residual,
+            forward_metadata,
+            cache_data,
+            query_start_loc,
+            query_boundaries,
+        )
         # AttnRes and final norm run on the rank-owned shard.
         hidden_states = _apply_attn_res(
             hidden_states,
@@ -2902,20 +3638,13 @@ class KimiLinearModel(nn.Module):
         block_residual: torch.Tensor,
         effective_queries: torch.Tensor,
         valid_blocks: torch.Tensor,
-        epsilon: torch.Tensor,
     ) -> AttnResPhase1Stats:
-        if self.attn_res_mode == "two_phase":
-            return _prepare_attn_res_phase1(
-                block_residual,
-                effective_queries,
-                valid_blocks,
-                epsilon,
-            )
-        inter_numerator, inter_max, inter_exp_sum = _block_attn_res_prepare_impl(
+        # Keep the Python wrapper's validation lambdas outside Dynamo tracing.
+        inter_numerator, inter_max, inter_exp_sum = torch.ops.cann_ops_transformer.block_attn_res_prepare(
             block_residual,
+            valid_blocks.reshape(1),
             effective_queries,
-            valid_blocks,
-            eps=self.config.rms_norm_eps,
+            eps=float(self.config.rms_norm_eps),
         )
         return AttnResPhase1Stats(
             inter_numerator=inter_numerator,
@@ -2928,25 +3657,32 @@ class KimiLinearModel(nn.Module):
         partial_block: torch.Tensor,
         partial_delta: torch.Tensor,
         slot: AttnResPhase2Slot,
-        epsilon: torch.Tensor,
+        norm: Optional[KimiRMSNorm] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if self.attn_res_mode == "two_phase":
-            output = _update_attn_res_phase2(
+        if norm is not None:
+            output = _block_attn_res_update_rms_norm_impl(
                 partial_block,
                 partial_delta,
-                slot,
-                epsilon,
+                slot.effective_query,
+                slot.inter_numerator,
+                slot.inter_max,
+                slot.inter_exp_sum,
+                norm.weight.to(dtype=partial_delta.dtype),
+                self.config.rms_norm_eps,
+                norm.variance_epsilon,
             )
             return output, partial_block
-        return _block_attn_res_update_impl(
+        output = _block_attn_res_update_impl(
             partial_block,
             partial_delta,
             slot.effective_query,
+            slot.inter_numerator,
             slot.inter_max,
             slot.inter_exp_sum,
-            slot.inter_numerator,
-            self.config.rms_norm_eps,
+            eps=float(self.config.rms_norm_eps),
         )
+
+        return output, partial_block
 
     def _forward_attn_res_block(
         self,
@@ -2960,19 +3696,19 @@ class KimiLinearModel(nn.Module):
         query_start_loc: Optional[torch.Tensor],
         query_boundaries: Optional[list[int]],
     ) -> tuple[torch.Tensor, list[tuple[int, torch.Tensor]]]:
-        """Process one block with an unfused or fused two-phase backend."""
+        """Process one block with fused two-phase AttnRes operators."""
         effective_queries = self.attn_res_effective_queries
         valid_blocks_table = self.attn_res_valid_blocks
-        epsilon = self.attn_res_epsilon
-
-
-        block_indices = (
-            torch.arange(
-                block_residual.shape[0], device=block_residual.device
+        if not forward_metadata["is_prefill"]:
+            block_indices = self.decode_attn_res_block_indices[block_idx]
+        else:
+            block_indices = (
+                torch.arange(
+                    block_residual.shape[0], device=block_residual.device
+                )
+                * block_residual.shape[1]
+                + block_idx
             )
-            * block_residual.shape[1]
-            + block_idx
-        )
         block_update = hidden_states
         if block_update.dtype != block_residual.dtype:
             block_update = block_update.to(block_residual.dtype)
@@ -2994,18 +3730,21 @@ class KimiLinearModel(nn.Module):
             block_residual,
             block_queries,
             valid_blocks,
-            epsilon,
         )
 
-        partial_dtype = (
-            torch.float32
-            if self.attn_res_mode == "fused"
-            else hidden_states.dtype
-        )
-        partial_block = torch.zeros_like(hidden_states, dtype=partial_dtype)
+        partial_block = torch.zeros_like(hidden_states, dtype=torch.float32)
         previous_mlp_delta = None
         collected_target_hidden = []
+        fuse_norm = not forward_metadata["is_prefill"]
         for layer_offset, layer in enumerate(block_layers):
+            layer_idx = start_layer_idx + layer_offset
+            target_layer_id = layer_idx - 1
+            # DSpark consumes pre-norm hidden; the fused op only returns normalized y.
+            attention_norm_fused = (
+                fuse_norm
+                and previous_mlp_delta is not None
+                and target_layer_id not in self.dspark_target_layer_ids
+            )
             attention_slot = 2 * layer_offset
             mlp_slot = attention_slot + 1
             if previous_mlp_delta is None:
@@ -3024,7 +3763,7 @@ class KimiLinearModel(nn.Module):
                     partial_block,
                     previous_mlp_delta.contiguous(),
                     attention_stats,
-                    epsilon,
+                    norm=layer.input_layernorm if attention_norm_fused else None,
                 )
                 attention_input = attention_input.to(hidden_states.dtype)
             attention_output = layer.forward_attention(
@@ -3033,7 +3772,9 @@ class KimiLinearModel(nn.Module):
                 cache_data[layer.layer_idx],
                 query_start_loc,
                 query_boundaries,
-                self._kv_stream
+                self.mla_ctx,
+                self.replayssm_ctx,
+                input_normalized=attention_norm_fused,
             )
             mlp_stats = AttnResPhase2Slot(
                 effective_query=block_queries[mlp_slot],
@@ -3045,16 +3786,15 @@ class KimiLinearModel(nn.Module):
                 partial_block,
                 attention_output.contiguous(),
                 mlp_stats,
-                epsilon,
+                norm=layer.post_attention_layernorm if fuse_norm else None,
             )
             mlp_input = mlp_input.to(hidden_states.dtype)
             previous_mlp_delta = layer.forward_mlp(
                 mlp_input,
                 forward_metadata,
                 self.moe_ctx,
+                input_normalized=fuse_norm,
             )
-            layer_idx = start_layer_idx + layer_offset
-            target_layer_id = layer_idx - 1
             if target_layer_id in self.dspark_target_layer_ids:
                 collected_target_hidden.append(
                     (
@@ -3083,7 +3823,8 @@ class KimiLinearForCausalLM(nn.Module):
         self.runner_settings = runner_settings
         self.infer_config = _offline_infer_config(runner_settings)
         self.uses_dspark_draft = (
-            self.infer_config.model_config.draft_model_type == "dspark"
+            self.infer_config.model_config.draft_model_type
+            in DSPARK_DRAFT_MODEL_TYPES
         )
         self.comm_manager = _OfflineCommManager(runner_settings)
         self._init_parallel_comm_groups()
@@ -3120,12 +3861,25 @@ class KimiLinearForCausalLM(nn.Module):
             )
         self.num_experts = config.num_experts
         self.num_experts_per_tok = config.num_experts_per_token
+        moe_ep_size = parallel.moe_ep_size
+        moe_ep_rank = (
+            0 if moe_ep_size == 1 else self.comm_manager.get_rank("moe_ep_group")
+        )
+        experts_per_rank = self.num_experts // moe_ep_size
+        self.local_expert_start = moe_ep_rank * experts_per_rank
+        self.local_expert_end = self.local_expert_start + experts_per_rank
         self.mxfp4_experts = _mxfp4_expert_quantization(config)
         self.block_size = self.infer_config.scheduler_config.block_size
         self.attn_metadata = AttnMetaData(config, runner_settings)
+        self.model.bind_attn_metadata(self.attn_metadata)
         self.exe_mode = self.infer_config.model_config.exe_mode
         self.temperature = self.infer_config.data_config.temperature
         self._bound_cache_data: Optional[tuple[dict, ...]] = None
+
+    def should_load_weight(self, name: str) -> bool:
+        return is_local_expert_weight(
+            name, self.local_expert_start, self.local_expert_end
+        )
 
     def bind_cache_data(self, cache_data: tuple[dict, ...]) -> None:
         """Bind mutable inference state outside the compiled user-input tree."""
@@ -3183,7 +3937,26 @@ class KimiLinearForCausalLM(nn.Module):
                 name="attn_tp_group",
                 group_num=parallel.world_size // parallel.attn_tp_size,
                 group_size=parallel.attn_tp_size,
+                # MLA and KDA gather/all-reduce operations use CCU-MS.
+                group_type=5,
             )
+            self.comm_manager.register_group(
+                name="attn_reduce_scatter_group",
+                group_num=parallel.world_size // parallel.attn_tp_size,
+                group_size=parallel.attn_tp_size,
+                # MLA and KDA output reduce-scatter uses the AIV domain.
+                group_type=3,
+            )
+            custom_params = self.infer_config.model_config.custom_params
+            if custom_params.get("enable_multi_streams", False):
+                # Use a dedicated CCU-MS group for overlapping MLA decode collectives.
+                self.comm_manager.register_group(
+                    name="mla_decode_tp_group",
+                    group_num=parallel.world_size // parallel.attn_tp_size,
+                    group_size=parallel.attn_tp_size,
+                    # Keep MLA decode gather/all-to-all on the CCU-MS path.
+                    group_type=5,
+                )
         if parallel.moe_ep_size > 1:
             group_num = parallel.world_size // parallel.moe_ep_size
             self.comm_manager.register_group(
@@ -3191,15 +3964,18 @@ class KimiLinearForCausalLM(nn.Module):
                 group_num=group_num,
                 group_size=parallel.moe_ep_size,
                 group_stride=group_num,
+                group_type=3,
             )
-            self.comm_manager.register_group(
-                name="megamoe_ep_group",
-                group_num=group_num,
-                group_size=parallel.moe_ep_size,
-                group_stride=group_num,
-                return_name=True,
-                allow_physical_reuse=False,
-            )
+            if self.infer_config.model_config.custom_params.get("enable_prefill_mega_moe", False):
+                self.comm_manager.register_group(
+                    name="megamoe_ep_group",
+                    group_num=group_num,
+                    group_size=parallel.moe_ep_size,
+                    group_stride=group_num,
+                    return_name=True,
+                    allow_physical_reuse=False,
+                    group_type=3,
+                )
             # Separate group for the decode MC2 dispatch/combine ops: they need a
             # dedicated HCCL buffer and cannot physically reuse the default group.
             mc2_buffer_size = calc_moe_hccl_buffer_size(
@@ -3220,18 +3996,24 @@ class KimiLinearForCausalLM(nn.Module):
                 name="dense_tp_group",
                 group_num=parallel.world_size // parallel.dense_tp_size,
                 group_size=parallel.dense_tp_size,
+                hccl_buffer_size=self.comm_manager.default_hccl_buffer_size,
+                group_type=5,
             )
         if parallel.embed_tp_size > 1:
             self.comm_manager.register_group(
                 name="embed_tp_group",
                 group_num=parallel.world_size // parallel.embed_tp_size,
                 group_size=parallel.embed_tp_size,
+                hccl_buffer_size=self.comm_manager.default_hccl_buffer_size,
+                group_type=3,
             )
         if parallel.lmhead_tp_size > 1:
             self.comm_manager.register_group(
                 name="lmhead_tp_group",
                 group_num=parallel.world_size // parallel.lmhead_tp_size,
                 group_size=parallel.lmhead_tp_size,
+                hccl_buffer_size=self.comm_manager.default_hccl_buffer_size,
+                group_type=3,
             )
 
     @staticmethod
@@ -3264,6 +4046,8 @@ class KimiLinearForCausalLM(nn.Module):
     ) -> dict:
         """Build all step inputs locally without executor metadata objects."""
         self.bind_cache_data(cache_data)
+        packed_ids = self._to_packed(input_ids)
+        self.model.moe_ctx.prepare_eplb(packed_ids.shape[0], is_prefill, packed_ids.device)
         metadata = self.attn_metadata.get_attn_metadata(
             input_ids=input_ids,
             input_lens=input_lens,
@@ -3315,6 +4099,19 @@ class KimiLinearForCausalLM(nn.Module):
             query_boundaries=query_boundaries,
         )
         prev_hidden_states = hidden_states
+        if is_prefill and not forward_metadata.get("is_last_prefill_chunk", True):
+            output = torch.empty(
+                forward_metadata["actual_seq_lengths_q"].shape[0],
+                1,
+                dtype=torch.long,
+                device=hidden_states.device,
+            )
+            if self.uses_dspark_draft:
+                return output, {
+                    "prev_hidden_states": prev_hidden_states,
+                    "target_hidden_states": target_hidden_states,
+                }
+            return output
         # The engine samples from [requests, steps, vocab] (execution_engine
         # slices logits[:, -1:, :] on prefill), so the packed layout stops at
         # this boundary. One step per request either way: prefill just reduced
@@ -3426,6 +4223,7 @@ class KimiLinearForCausalLM(nn.Module):
         tp_rank = (
             0 if tp_size == 1 else self.comm_manager.get_rank("attn_tp_group")
         )
+        fused_gate_up_loaded: dict[str, set[int]] = {}
         fused_qkv_loaded: dict[str, set[str]] = {}
         fused_conv_loaded: dict[str, set[int]] = {}
 
@@ -3471,26 +4269,43 @@ class KimiLinearForCausalLM(nn.Module):
                 loaded.add(param_name)
                 continue
 
-            # Dense MLP and shared experts: fold gate/up into gate_up_proj.
-            gate_up = re.match(r"(.*)\.(gate_proj|up_proj)\.weight$", name)
+            # Dense MLP and shared experts: fold gate/up weights and their MXFP8
+            # scales into the matching fused gate_up_proj parameter.
+            gate_up = re.match(
+                r"(.*)\.(gate_proj|up_proj)\.(weight|weight_scale|scale)$", name
+            )
             if gate_up is not None:
-                param_name = f"{gate_up.group(1)}.gate_up_proj.weight"
+                suffix = "weight" if gate_up.group(3) == "weight" else "weight_scale"
+                param_name = f"{gate_up.group(1)}.gate_up_proj.{suffix}"
                 if param_name in params:
                     param = params[param_name]
-                    param.weight_loader(
-                        param, tensor, self._GATE_UP_SHARD_ID[gate_up.group(2)]
-                    )
-                    loaded.add(param_name)
+                    shard_id = self._GATE_UP_SHARD_ID[gate_up.group(2)]
+                    shards = fused_gate_up_loaded.setdefault(param_name, set())
+                    if shard_id in shards:
+                        raise RuntimeError(
+                            f"duplicate checkpoint shard {shard_id} for {param_name}"
+                        )
+                    param.weight_loader(param, tensor, shard_id)
+                    shards.add(shard_id)
+                    if shards == set(self._GATE_UP_SHARD_ID.values()):
+                        loaded.add(param_name)
                     continue
 
-            qkv_proj = re.match(r"(.*)\.(q_proj|k_proj|v_proj)\.weight$", name)
+            qkv_proj = re.match(
+                r"(.*)\.(q_proj|k_proj|v_proj)\.(weight|weight_scale|scale)$", name
+            )
             if qkv_proj is not None:
-                param_name = f"{qkv_proj.group(1)}.qkv_proj.weight"
+                suffix = "weight" if qkv_proj.group(3) == "weight" else "weight_scale"
+                param_name = f"{qkv_proj.group(1)}.qkv_proj.{suffix}"
                 if param_name in params:
                     param = params[param_name]
                     shard_id = self._KDA_QKV_SHARD[qkv_proj.group(2)]
-                    param.weight_loader(param, tensor, shard_id)
                     shards = fused_qkv_loaded.setdefault(param_name, set())
+                    if shard_id in shards:
+                        raise RuntimeError(
+                            f"duplicate checkpoint shard {shard_id} for {param_name}"
+                        )
+                    param.weight_loader(param, tensor, shard_id)
                     shards.add(shard_id)
                     if shards == set(self._KDA_QKV_SHARD.values()):
                         loaded.add(param_name)
@@ -3526,6 +4341,12 @@ class KimiLinearForCausalLM(nn.Module):
                         loaded.add(param_name)
                     continue
 
+            # MX checkpoints use either spelling for E8M0 block scales.
+            if name.endswith(".scale"):
+                scale_name = name[: -len(".scale")] + ".weight_scale"
+                if scale_name in params:
+                    name = scale_name
+
             if name not in params:
                 raise ValueError(f"checkpoint tensor has no parameter: {name}")
 
@@ -3540,7 +4361,7 @@ class KimiLinearForCausalLM(nn.Module):
 
             for source_suffix, decode_suffix in (
                 (".q_b_proj.weight", ".q_b_proj_decode.weight"),
-                (".q_proj.weight", ".q_proj_decode.weight"),
+                (".q_b_proj.weight_scale", ".q_b_proj_decode.weight_scale"),
                 (".kv_b_proj.weight", ".kv_b_proj_decode.weight"),
             ):
                 if not name.endswith(source_suffix):
@@ -3582,27 +4403,6 @@ class KimiLinearForCausalLM(nn.Module):
                 tensor = tensor.narrow(shard_dim, tp_rank * width, width)
             store(name, tensor)
 
-        expected_qkv = set(self._KDA_QKV_SHARD.values())
-        incomplete_qkv = {
-            name: sorted(expected_qkv - shards)
-            for name, shards in fused_qkv_loaded.items()
-            if shards != expected_qkv
-        }
-        if incomplete_qkv:
-            raise RuntimeError(
-                f"incomplete fused KDA qkv projection shards: {incomplete_qkv}"
-            )
-        expected_conv = set(self._KDA_CONV_SHARD.values())
-        incomplete_conv = {
-            name: sorted(expected_conv - shards)
-            for name, shards in fused_conv_loaded.items()
-            if shards != expected_conv
-        }
-        if incomplete_conv:
-            raise RuntimeError(
-                f"incomplete fused KDA qkv convolution shards: {incomplete_conv}"
-            )
-
         missing = sorted(set(params) - loaded)
         if missing:
             raise RuntimeError(
@@ -3613,12 +4413,48 @@ class KimiLinearForCausalLM(nn.Module):
         return loaded
 
     def process_weights_after_loading(self) -> None:
-        is_nz = self.infer_config.model_config.enable_weight_nz
+        # Pre-convert every supported framework Linear whose weight is
+        # consumed only by MatMul. Native nn.Linear modules keep their layout.
+        # kv_b_proj is excluded below because it is split into 3-D weights
+        # for the absorbed-attention path.
+        nz_linear_module_names = (
+            # MLA query/KV projections.
+            "q_a_proj",
+            "q_b_proj",
+            "q_b_proj_decode",
+            "kv_a_proj_with_mqa",
+            # KDA projections.
+            "qkv_proj",
+            # "f_a_proj",
+            "f_b_proj",
+            "b_proj",
+            "g_a_proj",
+            "g_b_proj",
+            # KDA/MLA output gate and output projection.
+            "g_proj",
+            "o_proj",
+            # Dense FFN and the always-active shared experts.
+            "gate_up_proj",
+            "down_proj",
+            # Stable LatentMoE projections around the routed experts.
+            "routed_expert_down_proj",
+            "routed_expert_up_proj",
+            # Vocab-TP output head. The TP=1 native nn.Linear is unaffected.
+            "lm_head",
+        )
         # kv_b_proj is split first and skipped in the loop below: the split
         # reads the checkpoint's [out, in] layout, which the loop would
         # transpose and cast to NZ out from under it.
+        prepared_mega_linears = set()
+        for module in list(self.modules()):
+            if isinstance(module, KimiMLAAttention) and module.use_w8a8c8:
+                module.prepare_prolog_weights()
+            elif isinstance(module, KimiDeltaAttention):
+                prepared_mega_linears.update(module.prepare_mega_kda_weights())
         self._split_kv_b_proj()
         for module_name, module in self.named_modules():
+            if module in prepared_mega_linears:
+                continue
             if "kv_b_proj" in module_name:
                 continue
             if isinstance(module, KimiShortConvolution):
@@ -3628,8 +4464,25 @@ class KimiLinearForCausalLM(nn.Module):
             if quant_method is not None and hasattr(
                 quant_method, "process_weights_after_loading"
             ):
+                module_leaf_name = module_name.rsplit(".", 1)[-1]
+                is_nz = module_leaf_name in nz_linear_module_names
                 quant_method.process_weights_after_loading(module, is_nz=is_nz)
+        for module in self.modules():
+            if isinstance(module, KimiMLAAttention) and not module.use_w8a8c8:
+                module.prepare_prolog_weights()
+            if isinstance(module, KimiDeltaAttention) and module.use_mega_kda:
+                # Pack before graph capture; keep Prefill's [K, 3*H*D] layout.
+                module._mega_conv_weight = (
+                    module.qkv_conv1d._conv_weight.view(
+                        module.qkv_conv1d.kernel_size, 3, module.num_heads, module.head_dim
+                    ).permute(1, 2, 0, 3).contiguous()
+                )
+                # ReplaySSM gets ABI-specific NZ roots without changing the
+                # shared Linear views used by Prefill and snapshot MegaKDA.
+                if module.use_mega_kda_replayssm:
+                    module.prepare_mega_replayssm_weights()
         self.model.prepare_attn_res_effective_queries()
+        self.model.initialize_runtime_buffers()
 
     def _split_kv_b_proj(self) -> None:
         """Split Prefill-TP and Decode-DP KV-B layouts for absorbed MLA."""
@@ -3663,7 +4516,7 @@ class KimiLinearForCausalLM(nn.Module):
                 setattr(
                     attn,
                     key_attr,
-                    nn.Parameter(w_k.permute(1, 2, 0).contiguous(), requires_grad=False),
+                    w_k.permute(1, 2, 0).contiguous().detach(),
                 )
                 setattr(
                     attn,
@@ -3675,10 +4528,20 @@ class KimiLinearForCausalLM(nn.Module):
         parallel = self.infer_config.parallel_config
         next_n = self.infer_config.model_config.next_n
         draft_model_type = self.infer_config.model_config.draft_model_type
-        if draft_model_type not in ("none", "dspark"):
+        custom_params = self.infer_config.model_config.custom_params
+        # ``infer.check_settings`` is the authoritative full ABI/platform
+        # validation. Keep only this small guard for alternate runner paths
+        # that instantiate the model without going through that entry point.
+        validate_mega_kda_replayssm_switch(
+            custom_params,
+            draft_model_type,
+            next_n,
+            error_type=RuntimeError,
+        )
+        if draft_model_type not in ("none", *DSPARK_DRAFT_MODEL_TYPES):
             raise RuntimeError(f"unsupported draft_model_type={draft_model_type!r}")
         if (draft_model_type == "none" and next_n != 0) or (
-            draft_model_type == "dspark" and next_n <= 0
+            draft_model_type in DSPARK_DRAFT_MODEL_TYPES and next_n <= 0
         ):
             raise RuntimeError(
                 "next_n must be 0 without a draft model and positive for DSpark"
@@ -3718,8 +4581,37 @@ class KimiLinearForCausalLM(nn.Module):
                 f"the NZ latent cache needs block_size divisible by "
                 f"{_KV_CACHE_NZ_DIM}, got {block_size}"
             )
+        latent_nz_dim = _KV_CACHE_NZ_DIM
+        if self.config.kv_lora_rank % latent_nz_dim:
+            raise RuntimeError(
+                "the MLA latent width must be divisible by the PA_NZ inner "
+                f"dimension: kv_lora_rank={self.config.kv_lora_rank}, "
+                f"nz_dim={latent_nz_dim}"
+            )
+        if self.config.qk_rope_head_dim % _KV_CACHE_NZ_DIM:
+            raise RuntimeError(
+                "the MLA auxiliary-key width must be divisible by "
+                f"{_KV_CACHE_NZ_DIM}: "
+                f"qk_rope_head_dim={self.config.qk_rope_head_dim}"
+            )
         if parallel.moe_ep_size > 1 and not _mxfp4_expert_quantization(self.config):
             raise RuntimeError("MoE expert parallelism requires MXFP4 experts")
+        custom_params = self.infer_config.model_config.custom_params
+        if custom_params.get("enable_superkernel", False):
+            if self.infer_config.model_config.exe_mode != "npugraph_ex":
+                raise RuntimeError("enable_superkernel=True requires exe_mode=npugraph_ex")
+            if not self.infer_config.model_config.enable_static_kernel:
+                raise RuntimeError("enable_superkernel=True requires enable_static_kernel=True")
+            if not custom_params.get("enable_multi_streams", False):
+                raise RuntimeError("enable_superkernel=True requires enable_multi_streams=True")
+            if not self.config.num_shared_experts:
+                raise RuntimeError("enable_superkernel=True requires shared experts")
+            scope_apis = ("super_kernel_scope_begin", "super_kernel_scope_end")
+            if not all(hasattr(torch.npu, name) for name in scope_apis):
+                raise RuntimeError(
+                    "enable_superkernel=True requires a torch_npu build with "
+                    "super_kernel_scope_begin/super_kernel_scope_end support"
+                )
 
 
 __all__ = [

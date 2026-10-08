@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1800 800" width="1800" height="800" preserveAspectRatio="xMidYMid meet" role="img" aria-labelledby="title desc">
   <title id="title">Kimi K3 Gated MLA architecture</title>
-  <desc id="desc">Normalized decoder states branch into query, compressed key-value, and output-gate paths. The normalized KV latent and extra key are written to two single-KV-head paged caches. Prefill expands the current latent through kv_b before causal attention. Decode absorbs W_UK into the query, reads both paged caches with FIA v2, and maps the latent output through W_UV. Both phases share the sigmoid output gate and o_proj.</desc>
+  <desc id="desc">Normalized decoder states branch into query, compressed key-value, and output-gate paths. Each request-owner rank stores its normalized KV latent and RoPE key in one merged 576-wide PA_NZ cache. Non-chunked Prefill expands the current latent through kv_b before causal attention. Decode absorbs W_UK into the query, reads the merged cache with BF16 or quantized Flash MLA, and maps the latent output through W_UV. Chunked Prefill uses separate BF16 latent and RoPE caches replicated for the current mini batch within its attention TP group. Both phases share the sigmoid output gate and o_proj.</desc>
   <defs>
     <style>
       svg {
@@ -82,7 +82,7 @@
   <text x="1478" y="70" class="section">Output</text>
 
   <rect x="792" y="92" width="616" height="190" rx="8" class="lane"/>
-  <text x="812" y="112" class="lane-title">Prefill · Expand</text>
+  <text x="812" y="112" class="lane-title">Non-chunked Prefill · Expand</text>
 
   <rect x="792" y="500" width="616" height="190" rx="8" class="lane"/>
   <text x="812" y="520" class="lane-title">Decode · Absorb</text>
@@ -163,17 +163,13 @@
   <text x="1247.5" y="177" class="label">FIA</text>
   <text x="1247.5" y="211" class="annotation">Causal Attention</text>
 
-  <!-- Two single-KV-head latent caches. -->
+  <!-- One merged owner-local Decode cache, with latent and RoPE components. -->
   <path d="M825 315 V390 H870" class="flow" marker-end="url(#arrow)"/>
-  <ellipse cx="970" cy="390" rx="100" ry="36" class="box state"/>
-  <text x="970" y="382" class="label-small">Latent Cache</text>
-  <text x="970" y="407" class="annotation">512</text>
-
-  <path d="M750 440 H1105 V390 H1160" class="flow" marker-end="url(#arrow)"/>
-  <ellipse cx="1250" cy="390" rx="90" ry="36" class="box state"/>
-  <text x="1250" y="382" class="label-small">Extra Cache</text>
-  <text x="1250" y="407" class="annotation">64</text>
-  <text x="1088" y="350" class="annotation">slot_mapping</text>
+  <path d="M750 440 H1250 V426" class="flow" marker-end="url(#arrow)"/>
+  <rect x="870" y="354" width="470" height="72" rx="12" class="box state"/>
+  <text x="1105" y="378" class="label-small">kv_cache · PA_NZ · 512 latent + 64 RoPE</text>
+  <text x="1105" y="407" class="annotation">Owner-local requests · BF16 / FP8</text>
+  <text x="1105" y="344" class="annotation">owner slot_mapping</text>
 
   <!-- Decode absorbs kv_b around paged attention. -->
   <path d="M760 175 V205" class="bridge"/>
@@ -185,17 +181,18 @@
 
   <path d="M780 300 V455" class="bridge"/>
   <path d="M740 190 H780 V650 H1095 V630 H1120" class="flow" marker-end="url(#arrow)"/>
-  <path d="M970 426 V555 H1120" class="flow" marker-end="url(#arrow)"/>
-  <path d="M1250 426 V535" class="flow" marker-end="url(#arrow)"/>
+  <path d="M1207.5 426 V535" class="flow" marker-end="url(#arrow)"/>
   <text x="1050" y="475" class="annotation">block_table</text>
 
   <rect x="1120" y="535" width="175" height="120" rx="7" class="box compute"/>
-  <text x="1207.5" y="580" class="label">FIA v2</text>
-  <text x="1207.5" y="615" class="annotation">Latent Attention</text>
+  <text x="1207.5" y="580" class="label">Flash MLA</text>
+  <text x="1207.5" y="615" class="annotation">BF16 / C8</text>
 
   <path d="M1295 595 H1320" class="flow" marker-end="url(#arrow)"/>
   <rect x="1320" y="565" width="90" height="60" rx="5" class="box projection"/>
   <text x="1365" y="595" class="label-small">W_UV</text>
+  <text x="1100" y="721" class="annotation">Chunked Prefill: separate BF16 latent / RoPE caches</text>
+  <text x="1100" y="746" class="annotation">Current mini batch replicated in the Attention TP group</text>
 
   <!-- Phase outputs converge before the common output gate. -->
   <path d="M1335 190 H1438 V385 H1490" class="flow" marker-end="url(#arrow)"/>

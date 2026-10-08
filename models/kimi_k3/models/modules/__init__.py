@@ -10,8 +10,10 @@
 from .attention_data import (
     AttnMetaData,
     CacheData,
+    build_dspark_mla_slot_mapping,
     build_paged_slot_mapping,
     gather_sp_shards_to_owner,
+    validate_mega_kda_replayssm_switch,
 )
 from .parallel_utils import (
     all_gather_first_dim,
@@ -24,8 +26,10 @@ from .parallel_utils import (
 __all__ = [
     "AttnMetaData",
     "CacheData",
+    "build_dspark_mla_slot_mapping",
     "build_paged_slot_mapping",
     "gather_sp_shards_to_owner",
+    "validate_mega_kda_replayssm_switch",
     "all_gather_first_dim",
     "distributed_argmax",
     "dp_to_tp_all_to_all",

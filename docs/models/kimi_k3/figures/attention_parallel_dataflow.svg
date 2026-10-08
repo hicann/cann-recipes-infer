@@ -246,18 +246,23 @@
   <text x="260" y="763" class="sub">Norm</text>
 
   <path d="M335 750 H365" class="flow" marker-end="url(#arrow)"/>
-  <rect x="365" y="717" width="280" height="66" rx="7" class="box dp"/>
-  <text x="505" y="737" class="label">Q/KV Projections + MLA Core</text>
-  <text x="505" y="763" class="sub">Decode DP</text>
+  <rect x="365" y="717" width="130" height="66" rx="7" class="box dp"/>
+  <text x="430" y="737" class="label">Prolog</text>
+  <text x="430" y="763" class="sub">Decode DP</text>
+  <path d="M495 750 H515" class="flow" marker-end="url(#arrow)"/>
+  <rect x="515" y="717" width="130" height="66" rx="7" class="box dp"/>
+  <text x="580" y="737" class="label">FA</text>
+  <text x="580" y="763" class="sub">Decode DP</text>
+  <path d="M495 765 H505 V804 H715 V810" fill="none" stroke="#777" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#arrow)"/>
 
   <path d="M645 750 H675" class="flow" marker-end="url(#arrow)"/>
-  <rect x="675" y="724" width="80" height="52" rx="7" class="box comm"/>
-  <text x="715" y="741" class="label">AG</text>
-  <text x="715" y="762" class="sub">output</text>
+  <rect x="675" y="724" width="80" height="52" rx="7" class="box tp"/>
+  <text x="715" y="741" class="label">V proj</text>
+  <text x="715" y="762" class="sub">packed</text>
 
   <path d="M755 750 H785" class="flow" marker-end="url(#arrow)"/>
-  <rect x="785" y="724" width="130" height="52" rx="7" class="box tp"/>
-  <text x="850" y="750" class="label">Head Slice</text>
+  <rect x="785" y="724" width="130" height="52" rx="7" class="box comm"/>
+  <text x="850" y="750" class="label">AllToAll</text>
 
   <path d="M915 750 H1183" class="flow" marker-end="url(#arrow)"/>
   <circle cx="1200" cy="750" r="16" class="box gate"/>
@@ -286,4 +291,6 @@
   <path d="M1443 750 H1475" class="flow" marker-end="url(#arrow)"/>
   <rect x="1475" y="724" width="105" height="52" rx="26" class="box io"/>
   <text x="1527.5" y="750" class="label">Output</text>
+<rect x="450" y="515" width="905" height="142" rx="9" fill="none" stroke="#a75c2b" stroke-width="1.5" stroke-dasharray="6 4"/>
+<text x="1120" y="649" class="sub" fill="#a75c2b">MegaKDA / ReplaySSM</text>
 </svg>

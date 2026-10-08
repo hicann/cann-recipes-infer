@@ -46,12 +46,21 @@ def dp_to_tp_all_to_all(
     tp_size: int,
     output_rows: int,
     channel_width: int,
+    *,
+    input_is_tp_packed: bool = False,
 ) -> torch.Tensor:
-    """Exchange owner-local tokens for precomputed row-TP channel shards."""
+    """Exchange owner-local tokens for row-TP channel shards.
+
+    Packed input is contiguous [tp_size, local_tokens, channel_width], as
+    produced by transpose_batchmatmul with batch_split_factor=tp_size.
+    """
     if tp_size <= 1:
         return tensor
-    send = tensor.reshape(-1, tp_size, channel_width)
-    send = send.transpose(0, 1).contiguous().view(-1)
+    if input_is_tp_packed:
+        send = tensor.view(-1)
+    else:
+        send = tensor.reshape(-1, tp_size, channel_width)
+        send = send.transpose(0, 1).contiguous().view(-1)
     received = torch.empty_like(send)
     dist.all_to_all_single(received, send, group=group)
     return received.view(output_rows, channel_width)
@@ -82,9 +91,11 @@ def distributed_argmax(
     owner_local: bool = False,
 ) -> torch.Tensor:
     """Select the global-vocab argmax from each rank's local candidate."""
-    values, token_ids = logits.float().max(dim=-1)
+    values, token_ids = logits.max(dim=-1)
     token_ids = token_ids + tp_rank * logits.shape[-1]
     if tp_size > 1:
+        # Keep FP32 communication without casting the full vocabulary logits.
+        values = values.float()
         value_shards = [torch.empty_like(values) for _ in range(tp_size)]
         id_shards = [torch.empty_like(token_ids) for _ in range(tp_size)]
         dist.all_gather(value_shards, values.contiguous(), group=group)

@@ -23,236 +23,35 @@ bias before sampling the speculative tokens.
 
 from __future__ import annotations
 
-import math
-from typing import Dict, Iterable, Optional, Tuple
+from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
-import torch.distributed as dist
-import torch.nn.functional as F
 import torch_npu
+from cann_ops_transformer.ops import flash_attn, flash_attn_metadata
 from torch import nn
 from transformers.utils import logging
 
 from executor.model_loader.weight_utils import default_weight_loader
-from .modeling_kimi_k3 import _offline_infer_config
+from .modeling_dspark_common import (
+    K3DSparkConfidenceHead,
+    K3DSparkForCausalLMBase,
+    K3DSparkMarkovHead,
+    K3DSparkMLP,
+    K3DSparkRMSNorm,
+    K3DSparkRotaryEmbedding,
+    _max_dspark_seq_len,
+)
 from .modules import (
     all_gather_first_dim,
     build_paged_slot_mapping,
-    distributed_argmax,
     reduce_scatter_first_dim,
-    vocab_tp_to_owner,
 )
-from module.linear import (
-    ColumnParallelLinear,
-    ReplicatedLinear,
-    RowParallelLinear,
-    VocabParallelEmbedding,
-)
+from module.linear import ReplicatedLinear
 
 logger = logging.get_logger(__name__)
 
 InferenceConfig = object
 CommManager = object
-
-_DSPARK_TP_SIZE = 8
-_DSPARK_TP_GROUP = "dspark_tp_group"
-
-
-def _max_dspark_seq_len(infer_config: InferenceConfig) -> int:
-    return (
-        infer_config.data_config.input_max_len
-        + infer_config.data_config.max_new_tokens
-        + infer_config.model_config.next_n
-    )
-
-
-class K3DSparkRMSNorm(nn.Module):
-    def __init__(self, hidden_size: int, eps: float):
-        super().__init__()
-        self.weight = nn.Parameter(
-            torch.ones(hidden_size, dtype=torch.bfloat16), requires_grad=False
-        )
-        self.variance_epsilon = float(eps)
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        residual=None,
-    ):
-        if residual is None:
-            residual = hidden_states
-            hidden_states = torch_npu.npu_rms_norm(
-                hidden_states,
-                self.weight,
-                self.variance_epsilon,
-            )[0]
-        else:
-            hidden_states, _, residual = torch_npu.npu_add_rms_norm(
-                residual,
-                hidden_states,
-                self.weight,
-                self.variance_epsilon,
-            )
-        return hidden_states, residual
-
-
-def _yarn_find_correction_dim(
-    rotations: float, dim: int, base: float, max_position_embeddings: int
-) -> float:
-    return (
-        dim
-        * math.log(max_position_embeddings / (rotations * 2 * math.pi))
-        / (2 * math.log(base))
-    )
-
-
-def _yarn_find_correction_range(
-    beta_fast: float,
-    beta_slow: float,
-    dim: int,
-    base: float,
-    max_position_embeddings: int,
-) -> Tuple[int, int]:
-    low = math.floor(
-        _yarn_find_correction_dim(
-            beta_fast, dim, base, max_position_embeddings
-        )
-    )
-    high = math.ceil(
-        _yarn_find_correction_dim(
-            beta_slow, dim, base, max_position_embeddings
-        )
-    )
-    return max(low, 0), min(high, dim - 1)
-
-
-def _yarn_ramp(low: int, high: int, size: int) -> torch.Tensor:
-    if low == high:
-        high += 1
-    ramp = (torch.arange(size, dtype=torch.float32) - low) / (high - low)
-    return ramp.clamp(0, 1)
-
-
-def _yarn_mscale(scale: float = 1.0, mscale: float = 1.0) -> float:
-    if scale <= 1:
-        return 1.0
-    return 0.1 * mscale * math.log(scale) + 1.0
-
-
-class K3DSparkRotaryEmbedding(nn.Module):
-    """YaRN rotary cache sized to the configured offline inference capacity."""
-
-    def __init__(self, config, max_seq_len: int):
-        super().__init__()
-        rope = config.rope_parameters or {}
-        dim = config.qk_rope_head_dim
-        if dim % 2:
-            raise ValueError("DSpark RoPE dimension must be even")
-        base = rope.get("rope_theta", config.rope_theta)
-        factor = rope.get("factor", 1.0)
-        original_max = rope.get(
-            "original_max_position_embeddings", config.max_position_embeddings
-        )
-        beta_fast = rope.get("beta_fast", 32.0)
-        beta_slow = rope.get("beta_slow", 1.0)
-
-        freq_extra = 1.0 / (
-            base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim)
-        )
-        if rope.get("rope_type", "default") == "yarn":
-            freq_inter = freq_extra / factor
-            low, high = _yarn_find_correction_range(
-                beta_fast, beta_slow, dim, base, original_max
-            )
-            extrapolation = 1.0 - _yarn_ramp(low, high, dim // 2)
-            inv_freq = freq_inter * (1.0 - extrapolation) + freq_extra * extrapolation
-        else:
-            inv_freq = freq_extra
-
-        mscale = rope.get("mscale", 1.0)
-        mscale_all_dim = rope.get("mscale_all_dim", 0.0)
-        amplitude = _yarn_mscale(factor, mscale) / _yarn_mscale(
-            factor, mscale_all_dim
-        )
-        positions = torch.arange(max_seq_len, dtype=torch.float32)
-        freqs = torch.outer(positions, inv_freq)
-        # Preserve the full-dimension BF16 contract of the fused operators.
-        fused_freqs = torch.cat((freqs, freqs), dim=-1)
-        self.register_buffer(
-            "cos_cached",
-            (fused_freqs.cos() * amplitude).to(torch.bfloat16),
-            persistent=False,
-        )
-        self.register_buffer(
-            "sin_cached",
-            (fused_freqs.sin() * amplitude).to(torch.bfloat16),
-            persistent=False,
-        )
-
-    def forward(self, position_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        positions = position_ids.clamp_min(0)
-        flat = positions.view(-1)
-        shape = (*positions.shape, self.cos_cached.shape[-1])
-        cos = self.cos_cached.index_select(0, flat).view(shape)
-        sin = self.sin_cached.index_select(0, flat).view(shape)
-        return cos, sin
-
-
-class K3DSparkMLP(nn.Module):
-    def __init__(
-        self,
-        config,
-        infer_config: InferenceConfig,
-        comm_manager: Optional[CommManager],
-        prefix: str,
-    ):
-        super().__init__()
-        self.tp_size = _DSPARK_TP_SIZE
-        self.tp_rank = comm_manager.get_rank(_DSPARK_TP_GROUP)
-        self.tp_group = comm_manager.get_group(_DSPARK_TP_GROUP)
-        common = dict(
-            bias=False,
-            tp_size=self.tp_size,
-            tp_rank=self.tp_rank,
-            params_dtype=torch.bfloat16,
-            quant_config=None,
-        )
-        self.gate_proj = ColumnParallelLinear(
-            config.hidden_size,
-            config.intermediate_size,
-            prefix=f"{prefix}.gate_proj",
-            **common,
-        )
-        self.up_proj = ColumnParallelLinear(
-            config.hidden_size,
-            config.intermediate_size,
-            prefix=f"{prefix}.up_proj",
-            **common,
-        )
-        self.down_proj = RowParallelLinear(
-            config.intermediate_size,
-            config.hidden_size,
-            bias=False,
-            tp_size=self.tp_size,
-            tp_rank=self.tp_rank,
-            input_is_parallel=True,
-            params_dtype=torch.bfloat16,
-            quant_config=None,
-            prefix=f"{prefix}.down_proj",
-        )
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # Gather the DP request shards only for the TP8 MLP, then scatter the
-        # row-parallel partial sum back to the original request owners.
-        hidden_states = all_gather_first_dim(
-            hidden_states, self.tp_group, self.tp_size
-        )
-        hidden_states = self.down_proj(
-            F.silu(self.gate_proj(hidden_states)) * self.up_proj(hidden_states)
-        )
-        return reduce_scatter_first_dim(
-            hidden_states, self.tp_group, self.tp_size
-        )
 
 
 class K3DSparkAttention(nn.Module):
@@ -402,9 +201,7 @@ class K3DSparkAttention(nn.Module):
         context_states: torch.Tensor,
         context_cos_sin: Tuple[torch.Tensor, torch.Tensor],
         draft_cos_sin: Tuple[torch.Tensor, torch.Tensor],
-        attn_metadata: Dict[str, torch.Tensor],
-        actual_seq_qlen: list[int],
-        actual_seq_kvlen: list[int],
+        attn_metadata: Dict[str, Any],
         layer_cache: Dict[str, torch.Tensor],
     ) -> torch.Tensor:
 
@@ -429,41 +226,41 @@ class K3DSparkAttention(nn.Module):
         )
         combined_key = torch.cat((context_key, draft_key), dim=1)
         combined_value = torch.cat((context_value, draft_value), dim=1)
-        combined_slots = torch.cat(
-            (
-                attn_metadata["context_slot_mapping"],
-                attn_metadata["draft_slot_mapping"],
-            ),
-            dim=1,
-        )
         self._update_cache(
             combined_key,
             combined_value,
-            combined_slots,
+            attn_metadata["combined_slot_mapping"],
             layer_cache,
         )
         k_cache = layer_cache["k_cache"]
         v_cache = layer_cache["v_cache"]
-        attn_output, _ = torch_npu.npu_fused_infer_attention_score_v2(
+        attn_output, _ = flash_attn(
             query,
-            k_cache.view(*k_cache.shape[:2], -1),
-            v_cache.view(*v_cache.shape[:2], -1),
-            atten_mask=None,
-            actual_seq_qlen=actual_seq_qlen,
-            actual_seq_kvlen=actual_seq_kvlen,
+            k_cache,
+            v_cache,
             block_table=attn_metadata["block_table"],
-            num_query_heads=self.total_num_heads,
-            num_key_value_heads=self.num_kv_heads,
+            attn_mask=None,
+            metadata=attn_metadata["fia_metadata"],
+            cu_seqlens_q=attn_metadata["cu_seqlens_q"],
+            seqused_q=attn_metadata["seqused_q"],
+            seqused_kv=attn_metadata["seqused_kv"],
             softmax_scale=self.softmax_scale,
-            input_layout="TND",
-            sparse_mode=0,
-            block_size=self.block_size,
+            mask_mode=0,
+            win_left=-1,
+            win_right=-1,
+            max_seqlen_q=draft_len,
+            max_seqlen_kv=attn_metadata["max_seqlen_kv"],
+            layout_q="TND",
+            layout_kv="PA_BBND",
+            layout_out="TND",
+            return_softmax_lse=False,
         )
         output = attn_output.reshape(
             local_batch, draft_len, self.total_num_heads * self.head_dim
         )
         # FIA returns all heads for this rank's owner-local requests. Project
         # locally and keep the request-DP shard between decoder submodules.
+        output = output.to(device=self.o_proj.weight.device)
         output = self.o_proj(output)
         return output
 
@@ -499,9 +296,7 @@ class K3DSparkDecoderLayer(nn.Module):
         context_states: torch.Tensor,
         context_cos_sin: Tuple[torch.Tensor, torch.Tensor],
         draft_cos_sin: Tuple[torch.Tensor, torch.Tensor],
-        attn_metadata: Dict[str, torch.Tensor],
-        actual_seq_qlen: list[int],
-        actual_seq_kvlen: list[int],
+        attn_metadata: Dict[str, Any],
         layer_cache: Dict[str, torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         hidden_states, residual = self.input_layernorm(hidden_states, residual)
@@ -511,8 +306,6 @@ class K3DSparkDecoderLayer(nn.Module):
             context_cos_sin,
             draft_cos_sin,
             attn_metadata,
-            actual_seq_qlen,
-            actual_seq_kvlen,
             layer_cache,
         )
         hidden_states, residual = self.post_attention_layernorm(
@@ -599,14 +392,23 @@ class K3DSparkModel(nn.Module):
         context_slot_mapping: torch.Tensor,
         draft_slot_mapping: torch.Tensor,
         block_table: torch.Tensor,
-        actual_seq_qlen: list[int],
-        actual_seq_kvlen: list[int],
+        cu_seqlens_q: torch.Tensor,
+        seqused_q: torch.Tensor,
+        seqused_kv: torch.Tensor,
+        fia_metadata: torch.Tensor,
+        max_seqlen_kv: int,
         cache_data: Tuple[Dict[str, torch.Tensor], ...],
     ) -> torch.Tensor:
         attn_metadata = {
-            "context_slot_mapping": context_slot_mapping,
-            "draft_slot_mapping": draft_slot_mapping,
+            "combined_slot_mapping": torch.cat(
+                (context_slot_mapping, draft_slot_mapping), dim=1
+            ),
             "block_table": block_table,
+            "fia_metadata": fia_metadata,
+            "cu_seqlens_q": cu_seqlens_q,
+            "seqused_q": seqused_q,
+            "seqused_kv": seqused_kv,
+            "max_seqlen_kv": max_seqlen_kv,
         }
         context_states, _ = self.hidden_norm(
             self.fc(target_hidden_states)
@@ -621,8 +423,6 @@ class K3DSparkModel(nn.Module):
                 context_cos_sin,
                 draft_cos_sin,
                 attn_metadata,
-                actual_seq_qlen,
-                actual_seq_kvlen,
                 layer_cache,
             )
         hidden_states, _ = self.norm(hidden_states, residual)
@@ -652,131 +452,9 @@ class K3DSparkModel(nn.Module):
             )
 
 
-class K3DSparkMarkovHead(nn.Module):
-    def __init__(
-        self,
-        config,
-        infer_config: InferenceConfig,
-        comm_manager: Optional[CommManager],
-        prefix: str,
-    ):
-        super().__init__()
-        self.vocab_size = config.vocab_size
-        self.tp_size = _DSPARK_TP_SIZE
-        self.tp_rank = comm_manager.get_rank(_DSPARK_TP_GROUP)
-        self.tp_group = comm_manager.get_group(_DSPARK_TP_GROUP)
-        self.markov_w1 = VocabParallelEmbedding(
-            self.vocab_size,
-            config.markov_rank,
-            config.pad_token_id,
-            torch.bfloat16,
-            tp_size=self.tp_size,
-            tp_rank=self.tp_rank,
-        )
-        self.markov_w2 = ColumnParallelLinear(
-            config.markov_rank,
-            self.vocab_size,
-            bias=False,
-            tp_size=self.tp_size,
-            tp_rank=self.tp_rank,
-            params_dtype=torch.bfloat16,
-            quant_config=None,
-            prefix=f"{prefix}.markov_w2",
-        )
+class K3DSparkForCausalLM(K3DSparkForCausalLMBase):
+    _model_class = K3DSparkModel
 
-    def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
-        token_ids = all_gather_first_dim(token_ids, self.tp_group, self.tp_size)
-        vocab_per_rank = self.vocab_size // self.tp_size
-        local_ids = token_ids - self.tp_rank * vocab_per_rank
-        mask = (local_ids >= 0) & (local_ids < vocab_per_rank)
-        markov_embed = self.markov_w1(local_ids * mask) * mask.unsqueeze(-1)
-        dist.all_reduce(markov_embed, group=self.tp_group)
-        logits = self.markov_w2(markov_embed)
-        logits = vocab_tp_to_owner(
-            logits, self.tp_group, self.tp_size
-        )
-        return logits
-
-    def forward_shard(self, token_ids: torch.Tensor) -> torch.Tensor:
-        token_ids = all_gather_first_dim(token_ids, self.tp_group, self.tp_size)
-        vocab_per_rank = self.vocab_size // self.tp_size
-        local_ids = token_ids - self.tp_rank * vocab_per_rank
-        mask = (local_ids >= 0) & (local_ids < vocab_per_rank)
-        markov_embed = self.markov_w1(local_ids * mask) * mask.unsqueeze(-1)
-        dist.all_reduce(markov_embed, group=self.tp_group)
-        return self.markov_w2(markov_embed)
-
-
-class K3DSparkForCausalLM(nn.Module):
-    @staticmethod
-    def update_model_cfg(config, infer_config: InferenceConfig) -> None:
-        quantization = config.quantization_config or config.compression_config
-        if quantization:
-            raise ValueError("Kimi K3 DSpark supports BF16 weights only")
-
-    def __init__(
-        self,
-        config,
-        runner_settings: dict,
-        comm_manager: Optional[CommManager] = None,
-        prefix: str = "",
-        **kwargs,
-    ):
-        super().__init__()
-        infer_config = _offline_infer_config(runner_settings)
-        self.update_model_cfg(config, infer_config)
-        self.config = config
-        self.runner_settings = runner_settings
-        self.infer_config = infer_config
-        self.comm_manager = comm_manager
-        world_size = int(infer_config.parallel_config.world_size)
-        if world_size % _DSPARK_TP_SIZE:
-            raise RuntimeError(
-                f"DSpark world_size={world_size} must be divisible by "
-                f"tp_size={_DSPARK_TP_SIZE}"
-            )
-        if comm_manager is None:
-            raise RuntimeError("DSpark TP8 requires a communication manager")
-        comm_manager.register_group(
-            name=_DSPARK_TP_GROUP,
-            group_num=world_size // _DSPARK_TP_SIZE,
-            group_size=_DSPARK_TP_SIZE,
-        )
-        self.dspark_tp_size = _DSPARK_TP_SIZE
-        self.dspark_tp_rank = comm_manager.get_rank(_DSPARK_TP_GROUP)
-        self.dspark_tp_group = comm_manager.get_group(_DSPARK_TP_GROUP)
-        # DSpark receives target hidden states through the target model's
-        # attention-TP request-DP shard and keeps that ownership internally.
-        self.attn_tp_size = infer_config.parallel_config.attn_tp_size
-        self.attn_tp_group = (
-            comm_manager.get_group("attn_tp_group")
-            if self.attn_tp_size > 1
-            else None
-        )
-        self.attn_tp_rank = (
-            comm_manager.get_rank("attn_tp_group") if self.attn_tp_size > 1 else 0
-        )
-        self.next_n = infer_config.model_config.next_n
-        self.temperature = infer_config.data_config.temperature
-        self.mask_token_id = config.mask_token_id
-        self.block_size = infer_config.scheduler_config.block_size
-        self.execute_mode = runner_settings.get("exe_mode", "eager")
-        self.model = K3DSparkModel(
-            config,
-            infer_config,
-            comm_manager,
-            prefix=f"{prefix}.model" if prefix else "model",
-        )
-        self.markov_head = K3DSparkMarkovHead(
-            config, infer_config, comm_manager, "markov_head"
-        )
-        self.lm_head = None
-        self.lmhead_tp_size = infer_config.parallel_config.lmhead_tp_size
-        self.lmhead_tp_group = (
-            comm_manager.get_group("lmhead_tp_group")
-            if self.lmhead_tp_size > 1
-            else None
-        )
     def prepare_target_hidden_states(
         self, target_hidden_states: torch.Tensor
     ) -> torch.Tensor:
@@ -786,14 +464,6 @@ class K3DSparkForCausalLM(nn.Module):
         )
         return context_states
 
-    def set_shared_target_modules(self, main_model) -> None:
-        main_model.set_draft_config(self.config)
-        if main_model.config.num_hidden_layers != self.config.target_num_hidden_layers:
-            raise ValueError("target_num_hidden_layers does not match the main model")
-        if main_model.config.vocab_size != self.config.vocab_size:
-            raise ValueError("draft and target vocab_size must match")
-        self.model.embed_tokens = main_model.model.embed_tokens
-        self.lm_head = main_model.lm_head
 
     def check_model_settings(self) -> None:
         parallel = self.infer_config.parallel_config
@@ -806,8 +476,6 @@ class K3DSparkForCausalLM(nn.Module):
             raise RuntimeError("num_attention_heads must be divisible by num_key_value_heads")
         if self.config.intermediate_size % self.dspark_tp_size:
             raise RuntimeError("intermediate_size must be divisible by DSpark tp_size")
-        if self.config.vocab_size % self.dspark_tp_size:
-            raise RuntimeError("vocab_size must be divisible by DSpark tp_size")
         if self.config.vocab_size % parallel.embed_tp_size:
             raise RuntimeError("vocab_size must be divisible by embed_tp_size")
         if self.config.vocab_size % parallel.lmhead_tp_size:
@@ -841,27 +509,6 @@ class K3DSparkForCausalLM(nn.Module):
         if self.config.markov_head_type != "vanilla":
             raise RuntimeError("only the vanilla DSpark Markov head is supported")
 
-    def _full_vocab_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if self.lm_head is None:
-            raise RuntimeError("DSpark lm_head has not been shared from the target model")
-        logits = self.lm_head(hidden_states)
-        return vocab_tp_to_owner(
-            logits, self.lmhead_tp_group, self.lmhead_tp_size
-        )
-
-    def sample(
-        self,
-        logits: torch.Tensor,
-        sample_noise: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        if self.temperature <= 0:
-            return torch.argmax(logits, dim=-1)
-        probabilities = torch.softmax(
-            logits.float() / max(self.temperature, 1e-5), dim=-1
-        )
-        if sample_noise is None:
-            sample_noise = torch.empty_like(probabilities).exponential_()
-        return probabilities.div(sample_noise).argmax(dim=-1)
 
     def forward_spec_decode(
         self,
@@ -875,8 +522,11 @@ class K3DSparkForCausalLM(nn.Module):
         context_slot_mapping: torch.Tensor,
         draft_slot_mapping: torch.Tensor,
         block_table: torch.Tensor,
-        actual_seq_qlen: list[int],
-        actual_seq_kvlen: list[int],
+        cu_seqlens_q: torch.Tensor,
+        seqused_q: torch.Tensor,
+        seqused_kv: torch.Tensor,
+        fia_metadata: torch.Tensor,
+        max_seqlen_kv: int,
         cache_data: Tuple[Dict[str, torch.Tensor], ...],
         sample_noise: Optional[torch.Tensor] = None,
     ):
@@ -887,7 +537,7 @@ class K3DSparkForCausalLM(nn.Module):
         )
         draft_input_ids[:, 0] = main_next_tokens
 
-        lm_hidden = self.model(
+        confidence_hidden = self.model(
             draft_input_ids,
             main_hidden,
             (context_cos, context_sin),
@@ -895,45 +545,40 @@ class K3DSparkForCausalLM(nn.Module):
             context_slot_mapping,
             draft_slot_mapping,
             block_table,
-            actual_seq_qlen,
-            actual_seq_kvlen,
+            cu_seqlens_q,
+            seqused_q,
+            seqused_kv,
+            fia_metadata,
+            max_seqlen_kv,
             cache_data,
         )
         lm_hidden = all_gather_first_dim(
-            lm_hidden, self.lmhead_tp_group, self.lmhead_tp_size
+            confidence_hidden, self.lmhead_tp_group, self.lmhead_tp_size
         )
-        if self.temperature <= 0:
-            logits = self.lm_head(lm_hidden).float()
-        else:
-            logits = self._full_vocab_logits(lm_hidden).float()
-        batch_size = main_next_tokens.shape[0]
-        output_ids = main_next_tokens.new_empty(batch_size, self.next_n + 1)
+        logits = self._full_vocab_logits(lm_hidden).float()
+        output_ids = main_next_tokens.new_empty(local_batch, self.next_n + 1)
         output_ids[:, 0] = main_next_tokens
+        markov_embeds = [] if self.confidence_head is not None else None
         for step in range(self.next_n):
-            if self.temperature <= 0:
-                markov_bias = self.markov_head.forward_shard(output_ids[:, step])
-                step_logits = logits[:, step] + markov_bias.float()
-                output_ids[:, step + 1] = distributed_argmax(
-                    step_logits,
-                    self.dspark_tp_group,
-                    self.dspark_tp_rank,
-                    self.dspark_tp_size,
-                    owner_local=True,
-                )
-            else:
-                markov_bias = self.markov_head(output_ids[:, step])
-                logits[:, step].add_(markov_bias.float())
-                noise = None if sample_noise is None else sample_noise[:, step]
-                output_ids[:, step + 1] = self.sample(logits[:, step], noise)
+            markov_bias, markov_embed = self.markov_head(output_ids[:, step])
+            # FP32 logits keep the addition in FP32 with a BF16 Markov bias.
+            logits[:, step].add_(markov_bias)
+            if markov_embeds is not None:
+                markov_embeds.append(markov_embed)
+            noise = None if sample_noise is None else sample_noise[:, step]
+            output_ids[:, step + 1] = self.sample(logits[:, step], noise)
 
-        return (
-            output_ids[:, 1:],
-            output_ids[:, 1:].unsqueeze(-1) if self.temperature <= 0 else logits,
-            cached_len + self.next_n,
-            cached_len,
-        )
+        spec_tokens = output_ids[:, 1:]
+        draft_output = spec_tokens.unsqueeze(-1) if self.temperature <= 0 else logits
+        confidence = None
+        if self.confidence_head is not None:
+            confidence = self.confidence_head(
+                confidence_hidden,
+                torch.stack(markov_embeds, dim=1),
+            )
+        return spec_tokens, draft_output, confidence, cached_len + self.next_n, cached_len
 
-    def propose(
+    def prepare_decode_inputs(
         self,
         input_dict: Dict,
         main_next_tokens: torch.Tensor,
@@ -943,24 +588,6 @@ class K3DSparkForCausalLM(nn.Module):
         block_table = input_dict["block_table"]
         slot_block_table = input_dict["slot_block_table"]
         cache_data = input_dict["cache_data"]
-        batch_size = target_hidden_states.shape[0]
-        is_prefill = bool(input_dict.get("is_prefill", False))
-        if is_prefill:
-            context_states = target_hidden_states
-            self.model.prefill_context_cache(
-                context_states,
-                context_positions,
-                slot_block_table,
-                cache_data,
-            )
-            cached_len = context_positions.view(batch_size, -1).max(dim=1).values + 1
-            return {
-                "spec_tokens": main_next_tokens.new_empty(batch_size, 0),
-                "logits": None,
-                "kv_len": cached_len,
-                "kv_len_cached": cached_len,
-            }
-
         decode_batch_size = self.infer_config.scheduler_config.batch_size_per_dp_rank
         local_batch = decode_batch_size // self.attn_tp_size
         context_lengths = (
@@ -998,6 +625,42 @@ class K3DSparkForCausalLM(nn.Module):
         actual_seq_kvlen = [
             length + self.next_n for length in context_lengths_list
         ]
+        # Build transformer FA metadata outside the compiled graph. Creating
+        # device tensors from Python lists inside NPUGraph capture triggers a
+        # synchronous host-to-device copy, which is unsupported in GLOBAL mode.
+        cu_seqlens_q = torch.tensor(
+            [0, *actual_seq_qlen],
+            dtype=torch.int32,
+            device=context_positions.device,
+        )
+        seqused_q = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
+        seqused_kv = torch.tensor(
+            actual_seq_kvlen,
+            dtype=torch.int32,
+            device=context_positions.device,
+        )
+        # This bound flows through decode_inputs into a graph ATTR, so its
+        # value must stay constant across steps: a per-step exact value would
+        # recompile the captured graph every round. The exact per-step lengths
+        # are carried by the seqused_kv tensor at runtime.
+        max_seqlen_kv = self.model.max_cache_len
+        fia_metadata = flash_attn_metadata(
+            batch_size=local_batch,
+            cu_seqlens_q=cu_seqlens_q,
+            seqused_q=seqused_q,
+            seqused_kv=seqused_kv,
+            num_heads_q=self.model.layers[0].self_attn.total_num_heads,
+            num_heads_kv=self.model.layers[0].self_attn.num_kv_heads,
+            head_dim=self.model.layers[0].self_attn.head_dim,
+            max_seqlen_q=self.next_n,
+            max_seqlen_kv=max_seqlen_kv,
+            mask_mode=0,
+            win_left=-1,
+            win_right=-1,
+            layout_q="TND",
+            layout_kv="PA_BBND",
+            layout_out="TND",
+        )
         sample_noise = None
         if self.temperature > 0:
             sample_noise = torch.empty(
@@ -1018,8 +681,11 @@ class K3DSparkForCausalLM(nn.Module):
             "context_slot_mapping": context_slot_mapping,
             "draft_slot_mapping": draft_slot_mapping,
             "block_table": block_table,
-            "actual_seq_qlen": actual_seq_qlen,
-            "actual_seq_kvlen": actual_seq_kvlen,
+            "cu_seqlens_q": cu_seqlens_q,
+            "seqused_q": seqused_q,
+            "seqused_kv": seqused_kv,
+            "fia_metadata": fia_metadata,
+            "max_seqlen_kv": max_seqlen_kv,
             "cache_data": cache_data,
             "sample_noise": sample_noise,
         }
@@ -1032,13 +698,33 @@ class K3DSparkForCausalLM(nn.Module):
                         for cache_value in layer_cache.values():
                             if isinstance(cache_value, torch.Tensor):
                                 torch._dynamo.mark_static(cache_value)
-        result = self.forward_spec_decode(**decode_inputs)
-        spec_tokens, logits, kv_len, kv_len_cached = result
+        return decode_inputs
+
+
+    def propose(
+        self,
+        input_dict: Dict,
+        main_next_tokens: torch.Tensor,
+        target_hidden_states: torch.Tensor,
+    ) -> Dict:
+        context_positions = input_dict["target_hidden_positions"]
+        slot_block_table = input_dict["slot_block_table"]
+        cache_data = input_dict["cache_data"]
+        batch_size = target_hidden_states.shape[0]
+        context_states = target_hidden_states
+        self.model.prefill_context_cache(
+            context_states,
+            context_positions,
+            slot_block_table,
+            cache_data,
+        )
+        cached_len = context_positions.view(batch_size, -1).max(dim=1).values + 1
         return {
-            "spec_tokens": spec_tokens,
-            "logits": logits,
-            "kv_len": kv_len,
-            "kv_len_cached": kv_len_cached,
+            "spec_tokens": main_next_tokens.new_empty(batch_size, 0),
+            "logits": None,
+            "confidence": None,
+            "kv_len": cached_len,
+            "kv_len_cached": cached_len,
         }
 
     @staticmethod
@@ -1054,27 +740,49 @@ class K3DSparkForCausalLM(nn.Module):
         return tuple(dict.fromkeys(expanded))
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        stacked_params_mapping = [
+            ("gate_up_proj", "gate_proj", 0),
+            ("gate_up_proj", "up_proj", 1),
+        ]
         params = dict(self.named_parameters())
         loaded: set[str] = set()
-        ignored_fragments = (
-            "embed_tokens.weight",
-            "lm_head.weight",
-            "confidence_head.",
-        )
-        for name, tensor in weights:
-            if any(fragment in name for fragment in ignored_fragments):
-                continue
-            param_name = next(
+
+        def resolve(name: str) -> Optional[str]:
+            return next(
                 (candidate for candidate in self._weight_candidates(name) if candidate in params),
                 None,
             )
-            if param_name is None:
-                logger.debug("Skip non-runtime RadixArk DSpark tensor: %s", name)
+
+        ignored_fragments = [
+            "embed_tokens.weight",
+            "lm_head.weight",
+        ]
+        if self.confidence_head is None:
+            ignored_fragments.append("confidence_head.")
+        for name, tensor in weights:
+            if any(fragment in name for fragment in ignored_fragments):
                 continue
-            param = params[param_name]
-            loader = getattr(param, "weight_loader", default_weight_loader)
-            loader(param, tensor)
-            loaded.add(param_name)
+
+            for fused_name, weight_name, shard_id in stacked_params_mapping:
+                if weight_name not in name:
+                    continue
+                mapped_name = name.replace(weight_name, fused_name)
+                param_name = resolve(mapped_name)
+                if param_name is None:
+                    continue
+                param = params[param_name]
+                param.weight_loader(param, tensor, shard_id)
+                loaded.add(param_name)
+                break
+            else:
+                param_name = resolve(name)
+                if param_name is None:
+                    logger.debug("Skip non-runtime RadixArk DSpark tensor: %s", name)
+                    continue
+                param = params[param_name]
+                loader = getattr(param, "weight_loader", default_weight_loader)
+                loader(param, tensor)
+                loaded.add(param_name)
 
         missing = sorted(set(params) - loaded)
         if missing:
@@ -1095,11 +803,17 @@ class K3DSparkForCausalLM(nn.Module):
             if quant_method is not None and hasattr(
                 quant_method, "process_weights_after_loading"
             ):
-                quant_method.process_weights_after_loading(module, is_nz=is_nz)
+                # FRACTAL_NZ matmul does not support the confidence projection's
+                # single output column. Keep its BF16 weight in ND format.
+                module_is_nz = is_nz and module_name != "confidence_head.proj"
+                quant_method.process_weights_after_loading(
+                    module, is_nz=module_is_nz
+                )
 
 __all__ = [
     "K3DSparkAttention",
     "K3DSparkDecoderLayer",
+    "K3DSparkConfidenceHead",
     "K3DSparkForCausalLM",
     "K3DSparkModel",
 ]

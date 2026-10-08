@@ -38,6 +38,8 @@ TORCH_LIBRARY(custom, m) {
         "int metadata_update=1) "
         "-> (Tensor, Tensor, Tensor, Tensor, Tensor)");
     m.def("npu_swiglu_clip_quant(Tensor x, Tensor group_index, Tensor group_alpha, *, bool activate_left=False, int quant_mode=1, int clamp_mode=1) -> (Tensor, Tensor)");
+    m.def("npu_situ_and_mul_sparse(Tensor x, Tensor expert_tokens, *, float beta=1.0, float alpha=1.0, bool high_precision=False) -> Tensor");
+    m.def("grouped_situ_mx_quant(Tensor x, Tensor expert_tokens, *, float beta=1.0, float alpha=1.0, bool high_precision=False) -> (Tensor, Tensor)");
     m.def("npu_swiglu_group_quant(Tensor x, *, Tensor? weight=None, Tensor? group_index=None, "
         "ScalarType dst_type, int quant_mode=0, int block_size=0, bool round_scale=False, "
         "float? clamp_limit=None, bool output_origin=False, int group_list_type=1) -> (Tensor, Tensor, Tensor)");

@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 560" width="1600" height="560" preserveAspectRatio="xMidYMid meet" role="img" aria-labelledby="title desc">
-  <title id="title">Kimi K3 KDA layer</title>
+  <title id="title">KDA: Prefill / snapshot fallback</title>
   <desc id="desc">High-level Kimi K3 KDA layer diagram for editorial use. Input projections feed a fused KDA operator containing Q/K normalization, decay and beta activation, and recurrent state update. A separate output gate joins after RMSNorm and before the output projection.</desc>
   <defs>
     <style>
@@ -28,7 +28,7 @@
   </defs>
 
   <rect width="1600" height="560" fill="#ffffff"/>
-  <text x="800" y="30" class="title">Kimi K3 KDA layer</text>
+  <text x="800" y="30" class="title">KDA: Prefill / snapshot fallback</text>
 
   <!-- Input projections. -->
   <rect x="25" y="65" width="460" height="420" rx="12" class="panel"/>
@@ -61,7 +61,7 @@
 
   <!-- Fused KDA. -->
   <rect x="515" y="65" width="670" height="420" rx="12" class="fusion"/>
-  <text x="540" y="92" class="section">Fused KDA operator</text>
+  <text x="540" y="92" class="section">Flash / snapshot core</text>
   <text x="1155" y="92" class="subhead" text-anchor="end">Includes normalization, recurrent gates and state update</text>
 
   <rect x="560" y="115" width="230" height="70" rx="8" class="compute"/>
@@ -84,7 +84,7 @@
   <rect x="850" y="165" width="270" height="190" rx="9" class="compute"/>
   <text x="985" y="208" class="label">KDA recurrence</text>
   <text x="985" y="247" class="small">Prefill: chunked Flash KDA</text>
-  <text x="985" y="276" class="small">Decode: fused recurrent KDA</text>
+  <text x="985" y="276" class="small">Fallback: snapshot recurrent</text>
   <text x="985" y="315" class="small">BF16 output + FP32 state update</text>
 
   <!-- Three preprocessing paths converge without crossing. -->

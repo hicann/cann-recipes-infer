@@ -1,0 +1,48 @@
+model_name: "kimi_k3"
+model_path: "/data/models/kimi_k3"
+draft_model_path: "/data/models/kimi_k3_dspark"
+exe_mode: "npugraph_ex"
+world_size: 32
+
+model_config:
+  with_ckpt: True
+  enable_online_split_weight: True
+  enable_profiler: True
+  enable_static_kernel: True
+  enable_cache_compile: True
+  force_eplb: False
+  platform_version: "950"
+  draft_model_type: "dspark_gqa"  # Use "dspark_mla" for the vLLM MLA checkpoint.
+  dspark_tp_size: 8
+  next_n: 7
+  skip_warm_up: True
+  # Per Attention DP group: 16 requests/group x DP2 = global batch 32.
+  prefill_mini_batch_size: 1
+  prefill_chunk_size: 8192
+  pa_block_size: 128
+  custom_params:
+    enable_multi_streams: True
+    enable_superkernel: True  # Requires npugraph_ex, static kernels and multi-streams.
+    enable_dspark_confidence_head: False
+    enable_mega_kda: True
+    enable_mega_kda_replayssm: True
+    moe_chunk_max_len: 12800
+    enable_prefill_mega_moe: True
+
+data_config:
+  dataset: "default"
+  input_max_len: 102400
+  max_new_tokens: 256
+  # TP16/DP2 assigns sixteen requests to each Attention group (one request per rank).
+  batch_size: 32
+  temperature: 0.0
+
+parallel_config:
+  # Attention/Embedding/OProj use TP16; Dense/LMHead/DSpark stay at TP8 to reduce collectives.
+  attn_tp_size: 16
+  moe_tp_size: 1
+  embed_tp_size: 16
+  lmhead_tp_size: 8
+  dense_tp_size: 8
+  oproj_tp_size: 16
+  cp_size: 1

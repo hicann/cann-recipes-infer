@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1500" height="390" viewBox="0 0 1500 390" role="img" aria-labelledby="title desc">
+<title id="title">Compile Cache 编译缓存</title>
+<desc id="desc">首次启动编译模型并保存缓存，随后捕获并执行图。后续启动命中兼容缓存时加载编译结果，再捕获并执行图。</desc>
+<defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8Z" fill="#64748b"/></marker></defs>
+<style>text{font-family:"Noto Sans CJK SC",sans-serif;fill:#172b4d;font-size:20px;text-anchor:middle} .box{fill:#e8edff;stroke:#8799da;stroke-width:1.5} .cache{fill:#e1f3ed;stroke:#62b69f;stroke-width:1.5} .arrow{fill:none;stroke:#64748b;stroke-width:2;marker-end:url(#arrow)} .label{text-anchor:start;font-weight:600}</style>
+<rect width="1500" height="390" fill="white"/>
+<rect x="20" y="35" width="1460" height="120" rx="12" fill="#f4f7fb"/>
+<rect x="20" y="235" width="1460" height="120" rx="12" fill="#f4f7fb"/>
+<text x="45" y="105" class="label">首次启动</text><text x="45" y="305" class="label">后续启动</text>
+<rect x="230" y="60" width="240" height="70" rx="8" class="box"/><text x="350" y="103">模型追踪与编译</text>
+<rect x="565" y="60" width="240" height="70" rx="8" class="cache"/><text x="685" y="103">保存编译缓存</text>
+<rect x="895" y="60" width="220" height="70" rx="8" class="box"/><text x="1005" y="103">捕获执行图</text>
+<rect x="1200" y="60" width="225" height="70" rx="8" class="box"/><text x="1312" y="103">执行 Decode</text>
+<path d="M470 95H565 M805 95H895 M1115 95H1200" class="arrow"/>
+<rect x="230" y="260" width="240" height="70" rx="8" class="cache"/><text x="350" y="303">命中兼容缓存</text>
+<rect x="565" y="260" width="240" height="70" rx="8" class="cache"/><text x="685" y="303">加载编译结果</text>
+<rect x="895" y="260" width="220" height="70" rx="8" class="box"/><text x="1005" y="303">捕获执行图</text>
+<rect x="1200" y="260" width="225" height="70" rx="8" class="box"/><text x="1312" y="303">执行 Decode</text>
+<path d="M470 295H565 M805 295H895 M1115 295H1200" class="arrow"/>
+<path d="M685 130V260" class="arrow" stroke-dasharray="6 5"/>
+</svg>

@@ -27,6 +27,7 @@ from dataclasses import dataclass
 import torch
 import torch.distributed as dist
 
+from .dspark_registry import DSPARK_DRAFT_MODEL_TYPES
 from .modules import CacheData, gather_sp_shards_to_owner
 
 
@@ -49,7 +50,7 @@ class DSparkAcceptanceStats:
 
 class KimiK3Infer:
     DECODE_STARTUP_SKIP_ROUNDS = 10
-    DECODE_PROFILE_ACTIVE_ROUNDS = 10
+    DECODE_PROFILE_ACTIVE_ROUNDS = 5
 
     def __init__(self, runner_settings: dict, model_runner, draft_model_runner=None):
         self.runner_settings = runner_settings
@@ -69,8 +70,12 @@ class KimiK3Infer:
         model_config = runner_settings.get("model_config", {})
         self.draft_model_type = model_config.get("draft_model_type", "none")
         self.next_n = int(model_config.get("next_n", 0))
-        self.uses_dspark = self.draft_model_type == "dspark"
+        self.uses_dspark = self.draft_model_type in DSPARK_DRAFT_MODEL_TYPES
+        self.skip_prefill = model_config.get("skip_prefill", False)
+        self.prefill_stub_token_id = model_config.get("prefill_stub_token_id")
+        self._prefill_stub_logged = False
         self.prefill_mini_batch_size = model_runner.prefill_mini_batch_size
+        self.prefill_chunk_size = model_runner.prefill_chunk_size
         self.mini_batch = (
             self.prefill_mini_batch_size
             if self.prefill_mini_batch_size > 0
@@ -85,6 +90,12 @@ class KimiK3Infer:
         self.local_batch = self.batch_size // self.attn_tp_size
         self.eos_ids = self._collect_eos_token_ids()
         self.pad_token_id = int(self.tokenizer.pad_token_id)
+        if (
+            self.skip_prefill
+            and self.prefill_stub_token_id is not None
+            and self.prefill_stub_token_id in self.eos_ids
+        ):
+            raise ValueError("prefill_stub_token_id must not be an EOS token")
         self.enable_profiler = bool(self.model_runner.enable_profiler)
         self._decode_profiler_context = None
         self._decode_profiler = None
@@ -317,7 +328,9 @@ class KimiK3Infer:
             input_dict["kv_len"] = input_dict["kv_len"] + 1
         return input_dict
 
-    def process_mini_batch_inputs(self, input_dict, cycle_idx):
+    def process_mini_batch_inputs(
+        self, input_dict, cycle_idx, chunk_start=0, chunk_end=None
+    ):
         """Build one Prefill cycle while retaining the full resident cache.
 
         Unlike the old DeepSeek implementation, Kimi K3 cannot narrow every
@@ -327,11 +340,20 @@ class KimiK3Infer:
         """
         request_start = cycle_idx * self.mini_batch
         request_end = request_start + self.mini_batch
-        token_rows = input_dict["prompt_token_rows"][request_start:request_end]
+        prompt_rows = input_dict["prompt_token_rows"][request_start:request_end]
+        token_rows = tuple(row[chunk_start:chunk_end] for row in prompt_rows)
+        input_lens = torch.tensor(
+            [row.numel() for row in token_rows],
+            dtype=torch.int32,
+            device=self.device,
+        )
+        kv_len = None
+        if self.prefill_chunk_size > 0:
+            kv_len = torch.full_like(input_lens, chunk_start)
         return {
             "input_ids": torch.cat(token_rows),
-            "input_lens": input_dict["input_lens"][request_start:request_end],
-            "kv_len": None,
+            "input_lens": input_lens,
+            "kv_len": kv_len,
             "cache_data": input_dict["cache_data"],
             "is_prefill": True,
             "request_indices": torch.arange(
@@ -341,14 +363,36 @@ class KimiK3Infer:
                 device=self.device,
             ),
             "prefill_cycle_idx": cycle_idx,
+            "prefill_chunk_start": chunk_start,
         }
 
     def prefill_infer_single_cycle(self, input_dict, cycle_idx, warm_up=False):
-        cycle_input = self.process_mini_batch_inputs(input_dict, cycle_idx)
-        model_inputs = self._model_inputs(cycle_input)
-        model_inputs["forward_metadata"]["prefill_cycle_idx"] = cycle_idx
+        request_start = cycle_idx * self.mini_batch
+        request_ids = list(range(request_start, request_start + self.mini_batch))
+        prompt_len = int(input_dict["input_lens"][request_start].item())
+        request_lens = input_dict["input_lens"][
+            request_start : request_start + self.mini_batch
+        ]
+        if self.prefill_chunk_size > 0:
+            if not torch.all(request_lens == prompt_len):
+                raise ValueError("chunked Prefill currently requires equal prompt lengths")
+            chunk_ranges = [
+                (start, min(start + self.prefill_chunk_size, prompt_len))
+                for start in range(0, prompt_len, self.prefill_chunk_size)
+            ]
+        else:
+            chunk_ranges = [(0, None)]
 
-        def run_prefill_cycle():
+        def run_prefill_chunk(chunk_idx, chunk_start, chunk_end):
+            cycle_input = self.process_mini_batch_inputs(
+                input_dict, cycle_idx, chunk_start, chunk_end
+            )
+            model_inputs = self._model_inputs(cycle_input)
+            model_inputs["forward_metadata"]["prefill_cycle_idx"] = cycle_idx
+            model_inputs["forward_metadata"]["prefill_chunk_idx"] = chunk_idx
+            model_inputs["forward_metadata"]["is_last_prefill_chunk"] = (
+                chunk_end is None or chunk_end == prompt_len
+            )
             logits, aux, elapsed = self._run_model(
                 model_inputs, is_prefill=True, warm_up=warm_up
             )
@@ -357,38 +401,23 @@ class KimiK3Infer:
                     raise RuntimeError(
                         "DSpark requires target hidden states from Main Prefill"
                     )
-                request_start = cycle_idx * self.mini_batch
-                request_ids = list(
-                    range(request_start, request_start + self.mini_batch)
-                )
                 elapsed += self._route_prefill_target_hidden(
                     aux["target_hidden_states"],
                     request_ids,
-                    [
-                        int(input_dict["input_lens"][idx].item())
-                        for idx in request_ids
-                    ],
+                    cycle_input["input_lens"].tolist(),
+                    position_start=chunk_start,
                     cycle_idx=cycle_idx,
                     warm_up=warm_up,
                 )
             return logits, aux, elapsed
 
-        profile_this_cycle = (
-            self.enable_profiler
-            and not warm_up
-            and cycle_idx == self.prefill_cycles // 2
-        )
-        if profile_this_cycle:
-            with self.model_runner.define_profiler(
-                enable_profiler=True,
-                profile_save_path=self._profile_path("prefill"),
-                active=1,
-                skip_first=0,
-            ) as profiler:
-                logits, aux, elapsed = run_prefill_cycle()
-                profiler.step()
-        else:
-            logits, aux, elapsed = run_prefill_cycle()
+        # Profiling is Decode-only, including when Prefill calls DSpark.
+        elapsed = 0.0
+        for chunk_idx, (chunk_start, chunk_end) in enumerate(chunk_ranges):
+            logits, aux, chunk_elapsed = run_prefill_chunk(
+                chunk_idx, chunk_start, chunk_end
+            )
+            elapsed += chunk_elapsed
         next_tokens = self.sample(logits)
         self._append_tokens(
             input_dict,
@@ -404,12 +433,69 @@ class KimiK3Infer:
         input_dict["is_prefill"] = False
         return input_dict
 
+    def _get_prefill_stub_tokens(self, input_dict):
+        if self.prefill_stub_token_id is not None:
+            return torch.full(
+                (self.batch_size,),
+                self.prefill_stub_token_id,
+                dtype=torch.long,
+                device=self.device,
+            )
+
+        stub_tokens = torch.stack(
+            [token_row[-1] for token_row in input_dict["prompt_token_rows"]]
+        ).to(dtype=torch.long, device=self.device)
+        if not self.eos_ids:
+            return stub_tokens
+
+        eos_mask = torch.zeros_like(stub_tokens, dtype=torch.bool)
+        for eos_id in self.eos_ids:
+            eos_mask |= stub_tokens == eos_id
+        if eos_mask.any():
+            fallback_token_id = next(
+                token_id
+                for token_id in range(self.model.config.vocab_size)
+                if token_id not in self.eos_ids
+            )
+            stub_tokens[eos_mask] = fallback_token_id
+        return stub_tokens
+
+    def _stub_prefill(self, input_dict):
+        """Build the Prefill-to-Decode handoff without running Prefill."""
+        self.cache_manager.reset_cache(input_dict["cache_data"])
+        if input_dict.get("draft_cache_data") is not None:
+            self.cache_manager.reset_cache(input_dict["draft_cache_data"])
+
+        stub_tokens = self._get_prefill_stub_tokens(input_dict)
+        self._append_tokens(input_dict, stub_tokens)
+        self.merge_multi_cycle_res(input_dict, [stub_tokens])
+
+        if not self._prefill_stub_logged and self.attn_tp_rank == 0:
+            logging.warning(
+                "Prefill is skipped: KDA/MLA caches are zero-filled and a synthetic "
+                "Decode input token is used. Generated text is invalid; use this mode "
+                "only for Decode execution and performance testing."
+            )
+            self._prefill_stub_logged = True
+
+    def _prepare_decode_input(self, input_dict, warm_up=False):
+        if self.skip_prefill:
+            self._stub_prefill(input_dict)
+            return []
+
+        cycle_next_tokens = []
+        prefill_times = []
+        for cycle_idx in range(self.prefill_cycles):
+            next_tokens, _, elapsed = self.prefill_infer_single_cycle(
+                input_dict, cycle_idx, warm_up=warm_up
+            )
+            cycle_next_tokens.append(next_tokens)
+            prefill_times.append(elapsed)
+        self.merge_multi_cycle_res(input_dict, cycle_next_tokens)
+        return prefill_times
+
     def _log_outputs(self, input_dict):
-        fallback_rank = int(os.getenv("LOCAL_RANK", "0")) + int(
-            os.getenv("RANK_OFFSET", "0")
-        )
-        global_rank = int(os.getenv("RANK", os.getenv("RANK_ID", str(fallback_rank))))
-        if global_rank != 0:
+        if self.attn_tp_rank != 0:
             return
         prompt_lens = input_dict["input_lens"].tolist()
         for request_idx, token_ids in enumerate(input_dict["generate_ids"]):
@@ -439,11 +525,7 @@ class KimiK3Infer:
         else:
             total_accepted_tokens = stats.total_accepted_tokens
             verify_count = stats.verify_count
-        fallback_rank = int(os.getenv("LOCAL_RANK", "0")) + int(
-            os.getenv("RANK_OFFSET", "0")
-        )
-        global_rank = int(os.getenv("RANK", os.getenv("RANK_ID", str(fallback_rank))))
-        if global_rank != 0:
+        if self.attn_tp_rank != 0:
             return
         total_spec_tokens = verify_count * self.next_n
         accept_length = (
@@ -458,34 +540,27 @@ class KimiK3Infer:
         )
         logging.info("The speculation accept length: %.4f", accept_length)
         logging.info("The speculation accept rate: %.4f", accept_rate)
-        if average_round_time is not None and accept_length > 0:
+        if average_round_time is not None:
+            if accept_length > 0:
+                logging.info(
+                    "%s model average equivalent latency with actual acceptance "
+                    "length %.4f is %.2f ms",
+                    self.model_runner.model_name,
+                    accept_length,
+                    average_round_time / accept_length * 1000,
+                )
+            reference_accept_length = 4
             logging.info(
-                "%s model average equivalent latency with actual acceptance "
-                "length %.4f is %.2f ms",
+                "%s model average equivalent latency with fixed acceptance "
+                "length %d is %.2f ms",
                 self.model_runner.model_name,
-                accept_length,
-                average_round_time / accept_length * 1000,
-            )
-            official_accept_length = 3.85
-            logging.info(
-                "%s model average equivalent latency with official acceptance "
-                "length %.2f is %.2f ms",
-                self.model_runner.model_name,
-                official_accept_length,
-                average_round_time / official_accept_length * 1000,
+                reference_accept_length,
+                average_round_time / reference_accept_length * 1000,
             )
 
     def _model_generate_legacy(self, prompts, cache_data=None, warm_up=False):
         input_dict = self.get_inputs(prompts, cache_data)
-        cycle_next_tokens = []
-        prefill_times = []
-        for cycle_idx in range(self.prefill_cycles):
-            next_tokens, _, elapsed = self.prefill_infer_single_cycle(
-                input_dict, cycle_idx, warm_up=warm_up
-            )
-            cycle_next_tokens.append(next_tokens)
-            prefill_times.append(elapsed)
-        self.merge_multi_cycle_res(input_dict, cycle_next_tokens)
+        prefill_times = self._prepare_decode_input(input_dict, warm_up=warm_up)
 
         if not warm_up and prefill_times:
             logging.info(
@@ -521,11 +596,18 @@ class KimiK3Infer:
             )
         return torch.tensor(active, dtype=torch.bool, device=self.device)
 
+    def _global_has_active_requests(self, input_dict):
+        active = input_dict["active_mask"].any().to(torch.int32).view(1)
+        if dist.is_initialized():
+            dist.all_reduce(active, op=dist.ReduceOp.MAX)
+        return bool(active.item())
+
     def _route_prefill_target_hidden(
         self,
         target_hidden_states,
         request_ids,
         input_lens,
+        position_start,
         cycle_idx,
         warm_up=False,
     ):
@@ -559,7 +641,10 @@ class KimiK3Infer:
                     offsets[local_idx] : offsets[local_idx + 1]
                 ]
                 positions = torch.arange(
-                    input_len, dtype=torch.long, device=self.device
+                    position_start,
+                    position_start + input_len,
+                    dtype=torch.long,
+                    device=self.device,
                 ).view(1, -1)
                 with torch.no_grad():
                     self.draft_model.propose(
@@ -614,22 +699,22 @@ class KimiK3Infer:
             raise RuntimeError("DSpark target hidden must remain owner-local")
         if context_positions.shape[0] != self.local_batch:
             raise RuntimeError("DSpark context positions must remain owner-local")
+        decode_inputs = self.draft_model.prepare_decode_inputs(
+            {
+                "target_hidden_positions": context_positions,
+                "block_table": self.attn_metadata.mla_block_table,
+                "slot_block_table": self.attn_metadata.mla_slot_block_table,
+                "cache_data": input_dict["draft_cache_data"],
+            },
+            anchor_tokens[owner_start:owner_end],
+            target_hidden,
+        )
         if dist.is_initialized():
             dist.barrier()
         torch.npu.synchronize()
         start = time.time()
         with torch.no_grad():
-            proposal = self.draft_model.propose(
-                {
-                    "is_prefill": False,
-                    "target_hidden_positions": context_positions,
-                    "block_table": self.attn_metadata.mla_block_table,
-                    "slot_block_table": self.attn_metadata.mla_slot_block_table,
-                    "cache_data": input_dict["draft_cache_data"],
-                },
-                anchor_tokens[owner_start:owner_end],
-                target_hidden,
-            )
+            proposal = self.draft_model.run_decode_proposal(decode_inputs)
         torch.npu.synchronize()
         elapsed = time.time() - start
         warm_prefix = "[warm up] " if warm_up else ""
@@ -812,15 +897,7 @@ class KimiK3Infer:
         input_dict = self.get_inputs(prompts, cache_data, draft_cache_data)
         acceptance_stats = DSparkAcceptanceStats.create()
         self._dspark_input = input_dict
-        cycle_next_tokens = []
-        prefill_times = []
-        for cycle_idx in range(self.prefill_cycles):
-            next_tokens, _, elapsed = self.prefill_infer_single_cycle(
-                input_dict, cycle_idx, warm_up=warm_up
-            )
-            cycle_next_tokens.append(next_tokens)
-            prefill_times.append(elapsed)
-        self.merge_multi_cycle_res(input_dict, cycle_next_tokens)
+        prefill_times = self._prepare_decode_input(input_dict, warm_up=warm_up)
 
         if not warm_up and prefill_times:
             logging.info(
@@ -837,7 +914,7 @@ class KimiK3Infer:
             input_dict, ignore_eos=warm_up
         )
 
-        if not bool(input_dict["active_mask"].any().item()):
+        if not self._global_has_active_requests(input_dict):
             if not warm_up:
                 self._log_acceptance_stats(acceptance_stats)
                 self._log_outputs(input_dict)
@@ -881,7 +958,7 @@ class KimiK3Infer:
         local_hidden, context_positions = self._mask_finished_context(
             input_dict, local_hidden, context_positions
         )
-        if not bool(input_dict["active_mask"].any().item()):
+        if not self._global_has_active_requests(input_dict):
             self._step_decode_profiler()
             if not warm_up:
                 self._log_acceptance_stats(acceptance_stats)
@@ -902,8 +979,6 @@ class KimiK3Infer:
             input_dict["active_mask"] = self._active_mask(
                 input_dict, ignore_eos=warm_up
             )
-            if not bool(input_dict["active_mask"].any().item()):
-                break
             verify_inputs = torch.cat(
                 (anchors, self._gather_owner_rows(state.spec_tokens)), dim=1
             )
@@ -933,7 +1008,7 @@ class KimiK3Infer:
                 input_dict, ignore_eos=warm_up
             )
             state.num_accepted_tokens = counts
-            if not bool(input_dict["active_mask"].any().item()):
+            if not self._global_has_active_requests(input_dict):
                 self._step_decode_profiler()
                 break
             local_hidden, context_positions = self._mask_finished_context(

@@ -2,18 +2,19 @@
 
 Kimi K3 采用 2.8T 参数的混合注意力 MoE 架构，交错使用 Kimi Delta Attention（KDA）与 Gated MLA，并引入 Attention Residuals（AttnRes）和 Stable LatentMoE，模型原生支持 1M 上下文。KDA 维护固定大小的序列状态，AttnRes 沿网络深度聚合历史表示，Stable LatentMoE 在 latent 空间执行 Routed Expert 计算。
 
-cann-recipes-infer 提供 Kimi K3 在昇腾 950PR/DT 4机 32卡集群上的推理实现参考，采用 Embedding TP、Attention DP/TP、Dense TP、Prefill SP、Decode DP 与 Routed Expert EP 的组合部署策略。KDA、MLA 与 MoE 均接入融合算子；模型目录内的 `CacheData` 和 `AttnMetaData` 负责 `conv_state`、KDA SSM State、MLA latent cache 及请求映射。Stable LatentMoE 支持原生 MXFP4 权重、动态 MXFP8 激活及 Decode Shared Expert 多流。AttnRes 两阶段融合、MegaMoE 和 DSpark 投机推理均提供对应配置路径。
+cann-recipes-infer 提供 Kimi K3 在昇腾 950PR/DT 4机 32卡集群上的推理实现参考，采用 Embedding TP、Attention DP/TP、Dense TP、Prefill SP、Decode DP 与 Routed Expert EP 的组合部署策略。KDA、MLA 与 MoE 均接入融合算子。Stable LatentMoE 支持原生 MXFP4 权重、动态 MXFP8 激活及 Decode Shared Expert 多流。AttnRes 两阶段融合、Prefill MegaMoE、MegaKDA/ReplaySSM 和 DSpark 投机推理均提供对应配置路径。
 
 完整运行方法见[模型 README](../../../models/kimi_k3/README.md)。
 
 ## Highlights
 
-- **Block AttnRes**：Attention 与 FFN 各自对跨层表示计算 Softmax 权重；在复用历史 Block 统计的基础上，提供 `two_phase` 参考路径和 `fused` 融合算子路径，算子实现见 [`block_attn_res_prepare`](../../../ops/cannbot_dsl/block_attn_res_prepare.py) 和 [`block_attn_res_update`](../../../ops/cannbot_dsl/block_attn_res_update.py)。
-- **Stable LatentMoE 与 SiTU**：Routed Expert 在 3584 维 latent 空间计算，Shared Expert 保持 7168 维主干路径，二者均使用 SiTU 激活，recipes提供Routed Expert  EP部署以及Shared Expert TP部署的参考实现，并支持原生MXFP4/MXFP8 Expert 计算。
-- **混合并行策略**：recipes采用 Embedding TP、Attention DP/TP、Dense TP、Routed Expert EP、Prefill SP 与 Decode DP部署策略，兼顾模型内存约束/推理性能。
-- **KDA 融合算子**：Prefill 接入 [`flash_kda`](../../../ops/cannbot_dsl/flash_kda.py) 融合算子，将 L2 归一化、gate 激活与 beta sigmoid 融合进算子内部；普通 Decode 和 DSpark Verify 均接入 [`fused_recurrent_kda`](../../../ops/cannbot_dsl/fused_recurrent_kda.py) 融合算子，实现逐 token 递推的 L2 norm/gate/beta 全融合。
-- **MoE 与投机推理**：896 Expert 大 EP 场景支持 MegaMoE 路由、专家计算与通信融合；Decode 支持基于 `RadixArk/Kimi-K3-DSpark` 的 DSpark 投机推理。
-- **Agent-Friendly 开发**：KDA 与 AttnRes 融合算子均由 CANNBot 基于 CANNBot-DSL 完成开发，覆盖方案生成、实现验证与性能调优。
+- **部署优化与多流编排**：组合使用 KDA TP16、MLA DP 与输出 TP16、MoE EP32 与共享专家 TP8，让计算与通信重叠，并通过控核和跨流依赖减少 Cube/vec 资源竞争。
+- **MegaKDA 扩大融合范围**：基于 CANNBot-DSL，将输入投影、ShortConv、状态递推和输出处理纳入同一融合算子，减少中间数据搬运与调度开销。
+- **DSpark 与 ReplaySSM**：通过草稿生成与批量验证提高解码效率，并在 MegaKDA 基础上支持 ReplaySSM，减少投机验证中的完整状态快照存储。
+- **SuperKernel 优化**：扩大 MoE 连续计算的融合范围，结合已有多流编排，减少 Kernel 之间的调度开销。
+- **低精度计算**：MLA 采用 MXFP8 W8A8 投影与 FP8 注意力及 KV Cache，latent MoE 采用 MXFP8 W8A8，路由专家采用 MXFP4 权重与动态 MXFP8 激活。
+- **NPU 亲和优化**：提前准备 NK/KN 与 NZ 权重布局，接入 AttnRes+RMSNorm、Group SiTU+MXQuant 等融合算子，并按资源需求选择昇腾 CCU/AIV 通信。
+- **图模式加速**：采用 PyTorch 图模式与 CANN Aclgraph，结合 Compile Cache 和模型级 Event 复用，缩短编译启动时间并降低调度开销。
 
 ## Outline
 
@@ -25,7 +26,9 @@ cann-recipes-infer 提供 Kimi K3 在昇腾 950PR/DT 4机 32卡集群上的推�
   - [Stable LatentMoE](#stable-latentmoe)
 - [并行策略](#并行策略)
 - [量化策略](#量化策略)
+- [多流编排与 NPU 亲和优化](#多流编排与-npu-亲和优化)
 - [npugraph_ex 图模式](#npugraph_ex-图模式)
+- [总结](#总结)
 - [Future Plan](#future-plan)
 
 ## 模型结构
@@ -115,11 +118,11 @@ $$
 
 以合并后的最大分数 $M$ 为基准平移指数项，可降低指数运算溢出的风险并改善数值稳定性。在精确算术下，两阶段计算与直接对全部候选状态执行 Softmax 聚合严格等价；在有限精度计算中，二者可能因运算顺序不同而产生细微数值差异。各 Block 的统计量相互独立，仅用于对应 Block 的当前次前向计算。
 
-#### 原实现、两阶段路径与融合算子
+#### 当前融合实现
 
-- **Kimi 原实现**：AttnRes 随 Decoder Layer 逐层更新，将有效块间历史状态与当前 block 表示进行深度 Softmax 聚合，生成 Attention 与 FFN/MoE 输入；核心聚合由 `KimiDecoderLayer.forward` 中的 `_apply_attn_res` 完成。
-- **两阶段优化**：`KimiLinearModel._forward_attn_res_block` 将 block 内复用的块间历史状态计算前移，批量生成统计量，并在层内通过 Online Softmax 合入动态 partial。该路径与 Kimi 原实现数学等价，由 `attn_res_mode: two_phase` 启用，适合作为对比和回退实现；Output AttnRes 保持原实现。
-- **融合算子**：`attn_res_mode: fused` 保持相同的两阶段数学流程，Phase 1/Phase 2 分别调用 [`block_attn_res_prepare`](../../../ops/cannbot_dsl/block_attn_res_prepare.py) 和 [`block_attn_res_update`](../../../ops/cannbot_dsl/block_attn_res_update.py)，将历史统计、Partial 更新和 Online Softmax 合并落到 NPU 融合算子中。当前普通和 DSpark 示例 YAML 均配置为 `fused`，推荐使用该路径；未显式指定时，模型配置默认使用 `original`。
+AttnRes 固定使用 fused 两阶段实现。`KimiLinearModel._forward_attn_res_block` 将 block 内复用的历史状态计算前移，Phase 1 调用 `cann_ops_transformer.ops.block_attn_res_prepare`，Phase 2 调用 `block_attn_res_update`，维护 FP32 residual 和 Online Softmax 统计量。
+
+Decode/Verify 的 Phase 2 融合后续 RMSNorm；每个 block 的首个 Attention 输入及 DSpark 采集归一化前 hidden 的位置仍单独归一化。Prefill 保持 prepare/update 和独立 RMSNorm。最终 Output AttnRes 仍由 `_apply_attn_res` 聚合，再执行输出 RMSNorm。
 
 ### 混合注意力：KDA 与 Gated MLA
 
@@ -127,7 +130,7 @@ $$
 
 KDA 是带逐 key-channel 衰减的 Delta Rule 线性注意力，输入为 Decoder Layer 的 Input RMSNorm 输出。每个 head 的 Q/K/V 维度均为 128，并维护固定大小的 `128 × 128` KDA SSM State。状态按 token 递推：旧状态先按 key channel 衰减，K 从中读出对当前 V 的预测；β 缩放实际 V 与预测值的差值，并沿 K 对应方向将修正写回状态；Q 最后读取更新后的状态。Q/K 进入 KDA core 前执行 L2Norm，Q 额外按 key 维度的平方根倒数缩放，V 不做归一化。
 
-逐 head、逐 key-channel 的 `gk` 由 `f_a_proj`、`f_b_proj`、`dt_bias` 和所有 heads 共享的 128 维 `A_log` 生成。K3 配置将 `gate_lower_bound` 设为 -5，因此 `gk` 位于 `(-5, 0)`。Prefill 与 Decode 均使用这一 log-decay；Decode 将其作为 `gk` 参数传入融合算子，旧状态乘入其指数对应的保留因子。`b_proj` 经 sigmoid 生成 β。KDA 输出先执行 per-head RMSNorm，再乘逐 value-channel 的 sigmoid 输出门，最后进入 `o_proj`。三类门分别控制状态衰减、状态写入和输出。
+逐 head、逐 key-channel 的 `gk` 由 `f_a_proj`、`f_b_proj`、`dt_bias` 和逐 head 的 `A_log` 生成。K3 配置将 `gate_lower_bound` 设为 -5，因此 `gk` 位于 `(-5, 0)`。Prefill 与 Decode 均使用这一 log-decay；融合算子内部完成衰减激活，旧状态乘入 log-decay 的指数对应的保留因子。`b_proj` 经 sigmoid 生成 β。KDA 输出先执行 per-head RMSNorm，再乘逐 value-channel 的 sigmoid 输出门，最后进入 `o_proj`。三类门分别控制状态衰减、状态写入和输出。
 
 KDA 的长期状态大小与序列长度无关；每个请求、每个 KDA 层只需保存：
 
@@ -138,49 +141,52 @@ KDA 的长期状态大小与序列长度无关；每个请求、每个 KDA 层�
   <img src="./figures/kda_architecture.svg?v=9" width="92%" alt="Kimi K3 KDA fused QKV ShortConv and state flow">
 </p>
 
-`qkv_proj` 按通道生成 Q/K/V。融合 QKV ShortConv 在 Prefill 调用 [`causal_conv1d_fn`](https://gitcode.com/cann/ops-transformer/blob/master/torch_extension/cann_ops_transformer/docs/zh/causal_conv1d_fn.md)，在 Decode 调用 [`causal_conv1d_update`](https://gitcode.com/cann/ops-transformer/blob/master/torch_extension/cann_ops_transformer/docs/zh/causal_conv1d_update.md)，完成逐通道因果卷积与 SiLU 后再拆分三路。三组通道使用各自的卷积权重，共同维护一份拼接的 `conv_state`。
+上图展示 Prefill 与非 MegaKDA 的 snapshot 路径。`qkv_proj` 按通道生成 Q/K/V。融合 QKV ShortConv 在 Prefill 调用 [`causal_conv1d_fn`](https://gitcode.com/cann/ops-transformer/blob/master/torch_extension/cann_ops_transformer/docs/zh/causal_conv1d_fn.md)，在 snapshot fused recurrent 路径调用 [`causal_conv1d_update`](https://gitcode.com/cann/ops-transformer/blob/master/torch_extension/cann_ops_transformer/docs/zh/causal_conv1d_update.md)，完成逐通道因果卷积与 SiLU 后再拆分三路。三组通道使用各自的卷积权重，共同维护一份拼接的 `conv_state`。
 
 推理实现由 `models/kimi_k3/models/modules/attention_data.py` 为每层分配 `conv_state` 与 KDA SSM State，并在本地 metadata 字典中维护请求到状态行的映射。Prefill 通过 `causal_conv1d_fn` 更新 `conv_state`，Fused KDA 完成前处理、分块计算和状态递推；在 Decode 和 DSpark Verify 中，模型沿请求已有的状态继续处理新增 token：ShortConv 先更新卷积状态并生成当前 Q/K/V，随后 KDA 按序更新 SSM State，完成递推计算并输出结果。
 
 ##### KDA 融合算子
 
-KDA 的 Prefill 与 Decode 阶段分别接入不同的融合算子，将 L2 归一化、gate 激活和 beta sigmoid 等预处理操作融合进 NPU 算子内部，减少中间张量读写和 Python 侧算子调度开销。前文 KDA 结构图中的 Fused KDA operator 覆盖 Q/K L2Norm、衰减 Gate、Beta 激活、状态递推与输出计算；QKV 投影和 ShortConv 作为输入准备阶段执行。普通 Decode 和 DSpark Verify 均使用 `fused_recurrent_kda`。
+KDA 的 Prefill 与 Decode 阶段分别接入不同的融合算子，将 L2 归一化、gate 激活和 beta sigmoid 等预处理操作融合进 NPU 算子内部，减少中间张量读写和 Python 侧算子调度开销。前文 KDA 结构图中的 Flash / snapshot core 覆盖 Q/K L2Norm、衰减 Gate、Beta 激活、状态递推与输出计算；QKV 投影和 ShortConv 在 Prefill 与 snapshot fused recurrent 路径中单独执行。默认 MegaKDA/ReplaySSM 将融合范围扩大至输入投影、ShortConv、递推、输出 RMSNorm/Gate 和输出投影，TP AllGather/ReduceScatter 位于算子外。
 
-本次融合算子由 CANNBot 基于 CANNBot-DSL 完成开发，源码如下：
+<p align="center">
+  <img src="./figures/megakda_decode.svg" width="92%" alt="MegaKDA Decode fusion and ReplaySSM commit">
+</p>
 
-| 阶段 | 融合算子 | 源码 |
+KDA 使用外部算子包提供的接口：
+
+| 阶段 | 融合算子 | 接口 |
 |:---|:---|:---|
-| Prefill | `flash_kda` | [`ops/cannbot_dsl/flash_kda.py`](../../../ops/cannbot_dsl/flash_kda.py) |
-| Decode / DSpark Verify | `fused_recurrent_kda` | [`ops/cannbot_dsl/fused_recurrent_kda.py`](../../../ops/cannbot_dsl/fused_recurrent_kda.py) |
-
-| 开关 | 默认值 | 作用 |
-|:---|:---|:---|
-| `enable_flash_kda` | `True` | Prefill 阶段选择 flash_kda 融合算子或 torch 参考实现 |
-| `enable_fused_recurrent_kda` | `True` | Decode 阶段选择 fused_recurrent_kda 融合算子或 gdr 算子 |
+| Prefill | `flash_kda` | `ops.flash_kda.flash_kda` |
+| Decode / DSpark Verify（默认配置） | MegaKDA ReplaySSM | `ops.mega_recurrent_kda_replayssm.mega_recurrent_kda_replayssm` + `ops.commit_recurrent_kda_replayssm.commit_recurrent_kda_replayssm` |
+| Decode / DSpark Verify（`enable_mega_kda=True`、ReplaySSM 关闭） | MegaKDA snapshot | `ops.mega_recurrent_kda.mega_recurrent_kda` |
+| Decode / DSpark Verify（`enable_mega_kda=False`） | snapshot fused recurrent | `ops.fused_recurrent_kda_snapshot.fused_recurrent_kda_op` |
 
 ###### Prefill：flash_kda 融合算子
 
-Prefill 阶段按请求分块计算 chunk KDA，每块大小 64 token。`enable_flash_kda=True` 时调用 [`flash_kda`](../../../ops/cannbot_dsl/flash_kda.py) 算子，`False` 时回退到纯 Python 参考实现（`_torch_chunk_kda`）。当 `gate_lower_bound is None`（softplus gate 形式）时，flash_kda 不支持该 gate 公式，自动退到 torch 参考实现。
+Prefill 固定调用 `ops.flash_kda.flash_kda`，以 TND 布局一次处理 packed batch。`ops.flash_kda_metadata.flash_kda_metadata` 使用 int32 `query_start_loc` 描述各请求边界。模型配置提供非空的 `gate_lower_bound`。
 
-**非对齐长度：** 当前 Prefill 以 64 token 为 chunk，对不足一个完整 chunk 的请求长度做临时 padding，并在计算后裁剪输出。后续将去掉 padding 约束，直接支持非 64 倍数的请求长度，减少无效 token 计算。
+**非对齐长度：** 算子按请求真实长度处理尾块。模型负责 TP/SP 的输入去 padding、输出补齐，以及 chunked Prefill 的初始状态读取与最终状态回写。
 
-###### Decode：fused_recurrent_kda 融合算子
+###### Decode：MegaKDA、ReplaySSM 与 snapshot fallback
 
-Decode 阶段逐 token 递推更新 KDA SSM State。`enable_fused_recurrent_kda=True` 且 `gate_lower_bound is not None` 时调用 [`fused_recurrent_kda`](../../../ops/cannbot_dsl/fused_recurrent_kda.py) 算子，否则回退到 `npu_recurrent_gated_delta_rule`（gdr）算子。
+当前配置同时开启 `enable_mega_kda` 和 `enable_mega_kda_replayssm`，Decode/Verify 调用 ReplaySSM 主算子与 Commit 算子。ReplaySSM 为每个请求保存一个可提交 checkpoint，并为 Verify width 内的候选 token 保存 replay 数据；Commit 算子只提交已接受 token 的状态，避免逐候选 token 回滚完整 snapshot。该路径需要 `ops.mega_recurrent_kda_replayssm`、`ops.commit_recurrent_kda_replayssm`，并要求 DSpark、`next_n=7`、本地 batch 不超过 16、local KDA heads 为 6、hidden size 为 7168、head dim 为 128、ShortConv kernel 为 4，以及 full-rank output gate。
 
-**State 布局：** 两条路径的 state 布局一致，均为 `[pool, H, Dv, Dk]` fp32，行索引对应 value 维度（Dv），列索引对应 key 维度（Dk）。fused_recurrent_kda 返回的 state 与传入的 `recurrent_state_cache` 是同一 tensor 对象（原地更新），因此返回的 state 直接丢弃，无需额外写回 cache。
+关闭 ReplaySSM 但保留 `enable_mega_kda` 时，调用 `ops.mega_recurrent_kda.mega_recurrent_kda`，将投影、卷积、递归与输出处理一起融合；关闭 `enable_mega_kda` 时回退到 `ops.fused_recurrent_kda_snapshot.fused_recurrent_kda_op`。Prefill 始终使用 FlashKDA。
+
+**State 布局：** snapshot 路径的 recurrent state 为 `[pool, H, Dv, Dk]` FP32；ReplaySSM 路径的 recurrent state 为 `[batch_size_per_rank, local_heads, head_dim, head_dim]`，并额外维护 `replay_u/replay_k/replay_decay`，形状均为 `[batch_size_per_rank, verify_size, local_heads, head_dim]`。ReplaySSM 的 commit stream 与主 Decode 流通过事件同步。
 
 #### Gated MLA
 
 Gated MLA 沿用 MLA 的 Q/KV 低秩投影，并在 Attention 输出后增加逐 head、逐 value-channel 的门控。
 
 <p align="center">
-  <img src="./figures/gated_mla_architecture.svg" width="90%" alt="Kimi K3 Gated MLA architecture and paged cache flow">
+  <img src="./figures/gated_mla_architecture.svg?v=2" width="90%" alt="Kimi K3 Gated MLA with merged owner-local Decode cache and separate chunked Prefill caches">
 </p>
 
-Recipes 提供 Prefill native、Decode absorb 的实现参考。本地 `CacheData` 为每个 MLA 层分配 `nope_cache` 与 `rope_cache`；`AttnMetaData` 根据固定 batch、rank 和 step 位置生成 `block_table` 与 `slot_mapping`，模型完成 KV latent 的 RMSNorm 后将其写入两份 Paged Cache。
+MLA 通过低秩压缩保存 KV 历史，降低长上下文推理的缓存占用。Prefill 支持分块处理长输入，逐块建立历史状态；Decode 按请求分配计算与缓存，在压缩空间完成注意力计算，避免每轮展开完整的历史 K/V。
 
-Prefill 通过 `kv_b_proj` 将本轮 latent 临时展开为 per-head K/V，并调用 `npu_fused_infer_attention_score`，以 `NTD_TND` 布局和 `sparse_mode=3` 完成变长序列的 causal Attention。Decode 将 KV up-projection 的 K 矩阵吸收到 Query 侧，再调用 [`npu_fused_infer_attention_score_v2`](https://gitcode.com/Ascend/op-plugin/blob/26.1.0/docs/zh/custom_APIs/torch_npu/torch_npu-npu_fused_infer_attention_score_v2.md)，直接读取 NZ 布局的 latent Paged Cache 完成 absorb Attention；随后通过吸收后的 V 投影将算子输出还原到各 Attention head 的 value 空间。
+Decode 将投影、归一化和缓存更新整合到 MLA Prolog，再通过 Flash MLA 计算注意力，随后完成 Value 投影、输出门控和输出投影。该方案支持 BF16 与 W8A8C8 两条路径：C8 结合 MXFP8 投影、FP8 注意力计算与 KV Cache，进一步降低计算和访存开销，具体精度方案见[量化策略](#量化策略)。
 
 ### Stable LatentMoE
 
@@ -206,47 +212,31 @@ $$
 
 Dense、Shared 和 Routed FFN 均使用 SiTU 作为激活函数。
 
-本次实践中：Router 使用 [`npu_moe_gating_top_k`](https://gitcode.com/Ascend/op-plugin/blob/26.1.0/docs/zh/custom_APIs/torch_npu/torch_npu-npu_moe_gating_top_k.md)，根据 sigmoid routing score 与 `correction_bias` 完成 Top-16 专家选择，并输出后续路由使用的专家索引和聚合权重。
+Router 使用 [`npu_moe_gating_top_k`](https://gitcode.com/Ascend/op-plugin/blob/26.1.0/docs/zh/custom_APIs/torch_npu/torch_npu-npu_moe_gating_top_k.md)，根据 sigmoid routing score 与 `correction_bias` 完成 Top-16 专家选择，并输出后续路由使用的专家索引和聚合权重。
 
-未启用 MegaMoE 时，Prefill 采用 AG–EP–RS 路径。Routed latent 先动态量化为 MXFP8，随后 AllGather 汇聚各 SP 分片的激活、scale 和路由结果。[`npu_moe_init_routing_v2`](https://gitcode.com/Ascend/op-plugin/blob/26.1.0/docs/zh/custom_APIs/torch_npu/torch_npu-npu_moe_init_routing_v2.md) 按专家展开并重排激活及其 scale；专家计算使用两次 [`npu_grouped_matmul`](https://gitcode.com/Ascend/op-plugin/blob/26.1.0/docs/zh/custom_APIs/torch_npu/torch_npu-npu_grouped_matmul.md)，分别完成 MXFP4 gate/up 投影和 down 投影。SiTU 后再次执行动态 MXFP8 量化，再进入第二次 GMM。最后由 [`npu_moe_finalize_routing`](https://gitcode.com/Ascend/op-plugin/blob/26.1.0/docs/zh/custom_APIs/torch_npu/torch_npu-npu_moe_finalize_routing.md) 恢复 token 顺序并按路由权重聚合，经 ReduceScatter 返回 SP 布局。
+未启用 MegaMoE 时，Prefill Routed Expert 使用 double routing。Routed latent 先动态量化为 MXFP8，随后 [`npu_moe_init_routing_v2`](https://gitcode.com/Ascend/op-plugin/blob/26.1.0/docs/zh/custom_APIs/torch_npu/torch_npu-npu_moe_init_routing_v2.md) 按专家展开并重排激活及其 scale。通过 `all_to_all_single` 交换专家 token 数、激活和 scale，将数据发送到专家所属 rank；`npu_moe_re_routing` 将接收数据按本地专家重排。专家计算使用两次 [`npu_grouped_matmul`](https://gitcode.com/Ascend/op-plugin/blob/26.1.0/docs/zh/custom_APIs/torch_npu/torch_npu-npu_grouped_matmul.md)，分别完成 MXFP4 gate/up 和 down 投影，中间通过 `grouped_situ_mx_quant` 完成 SiTU 与动态 MXFP8 量化。专家输出恢复接收顺序后，经反向 AllToAll 返回源 rank，最后由 [`npu_moe_finalize_routing`](https://gitcode.com/Ascend/op-plugin/blob/26.1.0/docs/zh/custom_APIs/torch_npu/torch_npu-npu_moe_finalize_routing.md) 按路由权重聚合，恢复本地 token 顺序。
 
-未启用 MegaMoE 时，Decode 采用 MC2 EP 路径。[`npu_moe_distribute_dispatch_v2`](https://gitcode.com/Ascend/op-plugin/blob/26.1.0/docs/zh/custom_APIs/torch_npu/torch_npu-npu_moe_distribute_dispatch_v2.md) 根据 Top-16 结果将 token 分发到对应 Expert rank；本地专家继续使用两次 `npu_grouped_matmul` 完成 MXFP4 Expert 计算；[`npu_moe_distribute_combine_v2`](https://gitcode.com/Ascend/op-plugin/blob/26.1.0/docs/zh/custom_APIs/torch_npu/torch_npu-npu_moe_distribute_combine_v2.md) 完成跨 EP 聚合、路由权重加权和 token 顺序恢复。启用多流时，Shared Expert 在独立流执行，并与上述 Routed Expert MC2 路径并行。
+Decode 统一采用 MC2 EP 路径。[`npu_moe_distribute_dispatch_v2`](https://gitcode.com/Ascend/op-plugin/blob/26.1.0/docs/zh/custom_APIs/torch_npu/torch_npu-npu_moe_distribute_dispatch_v2.md) 根据 Top-16 结果将 token 分发到对应 Expert rank；本地专家继续使用两次 `npu_grouped_matmul` 完成 MXFP4 Expert 计算；[`npu_moe_distribute_combine_v2`](https://gitcode.com/Ascend/op-plugin/blob/26.1.0/docs/zh/custom_APIs/torch_npu/torch_npu-npu_moe_distribute_combine_v2.md) 完成跨 EP 聚合、路由权重加权和 token 顺序恢复。启用多流时，Shared Expert 在独立流执行，并与上述 Routed Expert MC2 路径并行。
 
-启用 `enable_mega_moe=True` 且 EP 大于 1 时，Prefill 和 Decode 的 Routed Expert 路径均切换为 [MegaMoE](https://gitcode.com/cann/ops-transformer/tree/master/mc2/mega_moe)。该融合算子将 Token 路由、两次专家计算、SiTU 激活和结果聚合组织在同一执行路径中，并重叠通信、Cube 与 Vector 计算，减少中间张量搬运和通信边界等待，面向 896 Expert 大 EP 场景提升 MoE 执行效率。
+`enable_prefill_mega_moe` 控制 Prefill 的 Routed Expert 是否使用 [MegaMoE](https://gitcode.com/cann/ops-transformer/tree/master/mc2/mega_moe)，仅在 EP 大于 1 时生效。Decode 使用 `KimiSparseMoeBlock.decode` 的 split MC2 实现；`enable_superkernel` 控制融合，`enable_multi_streams` 独立控制流与事件。普通 SiTU 及 SiTU+MXFP8 量化固定使用自定义算子、`high_precision=False`，Prefill split 聚合固定采用 BF16 mode。
 
 ### DSpark 投机推理
 
-为进一步优化 Kimi K3 Decode 阶段的 TPOT，SGLang 基于 Hugging Face 开源的 [`RadixArk/Kimi-K3-DSpark`](https://huggingface.co/RadixArk/Kimi-K3-DSpark) 完成适配。通过草稿模型生成候选 Token、主模型批量验证并维护两套模型的状态 Cache，减少主模型逐 Token 执行次数，提升长文本和 Agent 场景下的生成效率。
+为进一步优化 Kimi K3 Decode 阶段的 TPOT，本实践基于 Hugging Face 开源的 [`RadixArk/Kimi-K3-DSpark`](https://huggingface.co/RadixArk/Kimi-K3-DSpark) 完成适配。通过草稿模型生成候选 Token、主模型批量验证并维护两套模型的状态 Cache，减少主模型逐 Token 执行次数，提升长文本和 Agent 场景下的生成效率。
 
 ## 并行策略
 
 以下并行配置适用于昇腾 950PR/DT 4机 32卡、完整 93 层和 896 Expert。框架级模型副本 DP 为 1；Decoder 层间表示采用 Prefill SP、Decode DP。
 
-### HBM 占用分析
+Decode 中，MLA 采用 DP，输出投影 `o_proj` 采用 TP16；KDA 采用 Head TP16；MoE 路由专家采用 EP32，共享专家采用 TP8。
 
-#### 主要 HBM 占用
-
-下表按模块汇总该切分策略下的单卡主要参数占用，不再展开每个投影矩阵的计算过程。其中 Routed Expert 使用 MXFP4 权重与 E8M0 scale，其余主要权重以 BF16 或 FP32 保存。
-
-Routed Expert EP 仅沿 Expert 维度分摊 Routed Expert 参数。Shared Expert 对所有 token 固定激活，不属于 Router 管理的 Expert 集合；KDA/Gated MLA 的 `g_proj/o_proj` 也位于 MoE EP 之外。若这些参数保持复制，Shared Expert 与 93 层 Attention `g_proj/o_proj` 即占约 53.2 GiB/卡，单卡占用约为 110.00 GiB，仍需继续切分。Shared Expert 与首层 Dense FFN 采用 Dense TP，`g_proj/o_proj` 分别采用 Column TP 与 Row TP，将上述主要项的单卡占用降至 58.51 GiB。
-
-| 模块 | 主要内容 | 切分方式 | GiB/卡 |
-|:---|:---|:---|---:|
-| Embedding + LM Head | 输入与输出词表权重 | Vocab TP | 0.136 |
-| Gated MLA（24 层） | Q/KV Low-Rank Projection、Output Gate 与 Output Projection | 部分复制 + Attention TP | 2.752 |
-| KDA（69 层） | Q/K/V、门控与输出投影 | Head / Column / Row TP | 1.769 |
-| MoE Router（92 层） | Router gating 权重 | Replicated | 2.201 |
-| Shared Expert（92 层） | `gate_up_proj` 与 `down_proj` | Dense TP | 0.708 |
-| Routed Expert（92 层） | MXFP4 `w13/w2` 权重及 scale | Expert EP | 42.097 |
-| Routed latent 投影（92 层） | latent down/up 投影 | Replicated | 8.805 |
-| Dense FFN（1 层） | `gate_up_proj` 与 `down_proj` | Dense TP | 0.042 |
-| **合计** | — | — | **58.51** |
-
-上表合计仅统计模型权重。启用 `two_phase` 或 `fused` AttnRes 时，运行期间还会维护一个按 Block 复用的 Phase 1 统计区：一个 Block 包含 12 个 Decoder Layer，Attention 与 FFN/MoE 各占一个 slot，因此共有 24 个 slot。核心 `inter_numerator` 为 `[24, T_local, 7168]` 的 FP32 张量，`inter_max` 与 `inter_exp_sum` 仅保存对应的标量统计量；其中 `T_local` 是 TP 切分后的本地 Prefill token 数。当前示例的 `input_max_len=16384`、`prefill_mini_batch_size=1`、`attn_tp_size=32` 时，`T_local=512`，24-slot 统计区约占 **336 MiB（0.328 GiB）/卡**，应计入运行时 HBM 预算。
+<p align="center">
+  <img src="./figures/decode_parallel_strategy.svg" width="80%" alt="Kimi K3 Decode 部署策略：MLA DP 与输出 TP16、KDA TP16、MoE EP32 与 Shared TP8">
+</p>
 
 ### Prefill 与 Decode 数据流
 
-本次实践KDA/MLA采用部署策略如下：
+KDA/MLA 的部署策略如下：
 
 <p align="center">
   <img src="./figures/attention_parallel_dataflow.svg?v=2" width="90%" alt="Kimi K3 KDA and MLA prefill and decode parallel flow">
@@ -255,28 +245,91 @@ Routed Expert EP 仅沿 Expert 维度分摊 Routed Expert 参数。Shared Expert
 Prefill 与 Decode 的 Attention / MoE 部署策略如下：
 
 <p align="center">
-  <img src="./figures/parallel_phase_dataflow.svg?v=2" width="90%" alt="Kimi K3 Prefill and Decode end-to-end MoE decoder flow">
+  <img src="./figures/parallel_phase_dataflow.svg?v=3" width="90%" alt="Kimi K3 MoE flow with Prefill AllToAll routing or fused MegaMoE and Decode split MC2">
 </p>
 
-- **Prefill**：Attention 前通过 AllGather 汇聚 SP 分片，KDA/Gated MLA 按 Head TP 计算；经输出门和 `o_proj` 后，由 ReduceScatter 恢复 SP 布局。未启用 MegaMoE 时 Routed Expert 使用 AG–EP–RS，启用时切换为 MegaMoE；Shared Expert 使用 AG–TP–RS。
-- **Decode**：KDA 采用 DP–TP–DP；Gated MLA 的 Q/KV 投影与 Attention core 保持 DP，Attention 输出和门控输入在输出门前转换为 TP，`o_proj` 后由 ReduceScatter 恢复 DP 布局。未启用 MegaMoE 时 Routed Expert 使用 MC2 Dispatch–EP–MC2 Combine，启用时切换为 MegaMoE；Shared Expert 使用 AG–TP–RS。
+- **Prefill**：Attention 前通过 AllGather 汇聚 SP 分片，KDA/Gated MLA 按 Head TP 计算；经输出门和 `o_proj` 后，由 ReduceScatter 恢复 SP 布局。未启用 MegaMoE 时 Routed Expert 使用 AllToAll 分发、EP 专家计算和反向 AllToAll 回传，启用时由 MegaMoE 融合路由、计算和通信；Shared Expert 使用 AG–TP–RS。
+- **Decode**：KDA 采用 DP–TP–DP；Gated MLA 的 Q/KV 投影与 Attention core 保持 DP，Attention 输出通过 AllToAll、门控输入通过 AllGather 在输出门前转换为 TP，`o_proj` 后由 ReduceScatter 恢复 DP 布局。Routed Expert 固定使用 MC2 Dispatch–EP–MC2 Combine，Shared Expert 使用 AG–TP–RS；启用多流时 Shared Expert 与 Routed Expert 路径并行。
 
-KDA SSM State 随 Head TP 切分；Gated MLA latent Cache 在 Prefill 复制，Decode 按 DP 布局读写。第 1 层 Dense FFN 与 Shared Expert 均使用 AG–TP–RS。
+KDA SSM State 随 Head TP 切分；Gated MLA 常驻合并 `kv_cache` 按请求归属保存在对应 rank，Prefill 写入后由 Decode/Verify 继续读写。Chunked Prefill 的两份专用 BF16 cache 在 Attention TP group 内复制当前 mini batch 的历史。第 1 层 Dense FFN 与 Shared Expert 均使用 AG–TP–RS。
 
 ## 量化策略
 
-Kimi K3 的 Routed Expert `w13/w2` 使用 MXFP4 权重和动态 MXFP8 激活，其余 checkpoint 权重以 BF16 为主；KDA ShortConv、`A_log`、`dt_bias`、`o_norm` 和 Router correction bias 在 checkpoint 中保留 FP32。加载后，融合的 `qkv_conv1d.weight` 转换为 BF16 参与计算。Routed Expert 的量化格式为：
+量化方案按模块设计，在降低计算和访存开销的同时保留必要的高精度计算。
 
-- 权重元素：MXFP4 E2M1，每两个 4-bit 元素打包为一个 byte；
-- 权重 scale：每 32 个输入元素共享一个 E8M0 scale；
-- 激活：每 token、每 group 动态量化为 MXFP8 E4M3FN，运行时 scale 为 E8M0FNU；
-- SiTU 后重新动态量化，再进入 `down_proj` GMM。
+| 模块 | 量化方案 |
+|:---|:---|
+| MLA | W8A8C8：Q/KV 压缩投影、Q 升维投影和输出投影采用 MXFP8 W8A8；FA 使用 FP8 Query 和 FP8 KV Cache，`kv_b_proj` 保持 BF16。另支持 BF16 MLA 路径。 |
+| MoE latent down/up | 采用 MXFP8 W8A8，降低主干与 latent 空间之间的投影开销；另支持 BF16 路径。 |
+| Routed Expert | 权重采用 MXFP4，激活采用动态 MXFP8；SiTU 后重新量化，再进入第二次 GMM。 |
+
+MXFP8 使用 E4M3 数据与 E8M0 分组缩放，每 32 个元素共享一个 scale；权重静态量化，激活动态量化。MXFP4 权重使用 E2M1，每两个 4-bit 元素打包为一个 byte，同样按 32 个元素分组缩放。MLA 的 FP8 KV Cache 减少长上下文注意力的数据读取量。
+
+## 多流编排与 NPU 亲和优化
+
+**MLA**：Prolog 完成后，Gate 分支启动 AllGather，与主流的 FA 重叠。FA 输出经 value projection 和 AllToAll 转为 TP 布局，Gate 分支完成投影后再汇合，随后执行输出投影与 ReduceScatter。Gate AllGather 等待 Prolog 完成；AllToAll 等待 Gate AllGather 完成，Gate 投影等待 value projection 完成，再与 AllToAll 重叠。
+
+**MoE**：Shared Expert 的 AllGather 与 Router/latent down 重叠，Dispatch 与 Shared gate/up 投影重叠。Shared SiTU 等待 Dispatch 完成，Routed GMM1 再等待 Shared SiTU，错开对 vec 资源的使用；Shared Down 的 Cube 计算与 Routed SiTU/量化重叠，Shared ReduceScatter 可与后续 Routed GMM2 重叠，最终 Add 等待两个分支完成。多流由 `enable_multi_streams` 独立控制。
+
+MoE 还对 Router GEMM 和 Shared Gate/Up MatMul 使用 `limit_core_num(32, 1)`。针对本次优化的 Decode shape，默认 MatMul 会使用 vec 加速；通过控核使其采用 Cube 路径，减少对 vec 的占用，为并行的量化、激活和通信任务释放 vec 资源。这一调整与跨流等待配合，避免算子各自优化后反而争抢资源。
+
+<p align="center">
+  <img src="./figures/mla_moe_multistream.svg" width="100%" alt="MLA 与 MoE Decode 多流调度：计算、通信及跨流依赖">
+</p>
+
+**SuperKernel**：`enable_superkernel=True` 时，MoE Decode 的命名 scope 覆盖 Router、latent down、专家计算、Combine 和 latent up，以及相应 Shared Expert 计算；Shared AllGather、ReduceScatter 和最终 Add 位于 scope 外。它需要 `npugraph_ex`、静态 kernel、多流和 Shared Expert。scope 表示编译融合范围，不等同于范围内全部操作成为一个硬件 kernel。
+
+<p align="center">
+  <img src="./figures/moe_sk_prof_comparison.svg" width="100%" alt="MoE 启用 SuperKernel 前后的历史 profiling 流水">
+</p>
+
+**布局与算子优化**：权重在加载阶段完成转置和 NZ 格式准备，减少运行时 TensorMove。这里 `K` 表示输入维度，`N` 表示输出维度；NK/KN 是逻辑维度顺序，NZ 是物理存储格式。
+
+| 计算路径 | 权重布局 |
+|:---|:---|
+| KDA MegaKDA / ReplaySSM | 使用 `[N, K]` 的 NZ 权重；Prefill Linear 通过同一存储的 `[K, N]` 转置视图执行 MatMul，避免保存两份权重。 |
+| BF16 MLA Prolog | Q/KV 压缩投影与 Q 升维投影复用 Linear 准备好的 `[K, N]` NZ 权重。 |
+| C8 MLA Prolog | 将 checkpoint 的 `[N, K]` MXFP8 权重提前打包为 `[N/32, K, 32]`，供融合算子直接读取。 |
+| latent down/up、Shared Expert 和 Dense Linear | 加载后将 `[N, K]` 转为 MatMul 使用的 `[K, N]` NZ 权重；例如未切分的 latent down 从 `[3584, 7168]` 转为 `[7168, 3584]`。 |
+
+DSpark 同样在加载后准备 Linear 的 NZ 权重。MLA 将转置与输出布局转换融合进 Value MatMul，直接生成 AllToAll 所需的分片布局，减少单独重排带来的数据搬运。
+
+Decode 接入 AttnRes Update+RMSNorm、Group SiTU+MXQuant 等融合算子，并将 latent up 前的 RMSNorm 与动态 MXFP8 量化融合，减少中间张量读写和算子调度。针对模型实际使用的 Decode shape，进一步调优 FA 与 MLA Prolog 的算子性能，与低精度路径共同缩短注意力计算耗时。
+
+**通信**：Embedding 在与 Attention 分片布局一致时，以 ReduceScatter 替代 AllReduce 后切分，直接生成各卡需要的 token 分片，减少通信量。结合昇腾专用 CCU 通信引擎与 AIV 通信，按并行任务的资源需求选择执行方式。CCU 可减少通信对 vec 计算资源的占用，适合与计算重叠；AIV 使用 vec 执行通信，适合该阶段可独占 vec、不会挤占其他计算的场景。
+
+| 通信位置 | 选择与原因 |
+|:---|:---|
+| KDA/MLA 的 AllGather、MLA 输出 AllToAll | 使用 CCU，为并行计算保留 vec 资源。 |
+| KDA/MLA 输出 ReduceScatter | 使用 AIV；此时本层计算分支已汇合，可利用 vec 完成通信。 |
+| Shared Expert 的 AllGather / ReduceScatter | 使用 Dense TP 的 CCU 通信组，减少与 Routed 分支的计算资源竞争。 |
+
+因此，ReduceScatter 不统一采用 AIV：可以独占 vec 时选择 AIV，需要与其他 vec 工作重叠时选择 CCU。当前 Embedding、LMHead 及 MoE EP 组另使用 AIV；MC2 Dispatch/Combine 按融合通信算子路径执行。具体选择落实到各通信组，而非只由全局环境变量决定。
 
 ## npugraph_ex 图模式
 
-`npugraph_ex` 用于捕获 Kimi K3 的 Decode 阶段。Prefill 保持 eager，用于处理变长 packed sequence 并建立初始 Cache。Decode 使用固定 token 数、固定 Cache 地址和固定 AttnRes slots 进行 capture/replay。
+Kimi K3 的 Decode 支持 `eager` 和 `npugraph_ex` 两种执行模式。设置 `exe_mode=npugraph_ex` 时捕获 Decode 阶段，使用固定 token 数、固定 Cache 地址和固定 AttnRes slots 进行 capture/replay。Prefill 固定保持 eager，用于处理变长 packed sequence 并建立初始 Cache。
+
+主模型和 DSpark 均支持 `enable_cache_compile`，将编译结果写入各自缓存目录；主模型 SuperKernel 使用独立子目录。修改模型形状、算子路径、权重布局或编译选项后，应重新生成对应缓存。缓存用于缩短后续启动时的编译过程，首次运行仍可能产生编译和捕获开销。
+
+<p align="center">
+  <img src="./figures/compile_cache.svg" width="100%" alt="Compile Cache：首次编译保存缓存，后续启动命中缓存后加载并捕获执行图">
+</p>
+
+MLA、MoE 和 ReplaySSM 使用模型级 Context 管理流与可复用 Event，在生产者完成、消费者读取的边界记录和等待事件，减少逐层创建调度对象的开销，并保留跨流依赖。
+
+## 总结
+
+本轮实践结合融合算子、部署与多流编排、量化和图模式优化，减少通信等待、数据搬运与调度开销，将模型等效 Decode 时延从 **28 ms 降至接近 10 ms，约 2.8× 加速**。测试条件为昇腾 950DT 32 卡、KDA TP16、单卡 Batch 1、输入 100K、输出 256、7 个草稿 token，接受长度统一按 4 折算，仅统计大小模型耗时。
+
+<p align="center">
+  <img src="./figures/kimi_k3_performance_waterfall.svg" width="100%" alt="Kimi K3 累计性能优化收益：28 ms 降至 10.3 ms">
+</p>
+
+相关实现见 [Kimi K3 推理样例](../../../models/kimi_k3)，为 Kimi K3 在昇腾上的低时延部署与算子优化提供实践参考，欢迎交流。
 
 ## Future Plan
 
-- **KDA CP 部署**：为支持更长的 Prefill 序列并进一步改善 TTFT，优化 KDA 的序列切分和状态协同，在降低单卡 HBM 内存占用的同时减少跨卡通信等待；配套融合算子将随 CP 数据流一起调整。
-- **权重 Prefetch**：针对 Routed Expert GMM 与大线性层的访存瓶颈，评估 MXFP4 专家权重预取收益。
+- **高吞吐场景优化**：结合批量规模与并行策略，优化吞吐与资源利用率。
+- **Prefill CP 支持**：推进 KDA 序列切分和跨卡状态协同，降低长序列 Prefill 的单卡内存占用。
+- **更大范围的 MegaMoE 融合**：基于 CANNBot-DSL 探索通信与专家计算的更大范围融合。

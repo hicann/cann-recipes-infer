@@ -15,7 +15,6 @@
 
 from .block_attn_res_prepare import block_attn_res_prepare
 from .block_attn_res_update import block_attn_res_update
-from .flash_kda import flash_kda
-from .fused_recurrent_kda import fused_recurrent_kda
 
-__all__ = ["block_attn_res_prepare", "block_attn_res_update", "flash_kda", "fused_recurrent_kda"]
+# KDA uses the external ops package; do not register the legacy kernels here.
+__all__ = ["block_attn_res_prepare", "block_attn_res_update"]

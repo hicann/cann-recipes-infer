@@ -18,21 +18,104 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import re
 from typing import Optional
 
 from transformers.configuration_utils import PretrainedConfig
 
 
-def _get_custom_params(runner_settings) -> dict:
-    if runner_settings is None:
-        return {}
-    model_config = getattr(runner_settings, "model_config", None)
-    if model_config is None and isinstance(runner_settings, dict):
-        model_config = runner_settings.get("model_config", {})
-    custom_params = getattr(model_config, "custom_params", None)
-    if custom_params is None and isinstance(model_config, dict):
-        custom_params = model_config.get("custom_params", {})
-    return custom_params or {}
+def mla_uses_mxfp8(config):
+    """Resolve MLA's checkpoint schemes without importing the NPU runtime.
+
+    MXFP8 MLA selects the coupled C8 Prolog/FA path even when the checkpoint's
+    kv_cache_scheme is null. MoE schemes alone never select this path.
+    """
+    quant = getattr(config, "quantization_config", None)
+    if quant is None:
+        quant = getattr(config, "compression_config", None)
+    if not isinstance(quant, dict):
+        return False
+    quant_method = quant.get("quant_method")
+    if quant_method not in ("compressed-tensors", "mxfp8"):
+        return False
+    if quant_method == "mxfp8":
+        # The direct MXFP8 config matches ignored_layers by exact prefix.
+        ignored = quant.get("ignored_layers", quant.get("modules_to_not_convert", ()))
+        quant = {
+            "ignore": ["re:" + re.escape(prefix) + "$" for prefix in ignored],
+            "config_groups": {"linear": {
+                "targets": ["Linear"],
+                "weights": {"num_bits": 8, "type": "float", "strategy": "group", "group_size": 32},
+                "input_activations": {"num_bits": 8, "type": "float", "strategy": "group",
+                                      "dynamic": quant.get("activation_scheme") == "dynamic"},
+            }},
+        }
+
+    def matches(value, target, module_type=False):
+        # Match the framework's compressed-tensors target precedence: exact
+        # name/regex first, then module class (e.g. Linear), with ignore first.
+        if target.startswith("re:"):
+            return re.match(target[3:], value) is not None
+        return target.lower() in value.lower() if module_type else target == value
+
+    targets = {
+        target: group
+        for group in quant.get("config_groups", {}).values()
+        for target in group.get("targets", ())
+    }
+
+    def scheme(prefix, module_type):
+        if any(matches(prefix, target) for target in quant.get("ignore", ())):
+            return None
+        for value, is_type in ((prefix, False), (module_type, True)):
+            for target, group in targets.items():
+                if matches(value, target, is_type):
+                    return group
+        return None
+
+    def is_mxfp8(group):
+        if group is None:
+            return False
+        weight = group.get("weights") or {}
+        activation = group.get("input_activations") or {}
+        block = ([1, weight.get("group_size")] if weight.get("strategy") == "group"
+                 else weight.get("block_structure") or quant.get("weight_block_size"))
+        if isinstance(block, str):
+            block = [int(part) for part in block.split("x")]
+        return (
+            weight.get("num_bits") == activation.get("num_bits") == 8
+            and weight.get("type") == activation.get("type") == "float"
+            and block == [1, 32]
+            and weight.get("strategy") in ("group", "block")
+            and activation.get("strategy") == "group"
+            and weight.get("symmetric", True)
+            and not weight.get("dynamic", False)
+            and activation.get("dynamic", False)
+        )
+
+    linear = getattr(config, "linear_attn_config", None) or {}
+    kda_layers = set(linear.get("kda_layers", ()))
+    mla_layers = [index for index in range(getattr(config, "num_hidden_layers", 0))
+                  if index + 1 not in kda_layers]
+    projections = (
+        ("q_a_proj", "ReplicatedLinear"),
+        ("q_b_proj", "ColumnParallelLinear"),
+        ("kv_a_proj_with_mqa", "ReplicatedLinear"),
+        ("o_proj", "RowParallelLinear"),
+    )
+    selected = []
+    for index in mla_layers:
+        prefix = f"model.layers.{index}.self_attn"
+        modes = [is_mxfp8(scheme(f"{prefix}.{name}", cls)) for name, cls in projections]
+        if any(modes) and not all(modes):
+            raise ValueError(f"{prefix}: MXFP8 MLA requires q_a/q_b/kv_a/o_proj to share MXFP8")
+        if all(modes) and scheme(f"{prefix}.kv_b_proj", "ColumnParallelLinear") is not None:
+            raise ValueError(f"{prefix}: MXFP8 MLA requires kv_b_proj in quantization ignore")
+        selected.append(all(modes))
+    # Cache storage and request metadata are shared across the MLA layers.
+    if any(selected) and not all(selected):
+        raise ValueError("Mixed BF16/MXFP8 MLA layers require separate cache metadata and are unsupported")
+    return bool(selected) and all(selected)
 
 
 # The Kimi K3 release spells its quantization contract as
@@ -139,7 +222,6 @@ class KimiLinearConfig(PretrainedConfig):
         max_position_embeddings: int = 4096,
         routed_expert_hidden_size: Optional[int] = None,
         topk_method: str = "noaux_tc",
-        attn_res_mode: str = "original",
         **kwargs,
     ) -> None:
         runner_settings = kwargs.pop("runner_settings", None)
@@ -150,6 +232,8 @@ class KimiLinearConfig(PretrainedConfig):
             self.__init__(**{**nested_text_config, "runner_settings": runner_settings})
             return
 
+        # Ignore the retired backend selector in older checkpoint configs.
+        kwargs.pop("attn_res_mode", None)
         values = dict(
             model_type=model_type,
             vocab_size=vocab_size,
@@ -193,12 +277,7 @@ class KimiLinearConfig(PretrainedConfig):
             max_position_embeddings=max_position_embeddings,
             routed_expert_hidden_size=routed_expert_hidden_size,
             topk_method=topk_method,
-            attn_res_mode=attn_res_mode,
         )
-
-        custom_params = _get_custom_params(runner_settings)
-        if "attn_res_mode" in custom_params:
-            values["attn_res_mode"] = custom_params["attn_res_mode"]
 
         for key in ("quantization_config", "compression_config"):
             if key in kwargs:

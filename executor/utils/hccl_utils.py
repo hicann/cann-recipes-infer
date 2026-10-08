@@ -93,9 +93,10 @@ def init_comm_group_by_ranks(
         hccl_buffer_size = int(os.environ.get("HCCL_BUFFSIZE", 200))
 
     options = torch_npu._C._distributed_c10d.ProcessGroupHCCL.Options()
-    options.hccl_config = {"hccl_buffer_size": hccl_buffer_size}
+    hccl_config = {"hccl_buffer_size": hccl_buffer_size}
     if group_type is not None:
-        options.hccl_config["hccl_op_expansion_mode"] = group_type
+        hccl_config["hccl_op_expansion_mode"] = group_type
+    options.hccl_config = hccl_config
     if platform_version == "950":
         os.environ["HCCL_BUFFSIZE"] = str(hccl_buffer_size)
 
@@ -164,8 +165,11 @@ def init_comm_group(
                 if group_name not in created_group.keys():
                     logging.info(f"group:{group_name} create type {group_type} comm group")
                     options = torch_npu._C._distributed_c10d.ProcessGroupHCCL.Options()
-                    options.hccl_config = {"hccl_op_expansion_mode" : group_type}
-                    options.hccl_config = {"hccl_buffer_size": hccl_buffer_size}
+                    hccl_config = {
+                        "hccl_buffer_size": hccl_buffer_size,
+                        "hccl_op_expansion_mode": group_type,
+                    }
+                    options.hccl_config = hccl_config
                     if platform_version == "950":
                         os.environ["HCCL_BUFFSIZE"] = str(hccl_buffer_size)
                     cur_group = dist.new_group(cur_group_list, pg_options=options)

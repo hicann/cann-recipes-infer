@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="400" viewBox="0 0 1600 400" role="img" aria-labelledby="title desc">
+<title id="title">MegaKDA Decode and ReplaySSM</title>
+<desc id="desc">AllGather precedes MegaKDA, which fuses projections, ShortConv, recurrence and output processing. ReduceScatter follows. Verify saves replay data and Commit advances the accepted checkpoint.</desc>
+<defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8Z" fill="#242424"/></marker></defs>
+<rect width="1600" height="400" fill="white"/>
+<g font-family="Arial, sans-serif" fill="#202124" text-anchor="middle">
+<text x="800" y="33" font-size="24">Default Decode / Verify: MegaKDA + ReplaySSM</text>
+<rect x="220" y="60" width="1110" height="178" rx="12" fill="#fff8ed" stroke="#a75c2b" stroke-width="2"/>
+<text x="775" y="88" font-size="20">MegaKDA — CANNBot-DSL</text>
+<rect x="25" y="130" width="160" height="68" rx="8" fill="#d9eddf" stroke="#242424" stroke-width="1.5"/>
+<text x="105.0" y="170.0" font-size="17">AllGather</text>
+<rect x="245" y="125" width="180" height="80" rx="8" fill="#f6d8d1" stroke="#242424" stroke-width="1.5"/>
+<text x="335.0" y="171.0" font-size="17">Input projections</text>
+<rect x="465" y="125" width="180" height="80" rx="8" fill="#d4e5f8" stroke="#242424" stroke-width="1.5"/>
+<text x="555.0" y="171.0" font-size="17">QKV ShortConv</text>
+<rect x="685" y="125" width="180" height="80" rx="8" fill="#d4e5f8" stroke="#242424" stroke-width="1.5"/>
+<text x="775.0" y="158.5" font-size="17">Norm / Gates</text>
+<text x="775.0" y="183.5" font-size="17">SSM recurrence</text>
+<rect x="905" y="125" width="180" height="80" rx="8" fill="#f0efbd" stroke="#242424" stroke-width="1.5"/>
+<text x="995.0" y="158.5" font-size="17">RMSNorm</text>
+<text x="995.0" y="183.5" font-size="17">Output gate</text>
+<rect x="1125" y="125" width="180" height="80" rx="8" fill="#f6d8d1" stroke="#242424" stroke-width="1.5"/>
+<text x="1215.0" y="171.0" font-size="17">Output projection</text>
+<path d="M185 165 L245 165" fill="none" stroke="#242424" stroke-width="1.8" marker-end="url(#arrow)"/>
+<path d="M425 165 L465 165" fill="none" stroke="#242424" stroke-width="1.8" marker-end="url(#arrow)"/>
+<path d="M645 165 L685 165" fill="none" stroke="#242424" stroke-width="1.8" marker-end="url(#arrow)"/>
+<path d="M865 165 L905 165" fill="none" stroke="#242424" stroke-width="1.8" marker-end="url(#arrow)"/>
+<path d="M1085 165 L1125 165" fill="none" stroke="#242424" stroke-width="1.8" marker-end="url(#arrow)"/>
+<path d="M1305 165 L1380 165" fill="none" stroke="#242424" stroke-width="1.8" marker-end="url(#arrow)"/>
+<rect x="1380" y="130" width="195" height="68" rx="8" fill="#d9eddf" stroke="#242424" stroke-width="1.5"/>
+<text x="1477.5" y="170.0" font-size="17">ReduceScatter</text>
+<rect x="455" y="280" width="250" height="75" rx="8" fill="#eeeeef" stroke="#242424" stroke-width="1.5"/>
+<text x="580.0" y="311.0" font-size="17">Checkpoint</text>
+<text x="580.0" y="336.0" font-size="17">Conv / SSM state</text>
+<rect x="750" y="280" width="235" height="75" rx="8" fill="#eeeeef" stroke="#242424" stroke-width="1.5"/>
+<text x="867.5" y="323.5" font-size="17">Verify replay data</text>
+<rect x="1065" y="280" width="240" height="75" rx="8" fill="#d4e5f8" stroke="#242424" stroke-width="1.5"/>
+<text x="1185.0" y="323.5" font-size="17">Commit accepted tokens</text>
+<path d="M580 280 L710 205" fill="none" stroke="#242424" stroke-width="1.8" marker-end="url(#arrow)"/>
+<path d="M810 205 L868 280" fill="none" stroke="#242424" stroke-width="1.8" marker-end="url(#arrow)"/>
+<path d="M985 318 L1065 318" fill="none" stroke="#242424" stroke-width="1.8" marker-end="url(#arrow)"/>
+<path d="M1185 355 V380 H580 V355" fill="none" stroke="#242424" stroke-width="1.8" marker-end="url(#arrow)"/>
+</g></svg>

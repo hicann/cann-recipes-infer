@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 2150 780" width="2150" height="780" preserveAspectRatio="xMidYMid meet" role="img" aria-labelledby="title desc">
   <title id="title">Kimi K3 Prefill and Decode MoE layer parallel flow</title>
-  <desc id="desc">AllGather and ReduceScatter delimit the attention tensor-parallel stage. KDA and prefill MLA compute local heads and apply an input-derived output gate before row-parallel o_proj; KDA applies per-head o_norm before the gate. A Decode layer selects either KDA or MLA. Decode MLA keeps Q/KV projection and attention data-parallel, then gathers attention output and normalized hidden separately for the output-gate tensor-parallel stage. Prefill routed experts use AllGather and ReduceScatter, while Decode uses MC2 Dispatch and Combine.</desc>
+  <desc id="desc">AllGather and ReduceScatter delimit the attention tensor-parallel stage. KDA and prefill MLA compute local heads and apply an input-derived output gate before row-parallel o_proj; KDA applies per-head o_norm before the gate. A Decode layer selects either KDA or MLA. Decode MLA keeps Q/KV projection and attention data-parallel, then gathers attention output and normalized hidden separately for the output-gate tensor-parallel stage. Prefill routed experts use AllToAll dispatch and return in the double-routing path; MegaMoE fuses routing, expert compute and communication when enabled. Decode uses MC2 Dispatch and Combine. Shared experts use AllGather and ReduceScatter in both phases.</desc>
   <defs>
     <style>
       svg {
@@ -128,24 +128,26 @@
   <path d="M1075 180 H1125" class="flow" marker-end="url(#arrow)"/>
   <rect x="1100" y="70" width="835" height="250" rx="10" class="subpanel"/>
   <text x="1125" y="96" class="subhead">LatentMoE</text>
+  <text x="1502.5" y="96" class="annotation-small">Routed: double routing / MegaMoE fused</text>
 
   <rect x="1125" y="145" width="155" height="70" rx="7" class="box projection"/>
   <text x="1202.5" y="168" class="label-small">Router +</text>
   <text x="1202.5" y="197" class="annotation">Latent Down</text>
   <path d="M1280 180 H1300" class="flow" marker-end="url(#arrow)"/>
   <rect x="1300" y="150" width="80" height="60" rx="7" class="box comm"/>
-  <text x="1340" y="180" class="label-small">AG</text>
+  <text x="1340" y="180" class="label-small">A2A</text>
   <path d="M1380 180 H1400" class="flow" marker-end="url(#arrow)"/>
   <rect x="1400" y="145" width="205" height="70" rx="7" class="box routed"/>
   <text x="1502.5" y="168" class="label-small">Routed Experts</text>
   <text x="1502.5" y="197" class="annotation">Expert Parallel</text>
   <path d="M1605 180 H1625" class="flow" marker-end="url(#arrow)"/>
   <rect x="1625" y="150" width="80" height="60" rx="7" class="box comm"/>
-  <text x="1665" y="180" class="label-small">RS</text>
+  <text x="1665" y="180" class="label-small">A2A</text>
   <path d="M1705 180 H1725" class="flow" marker-end="url(#arrow)"/>
   <rect x="1725" y="145" width="125" height="70" rx="7" class="box compute"/>
   <text x="1787.5" y="168" class="label-small">Norm</text>
   <text x="1787.5" y="197" class="annotation">Latent Up</text>
+  <text x="1502.5" y="232" class="annotation-small">A2A = AllToAll; return outputs to source ranks</text>
   <path d="M1850 180 H1870" class="flow" marker-end="url(#arrow)"/>
   <circle cx="1890" cy="180" r="20" class="box compute"/>
   <text x="1890" y="180" class="label">+</text>
@@ -215,13 +217,13 @@
   <text x="460" y="644" class="annotation-small">Core · Decode DP</text>
   <path d="M530 630 H540" class="flow" marker-end="url(#arrow)"/>
   <rect x="540" y="602" width="90" height="56" rx="7" class="box comm"/>
-  <text x="585" y="620" class="label-compact">2×AG</text>
+  <text x="585" y="620" class="label-compact" style="font-size:12px">A2A / AG</text>
   <text x="585" y="644" class="annotation-small">out · hidden</text>
-  <!-- The second AG receives normalized hidden directly from the DP path. -->
+  <!-- The hidden AG receives normalized hidden directly from the DP path. -->
   <path d="M386 630 V678 H585 V658" class="flow" marker-end="url(#arrow)"/>
   <path d="M630 630 H665" class="flow" marker-end="url(#arrow)"/>
   <rect x="665" y="607" width="80" height="46" rx="7" class="box projection"/>
-  <text x="705" y="622" class="annotation-small">slice × Gate</text>
+  <text x="705" y="622" class="annotation-small">× Gate</text>
   <text x="705" y="644" class="annotation-small">g_proj TP</text>
   <path d="M745 630 H760" class="flow" marker-end="url(#arrow)"/>
   <rect x="760" y="607" width="65" height="46" rx="7" class="box compute"/>
