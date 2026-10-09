@@ -67,6 +67,15 @@ except ImportError:
 PACKED_KV_STORAGE_DTYPE = torch.uint8
 PACKED_KV_COMPUTE_DTYPE = torch.float8_e4m3fn
 
+DEFAULT_AIC_NUM = 24
+
+
+def get_total_aic_num():
+    try:
+        return torch.npu.get_stream_limit(torch.npu.current_stream())["cube_core_num"]
+    except Exception:
+        return DEFAULT_AIC_NUM
+
 
 def is_packed_kv_layout(kv_cache_quant_mode: str) -> bool:
     # Only the FP8 record has the extra packed fields and needs a FLOAT8 view.

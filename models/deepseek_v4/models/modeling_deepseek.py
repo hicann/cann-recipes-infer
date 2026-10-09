@@ -83,7 +83,8 @@ from .modules import (get_window_topk_idxs, get_compress_topk_idxs,
                       DeepseekV3RMSNorm, _init_rope, DEEPSEEKV3_START_DOCSTRING,
                       DEEPSEEKV3_INPUTS_DOCSTRING, DeepseekV3PreTrainedModel, apply_rotary_emb,
                       partial_rotary_mul_quant, AttnMetaData, PACKED_KV_STORAGE_DTYPE,
-                      PACKED_KV_COMPUTE_DTYPE, get_kv_cache_dim, is_packed_kv_layout
+                      PACKED_KV_COMPUTE_DTYPE, get_kv_cache_dim, is_packed_kv_layout,
+                      get_total_aic_num
                     )
 from .modules import Indexer, Compressor
 from .modules.registry import OpKernel, auto_import_modules
@@ -481,10 +482,12 @@ class DeepseekV3MoE(nn.Module):
     def forward_shared_expert(self, hidden_states, shared_expert_stream=None):
         record_stream(self.enable_multi_streams, hidden_states, shared_expert_stream)
         record_event(self.enable_multi_streams, self.npu_events, 0)
+        cur_stream = torch.npu.current_stream()
         with npu_stream_switch(self.enable_multi_streams, shared_expert_stream):
             wait_event(self.enable_multi_streams, self.npu_events, 0)
             # shared_expert use multi streams
             hidden_states_share = self.shared_experts(hidden_states.view(-1, hidden_states.shape[-1]))
+            record_stream(self.enable_multi_streams, hidden_states_share, cur_stream)
             record_event(self.enable_multi_streams, self.npu_events, 1)
         return hidden_states_share
 
@@ -734,11 +737,13 @@ class DeepseekV3MoE(nn.Module):
         hidden_states_ordered_by_experts = self.moe_ffn(**gmm_args)
 
         record_event(self.enable_multi_streams, self.shared_expert_event, 0)
+        cur_stream = torch.npu.current_stream()
         with npu_stream_switch(self.enable_multi_streams, shared_expert_stream):
             wait_event(self.enable_multi_streams, self.npu_events, 0)
             # shared_expert use multi streams
             hidden_states_share = self.shared_experts(hidden_states.view(-1, hidden_states.shape[-1]), \
                 enable_decode_stream=self.enable_multi_streams, shared_expert_event=self.shared_expert_event)
+            record_stream(self.enable_multi_streams, hidden_states_share, cur_stream)
             record_event(self.enable_multi_streams, self.npu_events, 1)
 
         # moe combine
@@ -808,13 +813,13 @@ class Attention(nn.Module):
 
         self.enable_limit_core = self.infer_config.model_config.custom_params.get("enable_limit_core", False)
         self.compress_ratio = 1 if self.is_mtp else config.compress_ratios[layer_idx]
-        if self.enable_multi_streams and self.platform_version == PlatformVersion.A3:
+        if self.enable_multi_streams and self.platform_version in (PlatformVersion.A3, PlatformVersion.ASCEND_950):
             self.enable_compressor_parallel = self.compress_ratio == 128
             if self.compress_ratio == 4: # c4a supports compressor parallel only if it supports limit core num
                 self.enable_compressor_parallel = self.enable_limit_core
         else:
             self.enable_compressor_parallel = False
-        self.total_aic_num = 24 # enable_limit_core only suppots A3 (24 cube and 48 vector cores)
+        self.total_aic_num = get_total_aic_num()
         self.cmpr_aic_num = 0
         self.cmpr_events = []
         if self.enable_compressor_parallel:
@@ -2428,8 +2433,8 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
             raise ValueError(f"{exe_mode=} does not support cache compile or superkernel!")
         if enable_limit_core and not enable_multi_streams:
             raise ValueError(f"{enable_limit_core=} only if enable_multi_streams!")
-        if enable_limit_core and platform_version != PlatformVersion.A3:
-            raise ValueError(f"{enable_limit_core=} only supports platform A3!")
+        if enable_limit_core and platform_version not in (PlatformVersion.A3, PlatformVersion.ASCEND_950):
+            raise ValueError(f"{enable_limit_core=} only supports platforms A3 and 950!")
         if enable_limit_core and enable_pypto:
             raise ValueError(f"{enable_pypto=} does not support {enable_limit_core=}!")
         if next_n > 3 and not self.infer_config.speculative_config.uses_method("dspark"):

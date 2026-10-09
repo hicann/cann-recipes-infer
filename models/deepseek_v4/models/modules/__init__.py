@@ -19,6 +19,7 @@ __all__ = ["get_window_topk_idxs", "get_compress_topk_idxs",
            "DEEPSEEKV3_START_DOCSTRING", "DEEPSEEKV3_INPUTS_DOCSTRING", "DeepseekV3PreTrainedModel",
            "apply_rotary_emb", "rotate_activation", "partial_rotary_mul_quant",
            "PACKED_KV_STORAGE_DTYPE", "PACKED_KV_COMPUTE_DTYPE", "is_packed_kv_layout", "get_kv_cache_dim",
+           "get_total_aic_num",
            "Compressor", "Indexer", "AttnMetaData"]
 
 from .common_modules import (get_window_topk_idxs, get_compress_topk_idxs,
@@ -26,7 +27,7 @@ from .common_modules import (get_window_topk_idxs, get_compress_topk_idxs,
                         DeepseekV3RMSNorm, _init_rope, apply_rotary_pos_emb, DEEPSEEKV3_START_DOCSTRING,
                         DEEPSEEKV3_INPUTS_DOCSTRING, DeepseekV3PreTrainedModel, apply_rotary_emb, rotate_activation,
                         partial_rotary_mul_quant, PACKED_KV_STORAGE_DTYPE, PACKED_KV_COMPUTE_DTYPE,
-                        is_packed_kv_layout, get_kv_cache_dim
+                        is_packed_kv_layout, get_kv_cache_dim, get_total_aic_num
                         )
 from .compressor import Compressor
 from .indexer import Indexer

@@ -36,13 +36,13 @@ import torchair as tng
 import cann_ops_transformer
 
 from transformers.cache_utils import Cache
-from executor.core.config import InferenceConfig, CommManager
+from executor.core.config import InferenceConfig, CommManager, PlatformVersion
 from executor.utils import get_had_pow2
 from executor.utils.stream_utils import (
     limit_core_num, npu_stream_switch, record_event, wait_event, record_stream)
 from module.linear import ReplicatedLinear
 from .common_modules import DeepseekV3RMSNorm, apply_rotary_emb, rotate_activation, \
-    partial_rotary_mul_quant
+    partial_rotary_mul_quant, get_total_aic_num
 from .compressor import Compressor
 
 
@@ -98,7 +98,7 @@ class Indexer(nn.Module):
         self.platform_version = self.infer_config.model_config.platform_version
         self.enable_limit_core = self.infer_config.model_config.custom_params.get("enable_limit_core", False)
 
-        aic_total = 24 # enable_limit_core only suppots A3
+        aic_total = get_total_aic_num()
         aiv_to_aic_ratio = 2 # aiv_num is 2 * aic_num
         self.cmpr_aic_num = 16
         self.cmpr_aiv_num = self.cmpr_aic_num * aiv_to_aic_ratio
@@ -169,15 +169,11 @@ class Indexer(nn.Module):
                     x_for_weights_proj = torch.cat([x[0][-q_len:], x[1][-q_len:]], dim=0)
             else:
                 x_for_weights_proj = x
-            weights = self.weights_proj(x_for_weights_proj) * (self.softmax_scale * self.n_heads ** -0.5)
-            if self.li_cache_quant_mode == "int8":
-                weights = weights.to(torch.float16)
-            else:
-                weights = weights.to(torch.float32)
             # compressor
             self.compressor(x, attn_metadata, is_prefill)
 
         # li event 0 and input tensors are recorded in Attention.mal_prolog function, after calling mla qb
+        record_stream(enable_multi_streams, x_for_weights_proj, attn_metadata.get('indexer_stream', None))
         cur_stream = torch.npu.current_stream()
         with npu_stream_switch(enable_multi_streams, attn_metadata.get('indexer_stream', None)):
             wait_event(enable_multi_streams, self.indexer_events, 0)
@@ -204,8 +200,16 @@ class Indexer(nn.Module):
                 # hif8 covers outliers natively, no need for hadamard
                 if self.mm_quant_mode != "w8a8hifloat8":
                     q = rotate_activation(q, self.hadamard_matrix)
+                weights = self.weights_proj(x_for_weights_proj) * (self.softmax_scale * self.n_heads ** -0.5)
+                if self.li_cache_quant_mode == "int8":
+                    weights = weights.to(torch.float16)
+                else:
+                    weights = weights.to(torch.float32)
                 # separate sfa compressor and li qb dynamic quant
-                wait_event(cmpr_switch_flag, cmpr_event, cmpr_event_idx)
+                wait_event(
+                    cmpr_switch_flag and self.platform_version != PlatformVersion.ASCEND_950,
+                    cmpr_event,
+                    cmpr_event_idx)
                 if self.li_cache_quant_mode == "int8":
                     q, q_scale = torch_npu.npu_dynamic_quant(q)  # T,N,D
                     q_scale = q_scale.to(torch.float16)
@@ -221,6 +225,7 @@ class Indexer(nn.Module):
                     q_scale = q_scale.view(-1, self.n_heads)
             record_stream(enable_multi_streams, q, cur_stream)
             record_stream(enable_multi_streams, q_scale, cur_stream)
+            record_stream(enable_multi_streams, weights, cur_stream)
             record_event(enable_multi_streams, self.indexer_events, 1)
 
         # LI fusion kernel

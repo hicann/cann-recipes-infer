@@ -11,6 +11,7 @@ model_config:
   enable_cache_compile: False
   custom_params:
     enable_multi_streams: True
+    enable_limit_core: True
 
 speculative_config:  # Speculative decoding
   num_speculative_tokens: 5  # Maximum draft tokens per proposal

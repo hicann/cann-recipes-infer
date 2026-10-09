@@ -12,6 +12,7 @@ model_config:
   enable_cache_compile: False
   custom_params:
     enable_multi_streams: True
+    enable_limit_core: True
 
 data_config:
   dataset: "InfiniteBench"
