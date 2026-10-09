@@ -286,6 +286,8 @@ bash infer.sh
 
 默认跳过 warm-up；设置 `skip_warm_up=False` 后，先执行 warm-up，再清空主模型和 DSpark 的 cache，开始正式推理。
 
+**复现最优性能时，请开启 `model_config.enable_cache_compile=True`，使用相同配置完整运行两遍 `bash infer.sh`：第一遍生成编译缓存，第二遍复用缓存，以第二遍的性能结果为准。两次运行之间保留 `compile_cache` 目录。**
+
 ### 日志与性能采集
 
 - 日志输出生成结果、主模型 Verify 和 DSpark 的平均耗时，以及实测平均接受长度和接受率。

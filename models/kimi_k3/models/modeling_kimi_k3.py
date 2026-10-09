@@ -1519,9 +1519,11 @@ class KimiSparseMoeBlock(nn.Module):
             raise RuntimeError("MegaMoE requires an initialized sym_buffer")
         sym_buf = moe_ctx.mega_sym_buffer
         l1 = [self.experts.w13_weight]
-        l1_s = [self.experts.w13_weight_scale]
+        # The loader stores E8M0 encodings as bytes; MegaMoE requires the
+        # actual E8M0 dtype. Reinterpret without converting values or copying.
+        l1_s = [self.experts.w13_weight_scale.view(torch.float8_e8m0fnu)]
         l2 = [self.experts.w2_weight]
-        l2_s = [self.experts.w2_weight_scale]
+        l2_s = [self.experts.w2_weight_scale.view(torch.float8_e8m0fnu)]
         y, _ = mega_moe(
             x=routed_states,
             topk_ids=topk_idx.to(torch.int32),

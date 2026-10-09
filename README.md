@@ -21,6 +21,7 @@
 
 ## 📰 最新动态
 
+- [2026/10] [Kimi K3](models/kimi_k3/README.md) 在昇腾 950PR/DT 系列上新增 MegaKDA、ReplaySSM、SuperKernel 与 W8A8C8 量化支持，结合多流优化实现 **约 2.8× 推理加速**
 - [2026/09] 新增 DeepSeek-V4 Attention-FFN 分离样例：基于 vLLM 和 afd-plugin，提供昇腾 A5 上的 P2P 同步与 Window 异步方案，支持双 microbatch、ACLGraph 和 DSpark
 - [2026/09] DeepSeek-V4.1-Flash 模型在昇腾 950PR/DT 系列上已支持 **单卡推理部署**
 - [2026/09] GLM-5.3-Flash 模型在昇腾 950DT 系列上已支持 **HiF8 推理部署**
