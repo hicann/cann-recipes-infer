@@ -60,7 +60,7 @@ def torch_concat_2d_jagged(
     offsets_b: Optional[torch.Tensor] = None,
     is_replace: bool = False,
     n_prefix_from_right: int = 0,
-) -> torch.Tensor:        
+) -> torch.Tensor:
     prefix_len = int(n_prefix_from_right)
 
     def to_jagged_2d(
@@ -406,10 +406,11 @@ class InferenceRankingGR(torch.nn.Module):
         if onload_length > 0:
             if fused_enabled("concat_nd_jagged") and hasattr(torch.ops.mxrec, "concat_2d_jagged"):
                 kv_page_ids = torch.ops.mxrec.concat_2d_jagged(
-                    values_a=onload_kv_page_ids.view(-1, 1),
-                    values_b=kv_cache_metadata.kv_indices.view(-1, 1),
-                    offsets_a=onload_kv_page_indptr.to(torch.int64),
-                    offsets_b=kv_cache_metadata.kv_indptr.to(torch.int64),
+                    maxSeqlen=1024,  # Reserved parameter; currently unused by RecSDK.
+                    valuesA=onload_kv_page_ids.view(-1, 1),
+                    valuesB=kv_cache_metadata.kv_indices.view(-1, 1),
+                    offsetA=onload_kv_page_indptr.to(torch.int64),
+                    offsetB=kv_cache_metadata.kv_indptr.to(torch.int64),
                 )
             else:
                 kv_page_ids = torch_concat_2d_jagged(
@@ -484,7 +485,7 @@ class InferenceRankingGR(torch.nn.Module):
     ):
         with torch.inference_mode():
             kvcache_metadata = self.prepare_kv_cache(batch, user_ids, user_start_pos)
-            
+
             meta = self._kvcache_metadata if self.use_cudagraph else kvcache_metadata
             host_kvdata_start_pos, host_kvdata_lengths = zip(
                 *[
@@ -494,7 +495,7 @@ class InferenceRankingGR(torch.nn.Module):
             )
             host_kvdata_start_pos = torch.tensor(host_kvdata_start_pos, dtype=torch.int64)
             host_kvdata_lengths = torch.tensor(host_kvdata_lengths, dtype=torch.int64)
-            
+
             self._gpu_kv_cache_manager.start_offload_plan(
                 user_ids, host_kvdata_start_pos, host_kvdata_lengths, meta
             )
