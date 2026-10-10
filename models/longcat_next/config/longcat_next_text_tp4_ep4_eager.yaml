@@ -1,0 +1,39 @@
+model_name: longcat_next
+world_size: 4
+
+model_config:
+  model_name: longcat_next
+  model_path: your_model_path
+  dtype: bfloat16
+  with_ckpt: True
+  exe_mode: eager
+  enable_cache_compile: False
+  enable_dynamic_graph: True
+  enable_static_kernel: False
+  enable_profiler: False
+  force_eplb: False
+  next_n: 0
+  custom_params:
+    moe_chunk_max_len: 1024
+    decompose_post_attn0_rmsnorm: True
+
+data_config:
+  dataset: default
+  dataset_path: models/longcat_next/requests
+  input_truncated_len: 2048
+  seed: 336
+
+parallel_config:
+  world_size: 4
+  attn_tp_size: 4
+  dense_tp_size: 4
+  moe_tp_size: 1
+  embed_tp_size: 4
+  lmhead_tp_size: 4
+  o_proj_tp_size: 4
+
+scheduler_config:
+  block_size: 128
+  max_new_tokens: 128
+  max_prefill_tokens: 4096
+  batch_size: 2

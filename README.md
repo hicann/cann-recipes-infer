@@ -25,6 +25,7 @@
 - [2026/09] 新增 DeepSeek-V4 Attention-FFN 分离样例：基于 vLLM 和 afd-plugin，提供昇腾 A5 上的 P2P 同步与 Window 异步方案，支持双 microbatch、ACLGraph 和 DSpark
 - [2026/09] DeepSeek-V4.1-Flash 模型在昇腾 950PR/DT 系列上已支持 **单卡推理部署**
 - [2026/09] GLM-5.3-Flash 模型在昇腾 950DT 系列上已支持 **HiF8 推理部署**
+- [2026/10] LongCat-Next 多模态模型在昇腾 Atlas A3 系列完成 NPU 推理适配，支持文本、图像和语音生成。
 - [2026/09] DeepSeek-V4.1-Flash 模型在昇腾 950PR/DT 系列上已支持 **FP8-FP4 推理部署**，支持多模理解、Engram offload等特性
 - [2026/08] DeepSeek-V4-Flash 模型在昇腾 910B/A3 上已支持 **单卡推理部署**：attention 与热专家基于NPU计算，其余 MoE 专家 offload 到 Kunpeng CPU 并以原生 MXFP4 计算，decode 约 19–22.5 tok/s。**支持CANNLab lite-infer-and-train镜像部署**
 - [2026/08] BaiLing-V3 模型在昇腾 Atlas A2/A3系列上已 **0day 支持推理部署**
@@ -187,6 +188,7 @@ bash infer.sh
 | [Hy3](models/hy3/README.md)                             |基于Transformers库，在Atlas A3和Ascend 950PR/DT环境中完成腾讯混元 Hy3（295B MoE，激活约21B/token）模型的NPU推理适配。
 | [Gemma-4](models/gemma_4/README.md)                     |基于Transformers库，在NPU上完成Google开源的多模态稀疏MoE大模型Gemma-4的Language MoE Decoder路径推理优化适配。
 | [LongCat-Flash-Lite](models/longcat_flash_lite/README.md)|基于Transformers库，在NPU上完成基于MLA + Sparse MoE + N-gram Embedding架构的LongCat-Flash-Lite模型适配，覆盖Paged Attention缓存管理、融合算子替换、图模式加速、专家并行、W8A8量化与Decode多流重叠优化。
+| [LongCat-Next](models/longcat_next/README.md)              |基于Transformers库，在Atlas A3环境中完成LongCat-Next模型的NPU推理适配，支持图像和音频输入，支持文本、图像与语音的多模态生成，支持TP/EP并行部署。
 | [Step-3.7-Flash](models/step3p7_flash/README.md)        |基于Transformers库，在Atlas A3环境中完成多模态MoE大模型Step-3.7-Flash（视觉编码器+MoE文本主干+3层MTP，约197B参数）的8卡/16 rank推理实现，支持纯文本与图文输入。
 | [Pangu7B](models/pangu_7b/README.md)                    |基于HuggingFace官方实现，在NPU上完成华为开源盘古7B大语言模型的低时延推理适配与优化。
 | [DeepSeek-V4-TileLang/Inductor](models/deepseek_v4_flash_tilelang_and_inductor_af/README.md) |基于TileLang-ascend算子替换与inductor+autofuse融合编译，在昇腾A3 NPU上展示DeepSeek模型的加速效果。
@@ -267,6 +269,7 @@ bash infer.sh
 │   ├── kimi_k3                                 # Kimi-K3 的模型脚本及执行配置
 │   ├── longcat_flash                           # LongCat-Flash 的模型脚本及执行配置
 │   ├── longcat_flash_lite                      # LongCat-Flash-Lite 的模型脚本及执行配置
+│   ├── longcat_next                            # LongCat-Next 的模型脚本及执行配置
 │   ├── pangu_7b                                # PanGu-7B 的模型脚本及执行配置
 │   ├── qwen                                    # Qwen2/Qwen3 Dense 模型统一脚本及执行配置
 │   ├── qwen3_5                                 # Qwen3.5 的模型脚本及执行配置

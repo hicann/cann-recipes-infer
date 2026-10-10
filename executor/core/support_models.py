@@ -114,6 +114,10 @@ _specs: dict[str, list[tuple[str, str]]] = {
         ("models.longcat_flash.models.ffn", "FFNForCausalLM"),
         ("models.longcat_flash.models.configuration_longcat_flash", "LongcatFlashConfig"),
     ],
+    "longcat_next": [
+        ("models.longcat_next.models.modeling_longcat_next", "LongcatNextForCausalLM"),
+        ("models.longcat_next.models.configuration_longcat_next", "LongcatNextConfig"),
+    ],
 }
 
 _speculative_specs: dict[tuple[str, str], tuple[tuple[str, str], tuple[str, str]]] = {
