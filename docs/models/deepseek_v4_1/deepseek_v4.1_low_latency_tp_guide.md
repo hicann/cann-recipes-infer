@@ -54,7 +54,7 @@ MoE路径的优化重点是减少无效专家处理、使专家权重分片与�
 
 ### DSpark
 
-DeepSeek-V4.1 Flash的[DSpark方案](./deepseek_v4_inference_guide.md#dspark)支持Ascend 950系列，在一次草稿模型执行中生成一组Draft Token，由主模型批量Verify。与原生MTP逐步生成候选不同，DSpark使用多级Proposal Layer生成Draft Block，并通过Markov Head建模块内Token依赖，Confidence Head给出候选置信度。
+DeepSeek-V4.1 Flash的[DSpark方案](./deepseek_v4.1_flash_cann_tech_report.md#dspark)支持Ascend 950系列，在一次草稿模型执行中生成一组Draft Token，由主模型批量Verify。与原生MTP逐步生成候选不同，DSpark使用多级Proposal Layer生成Draft Block，并通过Markov Head建模块内Token依赖，Confidence Head给出候选置信度。
 
 <p align="center">
   <img src="./figures/dspark.png" width="60%" alt="dspark">
