@@ -916,6 +916,12 @@ __aicore__ inline void VFProcessSwigluMxFp8InvScale(const LocalTensor<T0>& yOrig
                 pregInv = UpdateMask<float>(invSreg);
                 StoreOutputData<float>(invScaleLocalAddr, invScale1, pregInv, j * 16 + i * invScaleColNumAlign);
             }
+            // MX scales are packed in pairs. The unused partner of an odd final group must
+            // be zero: an uninitialized E8M0 0xff is NaN and contaminates downstream matmul.
+            if ((scaleColNum & 1) != 0) {
+                DataCopyUnAlign<uint8_t, PostLiteral::POST_MODE_UPDATE>(
+                    scaleLocalAddr, (RegTensor<uint8_t>&)zeroUint32, uReg, 1);
+            }
             DataCopyUnAlignPost(scaleLocalAddr, uReg, 0);
         }
     }

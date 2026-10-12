@@ -52,6 +52,7 @@ constexpr int64_t B32_ALIGN_NUM = BLOCK_SIZE / B32_BYTES;
 constexpr int64_t PER_BLOCK_FP16 = 128;
 constexpr int64_t PER_MX_FP16 = 32;
 constexpr int64_t MX_QUANT_ALIGN = 2 * PER_MX_FP16;  // 2 * block_size of mx quant
+constexpr int64_t MX_SCALE_ALIGN_FACTOR = 2;         // mx scales are packed in pairs; odd tail pads zero
 constexpr int64_t FP4_PACK_NUM = 2;
 constexpr int64_t BLOCK_QUANT = 0;
 constexpr int64_t MX_QUANT = 1;
@@ -325,7 +326,8 @@ ge::graphStatus SwigluGroupQuantTiling::CalcMxQuantOpTiling()
     int64_t x0Size = rowOnceLoop * RoundUp(splitD_, B16_ALIGN_NUM) * B16_BYTES * DOUBLE_BUFFER;
     int64_t x1Size = rowOnceLoop * RoundUp(splitD_, B16_ALIGN_NUM) * B16_BYTES * DOUBLE_BUFFER;
     int64_t ySize = rowOnceLoop * RoundUp(splitD_, FP8_ALIGN_NUM) * FP8_BYTES * DOUBLE_BUFFER;
-    int64_t scaleSize = RoundUp(rowOnceLoop * scaleCol_, FP8_ALIGN_NUM) * FP8_BYTES * DOUBLE_BUFFER;
+    int64_t scaleSize =
+        RoundUp(rowOnceLoop * RoundUp(scaleCol_, MX_SCALE_ALIGN_FACTOR), FP8_ALIGN_NUM) * FP8_BYTES * DOUBLE_BUFFER;
     int64_t yFp32Size = rowOnceLoop * RoundUp(splitD_, B32_ALIGN_NUM) * B32_BYTES;
     int64_t invScaleSize =
         rowOnceLoop * RoundUp(CeilDiv(splitD_, B32_ALIGN_NUM), B32_ALIGN_NUM) * B32_BYTES;
@@ -358,7 +360,8 @@ ge::graphStatus SwigluGroupQuantTiling::CalcMxQuantOpTiling()
             x0Size = rowOnceLoop * RoundUp(tryDFactor, B16_ALIGN_NUM) * B16_BYTES * DOUBLE_BUFFER;
             x1Size = rowOnceLoop * RoundUp(tryDFactor, B16_ALIGN_NUM) * B16_BYTES * DOUBLE_BUFFER;
             ySize = rowOnceLoop * RoundUp(tryDFactor, FP8_ALIGN_NUM) * FP8_BYTES * DOUBLE_BUFFER;
-            scaleSize = RoundUp(rowOnceLoop * tryScaleCol, FP8_ALIGN_NUM) * FP8_BYTES * DOUBLE_BUFFER;
+            scaleSize = RoundUp(rowOnceLoop * RoundUp(tryScaleCol, MX_SCALE_ALIGN_FACTOR), FP8_ALIGN_NUM) *
+                FP8_BYTES * DOUBLE_BUFFER;
             yFp32Size = rowOnceLoop * RoundUp(tryDFactor, B32_ALIGN_NUM) * B32_BYTES;
             invScaleSize =
                 rowOnceLoop * RoundUp(CeilDiv(tryDFactor, B32_ALIGN_NUM), B32_ALIGN_NUM) * B32_BYTES;
@@ -391,7 +394,8 @@ ge::graphStatus SwigluGroupQuantTiling::CalcMxQuantOpTiling()
             int64_t x0 = rf * RoundUp(dFactor_, B16_ALIGN_NUM) * B16_BYTES * DOUBLE_BUFFER;
             int64_t x1 = rf * RoundUp(dFactor_, B16_ALIGN_NUM) * B16_BYTES * DOUBLE_BUFFER;
             int64_t y = rf * RoundUp(dFactor_, FP8_ALIGN_NUM) * FP8_BYTES * DOUBLE_BUFFER;
-            int64_t scale = RoundUp(rf * scaleCol_, FP8_ALIGN_NUM) * FP8_BYTES * DOUBLE_BUFFER;
+            int64_t scale =
+                RoundUp(rf * RoundUp(scaleCol_, MX_SCALE_ALIGN_FACTOR), FP8_ALIGN_NUM) * FP8_BYTES * DOUBLE_BUFFER;
             int64_t yFp32 = rf * RoundUp(dFactor_, B32_ALIGN_NUM) * B32_BYTES;
             int64_t invScale = rf * RoundUp(CeilDiv(dFactor_, B32_ALIGN_NUM), B32_ALIGN_NUM) * B32_BYTES;
             int64_t total = x0 + x1 + y + scale + yFp32 + invScale;

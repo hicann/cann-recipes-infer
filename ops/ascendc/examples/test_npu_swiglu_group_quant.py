@@ -1201,6 +1201,32 @@ class TestCustomSwigluGroupQuant(TestCase):
                                                          rtol=0.01, atol=0.01, equal_nan=True)
                             self.assertTrue(y_origin_close, f"y_origin precision compare fail ({tag})")
 
+    def test_mode1_fp8mx_scale_padding(self):
+        # D=320 produces five valid E8M0 scales stored in three pairs. A stale 0xff
+        # in the final partner is NaN and poisons downstream MXFP8 matmuls.
+        device = "npu:%s" % DEVICE_ID
+        for rows in (1, 64, 512):
+            for x_dtype in (torch.float16, torch.bfloat16):
+                x = torch.ones((rows, 320), dtype=x_dtype, device=device)
+                for dst_type in (torch.float8_e4m3fn, torch.float8_e5m2):
+                    for output_origin in (False, True):
+                        with self.subTest(rows=rows, x_dtype=x_dtype, dst_type=dst_type,
+                                          output_origin=output_origin):
+                            # Seed same-sized freed allocations before the operator allocates scale.
+                            scratch = [torch.empty((rows, 3, 2), dtype=torch.float8_e8m0fnu,
+                                                   device=device) for _ in range(32)]
+                            for tensor in scratch:
+                                tensor.view(torch.uint8).fill_(255)
+                            torch_npu.npu.synchronize()
+                            del tensor
+                            scratch.clear()
+                            _, scale, _ = torch.ops.custom.npu_swiglu_group_quant(
+                                x, dst_type=dst_type, quant_mode=1, block_size=32,
+                                round_scale=True, output_origin=output_origin)
+                            scale_bytes = scale.view(torch.uint8).cpu().reshape(rows, 6)
+                            self.assertTrue(torch.all(scale_bytes[:, 5] == 0).item(),
+                                            "MXFP8 scale padding must not retain allocator contents")
+
     def test_mode1_fp8mx_tail_d_with_group_index(self):
         # MX fp8 tail-d with group_index, both group_list_type=1 (counts) and 2 ([E, 2] pairs).
         torch_npu.npu.set_device(int(DEVICE_ID))
