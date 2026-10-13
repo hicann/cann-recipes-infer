@@ -1073,7 +1073,7 @@ class Attention(nn.Module):
             # need the full current prompt. This temporary buffer is reused by layers.
             win_kv = attn_metadata["full_kv_cache"]
             self.update_win_kv(kv, attn_metadata["cache_slot_mapping"]["full_kv"], win_kv)
-        return win_kv, attn_metadata["win_idx"], qr, q
+        return win_kv, qr, q
 
     def compute_win_cache_cp(self, x: torch.Tensor, kv_cache: KVCache, attn_metadata):
         """Write this rank's window rows, then exchange the tail window of every segment.
@@ -1111,7 +1111,7 @@ class Attention(nn.Module):
                 all_win[seg_metadata["segment_idx"] - 1].flatten(0, 1))
         if has_cp_decode_requests(attn_metadata["cp_metadata"]):
             self.update_decode_win_kv(all_win, attn_metadata, kv_cache)
-        return win_kv, None, qr, q
+        return win_kv, qr, q
 
     def take_window_tails(self, cache_rows, own_slots, seg_metadata):
         """Last window_size rows this segment holds for every request, zero padded when shorter."""
@@ -1370,7 +1370,7 @@ class Attention(nn.Module):
     def attention_prolog_mla_rank(self, x, attn_metadata, is_prefill, kv_cache):
         if self.is_index_source:
             kv_cache.shared_idx = self.process_li_rank_inputs(x, attn_metadata, is_prefill, kv_cache)
-        win_kv, _, _, q = self.compute_win_cache(x, kv_cache, attn_metadata)
+        win_kv, _, q = self.compute_win_cache(x, kv_cache, attn_metadata)
         return win_kv, q
 
     def attention_prolog_li_rank(self, x, attn_metadata, is_prefill, kv_cache):
@@ -1488,7 +1488,7 @@ class Attention(nn.Module):
             raise RuntimeError("KVCache layer does not match Attention layer")
         if self.low_latency_tp and self.compress_ratio > 0:
             return self.forward_separate_mla(x, attn_metadata, is_prefill, kv_cache)
-        win_kv, win_idx, qr, q = self.compute_win_cache(x, kv_cache, attn_metadata)
+        win_kv, qr, q = self.compute_win_cache(x, kv_cache, attn_metadata)
         if is_prefill:
             block_table = attn_metadata["block_table"]["full_kv"]
         else:

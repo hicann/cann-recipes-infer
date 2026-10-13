@@ -375,7 +375,6 @@ class DSparkWorker(BaseSpeculativeWorker):
         if not batch.draft_info:
             batch.draft_info = DSparkInfo()
         batch.draft_info.accepted_num = accepted_num
-        accepted_num_clone = accepted_num.clone()
         batch.draft_info.is_prefill = batch.is_prefill
         batch.draft_info.spec_tokens = None
 
@@ -462,7 +461,6 @@ class DSparkWorker(BaseSpeculativeWorker):
             proposal_input_ids if not batch.is_prefill else main_next_tokens,
             target_hidden_states,
         )
-        batch.draft_info.accepted_num = accepted_num_clone
         proposal, infer_time = self.dspark_model_worker.execute_model_call(
             self.model.propose, prepared_inputs,
         )

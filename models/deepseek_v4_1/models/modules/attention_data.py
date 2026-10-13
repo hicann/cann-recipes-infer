@@ -504,21 +504,6 @@ class AttnMetaData(nn.Module):
         )
         return full_kv_cache, full_block_table, full_slot_mapping
 
-    def get_window_metadata(self, attn_metadata, is_prefill):
-        """Map each packed query's causal window to [T, 1, W] physical slots."""
-        positions = attn_metadata["position_ids"].reshape(-1).long()
-        cu_lengths = attn_metadata["cu_seq_lens_q"]
-        request_ids = torch.repeat_interleave(
-            torch.arange(cu_lengths.numel() - 1, device=positions.device),
-            (cu_lengths[1:] - cu_lengths[:-1]).long(), output_size=positions.numel())
-        window = positions[:, None] + torch.arange(1 - self.window_size, 1, device=positions.device)
-        safe_window = window.clamp_min(0)
-        table = attn_metadata["block_table"]["full_kv" if is_prefill else "win_kv"]
-        blocks = table[request_ids[:, None], safe_window // self.block_size].long()
-        slots = blocks * self.block_size + safe_window % self.block_size
-        attn_metadata["query_request_ids"] = request_ids
-        attn_metadata["win_idx"] = slots.masked_fill((window < 0) | (blocks == 0), -1).unsqueeze(1).int()
-
     def build_attn_metadata(self, input_ids, position_ids, forward_metadata, batch):
         is_prefill = forward_metadata.is_prefill
 
@@ -636,9 +621,6 @@ class AttnMetaData(nn.Module):
             attn_metadata["block_table"].update({"full_kv": full_block_table})
             attn_metadata["slot_mapping"].update({"full_kv": full_slot_mapping})
             attn_metadata["full_kv_cache"] = full_kv_cache
-
-        if not is_cp_prefill:
-            self.get_window_metadata(attn_metadata, is_prefill)
 
         if is_cp_prefill:
             attn_metadata = self.get_cp_metadata(
