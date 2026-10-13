@@ -76,11 +76,11 @@ python /cann-recipes-infer/models/pangu_7b/utils/convert_model.py --input_bf16_h
 
    - 修改YAML文件中`model_path`参数。关于YAML文件中的更多配置说明可参见[YAML参数描述](./config/README.md)。
 
-     在`models/pangu_7b/config`目录下已提供了较优性能的YAML样例供您参考，您可以根据模型类型选择对应的YAML文件，本文以`models/pangu_7b/config/openpangu_v5_7b.yaml`文件为例，修改其中的`model_path`参数，将其设置为[权重准备](#权重准备)阶段准备好的权重文件存储路径，例如`/dev/shm/ckpts/openPangu-Embedded-7B`。
+     在`models/pangu_7b/config`目录下已提供了较优性能的YAML样例供您参考，您可以根据模型类型选择对应的YAML文件，本文以`models/pangu_7b/config/openpangu_v5_7b_mxfp8.yaml`文件为例，修改其中的`model_path`参数，将其设置为[权重准备](#权重准备)阶段准备好的权重文件存储路径，例如`/dev/shm/ckpts/openPangu-Embedded-7B-MXFP8`。
 
    - 修改`models/pangu_7b/infer.sh`脚本中`YAML_FILE_NAME`参数。
 
-     将`YAML_FILE_NAME`设置为`config`文件夹下YAML文件的名字，例如`openpangu_v5_7b.yaml`。
+     将`YAML_FILE_NAME`设置为`config`文件夹下YAML文件的名字，例如`openpangu_v5_7b_mxfp8.yaml`。
 
 2. 准备输入prompt。
 
@@ -114,4 +114,3 @@ python /cann-recipes-infer/models/pangu_7b/utils/convert_model.py --input_bf16_h
 cd cann-recipes-infer
 bash ./models/pangu_7b/run_experiments.sh
 ```
-
