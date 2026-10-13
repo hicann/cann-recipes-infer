@@ -1,7 +1,7 @@
-# Adapted from  
+# Adapted from
 # https://github.com/Tencent-Hunyuan/HunyuanVideo,
 # https://github.com/ali-vilab/TeaCache,
-# Copyright (c) Huawei Technologies Co., Ltd. 2025.
+# Copyright (c) Huawei Technologies Co., Ltd. 2025-2026.
 # Copyright (C) 2024 THL A29 Limited, a Tencent company. All rights reserved.
 # Copyright (C) 2025 ali-vilab.
 #
@@ -47,7 +47,7 @@ from .token_refiner import SingleTokenRefiner
 
 class MMDoubleStreamBlock(nn.Module):
     """
-    A multimodal dit block with seperate modulation for
+    A multimodal dit block with separate modulation for
     text and image/video, see more details (SD3): https://arxiv.org/abs/2403.03206
                                      (Flux.1): https://github.com/black-forest-labs/flux
     """
@@ -227,7 +227,7 @@ class MMDoubleStreamBlock(nn.Module):
         assert (
             cu_seqlens_q.shape[0] == 2 * img.shape[0] + 1
         ), f"cu_seqlens_q.shape:{cu_seqlens_q.shape}, img.shape[0]:{img.shape[0]}"
-        
+
         # attention computation start
         if not self.hybrid_seq_parallel_attn:
             attn = attention(
@@ -252,12 +252,12 @@ class MMDoubleStreamBlock(nn.Module):
                 cu_seqlens_q=cu_seqlens_q,
                 cu_seqlens_kv=cu_seqlens_kv
             )
-            
+
         # attention computation end
 
         img_attn, txt_attn = attn[:, :img.shape[1]], attn[:, img.shape[1]:]
 
-        # Calculate the img bloks.
+        # Calculate the img blocks.
         img = img + apply_gate(self.img_attn_proj(img_attn), gate=img_mod1_gate)
         img = img + apply_gate(
             self.img_mlp(
@@ -268,7 +268,7 @@ class MMDoubleStreamBlock(nn.Module):
             gate=img_mod2_gate,
         )
 
-        # Calculate the txt bloks.
+        # Calculate the txt blocks.
         txt = txt + apply_gate(self.txt_attn_proj(txt_attn), gate=txt_mod1_gate)
         txt = txt + apply_gate(
             self.txt_mlp(
@@ -305,7 +305,7 @@ class MMSingleStreamBlock(nn.Module):
     ):
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
-        
+
         self.fa_type = fa_type
         self.deterministic = False
         self.hidden_size = hidden_size
@@ -394,7 +394,7 @@ class MMSingleStreamBlock(nn.Module):
         assert (
             cu_seqlens_q.shape[0] == 2 * x.shape[0] + 1
         ), f"cu_seqlens_q.shape:{cu_seqlens_q.shape}, x.shape[0]:{x.shape[0]}"
-        
+
         # attention computation start
         if not self.hybrid_seq_parallel_attn:
             attn = attention(
@@ -724,7 +724,7 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
                     x = block(*single_block_args)
 
             img = x[:, :img_seq_len, ...]
-            
+
         #=========================================================
 
 

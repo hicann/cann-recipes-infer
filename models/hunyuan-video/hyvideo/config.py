@@ -1,5 +1,5 @@
 # coding=utf-8
-# Adapted from  
+# Adapted from
 # https://github.com/Tencent-Hunyuan/HunyuanVideo,
 # Copyright (c) Huawei Technologies Co., Ltd. 2025-2026.
 # Copyright (C) 2024 THL A29 Limited, a Tencent company. All rights reserved.
@@ -414,7 +414,7 @@ def add_inference_args(parser: argparse.ArgumentParser):
         "--embedded-cfg-scale",
         type=float,
         default=6.0,
-        help="Embeded classifier free guidance scale.",
+        help="Embedded classifier free guidance scale.",
     )
 
     group.add_argument(
@@ -484,7 +484,7 @@ def add_parallel_args(parser: argparse.ArgumentParser):
         action="store_true",
         help="Enable Ulysses Anything Attention (UAA) for arbitrary sequence length.",
     )
- 
+
     return parser
 
 

@@ -1,4 +1,4 @@
-# Adapted from  
+# Adapted from
 # https://github.com/Tencent-Hunyuan/HunyuanVideo,
 # https://github.com/ali-vilab/TeaCache,
 # https://github.com/chengzeyi/ParaAttention.
@@ -47,9 +47,9 @@ from ..modules.token_refiner import SingleTokenRefiner
 
 
 def _double_block_full_compute(
-    self, 
+    self,
     block_args: dict,
-    cache_dic: dict, 
+    cache_dic: dict,
     current: dict
 ):
     img = block_args['img']
@@ -64,10 +64,10 @@ def _double_block_full_compute(
     img_q, img_k, img_v = rearrange(img_qkv, "B L (K H D) -> K B L H D", K=3, H=self.heads_num)
     img_q = self.img_attn_q_norm(img_q).to(img_v.dtype)
     img_k = self.img_attn_k_norm(img_k).to(img_v.dtype)
-    
+
     if freqs_cis is not None:
         img_q, img_k = apply_rotary_emb(img_q, img_k, freqs_cis, head_first=False)
-    
+
     # Text Attention
     current['module'] = 'txt_attn'
     txt_modulated = self.txt_norm1(txt)
@@ -88,10 +88,10 @@ def _double_block_full_compute(
             k,
             v,
             mode='flash',
-            cu_seqlens_q=block_args['cu_seqlens_q'], 
-            cu_seqlens_kv=block_args['cu_seqlens_kv'], 
-            max_seqlen_q=block_args['max_seqlen_q'], 
-            max_seqlen_kv=block_args['max_seqlen_kv'], 
+            cu_seqlens_q=block_args['cu_seqlens_q'],
+            cu_seqlens_kv=block_args['cu_seqlens_kv'],
+            max_seqlen_q=block_args['max_seqlen_q'],
+            max_seqlen_kv=block_args['max_seqlen_kv'],
             batch_size=img_k.shape[0],
         )
     else:
@@ -102,10 +102,10 @@ def _double_block_full_compute(
             v,
             img_q_len=img_q.shape[1],
             img_kv_len=img_k.shape[1],
-            cu_seqlens_q=block_args['cu_seqlens_q'], 
-            cu_seqlens_kv=block_args['cu_seqlens_kv'], 
+            cu_seqlens_q=block_args['cu_seqlens_q'],
+            cu_seqlens_kv=block_args['cu_seqlens_kv'],
         )
-    
+
     img_attn, txt_attn = attn[:, :img.shape[1]], attn[:, img.shape[1]:]
     # Image Attn Update
     current['module'] = 'img_attn'
@@ -131,14 +131,14 @@ def _double_block_full_compute(
     txt_mlp_out = self.txt_mlp(txt_mlp_in)
     txt = txt + apply_gate(txt_mlp_out, gate=block_args['txt_mod2_gate'])
     cache_manager.cache_method.derivative_approximation(cache_dic, current, txt_mlp_out)
-    
+
     return img, txt
 
 
 def _double_block_taylor_compute(
     self,
     block_args: dict,
-    cache_dic: dict, 
+    cache_dic: dict,
     current: dict
 ):
     img = block_args['img']
@@ -239,9 +239,9 @@ def double_block_forward(
 
 
 def _single_block_full_compute(
-    self, 
+    self,
     block_args: dict,
-    cache_dic: dict, 
+    cache_dic: dict,
     current: dict
 ):
     x = block_args['x']
@@ -251,11 +251,11 @@ def _single_block_full_compute(
     current['module'] = 'total'
     x_mod = modulate(self.pre_norm(x), shift=block_args['mod_shift'], scale=block_args['mod_scale'])
     qkv, mlp = torch.split(self.linear1(x_mod), [3 * self.hidden_size, self.mlp_hidden_dim], dim=-1)
-    
+
     q, k, v = rearrange(qkv, "B L (K H D) -> K B L H D", K=3, H=self.heads_num)
     q = self.q_norm(q).to(v.dtype)
     k = self.k_norm(k).to(v.dtype)
-    
+
     if freqs_cis is not None:
         img_q, txt_q = q[:, :-txt_len], q[:, -txt_len:]
         img_k, txt_k = k[:, :-txt_len], k[:, -txt_len:]
@@ -270,10 +270,10 @@ def _single_block_full_compute(
             k,
             v,
             mode='flash',
-            cu_seqlens_q=block_args['cu_seqlens_q'], 
-            cu_seqlens_kv=block_args['cu_seqlens_kv'], 
-            max_seqlen_q=block_args['max_seqlen_q'], 
-            max_seqlen_kv=block_args['max_seqlen_kv'], 
+            cu_seqlens_q=block_args['cu_seqlens_q'],
+            cu_seqlens_kv=block_args['cu_seqlens_kv'],
+            max_seqlen_q=block_args['max_seqlen_q'],
+            max_seqlen_kv=block_args['max_seqlen_kv'],
             batch_size=k.shape[0],
         )
     else:
@@ -284,10 +284,10 @@ def _single_block_full_compute(
             v,
             img_q_len=img_q.shape[1],
             img_kv_len=img_k.shape[1],
-            cu_seqlens_q=block_args['cu_seqlens_q'], 
-            cu_seqlens_kv=block_args['cu_seqlens_kv'], 
+            cu_seqlens_q=block_args['cu_seqlens_q'],
+            cu_seqlens_kv=block_args['cu_seqlens_kv'],
         )
-    
+
     output = self.linear2(torch.cat((attn, self.mlp_act(mlp)), dim=2))
     cache_manager.cache_method.derivative_approximation(cache_dic, current, output)
     x = x + apply_gate(output, gate=block_args['mod_gate'])
@@ -296,9 +296,9 @@ def _single_block_full_compute(
 
 
 def _single_block_taylor_compute(
-    self, 
+    self,
     block_args: dict,
-    cache_dic: dict, 
+    cache_dic: dict,
     current: dict
 ):
     x = block_args['x']
@@ -349,12 +349,12 @@ def single_block_forward(
         x = _single_block_full_compute(
             self, block_args, cache_dic, current
         )
-        
+
     elif current.get('type') == 'taylor_cache':
         x = _single_block_taylor_compute(
         self, block_args, cache_dic, current
     )
-        
+
     return x
 
 
@@ -446,7 +446,7 @@ def first_block_forward(
             f"Sequence length mismatch: cu_seqlens_q.shape:{cu_seqlens_q.shape}, "
             f"img.shape[0]:{img.shape[0]}, expected length:{2 * img.shape[0] + 1}"
         )
-    
+
     # attention computation start
     if not self.hybrid_seq_parallel_attn:
         attn = attention(
@@ -471,12 +471,12 @@ def first_block_forward(
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_kv=cu_seqlens_kv
         )
-        
+
     # attention computation end
 
     img_attn, txt_attn = attn[:, :img.shape[1]], attn[:, img.shape[1]:]
 
-    # Calculate the img bloks.
+    # Calculate the img blocks.
     img = img + apply_gate(self.img_attn_proj(img_attn), gate=img_mod1_gate)
     img = img + apply_gate(
         self.img_mlp(
@@ -487,7 +487,7 @@ def first_block_forward(
         gate=img_mod2_gate,
     )
 
-    # Calculate the txt bloks.
+    # Calculate the txt blocks.
     txt = txt + apply_gate(self.txt_attn_proj(txt_attn), gate=txt_mod1_gate)
     txt = txt + apply_gate(
         self.txt_mlp(
