@@ -58,6 +58,21 @@ class MTPWorker(BaseSpeculativeWorker):
     def model_worker(self) -> ModelWorker:
         return self.mtp_model_worker
 
+    @staticmethod
+    def _build_mtp_model_inputs(
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor,
+        forward_metadata,
+        prev_hidden_states: torch.Tensor,
+    ) -> Dict:
+        """Build the model-facing MTP input contract shared by warm-up and inference."""
+        return {
+            "input_ids": input_ids,
+            "position_ids": position_ids,
+            "prev_hidden_states": prev_hidden_states,
+            "forward_metadata": forward_metadata,
+        }
+
     def warm_up_prefill(
         self,
         input_ids: torch.Tensor,
@@ -65,8 +80,14 @@ class MTPWorker(BaseSpeculativeWorker):
         model_inputs: Dict,
         prev_hidden_states: torch.Tensor,
     ) -> None:
-        draft_inputs = dict(model_inputs)
-        draft_inputs["prev_hidden_states"] = prev_hidden_states
+        draft_inputs = self._build_mtp_model_inputs(
+            model_inputs["input_ids"],
+            model_inputs["position_ids"],
+            model_inputs["forward_metadata"],
+            prev_hidden_states,
+        )
+        if "request_offset" in model_inputs:
+            draft_inputs["request_offset"] = model_inputs["request_offset"]
         self.mtp_model_worker.inference(draft_inputs, is_prefill=True, is_mtp=True)
 
     def build_main_warmup_batch(self, input_ids: torch.Tensor) -> Batch:
@@ -81,8 +102,12 @@ class MTPWorker(BaseSpeculativeWorker):
         return batch
 
     def warm_up_decode(self, model_inputs: Dict, main_output) -> None:
-        draft_inputs = dict(model_inputs)
-        draft_inputs["prev_hidden_states"] = main_output[1]
+        draft_inputs = self._build_mtp_model_inputs(
+            model_inputs["input_ids"],
+            model_inputs["position_ids"],
+            model_inputs["forward_metadata"],
+            main_output[1],
+        )
         if self.exe_mode in ["ge_graph", "npugraph_ex"]:
             self.mtp_model_worker.compile_model()
         self.mtp_model_worker.inference(draft_inputs, is_prefill=False, is_mtp=True)
@@ -154,12 +179,12 @@ class MTPWorker(BaseSpeculativeWorker):
             input_ids_mtp = main_next_tokens.reshape(-1).clone()
             position_ids_mtp = model_inputs_main["position_ids"]
             forward_metadata_mtp = get_forward_metadata()
-        model_inputs = {
-            "input_ids": input_ids_mtp.contiguous(),
-            "position_ids": position_ids_mtp,
-            "prev_hidden_states": prev_hidden_states,
-            "forward_metadata": forward_metadata_mtp,
-        }
+        model_inputs = self._build_mtp_model_inputs(
+            input_ids_mtp,
+            position_ids_mtp,
+            forward_metadata_mtp,
+            prev_hidden_states,
+        )
         if batch.is_prefill:
             model_inputs.update({
                 "request_offset": model_inputs_main.get("request_offset", 0),
