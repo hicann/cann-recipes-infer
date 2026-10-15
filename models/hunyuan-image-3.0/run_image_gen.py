@@ -88,8 +88,8 @@ def parse_args():
 
     parser.add_argument("--reproduce", action="store_true", help="Whether to reproduce the results")
     group = parser.add_mutually_exclusive_group()
-    group.add_argument("--moe-tp", action="store_true", help="Use TP for MoE mudule")
-    group.add_argument("--moe-ep", action="store_true", help="Use EP for MoE mudule")
+    group.add_argument("--moe-tp", action="store_true", help="Use TP for MoE module")
+    group.add_argument("--moe-ep", action="store_true", help="Use EP for MoE module")
 
     return parser.parse_args()
 

@@ -212,7 +212,7 @@ def moe_dispatch_double_routing(self, tokens_per_expert, expanded_x):
     tokens_per_expert_group = tokens_per_expert.new_empty(tokens_per_expert.shape[0])
     # First all_to_all: (total_experts,)->(total_ranks*n_routed_experts_per_rank)
     dist.all_to_all_single(tokens_per_expert_group, tokens_per_expert, group=self.moe_ep_group)
-    # Combine tensors, do reduceSum and D2H togather
+    # Combine tensors, do reduceSum and D2H together
     combine_tokens = torch.stack([tokens_per_expert_group, tokens_per_expert], dim=0)
     combine_tokens = combine_tokens.view(2, self.moe_ep_size, -1).sum(2)
     all_tokens = combine_tokens[0].sum()
@@ -346,7 +346,7 @@ def moe_forward(self, hidden_states):
             topk_weight, topk_index = self.gate(hidden_states, topk_impl='easy')
 
             combined_output = torch.zeros_like(reshaped_input)
-            _ = flashinfer.fused_moe.cutlass_fused_moe(     # noqa
+            _ = flashinfer.fused_moe.cutlass_fused_moe(  # noqa
                 reshaped_input.contiguous(),
                 topk_index.to(torch.int).contiguous(),
                 topk_weight.to(torch.float).contiguous(),
@@ -374,7 +374,7 @@ def moe_forward(self, hidden_states):
             mlp_done_event = torch.npu.Event()
             mlp_done_event.record(self.share_mlp_stream)
             mlp_done_event.wait(torch.npu.current_stream())
-        output = hidden_states_mlp + combined_output    # noqa
+        output = hidden_states_mlp + combined_output  # noqa
     else:
         output = combined_output
 

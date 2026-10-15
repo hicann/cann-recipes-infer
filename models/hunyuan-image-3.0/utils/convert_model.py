@@ -306,7 +306,7 @@ class HunyuanWeightSplitterMixedSharded:
     def _process_single_rank(self, rank: int, weights: Dict[str, torch.Tensor]) -> tuple:
         """
         Processing the MoE weights of a single rank
-        Return: (rank, success or not, error infomation)
+        Return: (rank, success or not, error information)
         """
         try:
             experts_per_rank = self.num_experts // self.ep
@@ -481,7 +481,7 @@ class HunyuanWeightSplitterMixedSharded:
     def _process_single_file(self, file_name: str) -> tuple:
         """
         Loading and processing a single weight file
-        Return: (file_name, success or not, error infomation)
+        Return: (file_name, success or not, error information)
         """
         try:
             file_path = self.model_path / file_name
@@ -742,7 +742,7 @@ class HunyuanWeightSplitterMixedSharded:
         """
         Saving shard weights in batches
         """
-        # 1. Traverse earch rank
+        # 1. Traverse each rank
         # (Operation at the rank-level is performed in serial mode to avoid competition for directory/index files)
         for rank in tqdm(range(self.world_size), desc="Saving weights"):
             rank_dir = self.output_path / f"rank-{rank:02d}"
@@ -780,7 +780,7 @@ class HunyuanWeightSplitterMixedSharded:
                         tqdm.write(f"⚠️ Shard task error {shard_path}: {str(e)}")
                         shard_results.append((shard_path, False, str(e)))
 
-            # Check if all shards of current rank have been successed saved
+            # Check if all shards of current rank have been succeeded saved
             failed_shards = [r for r in shard_results if not r[1]]
             if failed_shards:
                 tqdm.write(f"❌ {len(failed_shards)} shard of rank {rank} failed to be saved")
@@ -788,7 +788,7 @@ class HunyuanWeightSplitterMixedSharded:
                 tqdm.write(f"✅ All {total_shards} shards of rank {rank} were successfully saved")
 
             # 5. Calculate the total size of current rank and generate the index file.
-            # (Performed in serial mode to avoid competion)
+            # (Performed in serial mode to avoid competition)
             total_size = sum(
                 t.numel() * t.element_size()
                 for t in self.rank_weights[rank].values()
