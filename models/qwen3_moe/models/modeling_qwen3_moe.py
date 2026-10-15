@@ -271,10 +271,10 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         if self.force_eplb:
             topk_idx = cur_topk_list
         topk_idx = topk_idx.to(torch.int32)
-        
-        
+
+
         if self.moe_tp_size > 1:
-            # MoE TP scence
+            # MoE TP scene
             return self.moe_infer_tp(hidden_states, topk_idx, topk_weight)
         else:
             # MoE EP scene
@@ -324,7 +324,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         tokens_per_expert_group = tokens_per_expert.new_empty(tokens_per_expert.shape[0])
         # (total_experts,)->(total_ranks*n_routed_experts_per_rank)
         dist.all_to_all_single(tokens_per_expert_group, tokens_per_expert, group=moe_ep_group)
-        # combine tensors, do reduceSum and D2H togather
+        # combine tensors, do reduceSum and D2H together
         combine_tokens = torch.stack([tokens_per_expert_group, tokens_per_expert], dim=0)
         combine_tokens = combine_tokens.view(2, self.moe_ep_size, -1).sum(2)
         all_tokens = combine_tokens[0].sum()
@@ -376,7 +376,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             export_for_source_row=None, drop_pad_mode=2
         )
         return hidden_states.view(token_count, self.hidden_dim)
-    
+
     def moe_infer_ag_w4a8mx(self, hidden_states, topk_ids, topk_weight):
         bs_qlen, h = hidden_states.shape
         h_dtype = hidden_states.dtype
@@ -456,7 +456,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         hidden_states = hidden_states_rs
         hidden_states = hidden_states.view(bs_qlen, self.hidden_dim)
         return hidden_states.view(-1, h)
-    
+
     def moe_infer_dispatch_combine(self, x, topk_ids, topk_weight):
         """
         support ep for decode stage
@@ -589,7 +589,7 @@ class Qwen3MoeAttention(nn.Module):
                                             bias=False,
                                             quant_config=config.quant_config,
                                             prefix=f"{prefix}.o_proj")
-        
+
         self.scale_fa = 1 / (self.head_dim ** 0.5)
         self.dynamic_mx_block = 64
         self.k_cache = torch.Tensor([])
@@ -679,15 +679,15 @@ class Qwen3MoeAttention(nn.Module):
             ks_cache, vs_cache = self.ks_cache, self.vs_cache
         if not k_cache.numel() or not v_cache.numel():
             raise RuntimeError("A BUG: k_cache or v_cache are not initialized properly.")
-        
+
         tmp_slot_mapping = slot_mapping.view(-1)
         if self.kv_cache_quant_mode == "float8":
             seq_len, num_heads, head_dim = key_states.shape
-            key_quant, key_scale = torch_npu.npu_dynamic_quant(key_states.view(seq_len, -1), 
-                                                            dst_type=torch.float8_e4m3fn, 
+            key_quant, key_scale = torch_npu.npu_dynamic_quant(key_states.view(seq_len, -1),
+                                                            dst_type=torch.float8_e4m3fn,
                                                             quant_mode="pertoken")
-            value_quant, value_scale = torch_npu.npu_dynamic_quant(value_states.view(seq_len, -1), 
-                                                                dst_type=torch.float8_e4m3fn, 
+            value_quant, value_scale = torch_npu.npu_dynamic_quant(value_states.view(seq_len, -1),
+                                                                dst_type=torch.float8_e4m3fn,
                                                                 quant_mode="pertoken")
             torch_npu.npu_scatter_nd_update_(
                 k_cache.view(-1, self.num_key_value_heads_per_rank, self.head_dim),
@@ -728,7 +728,7 @@ class Qwen3MoeAttention(nn.Module):
 
         key_states, value_states = k_cache, v_cache
         return key_states, value_states, key_scale, value_scale
-    
+
     def exec_qkv(
         self,
         qkv: torch.Tensor,
@@ -743,7 +743,7 @@ class Qwen3MoeAttention(nn.Module):
         attention_mask = forward_metadata.attention_mask
         q_len = qkv.size(0)
         prompt_tokens = forward_metadata.prompt_tokens if forward_metadata else q_len
-        
+
         if is_prefill:
             padded_q_len = q_len
             if prompt_tokens < padded_q_len:
@@ -824,7 +824,7 @@ class Qwen3MoeAttention(nn.Module):
         attn_output = attn_output.reshape(q_len, self.attn_intermediate_size_per_rank)
         if self.prefill_opt:
             if is_prefill:
-                attn_output, attn_output_scale = torch_npu.npu_dynamic_mx_quant(attn_output, 
+                attn_output, attn_output_scale = torch_npu.npu_dynamic_mx_quant(attn_output,
                                                             dst_type=torch.float8_e4m3fn)
                 out_shape_dim_last = attn_output.shape[-1]
                 attn_tp_group = self.comm_manager.get_group("attn_tp_group")
@@ -876,7 +876,7 @@ class Qwen3MoeAttention(nn.Module):
                 if self.enable_hadamard:
                     attn_output = hadamard_transform(attn_output, self.output_transform_weight)
                 attn_output = self.o_proj(attn_output)
-        else:            
+        else:
             if self.enable_hadamard:
                 attn_output = hadamard_transform(attn_output, self.output_transform_weight)
             attn_output = self.o_proj(attn_output)
@@ -923,7 +923,7 @@ class Qwen3MoeAttention(nn.Module):
 
         is_prefill = forward_metadata.is_prefill if forward_metadata else False
         q_len, h = hidden_states.size()
-        
+
         if self.prefill_opt and is_prefill:
             h_dtype = hidden_states.dtype
             s_dtype = hidden_states_scale.dtype
@@ -942,7 +942,7 @@ class Qwen3MoeAttention(nn.Module):
             new_hidden_states = torch.empty([q_len * self.attn_tp_size, h], dtype=h_dtype, device="npu")
             dist.all_gather_into_tensor(new_hidden_states, hidden_states, group=attn_tp_group)
             hidden_states = new_hidden_states
-        
+
         if self.enable_hadamard:
             hidden_states = hadamard_transform(hidden_states, self.input_transform_weight)
         qkv = self.merged_qkv_proj(hidden_states, dynamic_scale=hidden_states_scale)
@@ -1046,7 +1046,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
         # Fully Connected
         if self.prefill_opt:
             hidden_states_fp32, hidden_states_bf16, _, residual = torch_npu.npu_add_rms_norm_cast(
-                                hidden_states, residual, self.post_attention_layernorm.weight, 
+                                hidden_states, residual, self.post_attention_layernorm.weight,
                                 self.post_attention_layernorm.variance_epsilon)
             hidden_states = (hidden_states_fp32, hidden_states_bf16)
         else:
