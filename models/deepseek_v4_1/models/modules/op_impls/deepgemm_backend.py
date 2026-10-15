@@ -62,7 +62,7 @@ class DeepGemmContext:
         self.group = comm_manager.get_group(ep_group_name)
         self.deep_gemm = deep_gemm
         num_shared_experts = getattr(config, "n_shared_experts", 0) or 0
-        self.sym_buffer = deep_gemm.get_symm_buffer_for_mega_moe(
+        self.sym_buffer = deep_gemm.SymmBuffer(
             self.group,
             num_experts=config.n_routed_experts,
             num_max_tokens_per_rank=num_max_tokens_per_rank,
