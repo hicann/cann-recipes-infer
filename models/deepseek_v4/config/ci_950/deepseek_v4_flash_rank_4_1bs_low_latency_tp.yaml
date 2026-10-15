@@ -14,6 +14,13 @@ model_config:
     low_latency_tp: True
     enable_multi_streams: False
     moe_chunk_max_len: 65536
+    # Routing emits the sparse [E, 2] (expert_id, count) grouplist directly;
+    # GMM/swiglu consume group_list_type=2. Requires an op package with the
+    # KEY_VALUE empty-expert fix.
+    kernel_config:
+      # swiglu kernel: custom (repo op) or cann_ops_nn (mainline).
+      swiglu: custom
+    enable_sparse_grouplist: True
 
 data_config:
   input_truncated_len: 8192

@@ -115,7 +115,7 @@ class FusedMoeWeightScaleSupported(Enum):
 
 
 class FusedMoEGMM(torch.nn.Module):
-    TP_INTERMEDIATE_ALIGN = 128
+    TP_INTERMEDIATE_ALIGN = 64
 
     def __init__(
         self,

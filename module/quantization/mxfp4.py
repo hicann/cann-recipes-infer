@@ -265,20 +265,36 @@ class W4A4MxFp4MoEGMMMethod(W4A8MxFp4MoEGMMMethod):
 
         record_event(layer.gmm1_events is not None, layer.gmm1_events, 0)
         swiglu_limit = kwargs.get("swiglu_limit")
-        swiglu_kwargs = {}
-        if swiglu_limit is not None:
-            swiglu_kwargs.update({
-                "swiglu_mode": 0,
-                "clamp_limit": swiglu_limit,
-                "glu_alpha": 1,
-                "glu_bias": 0,
-            })
-        intermediate_h, pertoken_scale = torch_npu.npu_swiglu_mx_quant(
-            mm1_mm3,
-            group_index=expert_tokens,
-            dst_type=torch_npu.float4_e2m1fn_x2,
-            activate_left=True,
-            **swiglu_kwargs)
+        if group_list_type == 2:
+            # Type-2 sparse pairs: the repo custom op consumes the [E, 2]
+            # grouplist directly with an FP4 dst_type.
+            intermediate_h, pertoken_scale, _ = swiglu_group_quant(
+                mm1_mm3,
+                dst_type=torch.float4_e2m1fn_x2,
+                round_scale=True,
+                quant_mode=1,
+                clamp_limit=swiglu_limit,
+                group_index=expert_tokens,
+                group_list_type=2,
+                prefer_custom=True,
+            )
+        else:
+            swiglu_kwargs = {}
+            if swiglu_limit is not None:
+                swiglu_kwargs.update({
+                    # 2: contiguous [gate, up] split with the clamped SwiGLU computation;
+                    # with mode 0 clamp_limit is ignored by npu_swiglu_mx_quant.
+                    "swiglu_mode": 2,
+                    "clamp_limit": swiglu_limit,
+                    "glu_alpha": 1,
+                    "glu_bias": 0,
+                })
+            intermediate_h, pertoken_scale = torch_npu.npu_swiglu_mx_quant(
+                mm1_mm3,
+                group_index=expert_tokens,
+                dst_type=torch_npu.float4_e2m1fn_x2,
+                activate_left=True,
+                **swiglu_kwargs)
 
         return torch_npu.npu_grouped_matmul(
             [intermediate_h], [layer.w2_weight],

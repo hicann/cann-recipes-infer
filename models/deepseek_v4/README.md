@@ -149,12 +149,16 @@ docker run -u root -itd --name cann_recipes_infer --ulimit nproc=65535:65535 --i
   source ${cann_path}/bin/setenv.bash
   ```
 
-  >入参介绍：`input_fp8_hf_path`：原始权重路径；
+  >入参介绍：`input_fp8_hf_path`：原始权重路径；`moe_activation_bits`：MoE路由专家激活量化位宽，默认`8`（W4A8），如需启用A4W4 MXFP4（仅支持Ascend 950系列）请设置为`4`；
 
   拉起示例：
 
   ```shell
+  # 默认生成W4A8量化配置（适用于原生Hybrid FP8-MXFP4权重）
   python utils/convert_config.py --input_fp8_hf_path /data/models/deepseek_v4
+
+  # 生成A4W4 MXFP4量化配置，适用于Ascend 950系列
+  python utils/convert_config.py --input_fp8_hf_path /data/models/deepseek_v4 --moe_activation_bits 4
   ```
 
 ### 转换权重
@@ -183,6 +187,9 @@ docker run -u root -itd --name cann_recipes_infer --ulimit nproc=65535:65535 --i
 
   # 转换为Hybrid MXFP8-MXFP4权重，适用于Ascend 950系列
   python utils/convert_model.py --input_fp8_hf_path /data/models/deepseek_v4  --output_hf_path /data/models/deepseek_v4_hybrid_mxfp8_mxfp4 --quant_type w4a8-mx
+
+  # 转换为Hybrid MXFP4-MXFP4（A4W4）权重，适用于Ascend 950系列
+  python utils/convert_model.py --input_fp8_hf_path /data/models/deepseek_v4  --output_hf_path /data/models/deepseek_v4_hybrid_mxfp4_a4w4 --quant_type w4a4-mx
 
   # 转换为Hybrid HiF8-MXFP8-MXFP4权重，适用于Ascend 950系列
   python utils/convert_model.py --input_fp8_hf_path /data/models/deepseek_v4  --output_hf_path /data/models/deepseek_v4_hybrid_hif8_mxfp8_mxfp4 --quant_type w4a8-mx-hif

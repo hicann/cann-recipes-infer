@@ -66,7 +66,8 @@ from module.linear import (
     )
 from module.fuse_moe_gmm import FusedMoEGMM
 from module.utils import get_moe_num_chunks, split_moe_tensors
-from module.quantization.utils.quant_utils import reshape_mx_scale
+from module.quantization.utils.quant_utils import (_ensure_custom_swiglu_registered,
+                                        reshape_mx_scale)
 from module.quantization import QuantizeMethodBase
 from module.quantization.compressed_tensors.compressed_tensors import CompressedTensorsConfig
 from module.quantization.compressed_tensors.compressed_tensors_w8a8_hif8 import CompressedTensorsW8A8Hif8LinearMethod
@@ -126,7 +127,7 @@ class DeepseekV3SharedExpert(nn.Module):
         # SwiGLU via the repo custom op when its package is deployed in the
         # image; falls back to the mainline op otherwise.
         kernel_config = self.infer_config.model_config.custom_params.get("kernel_config", {})
-        self.enable_custom_swiglu = kernel_config.get("swiglu", "custom") == "custom"
+        self.enable_custom_swiglu = kernel_config.get("swiglu", "cann_ops_nn") == "custom"
         self.config = config
         self.hidden_size = config.hidden_size
         self.is_moe_layer = is_moe_layer
@@ -191,6 +192,7 @@ class DeepseekV3SharedExpert(nn.Module):
         is_mx = "mx" in self.mm_quant_mode or "hif" in self.mm_quant_mode
         d_limit = 64 if "mx" in self.mm_quant_mode else 256
         if self.enable_custom_swiglu and merged_x.shape[-1] % d_limit == 0:
+            _ensure_custom_swiglu_registered()
             intermediate_hidden_states, pergroup_scale, _ = torch.ops.custom.npu_swiglu_group_quant(
                 merged_x,
                 dst_type=torch.float8_e4m3fn,
@@ -264,7 +266,10 @@ class DeepseekV3MoE(nn.Module):
         self.n_routed_experts = config.n_routed_experts
         self.experts_per_rank = config.n_routed_experts // self.moe_ep_size
         kernel_config = self.infer_config.model_config.custom_params.get("kernel_config", {})
-        self.enable_custom_swiglu = kernel_config.get("swiglu", "custom") == "custom"
+        self.enable_custom_swiglu = kernel_config.get("swiglu", "cann_ops_nn") == "custom"
+        self.enable_sparse_grouplist = bool(
+            self.infer_config.model_config.custom_params.get("enable_sparse_grouplist", False)
+        )
         self.experts = FusedMoEGMM(
             num_experts=config.n_routed_experts,
             hidden_size=self.hidden_dim,
@@ -430,7 +435,9 @@ class DeepseekV3MoE(nn.Module):
             "expert_idx": topk_ids,
             "active_num": x.shape[0] * self.top_k,
             "expert_num": self.num_experts,
-            "expert_tokens_num_type": 1,
+            # type=2: routing emits the sparse [E, 2] (expert_id, count)
+            # directly in expert order; type=1 keeps the count list.
+            "expert_tokens_num_type": 2 if self.enable_sparse_grouplist else 1,
             "expert_tokens_num_flag": True,
             "active_expert_range": [0, self.num_experts],
             "quant_mode": quant_mode,
@@ -438,10 +445,22 @@ class DeepseekV3MoE(nn.Module):
         return routing_args, routing_quantizes_input
 
     def _build_moe_tp_gmm_args(self, expanded_x, tokens_per_expert, pertoken_scale, routing_quantizes_input):
+        group_list_type = 1
+        gmm_group_list = tokens_per_expert
+        swiglu_group_list = None
+        if self.enable_sparse_grouplist:
+            # Requires a CANN package with the KEY_VALUE empty-expert fix
+            # (ops-transformer#11372); the routing op outputs [E, 2]
+            # (expert_id, count) pairs directly in expert order.
+            # The GMM walks the pairs in order; they must keep expert order.
+            group_list_type = 2
+            gmm_group_list = tokens_per_expert
+            swiglu_group_list = gmm_group_list
         gmm_args = {
             "x": expanded_x,
-            "expert_tokens": tokens_per_expert,
-            "group_list_type": 1,
+            "expert_tokens": gmm_group_list,
+            "group_list_type": group_list_type,
+            "swiglu_expert_tokens": swiglu_group_list,
             "swiglu_limit": self.swiglu_limit,
         }
         if routing_quantizes_input:
@@ -464,6 +483,13 @@ class DeepseekV3MoE(nn.Module):
             expanded_x, tokens_per_expert, pertoken_scale, routing_quantizes_input)
 
         expert_output = self.moe_ffn(**gmm_args)
+
+        # Wait for the shared expert on the side stream before the finalize
+        # consumes its output (mirrors the V4.1 moe_infer_tp synchronization;
+        # without this the main stream can read an incomplete tensor when
+        # multi_streams is enabled, which surfaces as NaN under DSpark).
+        wait_event(self.enable_multi_streams and hidden_states_share is not None,
+                   self.npu_events, 1)
 
         hidden_states = torch_npu.npu_moe_finalize_routing(
             expert_output,
@@ -2290,6 +2316,14 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
                 if val == 0:
                     config.compress_ratios[i] = 1
 
+    @staticmethod
+    def check_model_config_before_loading(config, infer_config: InferenceConfig):
+        # Reject unsupported A4W4 MXFP4 runs before any weight is loaded.
+        quant_config = getattr(config, "quant_config", None)
+        gmm_quant_mode = quant_config.gmm_quant_mode if quant_config is not None else "w16a16"
+        if gmm_quant_mode == "w4a4mxfloat4" and not infer_config.model_config.platform_version.is_ascend_950():
+            raise ValueError("A4W4 MXFP4 MoE is only supported on Ascend 950")
+
     def __init__(
         self,
         config,
@@ -2445,9 +2479,14 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
 
         gmm_quant_mode = self.config.quant_config.gmm_quant_mode
         if gmm_quant_mode == "w4a4mxfloat4":
-            if platform_version != PlatformVersion.ASCEND_950:
-                raise ValueError("A4W4 MXFP4 MoE is only supported on Ascend 950")
-            layers = self.model.layers.values() if self.is_mtp else self.model.layers
+            if getattr(self, "mtp", None) is not None:
+                # The DSpark proposal model reuses self.model for embeddings only
+                # and keeps its MoE blocks in self.mtp.
+                layers = self.mtp
+            elif self.is_mtp:
+                layers = self.model.layers.values()
+            else:
+                layers = self.model.layers
             first_moe = next(iter(layers)).ffn
             if not isinstance(first_moe.experts.quant_method, W4A4MxFp4MoEGMMMethod):
                 raise RuntimeError(

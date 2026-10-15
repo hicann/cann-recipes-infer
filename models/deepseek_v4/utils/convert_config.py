@@ -131,7 +131,7 @@ def generate_quant_config(cache_scheme, ignores, w4a8=False, is_fp=False, is_mx=
     return quant_config
 
 
-def main(fp8_path, hif=False, moe_activation_bits=NUM_BITS_4):
+def main(fp8_path, hif=False, moe_activation_bits=NUM_BITS_8):
     config_file = os.path.join(fp8_path, 'config.json')
     with open(config_file, "r") as f:
         config = json.load(f)
@@ -168,7 +168,7 @@ if __name__ == "__main__":
     parser.add_argument("--hif", action="store_true",
                         help="generate a HiF8 quant config instead of the default MXFP4 config")
     parser.add_argument("--moe_activation_bits", type=int, choices=[NUM_BITS_4, NUM_BITS_8],
-                        default=NUM_BITS_4,
-                        help="MoE activation bit width. Default 4 enables A4W4 MXFP4; use 8 for W4A8.")
+                        default=NUM_BITS_8,
+                        help="MoE activation bit width: 8 for W4A8 (default), 4 for A4W4 MXFP4.")
     args = parser.parse_args()
     main(args.input_fp8_hf_path, hif=args.hif, moe_activation_bits=args.moe_activation_bits)

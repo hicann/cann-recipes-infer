@@ -7,28 +7,28 @@ model_config:
   with_ckpt: True
   exe_mode: "npugraph_ex"
   next_n: 0
-  enable_static_kernel: False
+  enable_static_kernel: True
   enable_dynamic_graph: False
   enable_profiler: False
   force_eplb: False
-  enable_cache_compile: False
+  enable_cache_compile: True
   custom_params:
     # Only applies to npugraph_ex; leave unset or False for eager/ge_graph.
-    unsafe_skip_npugraph_capture_validation: False
+    unsafe_skip_npugraph_capture_validation: True
     low_latency_tp: True
     kernel_config:
       indexer_prolog_qw: ascendc
       # swiglu kernel: custom (repo op) or cann_ops_nn (mainline).
       swiglu: custom
     enable_engram: True
-    enable_multi_streams: False
+    enable_multi_streams: True
     enable_mega_moe: False
     enable_engram_offload: True
     engram_tp_size: 8
     # Routing emits the sparse [E, 2] (expert_id, count) grouplist directly;
     # GMM/swiglu consume group_list_type=2. Requires an op package with the
     # KEY_VALUE empty-expert fix.
-    enable_grouplist_type2: True
+    enable_sparse_grouplist: True
 
 data_config:
   dataset: "default_multimodal"

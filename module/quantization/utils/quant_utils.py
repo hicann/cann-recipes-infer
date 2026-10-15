@@ -3,6 +3,7 @@
 # (https://github.com/vllm-project/vllm/blob/v0.9.0/vllm/model_executor/layers/quantization/utils/quant_utils.py)
 # SPDX-License-Identifier: Apache-2.0
 
+import importlib
 from collections.abc import Mapping
 from types import MappingProxyType
 
@@ -47,16 +48,47 @@ def is_layer_skipped(
     return is_skipped
 
 
-def swiglu_group_quant(x, *, dst_type, round_scale=False, quant_mode,
-                       clamp_limit=None, group_index=None, group_list_type=1,
-                       prefer_custom=False):
-    """SwiGLU + group quant. prefer_custom selects the repo custom op
-    (64-element mx tail, type-2 group lists); otherwise the mainline
-    cann_ops_nn kernel is used (count-list group index, 256-aligned tail)."""
+def _ensure_custom_swiglu_registered():
+    """Import the custom_ops extension and verify the swiglu op is present.
+
+    Verified once per process; subsequent calls return immediately.
+    """
+    if getattr(_ensure_custom_swiglu_registered, "verified", False):
+        return
+    try:
+        importlib.import_module("custom_ops")
+    except ImportError as e:
+        raise ImportError(
+            "kernel_config.swiglu=custom requires the custom_ops op package; "
+            "deploy it in the image or set kernel_config.swiglu: cann_ops_nn"
+        ) from e
+    if not hasattr(torch.ops.custom, "npu_swiglu_group_quant"):
+        raise RuntimeError(
+            "the deployed custom_ops package does not register "
+            "npu_swiglu_group_quant; redeploy a package containing it or "
+            "set kernel_config.swiglu: cann_ops_nn")
+    _ensure_custom_swiglu_registered.verified = True
+
+
+def swiglu_group_quant(
+    x,
+    *,
+    dst_type,
+    round_scale=False,
+    quant_mode,
+    clamp_limit=None,
+    group_index=None,
+    group_list_type=1,
+    prefer_custom=False,
+):
+    # SwiGLU + group quant. prefer_custom selects the repo custom op
+    # (64-element mx tail, type-2 group lists); otherwise the mainline
+    # cann_ops_nn kernel is used (count-list group index, 256-aligned tail).
     if group_list_type == 2 and not prefer_custom:
         raise RuntimeError(
             "group_list_type=2 requires prefer_custom (the repo custom op)")
     if prefer_custom:
+        _ensure_custom_swiglu_registered()
         return torch.ops.custom.npu_swiglu_group_quant(
             x, dst_type=dst_type, round_scale=round_scale,
             quant_mode=quant_mode, clamp_limit=clamp_limit,
@@ -74,7 +106,6 @@ def reshape_mx_scale(scale_tensor):
     Reshape the last dimension into pairs for GMM/MM operators; an odd
     group count gets one zero tail slot for the pair view.
     """
-    import torch
     num_groups = scale_tensor.size(-1)
     if num_groups % 2:
         pad = torch.zeros((*scale_tensor.shape[:-1], 1), dtype=scale_tensor.dtype,

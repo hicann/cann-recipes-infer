@@ -68,7 +68,8 @@ from module.linear import (
     )
 from module.fuse_moe_gmm import FusedMoEGMM
 from module.utils import get_moe_num_chunks, split_moe_tensors
-from module.quantization.utils.quant_utils import reshape_mx_scale
+from module.quantization.utils.quant_utils import (_ensure_custom_swiglu_registered,
+                                        reshape_mx_scale)
 from module.quantization import QuantizeMethodBase
 from module.quantization.fp8 import Fp8PerTileMoEGMMMethod
 from module.quantization.mxfp4 import W4A8MxFp4MoEGMMMethod
@@ -206,7 +207,7 @@ class DeepseekV41SharedExpert(nn.Module):
         # SwiGLU via the repo custom op when its package is deployed in the
         # image; falls back to the mainline op otherwise.
         kernel_config = self.infer_config.model_config.custom_params.get("kernel_config", {})
-        self.enable_custom_swiglu = kernel_config.get("swiglu", "custom") == "custom"
+        self.enable_custom_swiglu = kernel_config.get("swiglu", "cann_ops_nn") == "custom"
         self.config = config
         self.hidden_size = config.hidden_size
         self.is_moe_layer = is_moe_layer
@@ -278,6 +279,7 @@ class DeepseekV41SharedExpert(nn.Module):
             swiglu_limit_args["clamp_limit"] = self.swiglu_limit
         d_limit = 64 if "mx" in self.mm_quant_mode else 256
         if self.enable_custom_swiglu and merged_x.shape[-1] % d_limit == 0:
+            _ensure_custom_swiglu_registered()
             intermediate_hidden_states, pergroup_scale, _ = torch.ops.custom.npu_swiglu_group_quant(
                 merged_x,
                 dst_type=torch.float8_e4m3fn,
@@ -355,14 +357,14 @@ class DeepseekV41MoE(nn.Module):
         self.top_k = self.num_experts_per_tok
         self.is_a4w4_mxfp4 = self.gmm_quant_mode == "w4a4mxfloat4"
         self.is_a8w4_mxfp4 = self.gmm_quant_mode == "w4a8mxfloat4"
-        self.enable_grouplist_type2 = self.infer_config.model_config.custom_params.get("enable_grouplist_type2", False)
+        self.enable_sparse_grouplist = self.infer_config.model_config.custom_params.get("enable_sparse_grouplist", False)
 
         self.intermediate_size_per_rank = self.intermediate_size // self.moe_tp_size
         self.shared_expert_rank_num = 0 # route and share on same card
         self.n_shared_experts = config.n_shared_experts
         self.experts_per_rank = self.n_routed_experts // self.moe_ep_size
         kernel_config = self.infer_config.model_config.custom_params.get("kernel_config", {})
-        self.enable_custom_swiglu = kernel_config.get("swiglu", "custom") == "custom"
+        self.enable_custom_swiglu = kernel_config.get("swiglu", "cann_ops_nn") == "custom"
         self.experts = FusedMoEGMM(
             num_experts=self.n_routed_experts,
             hidden_size=self.hidden_dim,
@@ -567,7 +569,7 @@ class DeepseekV41MoE(nn.Module):
             "expert_num": self.num_experts,
             # type=2: routing emits the sparse [E, 2] (expert_id, count)
             # directly in expert order; type=1 keeps the count list.
-            "expert_tokens_num_type": 2 if self.enable_grouplist_type2 else 1,
+            "expert_tokens_num_type": 2 if self.enable_sparse_grouplist else 1,
             "expert_tokens_num_flag": True,
             "active_expert_range": [0, self.num_experts],
             "quant_mode": 3 if routing_quantizes_input else -1,
@@ -578,19 +580,13 @@ class DeepseekV41MoE(nn.Module):
         group_list_type = 1
         gmm_group_list = tokens_per_expert
         swiglu_group_list = None
-        if self.enable_grouplist_type2:
-            if tokens_per_expert.dim() == 1:
-                # Pre-fix op form: build the sparse pairs locally.
-                expert_ids = torch.arange(self.num_experts, dtype=torch.int64,
-                                          device=tokens_per_expert.device)
-                sparse_pairs = torch.stack(
-                    [expert_ids, tokens_per_expert.to(torch.int64)], dim=1)
-            else:
-                # type=2 direct output: [E, 2] (expert_id, count).
-                sparse_pairs = tokens_per_expert
+        if self.enable_sparse_grouplist:
+            # Requires a CANN package with the KEY_VALUE empty-expert fix
+            # (ops-transformer#11372); the routing op outputs [E, 2]
+            # (expert_id, count) pairs directly in expert order.
             # The GMM walks the pairs in order; they must keep expert order.
             group_list_type = 2
-            gmm_group_list = sparse_pairs.to(torch.int64)
+            gmm_group_list = tokens_per_expert
             swiglu_group_list = gmm_group_list
         gmm_args = {
             "x": expanded_x,
