@@ -256,6 +256,19 @@ git clone https://huggingface.co/Qwen/Qwen3-8B /data/models/origin/Qwen3-8B
 - CANNLab 平台 CANN 安装路径：`/home/developer/Ascend/cann`
 - CANNLab 平台权重存放路径：`/home/developer/models/Qwen3-8B`（按需自定义）
 
+### 0. 代码仓库准备
+
+创建 CANNLab 环境时可指定所需 CANN 开源仓库及分支，平台会自动下载对应代码，**进入环境时的默认路径即创建环境时指定的代码仓根目录**。
+
+以下命令判断当前目录名是否为 `cann-recipes-infer`（即进入环境时指定的代码仓）：是则直接使用；否则克隆到用户主目录 `$HOME/cann-recipes-infer` 后进入（避免污染当前所在的代码仓），再执行后续命令（均为相对路径，需在仓库根目录下运行）：
+
+```bash
+if [ "$(basename "$PWD")" != "cann-recipes-infer" ]; then
+    [ -d "$HOME/cann-recipes-infer/.git" ] || git clone https://gitcode.com/cann/cann-recipes-infer.git "$HOME/cann-recipes-infer"
+    cd "$HOME/cann-recipes-infer"
+fi
+```
+
 ### 1. 环境前置（conda + CANN + torch_npu）
 
 > - 先用 `python --version`（期望 3.11.x）与 `python -c "import torch_npu; print(torch_npu.__version__)"`（期望 2.8.0.post4）核对环境；满足则可分别跳过 §1.1（conda 创建）与 §1.3（torch_npu wheel 安装）。§1.2 CANN 环境为必须步骤。
@@ -280,6 +293,8 @@ conda create -n qwen python=3.11 -y
 conda activate qwen
 ```
 
+> 后续步骤（§1.3 ~ §5）均需在已激活的 `qwen` 环境下执行；若中途新开终端，需先执行 `source $HOME/miniforge3/etc/profile.d/conda.sh && conda activate qwen`。
+
 **1.2 配置 CANN 环境变量**
 
 ```shell
@@ -287,12 +302,26 @@ sed -i 's|^cann_path=.*|cann_path="/home/developer/Ascend/cann"|' executor/scrip
 source executor/scripts/set_env.sh
 ```
 
+> 若执行 `source executor/scripts/set_env.sh` 时出现 `rm: cannot remove '/root/atc_data/': Permission denied`，是因为该脚本启动时清理 ATC/AOE 算子自调优缓存（默认路径 `/root/atc_data/`），而普通用户无权访问 `/root` 目录。**该告警不影响后续推理**（不在推理链路中，仅影响调优缓存的清理），可安全忽略。如需确认 CANN 环境已正确加载，可执行：
+>
+> ```shell
+> echo $ASCEND_HOME_PATH   # 期望输出 /home/developer/Ascend/cann
+> ```
+
 **1.3 安装 torch_npu wheel**
 
 ```shell
 wget https://gitcode.com/Ascend/pytorch/releases/download/v26.0.0-pytorch2.8.0/torch_npu-2.8.0.post4-cp311-cp311-manylinux_2_28_aarch64.whl
 pip install ./torch_npu-2.8.0.post4-cp311-cp311-manylinux_2_28_aarch64.whl
 ```
+
+此外，安装环境准备阶段依赖的基础 Python 库（`numpy`、`pyyaml`）：
+
+```shell
+pip install numpy==1.26.4 pyyaml
+```
+
+> 说明：`torch_npu` 与 `modelscope` 的 wheel 均未在依赖中声明 `numpy`/`pyyaml`（属隐式运行时依赖），在全新环境中需显式补装，否则加载 torch_npu 或下载权重时会报 `ModuleNotFoundError`。CANNLab 镜像若已预置这些库，该命令幂等（pip 自动跳过）。`numpy==1.26.4` 与 §5.1 `requirements.txt` 锁定版本一致。`transformers` 等项目推理依赖统一在 §5.1 安装。
 
 ### 2. 下载 Qwen3-8B BF16 原始权重到平台路径
 
