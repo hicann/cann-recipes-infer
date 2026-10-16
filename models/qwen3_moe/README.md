@@ -5,7 +5,7 @@ Qwen3-MoE模型是2025年开源的大语言模型，包括Qwen3-235B-A22B与Qwen
 
 
 ## 支持的产品型号
-<term>Atlas A3、950 系列产品</term>  
+<term>Atlas A3、950 系列产品</term>
 在950系列产品中，Qwen3-MoE Prefill支持低时延优化、Decode支持W4A8混精推理。
 
 ## A3系列产品环境准备
@@ -22,9 +22,9 @@ Qwen3-MoE模型是2025年开源的大语言模型，包括Qwen3-235B-A22B与Qwen
 2. 安装Ascend Extension for PyTorch（torch_npu）。
 
    Ascend Extension for PyTorch（torch_npu）为支撑PyTorch框架运行在NPU上的适配插件，本样例支持的Ascend Extension for PyTorch版本为`v26.0.0`，PyTorch版本为`2.8.0`。
-   
+
    请从[软件包下载地址](https://gitcode.com/Ascend/pytorch/releases/v26.0.0-pytorch2.8.0)下载`torch_npu-2.8.0.post4-cp311-cp311-manylinux_2_28_${arch}.whl`安装包，并参考[torch_npu安装文档](https://www.hiascend.com/document/detail/zh/Pytorch/2600/configandinstg/instg/docs/zh/installation_guide/installation_via_binary_package.md)进行安装。
-   
+
     - `${arch}`表示CPU架构，如aarch64、x86_64。
 
 3. 下载项目源码并安装依赖的python库。
@@ -57,9 +57,9 @@ Qwen3-MoE模型是2025年开源的大语言模型，包括Qwen3-235B-A22B与Qwen
 2. 安装Ascend Extension for PyTorch（torch_npu）。
 
    Ascend Extension for PyTorch（torch_npu）为支撑PyTorch框架运行在NPU上的适配插件，本样例支持的Ascend Extension for PyTorch版本为`v26.0.0`，PyTorch版本为`2.8.0`。
-   
+
    请从[软件包下载地址](https://gitcode.com/Ascend/pytorch/releases/v26.0.0-pytorch2.8.0)下载`torch_npu-2.8.0.post4-cp311-cp311-manylinux_2_28_${arch}.whl`安装包，并参考[torch_npu安装文档](https://www.hiascend.com/document/detail/zh/Pytorch/2600/configandinstg/instg/docs/zh/installation_guide/installation_via_binary_package.md)进行安装。
-   
+
     - `${arch}`表示CPU架构，如aarch64、x86_64。
 
 3. 下载项目源码并安装依赖的python库。
@@ -86,7 +86,7 @@ Qwen3-MoE模型是2025年开源的大语言模型，包括Qwen3-235B-A22B与Qwen
 
 ## 权重转换
 
-本样例在950系列产品上支持Qwen3-MoE模型量化推理，基于`models\qwen3_moe\utils\convert_model.py`可以完成从Bfloat16到W4A8 MXFP8和A4W4 MXFP4的权重转换。默认不增加额外参数时，转换脚本保持原有W4A8 MXFP8流程；只有显式指定`--quant_type w4a4c16`时，才进入A4W4 MXFP4转换。
+本样例在950系列产品上支持Qwen3-MoE模型量化推理，基于`models\qwen3_moe\utils\convert_model.py`可以完成从Bfloat16到W4A8 MXFP8、A4W4 MXFP4、以及“HiFloat8 + MoE MXFP4/MXFP8”混合方案的权重转换。默认不增加额外参数时，转换脚本保持原有W4A8 MXFP8流程；显式指定`--quant_type w4a4c16`进入A4W4 MXFP4转换，`--quant_type w8a8hif8_w4a8mxfp`进入“HiFloat8 + MoE MXFP4/MXFP8”转换。
 
 > 入参介绍：`input_bf16_hf_path`：原始Bfloat16权重路径；`output_hf_path`：转换后输出的权重路径。
 
@@ -146,6 +146,24 @@ models/qwen3_moe/config/qwen3_235b_mxfp4_hadamard.yaml
 ```
 
 > 说明：Hadamard 只在 Attention Linear A4W4 MXFP4 通路启用。旧的 W4A8 MXFP8 推理链路即使配置了 `enable_hadamard` 和 `hadamard_weight_path`，也不会进入 Hadamard 分支。
+
+### HiFloat8 + MoE MXFP4/MXFP8 权重转换
+
+该方案 Attention Linear 采用 W8A8 HiFloat8（hif8），MoE 专家采用 W4A8（权重 mxfp4 / 激活 mxfp8）。
+
+转换需在 NPU 环境执行（依赖 `torch_npu.hifloat8`和安装cann包）。权重转换执行示例：
+
+```bash
+python models/qwen3_moe/utils/convert_model.py \
+  --input_bf16_hf_path /data/models/Qwen3-235B-A22B \
+  --output_hf_path /data/models/Qwen3-235B-A22B-HIF8-MXFP \
+  --quant_type w8a8hif8_w4a8mxfp
+```
+
+### 量化权重推理的YAML配置
+
+HiFloat8 + MoE MXFP4/MXFP8 和MXFP-W4A8 量化方案可共用同一份推理YAML：`models/qwen3_moe/config/qwen3_235b_4tp_4ep_quant.yaml`。量化方式由权重目录下`config.json`中的`quantization_config`字段决定，推理时只需将`model_config.model_path`修改为对应量化类型的权重转换输出路径。
+
 
 ## 推理执行
 

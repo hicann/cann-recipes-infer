@@ -68,7 +68,7 @@ class CompressedTensorsW8A8Hif8LinearMethod(CompressedTensorsScheme):
             set_weight_attrs(weight_scale, {"output_dim": 0, "weight_loader": weight_loader})
 
         x_scale = torch.tensor([1.0], dtype=torch.float32)
-        x_scale = torch_npu.npu_trans_quant_param(x_scale.npu()) 
+        x_scale = torch_npu.npu_trans_quant_param(x_scale.npu())
         scale = torch.tensor([1.0], dtype=torch.bfloat16)
         offset = torch.tensor([0.0], dtype=torch.int8)
         layer.register_buffer("x_scale", x_scale)
@@ -114,10 +114,10 @@ class CompressedTensorsW8A8Hif8LinearMethod(CompressedTensorsScheme):
         if is_transpose:
             weight.data = weight.data.transpose(-2, -1)
 
-        if 'smooth_scale_dtype' in scales_dtype:
+        if scales_dtype and 'smooth_scale_dtype' in scales_dtype:
             smooth_scales.data = smooth_scales.data.to(scales_dtype.get('smooth_scale_dtype'))
 
-        weight_scale = torch_npu.npu_trans_quant_param(weight_scale.to(torch.float32)) 
+        weight_scale = torch_npu.npu_trans_quant_param(weight_scale.to(torch.float32))
 
         layer.weight = Parameter(weight, requires_grad=False)
         layer.weight_scale = Parameter(weight_scale, requires_grad=False)

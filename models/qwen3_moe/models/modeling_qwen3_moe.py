@@ -195,7 +195,8 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         self.prefill_opt = (
             self.attn_tp_size == self.moe_ep_size
             and self.gmm_quant_mode == "w4a8mxfloat4"
-            and self.mm_quant_mode != "w4a4mxfloat4"
+            # prefill_opt assumes mxfp8 attention; hif8 attention must not enter this: require mxfp8 mm here.
+            and self.mm_quant_mode == "w8a8mxfloat8"
         )
 
     def init_gate(self, prefix):
@@ -568,7 +569,8 @@ class Qwen3MoeAttention(nn.Module):
         self.prefill_opt = (
             self.attn_tp_size == self.moe_ep_size
             and self.gmm_quant_mode == "w4a8mxfloat4"
-            and self.mm_quant_mode != "w4a4mxfloat4"
+            # prefill_opt assumes mxfp8 attention; hif8 attention must not enter this: require mxfp8 mm here.
+            and self.mm_quant_mode == "w8a8mxfloat8"
         )
         self.enable_hadamard = (
             infer_config.model_config.enable_hadamard
@@ -998,7 +1000,8 @@ class Qwen3MoeDecoderLayer(nn.Module):
         self.prefill_opt = (
             self.attn_tp_size == self.moe_ep_size
             and self.gmm_quant_mode == "w4a8mxfloat4"
-            and self.mm_quant_mode != "w4a4mxfloat4"
+            # prefill_opt assumes mxfp8 attention; hif8 attention must not enter this: require mxfp8 mm here.
+            and self.mm_quant_mode == "w8a8mxfloat8"
         )
 
     def forward(
@@ -1097,7 +1100,8 @@ class Qwen3MoeModel(nn.Module):
         self.prefill_opt = (
             self.attn_tp_size == self.moe_ep_size
             and self.gmm_quant_mode == "w4a8mxfloat4"
-            and self.mm_quant_mode != "w4a4mxfloat4"
+            # prefill_opt assumes mxfp8 attention; hif8 attention must not enter this: require mxfp8 mm here.
+            and self.mm_quant_mode == "w8a8mxfloat8"
         )
 
     def forward(

@@ -937,19 +937,57 @@ def generate_w4a8_quant(num_layers):
     return quant_w4a8_layers
 
 
+def generate_quant_spec(num_bits, strategy, group_size, dynamic):
+    return {"actorder": None, "block_structure": None, "dynamic": dynamic,
+            "group_size": group_size, "num_bits": num_bits,
+            "observer": "minmax", "observer_kwargs": {},
+            "strategy": strategy, "symmetric": True, "type": "float"}
+
+
 def generate_quant_group(a_num_bits=8, w_num_bits=8, targets=None, activation_use_clip=False):
-    quant_group = {"input_activations": {"actorder": None, "block_structure": None, "dynamic": True,
-                                         "group_size": 32, "num_bits": a_num_bits,
-                                         "observer": "minmax", "observer_kwargs": {},
-                                         "strategy": "group", "symmetric": True, "type": "float"},
-                   "activation_use_clip": activation_use_clip,
-                   "output_activations": None,
-                   "targets": targets,
-                   "weights": {"actorder": None, "block_structure": None, "dynamic": False,
-                               "group_size": 32, "num_bits": w_num_bits,
-                               "observer": "minmax", "observer_kwargs": {},
-                               "strategy": "group", "symmetric": True, "type": "float"}}
-    return quant_group
+    return {"input_activations": generate_quant_spec(a_num_bits, "group", 32, True),
+            "activation_use_clip": activation_use_clip,
+            "output_activations": None,
+            "targets": targets,
+            "weights": generate_quant_spec(w_num_bits, "group", 32, False)}
+
+
+def hif8_weight_quant(tensor: torch.Tensor):
+    try:
+        import torch_npu
+    except ImportError as e:
+        raise ImportError(
+            "quant_type 'w8a8hif8_w4a8mxfp' requires torch_npu and an NPU device. "
+        ) from e
+
+    assert tensor.dim() == 2
+    tensor = tensor.npu()
+    quantized_tensor, scale = torch_npu.npu_dynamic_quant(tensor, dst_type=torch_npu.hifloat8)
+    quantized_tensor, scale = quantized_tensor.cpu(), scale.cpu()
+    scale = scale.unsqueeze(-1)
+    assert scale.shape == (tensor.shape[0], 1)
+    return quantized_tensor, scale.to(torch.float32)
+
+
+def generate_hif8_quant_group(targets):
+    return {"input_activations": generate_quant_spec(8, "tensor", None, True),
+            "output_activations": None,
+            "targets": targets,
+            "weights": generate_quant_spec(8, "channel", None, False)}
+
+
+def generate_hif8_attn_mxfp_moe_config(ignores):
+    quant_config = {"config_groups": {"group_0": {}, "group_1": {}},
+                    "format": "float-quantized",
+                    "global_compression_ratio": None,
+                    "ignore": ignores,
+                    "kv_cache_scheme": None,
+                    "quant_method": "compressed-tensors",
+                    "quantization_status": "compressed"}
+    quant_config["config_groups"]["group_0"] = generate_hif8_quant_group(["Linear"])
+    quant_config["config_groups"]["group_1"] = generate_quant_group(
+        a_num_bits=8, w_num_bits=4, targets=["MoEGMM"])
+    return quant_config
 
 
 def generate_quant_config_bakc(c8, ignores, w4a8=False, clip=False):
@@ -1118,7 +1156,8 @@ def main(fp8_path, output_path, **kwargs):
         hadamard_weight_path) if hadamard_weight_path else ""
     os.makedirs(output_path, exist_ok=True)
     assert quant_type in [
-        "w8a8c16", "w8a8c8", "w4a8c16", "w4a8c8", "w4a4c16"], f"Unsupported quant_type: {quant_type}"
+        "w8a8c16", "w8a8c8", "w4a8c16", "w4a8c8", "w4a4c16",
+        "w8a8hif8_w4a8mxfp"], f"Unsupported quant_type: {quant_type}"
     if hadamard_weight_path and not os.path.isdir(hadamard_weight_path):
         raise FileNotFoundError(f"Hadamard weight path not found: {hadamard_weight_path}")
 
@@ -1140,10 +1179,14 @@ def main(fp8_path, output_path, **kwargs):
     w4a8 = quant_type.startswith("w4a8")
     w8a8 = quant_type.startswith("w8a8")
     w4a4 = quant_type.startswith("w4a4")
+    mixed_hmx = quant_type == "w8a8hif8_w4a8mxfp"
 
     if w8a8 or w4a8 or w4a4:
         quant_ignore_layers = generate_ignore_item(num_layers)
-        if w4a4:
+        if mixed_hmx:
+            quantization_config = generate_hif8_attn_mxfp_moe_config(
+                ignores=quant_ignore_layers)
+        elif w4a4:
             quantization_config = generate_mxfp4_quant_config(
                 ignores=quant_ignore_layers)
         else:
@@ -1155,7 +1198,7 @@ def main(fp8_path, output_path, **kwargs):
                 clip=clip)
         config['quantization_config'] = quantization_config
 
-    if w4a8:
+    if w4a8 or mixed_hmx:
         quant_w4a8_layers = generate_w4a8_quant(
             num_layers)
 
@@ -1236,10 +1279,15 @@ def main(fp8_path, output_path, **kwargs):
                         if not is_ignore_layer:
                             weight_clip_factor = None
                             bits = 8
-                            if w4a4 or is_match_layer_name(weight_name, quant_w4a8_layers):
+                            is_expert = is_match_layer_name(weight_name, quant_w4a8_layers)
+                            if w4a4 or is_expert:
                                 bits = 4
                                 print(f" {weight_name} - bits {bits}")
-                            mxfp_weight, scale_inv = mxfp_weight_quant(bf16_weight, bits=bits)
+                            if mixed_hmx and not is_expert:
+                                # attention Linear -> hif8
+                                mxfp_weight, scale_inv = hif8_weight_quant(bf16_weight)
+                            else:
+                                mxfp_weight, scale_inv = mxfp_weight_quant(bf16_weight, bits=bits)
                             new_scale_name = scale_inv_name.replace(
                                 '_scale_inv', '_scale')
 
@@ -1269,11 +1317,16 @@ def main(fp8_path, output_path, **kwargs):
                     new_weight_map[weight_name] = file_name
                 else:
                     bits = 8
-                    if w4a4 or is_match_layer_name(weight_name, quant_w4a8_layers):
+                    is_expert = is_match_layer_name(weight_name, quant_w4a8_layers)
+                    if w4a4 or is_expert:
                         bits = 4
                         print(f" {weight_name} - bits {bits}")
 
-                    mxfp_weight, scale_inv = mxfp_weight_quant(weight, bits=bits)
+                    if mixed_hmx and not is_expert:
+                        # attention Linear -> hif8
+                        mxfp_weight, scale_inv = hif8_weight_quant(weight)
+                    else:
+                        mxfp_weight, scale_inv = mxfp_weight_quant(weight, bits=bits)
                     new_scale_name = weight_name.replace(
                         'weight', 'weight_scale')
 
@@ -1327,8 +1380,11 @@ if __name__ == "__main__":
     parser.add_argument("--input_bf16_hf_path", type=str, required=True)
     parser.add_argument("--output_hf_path", type=str, required=True)
     parser.add_argument("--quant_type", type=str, default="w4a8c16",
-                        choices=["w8a8c16", "w8a8c8", "w4a8c16", "w4a8c8", "w4a4c16"],
-                        help="Default keeps the original W4A8 MXFP8 conversion. Use w4a4c16 for MXFP4.")
+                        choices=["w8a8c16", "w8a8c8", "w4a8c16", "w4a8c8", "w4a4c16",
+                                 "w8a8hif8_w4a8mxfp"],
+                        help="Default keeps the original W4A8 MXFP8 conversion. "
+                             "Use w4a4c16 for MXFP4, "
+                             "w8a8hif8_w4a8mxfp for attention hif8 + MoE mxfp4/mxfp8.")
     parser.add_argument("--hadamard_weight_path", type=str, default="",
                         help="Hadamard parameter directory. Only used by w4a4c16 MXFP4 conversion.")
     args = parser.parse_args()
