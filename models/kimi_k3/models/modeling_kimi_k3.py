@@ -2113,7 +2113,7 @@ class KimiDeltaAttention(nn.Module):
                 self.dt_bias.view(self.num_heads, self.head_dim),
                 self.head_dim**-0.5,
                 self.gate_lower_bound,
-                rms_norm_eps=1e-6,
+                rms_norm_eps=float(self.o_norm.variance_epsilon),
             )
         return reduce_scatter_first_dim(
             output.view(-1, hidden_states.shape[-1]),
@@ -2355,18 +2355,24 @@ class KimiDeltaAttention(nn.Module):
 
 
 def view_bf16_nz(weight):
-    """Expose Linear's NZ storage as [N/16, K, 16] without copying weights."""
+    """Return a BF16 NZ weight with its logical matrix shape preserved.
+
+    ``mla_prolog_bf16`` requires NZ weights to have logical rank 2.  An
+    explicit ``set_`` view such as ``[N / 16, K, 16]`` exposes the physical
+    NZ packing as a third logical dimension and is rejected by the operator,
+    even when the underlying storage carries an NZ descriptor.  Keep the
+    original ``[K, N]`` view and only validate that it is already an aligned
+    NZ tensor.
+    """
     if weight.dtype != torch.bfloat16 or weight.ndim != 2:
         raise ValueError("BF16 MLA Prolog requires a two-dimensional BF16 weight")
     k, output = weight.shape
     if (torch_npu.get_npu_format(weight) != 29 or k % 16 or output % 16
             or weight.storage_offset() != 0 or not weight.is_contiguous()):
         raise ValueError("BF16 MLA Prolog requires an aligned, contiguous NZ weight root")
-    # NZ physical [N/16, K/16, 16, 16] is exactly [N/16, K, 16].
-    # set_ retains the Storage and its NZ descriptor used by Prefill MatMul.
-    return torch.empty(0, dtype=weight.dtype, device=weight.device).set_(
-        weight.untyped_storage(), 0, (output // 16, k, 16), (k * 16, 16, 1),
-    )
+    # Keep [K, N] as the logical shape.  The NZ descriptor on ``weight``
+    # describes the physical layout to the NPU kernels.
+    return weight.detach()
 
 
 def pack_mxfp8_nz(weight):
@@ -2554,9 +2560,9 @@ class KimiMLAAttention(nn.Module):
 
             self.mla_prolog_op = quant_mla_prolog_op
         else:
-            from ops.mla_prolog_bf16 import mla_prolog_bf16_op
+            from ops.mla_prolog_bf16 import mla_prolog_bf16
 
-            self.mla_prolog_op = mla_prolog_bf16_op
+            self.mla_prolog_op = mla_prolog_bf16
         for name, linear in (("qa", self.q_a_proj), ("qb", self.q_b_proj_decode),
                              ("kva", self.kv_a_proj_with_mqa)):
             weight = linear.weight.detach()
@@ -2677,11 +2683,12 @@ class KimiMLAAttention(nn.Module):
             )
             q, q_descale = outs[0], outs[1]
         else:
-            q = self.mla_prolog_op(
+            outs = self.mla_prolog_op(
                 x, self.mla_w_qa, self.mla_w_qb, self.mla_w_kva,
                 self.kv_b_proj_decode_w_k, self.mla_gamma_qa, self.mla_gamma_kva,
                 cache, slots, self.q_a_layernorm.variance_epsilon,
             )
+            q, _ = outs[0], outs[1]
         full_hidden = None
         if self.use_output_gate and self.enable_multi_streams:
             # Wait for Prolog on device before starting AllGather on the gate
