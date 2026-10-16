@@ -29,9 +29,10 @@
 from executor.utils import superkernel_scope
 
 class MoELayer(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, infer_config):
         super().__init__()
-        self.enable_superkernel = config.enable_superkernel
+        self.infer_config = infer_config
+        self.enable_superkernel = infer_config.model_config.custom_params.get("enable_superkernel", False)
         self.num_experts = config.num_experts
         self.gate = nn.Linear(config.hidden_size, config.num_experts)
         self.experts = nn.ModuleList([
@@ -43,29 +44,31 @@ class MoELayer(nn.Module):
 
         # 路由计算（在 Scope 外）
         router_logits = self.gate(hidden_states)
-        routing_weights = F.softmax(router_logits, dim=-1)
+        routing_weights, selected_experts = torch.topk(
+            F.softmax(router_logits, dim=-1), self.top_k, dim=-1
+        )
 
         # SuperKernel scope 仅包含专家计算
         with superkernel_scope(
             self.enable_superkernel and not is_prefill,
-            label="moe_experts",
-            option="stream-fusion=1"
+            "moe_experts",
+            "stream-fusion=1",
         ):
             # 专家计算
             final_hidden_states = torch.zeros_like(hidden_states)
 
             for expert_idx in range(self.num_experts):
                 # 选择当前专家的 token
-                expert_mask = routing_weights[:, :, expert_idx] > threshold
+                hit = selected_experts == expert_idx
+                expert_mask = hit.any(dim=-1)
                 expert_input = hidden_states[expert_mask]
 
                 # 专家计算
                 expert_output = self.experts[expert_idx](expert_input)
 
                 # 加权累加
-                final_hidden_states[expert_mask] += (
-                    expert_output * routing_weights[expert_mask, expert_idx].unsqueeze(-1)
-                )
+                weight = (routing_weights * hit).sum(dim=-1)[expert_mask]
+                final_hidden_states[expert_mask] += expert_output * weight.unsqueeze(-1)
 
         return final_hidden_states
 
@@ -103,6 +106,8 @@ model_config:
 ---
 
 ## 预期性能提升
+
+> 下列为常见量级示意，不作通用验收门槛；实际收益以本模型的实测基线对比为准。
 
 | 模型类型 | 预期提升 | 说明 |
 |---------|---------|------|

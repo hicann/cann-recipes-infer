@@ -22,6 +22,6 @@ GE 图模式编译期会重排算子，最常见的事故是把"消费副流输�
 
 - 副流时间窗：`[start, end] us`
 - 主流 dominator 时间窗：`[start, end] us`
-- `overlap_pct` 数值 + 判定：`真并行 (≥0.5)` / `部分并行 (0.05~0.5)` / `假并行 (≤0.05)`
+- `overlap_pct` 数值 + 判定，判定档位见 [`timeline-overlap-check.md`](timeline-overlap-check.md) 的「Step 4：判定」
 
 算法见 [`timeline-overlap-check.md`](timeline-overlap-check.md)。"Stream ID 已切到副流"不能作为并行成立的结论。

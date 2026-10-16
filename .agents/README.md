@@ -53,6 +53,8 @@
 |-------|------|---------|
 | [model-infer-precision-debug](skills/model-infer-precision-debug/) | NPU 推理精度诊断 | 精度验证未通过、NaN/Inf、MoE 精度偏差（当前主要覆盖 KVCache/FA） |
 | [model-infer-runtime-debug](skills/model-infer-runtime-debug/) | NPU 运行时错误诊断 | aicore timeout、HCCL 错误、OOM、推理卡住 |
+| [model-infer-profiling](skills/model-infer-profiling/) | 性能数据采集 | 采集 NPU profiling、torch_npu.profiler 使用、解析失败排查 |
+| [model-infer-perf-breakdown](skills/model-infer-perf-breakdown/) | 性能数据拆解 | 拆解 kernel_details.csv、按模块定位耗时分布与抖动 layer |
 
 ### 独立进阶优化 Skills
 
@@ -60,6 +62,7 @@
 
 | Skill | 功能 | 触发场景 |
 |-------|------|---------|
+| [model-infer-sota-approach](skills/model-infer-sota-approach/) | 探索式优化编排入口 | 在已有 baseline 之上由 profiling 驱动、多方向发现候选并按 Plan 收敛 |
 | [model-infer-multi-stream](skills/model-infer-multi-stream/) | 多流并行优化 | NPU 多流表达、算子分流、计算与计算并行 |
 | [model-infer-prefetch](skills/model-infer-prefetch/) | 权重预取适配 | 权重预取、prefetch 适配 |
 | [model-infer-superkernel](skills/model-infer-superkernel/) | SuperKernel 适配 | SuperKernel scope 划分、NPU 算子融合 |
@@ -113,9 +116,12 @@ model-infer-optimize（编排入口）
     ├── model-infer-graph-mode/                  # 图模式适配
     ├── model-infer-precision-debug/             # NPU 推理精度诊断
     ├── model-infer-runtime-debug/               # NPU 运行时调试
-    ├── model-infer-multi-stream/                # 多流并行（独立进阶优化）
-    ├── model-infer-prefetch/                    # 权重预取（独立进阶优化）
-    ├── model-infer-superkernel/                 # SuperKernel（独立进阶优化）
+    ├── model-infer-profiling/                   # 性能数据采集
+    ├── model-infer-perf-breakdown/              # 性能数据拆解
+    ├── model-infer-sota-approach/               # 探索式优化编排
+    ├── model-infer-multi-stream/                # 多流并行
+    ├── model-infer-prefetch/                    # 权重预取
+    ├── model-infer-superkernel/                 # SuperKernel
 ```
 
 ## 在线文档引用

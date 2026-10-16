@@ -63,12 +63,16 @@ if self.micro_batch_mode != MicroBatchMode.DISABLE:
 cur_stream = torch.npu.current_stream()
 
 with torch.npu.stream(cur_stream):
-    hidden_states_mb0, residual_mb0, _, cos_sin_mb0, slot_mapping_mb0, actual_seq_lengths_kv_mb0 = \
-        self.prepare_inputs_for_layer(input_ids_mb0, kv_len_mb0, position_ids, actual_seq_lengths_kv_mb0, is_prefill)
+    hidden_states_mb0, residual_mb0, kv_len_mb0, cos_sin_mb0, actual_seq_lengths_kv_mb0 = \
+        self.prepare_inputs_for_layer(
+            input_ids_mb0, slot_mapping_mb0, None, position_ids_mb0,
+            mb0["actual_seq_lengths_kv"], mb0["seq_lens"], is_prefill)
 
 with torch.npu.stream(self.stream1):
-    hidden_states_mb1, residual_mb1, _, cos_sin_mb1, slot_mapping_mb1, actual_seq_lengths_kv_mb1 = \
-        self.prepare_inputs_for_layer(input_ids_mb1, kv_len_mb1, position_ids, actual_seq_lengths_kv_mb1, is_prefill)
+    hidden_states_mb1, residual_mb1, kv_len_mb1, cos_sin_mb1, actual_seq_lengths_kv_mb1 = \
+        self.prepare_inputs_for_layer(
+            input_ids_mb1, slot_mapping_mb1, None, position_ids_mb1,
+            mb1["actual_seq_lengths_kv"], mb1["seq_lens"], is_prefill)
 ```
 
 第三段代码展示事件驱动的 dispatch/expert/combine 流水：

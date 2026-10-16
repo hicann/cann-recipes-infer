@@ -1,17 +1,30 @@
 #!/usr/bin/env python3
+# ----------------------------------------------------------------------------------------------------------
+# Copyright (c) 2026 Huawei Technologies Co., Ltd.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# ----------------------------------------------------------------------------------------------------------
 # coding=utf-8
-"""Step 5 — 洞察 HTML 渲染（脚本角色）。
+"""Step 5 — render the insight HTML page.
 
-以 references/insight_html_template.html 为骨架，服务端预填五类 insight 表 + 常驻
-结论区。**只渲染已落盘的 JSON 和 final_conclusions.md，不重算、不推断语义**。
+Fill scripts/templates/insight_page.html server-side with the five insight
+tables and the findings section. Only JSON and final_conclusions.md already on
+disk are rendered: nothing is recomputed and no semantics are inferred.
 
-- 表格按 agent_review.confidence (high>medium>low) 重排，同档按事实数值降序，取 Top5，
-  表头标 "Top5"。某数组空时保留 tab，显示“本次未发现候选”。
-- 结论卡 / 数据限制：从 final_conclusions.md 的 "### High|Medium|Low" 和 "## 数据限制"
-  小节解析（agent 写什么就显示什么，脚本不造）。
-- 列布局按**固定 schema 字段**派生，不枚举模型/component/cluster 名（这些来自数据）。
+- Each table is reordered by agent_review.confidence (high > medium > low), ties
+  broken by the underlying value descending, then truncated to the top rows. An
+  empty array still renders its tab, with a placeholder in place of the body.
+- Finding cards and data limitations are parsed from the "### High|Medium|Low"
+  and data-limitation headings of final_conclusions.md, so whatever the agent
+  wrote there is exactly what gets shown.
+- Column layout is derived from fixed schema fields. No model, component or
+  cluster name is hardcoded here; those all come from the data.
 
-用法:
+Usage:
   python render_insights.py --insights-dir <run>/runs/<label>/insights \
     --model-name "<name>" --label <label> [--template <path>] -o <.../insights/index.html>
 """
@@ -22,8 +35,8 @@ import os
 import re
 
 CONF = {"high": 0, "medium": 1, "low": 2, "": 3, None: 3}
-DEF_TEMPLATE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                            "references", "insight_html_template.html")
+DEF_TEMPLATE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "templates", "insight_page.html")
 
 
 def load(p):
@@ -50,7 +63,7 @@ def metric(x, unit="µs"):
 
 
 def order(rows, value_key):
-    """confidence 升序(high 在前) → 事实数值降序。"""
+    """Sort rows by confidence (high first), then by value_key descending."""
     def vk(r):
         v = r.get(value_key)
         return v if isinstance(v, (int, float)) else 0
@@ -190,7 +203,10 @@ def build_tables(ins):
 
 
 def parse_conclusions(md_text):
-    """从 final_conclusions.md 抽 High/Medium/Low 核心结论 + 数据限制（纯解析，不造）。"""
+    """Extract High/Medium/Low findings and data limitations from final_conclusions.md.
+
+    Pure parsing: only bullet lines the agent wrote are returned, nothing is synthesized.
+    """
     findings = {"high": [], "medium": [], "low": []}
     limits = []
     section = None
@@ -246,8 +262,8 @@ def main():
     tpl = open(args.template, encoding="utf-8").read()
     for k, v in {"{{model_name}}": args.model_name, "{{label}}": args.label,
                  "{{generated_at}}": args.generated_at,
-                 "{{metrics_path}}": "../metrics.json", "{{raw_ops_path}}": "raw_ops.json",
-                 "{{structure_draft_path}}": "structure_draft.json"}.items():
+                 "{{metrics_path}}": "../metrics.json", "{{raw_ops_path}}": "../../../raw_ops.json",
+                 "{{structure_draft_path}}": "../../../structure_draft.json"}.items():
         tpl = tpl.replace(k, v)
 
     def fill(mo):

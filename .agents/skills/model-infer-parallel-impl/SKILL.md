@@ -41,7 +41,7 @@ description: 基于 PyTorch 框架的昇腾 NPU 模型推理并行切分实施�
 | `attn_tp_size = 1` 且 `world_size > 1` | 无 Attention TP 组（走 DP） | Attention 不需要 TP 替换 |
 | `dense_tp_size > 1` | `dense_tp_group` | Dense FFN Gate/Up/Down 替换 |
 | `moe_tp_size > 1` | `moe_tp_group` | MoE 专家 FFN 做 TP 切分 |
-| `moe_tp_size = 1` 且有 MoE | `moe_ep_group` + `moe_ep_group_mc2`（均需 HCCL group name；MC2 组须 `allow_physical_reuse=False` 区分独立物理组） | MoE EP dispatch/combine 实现 |
+| `moe_tp_size = 1` 且有 MoE | `moe_ep_group`（prefill double-routing AllToAll）+ `moe_ep_group_mc2`（decode MC2 dispatch/combine，须 `allow_physical_reuse=False` 占独立物理组） | MoE EP dispatch/combine 实现 |
 | `o_proj_tp_size ≠ attn_tp_size` | `oproj_tp_group`（独立组） | O_proj 使用独立通信组 |
 | `embed_tp_size > 1` | `embed_tp_group` | Embedding 替换为 VocabParallelEmbedding |
 | `lmhead_tp_size > 1` | `lmhead_tp_group` | LMHead 替换为 ColumnParallelLinear |
@@ -133,8 +133,8 @@ class XxxForCausalLM(nn.Module):
 `init_parallel_comm_group` 内部调 `self.comm_manager.register_group(name, group_num, group_size, ...)` 注册三类组：
 
 - **基础 TP 组**（按本模型启用的切分注册）：`attn_tp_group` / `embed_tp_group` / `lmhead_tp_group`
-- **条件组**（`*_size > 1` 时启用）：`moe_tp_group` / `moe_ep_group` / `dense_tp_group` / `oproj_tp_group`；其中 `moe_ep_group` 需传 `group_stride` 和 `return_name=True`
-- **特殊独立物理组**（必须 `allow_physical_reuse=False`）：`moe_ep_group_mc2`（MC2 fullmesh_v2 通信）、`*_stream1` 副本组（multi-stream micro-batch）等；MC2 组的 `hccl_buffer_size` 通过 `calc_moe_hccl_buffer_size` 算出
+- **条件组**（`*_size > 1` 时启用）：`moe_tp_group` / `moe_ep_group`（prefill `double-routing AllToAll` 用） / `dense_tp_group` / `oproj_tp_group`；其中 `moe_ep_group` 需传 `group_stride` 和 `return_name=True`
+- **特殊独立物理组**（必须 `allow_physical_reuse=False`）：`moe_ep_group_mc2`（decode MC2 `dispatch_v2 / combine_v2` 用；参考实现按 `comm_alg="fullmesh_v2"` 注册时置 `allow_physical_reuse=False`）、`*_stream1` 副本组（multi-stream micro-batch）等；MC2 组的 `hccl_buffer_size` 通过 `calc_moe_hccl_buffer_size` 算出
 
 模板代码、参数表与上游 `qwen3_moe` / `deepseek_r1` 参考实现见 `references/framework_moe_parallel.md` 的"通信组注意事项"段。
 
@@ -173,7 +173,7 @@ QKV → `QKVParallelLinear`，O → `RowParallelLinear`，均使用 `attn_tp_gro
 
 > **forward 签名约定**：设计文档 `executor_design.md` §6.1 要求模型类 forward 接收 `slot_mapping` / `block_table`；参考模型统一通过 `**kwargs` 透传，不显式列参数（见 `models/qwen/models/modeling_qwen.py::forward`），照此写法即可。
 
-> **paged 模式联动**：若模型已通过 kvcache skill 改造为 paged 模式（实现 `get_cache_info()` + 构造 `cache_entries`），attn_tp_size 改动后必须同步更新 `cache_entries` 的 `num_head` 字段为 `num_key_value_heads_per_rank = max(num_kv_heads // attn_tp_size, 1)`，否则 KV 按错误的 head 数预分配。
+> **paged 模式联动**：若模型已通过 model-infer-kvcache skill 改造为 paged 模式（实现 `get_cache_info()` + 构造 `cache_entries`），attn_tp_size 改动后必须同步更新 `cache_entries` 的 `num_head` 字段为 `num_key_value_heads_per_rank = max(num_kv_heads // attn_tp_size, 1)`，否则 KV 按错误的 head 数预分配。
 
 > **TP+DP 通信模式（`attn_tp_size > 1` 且 `attn_dp_size > 1`）**：注册模型 attention 层用 `all_gather_into_tensor` + `reduce_scatter_tensor` 配对 `attn_tp_group`（不用 `all_reduce`）：layer 间 hidden 维持 `[T/tp, H]` 切分以省 tp_size 倍激活内存，attention 入口 AllGather 还原全 T，出口 ReduceScatter 切回。通信原语要求各 rank 等长，因此 model 顶层 forward 必须做：
 >
@@ -321,64 +321,23 @@ ParallelLinear 替换、Embedding/LMHead 并行、模块间数据重排、MoE EP
 
 ## YAML 配置生成
 
-YAML schema 两模式 4 段式完全一致：`model_config` / `data_config` / `parallel_config` / `scheduler_config`。差异仅在解析方式（框架部署走 `InferenceConfig.from_dict`，独立部署 Runner 用 `yaml.safe_load` 直接读）。
+YAML schema 完整字段、命名规范、粒度判定、保留策略见 model-infer-migrator skill `references/yaml_template.md`（两模式共用），本段只补多卡场景填值。
 
-> 顶层 `world_size` 与 `parallel_config.world_size` 双写：前者供启动脚本（框架部署 `function.sh::launch` / 独立部署 `infer.sh`）读取，后者供业务代码（`InferenceConfig` / `build_parallel_context`）读取，需保持一致。
+### 多卡填值
 
-### 配置模板
+根据 model-infer-parallel-analysis 决策结果填入 `parallel_config` 段：
 
-```yaml
-model_name: "{model_name}"
-world_size: {W}
-
-model_config:
-  model_name: "{model_name}"
-  model_path: "/path/to/weights"
-  exe_mode: "eager"                  # 初始用 eager，后续可切 ge_graph
-  with_ckpt: True
-  enable_weight_nz: True
-  enable_profiler: False
-  custom_params:                     # 模型特有开关放这里
-    enable_multi_streams: False
-    moe_chunk_max_len: 65536         # MoE 专用，Decode 用 1024，Prefill 用 65536
-    perfect_eplb: False
-
-data_config:
-  dataset: "default"                  # framework 模式从 dataset/default_prompt.json 读
-  input_truncated_len: {根据场景}
-  prompts:                            # 独立部署专属：yaml 内嵌 prompts（framework 模式忽略此字段）
-    - "What is the capital of France?"
-
-parallel_config:
-  world_size: {W}
-  attn_tp_size: {value}
-  dense_tp_size: {value}
-  moe_tp_size: {value}        # MoE 模型需要
-  embed_tp_size: {value}
-  lmhead_tp_size: {value}
-  o_proj_tp_size: {value}     # MLA 模型需要
-
-scheduler_config:
-  batch_size: {根据显存估算}   # 全局 batch；按 attn_dp_size 推导每 rank batch（框架部署：ExecutionEngine 自动推导；独立部署：Runner 自管推导）
-  max_new_tokens: {根据场景}
-  block_size: 128             # Paged 块粒度
-```
-
-### 命名规范
-
-```
-config/
-├── {model_name}_rank_{W}_{W}ep_decode.yaml          # Decode 纯 EP
-├── {model_name}_rank_{W}_{tp}tp_prefill.yaml        # Prefill 纯 TP
-├── {model_name}_rank_{W}_densetp{n}_ep{m}.yaml      # 混合模式
-└── ci/
-    └── {model_name}_ci.yaml                          # CI 测试用
-```
+- `world_size` 写在 `parallel_config` 下，与实际拉起卡数一致（启动脚本与业务代码都从此处读）
+- `attn_tp_size` / `dense_tp_size` / `moe_tp_size` / `embed_tp_size` / `lmhead_tp_size` / `o_proj_tp_size`：按 parallel-analysis 推导值填
+- `moe_ep_size` / `attn_dp_size`：框架自动推导（`world_size // *_tp_size`），不需手填
+- `custom_params`：多卡特性开关（`enable_multi_streams` / `moe_chunk_max_len` 等）
+- `scheduler_config.batch_size`：全局 batch，按 `attn_dp_size` 推导每 rank batch（框架部署 ExecutionEngine 自动；独立部署 Runner 自管）
+- `scheduler_config.block_size`：Paged 块粒度，128 起步
 
 ### 完成标志
 
 - [ ] 每种部署场景有独立的 YAML 文件
-- [ ] 配置文件命名符合规范
+- [ ] 配置文件命名符合规范（按 `yaml_template.md` 命名维度 + 粒度判定）
 
 ---
 
@@ -416,17 +375,9 @@ def process_weights_after_loading(self):
 
 若模型未实现 online split，或需要预切权重用于离线部署：
 
-```bash
-bash utils/weight_convert.sh \
-    --input_path /path/to/origin \
-    --output_path /path/to/output \
-    --world_size {W} \
-    --quant_mode {w8a8/w8a8c8/...}
-```
+转换脚本在模型自己的 `models/{model_name}/utils/` 下，执行前读该脚本的 usage 确认参数与支持的 quant_mode。
 
-输出为 `rank_0/` ~ `rank_N/` 目录结构，每个 rank 只包含该卡需要的权重切片。
-
-> 注意：offline 预切的权重与 parallel_config 绑定。改了配置必须重新转换。
+> 注意：按 parallel_config 预切的权重与该配置绑定，改了配置必须重新转换。
 
 参考实现：`models/deepseek_r1/utils/convert_model.py`、`models/deepseek_r1/utils/weight_convert.sh`。独立部署可复制此对到模型目录改造。
 
@@ -459,8 +410,8 @@ assert embed_tp_size % attn_tp_size == 0
 ### 功能验证
 
 1. 确认推理实际加载的是修改后的代码（检查模型注册表、import 路径、日志中的模块路径等，确保运行时代码路径与修改路径一致）
-2. `infer.sh` 中 `YAML` 变量指向目标配置（两模式都用 `YAML`，框架部署的 `function.sh::launch` 与独立部署的 torchrun 启动都从此变量读路径）
-3. 执行 `bash infer.sh`
+2. 确认配置指向目标 YAML：框架部署由拉起命令的 `--yaml` 指定，独立部署改模型目录 `infer.sh` 里指向 yaml 的变量（skill 模板为 `YAML`，仓内 legacy 模型多为 `YAML_FILE_NAME`）
+3. 按部署模式拉起推理入口（框架部署 `bash executor/scripts/infer.sh --model {model_name} --yaml {yaml_name}.yaml`，独立部署 `bash infer.sh`）
 4. 检查 Prefill + Decode 推理成功（无 crash）
 5. 检查各 Rank 输出形状一致
 6. 如加载权重：检查输出文本合理性
@@ -502,7 +453,7 @@ assert embed_tp_size % attn_tp_size == 0
 | 通信组创建实现 | `executor/core/config/comm_manager.py` | `CommManager.initialize` |
 | MoE EP Prefill | `models/deepseek_r1/models/modeling_deepseek.py` | `npu_moe_re_routing` |
 | MoE EP Decode | `models/deepseek_r1/models/modeling_deepseek.py` | `npu_moe_distribute_dispatch` |
-| Embed/LMHead 并行 | `models/kimi-k2-thinking/models/modeling_deepseek.py` | `VocabParallelEmbedding` |
-| oproj_tp 独立配置 | `models/longcat-flash/models/modeling_longcat_flash.py` | `oproj_tp` |
+| Embed/LMHead 并行 | `models/kimi_k2_thinking/models/modeling_deepseek.py` | `VocabParallelEmbedding` |
+| oproj_tp 独立配置 | `models/longcat_flash/models/modeling_longcat_flash.py` | `oproj_tp` |
 | 权重转换脚本 | `models/deepseek_r1/utils/` | `weight_convert` |
 | YAML 多场景配置 | `models/deepseek_r1/config/` | decode / prefill 分离 |

@@ -23,6 +23,7 @@
 | **PyTorch版本** | 需要 2.6.0+ | 无特殊要求 |
 | **支持场景** | 在线推理 | 通用场景 |
 | **配置方式** | `options={}` 参数 | `CompilerConfig` 对象 |
+| **类似技术** | torch.cuda.CUDAGraph | 传统图编译 |
 
 ---
 
@@ -52,35 +53,6 @@ output = opt_model(input_tensor)
 ```
 
 > 完整示例见 [GE 图模式快速上手](https://gitcode.com/Ascend/torchair/tree/master/docs/zh/ascend_ir/quick_start.md)
-
----
-
-## CompilerConfig 配置
-
-```python
-config = torchair.CompilerConfig()
-
-# debug 类功能
-config.debug.xxx = ...
-
-# export 类功能（离线导图）
-config.export.xxx = ...
-
-# dump_config 类功能
-config.dump_config.xxx = ...
-
-# fusion_config 类功能
-config.fusion_config.xxx = ...
-
-# experimental_config 类功能
-config.experimental_config.xxx = ...
-
-# inference_config 类功能
-config.inference_config.xxx = ...
-
-# ge_config 类功能
-config.ge_config.xxx = ...
-```
 
 ---
 

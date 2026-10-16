@@ -37,7 +37,13 @@
 from executor.utils import superkernel_scope
 
 class Model(nn.Module):
-    def decode(self, input_ids, **kwargs):
+    def __init__(self, config, infer_config):
+        super().__init__()
+        self.infer_config = infer_config
+        self.enable_superkernel = infer_config.model_config.custom_params.get("enable_superkernel", False)
+        # ... 其他初始化
+
+    def decode(self, input_ids, attention_mask, position_ids, past_key_values, **kwargs):
         is_prefill = False  # decode 阶段
 
         hidden_states = self.embed_tokens(input_ids)
@@ -45,8 +51,8 @@ class Model(nn.Module):
         # SuperKernel scope 包含所有 Decoder 层
         with superkernel_scope(
             self.enable_superkernel and not is_prefill,
-            label="all_decoder_layers",
-            option="stream-fusion=1"
+            "all_decoder_layers",
+            "stream-fusion=1",
         ):
             for decoder_layer in self.layers:
                 hidden_states = decoder_layer(
@@ -64,6 +70,8 @@ class Model(nn.Module):
 ---
 
 ## 预期性能提升
+
+> 下列为常见量级示意，不作通用验收门槛；实际收益以本模型的实测基线对比为准。
 
 | 模型类型 | 预期提升 | 说明 |
 |---------|---------|------|

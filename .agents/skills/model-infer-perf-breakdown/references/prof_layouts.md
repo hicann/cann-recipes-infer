@@ -12,7 +12,7 @@ PyTorch 调 `torch_npu.profiler.profile(...)` + `tensorboard_trace_handler` 产�
 
 ```
 <output_root>/
-├── <ts>_host_<pid>_rank0_ascend_pt/        # rank 0（一卡一目录）
+├── <hostname>_<pid1>_<timestamp>_ascend_pt/   # 一个进程一目录，rank 由用户告知
 │   ├── profiler_metadata.json              # 环境变量 / 自定义 metadata
 │   ├── logs/                               # 解析日志
 │   ├── ASCEND_PROFILER_OUTPUT/             # ← 本 skill 主消费这里
@@ -23,21 +23,21 @@ PyTorch 调 `torch_npu.profiler.profile(...)` + `tensorboard_trace_handler` 产�
 │   │   └── l2_cache.csv                    # 仅当 l2_cache=True 时存在
 │   ├── FRAMEWORK/                          # 框架层原始数据（GE / ACL 等）
 │   └── PROF_<id>_<ts>/                     # CANN 底层 raw 数据（B 类同款结构）
-└── <ts>_host_<pid>_rank1_ascend_pt/        # rank 1
+└── <hostname>_<pid2>_<timestamp>_ascend_pt/   # 同上，另一进程
     └── ...（同上）
 ```
 
 **多卡识别要点**：
-- top-level 一卡一目录，目录名末尾 `_rank<N>_ascend_pt`
-- agent 看到多个 `*_ascend_pt/` 时必须列出所有 rank 让用户挑（一般用户只关心特定 rank，跨 rank 算子序列也不可比）
+- top-level 一卡一目录，目录名形如 `<hostname>_<pid>_<timestamp>_ascend_pt`，按 pid 区分进程
+- agent 看到多个 `*_ascend_pt/` 时必须列出所有目录让用户挑，rank 由用户告知或从同级日志推断（一般用户只关心特定 rank，跨 rank 算子序列也不可比）
 - `kernel_details.csv` 已经按卡分开，不需要按 device 再切
 
 **`inputs.json` 写法**：
 ```json
 {
-  "prof_dir": "/abs/.../<ts>_host_<pid>_rank0_ascend_pt",
-  "kernel_csv": "/abs/.../<ts>_host_<pid>_rank0_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
-  "trace_json": "/abs/.../<ts>_host_<pid>_rank0_ascend_pt/ASCEND_PROFILER_OUTPUT/trace_view.json",
+  "prof_dir": "/abs/.../<hostname>_<pid>_<timestamp>_ascend_pt",
+  "kernel_csv": "/abs/.../<hostname>_<pid>_<timestamp>_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
+  "trace_json": "/abs/.../<hostname>_<pid>_<timestamp>_ascend_pt/ASCEND_PROFILER_OUTPUT/trace_view.json",
   "model_script_paths": ["/abs/.../modeling_xxx.py", ...],
   "phase": "decode",
   "rank": 0

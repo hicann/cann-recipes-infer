@@ -422,7 +422,7 @@ modeling forward 接收 `forward_metadata`（或自定义 `past_key_values + kv_
 > 以下特性仅供参考，超出本 skill 标准接入范围：
 
 - **KV 量化（INT8 / W8A8C8）**：cache_entries.dtype 改 INT8 + FA 调用 dequant_scale 等改造由 model-infer-quantization skill 处理
-- **KV 并行（KVP）**：KVCache 沿 head 维度切分到多卡，与 model-infer-parallel-impl skill 联动；参考 `models/longcat-flash/`
+- **KV 并行（KVP）**：KVCache 沿 head 维度切分到多卡，与 model-infer-parallel-impl skill 联动；参考 `models/longcat_flash/`
 - **CPU-GPU Offload**：HBM 不足时 offload 到 CPU；`torch_npu.empty_with_swapped_memory` + 异步双流；参考 `models/hstu/modules/gpu_kv_cache_manager.py`
 - **DiT Cache（扩散模型）**：TeaCache / FBCache / TaylorSeer；参考 `module/dit_cache/cache_method.py`
 
@@ -453,7 +453,7 @@ modeling forward 接收 `forward_metadata`（或自定义 `past_key_values + kv_
 | 标准 GQA + FullAttention（含 MoE 变体） | `models/qwen/models/modeling_qwen.py`、`models/qwen3_moe/models/modeling_qwen3_moe.py` | `cache_entries`、`get_cache_info`、`num_key_value_heads_per_rank` |
 | SlidingWindow + 混合 attn_type | `models/gpt_oss/models/modeling_gpt_oss.py` | `sliding_window`、`block_table[self.attn_type]` |
 | MLA absorb + MTP | `models/deepseek_r1/models/modeling_deepseek.py` | `nope_cache`、`rope_cache`、`forward_absorb` |
-| 长序列 + KVP（高级） | `models/longcat-flash/models/modeling_longcat_flash.py` | `kvp_size`、`BSND_NBSD` |
+| 长序列 + KVP（高级） | `models/longcat_flash/models/modeling_longcat_flash.py` | `kvp_size`、`BSND_NBSD` |
 | 框架核心实现 | `executor/core/kv_cache/{cache_info,cache_utils,kv_cache_manager,single_type_kv_cache_manager,block_pool}.py` | `CacheEntry`、`prepare_block_tables`、`prepare_slot_mapping` |
 | 设计文档 | `docs/design/kv_cache_design.md` | §4 辅助模块、§5 接入 Checklist |
 | FA 完整代码示例 | `references/fa-code-examples.md` | — |

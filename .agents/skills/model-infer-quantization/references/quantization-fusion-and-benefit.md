@@ -198,8 +198,8 @@ B.1.1 的 4 段加和回答“收益由什么组成”，B.1.2 的显存分账�
 | 路线 | 结构 | 典型证据 | 主量化路径 | 复用价值 |
 | --- | --- | --- | --- | --- |
 | A1 | MLA + MoE + MTP | `deepseek-r1` | 统一 W8A8，可叠加 KVCache C8 | 适合 MLA+MoE 结构，细节见结构卡 C |
-| A2 | Indexer / 长序列 + MLA + MoE | `deepseek-v3.2-exp`、`glm_5` | Linear W8A8 + MoEGMM W4A8/W8A8 + KVCache C8 + LI cache | 适合混合量化，细节见结构卡 C 经验 C2 |
-| A3 | MoE + attention 大多保持 BF16 | `longcat-flash-lite` | MLP/MoE W8A8，attention BF16 | 适合 attention 融合约束强于 projection 量化收益的保守路线 |
+| A2 | Indexer / 长序列 + MLA + MoE | `deepseek_v3_2_exp`、`glm_5` | Linear W8A8 + MoEGMM W4A8/W8A8 + KVCache C8 + LI cache | 适合混合量化，细节见结构卡 C 经验 C2 |
+| A3 | MoE + attention 大多保持 BF16 | `longcat_flash_lite` | MLP/MoE W8A8，attention BF16 | 适合 attention 融合约束强于 projection 量化收益的保守路线 |
 | A4 | Dense Decoder | `qwen3-8b` | Linear W8A8（per-channel weight + per-token activation dynamic），MLP 走 `npu_dequant_swiglu_quant` 融合 | 已确认并复现，细节见结构卡 A 经验 A2 |
 
 不要把 `qwen3-next` 这类外部 patch/service 路线作为 infer 主线 `compressed-tensors` 参考路径。

@@ -33,6 +33,7 @@ import torch_npu
 
 model = YourModel().npu()
 opt_model = torch.compile(model, backend="npugraph_ex", fullgraph=True, dynamic=False)
+# LLM Decode 场景 actual_seq_lengths 每步变化时需改为 dynamic=True
 output = opt_model(input_tensor)
 ```
 
@@ -42,17 +43,7 @@ output = opt_model(input_tensor)
 
 ## 问题定界流程
 
-```
-问题发生
-    │
-    ├─→ aot_eager 验证 ──失败──→ 修复用户脚本
-    │       ↓ 正常
-    │
-    ├─→ force_eager=True ──失败──→ 修复用户脚本
-    │       ↓ 正常
-    │
-    └─→ npugraph_ex/FX图问题
-```
+逐层剥离的完整流程见 SKILL.md 的「问题定界流程」。npugraph_ex 路径下强制逐算子执行的开关是 `options` 里的 `force_eager`。
 
 ---
 

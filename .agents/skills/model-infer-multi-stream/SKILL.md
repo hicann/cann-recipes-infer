@@ -1,7 +1,6 @@
 ---
 name: model-infer-multi-stream
-description: NPU 多流技术知识技能。提供整网模块 / 算子 DAG 拆解、模块间与模块内并行性判断、多流候选编排派生、TorchAir(Ascend IR/GE) 与 npugraph_ex/aclgraph 的多流 API 路由、切流 / 同步 / 控核实现，以及假并行（overlap_pct）排查与 Profile 验证等技术规则。供两类工作引用：形成多流优化候选 plan，以及实施 / review 多流改造。触发场景包括：多流、双流、stream overlap、控核、limit_core_num、整网 DAG、模块拆解、npu_stream_switch、npu_wait_tensor、TorchAir 多流、record_stream、多流假并行排查。本技能只提供多流技术规则，不做 Plan / round 编排。
-user-invocable: true
+description: NPU 多流技术知识技能。提供整网模块 / 算子 DAG 拆解、模块间与模块内并行性判断、多流候选编排派生、TorchAir(Ascend IR/GE) 与 npugraph_ex/aclgraph 的多流 API 路由、切流 / 同步 / 控核实现，以及假并行（overlap_pct）排查与 Profile 验证等技术规则。供两类工作引用：形成多流优化候选 plan，以及实施 / review 多流改造。触发场景包括：多流、双流、stream overlap、控核、limit_core_num、整网 DAG、模块拆解、npu_stream_switch、npu_wait_tensor、TorchAir 多流、record_stream、多流假并行排查。
 ---
 
 # NPU 多流技术知识
@@ -17,8 +16,8 @@ user-invocable: true
 
 | 你在做的事 | 先读 | 要点 |
 | --- | --- | --- |
-| 形成多流候选 plan | 下文"分析"一节 + [`references/module-decomposition.md`](references/module-decomposition.md) + [`examples/README.md`](examples/README.md) + [`references/ge-reorder-design-check.md`](references/ge-reorder-design-check.md) + [`references/plan-detail-fragment.md`](references/plan-detail-fragment.md) | 拆模块 / 算子 → 判并行性 → 每个并行点派生 ≥2 种编排 |
-| 实施多流方案 | 下文"实现"一节 + [`references/api-routing.md`](references/api-routing.md) + `resources/` 官方 doc | 先定执行路径，再切流 / 同步 / 控核，始终保留开关和回退路径 |
+| 形成多流候选 plan | 下文"分析"一节 + [`references/module-decomposition.md`](references/module-decomposition.md) + [`references/multi-stream-cases-index.md`](references/multi-stream-cases-index.md) + [`references/ge-reorder-design-check.md`](references/ge-reorder-design-check.md) + [`references/plan-detail-fragment.md`](references/plan-detail-fragment.md) | 拆模块 / 算子 → 判并行性 → 每个并行点派生 ≥2 种编排 |
+| 实施多流方案 | 下文"实现"一节 + [`references/api-routing.md`](references/api-routing.md) + `references/` 下的官方 doc | 先定执行路径，再切流 / 同步 / 控核，始终保留开关和回退路径 |
 | review / 调试多流方案 | 下文"调试与验证"一节 + [`references/timeline-overlap-check.md`](references/timeline-overlap-check.md) + [`references/kernel-fields-lookup.md`](references/kernel-fields-lookup.md) + [`references/plan-detail-fragment.md`](references/plan-detail-fragment.md) | 用 overlap_pct 判真假并行，按五类问题分诊 |
 
 被调用方（如优化编排流程）消费时，本技能产出两类内容，结构都由本技能定义、调用方不解析：**方向级分析产物**（module / op DAG + 并行性判断，一个模型一份，被所有候选 Plan 共享，结构见 [`references/module-decomposition.md`](references/module-decomposition.md)）和**每个 Plan 的方案细节**（流分组 / GE 风险 / overlap_pct 等，结构见 [`references/plan-detail-fragment.md`](references/plan-detail-fragment.md)）。
@@ -34,17 +33,17 @@ user-invocable: true
 - **overlap 不等于收益**：出现拖尾、资源争抢、host bound、shape 劣化时，overlap 真实成立也可能不降 wall，要继续评估控核和图模式限制。
 - **不要混抄案例**：先确定当前模型走哪条执行模式，再选一套主 API 路径，不要把 eager 和 graph 风格混着套。
 - **编排不唯一，要多试**：同一个并行点的分流编排往往不止一种，调试时多尝试不同编排，选物理上真并行且 wall 下降最大的那个。
-- **官方约束优先看 `resources/`**：先读对应模式的 multi_stream 文档；只有 overlap 已成立但出现资源争抢、拖尾或卡死风险时，再读对应模式的 limit_cores 文档。
+- **官方约束优先看 `references/` 下的官方 doc**：先读对应模式的 multi_stream 文档；只有 overlap 已成立但出现资源争抢、拖尾或卡死风险时，再读对应模式的 limit_cores 文档。
 - **开发与调试穿插**：改造一处 → 看物理布局 → 再改下一处或回滚，是多轮反复的过程；关注算子 / 模块是否真落在目标流上、cube / vector 的利用率与占核情况。
 
 ## 执行路径定界
 
 动手前先确认当前代码走哪条多流路径，两条路径的 API 与约束不能混用。
 
-> **术语辨析**：上游 torchair 文档里「Ascend IR」和「GE 图模式」指同一条路径，只是分别从 IR 侧和执行侧描述——通过 `torchair.CompilerConfig(mode="max-autotune")` 把 PyTorch FX 图转成 Ascend IR，再由 GE（Graph Engine）编译执行。所以「multi_stream（Ascend IR）」文档里写「仅适用于 GE 图模式」并不矛盾。
+> **术语辨析**：上游 torchair 文档里「Ascend IR」和「GE 图模式」指同一条路径，只是分别从 IR 侧和执行侧描述——通过 `torchair.CompilerConfig()` 把 PyTorch FX 图转成 Ascend IR，需要指定编译模式时再设 `compiler_config.mode`，再由 GE（Graph Engine）编译执行。所以「multi_stream（Ascend IR）」文档里写「仅适用于 GE 图模式」并不矛盾。
 
-- `torchair.CompilerConfig()` + `torchair.get_npu_backend()` + GE 图模式：走 **Ascend IR** 路径。先看 [`resources/ascend_ir_multi_stream.md`](resources/ascend_ir_multi_stream.md)，需要控核时再看 [`resources/ascend_ir_limit_cores.md`](resources/ascend_ir_limit_cores.md)。
-- `torch.compile(..., backend="npugraph_ex")`：走 **npugraph_ex / aclgraph** 路径。先看 [`resources/npugraph_ex_multi_stream.md`](resources/npugraph_ex_multi_stream.md)，需要控核时再看 [`resources/npugraph_ex_limit_cores.md`](resources/npugraph_ex_limit_cores.md)。
+- `torchair.CompilerConfig()` + `torchair.get_npu_backend()` + GE 图模式：走 **Ascend IR** 路径。先看 [`references/ascend_ir_multi_stream.md`](references/ascend_ir_multi_stream.md)，需要控核时再看 [`references/ascend_ir_limit_cores.md`](references/ascend_ir_limit_cores.md)。
+- `torch.compile(..., backend="npugraph_ex")`：走 **npugraph_ex / aclgraph** 路径。先看 [`references/npugraph_ex_multi_stream.md`](references/npugraph_ex_multi_stream.md)，需要控核时再看 [`references/npugraph_ex_limit_cores.md`](references/npugraph_ex_limit_cores.md)。
 - 不要把 Ascend IR 的图内 API 和 aclgraph 的显式 stream API 混写进同一套实现。
 - GE 图模式通常通过 `CompilerConfig` + `get_npu_backend()` 定界，不要把 `torch.compile(mode=...)` 当成当前主入口写法。
 - `npugraph_ex` 路径本质是显式 stream / event / 生命周期管理；如果代码已经是这套风格，顺着现有实现继续，不要强改成 TorchAir 图内表达。
@@ -59,9 +58,9 @@ user-invocable: true
 2. **对每个候选模块拆算子、画算子 DAG、判模块内并行**：仍沿计算 / 通信 / 同步 / 状态边界拆，识别模块内部哪些算子可并行、哪些依赖边不能打破。
 3. **为每个并行点派生候选编排**：把共享同一输入、彼此无 `data` 依赖的模块 / 算子看成一个集合，按集合划分思考分流。**每个并行点至少给 2 种不同编排**——并行对象、流分组、汇合点、tag 粒度或跨阶段 overlap 不同，就是不同的候选方案。
 
-选案例先读 [`examples/README.md`](examples/README.md) 的快速选型表，找到与当前模型结构最接近的模式再派生候选。
+选案例先读 [`references/multi-stream-cases-index.md`](references/multi-stream-cases-index.md) 的快速选型表，找到与当前模型结构最接近的模式再派生候选。
 
-**派生维度**（每一种取值变化都是一个独立候选）：算子粒度（是否合并 / 拆分 / 重排）、集合划分（哪些算子同流串行、哪些放另一条流）、汇合点（早汇合还是晚汇合）、流数量（双流还是三流）、tag 粒度（同一副流串行下发还是多个独立副流）、跨阶段 overlap（仅本模块内，还是跨层 / 跨阶段掩盖 dominator）。
+**派生维度**：每一种取值变化都是一个独立候选，完整清单见 [`references/module-decomposition.md`](references/module-decomposition.md) 的「常见派生维度」。
 
 **实现强度是一个复杂度阶梯**，不是不同的并行方案：同一个编排可以从 **C1 最小切流** → **C2 切流 + 控核** → **C3 切流 + 控核 + 手动同步点控制** 逐级加码，先用 C1 验证核心编排是否真并行，再决定要不要上更高强度。改变并行对象 / 流分组 / 汇合点则属于另一个候选，不要塞进同一方案的强度递进里。
 
@@ -69,11 +68,11 @@ user-invocable: true
 
 ## 实现（实施方案）
 
-动手前先读 [`references/api-routing.md`](references/api-routing.md)，确认当前执行路径对应的官方文档入口、推荐 API、控核约束和已知坑点。
+动手前先读 [`references/api-routing.md`](references/api-routing.md)，确认当前执行路径对应的官方文档入口、推荐 API、控核约束和已知问题。
 
 1. **按执行路径选 API**：
    - Ascend IR / GE 图模式：切流用 `torchair.scope.npu_stream_switch(stream_tag, ...)`，时序用 `torchair.scope.npu_wait_tensor`，已有 tagged event 风格时沿用 `torchair.ops.npu_record_tagged_stream` / `torchair.ops.npu_tagged_event_record` / `torchair.ops.npu_tagged_event_wait`（注意：切流 / 时序在 `torchair.scope`，而 record / wait / tagged event 在 `torchair.ops`，是两个不同命名空间）。
-   - npugraph_ex / aclgraph：切流用 `torch.npu.Stream()` + `with torch.npu.stream(stream)`，时序用 `torch.npu.Event()` + `Event.record()` + `Event.wait(stream)`，或 Stream 侧的 `record_event` / `wait_event` / `wait_stream`。在 `torch.compile(fullgraph=True, dynamic=True)` 下 dynamo 拦截 Stream / Event 对象（缺 `as_proxy()`）时，改用 `torch.npu.npugraph_ex.scope.npu_stream_switch(tag)` 或 `torch.npu.npugraph_ex.scope.npu_tagged_event_record` / `torch.npu.npugraph_ex.scope.npu_tagged_event_wait` 这套 string-tag / tagged-event 接口（npugraph_ex 路径下切流与 tagged event 都在 `torch.npu.npugraph_ex.scope` 命名空间，与 GE 路径 tagged event 落在 `torchair.ops` 不同）。
+   - npugraph_ex / aclgraph：切流用 `torch.npu.Stream()` + `with torch.npu.stream(stream)`，时序用 `torch.npu.Event()` + `Event.record()` + `Event.wait(stream)`，或 Stream 侧的 `record_event` / `wait_event` / `wait_stream`。在 `torch.compile(fullgraph=True, dynamic=True)` 下 dynamo 拦截 Stream / Event 对象（缺 `as_proxy()`）时，改用 `torch.npu.npugraph_ex.scope.npu_stream_switch(tag)` 或 `torch.npu.npugraph_ex.scope.npu_tagged_event_record` / `torch.npu.npugraph_ex.scope.npu_tagged_event_wait` 这套 string-tag / tagged-event 接口。仓内目前只用到该命名空间下的 `limit_core_num`，切流与 tagged event 接口未验证，使用前先在目标环境确认。
 2. **显式 stream 路径检查内存生命周期**：短生命周期 tensor 若被其他 stream 继续消费，补 `record_stream()`；模型权重、常驻 cache 这类长生命周期对象一般不需要。
 3. **先做最小可验证 overlap**：只改一个明确的并行点，先补同步再扩大并行窗口，始终保留原路径和 enable 开关。
 4. **overlap 成立后再评估控核**：出现明显拖尾时，Ascend IR 用算子级 `torchair.scope.limit_core_num`（优先级高于全局 `config.ge_config.aicore_num`），npugraph_ex 用 Stream 级 `torch.npu.npugraph_ex.scope.limit_core_num`。
@@ -87,7 +86,7 @@ user-invocable: true
 2. **精度 / 功能异常**：先对比优化前基线，再按 `prefill/decode → 模块 → 算子` 缩小范围，判断是不是多流引入的状态时序问题，而不是算子本身的问题。
 3. **性能无收益**——必须按 3a → 3b → 3c 顺序排查，**不允许跳过 3a/3b 直接走资源 / host 假设**：
 
-   - **3a 副流根本没真跑（逻辑切流失败）**：现象是副流 ops 的 `stream_id` 仍落在主流、或全退到 `sid=1`。检查 `npu_stream_switch` 的 with-block 是否在 `is_prefill / enable_multi_stream` 条件下真的走到、`_TORCHAIR_AVAILABLE` 兜底有没有被命中、源码顺序有没有让 GE 把 ops 挪到 block 外。
+   - **3a 副流根本没真跑（逻辑切流失败）**：现象是副流 ops 的 `stream_id` 仍落在主流、或全退到 `sid=1`。检查 `npu_stream_switch` 的 with-block 是否在 `is_prefill / enable_multi_streams` 条件下真的走到、`switch_flag` 为 False 时是否退化成了空上下文、源码顺序有没有让 GE 把 ops 挪到 block 外。
    - **3b 副流跑了但和主流串行（假并行 / GE auto-reorder barrier）**：现象是 Stream ID 已分裂但候选模块 wall 与 baseline 持平、并行度 ≤ 1.05×。**必须**按 [`references/timeline-overlap-check.md`](references/timeline-overlap-check.md) 重建甘特图算 `overlap_pct`，`≤ 0.05` 即判假并行。典型根因是 GE 把消费副流输出的轻量 precompute（Cast / Swish / Sigmoid / Reshape）拉到主流提前下发，卡住主流 dominator。解法是把 barrier op 显式钉在 with-block 内（自己写出 precompute，不依赖 GE 自动放置），或重新设计 op 集合让副流有真正的 dominator 可吃——这两种都是新的编排候选。
    - **3c 真重叠（overlap_pct ≥ 0.5）但 wall 不变**：仅在 3a/3b 排除后才走这步。看 shape 变化、task 数增加、host bound、带宽争抢、流间资源抢占、拖尾。判"主 / 副是否争 cube"用 `kernel_details.csv` 的 `Block Dim` 加和 vs 设备 `ai_core_cnt`，**不要**用"算子类型是 MatMul / Vector"二元判断（MatMul 也能 blk=1 占很少核）。跨流 tensor 维度偏大时先查 `TransData` / `BroadcastTo` / `MemSet` 是否长尾。
 4. **图模式 / runtime 限制**：重点看 graph break、图模式 API 约束、stream 语义差异、运行时不支持；graph 场景按 TorchAir 路径排查，不要回退成 eager 思路硬套。
@@ -106,7 +105,7 @@ user-invocable: true
 **选定方案前做 Profile 双重验证**（第 1、2 步都不可选）：
 
 1. **Stream ID 落点检查**：副流算子的 `stream_id` 确实落到目标 stream、没被 GE 挪回主流；不对就回 3a。
-2. **overlap_pct 时间线验证**：按 [`references/timeline-overlap-check.md`](references/timeline-overlap-check.md) 算 `overlap_pct`。判方案成立要 `≥ 0.5`；判方案无效要先确认是 `≤ 0.05`（假并行）还是 `≥ 0.5`（真并行但 wall 没降），两者的改进方向完全不同。
+2. **overlap_pct 时间线验证**：按 [`references/timeline-overlap-check.md`](references/timeline-overlap-check.md) 算 `overlap_pct`。判方案成立要 `≥ 0.5`；`≤ 0.05` 是假并行；`0.05 ~ 0.5` 是部分并行，调 op 集合让副流更长或换 dominator。三档的改进方向完全不同。
 3. 控核场景下副流算子 `Block Dim` 不超过配置值，主 / 副 `Block Dim` 加和不超过设备核数。
 4. 汇合点后没有新的 `EVENT_WAIT` 空洞或明显 gap。
 5. 跨流 tensor 名称和维度与设计一致，没把大 tensor 搬运变成新瓶颈。
@@ -131,7 +130,7 @@ user-invocable: true
 - **overlap 时间线复盘（判真 / 假并行）**：[`references/timeline-overlap-check.md`](references/timeline-overlap-check.md)
 - **kernel_details 字段查法（设计 / post-mortem 两套字段集）**：[`references/kernel-fields-lookup.md`](references/kernel-fields-lookup.md)
 - **GE auto-reorder 风险设计清单**：[`references/ge-reorder-design-check.md`](references/ge-reorder-design-check.md)
-- **案例库与选型表**：[`examples/README.md`](examples/README.md)
+- **案例库与选型表**：[`references/multi-stream-cases-index.md`](references/multi-stream-cases-index.md)
 - **官方多流 / 控核文档（torchair docs/zh 离线副本）**：
-  - Ascend IR / GE 图模式：[`resources/ascend_ir_multi_stream.md`](resources/ascend_ir_multi_stream.md)、[`resources/ascend_ir_limit_cores.md`](resources/ascend_ir_limit_cores.md)
-  - npugraph_ex / aclgraph：[`resources/npugraph_ex_multi_stream.md`](resources/npugraph_ex_multi_stream.md)、[`resources/npugraph_ex_limit_cores.md`](resources/npugraph_ex_limit_cores.md)
+  - Ascend IR / GE 图模式：[`references/ascend_ir_multi_stream.md`](references/ascend_ir_multi_stream.md)、[`references/ascend_ir_limit_cores.md`](references/ascend_ir_limit_cores.md)
+  - npugraph_ex / aclgraph：[`references/npugraph_ex_multi_stream.md`](references/npugraph_ex_multi_stream.md)、[`references/npugraph_ex_limit_cores.md`](references/npugraph_ex_limit_cores.md)

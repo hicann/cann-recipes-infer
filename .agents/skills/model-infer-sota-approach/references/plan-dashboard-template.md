@@ -1,6 +1,6 @@
 # Plan Dashboard 模板
 
-Dashboard 记录从推理场景、baseline profiling 分析、候选发现，到 Plan 实施 / review / 最终验收的整条过程。它是**单一文件**，约定落在 `optimization-analysis/<case>/plan-dashboard.md`，候选发现完成后初始化；在那之前的场景和 baseline profiling 产物，也先记进本文件对应小节。
+Dashboard 记录从推理场景、baseline profiling 分析、候选发现，到 Plan 实施 / review / 最终验收的整条过程。它是**单一文件**，约定落在 `optimization-analysis/<case>/plan-dashboard.md`，候选发现完成后初始化，初始化时把此前的场景与 baseline profiling 产物一次性回填到对应小节。
 
 ## 落盘布局
 
@@ -19,16 +19,16 @@ optimization-analysis/<case>/
 └── perf/                      perf-breakdown 的工作目录（采集 + 分析的 profile 与报告全在这；内部结构和文件名归 model-infer-perf-breakdown，本流程不感知）
 ```
 
-此外，`progress.md`（共享状态文件）不在本 case 树内——位置由主 agent 解析、找不到就创建，是跨 agent 共享上下文 + subagent 实施 / 踩坑 / 验证过程日志（沿用 `model-infer-optimize` 的常驻区 / 工作区 / 归档约定）；编排器读它取上下文、往工作区写过程。
+此外，`progress.md`（共享状态文件）不在本 case 树内——位置由主 agent 解析、找不到就创建，是跨 agent 共享上下文 + subagent 实施 / 问题 / 验证过程日志（沿用 `model-infer-optimize` 的常驻区 / 工作区 / 归档约定）；编排器读它取上下文、往工作区写过程。
 
 引用关系（一份分析派生多个 Plan，不重复）：
 
 ```text
 baseline 性能报告 ──证据──► analysis/<source>.md ──派生──► plans/plan-A.md / plan-B.md / …
-（时间分布 + 理论 gap）        （一份分析，多 Plan 共享）       每 Plan 一份完整记录
+（时间分布，理论对比已启用时含理论 gap）        （一份分析，多 Plan 共享）       每 Plan 一份完整记录
 ```
 
-`perf/` 的内部结构由 `model-infer-perf-breakdown` 自己管，本流程只把它当工作目录、读它产出的报告，不重定义它的契约。
+`perf/` 的内部结构由 `model-infer-perf-breakdown` 自己管，本流程只把它当工作目录、读它产出的报告，不重定义它的契约。profiling 与分析产物的目录字段 `<round_output_dir>` / `<round_profiling_dir>` 派发时指向 `perf/` 之下；`<analysis_root>` 仍是 case 根 `optimization-analysis/<case>/`。
 
 ## 分层与写者
 
@@ -42,7 +42,7 @@ baseline 性能报告 ──证据──► analysis/<source>.md ──派生─
 
 **写者规则**：dashboard（§1–§7）只有主 agent 写；`plans/plan-<id>.md` 由该 Plan 的 candidate / implementer / reviewer 产出与追加。主 agent 读 plan 文件做裁决、把关键信息 + 状态镜像进 dashboard 表，不改 plan 文件的内层结构；subagent 不写 dashboard。
 
-**dashboard / progress.md / plan-<id>.md 分工**：dashboard 只管**状态指示**（Plan 状态、采纳实现、round 裁决），是 Plan 状态的单一真相源。跨 agent 共享上下文与 subagent 实施 / 踩坑 / 验证过程落 `progress.md`（共享状态文件，路径由主 agent 解析、找不到就创建，不在本 case 树内，沿用 `model-infer-optimize` 的常驻区 / 工作区 / 归档约定）；每个 Plan 的方案 spec 与 round 级结论摘要落 `plans/plan-<id>.md`。三者各司其职、不互相复制：看状态查 dashboard、看过程与共享上下文查 progress.md、看单个 Plan 的方案查它的 plan 文件。
+**dashboard / progress.md / plan-<id>.md 分工**：dashboard 只管**状态指示**（Plan 状态、采纳实现、round 裁决），是 Plan 状态的单一真相源。跨 agent 共享上下文与 subagent 实施 / 问题 / 验证过程落 `progress.md`（共享状态文件，路径由主 agent 解析、找不到就创建，不在本 case 树内，沿用 `model-infer-optimize` 的常驻区 / 工作区 / 归档约定）；每个 Plan 的方案 spec 与 round 级结论摘要落 `plans/plan-<id>.md`。三者各司其职、不互相复制：看状态查 dashboard、看过程与共享上下文查 progress.md、看单个 Plan 的方案查它的 plan 文件。
 
 ## 1. 场景与基线
 
@@ -64,7 +64,7 @@ baseline 性能报告 ──证据──► analysis/<source>.md ──派生─
 - profiling 采集命令 / 产物路径：
 - perf-breakdown 工作目录：
 - 性能分析报告路径：
-- 关键瓶颈摘要（时间分布 top 模块 + 实测/理论 gap top 算子）：
+- 关键瓶颈摘要（时间分布 top 模块；理论对比已启用时补实测/理论 gap top 算子）：
 - 热点模块 / 文件 / 算子：
 - 数据质量或采集风险：
 

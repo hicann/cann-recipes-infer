@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
-"""PreToolUse hook: 角色越界文件保护 + 改代码前必读 progress.md"""
+# ----------------------------------------------------------------------------------------------------------
+# Copyright (c) 2026 Huawei Technologies Co., Ltd.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# ----------------------------------------------------------------------------------------------------------
+"""PreToolUse hook: keep agents inside their role and require progress.md before code edits."""
 
 import json
 import logging
@@ -10,7 +19,7 @@ logging.basicConfig(stream=sys.stderr, level=logging.WARNING, format="%(message)
 logger = logging.getLogger(__name__)
 import fnmatch
 
-# 保护模式：agent_type -> 不允许修改的文件模式列表
+# agent_type -> file patterns that role must not modify
 PROTECTED_PATTERNS = {
     "model-infer-analyzer": [
         "modeling_*.py",
@@ -24,7 +33,7 @@ PROTECTED_PATTERNS = {
     ],
 }
 
-# 改代码前必读 progress.md 的文件模式
+# File patterns that require progress.md to be read first
 CODE_PATTERNS = ["modeling_*.py", "runner_*.py"]
 
 
@@ -38,7 +47,7 @@ def matches_any(basename, full_path, patterns):
 
 
 def check_role_protection(data):
-    """检查 1：角色越界文件保护（P0，阻断）"""
+    """Reject edits to files the acting role is not allowed to touch."""
     agent_type = data.get("agent_type", "")
     agent_id = data.get("agent_id", "")
     file_path = data.get("tool_input", {}).get("file_path", "")
@@ -58,7 +67,7 @@ def check_role_protection(data):
 
 
 def check_read_progress_first(data):
-    """检查 2：改代码前必读 progress.md（P1，阻断）"""
+    """Reject model code edits made before progress.md has been read."""
     agent_id = data.get("agent_id", "")
     file_path = data.get("tool_input", {}).get("file_path", "")
 

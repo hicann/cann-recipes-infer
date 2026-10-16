@@ -32,7 +32,7 @@
 ### 解决（按顺序）
 
 1. 确认是不是这个故障：`grep -c "run failed" <res>/log_0.log` 非 0、且 `kernel_details.csv` 缺失。
-2. **首选：把 profiling 输出换到另一个目录/文件系统**（优先本地盘），重跑后重新验收。profiler 输出路径 = `WORK_DIR/RES_PATH/prof/...`（`execution_engine.py:83`）；但 `function.sh` 会把 `WORK_DIR` 重写成 `models/<model>`，**直接 `export WORK_DIR` 会被覆盖**。可靠做法是把 `res` 软链到本地盘：`ln -sfn /tmp/recipes_res models/<model>/res`（res 已是非空真实目录则先移走），再跑 `infer.sh`。多换几个盘定位哪个文件系统可用。
+2. **首选：把 profiling 输出换到另一个目录/文件系统**（优先本地盘），重跑后重新验收。profiler 输出路径 = `WORK_DIR/RES_PATH/prof/...`（见 `executor/core/engine/execution_engine.py` 的 profiler 输出路径拼接）；但 `function.sh` 会把 `WORK_DIR` 重写成 `models/<model>`，**直接 `export WORK_DIR` 会被覆盖**。可靠做法是把 `res` 软链到本地盘：`ln -sfn /tmp/recipes_res models/<model>/res`（res 已是非空真实目录则先移走），再按部署模式重跑推理入口。多换几个盘定位哪个文件系统可用。
 3. 快速坐实是不是输出目录的问题：把那份失败的 `*_ascend_pt` 原始数据 `cp -r` 到另一个盘，再 `python3 -c "import torch_npu; torch_npu.profiler.profiler.analyse('<新路径>')"` —— 能解析出 CSV，就确定是原输出目录所在盘的问题。
 4. **换了几个盘都不行**，再回退到注入采集（SKILL.md 路径 B / `scripts/profile_template.py`）兜底。
 
@@ -119,7 +119,7 @@ schedule 的转换发生在 `prof.step()` 被调用时。如果循环结束时 p
 
 ### 正确规则
 
-**`prof.step()` 总调用次数 ≥ `skip_first + warmup + active + 1`**（精确边界是 `skip_first + warmup + active`，+1 为收尾余量）。下面例子都用 `skip_first=0`，故化简成 `warmup + active + 1`；框架 decode 是 `skip_first=3, active=3`，最小就是 `3+0+3=6`、留余量取 7。
+**`prof.step()` 总调用次数 ≥ `skip_first + warmup + active + 1`**。最后那 1 步用于触发 trace 收尾，少一步会停在 RECORD 状态。下面例子都用 `skip_first=0`，故化简成 `warmup + active + 1`；框架 decode 是 `skip_first=3, active=3`，最小为 `3+0+3+1=7`。
 
 两种等价实现：
 

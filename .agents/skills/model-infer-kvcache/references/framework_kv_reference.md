@@ -231,7 +231,7 @@ class XxxForCausalLM(nn.Module):
 
 > **packed sequence 协议（必须遵守）**：
 > - `input_ids: [TotalTokens]` 是 packed 一维（变长 batch 串接，无 padding）
-> - `position_ids: [TotalTokens]` 也是 packed 一维（modeling 内 `if position_ids.dim() != 1: raise RuntimeError("expects packed 1D position_ids.")`，参考 `models/qwen3_moe/models/modeling_qwen3_moe.py:104`）
+> - `position_ids: [TotalTokens]` 也是 packed 一维（modeling 内 `if position_ids.dim() != 1: raise RuntimeError("expects packed 1D position_ids.")`，参考 `models/qwen3_moe/models/modeling_qwen3_moe.py` 中该校验所在的 forward 入口）
 > - `hidden_states` 全程保持 `[TotalTokens, hidden_size]` 二维形态，**不要 reshape 成 `[B, S, H]`**——变长 batch 不能简单 reshape，batch 边界由 FA 调用时的 `actual_seq_qlen` / `actual_seq_kvlen` 表达
 > - 阶段分支判断**统一用 `forward_metadata.is_prefill`**
 
@@ -321,7 +321,7 @@ class XxxAttention(nn.Module):
 
 ### 4.3 MLA 模型的写入：融合算子 npu_kv_rmsnorm_rope_cache
 
-参考来源：`models/longcat-flash/models/modeling_longcat_flash.py`。MLA 的 KV 写入可以用融合算子一步完成 RMSNorm + RoPE + Cache 写入：
+参考来源：`models/longcat_flash/models/modeling_longcat_flash.py`。MLA 的 KV 写入可以用融合算子一步完成 RMSNorm + RoPE + Cache 写入：
 
 ```python
 _, _, k_rope, k_nope = torch_npu.npu_kv_rmsnorm_rope_cache(

@@ -10,7 +10,7 @@
 
 ### 问题 1: `models/<name>/models/__init__.py` 遮蔽顶层 `models` namespace
 
-- **现象**：`bash infer.sh` 启动报 `ModuleNotFoundError: No module named 'models.gpt_oss'`（或其他同级模型）
+- **现象**：拉起推理报 `ModuleNotFoundError: No module named 'models.gpt_oss'`（或其他同级模型）
 - **根因**：从 `models/<your_model>/` 启动时，Python `sys.path[0]` 指向该目录。其下的 `models/__init__.py`（哪怕空文件）会把这个子目录变成 regular package，遮蔽仓库根的 `models/` namespace package
 - **修法**：删除 `models/<your_model>/models/__init__.py`。已注册参考模型（qwen3_moe / gpt_oss / deepseek_r1 等）下都没有这个文件
 - **检查**：`ls models/<your_model>/models/__init__.py` 应该报 file not found
@@ -27,13 +27,15 @@
       atten_mask = None  # decode 只靠 actual_seq_lengths_kv + sparse_mode
   ```
 
-### 问题 3: `infer.sh` 没 export `PYTHONPATH`
+### 问题 3: 模型目录自建 `infer.sh` 没 export `PYTHONPATH`
 
-- **现象**：8 卡启动后 rank 0 的 log 里 `ModuleNotFoundError: No module named 'models.gpt_oss'`
-- **根因**：从模型目录启动时 `sys.path[0]` 是 `models/<your>/`，不是仓库根，导致 `executor/core/support_models.py` import 兄弟模型失败
-- **修法**：`infer.sh` 在 source set_env / function 之后加：
+- **适用范围**：模型目录自建 `infer.sh` 且脚本内未把仓库根加入 `PYTHONPATH`。source `executor/scripts/set_env.sh` 时仓库根已由该脚本加入，此时无需再加
+- **现象**：启动后 log 里 `ModuleNotFoundError: No module named 'models.gpt_oss'`
+- **根因**：从模型目录启动时 `sys.path[0]` 是 `models/<your>/`，仓库根不在搜索路径上，`executor/core/support_models.py` import 兄弟模型失败
+- **修法**：在模型目录 `infer.sh` 里、拉起 python 之前加：
   ```bash
-  export PYTHONPATH="${SCRIPT_PATH}/../..:${PYTHONPATH}"
+  REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+  export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH}"
   ```
 - **判断方式**：和问题 1 现象一样，但问题 1 是 `__init__.py` 遮蔽（删 init 修），问题 3 是 PYTHONPATH 缺失（加 export 修）。两条都查
 

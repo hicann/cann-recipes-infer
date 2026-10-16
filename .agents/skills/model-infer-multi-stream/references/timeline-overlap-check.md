@@ -75,12 +75,15 @@ overlap=0us / overlap_pct=0%，判为假并行；barrier = ops 55-56 (Cast+Swish
 下一候选：把 silu(z) 显式预计算钉在 with-block 内。
 ```
 
-## 该做、不该做
+## 该做
 
-- ✅ overlap 复盘是判断方案成败的核心证据，必须自己做，不能因为"Stream ID 已切到副流"就直接判通过。
-- ✅ 判通过和判淘汰前都要算 `overlap_pct`，并把结论连同 barrier（如有）记下来。
-- ❌ 不要把整份 per-op 明细贴进对话，只下钻必要的几条 op。
-- ❌ 不要把"host overhead 吃掉收益"当默认解释，先证明 overlap 真实成立。
+- overlap 复盘是判断方案成败的核心证据，必须自己做，不能因为"Stream ID 已切到副流"就直接判通过。
+- 判通过和判淘汰前都要算 `overlap_pct`，并把结论连同 barrier（如有）记下来。
+
+## 不该做
+
+- 不要把整份 per-op 明细贴进对话，只下钻必要的几条 op。
+- 不要把"host overhead 吃掉收益"当默认解释，先证明 overlap 真实成立。
 
 ## 关键约束
 

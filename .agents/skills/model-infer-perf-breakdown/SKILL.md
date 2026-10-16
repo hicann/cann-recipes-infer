@@ -1,10 +1,6 @@
 ---
 name: model-infer-perf-breakdown
-description: |
-  NPU 性能数据拆解技能。把 kernel_details.csv 按用户描述的模型结构切成 component
-  实例（每层 attn / ffn / moe…），再按用户给的 cluster 规则把 component 内部算子
-  分桶，生成 wall_ms / bubble_ms 中位数 + 异常 layer 的单页 HTML。
-  触发场景：分析 NPU prof / 拆解大模型性能 / 找抖动 layer。
+description: 昇腾 NPU 性能数据拆解技能。把 kernel_details.csv 按模型结构切成 component 实例，再按 cluster 规则对 component 内算子分桶，产出 wall_ms / bubble_ms 中位数与异常 layer 的单页 HTML。触发场景：分析 NPU prof、拆解大模型性能、定位抖动 layer。
 ---
 
 # NPU 性能数据拆解技能
@@ -108,12 +104,16 @@ agent 维护的人类可读运行日志，用途：
 
 ### Step 1 — 单 step 提取
 
+在 skill 根目录执行，`<kernel_csv>` 取 `inputs.json` 的同名字段，`<run_dir>` 用绝对路径：
+
 ```bash
-python scripts/analyze_kernels.py -f kernel_details.csv -s 2 \
+python scripts/analyze_kernels.py -f <kernel_csv> -s <step_id> \
   -o <run_dir>/raw_ops.json -d <run_dir>/raw_ops_details.json
 ```
 
-**作用**：从 csv 抽一个稳定 step（默认跳过 step 0 warmup），后续所有分析以单 step 为单位。
+**作用**：从 csv 抽一个稳定 step，后续所有分析以单 step 为单位。`-s` 不指定时取第一个 step，而第一个 step 可能是 warmup，用 `-s` 显式指定一个稳态 step id。
+
+**一致性门禁**：脚本在多 step 的 kernel 分布不同时报「各 Step 的 Kernel 分布不一致」并以 1 退出，这发生在选 step 之前。若 csv 里含 warmup step 或一次采集同时覆盖 prefill 与 decode，先按阶段拆出只含稳态 step 的 csv 再跑。
 
 **输入**：`kernel_details.csv`（同目录通常还有 `trace_view.json`，Step 4 用，Step 1 不消费）。
 
@@ -219,8 +219,8 @@ hard / ambiguous warnings（含 `auxiliary_stream_temporally_displaced`）默认
 - `components[]` — 扁平表，每条 = 一个 component instance（`component_id` / `layer_idx` / `phase` / `type` / `op_indices[]` / `stream_segments[]` / stream-aware `scores`；某条 aux 流被判时间脱节时还含 `displaced_op_indices[]`——该流的 op，render 据此从 cluster/bubble/TOTAL 剔除，但仍在 `op_indices` 全集内、partition 不破）
 - `op_to_component` — op index 到 component_id 的反查表
 - `unmatched_op_indices[]` / `unmatched_stream_segments[]` — 未归属 op，不能静默丢弃
-- `warnings[]` — primary/auxiliary stream、op membership、composition schedule、count/shape/ambiguity、temporally-displaced aux stream 类问题，每条含 `code` + `message`
-- `validation` — declared vs detected 层数 / missing_samples / ambiguous_matches
+- `warnings[]` — primary/auxiliary stream、op membership、composition mismatch 与 schedule、sample ack 不匹配、stream shape 不匹配、temporally-displaced aux stream 类问题，每条含 `code` + `message`
+- `validation` — declared vs detected 层数、per_phase_layer_match、ambiguous_matches（由 `op_membership_conflict` 填充）
 
 warning codes、validation 字段、匹配算法细节见 `detect_structure.py` / `sample_matching.py` docstring。
 
@@ -302,19 +302,16 @@ python scripts/split_artifacts.py \
 
 | kind | 命名 |
 |------|------|
-| component 实例 | `L<idx:03d>_<phase>_<type>` |
-| pre/post 头尾 | `pre` / `post` |
-| 相邻 component 间的 gap | `gap_L<prev>_<phase>_<type>_to_L<next>_<phase>_<type>` |
-| 头尾外侧 gap | `gap_before_L<next>_…` / `gap_after_L<prev>_…` |
-| 疑似未声明的 component | `suspected_…`（其余结构同 gap） |
+| component 实例 | `L<idx:03d>_<phase>_<type>`；同层出现同类型多个实例时追加 `_<lo>_<hi>` 消歧 |
+| 未归属区间 | `unmatched_<lo>_<hi>` |
 
 每个文件夹内只放两份产物：
 - `kernels.csv` — csv 切片（保留 header，首列 `org_index`）
 - `trace_view.json` — trace 证据；传 `-t` 时是该目标 op 的时间包络上下文窗口，可能包含同时间并行的其他目标 op；不传时从 raw_ops 的 `op_indices` 精确合成
 
-顶层 `manifest.json` 是 folder → `{kind, op_range, op_indices?, ops_count, files}` 索引，给下游 / 用户导航用；当目标 op 非连续时才写 `op_indices`。`files.trace_scope` 标明 trace 是 `op_membership_exact` 还是 `time_envelope_context`。
+顶层 `manifest.json` 形如 `{source, n_ops, targets}`，`targets` 是 `{folder, kind, op_range, op_indices?, ops_count, files}` 的列表，给下游 / 用户导航用；`op_indices` 恒存在，目标 op 连续时为 `null`。`files.trace_scope` 标明 trace 是 `op_membership_exact` 还是 `time_envelope_context`。
 
-`-f` / `-t` 在标准 prof 包下必传；缺 csv 跳过 csv 切片，缺 trace 时 trace_view.json 从 raw_ops 合成。`--dry-run` 只打印目标清单不落盘。
+`-f` / `-t` 在标准 prof 包下必传；缺 csv 跳过 csv 切片，缺 trace 时 trace_view.json 从 raw_ops 合成。`--dry-run` 打印目标清单并跳过 csv / trace 切片，仍会建目录并写 `manifest.json`。
 
 ### Step 5 — 洞察归纳
 
@@ -344,7 +341,7 @@ python scripts/compare_runs.py \
   [--baseline <label>]    # 默认第一个 run 当 baseline
 ```
 
-`-r` 给目录时自动扫所有 `*/metrics.json`，按 mtime 升序排（早的当 baseline）。也可以列出多个 `metrics.json` 路径显式指定顺序。
+`-r` 给目录时自动扫所有 `*/metrics.json`，按 mtime 升序排（早的当 baseline）。也可以用 `--runs path1 path2 ...` 列出多个 `metrics.json` 路径显式指定顺序（`-r` 只接受一个目录）。
 
 输出 `history.html` — 多 run 跨版本对比表（Δ% vs baseline + outlier diff），列布局见 `compare_runs.py` docstring。
 
@@ -371,6 +368,8 @@ python scripts/compare_runs.py \
 | `<run_dir>/runs/<label>/insights/final_conclusions.md` | Step 5 | agent 基于五类 insight 汇总的最终结论与证据索引 |
 | `<run_dir>/runs/<label>/insights/index.html` | Step 5 | 五类 insight 的可视化页面 |
 | `<run_dir>/runs/<label>/insights/main_report_insights.json` | Step 5 | agent 选择回填到主报告 `insight` 列的 high / medium 洞察 |
+| `<run_dir>/runs/<label>/insights/_review_stub.json` | Step 5 | pass 1 中间产物，列出待 agent 审阅的 key |
+| `<run_dir>/runs/<label>/insights/_taxonomy_candidates.json` | Step 5 | pass 1 中间产物，movement 分类候选 |
 | `<run_dir>/history.html` | 增量 | 多 run 对比表（Δ% vs baseline） |
 | `<run_dir>/HISTORY.md` | 每 run 收尾 | agent append 的运行日志，记录复用 / 变更 / 观察 |
 | `<run_dir>/splits/` | Step 4 | 按 component 切的 csv / trace_view，含 manifest.json |
@@ -388,5 +387,5 @@ python scripts/compare_runs.py \
 - `references/reuse_policy.md` — prof 变更检测信号 + 三档复用规则
 - `references/theoretical_perf_workflow.md` — Step 1.5 理论性能注入：外部 skill 调用、CSV 理论列合并、多流选择口径
 - `references/insight_workflow.md` — Step 5 洞察归纳：五类 insight、脚本/agent 边界、HTML 渲染
-- `references/insight_html_template.html` — Step 5 洞察页 HTML/CSS/JS 骨架
+- `scripts/templates/insight_page.html` — Step 5 洞察页 HTML/CSS/JS 骨架，由 `scripts/render_insights.py` 填充
 - 各脚本 docstring — 内部算法、阈值推导、edge case 处理

@@ -15,7 +15,7 @@
 
 ## 推荐模式
 
-优先参考 `deepseek-v3.2-exp` 和 `deepseek_r1` 等成熟实现，并采用下面的共同思路：
+优先参考 `deepseek_v3_2_exp` 和 `deepseek_r1` 等成熟实现，并采用下面的共同思路：
 
 1. 将 RoPE 的预计算、缓存和取值逻辑收敛到统一位置，不再分散到各层或多个辅助函数中；实现位置可以是独立类、公共模块或模型内部统一入口
 2. 在模型初始化阶段完成第一次 `cos/sin` cache 预计算，并用 `register_buffer` 保存
@@ -26,7 +26,7 @@
 
 ## 仓库成熟参考
 
-- `models/deepseek-v3.2-exp/models/modules.py` 与 `models/deepseek-v3.2-exp/models/modeling_deepseek.py`
+- `models/deepseek_v3_2_exp/models/modules.py` 与 `models/deepseek_v3_2_exp/models/modeling_deepseek.py`
   - 参考 `RotaryEmbedding` 类、`_init_rope()`、模型级统一取值
 - `models/deepseek_r1/models/modules.py` 与 `models/deepseek_r1/models/modeling_deepseek.py`
   - 参考 `Prefill / Decode`、`PA / 非PA`、`BNSD / TND` 等分支处理方式

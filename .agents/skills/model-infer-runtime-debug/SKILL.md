@@ -370,16 +370,19 @@ if "lm_head" in name and loaded_weight.shape[0] < self.lm_head_vocab_size:
 # 1. npu-smi 确认进程数
 npu-smi info | grep "Process id"
 
-# 2. 逐 rank 检查日志末尾
-for i in $(seq 0 7); do
-    echo "=== Rank $i ===" 
-    tail -5 logs/log_${i}.log
+# 2. 定位本次运行的日志目录（通常是 res/<date>/<case>/log_<rank>.log）
+RES=$(ls -dt models/{model_name}/res/*/* | head -1)
+
+# 3. 逐 rank 检查日志末尾
+for f in "$RES"/log_*.log; do
+    echo "=== $f ==="
+    tail -5 "$f"
 done
 
-# 3. 检查是否所有 rank 都到达了同一个里程碑
-grep "model run success" logs/log_*.log
+# 4. 检查是否所有 rank 都到达了同一个里程碑
+grep "model run success" "$RES"/log_*.log
 # 或
-grep "Loading weights took" logs/log_*.log
+grep "Loading weights took" "$RES"/log_*.log
 ```
 
 ### 多卡权重加载检查清单
@@ -481,27 +484,29 @@ npu-smi info | grep "No running"
 
 ### 完成检测方法
 
+下表命令中的 `$RES` 指本次运行的日志目录，框架部署下通常是 `models/{model_name}/res/<date>/<case>/`，取最近一次用 `RES=$(ls -dt models/{model_name}/res/*/* | head -1)`；独立部署按该模型 Runner 的实际落盘位置取。
+
 | 方法 | 命令 | 说明 |
 |------|------|------|
 | **查 NPU 进程** | `npu-smi info \| grep "running process"` | 无进程 = 已结束 |
-| **查非 rank0 日志** | `grep "model run success" logs/*/log_1.log` | Rank 1-7 日志不经 tee，完整写入。**不要只查 rank 0** |
-| **查所有 rank** | `for i in $(seq 0 7); do grep -l "model run success" logs/*/log_${i}.log; done \| wc -l` | 期望输出 = world_size |
+| **查非 rank0 日志** | `grep "model run success" "$RES"/log_1.log` | 非 rank 0 的日志不经 tee，完整写入。**不要只查 rank 0** |
+| **查所有 rank** | `grep -l "model run success" "$RES"/log_*.log \| wc -l` | 期望输出 = world_size |
 
 ### 日志关键字判断阶段
 
 ```bash
-grep "Loading safetensors" logs/*/log_1.log     # 正在加载权重
-grep "Loading weights took" logs/*/log_1.log    # 加载完成
-grep "inference time cost of prefill" logs/*/log_1.log  # 推理已开始
-grep "model run success" logs/*/log_1.log       # 推理已结束
+grep "Loading safetensors" "$RES"/log_1.log     # 正在加载权重
+grep "Loading weights took" "$RES"/log_1.log    # 加载完成
+grep "inference time cost of prefill" "$RES"/log_1.log  # 推理已开始
+grep "model run success" "$RES"/log_1.log       # 推理已结束
 ```
 
 ### 一条命令获取全局状态
 
 ```bash
 echo "=== NPU ===" && npu-smi info | grep -E "Process|HBM" | head -5 && \
-echo "=== Log ===" && tail -3 logs/*/log_1.log && \
-echo "=== Done? ===" && grep -c "model run success" logs/*/log_*.log 2>/dev/null
+echo "=== Log ===" && tail -3 "$RES"/log_1.log && \
+echo "=== Done? ===" && grep -c "model run success" "$RES"/log_*.log 2>/dev/null
 ```
 
 ### 常见误判场景
@@ -515,10 +520,9 @@ echo "=== Done? ===" && grep -c "model run success" logs/*/log_*.log 2>/dev/null
 
 ### Agent 工作模式
 
-1. **启动推理**（`bash infer.sh`，前台或 `run_in_background`）
+1. **启动推理**（框架部署在仓库根 `bash executor/scripts/infer.sh --model {model_name} --yaml {yaml_name}.yaml`，独立部署 `cd models/{model_name} && bash infer.sh`；前台或 `run_in_background`）
 2. **不要盲目 sleep** —— 用 `run_in_background` 等通知，或前台直接看输出
 3. **10 分钟无进展 → 主动排查**：推理启动超过 10 分钟仍无 `model run success` 输出，不要继续等待，按「推理卡住诊断」流程排查（`npu-smi` → 判断状态 → 分流）
 4. **超时后第一步查 `npu-smi`**，不要先查日志
 5. **检查完成时查 rank 1（不是 rank 0）**—— rank 1 日志完整无截断
 6. **一次检查多个信号**：`npu-smi` + `tail log_1.log` + `grep "model run success" log_*.log` 并行执行
-

@@ -14,7 +14,7 @@
 
 - 主流跑 dense / attention 主路径。
 - 副流提前执行 shortcut MoE 路径。
-- 通过 `limit_core_num(True, aic, aiv)` 给两个流分配不同的 AI Core / Vector Core 数量。
+- 通过 `limit_core_num(True, aic, aiv, exe_mode=exe_mode)` 给两个流分配不同的 AI Core / Vector Core 数量。
 - 必要时叠加 `npu_prefetch` 和 superkernel，让双流窗口更完整。
 
 ## 执行编排图
@@ -41,7 +41,7 @@ flowchart LR
 第一段代码展示 decode 阶段进入多流分支：
 
 ```python
-if (self.enable_multi_stream > 0) and not is_prefill:
+if (self.enable_multi_streams > 0) and not is_prefill:
     return self.multi_stream_forward(
         hidden_states,
         kv_len,
@@ -58,28 +58,34 @@ if (self.enable_multi_stream > 0) and not is_prefill:
     )
 ```
 
-第二段代码是核心并行段：把 shortcut MoE 放到副流，并单独控核：
+第二段代码是核心并行段：把 shortcut MoE 放到副流，并单独控核。`limit_core_num` 在 `switch_flag` 为真且 `exe_mode` 为 `npugraph_ex` 或 `ge_graph` 时真正控核，其余情况返回空上下文，因此调用时需显式传入 `exe_mode`：
 
 ```python
 if not self.enable_afd:
     npu_prefetch(self.enable_prefetch, self.mlp.router.classifier.weight.data, o_proj, 18 * 1024 * 1024, 0)
-    with npu_stream_switch(True, "1"):
-        with limit_core_num(True, self.aic_num1, self.aiv_num1):
+    with npu_stream_switch_gegraph(True, "1"):
+        with limit_core_num(True, self.aic_num1, self.aiv_num1, exe_mode=exe_mode):
             shortcut_mlp_output = self.mlp(hidden_states_norm, is_prefill, cur_topk_list=cur_topk_list)
 ```
 
 主路径继续在另一套核数配置下运行：
 
 ```python
-with limit_core_num(not self.enable_afd, self.aic_num2, self.aiv_num2):
-    hidden_states, _, dsq = self.mlps[0](hidden_states_norm, self.enable_prefetch, o_proj)
+with limit_core_num(not self.enable_afd, self.aic_num2, self.aiv_num2, exe_mode=exe_mode):
+    if self.enable_prefetch:
+        hidden_states, _, dsq = self.mlps[0].forward_prefetch(hidden_states_norm, o_proj, is_prefill=is_prefill)
+    else:
+        hidden_states, _, dsq = self.mlps[0](hidden_states_norm, is_prefill=is_prefill)
     hidden_states, residual = self.input_layernorm[1](hidden_states, residual)
-    hidden_states, o_proj = self.self_attn[1].fused_infer_attention_score(
-        query_states=query_states,
-        k_nope=k_nope,
-        k_rope=k_rope,
+    hidden_states, o_proj = self.self_attn[1].forward_page_attention_absorb(
+        hidden_states=hidden_states,
+        position_embeddings=position_embeddings,
+        kv_len=kv_len,
         attention_mask=attention_mask,
         actual_seq_lengths_kv=actual_seq_lengths_kv,
+        slot_mapping=slot_mapping,
+        block_table=block_table,
+        return_o_proj=True,
     )
 ```
 

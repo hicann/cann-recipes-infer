@@ -78,7 +78,7 @@ attn_output, _ = self.fa_ops.npu_fused_infer_attention_score_v2(
 ### Kimi-K2（TND_NTD, FA v1, Prefill/Decode 分离实例）
 
 ```python
-# 参考: models/kimi-k2-thinking/models/modeling_deepseek.py
+# 参考: models/kimi_k2_thinking/models/modeling_deepseek.py
 fa_input_kwargs = {
     "query": q_nope, "key": k_nope, "value": k_nope,
     "query_rope": q_pe, "key_rope": k_pe,
@@ -102,7 +102,7 @@ else:
 > `BSND_NBSD` layout 仅 KVP 长序列（KV 沿 head 切分多卡）场景使用，普通 Paged 模式仍走 TND / TND_NTD 默认推荐路径。
 
 ```python
-# 参考: models/longcat-flash/models/modeling_longcat_flash.py
+# 参考: models/longcat_flash/models/modeling_longcat_flash.py
 attn_partial, lse_partial = self.fa_ops.npu_fused_infer_attention_score(
     query_states[0], k_nope, k_nope,
     query_rope=query_states[1], key_rope=k_rope,
@@ -138,7 +138,7 @@ def process_weights_after_loading(self):
 ## 缓存写入融合算子
 
 ```python
-# 参考: models/longcat-flash/models/modeling_longcat_flash.py
+# 参考: models/longcat_flash/models/modeling_longcat_flash.py
 _, _, k_rope, k_nope = torch_npu.npu_kv_rmsnorm_rope_cache(
     latent_cache, self.kv_a_layernorm.weight,
     cos, sin,

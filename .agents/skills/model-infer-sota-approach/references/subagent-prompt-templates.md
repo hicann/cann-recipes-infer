@@ -11,7 +11,7 @@
 - **Dashboard 只读**：Plan Dashboard 由主 agent 独占维护。subagent 可以读它了解全局，但不直接写入；自己的产出通过回传摘要交给主 agent 落库。
 - **性能口径统一**：凡涉及性能收益的结论，一律以 profile-analyzer 产出的分析报告为准，不拿裸 wall-clock 数字（infer 脚本打印、`time.perf_counter` 计时等）当判定依据。
 - **上下文读 progress.md，dispatch 不转述**：主 agent 的 dispatch 只给模板字段与路径，subagent 进场先读主 agent 传入的 `<progress_path>`（progress.md 共享状态文件，位置由主 agent 解析）取共享上下文（场景 / 精度口径 / baseline 瓶颈 / 已通过 Plan / 当前 round 目标），主 agent 不在 prompt 里复述这些。
-- **过程写 progress.md 工作区**：subagent 把当前 round 的实施步骤、踩坑、验证过程追加到 `progress.md` 工作区（跨 agent 共享，沿用 `model-infer-optimize` 的工作区 / 归档约定），便于其它 agent 复用；只把结论性证据摘要回传主 agent 上浮 dashboard，把方案 spec 级结论落对应 `plan-<id>.md`。
+- **过程写 progress.md 工作区**：subagent 把当前 round 的实施步骤、问题、验证过程追加到 `progress.md` 工作区（跨 agent 共享，沿用 `model-infer-optimize` 的工作区 / 归档约定），便于其它 agent 复用；只把结论性证据摘要回传主 agent 上浮 dashboard，把方案 spec 级结论落对应 `plan-<id>.md`。
 
 ## scenario：构造推理输入并跑通精度基线
 
@@ -90,7 +90,7 @@ baseline 与重采 round 都用本模板。perf-breakdown 需要用户敲定的�
 
 目标：
 - 用 model-infer-perf-breakdown 分析本轮 profiling，按主 agent 传入的拆解 spec 跑、不与用户对话。
-- 产出一份报告，含「时间分布」和「逐算子实测 / 理论 gap + need optimization 清单」两类证据；重采轮与 baseline 做同口径对照给出 Δ%（baseline 轮无对照）。
+- 产出一份报告，含「时间分布」证据；该 skill 的理论对比步骤已启用时，再加「逐算子实测 / 理论 gap」；重采轮与 baseline 做同口径对照给出 Δ%（baseline 轮无对照）。
 - 标出后续工作（候选发现或当前 Plan 复核）应重点关注的模块、文件或算子。
 
 输入：
@@ -106,7 +106,7 @@ baseline 与重采 round 都用本模板。perf-breakdown 需要用户敲定的�
 
 只返回：
 - 性能分析报告路径
-- 关键瓶颈摘要：时间分布 top 模块 + 实测/理论 gap top 算子
+- 关键瓶颈摘要：时间分布 top 模块；理论对比已启用时补实测/理论 gap top 算子
 - 热点模块 / 文件 / 算子
 - 与 baseline 的 Δ% 关键差异（baseline 轮 NA）
 - 异常副作用或数据质量问题
@@ -178,7 +178,7 @@ baseline 与重采 round 都用本模板。perf-breakdown 需要用户敲定的�
 - 如果当前 Plan 与已通过 Plan 冲突，停止实施并报告冲突。
 - 如果当前 Plan 无法实施或明显无收益，说明原因，不要硬改。
 - 完成该单点 skill 要求的最小功能 / 编译验证；性能自验证结果仅供参考，最终性能判定以主 agent 侧 profile-analyzer 报告为准。
-- 实施步骤、踩坑、自验证过程写进 `progress.md` 工作区；方案细节 spec（设计层，如多流的流分组 / 汇合点 / GE 风险）与本 round 结论摘要落 `<plan_file_path>`，按该单点 skill 的方案细节结构组织；把裁决要看的信息浓缩成证据摘要回传给主 agent 上浮到 Dashboard。
+- 实施步骤、问题、自验证过程写进 `progress.md` 工作区；方案细节 spec（设计层，如多流的流分组 / 汇合点 / GE 风险）与本 round 结论摘要落 `<plan_file_path>`，按该单点 skill 的方案细节结构组织；把裁决要看的信息浓缩成证据摘要回传给主 agent 上浮到 Dashboard。
 
 只返回：
 - 是否完成实施

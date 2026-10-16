@@ -21,7 +21,7 @@
 ### EP Prefill（double-routing 模式）
 
 ```python
-# 来源：models/deepseek-v3.2-exp/models/modeling_deepseek.py
+# 来源：models/deepseek_v3_2_exp/models/modeling_deepseek.py
 
 # ===== Step 1: 门控 + 路由初始化 =====
 topk_weight, topk_idx, _ = torch_npu.npu_moe_gating_top_k(
@@ -274,7 +274,7 @@ MoE 并行改造必须同步检查 `FusedMoEGMM` 的权重加载：
 
 ```yaml
 model_config:
-  perfect_eplb: True
+  force_eplb: True
 ```
 
 开启后框架会重新分配 expert 到各 rank，确保负载均衡。需配合对应 routing 算子参数。

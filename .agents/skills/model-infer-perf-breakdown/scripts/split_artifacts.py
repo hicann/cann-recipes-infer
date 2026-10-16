@@ -1,4 +1,13 @@
 #!/usr/bin/env python3
+# ----------------------------------------------------------------------------------------------------------
+# Copyright (c) 2026 Huawei Technologies Co., Ltd.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# ----------------------------------------------------------------------------------------------------------
 # coding=utf-8
 """Split kernel_details.csv + trace_view.json per component / region.
 
@@ -7,9 +16,7 @@ membership into a complete set of folders — every op appears in exactly one
 folder, no duplicates, no gaps:
 
   - one folder per component instance, named L<layer:03d>_<phase>_<type>
-  - one folder per unmatched region between components, named after the
-    surrounding components: gap_L<idx>_<phase>_<type>_to_L<idx>_<phase>_<type>,
-    gap_before_L<...> / gap_after_L<...>, pre, post, suspected_...
+  - one folder per unmatched region, named unmatched_<lo>_<hi>
 
 Each folder contains:
 
@@ -21,8 +28,9 @@ Each folder contains:
                    --trace it is synthesized exactly from this folder's
                    op_indices (one 'X' event per kernel with ts/dur/name/stream).
 
-Top-level `manifest.json` maps folder → {kind, op_range, op_indices?,
-ops_count, files} for quick navigation. `op_range` is only the display
+Top-level `manifest.json` is {source, n_ops, targets}, where targets is a
+list of {folder, kind, op_range, op_indices?, ops_count, files} entries for
+quick navigation. `op_range` is only the display
 envelope; `op_indices` is present when the target membership is non-contiguous.
 `files.trace_scope` distinguishes exact synthesized traces from source-trace
 time-envelope context. No per-folder summary.json is written.

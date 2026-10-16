@@ -110,13 +110,13 @@ Skill 动作：
 | MoE fused GMM 不支持当前量化 bit/scale | 回退原有 expert 路径继续验证，记录 GMM 量化需求 |
 | EP 下 smooth scale 不完整 | 补 infer 侧 gather / rank 对齐能力，不能修改产物语义 |
 | packed expert 名称与 `FusedMoEGMM` loader 不匹配 | 补加载映射或回退 per-expert Linear |
-| dense / shared expert MLP 仍走浮点 SwigLU | 参考本卡经验 B1 |
+| dense / shared expert MLP 仍走浮点 SwiGLU | 参考本卡经验 B1 |
 
 ### 已确认模型经验
 
-#### 经验 B1：W8A8 用量化友好 SwigLU 链替代浮点 SwigLU
+#### 经验 B1：W8A8 用量化友好 SwiGLU 链替代浮点 SwiGLU
 
-代表路径：`models/deepseek-v3.2-exp/models/modeling_deepseek.py`、`models/glm_5/models/modeling_glm.py`、`models/kimi-k2-thinking/models/modeling_deepseek.py`、`models/longcat-flash/models/modeling_longcat_flash.py`、`models/longcat_flash_lite/models/modeling_longcat_flash_lite.py`
+代表路径：`models/deepseek_v3_2_exp/models/modeling_deepseek.py`、`models/glm_5/models/modeling_glm.py`、`models/kimi_k2_thinking/models/modeling_deepseek.py`、`models/longcat_flash/models/modeling_longcat_flash.py`、`models/longcat_flash_lite/models/modeling_longcat_flash_lite.py`
 
 - W8A8 下，`gate_up_proj` 常以 `out_dtype=torch.int32` 输出累加结果和 per-token scale。
 - 原浮点链路 `gate_up -> npu_swiglu -> down_proj` 需要替换为 `npu_dequant_swiglu_quant`，同时消费 `gate_up_proj.weight_scale`、`down_proj.smooth_scales` 和上一段 matmul 的 `pertoken_scale`。
@@ -132,7 +132,7 @@ Skill 动作：
 
 #### 经验 B2：A8 scale 是路由/通信/专家计算的 side channel
 
-代表路径：`models/deepseek_r1/models/modeling_deepseek.py`、`models/deepseek-v3.2-exp/models/modeling_deepseek.py`、`models/glm_5/models/modeling_glm.py`、`models/kimi-k2-thinking/models/modeling_deepseek.py`、`models/longcat-flash/models/modeling_longcat_flash.py`、`models/longcat_flash_lite/models/modeling_longcat_flash_lite.py`
+代表路径：`models/deepseek_r1/models/modeling_deepseek.py`、`models/deepseek_v3_2_exp/models/modeling_deepseek.py`、`models/glm_5/models/modeling_glm.py`、`models/kimi_k2_thinking/models/modeling_deepseek.py`、`models/longcat_flash/models/modeling_longcat_flash.py`、`models/longcat_flash_lite/models/modeling_longcat_flash_lite.py`
 
 - MoE A8 不只是 expert 内部 `FusedMoEGMM` 量化；routing / dispatch / combine 是否携带 activation scale 也是适配核心。
 - EP 路线至少有两条合法实现：一条是在 `npu_moe_init_routing_v2` / `npu_moe_distribute_dispatch_v2` 上显式走 A8 scale side channel；另一条是 dispatch / all-to-all 保持 BF16，在 `npu_moe_re_routing` 或 `dispatch_v2` 之后按 rank 本地 `npu_dynamic_quant`，再把 `pertoken_scale` 传给 experts。
@@ -189,7 +189,7 @@ Skill 动作：
 
 #### 经验 C1：MLA/KVCache C8 的量化边界由 prolog、cache 和 FA 共同定义
 
-代表路径：`models/deepseek_r1/models/modeling_deepseek.py`、`models/deepseek-v3.2-exp/models/modeling_deepseek.py`、`models/glm_5/models/modeling_glm.py`、`models/kimi-k2-thinking/models/modeling_deepseek.py`
+代表路径：`models/deepseek_r1/models/modeling_deepseek.py`、`models/deepseek_v3_2_exp/models/modeling_deepseek.py`、`models/glm_5/models/modeling_glm.py`、`models/kimi_k2_thinking/models/modeling_deepseek.py`
 
 - C8 不是简单把 KV cache dtype 改成 int8。模型侧需要同时处理 `npu_mla_prolog_v3`、cache layout、query scale、cache scale 和后续 attention kernel。
 - DeepSeek-R1 路线会在进入 MLA prolog 前对 hidden states 做动态量化，并通过 `weight_quant_mode=2`、`kv_cache_quant_mode=1`、`query_quant_mode=1` 让 prolog 处理 W8A8C8。
@@ -206,7 +206,7 @@ Skill 动作：
 
 #### 经验 C2：Indexer / LI cache C8 有独立量化闭环
 
-代表路径：`models/deepseek-v3.2-exp/models/indexer.py`、`models/glm_5/models/indexer.py`
+代表路径：`models/deepseek_v3_2_exp/models/indexer.py`、`models/glm_5/models/indexer.py`
 
 - Indexer 侧通常不是普通 attention 量化，而是独立的 LI cache / sparse indexer 量化闭环。
 - q/k 在进入 lightning indexer 前会先做 Hadamard transform，再动态量化，生成 `query_dequant_scale` 和 `key_dequant_scale`。
@@ -225,7 +225,7 @@ Skill 动作：
 
 ## post-load 例外汇总
 
-代表路径：模型 ForCausalLM 的 `process_weights_after_loading` 方法（如 `models/qwen3_moe/models/modeling_qwen3_moe.py`、`models/deepseek_r1/models/modeling_deepseek.py`），post-load 调用点：框架模型在 `executor/core/model_worker/model_worker.py::_process_weights_after_loading` 触发；早期 runner 模型（如 glm_5 / deepseek-v3.2-exp）在其 `runner_*.py` 内调用（见 contract §5）。
+代表路径：模型 ForCausalLM 的 `process_weights_after_loading` 方法（如 `models/qwen3_moe/models/modeling_qwen3_moe.py`、`models/deepseek_r1/models/modeling_deepseek.py`），post-load 调用点：框架模型在 `executor/core/model_worker/model_worker.py::_process_weights_after_loading` 触发；早期 runner 模型（如 glm_5 / deepseek_v3_2_exp）在其 `runner_*.py` 内调用（见 contract §5）。
 
 同一套公共量化方法在不同模型中，post-load 参数不一定相同。常见差异：
 
@@ -278,9 +278,9 @@ Skill 动作：
 
 **命名与归类规则**：
 
-- 经验**标题按「模式 / 教训」命名**（如经验 B1「用量化友好 SwigLU 链替代浮点」），**不要用纯模型名**——同一模式常被多个模型确认，模型名放进「代表路径」字段。
-- **改造要点 vs 经验** 的边界：该结构**通用必做项**（不依赖某个已确认模型即成立）写入卡的「改造要点」；**已确认并复现的具体模式 / 坑**（带代表路径）才作为「经验」沉淀，二者不重复。
-- 可复用其它卡已有经验时**直接引用**（如 Dense 卡经验 A2 的 SwiGLU 链引用经验 B1），不重述。
-- **代表路径标到文件 + 符号**（类名 / 方法名，如 `_forward_w8a8int8`），**不写死行号**——行号随代码漂移、符号稳定。
+- 经验**标题按「模式 / 教训」命名**（如经验 B1「用量化友好 SwiGLU 链替代浮点」），不要用纯模型名——同一模式常被多个模型确认，模型名放进「代表路径」字段。
+- **改造要点 vs 经验** 的边界：该结构通用必做项（不依赖某个已确认模型即成立）写入卡的「改造要点」；已确认并复现的具体模式 / 缺陷（带代表路径）才作为「经验」沉淀，二者不重复。
+- 可复用其它卡已有经验时直接引用（如 Dense 卡经验 A2 的 SwiGLU 链引用经验 B1），不重述。
+- **代表路径标到文件 + 符号**（类名 / 方法名，如 `_forward_w8a8int8`），不写死行号——行号随代码漂移、符号稳定。
 
 不沉淀以下内容：未确认方案 / 失败试验细节 / 非量化优化（AFD / 多流 / 权重预取 / SuperKernel / graph cache）/ 仅含量化绝对性能没有 BF16 同条件基线的结论。

@@ -29,7 +29,7 @@ description: SuperKernel 适配技能。当用户需要启用 SuperKernel 算子
 4. **性能测试验证**（必须执行，不可跳过）
 
 **最终产出**：
-- 优化后的代码文件（config.yaml、modeling_*.py）
+- 优化后的代码文件（`config/{yaml_name}.yaml`、`modeling_*.py`）
 - SuperKernel 优化文档（`superkernel_optimization_report.md`）
 
 ---
@@ -42,7 +42,7 @@ description: SuperKernel 适配技能。当用户需要启用 SuperKernel 算子
 
 1. **读取模型代码**：
    - 找到模型实现文件（`models/{model_name}/models/modeling_*.py`）
-   - 找到配置文件（`models/{model_name}/config.yaml`）
+   - 找到配置文件（`models/{model_name}/config/{yaml_name}.yaml`）
    - 找到 runner 文件（`models/{model_name}/models/runner_*.py`）
 
 2. **识别模型架构特征**：
@@ -80,12 +80,10 @@ description: SuperKernel 适配技能。当用户需要启用 SuperKernel 算子
 | **仅 Attention 模块** | 只将 Attention 计算纳入 SuperKernel scope | 首次尝试、模型瓶颈在 Attention | 风险小、易调试 |
 | **仅 MoE 模块** | 只将 MoE 专家计算纳入 SuperKernel scope | MoE 架构模型 | 针对性强、效果明显 |
 | **全模型 Decoder 层** | 将整个 Decoder 层纳入 SuperKernel scope | 模型结构简单、已有成功案例 | 融合范围最大、性能提升潜力最高、调试难度较大 |
-| **使用自动分析工具** | 启动 subagent 分析最优 Scope 划分 | 追求最优性能 | 基于性能分析自动推荐、耗时较长（5-10分钟） |
 | **自定义 Scope** | 手动指定需要融合的模块 | 有特殊需求或已知最优配置 | 灵活性高 |
 
 **执行内容**：
 - 根据用户选择，生成对应的 Scope 配置
-- 如果选择"自动分析工具"，启动 subagent 执行性能分析
 - 生成 Scope 标记代码片段
 - 确定需要修改的文件和具体位置
 
@@ -105,7 +103,7 @@ description: SuperKernel 适配技能。当用户需要启用 SuperKernel 算子
 
 #### 3.1 配置文件修改
 
-修改 `models/{model_name}/config.yaml`：
+修改 `models/{model_name}/config/{yaml_name}.yaml`：
 
 ```yaml
 # 确保以下配置
@@ -130,12 +128,12 @@ class YourModel:
     def decode(self, input_ids, ...):
         is_prefill = False  # decode 阶段
 
-        # 根据选择的 Scope 策略添加
-        with superkernel_scope(
-            self.enable_superkernel and not is_prefill,
-            label="decode_layers",  # 或 "attention_only", "moe_only"
-            option="stream-fusion=1"  # 编译选项
-        ):
+        # executor/utils/common_utils.py: superkernel_scope(enable, scope, options=None)
+        # scope 与 options 按位置传入，没有 label= / option= 关键字
+        # scope 是透传给 tng.scope.super_kernel 的自由标签，取值见 references/scope-templates/
+        scope = "all_decoder_layers"
+        option = "stream-fusion=1" if self.enable_multi_streams else ""
+        with superkernel_scope(self.enable_superkernel and not is_prefill, scope, option):
             for decoder_layer in self.layers:
                 # 运算逻辑
                 hidden_states = decoder_layer(
@@ -154,7 +152,7 @@ class YourModel:
 - **全 Decoder 层**：在整个 Decoder 层循环外层
 
 **产出**：
-- 修改后的代码文件（config.yaml、modeling_*.py 等）
+- 修改后的代码文件（`config/{yaml_name}.yaml`、`modeling_*.py` 等）
 
 ---
 
@@ -166,42 +164,30 @@ class YourModel:
 
 #### 4.1 建立性能基线
 
-1. **临时禁用 SuperKernel**：
+1. **准备关闭 SuperKernel 的配置副本**（在仓库根执行，不要原地改已有配置）：
    ```bash
-   cd models/{model_name}
-   # 备份当前配置
-   cp config.yaml config.yaml.superkernel
-   # 禁用 SuperKernel
-   sed -i 's/enable_superkernel: True/enable_superkernel: False/' config.yaml
+   cp models/{model_name}/config/{yaml_name}.yaml models/{model_name}/config/{yaml_name}_sk_off.yaml
+   sed -i 's/enable_superkernel: True/enable_superkernel: False/' models/{model_name}/config/{yaml_name}_sk_off.yaml
    ```
 
 2. **运行基线测试**：
    ```bash
-   bash infer.sh 2>&1 | tee baseline.log
+   bash executor/scripts/infer.sh --model {model_name} --yaml {yaml_name}_sk_off.yaml
    ```
 
 3. **记录基线性能**：
-   - Decode 单步耗时（ms）
-   - 吞吐量（tokens/s）
-   - 从日志中提取关键性能指标
+   - Decode 单步耗时（ms），从日志的逐步计时行取中位数
+   - 吞吐量（tokens/s），按 `1000 / decode_ms × batch_size` 换算
 
 #### 4.2 测试优化版本
 
-1. **恢复 SuperKernel 配置**：
-   ```bash
-   # 恢复 SuperKernel 配置
-   cp config.yaml.superkernel config.yaml
-   ```
+原配置未被改动，直接用它跑优化版本：
 
-2. **运行优化测试**：
-   ```bash
-   bash infer.sh 2>&1 | tee optimized.log
-   ```
+```bash
+bash executor/scripts/infer.sh --model {model_name} --yaml {yaml_name}.yaml
+```
 
-3. **记录优化性能**：
-   - Decode 单步耗时（ms）
-   - 吞吐量（tokens/s）
-   - 从日志中提取关键性能指标
+**记录优化性能**：按 4.1 第 3 步同样的口径取 Decode 单步耗时与换算吞吐量。
 
 #### 4.3 性能对比分析
 
@@ -211,11 +197,13 @@ class YourModel:
 吞吐量提升 = (优化后吞吐量 - 基线吞吐量) / 基线吞吐量 × 100%
 ```
 
+对比完成后删除临时副本 `models/{model_name}/config/{yaml_name}_sk_off.yaml`。
+
 #### 4.4 生成优化报告
 
 **必须生成**：创建 `superkernel_optimization_report.md`，包含：
 
-```markdown
+````markdown
 # SuperKernel 优化报告
 
 ## 优化配置
@@ -227,7 +215,7 @@ class YourModel:
 ## 代码修改
 
 ### 配置文件修改
-- 文件：`config.yaml`
+- 文件：`config/{yaml_name}.yaml`
 - 修改内容：启用 `enable_superkernel: True`
 
 ### 模型代码修改
@@ -256,10 +244,9 @@ class YourModel:
 ## 使用说明
 
 优化后的模型配置已保存，可直接使用：
-\`\`\`bash
-cd models/{model_name}
-bash infer.sh
-\`\`\`
+```bash
+bash executor/scripts/infer.sh --model {model_name} --yaml {yaml_name}.yaml
+```
 ```
 
 **产出**：
@@ -275,7 +262,7 @@ bash infer.sh
 完成所有四个步骤后，必须提供：
 
 1. **优化后的代码文件**：
-   - `models/{model_name}/config.yaml`（已启用 SuperKernel）
+   - `models/{model_name}/config/{yaml_name}.yaml`（已启用 SuperKernel）
    - `models/{model_name}/models/modeling_*.py`（已添加 Scope 标记）
 
 2. **SuperKernel 优化报告**：
@@ -302,16 +289,13 @@ bash infer.sh
 首次尝试？
 └─ 是 → 选择"仅 Attention 模块"（风险最小）
 
-追求最优性能？
-└─ 是 → 选择"使用自动分析工具"
-
 已知最优配置？
 └─ 是 → 选择"自定义 Scope"
-```
+````
 
 ### Scope 模板
 
-详细的 Scope 模板见 `resources/scope-templates/` 目录：
+详细的 Scope 模板见 `references/scope-templates/` 目录：
 - `attention-only.md` - 仅 Attention 的 Scope 模板
 - `moe-only.md` - 仅 MoE 的 Scope 模板
 - `full-model.md` - 全模型 Scope 模板
@@ -335,12 +319,12 @@ bash infer.sh
 ### 内部文档
 - `references/scope-analysis-guide.md` - Scope 分析详细指南
 - `references/performance-baseline-guide.md` - 性能基线建立指南
-- `resources/scope-templates/` - Scope 模板
+- `references/scope-templates/` - Scope 模板
 
 ### 外部文档
 - [官方 SuperKernel 开发文档](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/83RC1alpha002/opdevg/Ascendcopdevg/atlas_ascendc_10_00029.html)
 - [PyTorch 图模式使用指南](https://www.hiascend.com/document/detail/zh/Pytorch/710/modthirdparty/torchairuseguide/torchair_00003.html)
-- [DeepSeek-R1 decode 性能优化](../../../docs/models/deepseek-r1/deepseek_r1_decode_optimization.md)
+- [DeepSeek-R1 decode 性能优化](../../../docs/models/deepseek_r1/deepseek_r1_decode_optimization.md)
 
 ---
 

@@ -1,29 +1,25 @@
 {
-  "enabledPlugins": {
-    "code-simplifier@claude-plugins-official": true,
-    "skill-creator@claude-plugins-official": true
-  },
   "hooks": {
     "PreToolUse": [
       {
         "matcher": "Edit|Write",
-        "hooks": [{"type": "command", "command": "python3 \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/pre_tool_use.py"}]
+        "hooks": [{"type": "command", "command": "sh -c 'f=\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/pre_tool_use.py; [ -f \"$f\" ] || { echo \"hook 缺失，改代码前必读 progress.md 的保护未生效，运行 scripts/init-agent.sh 恢复：${f}\" >&2; exit 1; }; exec python3 \"$f\"'"}]
       },
       {
         "matcher": "Edit|Write|Bash",
-        "hooks": [{"type": "command", "command": "python3 \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/time_reminder.py"}]
+        "hooks": [{"type": "command", "command": "sh -c 'f=\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/time_reminder.py; [ -f \"$f\" ] || { echo \"hook 缺失，时间提示未生效，运行 scripts/init-agent.sh 恢复：${f}\" >&2; exit 1; }; exec python3 \"$f\"'"}]
       }
     ],
     "PostToolUse": [
       {
         "matcher": "Read",
-        "hooks": [{"type": "command", "command": "python3 \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/post_tool_use.py"}]
+        "hooks": [{"type": "command", "command": "sh -c 'f=\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/post_tool_use.py; [ -f \"$f\" ] || { echo \"hook 缺失，progress.md 读取标记未生效，运行 scripts/init-agent.sh 恢复：${f}\" >&2; exit 1; }; exec python3 \"$f\"'"}]
       }
     ],
     "SubagentStop": [
       {
         "matcher": "model-infer-implementer|model-infer-reviewer",
-        "hooks": [{"type": "command", "command": "python3 \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/subagent_stop.py"}]
+        "hooks": [{"type": "command", "command": "sh -c 'f=\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/subagent_stop.py; [ -f \"$f\" ] || { echo \"hook 缺失，subagent 自验证完整性检查未生效，运行 scripts/init-agent.sh 恢复：${f}\" >&2; exit 1; }; exec python3 \"$f\"'"}]
       }
     ]
   }

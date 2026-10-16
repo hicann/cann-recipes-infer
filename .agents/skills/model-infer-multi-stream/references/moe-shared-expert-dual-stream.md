@@ -49,26 +49,22 @@ flowchart LR
 
 ```python
 if self.n_shared_experts > 0:
-    enable_multi_streams = self.enable_multi_streams and not is_prefill
-    with npu_stream_switch(enable_multi_streams, "11"):
+    enable_gegraph_and_multistream = self.enable_gegraph_and_multistream and not is_prefill
+    with npu_stream_switch(enable_gegraph_and_multistream, "22"):
         hidden_states_share = self.shared_experts(
             hidden_states.view(-1, hidden_states.shape[-1])
         )
 ```
 
-如果叠加 ACL graph event，常见写法会在切流前后记录和等待 tagged event：
+npugraph_ex 路径调用 `executor/utils/stream_utils.py` 的 `record_stream` / `record_event` / `wait_event` / `npu_stream_switch_npugraph` 包装，在切流前记录流与 event、进入副流后等待：
 
 ```python
-if use_aclgraph_event:
-    tng.ops.npu_record_tagged_stream(hidden_states, "11")
-    tng.ops.npu_tagged_event_record(moe_npu_events[0])
-
-with npu_stream_switch(enable_multi_streams, "11"):
-    if use_aclgraph_event:
-        tng.ops.npu_tagged_event_wait(moe_npu_events[0])
+record_stream(enable_npugraphex_and_multistream, hidden_states, self.shared_expert_stream)
+record_event(enable_npugraphex_and_multistream, self.npu_events, 0)
+with npu_stream_switch_npugraph(enable_npugraphex_and_multistream, self.shared_expert_stream):
+    wait_event(enable_npugraphex_and_multistream, self.npu_events, 0)
     hidden_states_share = self.shared_experts(hidden_states.view(-1, hidden_states.shape[-1]))
-    if use_aclgraph_event:
-        tng.ops.npu_tagged_event_record(moe_npu_events[1])
+    record_event(enable_npugraphex_and_multistream, self.npu_events, 1)
 ```
 
 图模式下通常还会给 superkernel 打开多流融合选项：

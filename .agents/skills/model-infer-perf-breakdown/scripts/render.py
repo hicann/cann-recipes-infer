@@ -1,4 +1,13 @@
 #!/usr/bin/env python3
+# ----------------------------------------------------------------------------------------------------------
+# Copyright (c) 2026 Huawei Technologies Co., Ltd.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# ----------------------------------------------------------------------------------------------------------
 # coding=utf-8
 """Render per-component sub-item dashboard from a sample-driven draft.
 
@@ -76,8 +85,8 @@ import time
 from collections import Counter, defaultdict
 
 
-UNMATCHED_PCT_HARD_LIMIT = 0.05    # > 5% unmatched ops 视为 Phase 1.5 漏 ack
-CLUSTER_COVERAGE_MIN_PCT = 80.0    # Σ cluster_wall.median / TOTAL.median 低于此值时红字提示
+UNMATCHED_PCT_HARD_LIMIT = 0.05    # above 5% unmatched ops, treat Phase 1.5 as missing an ack
+CLUSTER_COVERAGE_MIN_PCT = 80.0    # warn in red when Σ cluster_wall.median / TOTAL.median drops below this
 
 
 def load_json(path):
@@ -344,7 +353,7 @@ def analyze_component_type(
     method = outlier_cfg.get("method", "iqr")
     k = outlier_cfg.get("k", 1.5)
     n_inst = len(instances)
-    theory_present = _has_theory_columns(details_by_idx)   # 理论性能可选；缺则列留空
+    theory_present = _has_theory_columns(details_by_idx)   # optional; leave columns empty when absent
     cluster_order = [name for name, _d, _p in compiled]
     per_inst_wall_cluster = {c: [] for c in cluster_order}
     # cluster_slot_durs[cluster][(op_name, occurrence)] = [dur_us per instance,
@@ -619,8 +628,10 @@ def _to_float(value):
 
 
 def _has_theory_columns(details_by_idx):
-    """理论列是否存在（Step 1.5 是否跑过）。理论性能是可选的——外部
-    operator-theoretical-perf skill 可能不存在；没跑则 render 把理论列留空，不阻塞。"""
+    """Report whether the theoretical columns exist, which tells whether Step 1.5 ran.
+    Theoretical performance is optional because the external operator-theoretical-perf
+    skill may be unavailable; when it has not run, render leaves those columns empty
+    rather than blocking."""
     if not details_by_idx:
         return False
     return any("theoretical_operator_time_us" in d for d in details_by_idx.values())
@@ -1031,8 +1042,8 @@ def render_inst_op_table(op_records, details_by_idx, dur_anom_map, count_anom_ma
     dur_anom_map: {(op_name, occurrence): {duration_us, baseline_us}} flagged
         as duration outliers within this cluster, scoped to this instance.
     count_anom_map: {op_name: {count, modal_count}} for this instance — covers
-        both 多出 (count > modal) and 缺失/少出 (count < modal). Missing ops
-        are not in op_records, so we emit synthetic rows at the end.
+        both extra ops (count > modal) and missing ops (count < modal). Missing
+        ops are not in op_records, so we emit synthetic rows at the end.
     """
     if not op_records or not details_by_idx:
         return ""
@@ -1477,8 +1488,9 @@ def render_html(model_name, sections, outlier_cfg, details_by_idx=None, row_insi
                 f"</div>"
             )
         elif gap_pct > 0.0:
-            # 少量 overlap：过滤掉 < 1µs 的 floating-point 噪声项后，
-            # 若仍有 pair 则插一个浅蓝 info 面板提示是哪些桶在跨 stream 并发。
+            # Small overlap: after dropping pairs below 1µs of floating-point noise, any
+            # remaining pair gets a light-blue info panel naming the buckets that run
+            # concurrently across streams.
             pairs = [p for p in (ov.get("top_pairs", []) or [])
                      if p.get("median_overlap_ms", 0.0) >= 0.001][:8]
             if pairs:
@@ -1558,8 +1570,9 @@ def render_html(model_name, sections, outlier_cfg, details_by_idx=None, row_insi
 
 
 def print_history_reminder(run_dir):
-    """Hook #6：<run_dir>/HISTORY.md 缺失时打 stdout 软提示。不 exit 1，
-    HISTORY 是收尾物，硬卡反而打断 agent 的写日志节奏。返回是否打印过。"""
+    """Hook #6: print a soft stdout reminder when <run_dir>/HISTORY.md is missing.
+    Does not exit 1, because HISTORY is a wrap-up artifact and a hard gate would break
+    the agent's logging rhythm. Returns whether the reminder was printed."""
     history_path = os.path.join(run_dir, "HISTORY.md")
     if os.path.exists(history_path):
         return False
@@ -1668,14 +1681,15 @@ def main():
                    help="run label embedded in metrics.json (default: parent "
                         "dir name of -o). compare_runs.py keys runs by label.")
     p.add_argument("--accept-unmatched", action="store_true",
-                   help="跳过 compute-core unmatched%% > 阈值 的硬阻断。"
-                        "默认 exit 1 强迫 agent 看 per-core 分解后再决定是否放行"
-                        "（通信类已自动排除出 gate 指标）。")
+                   help="skip the hard stop when compute-core unmatched%% exceeds the "
+                        "threshold; exits 1 by default so the agent reviews the per-core "
+                        "breakdown first (communication ops are already excluded from the gate metric)")
     p.add_argument("--unmatched-limit", type=float,
                    default=UNMATCHED_PCT_HARD_LIMIT,
-                   help=f"compute-core unmatched 比例硬阈值 (默认 "
-                        f"{UNMATCHED_PCT_HARD_LIMIT}); 通信/AICPU 等非 layer "
-                        f"core 不计入。重 IO/采样负载可调高。")
+                   help=f"hard threshold on the compute-core unmatched ratio "
+                        f"(default {UNMATCHED_PCT_HARD_LIMIT}); non-layer cores (communication "
+                        f"and HCCL) are excluded, and AI_CPU is already dropped in Step 1 unless "
+                        f"--keep-ai-cpu was passed. Raise it for IO-heavy or sampling workloads.")
     args = p.parse_args()
 
     draft = load_json(args.draft)

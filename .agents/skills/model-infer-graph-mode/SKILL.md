@@ -66,47 +66,7 @@ description: 基于 PyTorch 框架的昇腾 NPU 模型推理图模式适配技�
 | **通用模型** | npugraph_ex | `references/npugraph_ex-guide.md` |
 | **需要 GE 图模式** | GE（Ascend IR） | `references/ge-graph-guide.md` |
 
-| 特性 | npugraph_ex 后端 (aclgraph) | GE 图模式 (Ascend IR) |
-|------|----------------------------|----------------------|
-| **启用方式** | `backend="npugraph_ex"` | `torchair.get_npu_backend()` |
-| **实现原理** | 捕获模式 (Capture & Replay) | FX 图转换为 Ascend IR，GE 引擎编译执行 |
-| **成熟度** | 试验特性，暂不支持商用 | 更成熟稳定 |
-| **PyTorch版本** | 需要 2.6.0+ | 无特殊要求 |
-| **支持场景** | 在线推理 | 通用场景 |
-| **类似技术** | torch.cuda.CUDAGraph | 传统图编译 |
-
-### npugraph_ex 快速示例
-
-```python
-import torch
-import torch_npu
-
-model = YourModel().to("npu")
-opt_model = torch.compile(model, backend="npugraph_ex", fullgraph=True, dynamic=False)
-# 注：LLM Decode 场景 actual_seq_lengths 每步变化时需 dynamic=True
-output = opt_model(input_tensor)
-```
-
-**关键约束**：PyTorch 2.6.0+、仅支持在线推理、不支持随机数算子和动态控制流、forward 中不可使用 `.item()`
-
-### GE 图模式快速示例
-
-```python
-import torch
-import torch_npu
-import torchair
-from torchair import patch_for_hcom
-
-patch_for_hcom()  # 集合通信入图（有 TP/EP 并行时需调用）
-
-model = YourModel().to("npu")
-config = torchair.CompilerConfig()
-npu_backend = torchair.get_npu_backend(compiler_config=config)
-opt_model = torch.compile(model, backend=npu_backend)
-output = opt_model(input_tensor)
-```
-
-> 详细文档：npugraph_ex 见 `references/npugraph_ex-guide.md`，GE 见 `references/ge-graph-guide.md`
+两种模式的启用方式、实现原理、成熟度与版本要求对比，见 `references/ge-graph-guide.md` 的「与 npugraph_ex 对比」；各自的最小可运行示例与使用约束见对应文档的「快速上手」「使用约束」。
 
 ---
 
@@ -118,48 +78,9 @@ output = opt_model(input_tensor)
 
 ## LLM 模型适配要点
 
-> 对于 LLM 推理模型，**必须严格区分 prefill 和 decode 阶段**。
+对于 LLM 推理模型必须严格区分 prefill 和 decode 阶段。Prefill 输入长度动态变化，保持 eager；Decode 输入长度固定、shape 稳定，对它应用图模式。改造方式是把两阶段的 forward 逻辑分离成独立方法，只对 decode 方法调 `torch.compile`。
 
-### Prefill 与 Decode 阶段限制
-
-| 阶段 | 是否支持图模式 | 原因 |
-|------|---------------|------|
-| **Prefill** | **禁止使用** | 输入长度动态变化、首 token 生成逻辑复杂、shape 不固定 |
-| **Decode** | **推荐使用** | 输入长度固定（通常为 1）、shape 稳定、适合图捕获 |
-
-**实现建议**：
-- 将 prefill 和 decode 的 forward 逻辑分离成不同方法
-- 仅对 decode 方法应用 `torch.compile` 图模式
-- prefill 阶段使用 eager 模式执行
-
-```python
-class YourModel:
-    def prefill(self, input_ids, ...):
-        """Prefill 阶段：使用 eager 模式"""
-        # 输入长度动态变化，不适合图模式
-        return self._forward(input_ids, ...)
-
-    def decode(self, input_ids, ...):
-        """Decode 阶段：可使用图模式"""
-        # 输入长度固定（通常为 1），适合图捕获
-        return self._forward(input_ids, ...)
-
-# 仅对 decode 方法应用图模式, model.prefill保持 eager
-model.decode = torch.compile(model.decode, backend="npugraph_ex", ...)
-```
-
-### 核心改造原则
-
-**核心原则**：将动态变化的东西提取为模型输入，模型内部尽量保证静态。
-
-| 动态因素 | 问题表现 | 解决思路 |
-|---------|---------|---------|
-| **内存地址变化** | Guard 失败、重编译 | 预分配固定大小，原地更新 |
-| **Shape 变化** | 图中断、多次编译 | 固定 shape 或通过参数控制 |
-| **Python 控制流** | Graph Break | 使用 Tensor 操作或模式参数 |
-| **`.item()` 调用** | 强制 Graph Break | 保持 Tensor 或外部传入 |
-
-> 详细改造指南：`references/llm-model-guide.md`
+改造的核心是把动态变化的东西提取为模型输入，模型内部保持静态。动态因素的完整清单、逐模块改造写法与 prefill / decode 分离的代码示例，见 `references/llm-model-guide.md` 的「核心原则」「模块改造指南」「区分 Prefill/Decode 实践指南」。
 
 ---
 

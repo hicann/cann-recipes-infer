@@ -11,13 +11,13 @@ MoE 模型 Decode 阶段的主流模式：Attention DP + MoE 大 EP，embed/lmhe
 | 参考模型 | 卡数 | attn_tp | dense_tp | moe_tp | embed_tp | lmhead_tp | oproj_tp | 量化 | 特殊配置 | 配置路径 |
 |---------|------|---------|----------|--------|----------|-----------|----------|------|---------|---------|
 | DeepSeek-R1 | 128 | 1 | 1 | 1 | 1 | — | — | W8A8 | moe_chunk=65536, prefill_multi_cycle | `decode_r1_rank_128_128ep_a8w8.yaml` |
-| DeepSeek-R1 | 128 | 1 | 1 | 1 | 1 | — | — | W8A8C8 | MTP, perfect_eplb, SuperKernel | `decode_r1_rank_128_128ep_a8w8c8_mtp_benchmark.yaml` |
+| DeepSeek-R1 | 128 | 1 | 1 | 1 | 1 | — | — | W8A8C8 | MTP, force_eplb, SuperKernel | `decode_r1_rank_128_128ep_a8w8c8_mtp_benchmark.yaml` |
 | DeepSeek-R1 | 16 | 1 | 1 | 1 | 16 | 16 | — | W8A8 | 16EP, micro_batch=0 | `decode_r1_rank_16_16ep_a8w8.yaml` |
 | DeepSeek-V3.2-Exp | 128 | 1 | 4 | 1 | 16 | 16 | 8 | BF16 | cp_size=128 | `deepseek_v3.2_exp_rank_128_128ep_decode_benchmark.yaml` |
 | DeepSeek-V3.2-Exp | 128 | 1 | 4 | 1 | 16 | 16 | 4 | W8A8C8 | MTP3, cp_size=128 | `deepseek_v3.2_exp_rank_128_128ep_w8a8c8_decode_benchmark.yaml` |
 | GLM-5 | 128 | 1 | 4 | 1 | 16 | 16 | 4 | W8A8 | MTP3, cp_size=128 | `glm_5_rank_128_128ep_w8a8_decode_benchmark.yaml` |
-| Kimi-K2 | 128 | 1 | 4 | 1 | 16 | 16 | 8 | — | cp_size=128 | `kimi_k2_thinking_rank_128_128ep_decode_benchmark.yaml` |
-| LongCat-Flash | 128 | 1 | 8 | 1 | 1 | 16 | 8 | W8A8 | AFD, MTP2, perfect_eplb, SuperKernel, prefetch | `longcat_flash_densetp8_ep128_*.yaml` |
+| Kimi-K2 | 32 | 1 | 4 | 1 | 16 | 16 | — | — | PD 分离 decode | `pd/decode.yaml` |
+| LongCat-Flash | 128 | 1 | 8 | 1 | 1 | 16 | 8 | W8A8 | MTP2, force_eplb, SuperKernel, prefetch | `longcat_flash_densetp8_ep128_*.yaml` |
 | Qwen3-MoE | 128 | 1 | 1 | 1 | 1 | 1 | — | — | 128EP 纯EP模式 | `qwen3_235b_128ep.yaml` |
 
 **经验总结**：
@@ -74,7 +74,7 @@ Prefill 阶段以 TTFT 为目标，长序列需要 CP 或大 TP 分摊计算和�
 | DeepSeek-V3.2-Exp | 64 | 1 | 1 | 1 | 16 | 16 | 8 | 64 | 65536 | BF16 | `*_rank_64_64ep_prefill_benchmark.yaml` |
 | DeepSeek-V3.2-Exp | 64 | 1 | 1 | 1 | 16 | 16 | 1 | 64 | 65536 | W8A8C8 | `*_rank_64_64ep_w8a8c8_prefill_benchmark.yaml` |
 | GLM-5 | 64 | 1 | 1 | 1 | 16 | 16 | 1 | 64 | 65536 | W8A8 | `glm_5_rank_64_64ep_w8a8_prefill_benchmark.yaml` |
-| Kimi-K2 | 64 | 1 | 1 | 1 | 16 | 16 | 1 | 64 | 65536 | — | `kimi_k2_thinking_rank_64_64ep_prefill_benchmark.yaml` |
+| Kimi-K2 | 32 | 1 | 1 | 1 | 16 | 16 | — | 32 | 65536 | — | `pd/prefill.yaml` |
 
 **经验总结**：
 - **CP 是长序列 Prefill 的标准方案**：V3.2-Exp/GLM-5/Kimi-K2 都用 cp_size=卡数，attn_tp=1
@@ -92,12 +92,11 @@ Prefill 阶段以 TTFT 为目标，长序列需要 CP 或大 TP 分摊计算和�
 
 | 参考模型 | 卡数 | kvp_size | oproj_tp | 序列长度 | 量化 | 特殊配置 | 配置路径 |
 |---------|------|---------|----------|---------|------|---------|---------|
-| LongCat-Flash | 32 | 8 | 8 | 131072 | W8A8 | decode_only, MLA_prolog | `longcat_flash_densetp8_ep32_kvp8_gegraph_w8a8.yaml` |
 | DeepSeek-V3.2-Exp | 128 | — | 4 | 65536 | W8A8C8 | enable_offload=T | `*_w8a8c8_offload_benchmark.yaml` |
 | DeepSeek-R1 | 128 | — | — | 65536 | W8A8C8 | dense_tp=4, lmhead_tp=16, moe_chunk=512 | `decode_r1_rank_128_128ep_a8w8c8_mtp_longseq.yaml` |
 
 **经验总结**：
-- **KVP**：KV Cache 按 head 维度切到多卡，每卡算部分 Attention 后聚合。约束：`oproj_tp = kvp_size`
+- **KVP**：KV Cache 按 head 维度切到多卡，每卡算部分 Attention 后聚合。约束：`oproj_tp = kvp_size`。仓内当前无 `kvp_size` 配置，该路径已下线
 - **KVCache Offload**：KV Cache 存主机内存，利用 TopK 局部性（~60% 命中率）减少 H2D 传输。需要 GatherSelectionKvCache 算子
 - R1 长序列方案不同：不用 KVP/Offload，而是 dense_tp=4 + moe_chunk=512 控制显存
 - 超长序列时 moe_chunk_max_len 要调小（512-1024），否则 MoE 激活显存爆
@@ -123,12 +122,12 @@ Prefill 阶段以 TTFT 为目标，长序列需要 CP 或大 TP 分摊计算和�
 
 | 模型 | Prefill 配置 | Decode 配置 | 设计文档 |
 |------|------------|-----------|---------|
-| DeepSeek-R1 | 32 卡 TP32 或 DP32 | 128 卡 EP128 | `docs/models/deepseek-r1/` |
-| DeepSeek-V3.2-Exp | 64 卡 CP64 | 128 卡 EP128+dense_tp4 | `docs/models/deepseek-v3.2-exp/` |
+| DeepSeek-R1 | 32 卡 TP32 或 DP32 | 128 卡 EP128 | `docs/models/deepseek_r1/` |
+| DeepSeek-V3.2-Exp | 64 卡 CP64 | 128 卡 EP128+dense_tp4 | `docs/models/deepseek_v3_2_exp/` |
 | GLM-5 | 64 卡 CP64 | 128 卡 EP128+dense_tp4 | — |
-| Kimi-K2 | 64 卡 CP64 | 128 卡 EP128+dense_tp4 | `docs/models/kimi-k2-thinking/` |
-| LongCat-Flash | — | 32/128 卡 dense_tp8+EP | `docs/models/longcat-flash/` |
-| Qwen3-MoE | — | 16 卡 TP16 / 128 卡 EP128 | `docs/models/qwen3-moe/` |
+| Kimi-K2 | 64 卡 CP64 | 128 卡 EP128+dense_tp4 | `docs/models/kimi_k2_thinking/` |
+| LongCat-Flash | — | 32/128 卡 dense_tp8+EP | `docs/models/longcat_flash/` |
+| Qwen3-MoE | — | 16 卡 TP16 / 128 卡 EP128 | `docs/models/qwen3_moe/` |
 | GPT-OSS | — | 8 卡 TP8 / 单卡 | `docs/models/gpt-oss/` |
 
 ---
@@ -137,9 +136,9 @@ Prefill 阶段以 TTFT 为目标，长序列需要 CP 或大 TP 分摊计算和�
 
 | 目标模型特征 | 参考文档 | 重点关注 |
 |-------------|---------|---------|
-| MoE + MLA + 大规模 EP Decode | `docs/models/deepseek-r1/` | EP 通信调优、MTP 收益、moe_chunk 配置 |
-| MoE + MLA + DSA/Sparse Attention | `docs/models/deepseek-v3.2-exp/` | CP vs TP 选择依据、KVCache Offload、MLA Absorb 权衡 |
-| MoE + MLA + 超长序列（256K+）| `docs/models/longcat-flash/` | KVP 约束、多流 core limiting、AFD、权重预取 |
-| MoE + 标准 GQA + 中规模 TP | `docs/models/qwen3-moe/` | head 切分、gate+up 合并、npu_swiglu 融合 |
-| MoE + W4A16 混合精度 | `docs/models/kimi-k2-thinking/` | 混合精度策略、Flash Decode |
+| MoE + MLA + 大规模 EP Decode | `docs/models/deepseek_r1/` | EP 通信调优、MTP 收益、moe_chunk 配置 |
+| MoE + MLA + DSA/Sparse Attention | `docs/models/deepseek_v3_2_exp/` | CP vs TP 选择依据、KVCache Offload、MLA Absorb 权衡 |
+| MoE + MLA + 超长序列（256K+）| `docs/models/longcat_flash/` | KVP 约束、多流 core limiting、AFD、权重预取 |
+| MoE + 标准 GQA + 中规模 TP | `docs/models/qwen3_moe/` | head 切分、gate+up 合并、npu_swiglu 融合 |
+| MoE + W4A16 混合精度 | `docs/models/kimi_k2_thinking/` | 混合精度策略、Flash Decode |
 | Dense + 标准 GQA | `docs/models/gpt-oss/` | 纯 TP 配置、Fixed KV Cache |

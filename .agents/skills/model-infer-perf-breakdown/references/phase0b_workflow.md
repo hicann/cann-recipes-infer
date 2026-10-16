@@ -25,8 +25,8 @@ agent 工作步骤：
 2. 回贴给用户 ack（**所有行号用 Excel 行号** = `org_index + 2`，并列出邻近 op 辅助核对）：
 
    ```
-   csa : excel 1210-1456  head=RmsNorm@1210  tail=TransposeBatchMatMul@1456
-         邻近：RmsNorm@1208(prev), HcPre@1457(next)
+   csa : excel 1210-1455  head=RmsNorm@1210  tail=TransposeBatchMatMul@1455
+         邻近：RmsNorm@1209(prev), AddRmsNormDynamicQuant@1456(next)
    moe : excel 1456-1750  head=AddRmsNormDynamicQuant@1456  tail=MoeDistributeCombine@1750
          邻近：HcPost@1751(next)
    ```
@@ -45,10 +45,10 @@ agent 工作步骤：
 
 1. 读 `forward()` 找每个 component 的第一个 / 最后一个 compute 调用，推断对应 prof 端 kernel 名：
    - `nn.RMSNorm` → `RmsNorm`
-   - `MoEDispatch` → `MoeDistributeDispatchV2`
+   - `torch_npu.npu_moe_distribute_dispatch_v2` → `MoeDistributeDispatchV2`
    - `nn.Linear` / 量化矩乘 → `MatMulV3` / `QuantBatchMatmulV3`
 2. （可选）跑 `python scripts/detect_structure.py --explore -r <run_dir>/raw_ops.json -o <run_dir>/explore.json` 看候选算子的频次是否符合预期（count = N × 该 component 在该 phase 出现次数；next_kernels_distinct 低的更适合做锚）。
-3. **同样按 A 档第 2 步格式回贴用户 ack**——明确标注"以下 sample 窗口和入口/出口提示是 agent 读 `<脚本路径:行号>` 推出来的，请核对"。
+3. **同样按 A 档第 2 步格式回贴用户 ack**——明确标注"以下 sample 窗口和入口/出口提示是 agent 读 `<脚本路径>` 的 `<函数名>` 推出来的，请核对"。
 4. 用户 ack 通过才写 `sample_ack.json`；用户单点纠正 → 回到 1 重推该项再 ack。
 
 ---
@@ -82,7 +82,7 @@ agent 工作步骤：
       "agent_note": "stream 189 is the main compute path; stream 203 carries index/cache side ops"
     },
     "moe": {
-      "source": "agent_inferred_from_script:modeling_xxx.py:412",
+      "source": "agent_inferred_from_script:modeling_xxx.py",
       "primary_stream_id": "203",
       "stream_samples": [
         {"stream_id": "203", "role": "primary", "op_indices": [1454, 1456, 1460]}
@@ -94,7 +94,7 @@ agent 工作步骤：
 
 `source` 三种取值：
 - `"user"` — 用户原话直接给
-- `"agent_inferred_from_script:<path>:<line>"` — agent 读脚本推出来的
+- `"agent_inferred_from_script:<path>"` — agent 读脚本推出来的
 - `"user_corrected"` — agent 推完后用户改过一处
 
 三种都必须经过用户 ack 才允许写入。`expected_components` 列表中任一缺失即视为 ack 未完成，`detect_structure.py` 启动时 exit 1。

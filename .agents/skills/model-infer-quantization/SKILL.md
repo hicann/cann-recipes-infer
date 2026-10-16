@@ -1,6 +1,6 @@
 ---
 name: model-infer-quantization
-description: infer 仓模型量化适配改造技能。分析并接入既有 compressed-tensors 量化方案和权重，完成量化产物契约检查、结构参考匹配、量化 runtime 映射、权重加载、post-load 处理、融合算子量化冲突回退、真实生效验证和收益评估。用于模型优化流程中的量化初评估和量化改造任务；不重新设计上游量化算法，不实现 compressed-tensors 之外的量化路线。
+description: infer 仓模型量化适配改造技能。分析并接入既有 compressed-tensors 量化方案和权重，完成量化产物契约检查、结构参考匹配、量化 runtime 映射、权重加载、post-load 处理、融合算子量化冲突回退、真实生效验证和收益评估。用于模型优化流程中的量化初评估和量化改造任务。
 ---
 
 # 模型量化适配改造
@@ -95,14 +95,7 @@ description: infer 仓模型量化适配改造技能。分析并接入既有 com
 
 ### 3.2 建立量化对象映射
 
-| 量化目标 | infer runtime object |
-| --- | --- |
-| Dense Linear | `Linear` / `ReplicatedLinear` / `RowParallelLinear` |
-| Dense MLP gate/up/down | 可量化 Linear；必要时 post-load 恢复 `gate/up` 融合 |
-| Attention q/k/v/o | 可量化 Linear；必要时 post-load 恢复 `q/k/v` 融合 |
-| MoE experts | `MoEGMM` / `FusedMoEGMM`，不满足时回退 per-expert Linear |
-| KVCache | `kv_cache_scheme` / cache scale / cache runtime |
-| `ignore` 模块 | 浮点回退，不宣称已量化 |
+按 3.1 的结构指纹把每个量化目标映射到 infer 运行对象，总表与无法映射时的处理见 `references/quantization-contract.md` 第 4 节。本步产出逐模块的映射清单，供第四步逐项打接入分级。
 
 ### 3.3 记录运行场景
 

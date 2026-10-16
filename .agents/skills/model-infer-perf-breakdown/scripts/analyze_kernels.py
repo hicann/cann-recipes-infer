@@ -1,17 +1,26 @@
 #!/usr/bin/env python3
+# ----------------------------------------------------------------------------------------------------------
+# Copyright (c) 2026 Huawei Technologies Co., Ltd.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# ----------------------------------------------------------------------------------------------------------
 """
-分析 kernel_details.csv，输出结构化 JSON 统计信息
+Analyze kernel_details.csv and emit structured JSON statistics.
 
-用法:
-  python analyze_kernels.py [-f FILE] [-s STEP] [-o OUTPUT] [-d DETAILS] [-m MD]
-  
-选项:
-  -f, --file FILE    指定 CSV 文件路径 (默认: kernel_details.csv)
-  -s, --step STEP    指定要输出详情的 step ID (默认: 自动选择第一个 step)
-  -o, --output FILE  输出 operators JSON 文件路径 (默认: kernels.json)
-  -d, --details FILE 输出详细 operators JSON 文件路径 (包含 CSV 全部字段)
-  -m, --markdown FILE 输出统计摘要 Markdown 文件路径 (不指定则不生成)
-  -h, --help         显示帮助信息
+Usage:
+  python analyze_kernels.py [-f FILE] [-s STEP] [-o OUTPUT] [-d DETAILS] [--keep-ai-cpu]
+
+Options:
+  -f, --file FILE     CSV file path (default: kernel_details.csv)
+  -s, --step STEP     step ID to emit operator details for (default: first step)
+  -o, --output FILE   operators JSON output path (default: kernels.json)
+  -d, --details FILE  detailed operators JSON output path, carrying every CSV column
+  --keep-ai-cpu       keep AI_CPU operators, which are dropped by default
+  -h, --help          show this help message
 """
 import csv
 import json
@@ -33,7 +42,7 @@ COMMUNICATION_FRAGMENT_NAME = 'AivKernel'
 MISSING_ID_VALUES = {'', 'N/A', 'NA', 'NONE', 'NULL'}
 
 METRIC_COLUMN_PATTERNS = [
-    'duration', 'time', 'cycles', 'ratio', 'utilization', 
+    'duration', 'time', 'cycles', 'ratio', 'utilization',
     'fops', 'rate', 'miss', 'count', 'num', 'dim', 'id'
 ]
 
@@ -65,16 +74,16 @@ def parse_column_value(value, col_name, json_key=None):
     value = value.strip().rstrip('\t')
     if not value or value == 'N/A':
         return None
-    
+
     col_lower = col_name.lower()
-    
+
     for suffix in FLOAT_SUFFIXES:
         if col_lower.endswith(suffix.lower()) or suffix.lower() in col_lower:
             try:
                 return float(value)
             except (ValueError, AttributeError):
                 return value
-    
+
     if is_metric_column(col_name):
         try:
             if '.' in value:
@@ -82,7 +91,7 @@ def parse_column_value(value, col_name, json_key=None):
             return int(value)
         except (ValueError, AttributeError):
             return value
-    
+
     try:
         if '.' in value:
             fval = float(value)
@@ -90,7 +99,7 @@ def parse_column_value(value, col_name, json_key=None):
         return int(value)
     except (ValueError, AttributeError):
         pass
-    
+
     return value
 
 
@@ -204,58 +213,59 @@ def has_matching_communication_summary(row, summaries, eps=1e-3):
 def extract_kernel_type(name):
     if not name:
         return 'Unknown'
-    
+
     if '/' in name:
         return name
-    
+
     if '_' not in name:
         return name
-    
+
     parts = name.split('_')
-    
+
     while parts and parts[-1].isdigit():
         parts.pop()
-    
+
     if not parts:
         return name
-    
+
     last_part = parts[-1]
     if last_part and last_part[0].isupper() and not last_part.isdigit():
         return last_part
-    
+
     return '_'.join([p for p in parts if p])
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description='分析 kernel_details.csv，输出结构化 JSON 统计信息',
+        description='Analyze kernel_details.csv and emit structured JSON statistics',
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument(
         '-f', '--file',
         default='kernel_details.csv',
-        help='指定 CSV 文件路径 (默认: kernel_details.csv)'
+        help='CSV file path (default: kernel_details.csv)'
     )
     parser.add_argument(
         '-s', '--step',
         type=int,
         default=None,
-        help='指定要输出详情的 step ID (默认: 自动选择第一个 step)'
+        help='step ID to emit operator details for (default: the first step)'
     )
     parser.add_argument(
         '-o', '--output',
         default='kernels.json',
-        help='输出 operators JSON 文件路径 (默认: kernels.json)'
+        help='operators JSON output path (default: kernels.json)'
     )
     parser.add_argument(
         '-d', '--details',
         default=None,
-        help='输出详细 operators JSON 文件路径 (包含 CSV 全部字段)'
+        help='detailed operators JSON output path, carrying every CSV column'
     )
     parser.add_argument(
         '--keep-ai-cpu',
         action='store_true',
-        help='保留 AI_CPU 算子（默认丢弃）。仅 host-bound 分析场景用；sample 模式严禁打开'
+        help='keep AI_CPU operators, which are dropped by default; '
+             'for host-bound analysis only and never in sample mode'
     )
     return parser.parse_args()
 
@@ -298,10 +308,10 @@ def _warmup_step_hint(steps_summary, selected_step_id, auto=False):
 def check_consistency(steps_summary):
     if len(steps_summary) <= 1:
         return
-    
+
     first_types = None
     first_step = None
-    
+
     for s in steps_summary:
         if first_types is None:
             first_types = s['kernel_types']
@@ -314,7 +324,7 @@ def check_consistency(steps_summary):
                 v2 = s['kernel_types'].get(k, 0)
                 if v1 != v2:
                     diff_kernels.append(f'  {k}: Step {first_step}={v1}, Step {s["step_id"]}={v2}')
-            
+
             raise ConsistencyError(
                 f'错误: 各 Step 的 Kernel 分布不一致\n'
                 f'差异:\n' + '\n'.join(diff_kernels[:10]) +
@@ -324,7 +334,7 @@ def check_consistency(steps_summary):
 
 def analyze_kernels(csv_file, detail_step_id=None, keep_ai_cpu=False):
     validate_file(csv_file)
-    
+
     steps_data = defaultdict(lambda: {
         'kernels': [],
         'kernels_details': [],
@@ -332,19 +342,19 @@ def analyze_kernels(csv_file, detail_step_id=None, keep_ai_cpu=False):
         'kernel_types': defaultdict(int),
         'all_columns': []
     })
-    
+
     try:
         with open(csv_file, 'r', encoding='utf-8') as f:
             reader = csv.DictReader(f)
-            
+
             if reader.fieldnames is None:
                 raise ValidationError('错误: CSV 文件为空或格式不正确')
             validate_csv_structure(reader.fieldnames)
-            
+
             all_columns = [col for col in reader.fieldnames if col not in IGNORED_COLUMNS]
             csv_rows = list(reader)
             communication_summaries = build_communication_summary_index(csv_rows)
-            
+
             has_accel_col = 'Accelerator Core' in reader.fieldnames
             row_count = 0
             ai_cpu_dropped = 0
@@ -408,17 +418,17 @@ def analyze_kernels(csv_file, detail_step_id=None, keep_ai_cpu=False):
                     for key in ('input_shapes', 'output_shapes'):
                         if key in detail_info and isinstance(detail_info[key], str):
                             detail_info[key] = detail_info[key].strip('"')
-                    
+
                     steps_data[step_id]['kernels'].append(op_info)
                     steps_data[step_id]['kernels_details'].append(detail_info)
                     steps_data[step_id]['total_duration'] += duration
                     steps_data[step_id]['kernel_types'][kernel_type] += 1
                     steps_data[step_id]['all_columns'] = all_columns
                     row_count += 1
-                    
+
                 except Exception as e:
                     sys.stderr.write(f'警告: 第 {row_num} 行数据解析失败: {e}\n')
-            
+
             if row_count == 0:
                 raise ValidationError('错误: CSV 文件没有有效数据行')
 
@@ -431,14 +441,14 @@ def analyze_kernels(csv_file, detail_step_id=None, keep_ai_cpu=False):
                     f'通信 task fragment {communication_task_fragments_dropped} 行已丢弃，'
                     f'保留 collective summary {communication_summary_rows_kept} 行\n'
                 )
-                
+
     except ValidationError:
         raise
     except Exception as e:
         raise ValidationError(f'错误: 解析 CSV 文件失败: {e}')
-    
+
     sorted_steps = sorted(steps_data.keys(), key=lambda x: int(x) if x.isdigit() else x)
-    
+
     result = {
         'step_count': len(steps_data),
         'steps_summary': [],
@@ -449,7 +459,7 @@ def analyze_kernels(csv_file, detail_step_id=None, keep_ai_cpu=False):
         'communication_task_fragments_dropped_by_step': dict(communication_task_fragments_dropped_by_step),
         'communication_summary_rows_kept_by_step': dict(communication_summary_rows_kept_by_step),
     }
-    
+
     for step_id in sorted_steps:
         data = steps_data[step_id]
         result['steps_summary'].append({
@@ -457,10 +467,10 @@ def analyze_kernels(csv_file, detail_step_id=None, keep_ai_cpu=False):
             'total_duration_us': round(data['total_duration'], 1),
             'kernel_count': len(data['kernels']),
             'kernel_types_count': len(data['kernel_types']),
-            'kernel_types': dict(sorted(data['kernel_types'].items(), 
+            'kernel_types': dict(sorted(data['kernel_types'].items(),
                                         key=lambda x: -x[1]))
         })
-    
+
     check_consistency(result['steps_summary'])
 
     if detail_step_id is None:
@@ -468,7 +478,7 @@ def analyze_kernels(csv_file, detail_step_id=None, keep_ai_cpu=False):
 
     _warmup_step_hint(result['steps_summary'], detail_step_id,
                       auto=(detail_step_id == (sorted_steps[0] if sorted_steps else None)))
-    
+
     if detail_step_id is not None:
         str_step_id = str(detail_step_id)
         if str_step_id in steps_data:
@@ -483,7 +493,7 @@ def analyze_kernels(csv_file, detail_step_id=None, keep_ai_cpu=False):
                 'total_duration_us': round(data['total_duration'], 1),
                 'kernel_count': len(data['kernels']),
                 'kernel_types_count': len(data['kernel_types']),
-                'kernel_types': dict(sorted(data['kernel_types'].items(), 
+                'kernel_types': dict(sorted(data['kernel_types'].items(),
                                             key=lambda x: -x[1])),
                 'communication_filter': selected_comm_filter,
                 'operators': data['kernels']
@@ -493,7 +503,7 @@ def analyze_kernels(csv_file, detail_step_id=None, keep_ai_cpu=False):
                 'total_duration_us': round(data['total_duration'], 1),
                 'kernel_count': len(data['kernels']),
                 'kernel_types_count': len(data['kernel_types']),
-                'kernel_types': dict(sorted(data['kernel_types'].items(), 
+                'kernel_types': dict(sorted(data['kernel_types'].items(),
                                             key=lambda x: -x[1])),
                 'communication_filter': selected_comm_filter,
                 'csv_columns': data['all_columns'],
@@ -511,7 +521,7 @@ def analyze_kernels(csv_file, detail_step_id=None, keep_ai_cpu=False):
                 f'可用的 Step: {", ".join(available)}'
                 f'{hint}'
             )
-    
+
     return result, sorted_steps
 
 
@@ -520,13 +530,13 @@ def main():
 
     try:
         result, sorted_steps = analyze_kernels(args.file, args.step, keep_ai_cpu=args.keep_ai_cpu)
-        
+
         if 'selected_step_operators' in result:
             operators_json = result['selected_step_operators']
             with open(args.output, 'w', encoding='utf-8') as f:
                 json.dump(operators_json, f, indent=2, ensure_ascii=False)
             print(f'Operators JSON 已保存到: {args.output}')
-        
+
         if args.details and 'selected_step_operators_details' in result:
             details_json = result['selected_step_operators_details']
             with open(args.details, 'w', encoding='utf-8') as f:

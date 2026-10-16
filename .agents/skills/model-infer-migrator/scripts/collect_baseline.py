@@ -1,7 +1,16 @@
 #!/usr/bin/env python3
+# ----------------------------------------------------------------------------------------------------------
+# Copyright (c) 2026 Huawei Technologies Co., Ltd.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# ----------------------------------------------------------------------------------------------------------
 """Collect baseline performance metadata for a model.
 
-Parses prefill/decode timing from ModelRunner inference logs, collects
+Parses prefill/decode timing from framework scheduler or standalone runner logs, collects
 environment information (NPU model, CANN/torch versions), and writes
 baseline_metadata.json.
 
@@ -43,8 +52,9 @@ def parse_args():
         help="YAML config file; recorded as yaml_path in output, parsed for model_name / exe_mode.",
     )
     parser.add_argument(
-        "--rank", type=int, default=1,
-        help="Rank ID to read when --log-file is a directory (default 1; rank 0 stdout may be truncated by tee).",
+        "--rank", type=int, default=0,
+        help="Rank ID to read when --log-file is a directory (default 0, the only rank on a single card; "
+             "use 1 on multi-card runs because rank 0 stdout may be truncated by tee).",
     )
     parser.add_argument(
         "--model-source", default="", help="Model source URL (e.g. HF link)."
@@ -63,8 +73,9 @@ def parse_args():
             with open(args.yaml_file, encoding="utf-8") as fh:
                 import yaml  # optional dependency
                 cfg = yaml.safe_load(fh)
-                args.model_name = cfg.get("model_name", "")
-                args.exe_mode = cfg.get("model_config", {}).get("exe_mode", "eager")
+                model_cfg = cfg.get("model_config", {})
+                args.model_name = model_cfg.get("model_name", cfg.get("model_name", ""))
+                args.exe_mode = model_cfg.get("exe_mode", "eager")
         except ImportError:
             logger.warning("PyYAML not installed; cannot read --yaml-file")
         except (OSError, ValueError) as exc:
@@ -77,7 +88,22 @@ def parse_args():
 # Log parsing
 # ---------------------------------------------------------------------------
 
-def parse_log(log_path, model_name):
+def _step_pattern(stage):
+    """Match one per-step timing line in either deployment mode.
+
+    Framework logs "[Main] Inference time (prefill): X ms"; the standalone runner
+    template logs "{model_name} inference time cost of prefill is X ms". Summary
+    lines ("... total/average inference time cost is ...") stay unmatched.
+    """
+    return re.compile(
+        rf"(?:\[Main\]\s*Inference time\s*\({stage}\)\s*:"
+        rf"|inference time cost of {stage} is)"
+        r"\s*(\d+(?:\.\d+)?)\s*ms",
+        re.I,
+    )
+
+
+def parse_log(log_path):
     """Parse inference log and extract timing + output text.
 
     decode_avg_ms excludes the first decode step (cold start: kernel compile
@@ -86,16 +112,8 @@ def parse_log(log_path, model_name):
     with open(log_path, "r", encoding="utf-8") as fh:
         lines = fh.readlines()
 
-    if model_name:
-        prefill_re = re.compile(
-            re.escape(model_name) + r".*prefill.*?(\d+(?:\.\d+)?)\s*ms", re.I
-        )
-        decode_re = re.compile(
-            re.escape(model_name) + r".*decode.*?(\d+(?:\.\d+)?)\s*ms", re.I
-        )
-    else:
-        prefill_re = re.compile(r"prefill.*?(\d+(?:\.\d+)?)\s*ms", re.I)
-        decode_re = re.compile(r"decode.*?(\d+(?:\.\d+)?)\s*ms", re.I)
+    prefill_re = _step_pattern("prefill")
+    decode_re = _step_pattern("decode")
 
     prefill_times = []
     decode_times = []
@@ -219,7 +237,7 @@ def main():
         logger.error("File not found: %s", args.log_file)
         sys.exit(1)
 
-    prefill_ms, decode_ms, output_text = parse_log(args.log_file, args.model_name)
+    prefill_ms, decode_ms, output_text = parse_log(args.log_file)
     if prefill_ms is None:
         logger.warning("No prefill timing found in log")
     if decode_ms is None:

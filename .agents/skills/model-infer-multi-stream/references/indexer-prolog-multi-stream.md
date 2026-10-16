@@ -53,11 +53,11 @@ flowchart LR
 第一段代码展示 Q 路径被放到 `"22"` 号流里：
 
 ```python
-enable_multi_streams = self.enable_multi_streams and not is_prefill
+enable_gegraph_and_multistream = self.enable_gegraph_and_multistream and not is_prefill
 
-with npu_stream_switch(enable_multi_streams, "22"):
-    if enable_multi_streams:
-        tng.scope.npu_wait_tensor(qr, query_states[0])
+with npu_stream_switch_gegraph(enable_gegraph_and_multistream, "22"):
+    if enable_gegraph_and_multistream:
+        qr = npu_wait_tensor(True, qr, query_states[0])
     q_b = self.wq_b(qr, c8_input_dict.get("pertoken_scale", None))
     q = q_b.view(bsz, seqlen, self.n_heads, self.head_dim)
     q_pe, q_nope = torch.split(q, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1)
@@ -68,18 +68,19 @@ with npu_stream_switch(enable_multi_streams, "22"):
 第二段代码展示 `weights_proj` 提前在 `"33"` 号流里执行：
 
 ```python
-with npu_stream_switch(enable_multi_streams, "33"):
-    if enable_multi_streams:
-        tng.scope.npu_wait_tensor(x, q_b)
+with npu_stream_switch_gegraph(enable_gegraph_and_multistream, "33"):
+    if enable_gegraph_and_multistream:
+        x = npu_wait_tensor(True, x, q_b)
     weights = self.weights_proj(x.view(-1, self.dim))
 ```
 
-如果图模式开启，常会配合 tagged stream event：
+npugraph_ex 路径下在切流前记录流与 event：
 
 ```python
-if enable_multi_streams and self.enable_aclgraph:
-    tng.ops.npu_record_tagged_stream(qr, "22")
-    tng.ops.npu_tagged_event_record(indexer_npu_events[0])
+enable_npugraph_and_multistream = enable_multi_streams and self.enable_npugraph_ex
+if enable_npugraph_and_multistream:
+    record_stream(True, qr, self.prolog_stream)
+    record_event(True, self.npu_events, 0)
 ```
 
 ## 复用参考

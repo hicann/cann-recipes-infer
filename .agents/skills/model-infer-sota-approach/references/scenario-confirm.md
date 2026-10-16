@@ -13,16 +13,16 @@
 从仓库收集，整理成候选清单：
 
 - **模型目录 `models/<model>/`**：
-  - `infer.sh` 里的 `YAML_FILE_NAME` —— 当前默认跑哪个场景。
+  - 当前默认跑哪个场景：框架部署看拉起命令的 `--yaml`，独立部署看模型目录 `infer.sh` 里指向 yaml 的变量。
   - `config/*.yaml` —— 每个 YAML 文件名编码一个场景：phase（`prefill` / `decode`）、卡数（`rank_16` …）、并行（`16ep` / `16tp` / `32dp` / `32sp` …）、量化（`a8w8` / `a8w8c8` …）。逐个列出可选场景。
   - `README.md` —— 推荐场景说明。
-- **已有产物**：`progress.md`、`optimization-analysis/`、`baseline/baseline_metadata.json` —— 判断是否已有 baseline、是否定过场景、之前优化到哪；`progress.md` 在则从中直接取模型 / 权重 / 部署配置等前置信息作场景定义默认值，不重新推导。
+- **已有产物**：`progress.md`、`optimization-analysis/`、`agentic/baseline/baseline_metadata.json` —— 判断是否已有 baseline、是否定过场景、之前优化到哪；`progress.md` 在则从中直接取模型 / 权重 / 部署配置等前置信息作场景定义默认值，不重新推导。
 
 候选清单每条 = `{YAML 名, phase, 卡数, 并行, 量化, 是否已有 baseline}`。
 
 ## 2. 前置条件检查
 
-确认模型已框架适配、`infer.sh` 能跑通，且有可复现精度的 baseline（或至少能现采）。
+确认模型已完成部署适配、按其部署模式能拉起跑通，且有可复现精度的 baseline（或至少能现采）。
 
 **不满足时**（代码缺失 / 跑不通 / 无 baseline）：停在这一步，告诉用户高阶流程的前置未满足，先走 `model-infer-migrator` 或 `model-infer-optimize` 阶段 0 建好 baseline 再回来。不要在没 baseline 时硬启动后续流程。
 
@@ -38,7 +38,7 @@
 
 ## 4. 处理"只给了泛化目标"
 
-用户只说"帮我优化 XX 模型 / 提速"时，不要直接开盘问、也不要擅自决定：主 agent 从第 1 步候选里挑最可能的场景（通常是 `infer.sh` 当前的 YAML，或 README 主推场景）作为**推荐**，连同其它候选一起摆给用户在 Q1 里选。
+用户只说"帮我优化 XX 模型 / 提速"时，不要直接开盘问、也不要擅自决定：主 agent 从第 1 步候选里挑最可能的场景（通常是当前默认拉起的 YAML，或 README 主推场景）作为**推荐**，连同其它候选一起摆给用户在 Q1 里选。
 
 ## 5. 锁定并交棒
 

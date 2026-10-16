@@ -15,7 +15,7 @@ description: 基于 PyTorch 框架的昇腾 NPU 模型推理并行策略分析�
 - **硬件平台**：昇腾 Atlas A2 / A3 系列
 - **决策范围**：`parallel_config` 中各 `*_tp_size`（TP）、`o_proj_tp_size`、`cp_size`（CP）、`kvp_size`（KVP）的值，以及由此推导的 DP/EP 度（`*_dp_size = world_size // *_tp_size`）
 
-> **CP / KVP 实施支持**：本 skill 输出可包含 `cp_size` / `kvp_size` 候选，但 `model-infer-parallel-impl` skill 当前不直接支持这两个维度的代码实施，需参照仓内已有模型手动改造（CP 参考 `models/deepseek-v3.2-exp/`，KVP 参考 `models/longcat-flash/`）。
+> **CP / KVP 实施支持**：本 skill 输出可包含 `cp_size` / `kvp_size` 候选，但 `model-infer-parallel-impl` skill 当前不直接支持这两个维度的代码实施，需参照仓内已有模型手动改造（CP 参考 `models/deepseek_v3_2_exp/`，KVP 参考 `models/longcat_flash/`）。
 
 ## 分析流程
 
@@ -217,7 +217,7 @@ CP 和 KVP 作为附加机制，默认在不推翻前两层主干的前提下叠
 | 长序列 + MLA | 叠加 CP | +cp_size | V3.2/GLM-5/Kimi-K2 64卡 |
 | 长序列 + GQA | 大 TP 或 叠加 CP | attn_tp=W 或 +cp_size | R1 32卡 |
 | 超长序列 | 叠加 KVP | +kvp_size, oproj_tp=kvp_size | LongCat 131K |
-| 进阶高吞吐 | +AFD+EPLB+MTP | enable_afd, perfect_eplb | LongCat/R1 128卡 |
+| 进阶高吞吐 | +AFD+EPLB+MTP | enable_afd, force_eplb | LongCat/R1 128卡 |
 
 ### 已验证的并行模式
 
@@ -322,7 +322,7 @@ MLA absorb：B_local × S × L × (kv_lora_rank + qk_rope_head_dim) × bytes_per
 - graph 模式 workspace
 - 激活临时 buffer（Decode 通常较小；Prefill 与 S、chunk 大小、attention backend 强相关）
 
-**可行性判断**：参数显存 + KV Cache 已接近卡容量 × 0.8 → 不可行，需增大并行度
+**可行性判断**：本步只算参数显存 + KV Cache，上列其他开销在第四步一并核。超过卡容量 × 0.8 判不可行，需增大并行度；在 0.8 以下的进入第四步，按总显存 ≤ 卡容量 × 0.95 复核。
 
 ### 3.3 通信分析
 
@@ -431,8 +431,8 @@ candidate_a:
     embed_tp_size: {value}
     lmhead_tp_size: {value}
     o_proj_tp_size: {value}     # MLA 模型需要，非 MLA 可省略
-    cp_size: {value}            # 长序列；parallel-impl skill 暂不直接支持，参照 deepseek-v3.2-exp 手动实施
-    kvp_size: {value}           # 超长序列；parallel-impl skill 暂不直接支持，参照 longcat-flash 手动实施
+    cp_size: {value}            # 长序列；model-infer-parallel-impl skill 暂不直接支持，参照 deepseek_v3_2_exp 手动实施
+    kvp_size: {value}           # 超长序列；model-infer-parallel-impl skill 暂不直接支持，参照 longcat-flash 手动实施
   estimation:
     params_per_card_gb: {value}
     kv_cache_per_card_gb: {value}
@@ -503,7 +503,7 @@ candidate_b:
 
 对比各 Rank 的单步总耗时，计算 (max - min) / mean：
 - < 5%：均衡良好
-- 5-15%：考虑启用 `perfect_eplb: True`
+- 5-15%：考虑启用 `force_eplb: True`
 - \> 15%：EP 策略可能不适合当前负载
 
 > 查看位置：各 Rank 独立 trace 文件（`{res_path}/prof/` 目录）

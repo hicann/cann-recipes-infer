@@ -49,7 +49,7 @@ skills:
    - 让 implementer 能直接定位
    - 文件名 + 行号 + 原因
 
-5. **更新 progress.md**
+6. **更新 progress.md**
    - 写入"精度验证"/"性能验证"section
    - 写入规则：只追加不清空；写入前先读取现有内容，追加到对应 section 末尾，避免覆盖其他角色的记录
    - 格式如下：
@@ -66,11 +66,11 @@ skills:
 - Decode: Xms → Yms（变化 Z%）
 ```
 
-6. **轻量修复仅限测试相关文件**
+7. **轻量修复仅限测试相关文件**
    - 测试脚本、验证配置中的明显错误可直接修复
    - 模型实现代码（modeling_*.py、runner_*.py 等）一律不改，输出诊断表交 implementer
 
-7. **性能对比基准**
+8. **性能对比基准**
    - 若工作目录下存在 agentic/baseline/baseline_metadata.json，性能验证以此为基准对比
    - 无 baseline_metadata.json 时，在报告中标注「缺少标准基线」，建议主 agent 派发 migrator 补采
 
@@ -105,10 +105,10 @@ skills:
 
 ### 性能验证
 
-> 基线和优化版使用相同的采集方法：执行 `bash infer.sh` → 从框架日志解析 Prefill/Decode 耗时。框架 ModelRunner 自动分离 warmup 和正式推理的计时。
+> 基线和优化版使用相同的采集方法：按部署模式拉起推理入口（框架部署 `bash executor/scripts/infer.sh --model {model_name} --yaml {yaml_name}.yaml`，独立部署 `bash infer.sh`） → 从框架日志解析 Prefill/Decode 耗时。框架 ModelRunner 自动分离 warmup 和正式推理的计时。
 
 1. 精度通过后执行性能验证
-2. 执行 `bash infer.sh`，从框架日志获取当前 Prefill/Decode 耗时（或使用 `collect_baseline.py` 生成当前性能数据）
+2. 按部署模式拉起推理入口，从框架日志获取当前 Prefill/Decode 耗时（或用 model-infer-migrator skill 的 collect_baseline 脚本生成当前性能数据）
 3. 若工作目录下有 `agentic/baseline/baseline_metadata.json`，以此为基准计算性能变化百分比
 4. 异常数据按核心原则第 1 条处理
 5. 写入 progress.md 性能验证 section
@@ -129,8 +129,8 @@ reviewer 完成验证后需要同时做两件事：
 
 ### 精度验证
 - 状态: 通过 / 未通过
-- Prefill: 误差 X（阈值 Y）✓ / ✗
-- Decode: 误差 X（阈值 Y）✓ / ✗
+- Prefill: 误差 X（阈值 Y）达标 / 不达标
+- Decode: 误差 X（阈值 Y）达标 / 不达标
 
 ### 性能验证
 - Prefill: Xms → Yms（变化 Z%）
@@ -145,7 +145,7 @@ reviewer 完成验证后需要同时做两件事：
 
 | 问题 | 位置 | 诊断 |
 |------|------|------|
-| {描述} | {file:line} | {原因和修复建议} |
+| {描述} | {文件:行号} | {原因和修复建议} |
 ```
 
 主 agent 收到此报告后直接呈现给用户，不需要再从 progress.md 提取信息。

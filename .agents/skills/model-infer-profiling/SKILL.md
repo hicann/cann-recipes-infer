@@ -1,16 +1,6 @@
 ---
 name: model-infer-profiling
-description: |
-  NPU 性能分析数据采集技能。用于华为昇腾NPU上的 PyTorch 模型性能分析。
-
-  触发场景：
-  - 用户需要采集 NPU 性能数据
-  - 用户提到 profiling、性能分析、tensorboard
-  - 用户需要分析模型推理性能瓶颈
-  - 用户使用 torch_npu.profiler
-  - 用户遇到 profiler 解析失败或 JSON 截断问题
-
-  关键要求：必须用 ExperimentalConfig(Level1 + PipeUtilization)，否则 kernel_details.csv 只有 9 列、op_statistic/api_statistic 不生成。采集前先判断仓库有无轻框架内置 prof（enable_profiler）：有则用框架只调参数、无则注入。
+description: 昇腾 NPU 上 PyTorch 模型的性能分析数据采集技能。按仓库是否自带 prof 能力选择调参或注入，产出可供拆解的 kernel_details.csv、op_statistic.csv 与 trace。触发场景：采集 NPU 性能数据、profiling、性能分析、tensorboard、推理性能瓶颈定位、torch_npu.profiler 使用、profiler 解析失败或 JSON 截断。
 ---
 
 # NPU Profiling 采集技能
@@ -88,14 +78,15 @@ model_config:
 |---|---|---|
 | **prefill** | `active=1, skip_first=0, warmup=0, repeat=1` | `<res_path>/prof/prefill/` |
 | **decode** | `active=3, skip_first=3, warmup=0, repeat=1` | `<res_path>/prof/decode/` |
+| **mm_encode** | `active=1, skip_first=0, warmup=0, repeat=1`，与 prefill 共用 `set_status` 分支 | `<res_path>/prof/mm_encode/` |
 
 - 配置已经是 **`ExperimentalConfig(Level1 + PipeUtilization)`**（与本 skill 的硬性要求一致，不用动）。
 - `<res_path>` = `models/<model>/res/<date>/<case>/`，与日志 `log_0.log` 同级。
-- prefill 和 decode **各产一份** `prof/<phase>/.../ASCEND_PROFILER_OUTPUT/`（实测两个目录都会生成）。
+- prefill 和 decode **各产一份** `prof/<phase>/.../ASCEND_PROFILER_OUTPUT/`（实测两个目录都会生成）。多模态模型还会多一份 `prof/mm_encode/`，由 `encode_mm_batch` 触发。
 - 注意：prefill profiler 是 `active=1`，每 request 只采 1 步 prefill（prefill 本就只有 1 步，设计如此）；实测能产出有效的 47 列 CSV。要更细的 prefill 分析（多步/自定义窗口）用注入路径模式 B。
 - 多卡时每个 rank 各采一份（同一个 `enable_profiler` 开关控制）。
 
-> 调用链：`execution_engine.py` 持有 `ProfilerManager`，每个 forward 调 `set_status(is_prefill)` + `step()`。`model_runner.py` 里另有一套 `define_profiler`（prefill `active=1`、decode `active=10/skip_first=10`），但**离线 infer 实际走的是 `ProfilerManager` 这条**，调参数认 `profiler_context.py`。
+> 调用链：`execution_engine.py` 持有 `ProfilerManager`，每个 forward 调 `set_status(ProfilerPhase.PREFILL / DECODE)` + `step()`。`model_runner.py` 里另有一套 `define_profiler`（prefill `active=1`、decode `active=10/skip_first=10`），但**离线 infer 实际走的是 `ProfilerManager` 这条**，调参数认 `profiler_context.py`。
 
 ## A.3 怎么调采集参数（只改这里）
 
@@ -105,24 +96,28 @@ model_config:
 |---|---|---|---|
 | **decode 采几步** | `active` | `create_profiler` 默认参数（decode 分支不传，吃默认 `active=3`） | 真正记录的步数。要"完整数据"就调大，例如 30 |
 | **decode 从第几步开始** | `skip_first` | 同上，默认 `skip_first=3` | 跳过最前面 N 个 decode step 不计入采集（跳过启动抖动）。从第 `skip_first+1` 步进入采集周期 |
-| **prefill 采几步** | `active` | `set_status` 的 prefill 分支，写死 `active=1` | prefill 每 request 只有 1 步，保持 1 |
-| **只采 decode / 只采 prefill** | —— | 在 `set_status` 里把不想采的那个分支的 profiler 换成 `FakeContextManager()`（或加判断跳过） | 框架默认两个阶段都采；要单采就短路掉另一个分支 |
+| **prefill 采几步** | `active` | `set_status` 的 prefill 分支，写死 `active=1` | prefill 每 request 只有 1 步，保持 1。该分支的条件是 `cur_status in (MM_ENCODE, PREFILL)`，改它会同时影响 mm_encode |
+| **只采 decode / 只采 prefill** | —— | 保留 `set_status` 的状态推进，只把不采的阶段的 `create_profiler` 换成不落盘的实现 | `set_status` 会对返回对象调 `start()`，替换实现需提供该方法；`check_if_update` 要求 decode 之前已有阶段进入过 profiling 状态，因此 prefill 分支的状态推进必须保留 |
 | `warmup` / `repeat` | `warmup` / `repeat` | `create_profiler` | 一般保持 `warmup=0, repeat=1` |
 
-**清窗口规则（改 `active`/`skip_first` 后务必满足）**：decode 的 `prof.step()` 调用次数 ≈ 实际 decode 步数（受 `max_new_tokens` 控制），必须 `≥ skip_first + warmup + active`（精确边界）才能跨出采集窗口，实践再多 1 步收尾更稳。框架 decode 默认需要 ≈ `3 + 0 + 3 = 6` 步，`max_new_tokens=32` 远够；**把 `active`/`skip_first` 调大时，记得把 YAML 的 `scheduler_config.max_new_tokens` 同步调大并留余量**，否则窗口没跨出去、解析会出问题。
+**清窗口规则（改 `active`/`skip_first` 后务必满足）**：decode 的 `prof.step()` 调用次数 ≈ 实际 decode 步数（受 `max_new_tokens` 控制），必须 `≥ skip_first + warmup + active + 1` 才能跨出采集窗口，最后那 1 步用于触发 trace 收尾。框架 decode 默认需要 `3 + 0 + 3 + 1 = 7` 步，`max_new_tokens=32` 远够；**把 `active`/`skip_first` 调大时，记得把 YAML 的 `scheduler_config.max_new_tokens` 同步调大并留余量**，否则窗口没跨出去、解析会出问题。
 
-改完直接重跑 `infer.sh`，不需要改 YAML 之外的推理代码。
+改完按部署模式重跑推理入口，不需要改 YAML 之外的推理代码。
 
 ## A.4 采完必须验收产物（关键，不能跳）
 
 **框架开了 `enable_profiler` 不等于拿到了可用数据。** 解析阶段（CANN `msprof` 离线分析）可能失败 —— 产物只剩一个**被截断的 `trace_view.json`**、CSV 全缺。**最常见的原因是 profiling 输出目录所在的文件系统/盘**（详见 A.5），不是框架代码、不是权限、不是版本。所以采完立刻验收：
 
+在仓库根执行：
+
 ```bash
 RES=models/<model>/res/<date>/<case>          # 与 log_0.log 同级
 # 1) 解析有没有报错（最快的信号）
 grep -c "run failed" "$RES"/log_0.log          # 期望 0；非 0 => 解析失败
-# 2) 你采的每个阶段都要查（默认 both 就两个都查；只采一个就只查那个）
-for PHASE in prefill decode; do
+# 2) 你采的每个阶段都要查（默认 both 查 prefill / decode；多模态模型另有 mm_encode）
+PHASES="prefill decode"
+[ -d "$RES/prof/mm_encode" ] && PHASES="mm_encode $PHASES"
+for PHASE in $PHASES; do
   [ -d "$RES/prof/$PHASE" ] || { echo "WARN: prof/$PHASE 没生成（该阶段未落盘 => 视同失败）"; continue; }
   OUT=$(find "$RES/prof/$PHASE" -name ASCEND_PROFILER_OUTPUT -type d | head -1)
   echo "== $PHASE: ${OUT:-无 ASCEND_PROFILER_OUTPUT} =="
@@ -154,7 +149,7 @@ done
 **修复步骤（按顺序）：**
 
 1. **首选 —— 把 profiling 输出换到另一个目录/文件系统**（优先本地盘），重跑后重新走 A.4 验收。
-   profiler 输出路径 = `os.getenv("WORK_DIR")/os.getenv("RES_PATH")/prof/...`（`execution_engine.py:83`）。**注意 `function.sh` 会把 `WORK_DIR` 写成 `models/<model>`，直接 `export WORK_DIR=...` 会被覆盖、不生效**。可靠做法是把 `res` 目录软链到本地盘：
+   profiler 输出路径 = `os.getenv("WORK_DIR")/os.getenv("RES_PATH")/prof/...`（见 `executor/core/engine/execution_engine.py` 的 profiler 输出路径拼接）。**注意 `function.sh` 会把 `WORK_DIR` 写成 `models/<model>`，直接 `export WORK_DIR=...` 会被覆盖、不生效**。可靠做法是把 `res` 目录软链到本地盘：
    ```bash
    mkdir -p /tmp/recipes_res
    # 若 models/<model>/res 已是非空真实目录, 先移走/备份再软链
@@ -196,7 +191,7 @@ experimental_config = torch_npu.profiler._ExperimentalConfig(
 | 产物 | 带 `ExperimentalConfig` | 不带（默认） |
 |---|---|---|
 | `kernel_details.csv` 列数 | **47** 列（含 `Stream ID`、`Input/Output Shapes`、`aic_mac_ratio`、`aic_mte2_ratio`、`aiv_vec_ratio` …） | **9** 列（基本时间/dur/block_dim） |
-| `op_statistic.csv` / `api_statistic.csv` | ✅ 生成 | ❌ 缺失 |
+| `op_statistic.csv` / `api_statistic.csv` | 生成 | 缺失 |
 | `operator_details.csv`、`step_trace_time.csv`、`trace_view.json` | 生成 | 生成 |
 | `communication*.json` | 仅多卡生成 | 仅多卡生成 |
 
@@ -279,7 +274,7 @@ with create_profiler("./prof_both", warmup=0, active=1+N) as prof:
         model.decode(...); torch.npu.synchronize(); prof.step()   # steps 2..N+1: decode
     prof.step()                                                   # 收尾
 
-# 模式 D：两次独立采集，两个 save_path（分别对比）
+# 模式 D：两次独立采集，两个 save_path（分别对比），实现见 scripts/profile_template.py 的 profile_separate
 ```
 
 ## 标准配置模板（注入）
@@ -308,7 +303,14 @@ def create_profiler(save_path, warmup=0, active=30):
 # 用法见上面四种模式；完整可运行模板（带 PHASE 开关）见 scripts/profile_template.py
 ```
 
-完整模板见 `scripts/profile_template.py`（`PHASE = "prefill"|"decode"|"both"|"separate"`，对应上面用户选择）。
+完整模板见 `scripts/profile_template.py`，在仓库根用 `python3 .agents/skills/model-infer-profiling/scripts/profile_template.py` 运行。使用前必须改四处：
+
+1. 把 `build_model()` / `run_prefill()` / `warm_one_decode()` / `run_one_decode()` 四个占位函数换成真实的模型加载与单步推理，不换会采到占位 `Linear` 的假负载
+2. `PHASE` 设为 `"prefill"|"decode"|"both"|"separate"`，与上面确认的采集范围一致
+3. `DECODE_STEPS` 设为实际要采的 decode 步数
+4. `SAVE_PATH` 设到本地盘目录
+
+产物落在 `SAVE_PATH` 下，按「产物自检清单」验收。
 
 ---
 
@@ -367,7 +369,7 @@ prof/
 ```bash
 tensorboard --logdir=./prof          # 需 pip install torch_tb_profiler，切 PyTorch Profiler tab
 # 或 chrome://tracing 加载 trace_view.json
-# 或 pandas 读 kernel_details.csv 做定制分析（拆解到模型结构 => 用 perf-breakdown-skill）
+# 或 pandas 读 kernel_details.csv 做定制分析（拆解到模型结构 => 用 model-infer-perf-breakdown skill）
 ```
 
 ## 参考文档

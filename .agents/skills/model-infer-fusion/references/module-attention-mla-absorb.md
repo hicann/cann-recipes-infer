@@ -1,6 +1,6 @@
 # Attention 层：MLA Absorb 路径（无 Indexer）
 
-**参考模型**：`models/deepseek_r1/`、`models/kimi-k2-thinking/`
+**参考模型**：`models/deepseek_r1/`、`models/kimi_k2_thinking/`
 
 **核心特征**：Q 吸收 W_uk 使维度降至 `kv_lora_rank`，KV Cache 只存 latent 向量。**Prefill 和 Decode 走不同算子路径**。
 

@@ -308,7 +308,7 @@ class MyRunner:
 | 组件 | Prefill | Decode |
 |------|---------|--------|
 | **输入** | 变长序列（提示词） | 固定数量 token |
-| **图模式** | 通常不图化 | 适合 `dynamic=False` 图模式 |
+| **图模式** | 不图化：输入长度动态变化、首 token 生成逻辑复杂、shape 不固定 | 适合 `dynamic=False` 图模式：输入长度固定、shape 稳定 |
 
 ---
 

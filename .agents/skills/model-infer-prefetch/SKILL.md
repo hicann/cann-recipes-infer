@@ -1,7 +1,6 @@
 ---
 name: model-infer-prefetch
 description: 为模型添加 torch_npu.npu_prefetch 优化特性时使用,当 profiling 显示 MatMul/QBMM/GMM 算子存在 memory-bound 热点时使用,或将 prefetch 模式迁移到新模型时使用
-user-invocable: true
 ---
 
 # Prefetch 预取优化技能
@@ -10,7 +9,7 @@ user-invocable: true
 
 ---
 
-## 重要原则
+## 预取原则
 
 - **前置条件**:模型必须在 NPU 上运行且已导入 `torch_npu`
 - **仅在 memory-bound 热点时使用**:必须通过 profiling 确认存在 memory-bound 瓶颈
@@ -28,7 +27,7 @@ user-invocable: true
 
 1. **确定预取位置**:选择手动指定或自动化分析方式
    - 手动指定:用户提供目标算子和依赖窗口
-   - 自动化分析:调用 `npu-roofline-analysis` 从 profiling 数据中识别候选位置
+   - 自动化分析:用 model-infer-profiling 采集含 pipe 利用率的 kernel_details.csv，按访存/计算占比列识别候选位置
 2. **确定预取大小**:根据权重张量维度和数据类型计算 `max_size`
 3. **设计改造方案**:
    - 需要修改哪些文件
@@ -85,16 +84,16 @@ user-invocable: true
 
 ### 自动化分析方式
 
-通过调用 `npu-roofline-analysis` skill 和分析模型代码自动识别候选位置。
+通过 model-infer-profiling 采集 kernel_details.csv（含 pipe 利用率列），按访存占比排序并结合模型代码识别候选位置。
 
 #### 自动化分析流程
 
 ```
 开始
   │
-  ├─→ 步骤 1:调用 npu-roofline-analysis
+  ├─→ 步骤 1:采集并拆解 profiling 数据
   │       ↓
-  │   获取 memory-bound top 10 算子列表
+  │   获取访存占比最高的 top 10 算子列表
   │       ↓
   ├─→ 步骤 2:对每个 memory-bound 算子
   │       ├── 分析前序算子
@@ -116,8 +115,8 @@ user-invocable: true
 
 | 步骤 | 检查项 | 结果 | 下一步 |
 |------|--------|------|--------|
-| 1 | 调用 `npu-roofline-analysis` | 获取 memory-bound top 10 算子 | 进入步骤 2 |
-| 2 | 调用 `npu-roofline-analysis`分析每个算子的前序算子（前2-3个） | 判断前序是否访存密集 | 进入步骤 3 |
+| 1 | 采集 profiling 并按访存占比排序 | 得到访存占比最高的 top 10 算子 | 进入步骤 2 |
+| 2 | 从 profiling 数据分析每个算子的前序算子（前2-3个） | 判断前序是否访存密集 | 进入步骤 3 |
 | 3a | 前序算子是访存密集(大 MatMul/通信)但其输出可用 | 有预取空间(使用前序输出作为依赖窗口) | 计算理论预取大小 |
 | 3b | 前序算子非访存密集(LayerNorm/ROPE/SwiGLU/小算子) | 有预取空间(使用前序输出作为依赖窗口) | 计算理论预取大小 |
 | 3c | 前序算子是通信或无合适窗口 | 无预取空间 | 跳过该算子 |
@@ -140,47 +139,18 @@ user-invocable: true
 
 #### 自动化分析示例
 
-**场景**:LongCat-Flash 模型优化
+以 LongCat-Flash 为例:按访存占比识别 top 10(gate_up_proj/down_proj/q_a_proj/q_b_proj/kv_a_proj_with_mqa/router.classifier/GMM1/GMM2 等),逐个回溯前序算子定依赖窗口:
 
-1. **调用 npu-roofline-analysis**:
-   - 识别 memory-bound top 10:gate_up_proj(MatMul), down_proj(MatMul), q_a_proj(MatMul), q_b_proj(MatMul), kv_a_proj_with_mqa(MatMul), router.classifier(MatMul), GMM1, GMM2, ...
+| 目标算子 | 前序算子 | 依赖窗口 | max_size |
+|---------|---------|---------|---------|
+| gate_up_proj | o_proj(大 MatMul,完成后带宽空闲) | o_proj 输出 | 计算值 |
+| down_proj | SwiGLU(计算密集) | gate_up_proj 输入 | 计算值 |
+| q_a_proj(下一层) | RMSNorm(非 memory-bound) | down_proj 输出 | 18 MB |
+| router.classifier | o_proj | o_proj 输出 | 18 MB |
 
-2. **分析 gate_up_proj 前序算子**:
-   - 前序:o_proj(大型 MatMul, memory-bound)
-   - 判断:访存密集 ✗
-   - 结论:但实际 o_proj 输出可作为依赖窗口(o_proj 执行完成后带宽空闲)
-   - **实际使用**:在 o_proj 完成时预取 gate_up_proj 权重 ✓
+大型 MatMul 完成后带宽空闲,其输出同样可作依赖窗口。理论 max_size = 权重维度乘积 × 字节数,保守取 50%。
 
-3. **分析 down_proj 前序算子**:
-   - 前序:SwiGLU(计算密集,非 memory-bound)
-   - 判断:非访存密集 ✓
-   - 结论:可预取,依赖窗口 = SwiGLU 输入 x
-   - **实际使用**:在 gate_up_proj 输入时预取 down_proj 权重 ✓
-
-4. **分析 q_a_proj 前序算子**:
-   - 前序:RMSNorm(虽是访存类算子,但非 memory-bound)
-   - 判断:非访存密集 ✓
-   - 结论:可预取,依赖窗口 = down_proj 输出
-   - **实际使用**:在 down_proj 完成时预取下一层 q_a_proj 权重 ✓
-
-5. **分析 router.classifier 前序算子**:
-   - 前序:router 输入(来自 recv 或 o_proj)
-   - 判断:非访存密集 ✓
-   - 结论:可预取,依赖窗口 = o_proj 输出
-   - **实际使用**:在 o_proj 完成时预取 router.classifier 权重 ✓
-
-6. **计算理论预取大小**:
-   - gate_up_proj:`hidden_size × intermediate_size × 2 × 2` 字节(bf16)
-   - 保守取值:理论值的 50%
-
-7. **输出候选列表**:
-   - 候选 1:gate_up_proj, 依赖窗口 = o_proj 输出, max_size = 计算值
-   - 候选 2:down_proj, 依赖窗口 = gate_up_proj 输入, max_size = 计算值
-   - 候选 3:q_a_proj(下一层), 依赖窗口 = down_proj 输出, max_size = 18 MB
-   - 候选 4:router.classifier, 依赖窗口 = o_proj 输出, max_size = 18 MB
-   - ...
-
-> 详细的 roofline 分析方法参见 `npu-roofline-analysis` skill
+> profiling 采集方法参考 model-infer-profiling skill；时间分布拆解参考 model-infer-perf-breakdown skill
 
 ---
 
@@ -239,15 +209,15 @@ gmm2_prefetch_size = hidden_size * intermediate_size * dtype_bit // moe_tp_size 
 
 ### LongCat-Flash 实际取值参考
 
-| 位置 | 目标算子 | 依赖窗口 | max_size | 说明 |
-|------|---------|---------|----------|------|
-| Line 1244 | router classifier | o_proj | 18 MB | 固定值 |
-| Line 1259 | q_a_proj | dense MLP output | 18 MB | 保守值 |
-| Line 1260 | q_b_proj | dense MLP output | 36 MB | 中等值 |
-| Line 1261 | kv_a_proj_with_mqa | dense MLP output | 7 MB | 保守值 |
-| Line 1286 | next layer attention | down_proj | 计算值 | 动态计算 |
+| 目标算子 | 依赖窗口 | max_size | 说明 |
+|---------|---------|----------|------|
+| router classifier | o_proj | 18 MB | 固定值 |
+| q_a_proj | dense MLP output | 18 MB | 保守值 |
+| q_b_proj | dense MLP output | 36 MB | 中等值 |
+| kv_a_proj_with_mqa | dense MLP output | 7 MB | 保守值 |
+| next layer attention | down_proj | 计算值 | 动态计算 |
 
-> 参考文件:`models/longcat-flash/models/modeling_longcat_flash.py`, `models/longcat-flash/models/ffn.py`
+> 参考文件:`models/longcat_flash/models/modeling_longcat_flash.py`、`models/longcat_flash/models/ffn.py`（搜 `npu_prefetch` 调用点）
 
 ---
 
@@ -260,7 +230,7 @@ gmm2_prefetch_size = hidden_size * intermediate_size * dtype_bit // moe_tp_size 
 | **高** | MatMul, BatchMatMul, QBMM, GMM | 主要预取目标,权重搬运密集 |
 | **高** | 大型 MLP/FFN 线性层 | q_proj, k_proj, v_proj, o_proj, up_proj, down_proj, gate_up_proj |
 | **高** | MoE 相关 MatMul | router.classifier, experts.w13_weight, experts.w2_weight |
-| **高** | 融合前置大搬运算子 | 如 MLAProlog(需 roofline 支持) |
+| **高** | 融合前置大搬运算子 | 如 MLAProlog(需 profiling 确认访存占比高) |
 | **低** | LayerNorm, RMSNorm, ROPE | 通常作为依赖窗口,不是预取目标 |
 | **低** | cast, reshape, transpose, concat | 同上 |
 | **低** | router topk, dispatch, combine | 同上 |
@@ -277,7 +247,7 @@ gmm2_prefetch_size = hidden_size * intermediate_size * dtype_bit // moe_tp_size 
   │       ├─→ 是 ──→ 前移到更早的前驱 ──→ 重新检查
   │       │
   │       └─→ 否 ──→ 检查:是否有足够执行时间?
-  │               ├─→ 是 ──→ 选择为依赖窗口 ✓
+  │               ├─→ 是 ──→ 选择为依赖窗口
   │               │
   │               └─→ 否 ──→ 前移到更早的前驱 ──→ 重新检查
   │
@@ -289,7 +259,7 @@ gmm2_prefetch_size = hidden_size * intermediate_size * dtype_bit // moe_tp_size 
 从目标算子向前找同一关键路径上的前序算子,优先选择:
 - 离目标算子足够近(在同一 layer 或相邻 layer)
 - 自身有一定执行时间(不是瞬时完成的小算子)
-- 被 `npu-roofline-analysis` 判断为**非 memory-bound**
+- 按 profiling 的访存占比列判定为**非访存密集**
 - 不是另一个大矩阵/大通信/大搬运算子
 
 **重要**:即使前序算子本身是大型 MatMul(如 o_proj),其**输出**仍可作为依赖窗口,因为该算子执行完成后带宽空闲,可以开始预取下一个算子的权重。
@@ -302,9 +272,9 @@ gmm2_prefetch_size = hidden_size * intermediate_size * dtype_bit // moe_tp_size 
 | gate_up_proj | o_proj 输出 | `modeling_longcat_flash.py` 的 dense MLP forward | o_proj 完成后预取 MLP 权重 |
 | down_proj | gate_up_proj 输入 x | `modeling_longcat_flash.py` 的 dense MLP forward | 在 gate_up_proj 执行时预取 down_proj 权重 |
 | q_a_proj / q_b_proj / kv_a_proj（下一层） | down_proj 输出 | `modeling_longcat_flash.py` 的 layer forward 末尾 | down_proj 完成后预取下一层 attention 权重 |
-| experts.w2_weight | router_logits 输出 | `models/longcat-flash/models/ffn.py` 的 MoE forward | router 完成后预取 GMM2 权重 |
-| router.classifier（下一层） | gmm2_out 输出 | `models/longcat-flash/models/ffn.py` 的 MoE forward 末尾 | GMM2 完成后预取下一层 router 权重 |
-| experts.w13_weight（下一层） | gmm2_out 输出 | `models/longcat-flash/models/ffn.py` 的 MoE forward 末尾 | GMM2 完成后预取下一层 GMM1 权重 |
+| experts.w2_weight | router_logits 输出 | `models/longcat_flash/models/ffn.py` 的 MoE forward | router 完成后预取 GMM2 权重 |
+| router.classifier（下一层） | gmm2_out 输出 | `models/longcat_flash/models/ffn.py` 的 MoE forward 末尾 | GMM2 完成后预取下一层 router 权重 |
+| experts.w13_weight（下一层） | gmm2_out 输出 | `models/longcat_flash/models/ffn.py` 的 MoE forward 末尾 | GMM2 完成后预取下一层 GMM1 权重 |
 
 **关键观察**:
 1. **大型 MatMul 的输出可作为依赖窗口**:o_proj, down_proj, gmm2_out 都是大型 MatMul,但其输出用于预取下一个算子
@@ -327,7 +297,7 @@ gmm2_prefetch_size = hidden_size * intermediate_size * dtype_bit // moe_tp_size 
 ```yaml
 model_config:
   enable_prefetch: true  # 默认 false
-  enable_multi_stream: 2  # prefetch 需要多流支持
+  enable_multi_streams: 2  # prefetch 需要多流支持
 ```
 
 **模型初始化示例**:
@@ -336,7 +306,7 @@ class YourModel:
     def __init__(self, config):
         self.enable_prefetch = config.get("enable_prefetch", False)
         # prefetch 需要图模式 + 多流
-        assert not self.enable_prefetch or config.get("enable_multi_stream", 0) > 0
+        assert not self.enable_prefetch or config.get("enable_multi_streams", 0) > 0
 ```
 
 ### 2. Prefetch 调用模式
@@ -461,7 +431,7 @@ mlp_output = self.mlp(attn_output)
 
 | 错误现象 | 根因 | 修复方案 |
 |---------|------|---------|
-| 不先跑 roofline 就选目标 | 缺少 profiling 数据支持 | 必须先用 `npu-roofline-analysis` 确认 memory-bound |
+| 不看 profiling 就选目标 | 缺少 profiling 数据支持 | 必须先用 profiling 数据确认 memory-bound |
 | 选了 LayerNorm/ROPE 作为预取目标 | 误判目标算子 | 这些通常是依赖窗口,不是预取目标 |
 | dependency 窗口也是 memory-bound | 依赖窗口选择不当 | 选非 memory-bound 的前驱,或前移 prefetch |
 | 一次性预取全量权重 | `max_size` 过大 | 先保守 `max_size`(50%),后续再调优 |
@@ -475,8 +445,8 @@ mlp_output = self.mlp(attn_output)
 ## 输出要求
 
 完成后必须汇报:
-1. **选了哪些目标算子,为什么**:基于 roofline 分析结果或用户手动指定
-2. **roofline skill 的关键结论**:memory-bound 算子列表、关键路径(如使用自动化分析)
+1. **选了哪些目标算子,为什么**:基于 profiling 访存占比或用户手动指定
+2. **profiling 拆解的关键结论**:memory-bound 算子列表、关键路径(如使用自动化分析)
 3. **为什么选这个 dependency 窗口**:非 memory-bound、有足够执行时间
 4. **加了哪些开关与代码路径**:配置文件 → 模型初始化 → forward 调用
 5. **`max_size` 取值依据**:权重维度、数据类型、保守系数或用户指定值
@@ -506,9 +476,9 @@ mlp_output = self.mlp(attn_output)
 | 主题 | 文件路径 |
 |-----|---------|
 | npu_prefetch wrapper 函数 | `executor/utils/common_utils.py`（搜索 `npu_prefetch`） |
-| LongCat-Flash prefetch 实现 | `models/longcat-flash/models/modeling_longcat_flash.py`（搜索 `npu_prefetch` 调用点） |
-| FFN prefetch 大小计算 | `models/longcat-flash/models/ffn.py`（搜索 `prefetch_size` 计算） |
+| LongCat-Flash prefetch 实现 | `models/longcat_flash/models/modeling_longcat_flash.py`（搜索 `npu_prefetch` 调用点） |
+| FFN prefetch 大小计算 | `models/longcat_flash/models/ffn.py`（搜索 `prefetch_size` 计算） |
 | 配置验证逻辑 | `executor/core/config/inference_config.py`（`InferenceConfig._validate`）+ 模型自身 `__init__` 中的额外语义校验 |
-| 配置示例 | `models/longcat-flash/config/README.md` |
-| Roofline 分析 | 调用 `npu-roofline-analysis` skill |
+| 配置示例 | `models/longcat_flash/config/` |
+| profiling 数据采集 | 参考 model-infer-profiling skill |
 | 图模式适配 | 调用 `model-infer-graph-mode` skill |

@@ -1,4 +1,13 @@
 #!/usr/bin/env python3
+# ----------------------------------------------------------------------------------------------------------
+# Copyright (c) 2026 Huawei Technologies Co., Ltd.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# ----------------------------------------------------------------------------------------------------------
 # coding=utf-8
 """Step 2 — Layer detection (sample-driven primary + explore fallback).
 
@@ -95,7 +104,12 @@ def load_structure_spec(path: str) -> dict:
 
 
 def validate_inputs_json(path: str) -> dict:
-    """Step 0 物料校验：prof_dir + model_script_paths 必须存在且非空。"""
+    """Validate the Step 0 inputs file, exiting when it cannot drive the run.
+
+    Requires a non-empty model_script_paths whose entries all exist on disk, plus
+    an explicit phase and rank — Phase 0b stream sample ack cannot be done without
+    them.
+    """
     import os
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -133,7 +147,11 @@ def validate_inputs_json(path: str) -> dict:
 
 
 def validate_sample_ack(path: str, expected_components: list) -> dict:
-    """Phase 0b ack 校验：每个 expected_component 都必须有 stream sample。"""
+    """Validate the Phase 0b ack file, exiting when any component is unacked.
+
+    Every expected component needs a stream_samples entry holding exactly one
+    primary sample, and each sample needs both stream_id and op_indices.
+    """
     try:
         with open(path, "r", encoding="utf-8") as f:
             ack = json.load(f)
@@ -480,29 +498,29 @@ def main():
                    help="stream sample mode → structure_draft.json; explore mode → "
                         "candidates + landmark_candidates report")
     p.add_argument("--structure-spec", default=None,
-                   help="(sample mode) 0a 解析结果 JSON 路径")
+                   help="(sample mode) path to the Phase 0a parse result JSON")
     p.add_argument("--inputs", default=None,
-                   help="(sample mode 必传) <run_dir>/inputs.json，Step 0 物料 "
-                        "(prof_dir + model_script_paths)；缺则 exit 1")
+                   help="(sample mode, required) <run_dir>/inputs.json holding the Step 0 "
+                        "inputs (prof_dir + model_script_paths); exits 1 when absent")
     p.add_argument("--sample-ack", default=None,
-                   help="(sample mode 必传) <run_dir>/sample_ack.json，Phase 0b "
-                        "用户 ack 过的每个 component 的 stream samples；"
-                        "缺则 exit 1")
+                   help="(sample mode, required) <run_dir>/sample_ack.json carrying the "
+                        "Phase 0b acked stream samples for every component; "
+                        "exits 1 when absent")
     p.add_argument("--accept-warnings", action="store_true",
-                   help="(sample mode) 默认 hard/ambiguous warnings 会 exit 1 "
-                        "强迫复读给用户；用户明确接受后加此 flag 放行")
+                   help="(sample mode) hard and ambiguous warnings exit 1 by default so "
+                        "they are read back to the user; pass this flag once the user accepts them")
     p.add_argument("--explore", action="store_true",
-                   help="生成 candidates + landmark_candidates；用户拿不出 sample 时探索用")
+                   help="emit candidates and landmark_candidates, for exploring when no sample is available")
     p.add_argument("--min-count", type=int, default=4,
-                   help="(explore mode) 候选最小出现次数 (default 4)")
+                   help="(explore mode) minimum occurrence count for a candidate (default 4)")
     p.add_argument("--top-k", type=int, default=40,
-                   help="(explore mode) 最多产 N 个候选 (default 40)")
+                   help="(explore mode) emit at most N candidates (default 40)")
     p.add_argument("--print-table", action="store_true",
-                   help="(explore mode) 在 stdout 打印 summary 表")
+                   help="(explore mode) print the summary table to stdout")
     p.add_argument("--op-start", type=int, default=None,
-                   help="(explore mode) 限定分析范围起点")
+                   help="(explore mode) first op index of the analysed range")
     p.add_argument("--op-end", type=int, default=None,
-                   help="(explore mode) 限定分析范围终点（含）")
+                   help="(explore mode) last op index of the analysed range, inclusive")
     args = p.parse_args()
 
     sample_mode = bool(args.structure_spec)

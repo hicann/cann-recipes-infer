@@ -8,31 +8,35 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # ----------------------------------------------------------------------------------------------------------
-"""torch_npu API 本地文档查询工具。
+"""Query torch_npu API documentation from the local installation.
 
-数据源：torch_npu 安装包内的 _op_plugin_docs.py（build 时由 op-plugin
-仓的 codegen 模板拷入，含已生成 docstring 的算子条目，数量随版本浮动）。
+Data source: _op_plugin_docs.py inside the installed torch_npu package. It is
+copied in at build time from the op-plugin repository codegen template and
+holds the operator entries whose docstrings were generated; the entry count
+varies with the version.
 
-跟用户实际安装的 torch_npu 版本严格绑定，零网络依赖，零版本 drift。
+Results are bound to the torch_npu version actually installed, need no network
+access, and cannot drift from the runtime.
 
-注意：op-plugin codegen 覆盖率有限，部分算子在 torch_npu 里可调用但
-_op_plugin_docs.py 没有对应条目。本脚本对 model-infer-fusion scope 的关键融合
-算子用内嵌 _FALLBACK_DOCS 字典兜底；对未被字典覆盖但运行时存在的算子，会给出
-明确的「算子可调用但无 docstring」提示。
+op-plugin codegen coverage is partial: some operators are callable through
+torch_npu yet have no entry in _op_plugin_docs.py. The built-in _FALLBACK_DOCS
+dict backfills the fusion operators inside model-infer-fusion scope. For an
+operator that exists at runtime but appears in neither source, the tool reports
+that it is callable without a docstring.
 
-子命令：
-  show   单 API 详情
-  search 反向搜索（按关键词匹配 API 名或文档内容）
-  list   枚举所有算子名
+Subcommands:
+  show   details of a single API
+  search reverse lookup, matching a keyword against API names and doc text
+  list   enumerate every operator name
 
-示例：
+Examples:
   python3 torch_npu_query.py show  npu_fusion_attention
   python3 torch_npu_query.py search attention
   python3 torch_npu_query.py search "MoE" --max 20
   python3 torch_npu_query.py list
   python3 torch_npu_query.py list --prefix npu_
 
-无 torch_npu 环境时可显式指定文档路径：
+Without a torch_npu environment, point at the doc file explicitly:
   python3 torch_npu_query.py --docs-path /path/to/_op_plugin_docs.py list
 """
 
@@ -51,23 +55,26 @@ DOC_ENTRY_PATTERN = re.compile(
 
 
 class QueryError(Exception):
-    """工具函数遇到不可恢复错误时抛出，由 main 统一捕获并退出。"""
+    """Raised on an unrecoverable error; main catches it and exits."""
 
 
 def _emit(text: str = "", *, file=sys.stdout) -> None:
-    """业务数据输出。"""
+    """Write one line of result data to the given stream."""
     file.write(text + "\n")
 
 
-# Fallback：当前 torch_npu build 里 hasattr 为 True 但 _op_plugin_docs.py 没注册
-# docstring 的算子。手工维护「一句话摘要 + 在线 URL」。
+# Fallback: operators for which hasattr is True in the current torch_npu build
+# but for which _op_plugin_docs.py registered no docstring. Each entry is a
+# hand-maintained one-line summary plus an online URL.
 #
-# Scope：仅覆盖 model-infer-fusion skill 关心的融合算子。stream/device 控制类等
-# 跨 scope 的算子不在此表，由各自 skill 自行维护。
+# Scope: only the fusion operators the model-infer-fusion skill cares about.
+# Cross-scope operators such as stream/device control stay out of this table and
+# are maintained by their own skills.
 #
-# URL 选型：hiascend.com 26.0.0 文档站。
+# URL choice: the hiascend.com 26.0.0 documentation site.
 #
-# 校验方式：op-plugin 后续若补齐 docstring，_op_plugin_docs.py 的条目会自动覆盖此表。
+# Staleness check: once op-plugin fills in the missing docstrings, entries parsed
+# from _op_plugin_docs.py override this table automatically.
 _HIASCEND_URL_BASE = (
     "https://www.hiascend.com/document/detail/zh/Pytorch/2600/"
     "apiref/torchnpuCustomsapi/docs/zh/custom_APIs/torch_npu/"
@@ -79,7 +86,7 @@ def _hiascend_url(api_name: str) -> str:
 
 
 _FALLBACK_DOCS: dict[str, tuple[str, str]] = {
-    # ===== 类 C：op-plugin codegen 漏 docstring 的 LLM 推理融合关键算子 =====
+    # ===== Category C: key LLM inference fusion operators whose docstring op-plugin codegen missed =====
     "npu_kv_rmsnorm_rope_cache": (
         "融合 MLA 结构中 RMSNorm + RoPE + ScatterUpdate(KVCache 写入) 三步骤",
         _hiascend_url("npu_kv_rmsnorm_rope_cache"),
@@ -121,8 +128,9 @@ _FALLBACK_DOCS: dict[str, tuple[str, str]] = {
         _hiascend_url("npu_moe_re_routing"),
     ),
 
-    # ===== 类 B：运行时 __doc__ 有内容但 _op_plugin_docs.py 未注册 =====
-    # show 已经能通过运行时 __doc__ 拿到完整文档，这里只是让 list/search 也能看到。
+    # ===== Category B: runtime __doc__ has content but _op_plugin_docs.py registered no entry =====
+    # show already returns the full document from the runtime __doc__; these entries
+    # exist so that list and search can see the operators too.
     "erase_stream": (
         "移除张量被 record_stream 添加的已被某 stream 使用的标记",
         _hiascend_url("erase_stream"),
@@ -135,7 +143,7 @@ _FALLBACK_DOCS: dict[str, tuple[str, str]] = {
 
 
 def _fallback_doc_text(api_name: str) -> str | None:
-    """生成 fallback 算子的展示文本：摘要 + 在线链接 + 警示。"""
+    """Render a fallback entry for display: summary, online link, and a warning."""
     entry = _FALLBACK_DOCS.get(api_name)
     if entry is None:
         return None
@@ -155,7 +163,9 @@ _OFFLINE_LIST_HINT = (
 
 
 def resolve_docs_path(explicit_path: str | None) -> str | None:
-    """定位 _op_plugin_docs.py。无 torch_npu 且无显式路径时返回 None，由调用方降级。"""
+    """Locate _op_plugin_docs.py. Return None when torch_npu is absent and no path
+    was given, so the caller can fall back to _FALLBACK_DOCS.
+    """
     if explicit_path:
         if not os.path.isfile(explicit_path):
             raise QueryError(f"指定的 --docs-path 不存在: {explicit_path}")
@@ -176,11 +186,11 @@ def resolve_docs_path(explicit_path: str | None) -> str | None:
 
 
 def parse_doc_entries(docs_path: str | None) -> list[tuple[str, str]]:
-    """解析 _op_plugin_docs.py，并合并 fallback 条目。
+    """Parse _op_plugin_docs.py and merge in the fallback entries.
 
-    优先级：_op_plugin_docs.py 的真实 docstring > _FALLBACK_DOCS。
-    若 op-plugin 后续补齐 docstring，会自动覆盖 fallback 条目。
-    docs_path 为 None（无环境降级）时只返回 _FALLBACK_DOCS。
+    A real docstring from _op_plugin_docs.py takes precedence over _FALLBACK_DOCS,
+    so entries filled in later by op-plugin override the fallback automatically.
+    When docs_path is None, only _FALLBACK_DOCS is returned.
     """
     entries: list[tuple[str, str]] = []
     if docs_path is not None:
@@ -196,13 +206,14 @@ def parse_doc_entries(docs_path: str | None) -> list[tuple[str, str]]:
 
 
 def cmd_show(api_name: str, docs_path: str | None) -> None:
-    """单 API 详情。
+    """Print the details of a single API.
 
-    查找优先级：
-      1. 运行时 torch_npu.<api>.__doc__（类 B / 正常算子）
-      2. parse_doc_entries（_op_plugin_docs.py + _FALLBACK_DOCS 字典）
-      3. 运行时 hasattr=True 但都未命中：通用「算子可调用但无 docstring」提示
-      4. 都不命中：未找到 API
+    Lookup order:
+      1. Runtime torch_npu.<api>.__doc__, covering Category B and normal operators
+      2. parse_doc_entries, i.e. _op_plugin_docs.py plus the _FALLBACK_DOCS dict
+      3. hasattr is True at runtime but neither source matched: report that the
+         operator is callable without a docstring
+      4. Nothing matched: report that the API was not found
     """
     api_exists_at_runtime = False
     try:
@@ -242,7 +253,7 @@ def cmd_show(api_name: str, docs_path: str | None) -> None:
 
 
 def cmd_search(keyword: str, max_results: int, docs_path: str | None) -> None:
-    """反向搜索：关键词匹配 API 名或文档内容。"""
+    """Reverse lookup: match a keyword against API names and doc text."""
     if docs_path is None:
         _emit(_OFFLINE_LIST_HINT, file=sys.stderr)
     entries = parse_doc_entries(docs_path)
@@ -256,7 +267,7 @@ def cmd_search(keyword: str, max_results: int, docs_path: str | None) -> None:
             )
             if len(first_line) > 150:
                 first_line = first_line[:147] + "..."
-            # fallback 条目在 search 输出里加标记，让 agent 选型时区分兜底 vs 完整 docstring
+            # Tag fallback entries so the caller can tell a stub apart from a full docstring
             if name in _FALLBACK_DOCS:
                 first_line = f"[fallback] {first_line}"
             results.append((name, first_line))
@@ -275,7 +286,7 @@ def cmd_search(keyword: str, max_results: int, docs_path: str | None) -> None:
 
 
 def cmd_list(prefix: str | None, docs_path: str | None) -> None:
-    """枚举所有算子名。"""
+    """Enumerate every operator name, optionally filtered by prefix."""
     if docs_path is None:
         _emit(_OFFLINE_LIST_HINT, file=sys.stderr)
     entries = parse_doc_entries(docs_path)
@@ -292,29 +303,29 @@ def cmd_list(prefix: str | None, docs_path: str | None) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="torch_npu API 本地文档查询",
+        description="Query torch_npu API documentation locally",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__.split("子命令：", 1)[-1] if __doc__ else "",
+        epilog=__doc__.split("Subcommands:", 1)[-1] if __doc__ else "",
     )
     parser.add_argument(
         "--docs-path",
         default=None,
-        help="显式指定 _op_plugin_docs.py 路径（无 torch_npu 环境时使用）",
+        help="explicit path to _op_plugin_docs.py, for use without a torch_npu environment",
     )
 
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    p_show = sub.add_parser("show", help="单 API 详情")
-    p_show.add_argument("api_name", help="算子名，如 npu_fusion_attention")
+    p_show = sub.add_parser("show", help="details of a single API")
+    p_show.add_argument("api_name", help="operator name, for example npu_fusion_attention")
 
-    p_search = sub.add_parser("search", help="反向搜索")
-    p_search.add_argument("keyword", help="关键词，匹配名字或文档内容")
+    p_search = sub.add_parser("search", help="reverse lookup")
+    p_search.add_argument("keyword", help="keyword matched against API names and doc text")
     p_search.add_argument(
-        "--max", type=int, default=10, dest="max_results", help="最多返回结果数（默认 10）"
+        "--max", type=int, default=10, dest="max_results", help="maximum number of results (default 10)"
     )
 
-    p_list = sub.add_parser("list", help="枚举所有算子名")
-    p_list.add_argument("--prefix", default=None, help="只列以该前缀开头的算子")
+    p_list = sub.add_parser("list", help="enumerate every operator name")
+    p_list.add_argument("--prefix", default=None, help="list only operators starting with this prefix")
 
     return parser
 

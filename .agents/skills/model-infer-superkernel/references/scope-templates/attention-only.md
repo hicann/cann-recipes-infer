@@ -41,9 +41,10 @@
 from executor.utils import superkernel_scope
 
 class Attention(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, infer_config):
         super().__init__()
-        self.enable_superkernel = config.enable_superkernel
+        self.infer_config = infer_config
+        self.enable_superkernel = infer_config.model_config.custom_params.get("enable_superkernel", False)
         # ... 其他初始化
 
     def forward(
@@ -58,8 +59,8 @@ class Attention(nn.Module):
         # SuperKernel scope 仅包含 Attention 计算
         with superkernel_scope(
             self.enable_superkernel and not is_prefill,
-            label="attention",
-            option="stream-fusion=1"
+            "attention",
+            "stream-fusion=1",
         ):
             # Q, K, V 投影
             query_states = self.q_proj(hidden_states)
@@ -93,10 +94,12 @@ class Attention(nn.Module):
 from executor.utils import superkernel_scope
 
 class DecoderLayer(nn.Module):
-    def __init__(self, config, layer_idx):
+    def __init__(self, config, infer_config, layer_idx):
         super().__init__()
-        self.enable_superkernel = config.enable_superkernel
-        self.self_attn = Attention(config, layer_idx)
+        self.infer_config = infer_config
+        self.layer_idx = layer_idx
+        self.enable_superkernel = infer_config.model_config.custom_params.get("enable_superkernel", False)
+        self.self_attn = Attention(config, infer_config)
         self.mlp = MLP(config)
         # ... 其他初始化
 
@@ -114,8 +117,8 @@ class DecoderLayer(nn.Module):
         # SuperKernel scope 仅包含 Attention
         with superkernel_scope(
             self.enable_superkernel and not is_prefill,
-            label=f"attention_layer_{self.layer_idx}",
-            option="stream-fusion=1"
+            f"attention_layer_{self.layer_idx}",
+            "stream-fusion=1",
         ):
             # Self-Attention
             hidden_states = self.input_layernorm(hidden_states)
@@ -144,7 +147,7 @@ class DecoderLayer(nn.Module):
 ## 配置文件
 
 ```yaml
-# models/{model_name}/config.yaml
+# models/{model_name}/config/{yaml_name}.yaml
 
 model_config:
   exe_mode: "ge_graph"            # 必须是 ge_graph
@@ -161,8 +164,7 @@ model_config:
 ### 1. 编译验证
 
 ```bash
-cd models/{model_name}
-bash infer.sh 2>&1 | tee compile.log
+bash executor/scripts/infer.sh --model {model_name} --yaml {yaml_name}.yaml 2>&1 | tee compile.log
 
 # 检查编译日志
 grep -i "superkernel" compile.log
@@ -172,33 +174,31 @@ grep -i "attention" compile.log
 ### 2. 功能验证
 
 ```bash
-# 对比启用前后的输出
+# 在仓库根执行，对比启用前后的输出
 # 1. 禁用 SuperKernel
-sed -i 's/enable_superkernel: True/enable_superkernel: False/' config.yaml
-bash infer.sh > baseline_output.txt
+cp models/{model_name}/config/{yaml_name}.yaml models/{model_name}/config/{yaml_name}_sk_off.yaml
+sed -i 's/enable_superkernel: True/enable_superkernel: False/' models/{model_name}/config/{yaml_name}_sk_off.yaml
+bash executor/scripts/infer.sh --model {model_name} --yaml {yaml_name}_sk_off.yaml > baseline_output.txt
 
 # 2. 启用 SuperKernel
-sed -i 's/enable_superkernel: False/enable_superkernel: True/' config.yaml
-bash infer.sh > optimized_output.txt
+# 优化版直接用原配置，无需改回
+bash executor/scripts/infer.sh --model {model_name} --yaml {yaml_name}.yaml > optimized_output.txt
 
-# 3. 对比输出
-diff baseline_output.txt optimized_output.txt
-# 应该完全一致
+# 3. 抽生成文本比对（日志行带毫秒时间戳与各自的 yaml 名）
+diff <(grep -o 'Request [0-9]*: outputs:.*' baseline_output.txt) \
+     <(grep -o 'Request [0-9]*: outputs:.*' optimized_output.txt)
+# 期望无差异
 ```
 
 ### 3. 性能验证
 
-```bash
-# 使用性能测试脚本
-python scripts/benchmark.py --config config.yaml --output performance.json
-
-# 查看性能提升
-cat performance.json | jq '.improvement_percent'
-```
+按 `../performance-baseline-guide.md` 的步骤跑关闭与启用 SuperKernel 两组，各取 decode 单步耗时中位数对比。
 
 ---
 
 ## 预期性能提升
+
+> 下列为常见量级示意，不作通用验收门槛；实际收益以本模型的实测基线对比为准。
 
 | 模型类型 | 预期提升 | 说明 |
 |---------|---------|------|
@@ -239,7 +239,7 @@ cat performance.json | jq '.improvement_percent'
 **解决方法**：
 1. 检查是否使用了自定义算子
 2. 如果使用了，添加 DCache 刷新
-3. 调用 `kvcache-fa-precision-debug` skill 进行排查
+3. 仍有偏差的按精度问题定位流程排查，先定位首个偏差点再判根因
 
 ---
 
@@ -254,8 +254,7 @@ cat performance.json | jq '.improvement_percent'
 
 ## 参考资源
 
-- Scope 分析指南：`../../references/scope-analysis-guide.md`
-- 性能基线指南：`../../references/performance-baseline-guide.md`
-- 调试指南：`../../references/debugging-guide.md`
+- Scope 分析指南：`../scope-analysis-guide.md`
+- 性能基线指南：`../performance-baseline-guide.md`
 - MoE-Only 模板：`moe-only.md`
 - Full-Model 模板：`full-model.md`

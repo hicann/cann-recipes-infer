@@ -1,7 +1,6 @@
 ---
 name: model-infer-sota-approach
 description: 通用模型推理优化编排技能。用于从推理场景、精度基线、profiling 采集与性能分析开始，拉起多个方向的 subagent 生成不限于多流的优化候选，再按 Plan / round 编排 implementer 和 reviewer subagent 实施、验收、派生新 Plan，并最终判断哪些 Plan 保留、哪些淘汰。适用于融合算子、prefetch、图模式、多流、KVCache、量化、并行等优化项的统一调测编排。
-user-invocable: true
 ---
 
 # 模型推理优化编排技能（高阶流程）
@@ -76,7 +75,7 @@ user-invocable: true
 
 ## 执行规则
 
-进入本 skill 后，先按下面的"编排步骤"建立 TaskList，再逐阶段推进。每次拉 subagent 前，按 [`references/subagent-prompt-templates.md`](references/subagent-prompt-templates.md) 选好模板、替换占位符。
+进入本 skill 后，先按下面的「0. TaskList 骨架」建立 TaskList，再逐阶段推进。每次拉 subagent 前，按 [`references/subagent-prompt-templates.md`](references/subagent-prompt-templates.md) 选好模板、替换占位符。
 
 Plan Dashboard 使用 [`references/plan-dashboard-template.md`](references/plan-dashboard-template.md)；状态裁决、互斥/叠加判定、是否重采 profiling 和派生规则见 [`references/decision-rules.md`](references/decision-rules.md)。
 
@@ -85,7 +84,7 @@ Plan Dashboard 使用 [`references/plan-dashboard-template.md`](references/plan-
 profiling 的采集与分析交给两个 skill，本流程只调用、不重复它们的内部契约：
 
 - **`model-infer-profiling`**：采集 profiling 数据（`kernel_details.csv` 等）。
-- **`model-infer-perf-breakdown`**：本流程唯一的性能分析入口。一份报告同时给出「时间分布」（哪个模块 / 哪层耗时、在抖）和「逐算子实测 / 理论 gap」（哪些算子离理论 bound 最远）两类证据，直接支撑候选发现。它怎么拆、怎么算理论是它内部的事。
+- **`model-infer-perf-breakdown`**：本流程唯一的性能分析入口。一份报告给出「时间分布」（哪个模块 / 哪层耗时、在抖）这类证据，直接支撑候选发现。它的理论对比是可选步骤，依赖外部 skill，启用后才额外产出「逐算子实测 / 理论 gap」。它怎么拆、怎么算理论是它内部的事。
 
 **采集和分析都走 subagent，交互只发生在主 agent 派发前**：`model-infer-perf-breakdown` 需要用户敲定的拆解口径（拆解模块偏好、structure / cluster spec 等）由主 agent 在派 subagent 前先问清、作为 spec 传下去，subagent 据此非交互地跑分析——包括第一次 baseline。采集本身非交互、输出冗长，按"采集走 subagent、主 agent 控上下文"的原则，baseline 和重采 round 的采集都走 profiling-instrumenter subagent。baseline 敲定的 spec 在重采轮复用、不再问；重采轮还与 baseline 做同口径对照得出 Δ%。
 
@@ -94,7 +93,7 @@ profiling 的采集与分析交给两个 skill，本流程只调用、不重复�
 - **subagent 配置继承主 agent**：所有 subagent 的 model、thinking、上下文强度等配置都与主 agent 一致，不降级、不缩短、不切配置。本约束对下文每一个 subagent 都生效，后续不再重复。
 - **主 agent 只编排不替工**：主 agent 负责阶段推进、一切用户交互（场景确认、perf-breakdown 拆解 spec 的提问等）、prompt 组装、Dashboard 维护和最终验收，不亲自下场跑采集 / 分析 / 实施。凡 subagent 因不能与用户对话而缺的交互，主 agent 在派发前先问好、把结果作为 spec 传下去；采集与分析（含第一次 baseline）都走 subagent。
 - **Dashboard 总览 + Plan 明细分离**：`plan-dashboard.md`（总览，约定路径 `optimization-analysis/<case>/plan-dashboard.md`）只放关键信息 + 状态 + 裁决，**只有主 agent 写**；每个 Plan 的完整记录（方案描述 / 方案细节 / 实施 / review / 派生）写在它自己的 `plans/plan-<id>.md`，由该 Plan 的 candidate / implementer / reviewer 产出，主 agent 不解析其结构、只把关键信息和状态镜像进 Dashboard 表。方向级分析另在 `analysis/<source>.md`。详见 [`references/plan-dashboard-template.md`](references/plan-dashboard-template.md) 的"分层与写者"。
-- **状态、过程、方案三处分工**：dashboard 只管**状态指示**（Plan 状态机、采纳实现、round 裁决），是 Plan 状态的单一真相源；项目级 `progress.md`（共享状态文件，路径由主 agent 解析、不在本流程钉死）承接**跨 agent 共享上下文 + subagent 实施 / 踩坑 / 验证过程**——常驻区放干活要读的上下文（场景与精度口径、baseline 瓶颈、已通过 Plan 速览、当前 round 目标，主 agent 维护），工作区由各 round 的 subagent 追加过程，其常驻区 / 工作区 / 归档（`progress_history.md`）与读写规则沿用 `model-infer-optimize` 的「共享状态文件」约定、本流程不重复；`plans/plan-<id>.md` 装每个 Plan 的方案 spec 与 round 级结论摘要。三者互不复制：看状态查 dashboard、看过程与共享上下文查 progress.md、看单个 Plan 的方案查它的 plan 文件。progress.md 找得到就续写，找不到就用 `model-infer-optimize` 的 `progress_template.md` 创建一份。dispatch prompt 只给模板字段与路径、**不转述上下文**，subagent 靠读 progress.md 取共享上下文。这套文件也是主 agent 跨上下文压缩重建状态的依据，关键节点即时回写、不攒到收尾。
+- **状态、过程、方案三处分工**：dashboard 只管**状态指示**（Plan 状态机、采纳实现、round 裁决），是 Plan 状态的单一真相源；项目级 `progress.md`（共享状态文件，路径由主 agent 解析、不在本流程钉死）承接**跨 agent 共享上下文 + subagent 实施 / 问题 / 验证过程**——常驻区放干活要读的上下文（场景与精度口径、baseline 瓶颈、已通过 Plan 速览、当前 round 目标，主 agent 维护），工作区由各 round 的 subagent 追加过程，其常驻区 / 工作区 / 归档（`progress_history.md`）与读写规则沿用 `model-infer-optimize` 的「共享状态文件」约定、本流程不重复；`plans/plan-<id>.md` 装每个 Plan 的方案 spec 与 round 级结论摘要。三者互不复制：看状态查 dashboard、看过程与共享上下文查 progress.md、看单个 Plan 的方案查它的 plan 文件。progress.md 找得到就续写，找不到就用 `model-infer-optimize` 的 `progress_template.md` 创建一份。dispatch prompt 只给模板字段与路径、**不转述上下文**，subagent 靠读 progress.md 取共享上下文。这套文件也是主 agent 跨上下文压缩重建状态的依据，关键节点即时回写、不攒到收尾。
 - **候选先发现，Dashboard 后初始化**：场景、精度、baseline profiling 和候选发现没全部完成前，不要初始化 Dashboard。
 - **性能证据统一口径**：一切性能收益判断都以 `profile-analyzer` 产出的分析报告为准，不拿裸 wall-clock 数字当结论依据。
 - **roundN 全局递增、不复用**：每一个 Plan、每一档强度、每一次尝试都用独立的全局递增 `roundN` 记录；派生出的 Plan 也分配新的 `roundN`，既不复用旧编号、也不与旧 round 合并。
@@ -156,7 +155,7 @@ TF5. 汇总最终方案、淘汰原因与剩余风险
 
 ### 4. 分析 baseline profiling
 
-先由**主 agent 交互问清** `model-infer-perf-breakdown` 需要的拆解口径——主 agent 读该 skill 了解它要哪些字段（拆解模块偏好、structure / cluster spec 等），再与用户敲定，结果作为分析 spec；然后拉 `profile-analyzer` subagent 用该 spec **非交互**跑 round0 分析，产出一份报告，含「时间分布」和「逐算子实测 / 理论 gap + need optimization 清单」两类证据。baseline 敲定的分析 spec 会被后续每个重采 round 复用。
+先由**主 agent 交互问清** `model-infer-perf-breakdown` 需要的拆解口径——主 agent 读该 skill 了解它要哪些字段（拆解模块偏好、structure / cluster spec 等），再与用户敲定，结果作为分析 spec；然后拉 `profile-analyzer` subagent 用该 spec **非交互**跑 round0 分析，产出一份报告，含「时间分布」证据（各模块与层的 wall、bubble 中位数与异常层），以及该 skill 的洞察产出（模块 bubble、算子抖动、连续 vector 区间、冗余搬运）；若该 skill 的理论对比步骤已启用，还会有「逐算子实测 / 理论 gap」。具体产物文件名归 `model-infer-perf-breakdown`，本流程不固定。baseline 敲定的分析 spec 会被后续每个重采 round 复用。
 
 这份 baseline 分析标定了性能结构和优化空间，既是候选发现的主要依据，也是最终验收做同场景、同口径对照的基准。
 
@@ -169,7 +168,7 @@ TF5. 汇总最终方案、淘汰原因与剩余风险
 | --- | --- | --- | --- | --- |
 | multi-stream | 用 `model-infer-multi-stream` 做整网 / 模块 / 算子 DAG 拆解、判并行性，每个并行点派 ≥2 种多流编排候选 | 代码目录、场景记录、baseline 分析 | `analysis/multi-stream.md`（DAG + 候选，结构见 module-decomposition 模板） | 各 Plan 引用本文件的 DAG，implement / review 据此实施 |
 | wiki | 查 CANN-Infer-Wiki，找该模型 / 场景适用的优化手段（不限多流）作候选；没挂载就跳过 | 场景记录（模型 / 硬件 / 阶段）、baseline 瓶颈摘要 | `analysis/wiki.md`（候选 + 页面引用 + 适用条件） | 每个候选把相关 wiki 页面 ID 记到对应 Plan 的 md，implement / review 按需 get_page 参考 |
-| perf-insight | 读 baseline perf-breakdown 的 insight 产物整理候选：连续 vector 区间 → 融合、冗余搬运 → prefetch、理论偏离 Top → 重点算子 | baseline 报告与 insight 目录、场景记录 | `analysis/perf-insight.md`（候选 + insight 证据） | 各 Plan 引用本文件的 insight 证据 |
+| perf-insight | 读 baseline perf-breakdown 的 insight 产物整理候选：连续 vector 区间 → 融合、冗余搬运 → prefetch、模块 bubble 与算子抖动 → 重点算子；理论对比已启用时再加理论偏离 Top | baseline 报告与 insight 目录、场景记录 | `analysis/perf-insight.md`（候选 + insight 证据） | 各 Plan 引用本文件的 insight 证据 |
 
 所有来源共性（不随来源变，故不进表）：各写自己的产物文件、都**不写** `plan-dashboard.md`；候选草案以摘要回主 agent，第 6 步统一归并、裁定候选间互斥 / 叠加；每个草案含方案描述、预期收益、风险与验证口径、互斥 / 可叠加、推荐优先级。用户给的优化列表作为种子分给对应来源的 candidate，增删合并要说明原因。
 
@@ -214,7 +213,7 @@ Dashboard 只放关键信息 + 状态 + 裁决；每个 Plan 的方案描述、�
 
 implementer 可以在发现更合理方案时**建议**派生，但不得覆盖当前 Plan；reviewer 负责复核验收，可以建议派生，但不改代码、不回退代码。派生出的新 Plan 一律分配新的 `roundN`、初始状态 `待实现`，追加而不合并。
 
-每轮收尾，implementer / reviewer 把实施 / 踩坑 / 验证**过程**写进 `progress.md` 工作区，把 round 级**结论摘要**（含方案细节 spec、派生建议）落该 Plan 的 `plans/plan-<id>.md`；主 agent 读它做裁决，只把关键信息 + 状态镜像进 Dashboard 表（证据摘要、状态、round、淘汰/保留原因），并同步更新「当前采纳的实现」和「Round 记录」。Dashboard 不展开明细。
+每轮收尾，implementer / reviewer 把实施 / 问题 / 验证**过程**写进 `progress.md` 工作区，把 round 级**结论摘要**（含方案细节 spec、派生建议）落该 Plan 的 `plans/plan-<id>.md`；主 agent 读它做裁决，只把关键信息 + 状态镜像进 Dashboard 表（证据摘要、状态、round、淘汰/保留原因），并同步更新「当前采纳的实现」和「Round 记录」。Dashboard 不展开明细。
 
 ### 8. 最终验收
 

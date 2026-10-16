@@ -9,7 +9,7 @@
 SuperKernel Scope 是指使用 `superkernel_scope` 上下文管理器标记的代码范围，编译器会将这个范围内的算子融合成一个 SuperKernel。
 
 ```python
-with superkernel_scope(enable, label, option):
+with superkernel_scope(enable, scope, options):
     # 这个范围内的算子会被融合
     pass
 ```
@@ -173,17 +173,7 @@ with superkernel_scope(enable, "all_layers", option):
 
 #### 步骤 1：性能分析
 
-```python
-# 启用 profiler
-import torch_npu
-torch_npu.npu.profile(use_npu=True)
-
-# 运行模型
-with torch_npu.npu.profile():
-    output = model(input_ids)
-
-# 查看性能报告
-```
+采 decode 阶段 profiling 并拆解到模块，取各模块的耗时占比。
 
 #### 步骤 2：识别瓶颈
 
@@ -226,10 +216,10 @@ with superkernel_scope(enable, "moe", option):
 │   ├─ Attention 验证成功？
 │   │   └─ 是 → 尝试扩大到"全 Decoder 层"
 │   └─ 追求最优性能？
-│       └─ 是 → 使用"自动分析工具"
+│       └─ 是 → 尝试"全 Decoder 层"
 │
 └─ 其他模型
-    └─ 使用"自动分析工具"或"自定义 Scope"
+    └─ 先做 scope 分析，从"仅 Attention 模块"起步
 ```
 
 ---
@@ -327,17 +317,16 @@ class QwenDecoderLayer:
 ### 验证脚本
 
 ```bash
-# 1. 禁用 SuperKernel，建立基线
-sed -i 's/enable_superkernel: True/enable_superkernel: False/' config.yaml
-bash infer.sh > baseline.log
+# 1. 复制一份关闭 SuperKernel 的配置，不原地改已有配置
+cp models/{model_name}/config/{yaml_name}.yaml models/{model_name}/config/{yaml_name}_sk_off.yaml
+sed -i 's/enable_superkernel: True/enable_superkernel: False/' models/{model_name}/config/{yaml_name}_sk_off.yaml
 
-# 2. 启用 SuperKernel，测试性能
-sed -i 's/enable_superkernel: False/enable_superkernel: True/' config.yaml
-bash infer.sh > optimized.log
-
-# 3. 对比结果
-python scripts/compare_performance.py baseline.log optimized.log
+# 2. 跑基线与优化版
+bash executor/scripts/infer.sh --model {model_name} --yaml {yaml_name}_sk_off.yaml
+bash executor/scripts/infer.sh --model {model_name} --yaml {yaml_name}.yaml
 ```
+
+两次运行的日志在 `models/{model_name}/res/<date>/<case>/log_<rank>.log`，各取 decode 单步耗时中位数对比，判据见 `performance-baseline-guide.md` 的性能对比表。
 
 ---
 
@@ -366,32 +355,10 @@ python scripts/compare_performance.py baseline.log optimized.log
 - 使用 `is_prefill` 标志控制
 
 ```python
-with superkernel_scope(enable and not is_prefill, label, option):
+with superkernel_scope(enable and not is_prefill, scope, options):
     # 只在 Decode 阶段启用
     pass
 ```
-
----
-
-## 自动分析工具
-
-### 工具原理
-
-自动分析工具通过以下步骤确定最优 Scope：
-
-1. **性能分析**：使用 profiler 分析各模块耗时
-2. **范围枚举**：尝试不同的 Scope 组合
-3. **性能对比**：对比各组合的性能提升
-4. **推荐方案**：选择性能最优且稳定的方案
-
-### 使用方法
-
-在 Skill 的第二步选择"使用自动分析工具"，系统会启动 subagent 执行分析。
-
-**注意**：
-- 分析过程耗时较长（5-10 分钟）
-- 需要模型能够正常运行
-- 结果仅供参考，需要人工验证
 
 ---
 
@@ -408,7 +375,6 @@ with superkernel_scope(enable and not is_prefill, label, option):
 
 ## 参考资源
 
-- Scope 模板：`../resources/scope-templates/`
+- Scope 模板：`scope-templates/`
 - 性能基线指南：`performance-baseline-guide.md`
-- 调试指南：`debugging-guide.md`
 - 官方文档：[SuperKernel 开发指南](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/83RC1alpha002/opdevg/Ascendcopdevg/atlas_ascendc_10_00029.html)

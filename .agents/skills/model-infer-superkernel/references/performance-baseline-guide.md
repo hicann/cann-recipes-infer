@@ -20,11 +20,11 @@
 
 | 指标 | 说明 | 单位 | 重要性 |
 |------|------|------|--------|
-| **Decode 单步耗时** | 生成一个 token 的时间 | ms | 🔴 高 |
-| **吞吐量** | 每秒生成的 token 数 | tokens/s | 🔴 高 |
-| **首 token 延迟** | Prefill 阶段耗时 | ms | 🟡 中 |
-| **内存占用** | 推理时的显存使用 | GB | 🟡 中 |
-| **编译时间** | torch.compile 耗时 | s | 🟢 低 |
+| **Decode 单步耗时** | 生成一个 token 的时间 | ms | 高 |
+| **吞吐量** | 每秒生成的 token 数 | tokens/s | 高 |
+| **首 token 延迟** | Prefill 阶段耗时 | ms | 中 |
+| **内存占用** | 推理时的显存使用 | GB | 中 |
+| **编译时间** | torch.compile 耗时 | s | 低 |
 
 ### 辅助指标
 
@@ -76,16 +76,14 @@ export PYTHONPATH=/path/to/cann-recipes-infer:$PYTHONPATH
 
 #### 2.1 禁用 SuperKernel
 
-修改 `config.yaml`：
+复制一份关闭 SuperKernel 的配置，保留原配置不动（在仓库根执行）：
 
-```yaml
-model_config:
-  exe_mode: "ge_graph"            # 保持图模式
-  enable_cache_compile: False
-  custom_params:
-    enable_superkernel: False     # 禁用 SuperKernel
-    enable_multi_streams: False   # 禁用其他优化
+```bash
+cp models/{model_name}/config/{yaml_name}.yaml models/{model_name}/config/{yaml_name}_sk_off.yaml
+sed -i 's/enable_superkernel: True/enable_superkernel: False/' models/{model_name}/config/{yaml_name}_sk_off.yaml
 ```
+
+再确认副本的 `model_config`：`exe_mode: "ge_graph"` 保持图模式、`enable_cache_compile: False`、`custom_params.enable_multi_streams: False` 排除其他优化干扰。
 
 #### 2.2 配置测试参数
 
@@ -98,56 +96,27 @@ data_config:
   dataset: "default"              # 使用 dataset/default_prompt.json 中的固定 prompt
 ```
 
-#### 2.3 准备测试脚本
-
-创建 `scripts/benchmark_baseline.sh`：
-
-```bash
-#!/bin/bash
-
-# 设置环境
-source /usr/local/Ascend/ascend-toolkit/latest/bin/setenv.bash
-
-# 进入模型目录
-cd models/${MODEL_NAME}
-
-# 运行基线测试（按部署模式选用推理入口：框架部署走模型目录下 `bash infer.sh`（wrapper 内 source 上游 executor/scripts/function.sh）；独立部署走模型自带的 `python -u infer.py --yaml_file_path config.yaml`）
-echo "=== Running Baseline Test ==="
-bash infer.sh 2>&1 | tee baseline.log
-
-# 提取性能数据
-python ../../scripts/extract_performance.py baseline.log > baseline_performance.json
-
-echo "=== Baseline Test Complete ==="
-cat baseline_performance.json
-```
-
----
-
 ### 步骤 3：运行基线测试
 
-#### 3.1 预热运行
+推理入口按部署模式选：框架部署在仓库根执行 `bash executor/scripts/infer.sh --model {model_name} --yaml {yaml_name}_sk_off.yaml`；独立部署在模型目录执行 `python -u infer.py --yaml_file_path config/{yaml_name}_sk_off.yaml`。
 
 ```bash
-# 第一次运行（预热，不计入统计）
-bash scripts/benchmark_baseline.sh
+source /usr/local/Ascend/ascend-toolkit/latest/bin/setenv.bash
 
-# 等待编译完成
-```
+# 第一次运行预热，不计入统计（等待图编译完成）
+bash executor/scripts/infer.sh --model {model_name} --yaml {yaml_name}_sk_off.yaml
 
-#### 3.2 正式测试
-
-```bash
-# 运行 3-5 次，取平均值
-for i in {1..5}; do
+# 正式测试跑 3-5 次
+for i in $(seq 1 5); do
     echo "=== Run $i ==="
-    bash scripts/benchmark_baseline.sh
+    bash executor/scripts/infer.sh --model {model_name} --yaml {yaml_name}_sk_off.yaml
     sleep 5
 done
-
-# 计算平均值
-python scripts/calculate_average.py baseline_performance_*.json > baseline_avg.json
 ```
+
+对比结束后删除临时副本 `models/{model_name}/config/{yaml_name}_sk_off.yaml`。
+
+每次运行的日志在 `models/{model_name}/res/<date>/<case>/log_<rank>.log`，从中取 prefill 与 decode 耗时，多次运行取中位数，记录格式见「步骤 4：记录基线数据」。
 
 ---
 
@@ -202,14 +171,13 @@ python scripts/calculate_average.py baseline_performance_*.json > baseline_avg.j
 #### 5.1 检查波动
 
 ```python
-import json
+import glob
 import numpy as np
 
-# 读取多次运行的数据
+# 从步骤 3 的 5 次运行日志里各取一个 decode 单步耗时
 data = []
-for i in range(1, 6):
-    with open(f'baseline_performance_{i}.json') as f:
-        data.append(json.load(f)['performance']['decode_latency_ms'])
+for log_path in sorted(glob.glob(f'{res_dir}/log_0.log')):
+    data.append(extract_decode_latency_ms(log_path))
 
 # 计算统计量
 mean = np.mean(data)
@@ -222,9 +190,9 @@ print(f"CV: {cv:.2f}%")
 
 # 判断稳定性
 if cv < 5:
-    print("✓ 基线稳定")
+    print("基线稳定")
 else:
-    print("✗ 基线波动较大，建议重新测试")
+    print("基线波动较大，建议重新测试")
 ```
 
 #### 5.2 稳定性标准
@@ -242,7 +210,7 @@ else:
 
 ### 步骤 1：启用 SuperKernel
 
-修改 `config.yaml`：
+修改 `models/{model_name}/config/{yaml_name}.yaml`：
 
 ```yaml
 model_config:
@@ -254,117 +222,37 @@ model_config:
 
 ### 步骤 2：运行优化测试
 
-```bash
-# 使用相同的测试脚本
-bash scripts/benchmark_optimized.sh
+用启用 SuperKernel 的原配置，按与基线相同的次数运行：
 
-# 运行多次取平均
-for i in {1..5}; do
+```bash
+bash executor/scripts/infer.sh --model {model_name} --yaml {yaml_name}.yaml
+
+for i in $(seq 1 5); do
     echo "=== Run $i ==="
-    bash scripts/benchmark_optimized.sh
+    bash executor/scripts/infer.sh --model {model_name} --yaml {yaml_name}.yaml
     sleep 5
 done
-
-python scripts/calculate_average.py optimized_performance_*.json > optimized_avg.json
 ```
 
 ### 步骤 3：性能对比
 
-创建 `scripts/compare_performance.py`：
+两组各取中位数后逐项对比，判据：
 
-```python
-import json
+| 指标 | 方向 | 通过判据 |
+|------|------|---------|
+| decode 单步耗时 | 越低越好 | 优化版低于基线，且降幅超过基线自身的波动范围 |
+| prefill 耗时 | 越低越好 | 不回退（SuperKernel 仅在 decode 生效） |
+| 显存峰值 | 越低越好 | 不显著上升 |
 
-# 读取基线和优化后的数据
-with open('baseline_avg.json') as f:
-    baseline = json.load(f)
-
-with open('optimized_avg.json') as f:
-    optimized = json.load(f)
-
-# 计算性能提升
-def calculate_improvement(baseline_val, optimized_val, lower_is_better=True):
-    if lower_is_better:
-        improvement = (baseline_val - optimized_val) / baseline_val * 100
-    else:
-        improvement = (optimized_val - baseline_val) / baseline_val * 100
-    return improvement
-
-# 对比各项指标
-metrics = {
-    'decode_latency_ms': True,   # lower is better
-    'throughput_tokens_per_sec': False,  # higher is better
-    'memory_usage_gb': True,
-}
-
-print("=== Performance Comparison ===\n")
-for metric, lower_is_better in metrics.items():
-    baseline_val = baseline['performance'][metric]
-    optimized_val = optimized['performance'][metric]
-    improvement = calculate_improvement(baseline_val, optimized_val, lower_is_better)
-
-    print(f"{metric}:")
-    print(f"  Baseline:  {baseline_val:.2f}")
-    print(f"  Optimized: {optimized_val:.2f}")
-    print(f"  Improvement: {improvement:+.2f}%")
-    print()
-
-# 生成对比报告
-report = {
-    'baseline': baseline,
-    'optimized': optimized,
-    'improvements': {}
-}
-
-for metric, lower_is_better in metrics.items():
-    baseline_val = baseline['performance'][metric]
-    optimized_val = optimized['performance'][metric]
-    improvement = calculate_improvement(baseline_val, optimized_val, lower_is_better)
-    report['improvements'][metric] = {
-        'baseline': baseline_val,
-        'optimized': optimized_val,
-        'improvement_percent': improvement
-    }
-
-with open('performance_comparison.json', 'w') as f:
-    json.dump(report, f, indent=2)
-
-print("Report saved to performance_comparison.json")
-```
+降幅落在波动范围内的记为「无显著收益」，不记为提升。基线波动范围按步骤 5 的稳定性检查得到。
 
 ---
 
 ## 性能分析工具
 
-### 工具 1：NPU Profiler
+定 scope 需要各模块的 decode 耗时占比，由 profiling 采集与模块拆解得到。
 
-```python
-import torch_npu
-
-# 启用 profiler
-torch_npu.npu.profile(use_npu=True)
-
-with torch_npu.npu.profile():
-    output = model(input_ids)
-
-# 查看性能报告
-# 结果保存在 prof/ 目录
-```
-
-### 工具 2：CANN Profiler
-
-```bash
-# 在 config.yaml 中启用
-enable_profiler: True
-
-# 运行模型
-bash infer.sh
-
-# 查看 profiling 结果
-ls prof/
-```
-
-### 工具 3：自定义计时
+### 自定义计时
 
 ```python
 import time
@@ -399,6 +287,8 @@ def benchmark_decode(model, input_ids, num_steps=100):
 ## 性能报告模板
 
 ### 完整报告结构
+
+> 下面模板中的数字是占位示例，不是实测值；填报时全部替换为本次运行的实际数据。
 
 ```markdown
 # SuperKernel 性能测试报告
@@ -474,7 +364,7 @@ SuperKernel 优化在 Decode 阶段带来了 **15.8%** 的性能提升，吞吐�
 2. 使用相同的配置参数（除了 enable_superkernel）
 3. 在相同的环境下测试
 4. 预热后再测试
-5. 多次运行取平均值
+5. 多次运行取中位数
 
 ### Q3: 性能提升不明显怎么办？
 
@@ -490,7 +380,7 @@ SuperKernel 优化在 Decode 阶段带来了 **15.8%** 的性能提升，吞吐�
 ## 最佳实践
 
 1. **固定测试条件**：确保基线和优化测试使用完全相同的条件
-2. **多次测试**：至少运行 3-5 次，取平均值
+2. **多次测试**：至少运行 3-5 次，取中位数
 3. **预热运行**：第一次运行不计入统计
 4. **记录详细信息**：保存完整的配置、日志和性能数据
 5. **版本控制**：使用 git 记录每次测试的代码版本
@@ -502,6 +392,4 @@ SuperKernel 优化在 Decode 阶段带来了 **15.8%** 的性能提升，吞吐�
 ## 参考资源
 
 - Scope 分析指南：`scope-analysis-guide.md`
-- 调试指南：`debugging-guide.md`
-- 性能分析工具：`../../scripts/performance_analysis.py`
 - 官方文档：[CANN 性能分析工具](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/83RC1alpha002/devtools/auxiliarydevtool/atlasprofiling_16_0001.html)

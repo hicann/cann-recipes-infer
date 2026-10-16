@@ -62,7 +62,7 @@ class Model(torch.nn.Module):
 
     def forward(self, in1, in2, in3, in4):
         # 指定Stream级核数
-        with torch.npu.npugraph_ex.scope.limit_core_num(4, 5): 
+        with torch.npu.npugraph_ex.scope.limit_core_num(4, 5):
             mm_result = torch.mm(in3, in4)
             add_result = torch.add(in1, in2)
         mm1_result = torch.mm(in3, in4)

@@ -100,7 +100,7 @@ class Model(torch.nn.Module):
         super().__init__()
     def forward(self, in1, in2, in3, in4):
         # 指定算子级核数
-        with torchair.scope.limit_core_num(4, 5): 
+        with torchair.scope.limit_core_num(4, 5):
             mm_result = torch.mm(in3, in4)
             add_result = torch.add(in1, in2)
         mm1_result = torch.mm(in3, in4)
@@ -110,7 +110,7 @@ model = Model()
 config = CompilerConfig()
 config.debug.graph_dump.type = "pbtxt"
 # 指定全局核数
-config.ge_config.aicore_num = "24|48"     
+config.ge_config.aicore_num = "24|48"
 npu_backend = torchair.get_npu_backend(compiler_config=config)
 model = torch.compile(model, backend=npu_backend, dynamic=False, fullgraph=True)
 in1 = torch.randn(1000, 1000, dtype = torch.float16).npu()

@@ -245,7 +245,7 @@ class {ModelName}Runner:
         # 独立部署 Runner 必须自管，至少填好以下字段：
         #   is_prefill / kv_len / actual_seq_lengths_q / actual_seq_lengths_kv
         #   attention_mask（prefill 用 causal mask；decode 必须为 None）
-        #   slot_mapping / block_table（paged 模式才需要，由 kvcache skill 改造引入）
+        #   slot_mapping / block_table（paged 模式才需要，由 model-infer-kvcache skill 改造引入）
         # 参考字段定义：executor/utils/forward_metadata.py::ForwardMetaData
         # 简单做法：在 runner 内 inline 一个轻量 dataclass 覆盖必填字段，避免引入 executor.core 依赖
         ...
@@ -398,7 +398,7 @@ if __name__ == "__main__":
 
 | 模型架构 | 是否支持 | 备注 |
 |---|---|---|
-| 标准 LLM（GQA / MHA）+ TP | ✅ | 复用 `QKVParallelLinear` |
-| MLA + 模块差异化 TP | ✅ | 复用 `ColumnParallelLinear` / `RowParallelLinear` 组合实现 MLA 投影；micro_batch / SP+TP 等高级特性需复用 modeling 内部 helper（如 deepseek_r1 的 `gather_prefill_outputs`、`forward_lm_head`），这些 helper 不依赖 `executor/core/`，可正常迁移 |
-| MoE EP / TP（含 Shared Expert） | ✅ | 复用 `FusedMoEGMM` + torch_npu dispatch/combine 算子 |
-| 量化（W8A8 / W4A16 / W8A8C8） | ✅ | 复用 `module.quantization` |
+| 标准 LLM（GQA / MHA）+ TP | 支持 | 复用 `QKVParallelLinear` |
+| MLA + 模块差异化 TP | 支持 | 复用 `ColumnParallelLinear` / `RowParallelLinear` 组合实现 MLA 投影；micro_batch / SP+TP 等高级特性需复用 modeling 内部 helper（如 deepseek_r1 的 `gather_prefill_outputs`、`forward_lm_head`），这些 helper 不依赖 `executor/core/`，可正常迁移 |
+| MoE EP / TP（含 Shared Expert） | 支持 | 复用 `FusedMoEGMM` + torch_npu dispatch/combine 算子 |
+| 量化（W8A8 / W4A16 / W8A8C8） | 支持 | 复用 `module.quantization` |

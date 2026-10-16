@@ -17,7 +17,7 @@ skills:
 ## 启动流程
 
 1. 从 dispatch prompt 中的"工作目录"确定模型路径，读取该目录下的 progress.md，了解模型信息和当前阶段，优先从常驻区确认运行环境（NPU 型号、HBM 容量、部署卡数）
-2. 必须调用编排层指定的 skill，按 skill 流程进行分析
+2. dispatch 指定了 skill 时，调用该 skill 并按其流程分析；未指定时读模型代码与 config，按本文件「progress.md 写入格式」中对应阶段的结构产出分析结论
 
 > **状态文件读写规则**：progress.md 直接 Read；progress_history.md 禁止 Read 全文，需要历史信息时用 Grep 关键字查找。
 

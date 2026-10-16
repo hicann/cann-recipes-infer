@@ -1,24 +1,41 @@
 #!/usr/bin/env python3
+# ----------------------------------------------------------------------------------------------------------
+# Copyright (c) 2026 Huawei Technologies Co., Ltd.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# ----------------------------------------------------------------------------------------------------------
 # coding=utf-8
-"""Step 5 — 洞察事实提取（脚本角色，纯机械，不做语义判断）。
+"""Step 5 — extract insight facts mechanically, without making semantic judgements.
 
-执行者边界（见 references/insight_workflow.md §1）：
-  脚本（本文件）：join / group-by / 排序 / 区间扫描 / 统计 / 选 Top-K 代表 / 落 JSON。
-  agent：定义 movement taxonomy、审阅可信度、写 agent_review（summary/confidence/
-         reason/fusion_candidate/elimination_direction）、写 final_conclusions。
+Role split (see references/insight_workflow.md §1):
+  This script: join / group-by / sort / interval scan / statistics / pick Top-K
+               representatives / dump JSON.
+  Agent:       define the movement taxonomy, review credibility, fill agent_review
+               (summary/confidence/reason/fusion_candidate/elimination_direction)
+               and final_conclusions.
 
-因此本脚本**绝不**内置：模型/component/cluster/op/stream 名、搬运或融合 op 规则、
-“理论不可靠”算子名单、性能原因、confidence。这些一律来自 agent：
-  --movement-taxonomy <json>   agent 定义的 movement family（Insight 5 必需，缺省则只
-                               产 op-frequency 候选清单 _taxonomy_candidates.json）。
-  --annotations <json>         agent 审阅后填的 agent_review，按 stable key 合并。
-缺省时 agent_review 字段留空，并产 _review_stub.json 列出所有待审 key。
+This script therefore never hardcodes model / component / cluster / op / stream names,
+data-movement or fusion op rules, lists of ops whose theory is unreliable, performance
+root causes, or confidence. All of those come from the agent:
+  --movement-taxonomy <json>   Movement families defined by the agent. Required for
+                               Insight 5; without it only the op-frequency candidate
+                               list _taxonomy_candidates.json is produced.
+  --annotations <json>         agent_review entries filled in after review, merged by
+                               stable key.
+Without them, agent_review fields stay empty and _review_stub.json lists every key
+awaiting review.
 
-排序口径：偏离/抖动一律按**绝对增量**（gap / delta）为主键——绝对量对不同模型/shape
-更稳健，且天然压低“理论值极小→ratio 虚高”的小算子噪声（是否可信仍由 agent 用
-confidence 标注）。展示层（render_insights.py）再按 confidence 重排。
+Sorting: deviation and jitter sort on **absolute increment** (gap / delta). Absolute
+values stay robust across models and shapes, and they damp the noise of small ops whose
+tiny theoretical value inflates the ratio; whether such an entry is trustworthy is still
+marked by the agent through confidence. The presentation layer (render_insights.py)
+re-sorts by confidence.
 
-用法:
+Usage:
   python gen_insights.py \
     --metrics <run>/runs/<label>/metrics.json \
     --raw-ops <run>/raw_ops.json \
@@ -28,10 +45,11 @@ confidence 标注）。展示层（render_insights.py）再按 confidence 重排
     [--movement-taxonomy <agent.json>] [--annotations <agent.json>] \
     [--top-k 5] [--small-n-ratio 1.5]
 
-输入事实来源：metrics.json（cluster/bubble/TOTAL/outlier/theoretical 摘要、op_records
-的 op→cluster 归属）、raw_ops.json（核类型/时间/stream/连续 vector 扫描/搬运邻接）、
-raw_ops_details.json（per-kernel duration_over_theoretical 等理论列）、structure_draft.json
-（op_to_component / component 边界）。
+Fact sources: metrics.json (cluster/bubble/TOTAL/outlier/theoretical summaries and the
+op-to-cluster mapping in op_records), raw_ops.json (core type, timing, stream, contiguous
+vector scan, movement adjacency), raw_ops_details.json (per-kernel theoretical columns
+such as duration_over_theoretical), structure_draft.json (op_to_component and component
+boundaries).
 """
 import argparse
 import json
@@ -54,7 +72,10 @@ def us(ms):
 
 
 def small_n_outlier_idx(values, ratio):
-    """与 render.detect_outliers 同口径：n>=4 用 IQR，2<=n<=3 用相对尖峰兜底。"""
+    """Flag outlier indices the way render.detect_outliers does under its default
+    iqr / k=1.5 setting: IQR for n>=4, relative-spike fallback for 2<=n<=3. A custom
+    network_spec.outlier config applies to render only.
+    """
     n = len(values)
     if n < 2:
         return set()
@@ -76,7 +97,9 @@ EMPTY_REVIEW = {"summary": "", "confidence": "", "reason": "", "needs_followup":
 
 
 def review_for(stub_registry, key, annotations, extra_fields=None):
-    """登记一个待审 key，返回合并后的 agent_review（缺省全空，等 agent 填）。"""
+    """Register a key awaiting review and return the merged agent_review, left empty
+    until the agent fills it in.
+    """
     base = dict(EMPTY_REVIEW)
     if extra_fields:
         base.update(extra_fields)
@@ -89,8 +112,8 @@ def review_for(stub_registry, key, annotations, extra_fields=None):
 
 
 def topk_with_annotated(cands, k, key_fn, annotations):
-    """取前 k（已按事实排序），但任何被 agent 注解过的候选强制保留（agent 可越过
-    脚本排序选要展示的项）。"""
+    """Take the first k of the fact-sorted candidates, always keeping any candidate the
+    agent annotated so the agent can override the script's ordering."""
     if not annotations:
         return cands[:k]
     annotated = [c for c in cands if key_fn(c) in annotations]
@@ -112,9 +135,10 @@ def main():
     ap.add_argument("--raw-ops-details", required=True)
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--movement-taxonomy", default=None,
-                    help="agent 定义的 movement family JSON（Insight 5）。缺省只产候选清单。")
+                    help="movement families defined by the agent (Insight 5); "
+                         "without it only the candidate list is emitted")
     ap.add_argument("--annotations", default=None,
-                    help="agent agent_review 注解 JSON（按 stable key 合并）。")
+                    help="agent_review annotations from the agent, merged by stable key")
     ap.add_argument("--top-k", type=int, default=5)
     ap.add_argument("--small-n-ratio", type=float, default=1.5)
     args = ap.parse_args()
@@ -142,7 +166,8 @@ def main():
 
     stub = {}  # stable key -> empty review (for _review_stub.json)
 
-    # op_idx -> (component_type, cluster) 来自 metrics op_records（不重评 network_spec 规则）
+    # op_idx -> (component_type, cluster) taken from metrics op_records; network_spec
+    # rules are not re-evaluated here
     op_cluster = {}
     for s in m["sections"]:
         ct = s["component_type"]
@@ -338,7 +363,9 @@ def main():
                 "actual_median_ms": round(amed, 4), "theoretical_median_ms": round(tmed, 4),
                 "wall_over_theoretical_median": round(amed / tmed, 2) if tmed else None,
                 "absolute_gap_us": round(gap, 1),
-                # 理论量级——agent 据此判可信度（极小理论值→ratio 不可信），脚本不替它判
+                # Theoretical magnitude: the agent judges credibility from it, since a
+                # tiny theoretical value makes the ratio untrustworthy. The script does
+                # not make that call for it.
                 "theoretical_magnitude_us": round(tmed * 1000, 1),
                 "support_ratio": round(th.get("supported_instance_count", 0) / max(th.get("instance_count", 1), 1), 2),
                 "representative_instances": rep,
@@ -391,7 +418,7 @@ def main():
             locs.append({"phase": cobj.get("phase"), "layer_idx": cobj.get("layer_idx"),
                          "org_index": oi, "duration_us": round(dur, 1) if dur else None,
                          "theoretical_us": round(th_us, 1) if th_us else None,
-                         "bound_type": bt})  # 可能为 None（理论 skill 未填）
+                         "bound_type": bt})  # None when the theory skill left it unfilled
         key = f"op_dev:{ct}:{cl}:{nm}:{occ}"
         op_dev.append({
             "component_type": ct, "cluster": cl, "op_name": nm, "occurrence": occ,
@@ -489,7 +516,8 @@ def main():
                "patterns": pk},
               open(f"{args.out_dir}/vector_sequence_candidates.json", "w"), ensure_ascii=False, indent=2)
 
-    # taxonomy candidates helper (op-name × core freq) — 给 agent 定 movement family 用
+    # taxonomy candidates helper (op-name × core freq) — input the agent uses to define
+    # movement families
     op_freq = defaultdict(lambda: {"count": 0, "total_us": 0.0, "cores": Counter()})
     for o in ops:
         e = op_freq[o["normalized_name"]]
@@ -508,7 +536,7 @@ def main():
     # ================= Insight 5: data_movement_ops =================
     families_out = []
     if not taxonomy:
-        # 没有 agent taxonomy → 只产候选清单，families 留空
+        # Without an agent taxonomy, emit only the candidate list and leave families empty
         json.dump({"schema_version": "insight.data_movement_ops.v1",
                    "agent_taxonomy": {"families": [], "needs_user_review": []},
                    "families": [],
@@ -516,9 +544,9 @@ def main():
                             "定义 movement family，再带 --movement-taxonomy 重跑。"},
                   open(f"{args.out_dir}/data_movement_ops.json", "w"), ensure_ascii=False, indent=2)
     else:
-        # 兼容三种输入：顶层 {"families":[...]}、直接 [...]、或误用输出 schema 的嵌套
-        # {"agent_taxonomy":{"families":[...]}}（常见踩坑：照 insight_workflow.md 的输出
-        # schema 写输入文件）。
+        # Accept three input shapes: top-level {"families":[...]}, a bare [...], or the
+        # nested {"agent_taxonomy":{"families":[...]}} — a common mistake is writing the
+        # input file against the output schema in insight_workflow.md.
         if isinstance(taxonomy, list):
             tax_families = taxonomy
         else:

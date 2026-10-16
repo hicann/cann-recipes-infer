@@ -13,7 +13,7 @@ Step 5 在 Step 3 渲染和 Step 4 切片之后执行，目标是把已有事实
 | `<run_dir>/raw_ops.json` | Step 1 | 单 step 算子序列、core type、时间、stream、shape |
 | `<run_dir>/raw_ops_details.json` | Step 1 | 原 CSV 完整字段，用于需要 profiler 原始列的证据 |
 | `<run_dir>/<network>_spec.json` | Step 3 | cluster 语义规则；只作为已确认语义来源 |
-| `<run_dir>/splits/manifest.json` | Step 4 | evidence link：component / gap 的 csv 与 trace 子目录 |
+| `<run_dir>/splits/manifest.json` | Step 4 | 供 agent 与用户导航 component / unmatched 的 csv 与 trace 子目录 |
 | `op_statistic_*.csv` | 原始 prof，可选 | agent 判断数据搬运 taxonomy 时查看 OP Type 总览 |
 
 **默认输出目录**：`<run_dir>/runs/<label>/insights/`。Step 5 必须和它消费的 `<run_dir>/runs/<label>/metrics.json` 归属同一个 label，避免多个 run 的洞察互相覆盖。只有没有 `runs/<label>/metrics.json` 的老式单 run 产物，才允许退回 `<run_dir>/insights/`。
@@ -136,7 +136,7 @@ python scripts/render.py -d <run_dir>/structure_draft.json -r <run_dir>/raw_ops.
       "bubble_us": 13.0,
       "bubble_pct_of_total": 4.6,
       "delta_vs_type_median_us": 1.2,
-      "evidence": {"op_indices": [1000, 1004, 1028], "op_range_envelope": [1000, 1028], "split_dir": "splits/L021_main_moe"},
+      "evidence": {"op_indices": [1000, 1004, 1028], "op_range_envelope": [1000, 1028]},
       "agent_review": {"summary": "", "confidence": "medium"}
     }
   ]
@@ -241,7 +241,7 @@ Step 1.5（理论性能注入）是**可选**步骤，默认不开（外部 `ope
   - `max_duration_over_theoretical`
   - `supported_count`
   - `top_locations`，只保留 Top5 单例证据。
-- 脚本候选排序使用 `wall_over_theoretical_median` / `duration_over_theoretical_median` 和 `absolute_gap_us` 两类字段，并把实际排序策略写入 `selection_policy`；`confidence` 只能由 agent 审阅后填写。
+- 脚本候选排序只用绝对增量字段 `absolute_gap_us` / `absolute_gap_us_median`，并把实际排序策略写入 `selection_policy`；比值类字段只展示不参与排序。`confidence` 只能由 agent 审阅后填写。
 - 不支持理论估算的 kernel、通信、runtime、host-bound 辅助项可以统计到 `unsupported_summary`，但不要伪造理论偏离。
 
 **agent 操作**：
@@ -260,8 +260,8 @@ Step 1.5（理论性能注入）是**可选**步骤，默认不开（外部 `ope
     "top_k": 5,
     "ranking_object": "logical_slot",
     "singleton_instances": "evidence_only",
-    "sub_item_sort": ["wall_over_theoretical_median", "absolute_gap_us"],
-    "operator_slot_sort": ["duration_over_theoretical_median", "absolute_gap_us_median"]
+    "sub_item_sort": ["absolute_gap_us"],
+    "operator_slot_sort": ["absolute_gap_us_median"]
   },
   "data_limits": [],
   "sub_item_deviation_candidates": [
@@ -302,7 +302,7 @@ Step 1.5（理论性能注入）是**可选**步骤，默认不开（外部 `ope
 
 本 insight 只列出大段连续 vector 区间候选，并按 pattern 聚合；不每层每 step 列一条。是否称为“缺失融合候选”由 agent 根据语义审阅后写入，不由脚本默认判断。
 
-**脚本输入**：`raw_ops.json`、`structure_draft.json`、`network_spec.json`。
+**脚本输入**：`metrics.json`、`raw_ops.json`、`structure_draft.json`、`raw_ops_details.json`。cluster 归属由 `metrics.json` 的 `op_records` 反查，`network_spec.json` 是 agent 侧的语义来源，不进脚本参数。
 
 **脚本操作**：
 
@@ -524,7 +524,7 @@ python scripts/render.py \
 
 **HTML 模板约束**：
 
-完整 HTML/CSS/JS 骨架放在 `references/insight_html_template.html`，不要 inline 到本文档。渲染脚本 `scripts/render_insights.py` 以该模板为基础、服务端预填各表生成 `<run_dir>/runs/<label>/insights/index.html`（模板 JS 只切 tab，不在前端 fetch/算数）。
+完整 HTML/CSS/JS 骨架放在 `scripts/templates/insight_page.html`，不要 inline 到本文档。渲染脚本 `scripts/render_insights.py` 以该模板为基础、服务端预填各表生成 `<run_dir>/runs/<label>/insights/index.html`（模板 JS 只切 tab，不在前端 fetch/算数）。
 
 模板固定以下结构：
 

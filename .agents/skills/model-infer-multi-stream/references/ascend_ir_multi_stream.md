@@ -63,7 +63,7 @@ class Model(torch.nn.Module):
         super().__init__()
     def forward(self, in1, in2, in3, in4):
         add_result = torch.add(in1, in2)
-        with tng.scope.npu_stream_switch('1'): 
+        with tng.scope.npu_stream_switch('1'):
             # torch.mm算子(mm_result)等待torch.add算子(add_result)执行完再执行
             tng.scope.npu_wait_tensor(in4, add_result)
             mm_result = torch.mm(in3, in4)
@@ -88,7 +88,7 @@ result = model(in1, in2, in3, in4)
 print(f"Result:\n{result}\n")
 ```
 
-**图 1**  pbtxt文件样例  
+**图 1**  pbtxt文件样例
 ![](https://gitcode.com/Ascend/torchair/blob/master/docs/zh/figures/ge_multi_stream.png "多流示意图")
 
 图中展示了流间的控制关系，虚线控制边表示显式的跨流数据依赖同步关系。

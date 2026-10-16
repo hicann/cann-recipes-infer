@@ -58,7 +58,7 @@ selected_nope = torch.zeros((self.selection_num_blocks, self.block_size, cache_l
 
 ## 复用参考
 
-- 代表实现：DeepSeek-V3.2-Exp。
+- 代表实现：GLM-5.2，本文片段的 `empty_with_swapped_memory` 分配写法出自该模型。
 - 相似实现：GLM-5。
 - 特化实现：不同模型的差异更多体现在 cache 结构和 selection 策略，不在流模型本身。
 

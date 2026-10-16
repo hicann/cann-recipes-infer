@@ -237,7 +237,6 @@ frontmatter 必需字段：
 ---
 name: skill-name          # kebab-case，与文件夹名一致
 description: 单行描述      # 触发场景关键词，< 1024 字符
-user-invocable: true      # 是否可由用户直接调用
 ---
 ```
 

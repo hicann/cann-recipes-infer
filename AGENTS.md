@@ -44,8 +44,8 @@ scripts/        # 工具脚本
 | 流程 | 类别 | 模型 |
 |---|---|---|
 | **统一流程** | Dense LLM | `gpt_oss`, `qwen25_7b_instruct`, `qwen3_8b`, `deepseek_v3_2_exp`, `gemma_4` |
-| | MoE LLM | `deepseek_r1`, `kimi_k2_thinking`, `qwen3_moe`, `qwen3.5`, `hy3`, `step3p7_flash`, `longcat_flash`, `longcat_flash_lite`, `deepseek_v4` |
-| **ModelRunner** | LLM (Dense / MoE) | `glm_5`, `pangu-7b` |
+| | MoE LLM | `deepseek_r1`, `glm_5`, `kimi_k2_thinking`, `qwen3_moe`, `qwen3.5`, `hy3`, `step3p7_flash`, `longcat_flash`, `longcat_flash_lite`, `deepseek_v4` |
+| **ModelRunner** | LLM (Dense / MoE) | `pangu_7b` |
 | | 视频生成 | `hunyuan-video`, `wan2.2-i2v`, `sana-video` |
 | | 图像生成 | `hunyuan-image-3.0` |
 | | 推荐 / 其他 | `hstu` |
@@ -54,13 +54,17 @@ scripts/        # 工具脚本
 
 ## 硬件平台映射
 
-`asys info -r=status` 输出的 Chip Name 与 Atlas 系列的对应关系：
+Atlas 系列、产品族与运行时可探测标识的对应关系（`asys info -r=status` 与 `torch.npu.get_device_name()` 输出的是 SoC 典型标识列）：
 
-| Atlas 系列 | Chip Name | 单卡 HBM |
-|-----------|---------|----------|
-| Atlas A2 | Ascend 910B* | 32/64 GB |
-| Atlas A3 | Ascend 910_93* | 64 GB |
-| Atlas A5 | Ascend 950* | — |
+| Atlas 系列 | 产品族（Chip Name） | SoC 典型标识 | 单 die HBM | 每物理卡 die 数 | 每整机物理卡数 |
+|-----------|---------|---------|----------|---------------|---------------|
+| Atlas A2 | Ascend 910B 系列 | `910B` | 32 / 64 GB | 1 | 8 |
+| Atlas A3 | Ascend 910C 系列 | `910_93` | 64 GB | 2 | 8 |
+| Atlas A5 | Ascend 950 系列（PR/DT） | - | 112 / 128 GB | 1 | 8 |
+
+> **口径**：skill 中描述的"卡"常用部署拓扑口径（= die = rank，一个进程一份 HBM），不等同于物理口径。A3 是特例，一物理卡 = 2 die。
+>
+> 单 die HBM 列为常见 SKU 容量，实际可能含其他规格变体。
 
 ---
 
@@ -75,11 +79,14 @@ CANN 9.0.0 + PyTorch 2.8.0 + torch_npu 2.8.0 + transformers 5.0.0
 source /usr/local/Ascend/ascend-toolkit/latest/bin/setenv.bash
 pip3 install -r models/{model_name}/requirements.txt
 
-# 推理执行
+# 推理执行（框架部署，在仓库根目录执行）
+bash executor/scripts/infer.sh --model {model_name} --yaml {yaml_name}.yaml
+
+# 推理执行（独立部署，模型目录自带 infer.sh）
 cd models/{model_name} && bash infer.sh
 
 # 权重转换（未启用 enable_online_split_weight 时）
-bash utils/weight_convert.sh --input_fp8_hf_path /path/to/origin \
+bash models/{model_name}/utils/weight_convert.sh --input_fp8_hf_path /path/to/origin \
     --output_hf_path /path/to/output --quant_mode w8a8
 
 # 性能分析：YAML 中设 enable_profiler: True，结果在 prof/ 目录
@@ -87,7 +94,7 @@ bash utils/weight_convert.sh --input_fp8_hf_path /path/to/origin \
 # CI 测试
 bash executor/scripts/test_all_case.sh
 
-# 多机部署：修改 executor/scripts/set_env.sh 中的 IPs 和 cann_path，各节点执行 infer.sh
+# 多机部署：修改 executor/scripts/set_env.sh 中的 IPs 和 cann_path，各节点执行对应部署模式的拉起命令
 ```
 
 ---
@@ -97,7 +104,7 @@ bash executor/scripts/test_all_case.sh
 | 场景 | Skill |
 |------|-------|
 | 模型部署基线 | model-infer-migrator |
-| 端到端模型优化 | model-infer-optimize（编排入口） |
+| 端到端模型优化 | model-infer-optimize |
 | KVCache 静态化 / FA 替换 | model-infer-kvcache |
 | 融合算子分析与替换 | model-infer-fusion |
 | 量化适配改造 | model-infer-quantization |
@@ -106,6 +113,12 @@ bash executor/scripts/test_all_case.sh
 | 并行策略分析 | model-infer-parallel-analysis |
 | 并行策略实施 | model-infer-parallel-impl |
 | NPU 运行时错误诊断 | model-infer-runtime-debug |
+| 多流并行优化 | model-infer-multi-stream |
+| 权重预取适配 | model-infer-prefetch |
+| SuperKernel 适配 | model-infer-superkernel |
+| 性能数据采集 | model-infer-profiling |
+| 性能数据拆解 | model-infer-perf-breakdown |
+| baseline 之上的探索式优化 | model-infer-sota-approach |
 
 ---
 
@@ -117,7 +130,7 @@ bash executor/scripts/test_all_case.sh
 - **及时持久化**：长任务中关键结论、设计决策、调试发现要及时写入文件（如 progress.md），上下文压缩会丢失未保存的信息
 - **事实性信息不推断**：硬件型号、卡数、die 数、显存容量、模型路径、权重路径等事实性配置信息，必须从已告知的获取方式或用户明确确认中获取。缺失时向用户确认，不猜测。获取后及时记录到 progress.md
 - **前置条件检查**：执行任务前，确认所需信息（模型路径、权重路径、部署配置等）是否可从 YAML 配置或 progress.md 中获取，缺失时向用户确认，不盲目搜索或猜测。单独使用 model-infer 系列 skill 时，若模型尚未完成框架适配或基线采集，应建议用户先通过 model-infer-optimize 完成阶段 0（模型分析与基线建立）
-- **工作目录规范**：运行推理、采集基线等操作必须先 `cd` 到模型目录（`models/{model_name}/`）再执行，不要从仓库根目录直接运行，避免日志和输出文件生成在错误位置
+- **工作目录规范**：框架部署在仓库根目录执行 `bash executor/scripts/infer.sh --model {model_name} --yaml {yaml_name}.yaml`，脚本按绝对路径把日志与产物写到 `models/{model_name}/` 下，进程工作目录仍是调用处；独立部署先 `cd` 到模型目录（`models/{model_name}/`）再执行 `bash infer.sh`，避免日志和输出文件生成在错误位置
 - **证据优先**：所有判断、结论或决策都必须有来自代码库、需求或文档的明确证据支撑。没有证据，就不能下结论。被要求做判断时，先说明证据来源，再给出结论。禁止凭经验、印象或类比推断
 
 ---

@@ -87,7 +87,7 @@ result = model(in1, in2, in3, in4)
 
 ```
 
-**图 1**  多流表达示意图  
+**图 1**  多流表达示意图
 ![](https://gitcode.com/Ascend/torchair/blob/master/docs/zh/figures/npugraph_ex_multi_stream.png "多流示意图")
 
 图中展示了流间的时序控制关系，其中npugraph_ex会在编图时插入record3、wait3、record4和wait4，用于默认流等待其他流任务完成。

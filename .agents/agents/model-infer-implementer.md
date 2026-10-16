@@ -48,7 +48,7 @@ skills:
 
 4. **内循环自审：基础问题自己解决**
    - 编译 → 修错 → 跑通 → 基础测试
-   - 编译错误、crash、shape 不匹配等自己搞定
+   - 编译错误、crash、shape 不匹配等自行解决
    - NPU 运行时错误（aicore timeout、HCCL 超时、OOM 等）参考 model-infer-runtime-debug skill 排查，不盲目重试
    - 推理超 10 分钟无输出时，按 model-infer-runtime-debug 的推理卡住流程主动排查，不盲目等待
    - 调试优先用工具观测（如 memory_summary、逐步 print），不要纯手算推断
@@ -86,7 +86,7 @@ skills:
 - 输出: 合理 / 异常（描述）
 
 ### 调试记录（调试修复时写入）
-- [已查] 检查项 ✓
+- [已查] 检查项
 - [发现] 问题描述
 - [放弃] 方案描述 — 放弃原因
 - [修复] 修复措施 — 文件:行号

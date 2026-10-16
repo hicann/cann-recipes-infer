@@ -85,7 +85,7 @@ agent 各优化阶段过程归档在 [agentic/](agentic/) 目录：
 {说明转换场景，例如 "FP8 原权重需转换为 BF16" 或 "需进行 W8A8 量化"}：
 
 ```bash
-bash utils/weight_convert.sh \
+bash models/{model_name}/utils/weight_convert.sh \
     --input_fp8_hf_path /data/models/{ModelName} \
     --output_hf_path /data/models/{ModelName}-{quant_mode} \
     --quant_mode {w8a8 / w4a16 / w8a8c8}

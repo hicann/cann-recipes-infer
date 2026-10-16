@@ -1,9 +1,20 @@
 #!/usr/bin/env python3
-"""归档 progress.md 的工作区内容到 progress_history.md。
+# ----------------------------------------------------------------------------------------------------------
+# Copyright (c) 2026 Huawei Technologies Co., Ltd.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# ----------------------------------------------------------------------------------------------------------
+"""Archive the working section of progress.md into progress_history.md.
 
-常驻区与工作区用以下标记分隔：
-    <!-- ===== 以上为常驻区，不清除 ===== -->
-    <!-- ===== 以下为工作区，阶段推进时归档并清空 ===== -->
+progress.md is split into a persistent section and a working section by the
+marker lines defined in SEPARATOR_END / SEPARATOR_START below, which must stay
+byte-identical to templates/progress_template.md. Everything after the
+working-section marker is appended to progress_history.md and then cleared, so
+the persistent section survives across stage transitions.
 """
 
 import logging
@@ -46,7 +57,7 @@ def archive_progress(progress_path: str) -> None:
         logger.info("工作区为空，无需归档。")
         return
 
-    # 归档到 progress_history.md
+    # Append to progress_history.md, seeding it with a persistent-section snapshot on first run
     progress_dir = os.path.dirname(os.path.abspath(progress_path))
     history_path = os.path.join(progress_dir, "progress_history.md")
     timestamp = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -65,7 +76,7 @@ def archive_progress(progress_path: str) -> None:
     with open(history_path, "a", encoding="utf-8") as f:
         f.write(archive_entry)
 
-    # 清空工作区
+    # Rewrite progress.md as the persistent section plus an empty working section
     new_content = f"{persistent_section}\n\n{SEPARATOR_START}\n\n"
     with open(progress_path, "w", encoding="utf-8") as f:
         f.write(new_content)

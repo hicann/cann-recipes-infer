@@ -25,7 +25,7 @@ This is the most granular device-side data. Each row is one kernel invocation on
 | Column | Type | Unit | Description |
 |---|---|---|---|
 | `OP State` | string | — | Operation execution state |
-| `Accelerator Core` | string | — | Core type used: `AiCore`, `AiCpu`, `AiVector`, `MixAic`, etc. |
+| `Accelerator Core` | string | — | Core type used: `AI_CORE`, `AI_CPU`, `AI_VECTOR_CORE`, `MIX_AIC`, `MIX_AIV`, `COMMUNICATION`, `HCCL` 等（脚本按这套大写下划线形态匹配） |
 
 ### 时间信息
 
@@ -127,7 +127,7 @@ This is the most granular device-side data. Each row is one kernel invocation on
 
 ---
 
-## Task Type 取值
+## Task Type 取值（`Type` 列，与上表的 `Accelerator Core` 列不同）
 
 | Task Type | Description |
 |-----------|-------------|

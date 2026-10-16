@@ -9,7 +9,7 @@
 - **方案 DAG**：Mermaid，标清主 / 副流归属和 event 边（`-.->`）。
 - **强度**：当前档位 + 计划（C1 最小切流 → C2 + 控核 → C3 + 手动同步），见 SKILL 正文"分析"一节。
 - **GE auto-reorder 风险**（Ascend IR 路径设计期必填）：按 [`ge-reorder-design-check.md`](ge-reorder-design-check.md) 过一遍——副流输出 → 主流消费者 → 是否有 cheap precompute → 是否成 barrier → 应对（是否在 with-block 内显式钉住）。
-- **overlap_pct 实测**（review / 落地后填，按 [`timeline-overlap-check.md`](timeline-overlap-check.md)，**不允许"是 / 否"二元**）：副流时间窗 `[start,end] us` / 主流 dominator 时间窗 `[start,end] us` / `overlap_pct` 数值 / 判定（真并行 ≥0.5 / 部分 0.05~0.5 / 假并行 ≤0.05）。
+- **overlap_pct 实测**（review / 落地后填，按 [`timeline-overlap-check.md`](timeline-overlap-check.md)，**不允许"是 / 否"二元**）：副流时间窗 `[start,end] us` / 主流 dominator 时间窗 `[start,end] us` / `overlap_pct` 数值 / 判定（档位见 [`timeline-overlap-check.md`](timeline-overlap-check.md) 的「Step 4：判定」）。
 - **enable 开关与回退路径**：开关名、关掉后走哪条原路径。
 - **风险与副作用**：`TransData` / `BroadcastTo` / `MemSet` 长尾、主副争核（`Block Dim` 加和）、shape 劣化等。
 

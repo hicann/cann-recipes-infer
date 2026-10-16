@@ -1,37 +1,49 @@
+# ----------------------------------------------------------------------------------------------------------
+# Copyright (c) 2026 Huawei Technologies Co., Ltd.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# ----------------------------------------------------------------------------------------------------------
 """Sample-driven layer detection core.
 
-无 IO 的纯函数 + dataclass。调用方（detect_structure.py）负责 load
-raw_ops.json / structure_spec.json，把数据传进来；本模块只算。
+Pure functions and dataclasses, no IO. The caller (detect_structure.py) loads
+raw_ops.json / structure_spec.json and passes the data in; this module only computes.
 
-两条装配路径（按入口区分；detect_structure.py 实际走 stream 模式）：
-  · stream 模式（**活跃路径**）：
+Two assembly paths, selected by entry point (detect_structure.py uses stream mode):
+  - stream mode (**active path**):
         run_stream_sample_mode(ops, structure_spec, sample_ack) -> StreamSampleDraft
-    装配走 _assemble_stream_components -> _expand_schedule，**强依赖 structure_spec
-    的 layer_range / layer_indices** 逐层 schedule（交错/逐层交替结构用 layer_indices；
-    同层被多个 composition 覆盖时 _expand_schedule 直接 hard error）。
-  · 非 stream 模式（row-order，legacy）：
+    Assembly goes through _assemble_stream_components -> _expand_schedule and
+    **depends on structure_spec layer_range / layer_indices** to schedule layer by
+    layer (interleaved or alternating structures use layer_indices; _expand_schedule
+    raises a hard error when one layer is covered by multiple compositions).
+  - non-stream mode (row-order, legacy):
         run_sample_mode(ops, structure_spec, samples, strict_composition=False)
             -> SampleDraft
-    装配走 assemble_layers（按 row 升序 + lookahead，**忽略 layer_range**）。
+    Assembly goes through assemble_layers (ascending row order plus lookahead,
+    **layer_range is ignored**).
 
-下面"子函数"列的是非 stream 路径（run_sample_mode）的调用链；stream 路径的装配见
-run_stream_sample_mode / _assemble_stream_components / _expand_schedule。
+The sub-function list below is the call chain of the non-stream path
+(run_sample_mode); for stream-path assembly see run_stream_sample_mode /
+_assemble_stream_components / _expand_schedule.
 
-子函数（run_sample_mode 路径，按调用顺序）：
+Sub-functions (run_sample_mode path, in call order):
     extract_fingerprint(ops, lo, hi, k=3) -> Fingerprint
-    build_prefix_counts(ops) -> 用于 O(distinct) Jaccard
-    scan_seeds(prefix, fingerprint, direction) -> [(direction, pos)]
-    match_instances(ops, prefix, fingerprint, seeds, expected_len)
+    build_prefix_counts(ops) -> backs O(distinct) Jaccard
+    scan_head_seeds / scan_tail_seeds / scan_body_seeds(...) -> [(direction, pos)]
+    match_component(ops, prefix, fingerprint, seeds, expected_len)
                                               -> [InstanceCandidate]
     endpoint_adjust(ops, prefix, fingerprint, candidate) -> InstanceCandidate
-    nms_instances(candidates, overlap=0.30) -> [Instance]
+    nms_candidates(candidates, overlap=0.30) -> [InstanceCandidate]
     arbitrate_overlaps(instances_by_component) -> [Instance]
     classify_unmatched(instances, total_ops, repeat_threshold=2)
                                               -> [UnmatchedRegion]
     assemble_layers(instances, structure_spec) -> (layers, warnings)
     build_validation(structure_spec, instances) -> dict
 
-阈值常量集中在文件顶部，便于回归时调。
+Threshold constants are kept at the top of the file so regression tuning is easy.
 """
 from __future__ import annotations
 
@@ -39,23 +51,25 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import Optional
 
-K = 3                          # head / tail 指纹窗口大小
-SEED_THRESHOLD = 0.8           # head/tail Jaccard 种子阈值
-ACCEPT_THRESHOLD = 0.85        # body_ms Jaccard 验收阈值
-MICROADJUST_LOWER = 0.70       # body_ms 落在 [0.70, 0.85) 触发端点微调
-SHAPE_CONFIDENCE_THRESHOLD = 0.75    # body_shape_ms < 0.75 → low_shape_confidence
-LENGTH_BAND = (0.85, 1.15)     # tail / head 窗口落在 [L*0.85, L*1.15]
-ENDPOINT_RADIUS = 3            # 端点微调 ±K
-NMS_OVERLAP = 0.30             # 区间重叠 > 30% 丢弃后者
-ARBITRATE_SCORE_TOLERANCE = 0.05      # 两个 component 差 < 0.05 进入 shape 仲裁
-ARBITRATE_SHAPE_TOLERANCE = 0.02      # shape 也差 < 0.02 → ambiguous_match
-SUSPECTED_UNDECLARED_MIN_REGIONS = 2  # 末尾 ≥ N 个相似 region 报警
-SUSPECTED_UNDECLARED_SIMILARITY = 0.80  # 区间长度互相 ≥ 80% → 视为重复 region
-LARGE_UNMATCHED_REGION_OPS = 30       # 单段 inter_layer_region > N ops → 升级为 suspected
-# aux 时间脱节体检：形态无关，只度量"并入辅流是否撑大 component 包络"。
-AUX_DISPLACEMENT_RATIO_LIMIT = 1.0    # 单 occurrence 膨胀比 (total_span-primary_span)/primary_span 超此 → 显著
-AUX_DISPLACEMENT_FRACTION = 0.5       # 一条 aux 流多数(>此比例)occurrence 脱节 → 判流级 displaced
-# 判据全用相对/结构量（inflation 比、流级多数），不设绝对时间阈值——避免量级过拟合。
+K = 3                          # head / tail fingerprint window size
+SEED_THRESHOLD = 0.8           # head/tail Jaccard seed threshold
+ACCEPT_THRESHOLD = 0.85        # body_ms Jaccard acceptance threshold
+MICROADJUST_LOWER = 0.70       # body_ms in [0.70, 0.85) triggers endpoint micro-adjust
+SHAPE_CONFIDENCE_THRESHOLD = 0.75    # body_shape_ms < 0.75 -> low_shape_confidence
+LENGTH_BAND = (0.85, 1.15)     # tail / head window must fall in [L*0.85, L*1.15]
+ENDPOINT_RADIUS = 3            # endpoint micro-adjust range, +/-K
+NMS_OVERLAP = 0.30             # interval overlap > 30% drops the later candidate
+ARBITRATE_SCORE_TOLERANCE = 0.05      # two components within 0.05 go to shape arbitration
+ARBITRATE_SHAPE_TOLERANCE = 0.02      # shape also within 0.02 -> ambiguous_match
+SUSPECTED_UNDECLARED_MIN_REGIONS = 2  # warn on >= N similar trailing regions
+SUSPECTED_UNDECLARED_SIMILARITY = 0.80  # region lengths within >= 80% of each other -> repeated region
+LARGE_UNMATCHED_REGION_OPS = 30       # a single inter_layer_region > N ops -> upgraded to suspected
+# Aux temporal-displacement check: shape-agnostic, it only measures whether merging an
+# auxiliary stream inflates the component time envelope.
+AUX_DISPLACEMENT_RATIO_LIMIT = 1.0    # per-occurrence (total_span-primary_span)/primary_span above this is significant
+AUX_DISPLACEMENT_FRACTION = 0.5       # whole aux stream displaced when > this fraction of occurrences are displaced
+# All criteria are relative or structural quantities (inflation ratio, per-stream
+# majority); no absolute time threshold, which would overfit to a magnitude range.
 
 AUXILIARY_NAMES = {
     "Cast", "Reshape", "Transpose", "Contiguous",
@@ -65,7 +79,7 @@ AUXILIARY_NAMES = {
 
 @dataclass(frozen=True)
 class Fingerprint:
-    """单个 sample 的指纹"""
+    """Fingerprint of a single sample."""
     component: str
     op_range: tuple[int, int]
     length: int
@@ -90,7 +104,7 @@ class InstanceCandidate:
 
 @dataclass
 class Instance:
-    """通过 NMS 仲裁后的最终 instance"""
+    """Final instance surviving NMS arbitration."""
     component: str
     start: int
     end: int
@@ -158,11 +172,11 @@ class StreamSampleDraft:
     displaced_streams: list = field(default_factory=list)   # [(component_type, stream_id)]
 
 
-# 其余函数将在 Task 5+ 添加
 def canon_shape(op: dict) -> str:
-    """规范化 input_shapes + output_shapes 为单字符串。
+    """Normalize input_shapes + output_shapes into a single string.
 
-    跨 run 稳定指纹的关键：去空格、统一定界符、合并 in/out。
+    Key to a fingerprint that stays stable across runs: strip spaces, unify the
+    delimiter, merge in/out.
     """
     ins = (op.get("input_shapes") or "").replace(" ", "").rstrip(";")
     outs = (op.get("output_shapes") or "").replace(" ", "").rstrip(";")
@@ -336,26 +350,39 @@ def _match_auxiliary_segments(primary_segs: list[StreamSegment],
                               ops_by_idx: dict[int, dict]
                               ) -> tuple[dict[int, tuple[int, StreamSegment, dict]],
                                          dict[int, dict]]:
-    """全局最优一一匹配 primary occurrence ↔ aux segment。
+    """Globally optimal one-to-one matching of primary occurrence to aux segment.
 
-    对每条 aux 流，在 primary occurrence 与该流的 aux segment 之间求一组一一匹配，使匹配数
-    最多、总时间距离最小。当辅流步距小于主流、逐层领先时，最近的 aux 会先被前段 occurrence
-    占走、后段只能配到远期 segment——按全局最优分配可避免这种错配，逐层单调时自然退化为序号
-    对齐（occ k ↔ aux 第 k 段）。
+    For each aux stream, build a one-to-one matching between the primary occurrences
+    and that stream's aux segments which maximizes the number of matched pairs and
+    minimizes total time distance. When the aux stream has a smaller stride than the
+    primary and runs ahead layer by layer, a greedy nearest match lets earlier
+    occurrences take the closest aux segments, leaving later ones only far segments;
+    global assignment avoids that mismatch and degrades naturally to index alignment
+    (occ k to the k-th aux segment) when the streams are monotonic layer by layer.
 
-    算法：代价 = 两段中心时间距离 pair_center_delta_us（一维点匹配）。一维点匹配的最优解
-    非交叉（保序）只在两序列各自按"中心时间"排序时成立；滑窗产出的 segment 按 *起点* 升序、
-    duration 非单调时起点序 ≠ 中心序，会破坏该前提。因此入口先按中心时间稳定排序 primary/aux，
-    再跑非交叉 DP，回溯后映射回原始 occurrence/cand 位置。目标按 (-matched_count, total_cost)
-    字典序最小化：先最大化匹配数，平局再比总代价。
+    Algorithm: the cost is the distance between segment center times,
+    pair_center_delta_us, i.e. one-dimensional point matching. The optimal solution of
+    one-dimensional point matching is non-crossing (order-preserving) only when both
+    sequences are sorted by center time; segments produced by the sliding window are
+    ordered by *start*, and with non-monotonic durations start order differs from
+    center order, which breaks that premise. So primary and aux are stably sorted by
+    center time on entry, the non-crossing DP runs on the sorted sequences, and the
+    backtracked pairs are mapped back to the original occurrence/candidate positions.
+    The objective minimizes (-matched_count, total_cost) lexicographically: maximize
+    the match count first, break ties by total cost.
 
-    cost 用 center_delta：等长窗口下它单调代表 overlap，且辅流通常短于 primary（重叠的 aux
-    中心必落在 primary 跨度内 → center_delta 小），故并发优先自然成立；仅当 aux 段反常地长于
-    primary 时，一个中心更近的脱节段可能赢过重叠段（aux 不长于 primary 时不出现）。
+    center_delta is used as the cost because for equal-length windows it varies
+    monotonically with overlap, and aux segments are usually shorter than the primary
+    (the center of an overlapping aux necessarily falls inside the primary span, so
+    center_delta is small), which makes concurrent segments win by construction. Only
+    when an aux segment is anomalously longer than the primary can a displaced segment
+    with a closer center beat an overlapping one; this cannot happen while aux is no
+    longer than primary.
 
-    返回:
+    Returns:
       assignment: {occ_idx -> (cand_pos, seg, pair_metrics)}
-      ambiguous:  {occ_idx -> ambiguity_dict}（全局最优非唯一时，该 occ 的配对可替换）
+      ambiguous:  {occ_idx -> ambiguity_dict}, present when the global optimum is not
+                  unique, meaning that occurrence's pairing is replaceable
     """
     n, m = len(primary_segs), len(aux_cands)
     if n == 0 or m == 0:
@@ -365,7 +392,8 @@ def _match_auxiliary_segments(primary_segs: list[StreamSegment],
         a, b = _segment_time_bounds(seg, ops_by_idx)
         return (a + b) / 2.0
 
-    # 按中心时间稳定排序，使一维点距离严格满足 Monge（非交叉 DP 才是全局最优）。
+    # Stable sort by center time so the one-dimensional point distance strictly
+    # satisfies the Monge condition, which is what makes the non-crossing DP globally optimal.
     p_order = sorted(range(n), key=lambda i: (_center(primary_segs[i]), i))
     a_order = sorted(range(m), key=lambda j: (_center(aux_cands[j]), j))
     P = [primary_segs[i] for i in p_order]
@@ -378,7 +406,8 @@ def _match_auxiliary_segments(primary_segs: list[StreamSegment],
         return (-state[0], state[1])
 
     def _solve(blocked_col):
-        """非交叉 DP 最优匹配；blocked_col(已排序列索引) 被禁用，用于唯一性检验。"""
+        """Non-crossing DP optimal matching; blocked_col (a sorted column index) is
+        disabled, which is how uniqueness is tested."""
         dp = [[(0, 0.0)] * (m + 1) for _ in range(n + 1)]
         choice = [[""] * (m + 1) for _ in range(n + 1)]
         for i in range(1, n + 1):
@@ -407,13 +436,14 @@ def _match_auxiliary_segments(primary_segs: list[StreamSegment],
 
     opt, pairs = _solve(blocked_col=-1)
 
-    # 映射回原始下标
+    # Map back to the original indices
     assignment: dict[int, tuple[int, StreamSegment, dict]] = {}
     for si, sj in pairs.items():
         occ, pos = p_order[si], a_order[sj]
         assignment[occ] = (pos, aux_cands[pos], metrics[si][sj])
 
-    # ambiguity: 禁用某 occ 选中的列后重跑，最优 (count,cost) 不变 → 该配对全局可替换。
+    # ambiguity: re-run with the column chosen by an occurrence disabled; if the
+    # optimal (count, cost) is unchanged, that pairing is globally replaceable.
     ambiguous: dict[int, dict] = {}
     for si, sj in pairs.items():
         opt2, _ = _solve(blocked_col=sj)
@@ -438,7 +468,9 @@ def _normalize_stream_ack(sample_ack: dict) -> dict:
 
 def extract_fingerprint(ops: list[dict], component: str,
                         lo: int, hi: int, k: int = K) -> Fingerprint:
-    """从 [lo, hi] 闭区间提取 4 个指纹（head_ms / tail_ms / body_ms / body_shape_ms）。"""
+    """Extract the four fingerprints (head_ms / tail_ms / body_ms / body_shape_ms)
+    from the closed interval [lo, hi].
+    """
     if lo < 0 or hi >= len(ops) or lo > hi:
         raise ValueError(f"bad sample range [{lo}, {hi}] for ops of len {len(ops)}")
     if hi - lo + 1 < 2 * k:
@@ -462,10 +494,10 @@ def extract_fingerprint(ops: list[dict], component: str,
 
 
 def build_prefix_counts(ops: list[dict]) -> dict[str, list[int]]:
-    """每个 normalized_name 一个 prefix-sum 数组。
+    """One prefix-sum array per normalized_name.
 
-    prefix[name][i] = count of `name` in ops[0:i]，i ∈ [0, N]。
-    单次 multiset Jaccard 取 [s, e+1] - [s] 即得窗口内 count。
+    prefix[name][i] = count of `name` in ops[0:i], i in [0, N].
+    A single multiset Jaccard takes [s, e+1] - [s] to get the in-window count.
     """
     names = set(_name_of(o) for o in ops)
     out: dict[str, list[int]] = {n: [0] * (len(ops) + 1) for n in names}
@@ -478,7 +510,7 @@ def build_prefix_counts(ops: list[dict]) -> dict[str, list[int]]:
 
 def window_name_counts(prefix: dict[str, list[int]],
                        s: int, e: int) -> dict[str, int]:
-    """O(distinct_names) 取 [s, e] 闭区间内的 name multiset。"""
+    """Get the name multiset over the closed interval [s, e] in O(distinct_names)."""
     return {
         n: prefix[n][e + 1] - prefix[n][s]
         for n in prefix
@@ -487,10 +519,10 @@ def window_name_counts(prefix: dict[str, list[int]],
 
 
 def multiset_jaccard(a, b) -> float:
-    """两个 dict-like multiset 的 Jaccard = sum(min) / sum(max)。
+    """Jaccard of two dict-like multisets = sum(min) / sum(max).
 
-    支持 a / b 是 dict 或 Counter。空多集对空多集 → 1.0；
-    一方非空一方空 → 0.0。
+    a and b may be dict or Counter. Empty against empty gives 1.0; one non-empty
+    against one empty gives 0.0.
     """
     if not a and not b:
         return 1.0
@@ -501,7 +533,9 @@ def multiset_jaccard(a, b) -> float:
 
 
 def window_shape_counts(ops: list[dict], s: int, e: int) -> dict[tuple[str, str], int]:
-    """[s, e] 闭区间内 (name, canon_shape) 多集——给 head_ms/tail_ms/body_shape_ms 用。"""
+    """(name, canon_shape) multiset over the closed interval [s, e], used by
+    head_ms / tail_ms / body_shape_ms.
+    """
     c: Counter = Counter()
     for i in range(s, e + 1):
         c[(_name_of(ops[i]), canon_shape(ops[i]))] += 1
@@ -509,9 +543,10 @@ def window_shape_counts(ops: list[dict], s: int, e: int) -> dict[tuple[str, str]
 
 
 def scan_head_seeds(ops: list[dict], fp: Fingerprint, k: int = K) -> list[int]:
-    """主方向：扫所有起点 s 使 window[s:s+k] 的 (name, shape) 多集与 head_ms Jaccard ≥ SEED_THRESHOLD。
+    """Primary direction: scan every start s whose window[s:s+k] (name, shape) multiset
+    has Jaccard >= SEED_THRESHOLD against head_ms.
 
-    返回 s 列表（升序），每个 s 是候选 instance 起点。
+    Returns the list of s in ascending order; each s is a candidate instance start.
     """
     n = len(ops)
     seeds = []
@@ -523,9 +558,10 @@ def scan_head_seeds(ops: list[dict], fp: Fingerprint, k: int = K) -> list[int]:
 
 
 def scan_tail_seeds(ops: list[dict], fp: Fingerprint, k: int = K) -> list[int]:
-    """兜底方向：扫所有终点 e 使 window[e-k+1:e+1] 与 tail_ms Jaccard ≥ SEED_THRESHOLD。
+    """Fallback direction: scan every end e whose window[e-k+1:e+1] has Jaccard
+    >= SEED_THRESHOLD against tail_ms.
 
-    返回 e 列表（升序）。只在 head seeds 全空时调用。
+    Returns the list of e in ascending order. Called only when head seeds are empty.
     """
     n = len(ops)
     seeds = []
@@ -546,15 +582,17 @@ def _body_shape_jaccard(ops, fp: Fingerprint, s: int, e: int) -> float:
 
 def scan_body_seeds(ops, prefix, fp: Fingerprint, step: int = 1,
                     threshold: float = MICROADJUST_LOWER) -> list[int]:
-    """body_ms Jaccard 滑窗：固定窗长 L = fp.length，按 step 扫所有起点。
+    """body_ms Jaccard sliding window: fixed window length L = fp.length, scanning every
+    start by step.
 
-    body 多集是 instance validity 的真信号（与 head/tail boundary 是否被
-    fused kernel 吞掉无关）。head/tail seed 卡掉的 instance（典型 case：
-    pre-norm 架构入口 RmsNorm 被前一层 InplaceAddRmsNorm 吸收）由此路径
-    找回，再由 endpoint_adjust 精化 (s, e)。
+    The body multiset is the true signal of instance validity, independent of whether
+    the head/tail boundary was swallowed by a fused kernel. Instances rejected by the
+    head/tail seeds are recovered through this path (typical case: in a pre-norm
+    architecture the entry RmsNorm is absorbed into the previous layer's
+    InplaceAddRmsNorm), then endpoint_adjust refines (s, e).
 
-    threshold 取 MICROADJUST_LOWER 与 head-seed 路径一致：seed 宽 →
-    endpoint_adjust 收紧 → 验收 ≥ ACCEPT_THRESHOLD。
+    threshold uses MICROADJUST_LOWER for consistency with the head-seed path: a wide
+    seed, tightened by endpoint_adjust, accepted at >= ACCEPT_THRESHOLD.
     """
     n = len(ops)
     L = fp.length
@@ -568,7 +606,8 @@ def scan_body_seeds(ops, prefix, fp: Fingerprint, step: int = 1,
 
 def _best_tail_in_band(ops, fp: Fingerprint, start: int, n: int,
                       k: int = K) -> Optional[tuple[int, float]]:
-    """在 [start + L*0.85 - k + 1, start + L*1.15 - k + 1) 内找 tail Jaccard 最高的 e。"""
+    """Find the e with the highest tail Jaccard within
+    [start + L*0.85 - k + 1, start + L*1.15 - k + 1)."""
     lo_end = start + int(fp.length * LENGTH_BAND[0]) - 1
     hi_end = min(n - 1, start + int(fp.length * LENGTH_BAND[1]) - 1)
     best: Optional[tuple[int, float]] = None
@@ -582,7 +621,8 @@ def _best_tail_in_band(ops, fp: Fingerprint, start: int, n: int,
 
 def _best_head_in_band(ops, fp: Fingerprint, end: int,
                       k: int = K) -> Optional[tuple[int, float]]:
-    """tail-seeded 兜底：给定 e，在 [e - L*1.15 + 1, e - L*0.85 + 1] 内找 head 最佳起点。"""
+    """tail-seeded fallback: given e, find the best head start within
+    [e - L*1.15 + 1, e - L*0.85 + 1]."""
     lo_start = max(0, end - int(fp.length * LENGTH_BAND[1]) + 1)
     hi_start = max(0, end - int(fp.length * LENGTH_BAND[0]) + 1)
     best: Optional[tuple[int, float]] = None
@@ -598,9 +638,11 @@ def _best_head_in_band(ops, fp: Fingerprint, end: int,
 
 def endpoint_adjust(ops, prefix, fp: Fingerprint, s: int, e: int,
                     radius: int = ENDPOINT_RADIUS) -> tuple[int, int, float]:
-    """在 (s, e) 周围 ±radius 内枚举 (2*r+1)² 组合，返回 body_ms 最高的 (s, e, score)。
+    """Enumerate the (2*r+1)^2 combinations within +/-radius around (s, e) and return the
+    (s, e, score) with the highest body_ms.
 
-    用于 body_ms ∈ [MICROADJUST_LOWER, ACCEPT_THRESHOLD) 时的救援。
+    Used to rescue candidates whose body_ms falls in
+    [MICROADJUST_LOWER, ACCEPT_THRESHOLD).
     """
     n = len(ops)
     best = (s, e, _body_jaccard(prefix, fp, s, e))
@@ -616,19 +658,23 @@ def endpoint_adjust(ops, prefix, fp: Fingerprint, s: int, e: int,
 
 
 def match_component(ops, prefix, fp: Fingerprint) -> list[InstanceCandidate]:
-    """主入口：对一个 component 的指纹扫全文，输出候选 instance 列表（已 NMS）。
+    """Main entry: scan the whole op list with one component's fingerprint and output the
+    candidate instance list, already NMS-reduced.
 
-    body_ms Jaccard 是 instance validity 的真信号——multiset 与 boundary
-    kernel 是否被融合无关。head/tail 都只是加速 anchor，可能被 fused boundary
-    kernel（如入口 RmsNorm 被前一层 residual-add 融合吃掉）卡掉。
+    body_ms Jaccard is the true signal of instance validity, because the multiset does
+    not depend on whether a boundary kernel was fused away. head and tail are only
+    acceleration anchors and may be defeated by a fused boundary kernel, for example an
+    entry RmsNorm absorbed into the previous layer's residual-add.
 
-    路径（执行顺序，并行附加候选，最后 NMS 去重）：
-      1. head-seed（快，head 完整时给出精确起点 + length-band tail；
-         与 body-seed 重叠时由 NMS 按 body_j 合并，相同分时插入序在前的胜出）
-      2. body-seed 滑窗（O(N) step=1）：扫所有 s，body_j ≥ MICROADJUST_LOWER
-         即 seed，endpoint_adjust 精化 (s, e)，验收 body_j ≥ ACCEPT_THRESHOLD。
-         覆盖 head 被融合吞掉的 instance。
-      3. tail-seed（兜底；仅 head 和 body 都空时尝试）
+    Paths, in execution order; each appends candidates independently and NMS
+    deduplicates at the end:
+      1. head-seed: fast, and when the head is intact it gives an exact start plus a
+         length-band tail. Overlaps with body-seed results are merged by NMS on body_j;
+         on equal scores the earlier-inserted candidate wins.
+      2. body-seed sliding window, O(N) with step=1: scan every s, seed on
+         body_j >= MICROADJUST_LOWER, refine (s, e) with endpoint_adjust, accept at
+         body_j >= ACCEPT_THRESHOLD. Covers instances whose head was fused away.
+      3. tail-seed: fallback, attempted only when both head and body yield nothing.
     """
     n = len(ops)
     accepted: list[InstanceCandidate] = []
@@ -722,7 +768,9 @@ def _overlap_ratio(a: InstanceCandidate, b: InstanceCandidate) -> float:
 
 def nms_candidates(cands: list[InstanceCandidate],
                    overlap: float = NMS_OVERLAP) -> list[InstanceCandidate]:
-    """按 score_body 降序贪心，与已选区间重叠 > overlap 的丢弃。"""
+    """Greedy pass in descending score_body order, dropping any candidate whose overlap
+    with an already selected interval exceeds overlap.
+    """
     ordered = sorted(cands, key=lambda c: -c.score_body)
     kept: list[InstanceCandidate] = []
     for c in ordered:
@@ -734,14 +782,16 @@ def nms_candidates(cands: list[InstanceCandidate],
 
 def arbitrate_overlaps(all_cands_by_component: dict[str, list[InstanceCandidate]]
                        ) -> tuple[list[Instance], list[Warning]]:
-    """跨 component 仲裁：
+    """Cross-component arbitration:
 
-    1. 把所有候选混进同一池，按 score_body 降序贪心
-    2. 与已选区间重叠 > NMS_OVERLAP 时：
-       - 如果是同 component → 直接丢弃后者（NMS 已做完，理论上不会进来）
-       - 如果是异 component → 比 score_body：差 < 0.05 比 score_body_shape；
-         差 < 0.02 → ambiguous_match 警告 + 都保留？不，选高的，
-         同时记 warning 让 AI 提示用户重挑 sample。
+    1. Pool all candidates together and walk them greedily in descending score_body.
+    2. When a candidate overlaps an already selected interval by more than NMS_OVERLAP:
+       - same component: drop the later one; per-component NMS already ran, so this
+         should not normally be reached.
+       - different component: compare score_body; if the gap is < 0.05, compare
+         score_body_shape as well, and if that gap is also < 0.02 record an
+         ambiguous_match warning so the user can be prompted to reselect the sample.
+         The higher-scoring candidate is kept either way.
     """
     pool = []
     for cands in all_cands_by_component.values():
@@ -757,7 +807,7 @@ def arbitrate_overlaps(all_cands_by_component: dict[str, list[InstanceCandidate]
             continue
         if conflict.component == c.component:
             continue
-        # 异 component 冲突：比较 body / body_shape
+        # Different-component conflict: compare body / body_shape
         d_body = abs(conflict.score_body - c.score_body)
         if d_body < ARBITRATE_SCORE_TOLERANCE:
             d_shape = abs(conflict.score_body_shape - c.score_body_shape)
@@ -771,7 +821,8 @@ def arbitrate_overlaps(all_cands_by_component: dict[str, list[InstanceCandidate]
                            "component_b": c.component,
                            "row_range": [c.start, c.end]},
                 ))
-        # 选 score 更高的；conflict 已经在 kept 里且分数 ≥ c（因为降序），保留 conflict
+        # Keep the higher score: conflict is already in kept and scores >= c because the
+        # pool is walked in descending order, so conflict stays.
 
     instances = [
         Instance(component=c.component, start=c.start, end=c.end,
@@ -793,10 +844,11 @@ def _are_lengths_similar(lens: list[int]) -> bool:
 
 def classify_unmatched(instances: list[Instance], n: int
                        ) -> tuple[list[UnmatchedRegion], list[Warning]]:
-    """把 instance 之间的空隙分类为 pre_arch / post_arch / inter_layer_region.
+    """Classify the gaps between instances as pre_arch / post_arch / inter_layer_region.
 
-    intra_layer_gap / intra_layer_outlier 在 assemble_layers 阶段才能算（需要先拼
-    layer），这里只处理 component 间的全局空隙。
+    intra_layer_gap and intra_layer_outlier can only be computed in assemble_layers,
+    which requires layers to be assembled first; this function handles only the global
+    gaps between components.
     """
     if not instances:
         return [], []
@@ -814,9 +866,11 @@ def classify_unmatched(instances: list[Instance], n: int
     if sorted_inst[-1].end < n - 1:
         regions.append(UnmatchedRegion(sorted_inst[-1].end + 1, n - 1, "post_arch"))
 
-    # 末尾未匹配的"重复 region"检测：把 post_arch + 末尾连续若干 inter_layer_region
-    # 合并看是否长度相似且 ≥ 2 个 → suspected_undeclared_component
-    # 必须先于 LARGE_UNMATCHED_REGION_OPS 检测：尾部重复模式比"单段巨大"更有信息量。
+    # Trailing unmatched "repeated region" detection: take post_arch plus the run of
+    # inter_layer_region at the end, and if they are similar in length and number >= 2,
+    # mark them suspected_undeclared_component.
+    # This must run before the LARGE_UNMATCHED_REGION_OPS check, because a repeated
+    # trailing pattern carries more information than a single oversized region.
     tail_regions = []
     for r in reversed(regions):
         if r.classification in ("post_arch", "inter_layer_region"):
@@ -837,9 +891,10 @@ def classify_unmatched(instances: list[Instance], n: int
             extra={"row_ranges": [[r.start, r.end] for r in tail_regions]},
         ))
 
-    # 余下的 inter_layer_region 单段 > LARGE_UNMATCHED_REGION_OPS 视为漏声明的
-    # component（sampler / lm_head / draft head 等被当 gap 吞掉的常见症状）：
-    # 升级 classification + 攒一条 large_unmatched_region 警告，render.py 据此硬停。
+    # Any remaining single inter_layer_region longer than LARGE_UNMATCHED_REGION_OPS is
+    # treated as an undeclared component; the common symptom is a sampler / lm_head /
+    # draft head swallowed as a gap. Upgrade its classification and emit one
+    # large_unmatched_region warning, which render.py turns into a hard stop.
     large_regions = [
         r for r in regions
         if r.classification == "inter_layer_region"
@@ -870,12 +925,12 @@ def _pick_composition_by_lookahead(
     candidates: list[dict], by_start: list[Instance],
     consumed: list[bool], inst_idx: int, n: int,
 ) -> tuple[dict, bool]:
-    """多 composition 共享 first.component 时，扫接下来 K 条未消费 instance
-    的 type 多集，挑能被该 multiset 最大覆盖的 composition。
+    """When several compositions share first.component, look at the type multiset of the
+    next K unconsumed instances and pick the composition that multiset covers best.
 
-    返回 (chosen, tie)：tie=True 表示最高分仍有多个 composition 并列。
-    K 取当前 candidate 的 components 数；若 candidate 间长度不同，分别用各自长度
-    取 lookahead 切片。
+    Returns (chosen, tie); tie=True means several compositions remain tied at the top
+    score. K is the number of components in the candidate under consideration; when
+    candidates differ in length, each takes a lookahead slice of its own length.
     """
     if len(candidates) == 1:
         return candidates[0], False
@@ -903,16 +958,18 @@ def _pick_composition_by_lookahead(
 
 def assemble_layers(instances: list[Instance], structure_spec: dict
                     ) -> tuple[list[Instance], list[Warning]]:
-    """row-order composition 推断.
+    """Row-order composition inference.
 
-    遍历每个 phase 的声明 layer 数 N：
-      - pending = phase row 范围内未消费 instance（按 row 升序）
-      - 对每个 layer slot：看 pending[0].component，找匹配的 declared composition
-        （component ∈ comp.components 且 comp 与已选 composition 之间可区分）
-      - 选中 composition → 从 pending 顺序消费一个该 composition 包含的每个 type
-      - 给消费的 instance 填 layer_idx / phase
+    For each phase, iterate over its declared layer count N:
+      - pending = unconsumed instances within the phase row range, in ascending row order
+      - for each layer slot, take pending[0].component and find the matching declared
+        composition, meaning component is in comp.components and comp is distinguishable
+        from the other declared compositions
+      - once a composition is chosen, consume one instance of each type it contains, in
+        pending order
+      - fill layer_idx and phase on every consumed instance
 
-    返回填好 layer_idx / phase 的 instances + warnings。
+    Returns the instances with layer_idx / phase filled in, plus warnings.
     """
     if not structure_spec.get("phases"):
         return instances, []
@@ -953,9 +1010,10 @@ def assemble_layers(instances: list[Instance], structure_spec: dict
                 ))
                 inst_idx += 1
                 continue
-            # 多 composition 共享 first.component（如 main phase 同时声明
-            # [mla,dense] 和 [mla,moe]）时，靠 lookahead 看接下来 K 条未消费
-            # instance 的 type 多集，选与之最匹配的那个 composition。
+            # When several compositions share first.component, for example a main phase
+            # declaring both [mla,dense] and [mla,moe], use lookahead over the type
+            # multiset of the next K unconsumed instances to select the best-matching
+            # composition.
             comp, tie = _pick_composition_by_lookahead(
                 candidates, by_start, consumed, inst_idx, n)
             if tie:
@@ -995,16 +1053,17 @@ def assemble_layers(instances: list[Instance], structure_spec: dict
             next_layer_id += 1
             layers_emitted += 1
         if layers_emitted != layers_expected:
-            pass  # 已 warn
+            pass  # already warned above
 
     return [i for i in by_start if i.layer_idx >= 0], warnings
 
 
 def build_validation(structure_spec: dict, instances: list[Instance]
                      ) -> tuple[dict, list[Warning]]:
-    """component_count_mismatch 校验.
+    """component_count_mismatch validation.
 
-    某 type 实测 instance 数 ≠ Σ phase.layers × count(type ∈ composition)。
+    Fires when the detected instance count of a type differs from
+    sum over phases of phase.layers * count(type in composition).
     """
     warnings: list[Warning] = []
     expected_per_type: Counter = Counter()
@@ -1012,8 +1071,10 @@ def build_validation(structure_spec: dict, instances: list[Instance]
         for comp in phase["layer_compositions"]:
             for t in comp["components"]:
                 expected_per_type[t] += phase["layers"] // len(phase["layer_compositions"])
-                # 上面是粗估；精确期望需要知道每种 composition 在 phase 内的比例，
-                # 但 row-order 推断本身就决定了比例，所以这里只能给一个上界
+                # This is a coarse estimate. An exact expectation would require the
+                # proportion of each composition within the phase, but that proportion is
+                # itself determined by row-order inference, so only an upper bound is
+                # available here.
     detected_per_type = Counter(i.component for i in instances)
 
     declared_layers = sum(p["layers"] for p in structure_spec.get("phases", []))
@@ -1069,16 +1130,16 @@ def _low_shape_confidence_warnings(instances: list[Instance]) -> list[Warning]:
 def run_sample_mode(ops: list[dict], structure_spec: dict,
                     samples: dict[str, tuple[int, int]],
                     strict_composition: bool = False) -> SampleDraft:
-    """主入口：从 ops + spec + samples 跑全流程.
+    """Main entry: run the full pipeline from ops + spec + samples.
 
     Args:
-        ops: raw_ops.json 的 operators 列表
-        structure_spec: 0a 解析结果 dict
-        samples: {component_name: (lo, hi)}（闭区间 row 号）
-        strict_composition: 若 True，遇到 composition_mismatch warning 抛 SystemExit
+        ops: the operators list from raw_ops.json
+        structure_spec: the Phase 0a parse result dict
+        samples: {component_name: (lo, hi)}, closed row-number intervals
+        strict_composition: if True, raise SystemExit on a composition_mismatch warning
 
     Returns:
-        SampleDraft（结构见 dataclass）
+        SampleDraft, whose layout is given by the dataclass
     """
     expected = list(structure_spec.get("expected_components", []))
     missing = [c for c in expected if c not in samples]
@@ -1241,7 +1302,8 @@ def _component_candidates_for_stream_ack(
         return [], warnings, sample_echo
 
     candidates = []
-    # 每条 aux 流先做一次全局最优匹配（occurrence ↔ segment），再按 occurrence 组装。
+    # Run one globally optimal occurrence-to-segment matching per aux stream first, then
+    # assemble by occurrence.
     aux_sids = [sid for sid in stream_cands
                 if sid != primary_stream_id
                 and role_by_stream.get(sid, "auxiliary") != "unknown"]
@@ -1471,25 +1533,35 @@ def _unmatched_stream_segments(unmatched: list[int],
 def detect_displaced_aux_streams(candidates: list[dict],
                                  ops_by_idx: dict[int, dict]
                                  ) -> tuple[list[Warning], set[tuple[str, str]]]:
-    """并入膨胀体检——形态无关，只度量"撑大包络"这一危害本身。
+    """Merge-inflation check: shape-agnostic, it measures only the harm itself, namely a
+    stretched time envelope.
 
-    对每个 component 实例量"并入某条 aux 流让 component 时间包络相对主流自身膨胀多少"：
-        primary_span = max_end(primary) − min_start(primary)
-        total_span   = max_end(primary∪aux) − min_start(primary∪aux)
-        inflation    = (total_span − primary_span) / primary_span
-    按 (component_type, aux_stream) 聚合：若多数 occurrence 满足 overlap==0 且
-    inflation > AUX_DISPLACEMENT_RATIO_LIMIT，则该流与主流时间脱节，并入会撑大 bubble。
+    For each component instance, measure how much merging a given aux stream inflates the
+    component time envelope relative to the primary stream alone:
+        primary_span = max_end(primary) - min_start(primary)
+        total_span   = max_end(primary union aux) - min_start(primary union aux)
+        inflation    = (total_span - primary_span) / primary_span
+    Aggregate by (component_type, aux_stream): if a majority of occurrences have
+    overlap == 0 and inflation > AUX_DISPLACEMENT_RATIO_LIMIT, that stream is temporally
+    displaced from the primary and merging it inflates the bubble.
 
-    不识别任何具体流形态，只看包络是否被撑大；并发辅流（overlap>0）天然不进判定。
-    只发 hard warning（detect_structure 会 block），不改 membership —— displaced 流的 op
-    默认仍保留在 component（单列 displaced_op_indices 供 render 从 cluster/bubble/TOTAL 剔除
-    并标注）；用户仅在确认该流不属于该 component 时才于 Phase 0b 改判为 unmatched。
+    No specific stream shape is recognized, only whether the envelope is stretched;
+    concurrent aux streams (overlap > 0) never enter the judgment by construction.
+    This emits a hard warning, which detect_structure blocks on, but does not change
+    membership: ops of a displaced stream stay in the component by default and are listed
+    separately as displaced_op_indices so render can exclude and annotate them. Only when
+    the user confirms the stream does not belong to the component is it reclassified as
+    unmatched in Phase 0b.
 
-    口径/边界：overlap 与 total 用 segment 时间包络（min_start/max_end），非 op 级 union；
-    对内部时间稀疏的 aux seg 是近似，per-layer 紧凑 aux 下足够。退化主流（p_len<=0 或
-    primary/aux 段为空）信息不足，跳过。判据全是相对/结构量（inflation 比 + 流级多数），
-    无绝对时间阈值——避免量级过拟合（prefill/小模型/不同芯片量级各异）；偶发单点膨胀由
-    流级多数（FRACTION）过滤，不靠绝对地板。
+    Definitions and limits: overlap and total use the segment time envelope
+    (min_start/max_end) rather than an op-level union, which approximates an aux segment
+    that is internally sparse in time but is sufficient for per-layer compact aux.
+    Degenerate primaries (p_len <= 0, or an empty primary/aux segment) carry too little
+    information and are skipped. All criteria are relative or structural quantities
+    (inflation ratio plus per-stream majority) with no absolute time threshold, which
+    would overfit to a magnitude range that varies across prefill, small models, and
+    different chips; occasional single-point inflation is filtered by the per-stream
+    majority (FRACTION) rather than by an absolute floor.
     """
     by_comp_aux: dict[tuple[str, str], list[dict]] = {}
     for cand in candidates:
@@ -1499,7 +1571,7 @@ def detect_displaced_aux_streams(candidates: list[dict],
             continue
         p_start, p_end = _segment_time_bounds(primary, ops_by_idx)
         p_len = p_end - p_start
-        if p_len <= 0:        # 主流跨度为 0：膨胀比无意义，不纳入判定
+        if p_len <= 0:        # zero primary span makes the inflation ratio meaningless; skip
             continue
         for s in segs:
             if s.role == "primary" or not s.op_indices:
@@ -1634,8 +1706,9 @@ def stream_draft_to_dict(draft: StreamSampleDraft,
             ],
             "scores": c.scores,
         }
-        # 时间脱节辅流的 op 仍留在 op_indices 全集（matched 不丢、partition 不破），
-        # 但单列出来供 render 从 TOTAL/bubble 排除并标注。
+        # Ops of a temporally displaced aux stream stay in the full op_indices set, so
+        # nothing matched is lost and the partition stays intact, but they are also
+        # listed separately so render can exclude them from TOTAL/bubble and annotate them.
         disp_ops = sorted({i for s in c.stream_segments
                            if (c.type, s.stream_id) in displaced
                            for i in s.op_indices})

@@ -75,7 +75,7 @@ Dashboard 只有在下列信息齐备后才能初始化；提前初始化会让�
 - 本轮只动了开关或参数，没有改变算子下发和计算结构，而且仍在用同一份数据做对照。
 - 改动与性能结构无关，例如纯精度修复、注释或日志调整。
 
-无论是否重采，性能收益的判定都以 profile-analyzer 的分析报告为准——看报告给出的时间分布、与 baseline 的 Δ%、以及逐算子实测 / 理论 gap 变化，不拿裸 wall-clock 数字（infer 脚本打印、`time.perf_counter` 计时等）直接下结论。
+无论是否重采，性能收益的判定都以 profile-analyzer 的分析报告为准——看报告给出的时间分布、与 baseline 的 Δ%，理论对比已启用时再看逐算子实测 / 理论 gap 变化，不拿裸 wall-clock 数字（infer 脚本打印、`time.perf_counter` 计时等）直接下结论。
 
 ## 派生新 Plan
 
