@@ -131,6 +131,15 @@ class BaseSpeculativeInfo:
             )
         return type(self)(**values_by_field)
 
+    def select_rows(self, indices: torch.Tensor) -> "BaseSpeculativeInfo":
+        """Extract the given requests from batched speculative state."""
+        values_by_field = {}
+        for state_field in fields(self):
+            value = getattr(self, state_field.name)
+            values_by_field[state_field.name] = (
+                torch.index_select(value, 0, indices) if isinstance(value, torch.Tensor) else value
+            )
+        return type(self)(**values_by_field)
 
     def snapshot(self) -> "BaseSpeculativeInfo":
         """Copy request-local state into independent, device-complete tensors."""
@@ -458,8 +467,8 @@ class Batch:
             accepted_count = None
 
             if self.draft_info:
-                # Draft state follows the request order, unlike the tensors the engine already selected.
-                state = self.draft_info.select(request_idx)
+                # Draft state holds the same selected rows as the tensors above.
+                state = self.draft_info.select(output_idx)
                 accepted_count = int(state.accepted_num.item()) if state.accepted_num is not None else None
                 state.update_request(request, is_prefill)
                 computed_lens = self.draft_info.progress_base(total_lens, is_prefill)

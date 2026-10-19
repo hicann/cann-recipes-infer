@@ -707,6 +707,12 @@ class DSparkWorker(BaseSpeculativeWorker):
         else:
             state.draft_probs = None
 
+        cp_metadata = get_forward_metadata().cp_metadata
+        if batch.is_prefill and cp_metadata is not None and cp_metadata.enabled:
+            # The proposal runs on the whole batch so every rank enters the draft
+            # collectives with the same shape. Only the selected rows become state.
+            batch.draft_info = state.select_rows(cp_metadata.output_request_indices)
+
     def _prepare_proposal_inputs(self, input_dict, main_next_tokens, target_hidden_states):
         """Prepare DSpark tokens and logical positions before model-specific metadata."""
         target_hidden_positions = input_dict.get("target_hidden_positions")
