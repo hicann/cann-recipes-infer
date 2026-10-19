@@ -132,6 +132,23 @@ class BaseSpeculativeInfo:
         return type(self)(**values_by_field)
 
 
+    def snapshot(self) -> "BaseSpeculativeInfo":
+        """Copy request-local state into independent, device-complete tensors."""
+        values = {state_field.name: getattr(self, state_field.name) for state_field in fields(self)}
+        devices = {
+            value.device for value in values.values()
+            if isinstance(value, torch.Tensor) and value.device.type == "npu"
+        }
+        for device in devices:
+            torch.npu.synchronize(device)
+        snapshot = type(self)(**{
+            name: value.detach().clone() if isinstance(value, torch.Tensor) else value
+            for name, value in values.items()
+        })
+        for device in devices:
+            torch.npu.current_stream(device).synchronize()
+        return snapshot
+
     def update_request(self, request: "Request", is_prefill: bool) -> None:
         """Persist this request-local state without dropping backend fields."""
         request.update_draft_info(self)

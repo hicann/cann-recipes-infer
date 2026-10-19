@@ -15,6 +15,7 @@
 
 """Tests for build_transfer_engine factory and DisaggConfig.engine_backend wiring."""
 
+import os
 import sys
 import types
 import unittest
@@ -63,14 +64,27 @@ class TestBuildTransferEngineFactory(unittest.TestCase):
         fake_module = types.ModuleType("memfabric_hybrid")
 
         class _FakeMFEngine:
+            class TransDataOpType:
+                SDMA = "sdma"
+
+            @staticmethod
+            def initialize(*args):
+                return 0
+
             @staticmethod
             def get_rpc_port():
                 return 12345
+
         fake_module.TransferEngine = _FakeMFEngine
-        with mock.patch.dict(sys.modules, {"memfabric_hybrid": fake_module}):
+        fake_module.create_config_store = mock.Mock(return_value=0)
+        with mock.patch.dict(sys.modules, {"memfabric_hybrid": fake_module}), mock.patch.dict(
+            os.environ, {"LOCAL_RANK": "0", "ASCEND_MF_TRANSFER_PROTOCOL": "sdma"},
+        ):
             engine = te.build_transfer_engine(
                 cfg, hostname="1.2.3.4", local_rank=0,
             )
+            # The RPC port is available only after engine initialization.
+            engine.initialize()
         self.assertIsInstance(engine, te.AscendTransferEngine)
         self.assertEqual(engine.rank_port, 12345)
         # Factory must forward the memfabric-specific ctor args verbatim from

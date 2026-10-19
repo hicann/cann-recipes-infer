@@ -247,9 +247,19 @@ DeepSeek-V4 Flash支持通过DSpark草稿模型一次生成多个Draft Token，�
 | `confidence_threshold` | `0.0` | 候选置信度阈值，范围为 `[0, 1]`；`0` 关闭前缀截断。 |
 | `draft_temperature` | 空值 | 草稿采样温度，非负；空值继承请求温度。主模型温度由 `data_config.temperature` 设置。 |
 
-> DSpark当前仅支持离线非PD分离部署，要求 `parallel_config.cp_size=1`。置信度截断只调整有效候选前缀，主模型校验宽度仍为 `num_speculative_tokens + 1`。
+> DSpark提供Ascend 950系列和A3平台适配，要求 `parallel_config.cp_size=1`。A3融合注意力路径要求配套的SparseFlashMLA及Metadata算子支持SWA稀疏ori_kv场景，包括非空的 `ori_sparse_indices` 和 `ori_topk_length` 输入；接口约束见[算子说明](https://gitcode.com/cann/ops-transformer/blob/0181047ae574477fe974a6258d32b68a711f108c/attention/sparse_flash_mla/docs/aclnnSparseFlashMla.md)。仅支持空稀疏索引的算子版本不适用于该路径。置信度截断只调整有效候选前缀，主模型校验宽度仍为 `num_speculative_tokens + 1`。
 
 > 原生MTP兼容 `model_config.next_n` 配置，DSpark示例使用 `speculative_config`。同时设置 `model_config.next_n` 和 `speculative_config.num_speculative_tokens` 时，两个参数的数值须保持一致。
+
+**Online PD分离原理：**
+
+DSpark复用现有PD调度与KV传输流程，将Prefill产生的草稿状态交给Decode继续执行：
+
+1. Prefill端执行主模型预填充，生成首Token和辅助hidden states；草稿模型据此建立上下文KV，并生成首组候选Token。
+2. 主模型和草稿模型的KV通过现有缓存传输通道交接，同时传输首Token、已计算长度、候选Token、有效候选长度和草稿采样概率。随机采样的拒绝校验需要使用生成候选时的实际概率，因此不能只传候选Token。
+3. Decode端恢复请求状态后，直接由主模型校验首组候选，再由草稿模型生成下一组候选，继续投机推理，无需重新执行Prompt预填充。接收KV时先保持与Prefill一致的滑窗范围，后续由常规Decode调度扩展。
+
+两端需使用配套的主模型与草稿权重，候选数、词表、缓存布局和采样配置保持一致；当前要求Attention TP相同且 `cp_size=1`。原有MTP元数据格式保持不变，DSpark额外传输FP32草稿概率，开销约为每请求 `4 × 候选数 × 词表大小` 字节。指定请求seed时，Decode使用独立、可复现的随机流，不保证与离线推理逐Token一致。
 
 ### 拉起多卡推理
 以下命令在仓库根目录执行。统一入口脚本位于 `executor/scripts/infer.sh`，通过以下参数控制启动：
@@ -285,7 +295,7 @@ bash executor/scripts/infer.sh --model deepseek_v4 --yaml ci_950/deepseek_v4_fla
 # offline 模式，Ascend 950系列，4卡低时延 TP + DSpark
 bash executor/scripts/infer.sh --model deepseek_v4 --yaml ci_950/deepseek_v4_flash_rank_4_1bs_low_latency_tp_dspark.yaml
 
-# online PD 模式，暂时只支持A3机型
+# online PD 模式，A3配置示例
 bash executor/scripts/infer.sh --model deepseek_v4 --mode online --pd-role prefill --p-yaml-name ci_a3/deepseek_v4_pd/prefill.yaml --d-yaml-name ci_a3/deepseek_v4_pd/decode.yaml
 bash executor/scripts/infer.sh --model deepseek_v4 --mode online --pd-role decode --p-yaml-name ci_a3/deepseek_v4_pd/prefill.yaml --d-yaml-name ci_a3/deepseek_v4_pd/decode.yaml
 ```

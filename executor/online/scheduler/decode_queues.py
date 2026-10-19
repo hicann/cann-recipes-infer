@@ -21,6 +21,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
+from typing import Callable, Optional
 
 import torch
 
@@ -193,7 +194,9 @@ class DecodePreallocQueue:
                 decode_req.req.finish_reason = "error"
                 self.transfer_queue.terminal_failed.append(decode_req)
 
-    def pop_preallocated(self, next_n: int = 0) -> tuple[list[DecodeRequest], list[DecodeRequest]]:
+    def pop_preallocated(
+        self, next_n: int = 0, *, preserve_prefill_cache: bool = False,
+    ) -> tuple[list[DecodeRequest], list[DecodeRequest]]:
         self._resolve_pending_reqs()
         self._update_handshake_waiters()
         n_wfi = sum(1 for r in self.queue if r.waiting_for_input)
@@ -228,11 +231,19 @@ class DecodePreallocQueue:
             # Matches _schedule_decode_batch(num_new_tokens=1+next_n, lookahead=max(next_n-1,0)).
             # Extra blocks beyond what prefill transfers are harmless — prefill
             # only writes src_block_ids count blocks (zip stops at the shorter).
+            computed_tokens = num_tokens
+            num_new_tokens = 1 + next_n
+            lookahead_tokens = max(next_n - 1, 0)
+            if preserve_prefill_cache:
+                # Match prefill's sliding window until KV transfer completes.
+                computed_tokens = 0
+                num_new_tokens = num_tokens
+                lookahead_tokens = next_n
             if not self.kv_cache_manager.allocate_slots(
                 request_id=decode_req.req.request_id,
-                computed_tokens=num_tokens,
-                num_new_tokens=1 + next_n,
-                lookahead_tokens=max(next_n - 1, 0),
+                computed_tokens=computed_tokens,
+                num_new_tokens=num_new_tokens,
+                lookahead_tokens=lookahead_tokens,
                 reserved_tokens=self.num_reserved_decode_tokens
             ):
                 logger.debug("preallocate skip room=%s: KV cache slot allocation failed", room)
@@ -266,7 +277,9 @@ class DecodeTransferQueue:
         # Read directly from the pool; returns None if slot still zeroed.
         return self.metadata_pool.read(decode_req.metadata_buffer_index)
 
-    def _commit_metadata(self, decode_req: DecodeRequest) -> bool:
+    def _commit_metadata(
+        self, decode_req: DecodeRequest, on_pd_restore: Optional[Callable[[object], None]] = None,
+    ) -> bool:
         """True iff request is resolved (committed or errored); caller removes it."""
         meta = self._read_metadata(decode_req)
         if meta is None:
@@ -291,14 +304,21 @@ class DecodeTransferQueue:
         if kv_len is not None:
             decode_req.req.computed_len = int(kv_len)
         mtp_spec_tokens = meta.get("mtp_spec_tokens")
-        if mtp_spec_tokens is not None:
+        draft_info = meta.get("draft_info")
+        if draft_info is not None:
+            decode_req.req.update_draft_info(draft_info)
+            if on_pd_restore is not None:
+                on_pd_restore(decode_req.req)
+        elif mtp_spec_tokens is not None:
             decode_req.req.mtp_info = MTPInfo(
                 spec_tokens=torch.tensor(mtp_spec_tokens, dtype=torch.long),
             )
         decode_req.req.is_prefill_done = True
         return True
 
-    def pop_transferred(self) -> list[DecodeRequest]:
+    def pop_transferred(
+        self, on_pd_restore: Optional[Callable[[object], None]] = None,
+    ) -> list[DecodeRequest]:
         ready = []
         indices_to_remove = set()
 
@@ -315,7 +335,7 @@ class DecodeTransferQueue:
                 self.terminal_failed.append(decode_req)
                 indices_to_remove.add(i)
             elif poll == KVPoll.Success:
-                if self._commit_metadata(decode_req):
+                if self._commit_metadata(decode_req, on_pd_restore):
                     indices_to_remove.add(i)
                     decode_req.kv_receiver.clear()
                     if decode_req.req.finish_reason == "error":

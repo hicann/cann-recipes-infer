@@ -80,7 +80,6 @@ def load_server_app_config(
     )
 
 
-
 def build_online_request_dict(  # pylint: disable=too-many-arguments
     prompt,
     sampling_params: Optional[dict] = None,
@@ -364,9 +363,63 @@ class ChatCompletionRequest(BaseModel):
 
 REQUEST_TIMEOUT_SECS = 1800.0
 
+_SPEC_COUNT_FIELDS = (
+    "spec_num_accepted_tokens",
+    "spec_num_draft_tokens",
+    "spec_num_forward_ct",
+)
+
+
+def _add_speculative_counts(totals: dict, result: dict) -> None:
+    """Accumulate raw counts; derive acceptance rates only after summing."""
+    if "spec_num_accepted_tokens" in result:
+        for field in _SPEC_COUNT_FIELDS:
+            totals[field] += result[field]
+
+
+def _speculative_stats(counts: dict) -> dict:
+    """Format counters and derive metrics after request counts are aggregated."""
+    stats = {field: counts[field] for field in _SPEC_COUNT_FIELDS}
+    accepted, draft, forward_ct = (stats[field] for field in _SPEC_COUNT_FIELDS)
+    stats["spec_acceptance_rate"] = accepted / draft if draft else 0.0
+    stats["spec_avg_accept_length"] = accepted / forward_ct + 1 if forward_ct else 1.0
+    return stats
+
 
 def create_app(dispatcher, server_config: ServerAppConfig):
     """Create FastAPI app (server process only)."""
+
+    _spec_accum = dict.fromkeys(_SPEC_COUNT_FIELDS, 0)
+    _has_spec_stats = False
+
+    def _log_speculative_stats(scope: str, counts: dict) -> None:
+        stats = _speculative_stats(counts)
+        logger.info(
+            "Speculative stats [role=%s %s]: accepted=%d draft=%d forward_ct=%d "
+            "accept_rate=%.4f avg_accept_length=%.4f",
+            server_config.disaggregation_mode,
+            scope,
+            stats["spec_num_accepted_tokens"],
+            stats["spec_num_draft_tokens"],
+            stats["spec_num_forward_ct"],
+            stats["spec_acceptance_rate"],
+            stats["spec_avg_accept_length"],
+        )
+
+    def _accumulate_spec(request_id: int, result: dict) -> None:
+        nonlocal _has_spec_stats
+        if server_config.disaggregation_mode == ROLE_PREFILL:
+            return
+        if "spec_num_accepted_tokens" not in result:
+            return
+        counts = {field: result.get(field, 0) for field in _SPEC_COUNT_FIELDS}
+        _log_speculative_stats(
+            f"request_id={request_id} finish_reason={result.get('finish_reason', 'unknown')}",
+            counts,
+        )
+        _add_speculative_counts(_spec_accum, counts)
+        _has_spec_stats = True
+        _log_speculative_stats("cumulative", _spec_accum)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -403,6 +456,7 @@ def create_app(dispatcher, server_config: ServerAppConfig):
                     f"exceeds the configured max_prefill_tokens limit"
                 ),
             )
+        _accumulate_spec(request_id, result)
         return result
 
     def _build_req(prompt, sampling_params, src) -> dict:
@@ -419,7 +473,10 @@ def create_app(dispatcher, server_config: ServerAppConfig):
     def _usage(result: dict) -> dict:
         pt = result.get("prompt_tokens", 0)
         ct = result.get("completion_tokens", 0)
-        return {"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct}
+        usage = {"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct}
+        if "spec_num_accepted_tokens" in result:
+            usage.update(_speculative_stats(result))
+        return usage
 
     disagg_mode = server_config.disaggregation_mode
 
@@ -429,6 +486,11 @@ def create_app(dispatcher, server_config: ServerAppConfig):
             _build_req(request.prompt, {}, request)
         )
         result = await _wait_result(request_id)
+        if (
+            disagg_mode != ROLE_PREFILL
+            and "spec_num_accepted_tokens" in result
+        ):
+            result.update(_speculative_stats(result))
         if disagg_mode == ROLE_PREFILL:
             return result
         return {"status": "success", "result": result}
@@ -488,6 +550,8 @@ def create_app(dispatcher, server_config: ServerAppConfig):
 
         choices = []
         totals = {"prompt_tokens": 0, "completion_tokens": 0}
+        spec_totals = dict.fromkeys(_SPEC_COUNT_FIELDS, 0)
+        has_spec_stats = False
         for idx, rid in enumerate(request_ids):
             result = await _wait_result(rid)
             completion_logprobs = (
@@ -502,7 +566,12 @@ def create_app(dispatcher, server_config: ServerAppConfig):
             })
             totals["prompt_tokens"] += result["prompt_tokens"]
             totals["completion_tokens"] += result["completion_tokens"]
+            if "spec_num_accepted_tokens" in result:
+                has_spec_stats = True
+                _add_speculative_counts(spec_totals, result)
         totals["total_tokens"] = totals["prompt_tokens"] + totals["completion_tokens"]
+        if has_spec_stats:
+            totals.update(_speculative_stats(spec_totals))
         return {
             "id": f"cmpl-{uuid.uuid4().hex[:8]}",
             "object": "text_completion",
@@ -614,11 +683,14 @@ def create_app(dispatcher, server_config: ServerAppConfig):
 
     @app.get("/stats")
     async def stats():
-        return {
+        result = {
             "status": "running",
             "pending_requests": dispatcher.get_pending_count(),
             "num_workers": server_config.world_size,
         }
+        if _has_spec_stats:
+            result.update(_speculative_stats(_spec_accum))
+        return result
 
     return app
 

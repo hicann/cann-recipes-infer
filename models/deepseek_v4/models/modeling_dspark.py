@@ -35,7 +35,7 @@ import cann_ops_transformer  # noqa: F401  # Registers torch.ops.cann_ops_transf
 from torch import nn
 from transformers.utils import logging
 
-from executor.core.config import CommManager, InferenceConfig
+from executor.core.config import CommManager, InferenceConfig, PlatformVersion
 from executor.core.engine.sampler import Sampler
 from executor.core.kv_cache.cache_info import CacheEntry, LayerCacheInfo, ModelCacheInfo
 from executor.utils.forward_metadata import get_forward_metadata
@@ -178,6 +178,9 @@ class DSparkAttention(Attention):
         # positions there because aclnnScatterNdUpdate rejects negative indices.
         safe_slots = slot_mapping.to(
             device=kv.device, dtype=torch.int32).reshape(-1).clamp_min(0)
+        if self.platform_version == PlatformVersion.A3:
+            self.update_win_kv(kv, safe_slots, cache)
+            return
         torch_npu.npu_scatter_nd_update_(
             cache.view(-1, cache.shape[-1]),
             safe_slots.view(-1, 1),
@@ -199,6 +202,12 @@ class DSparkAttention(Attention):
             partial_slice=self.partial_slice,
         )
         return tensor
+
+    def apply_norm_dynamic_quant(self, x):
+        """Keep the W16A16 dtype handling local to DSpark; the parent needs no changes."""
+        if self.mm_quant_mode == "w16a16":
+            return self.q_norm(x), None
+        return super().apply_norm_dynamic_quant(x)
 
     def _project_dspark_kv(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
         kv = self.wkv(x)
@@ -258,7 +267,14 @@ class DSparkAttention(Attention):
     def generate_dspark_fused_fa_metadata(self, attn_metadata: Dict):
         """Generate one metadata object shared by all DSpark proposal layers."""
         metadata_inputs = attn_metadata["dspark_fused_fa_inputs"]
-        seqused_q = metadata_inputs["seqused_q"]
+        is_a3 = self.platform_version == PlatformVersion.A3
+        seqused_q = None if is_a3 else metadata_inputs["seqused_q"]
+        sparse_kwargs = {}
+        if is_a3:
+            sparse_kwargs = {
+                "ori_topk": metadata_inputs["ori_sparse_indices"].shape[-1],
+                "ori_topk_length": metadata_inputs["ori_topk_length"],
+            }
         seqused_ori_kv = metadata_inputs["seqused_ori_kv"]
         metadata = self.dspark_sparse_attn_metadata_ops(
             num_heads_q=self.num_heads_per_rank,
@@ -273,12 +289,13 @@ class DSparkAttention(Attention):
             cmp_ratio=1,
             ori_mask_mode=0,
             cmp_mask_mode=0,
-            ori_win_left=-1,
-            ori_win_right=-1,
+            ori_win_left=0 if is_a3 else -1,
+            ori_win_right=0 if is_a3 else -1,
             layout_q="BSND",
             layout_kv="PA_BBND",
             has_ori_kv=True,
             has_cmp_kv=False,
+            **sparse_kwargs,
         )
         attn_metadata["dspark_fused_fa_metadata"] = (
             metadata_inputs["block_table"],
@@ -308,7 +325,12 @@ class DSparkAttention(Attention):
         block_table, seqused_q, seqused_ori_kv, metadata = \
             attn_metadata["dspark_fused_fa_metadata"]
 
-        compact_kv = self._gather_dspark_kv(attn_metadata["dspark_fused_fa_inputs"])
+        metadata_inputs = attn_metadata["dspark_fused_fa_inputs"]
+        compact_kv = self._gather_dspark_kv(metadata_inputs)
+        is_a3 = self.platform_version == PlatformVersion.A3
+        sparse_kwargs = {}
+        if is_a3:
+            sparse_kwargs["ori_topk_length"] = metadata_inputs["ori_topk_length"]
         sinks = self.attn_sink
         if self.low_latency_tp:
             head_start = self.attn_tp_rank * self.num_heads_per_rank
@@ -318,7 +340,7 @@ class DSparkAttention(Attention):
             q=q,
             ori_kv=compact_kv,
             cmp_kv=None,
-            ori_sparse_indices=None,
+            ori_sparse_indices=metadata_inputs.get("ori_sparse_indices"),
             cmp_sparse_indices=None,
             ori_block_table=block_table,
             cmp_block_table=None,
@@ -333,15 +355,16 @@ class DSparkAttention(Attention):
             cmp_ratio=1,
             ori_mask_mode=0,
             cmp_mask_mode=0,
-            ori_win_left=-1,
-            ori_win_right=-1,
+            ori_win_left=0 if is_a3 else -1,
+            ori_win_right=0 if is_a3 else -1,
             layout_q="BSND",
             layout_kv="PA_BBND",
             return_softmax_lse=False,
+            **sparse_kwargs,
         )[0].to(q.dtype)
 
     def _dspark_attn_post_eager(self, attn_output: torch.Tensor, attn_metadata: Dict):
-        if self.oproj_tp_size > 1:
+        if self.oproj_tp_size > 1 or self.platform_version == PlatformVersion.A3:
             output = self.attn_post(
                 attn_output.flatten(0, 1), attn_metadata, is_prefill=False)
             return output.unflatten(0, attn_output.shape[:2])
@@ -755,9 +778,9 @@ class DeepseekV4DSparkProposalModel(DeepseekV3ForCausalLM):
     @staticmethod
     def update_model_cfg(config, infer_config: InferenceConfig):
         """Validate DSpark-only model metadata before draft construction."""
-        if not infer_config.model_config.platform_version.is_ascend_950():
+        if infer_config.model_config.platform_version not in (PlatformVersion.A3, PlatformVersion.ASCEND_950):
             raise ValueError(
-                "DSpark currently supports Ascend 950 series only; "
+                "DSpark supports Ascend 950 series and A3; "
                 "disable speculative decoding or use a supported MTP configuration."
             )
         DeepseekV3ForCausalLM.update_model_cfg(config, infer_config)
@@ -1046,6 +1069,18 @@ class DeepseekV4DSparkProposalModel(DeepseekV3ForCausalLM):
             "seqused_q": seqused_q,
             "seqused_ori_kv": seqused_ori_kv,
         }
+
+        if self.platform_version == PlatformVersion.A3:
+            # Every draft query sees the same valid context and full draft block.
+            sparse_indices = torch.where(valid_kv, offsets, -1).to(torch.int32)
+            attn_metadata["dspark_fused_fa_inputs"].update({
+                "ori_sparse_indices": sparse_indices[:, None, None, :].expand(
+                    batch_size, draft_len, 1, -1,
+                ).contiguous(),
+                "ori_topk_length": seqused_ori_kv[:, None, None].expand(
+                    batch_size, draft_len, 1,
+                ).contiguous(),
+            })
 
     @staticmethod
     def _slot_mapping_from_positions(

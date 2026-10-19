@@ -30,7 +30,7 @@ import zmq
 from executor.core.config import InferenceConfig
 from executor.core.forward_data_info import SamplingParams
 from executor.offline.offline_inference import OfflineInference
-from executor.online.constants import zmq_ports_for_role
+from executor.online.constants import ROLE_PREFILL, zmq_ports_for_role
 from executor.online.kv_transfer import KVTransferManager, MetadataBufferPool
 from executor.online.scheduler import (
     DecodeDisaggScheduler,
@@ -102,11 +102,13 @@ class OnlineInference(OfflineInference):
         self.is_dp_leader = self.global_rank % self.group_size == 0
 
     def _build_kv_manager(self) -> KVTransferManager:
+        draft_worker = self.engine.draft_worker
+        speculative_metadata = draft_worker.build_pd_metadata() if draft_worker is not None else None
         # Only DECODE needs a metadata_pool — it's the NPU HBM target buffer
         # that prefill RDMA-writes into. PREFILL's RDMA source is the
         # per-thread _metadata_scratch pool inside KVTransferManager itself.
         metadata_pool = (
-            MetadataBufferPool(capacity=max(1, self.batch_size))
+            MetadataBufferPool(capacity=max(1, self.batch_size), speculative_metadata=speculative_metadata)
             if self.disaggregation_mode == "DECODE"
             else None
         )
@@ -120,6 +122,10 @@ class OnlineInference(OfflineInference):
             max_prefill_tokens=self.infer_config.scheduler_config.max_prefill_tokens,
             is_mla_backend=self.engine.kvcache_manager.is_mla_backend,
             metadata_pool=metadata_pool,
+            speculative_metadata=speculative_metadata,
+            require_matching_parallelism=(
+                draft_worker.pd_require_matching_parallelism if draft_worker is not None else False
+            ),
         )
 
     def _build_disagg_scheduler(self):
@@ -454,6 +460,20 @@ class OnlineInference(OfflineInference):
                     "completion_tokens": len(request.output_id_list),
                     "logprobs": logprobs_dict_list if request.sampling_params.logprobs else None,
                 }
+                spec_stats = None
+                if (
+                    request.draft_info is not None
+                    and self.disaggregation_mode != ROLE_PREFILL
+                ):
+                    accepted = request.spec_num_accepted_tokens
+                    draft = request.spec_num_draft_tokens
+                    forward_ct = request.spec_num_forward_ct
+                    spec_stats = {
+                        "spec_num_accepted_tokens": accepted,
+                        "spec_num_draft_tokens": draft,
+                        "spec_num_forward_ct": forward_ct,
+                    }
+                    result.update(spec_stats)
                 output_socket.send_multipart(
                     [
                         str(self.dp_rank).encode(),
@@ -465,3 +485,22 @@ class OnlineInference(OfflineInference):
                     f"DP Leader {self.dp_rank} completed request {req_id}: "
                     f"{len(request.output_id_list)} tokens"
                 )
+                if spec_stats is not None:
+                    accepted = spec_stats["spec_num_accepted_tokens"]
+                    draft = spec_stats["spec_num_draft_tokens"]
+                    forward_ct = spec_stats["spec_num_forward_ct"]
+                    accept_rate = accepted / draft if draft else 0.0
+                    avg_accept_length = accepted / forward_ct + 1 if forward_ct else 1.0
+                    logger.info(
+                        "Speculative stats [role=%s dp_rank=%d request_id=%s finish_reason=%s]: "
+                        "accepted=%d draft=%d forward_ct=%d accept_rate=%.4f avg_accept_length=%.4f",
+                        self.disaggregation_mode,
+                        self.dp_rank,
+                        req_id,
+                        request.finish_reason,
+                        accepted,
+                        draft,
+                        forward_ct,
+                        accept_rate,
+                        avg_accept_length,
+                    )

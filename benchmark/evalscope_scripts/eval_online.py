@@ -19,6 +19,8 @@
 import logging
 import json
 import argparse
+import threading
+from pathlib import Path
 from typing import List, Optional, Dict, Any
 
 import requests
@@ -36,6 +38,48 @@ logger = logging.getLogger(__name__)
 
 # 执行中间截断，并为服务端的 ChatTemplate 模板膨胀预留安全余量，
 SAFETY_MARGIN = 4 * 1024
+
+SPEC_COUNT_FIELDS = (
+    "spec_num_accepted_tokens",
+    "spec_num_draft_tokens",
+    "spec_num_forward_ct",
+)
+
+
+class SpecStatsAccumulator:
+    """Aggregate raw speculative counters for one benchmark run."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.num_requests_total = 0
+        self.num_requests_with_spec = 0
+        self._counts = dict.fromkeys(SPEC_COUNT_FIELDS, 0)
+
+    def add(self, usage: Dict[str, Any]) -> None:
+        with self._lock:
+            self.num_requests_total += 1
+            if "spec_num_accepted_tokens" not in usage:
+                return
+            self.num_requests_with_spec += 1
+            for field in SPEC_COUNT_FIELDS:
+                value = usage.get(field, 0) or 0
+                try:
+                    self._counts[field] += int(value)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"Invalid speculative usage field {field!r}: {value!r}") from exc
+
+    def report(self) -> Dict[str, Any]:
+        with self._lock:
+            accepted = self._counts["spec_num_accepted_tokens"]
+            draft = self._counts["spec_num_draft_tokens"]
+            forward_ct = self._counts["spec_num_forward_ct"]
+            return {
+                "num_requests_total": self.num_requests_total,
+                "num_requests_with_spec": self.num_requests_with_spec,
+                **self._counts,
+                "acceptance_rate": accepted / draft if draft else 0.0,
+                "mean_accept_length": 1 + accepted / forward_ct if forward_ct else 1.0,
+            }
 
 
 class MyCustomModel(ModelAPI):
@@ -61,14 +105,15 @@ class MyCustomModel(ModelAPI):
         self.max_tokens = max_tokens
         self.timeout = timeout
         self.model_name = model_name
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            pretrained_model_name_or_path,
-            trust_remote_code=True
+        self.spec_stats = SpecStatsAccumulator()
+        self.tokenizer = (
+            AutoTokenizer.from_pretrained(pretrained_model_name_or_path, trust_remote_code=True)
+            if pretrained_model_name_or_path else None
         )
 
     def generate(
             self,
-            input: List[ChatMessage],
+            input: List[ChatMessage],  # pylint: disable=redefined-builtin
             tools: List[ToolInfo],
             tool_choice: ToolChoice,
             config: GenerateConfig,
@@ -79,13 +124,18 @@ class MyCustomModel(ModelAPI):
         input_text = self._process_messages(input)
 
         # 3.2 调用模型
-        response = self._call_model(input_text, config)
+        response, usage = self._call_model(input_text, config)
+        self.spec_stats.add(usage)
 
         # 3.3 返回标准化输出
-        return ModelOutput.from_content(
+        output = ModelOutput.from_content(
             model=self.model_name,
-            content=response
+            content=response,
         )
+        spec_meta = {field: usage[field] for field in SPEC_COUNT_FIELDS if field in usage}
+        if spec_meta:
+            output.metadata = {"spec_decoding": spec_meta}
+        return output
 
     def _process_messages(self, messages: List[ChatMessage]) -> str:
         """将聊天消息转换为文本"""
@@ -98,6 +148,8 @@ class MyCustomModel(ModelAPI):
         return "\n".join(text_parts)
 
     def middle_truncation(self, prompt: str) -> str:
+        if self.tokenizer is None:
+            return prompt
         input_ids = self.tokenizer.encode(prompt)
         if len(input_ids) <= self.max_prefill_tokens:
             return prompt
@@ -107,11 +159,11 @@ class MyCustomModel(ModelAPI):
         prompt = self.tokenizer.decode(input_ids, skip_special_tokens=True)
         return prompt
 
-    def _call_model(self, input_text: str, config: GenerateConfig) -> str:
+    def _call_model(self, input_text: str, config: GenerateConfig):
         """调用的模型进行推理"""
         output_text = ""
         try:
-            output_text = self.request_ai(input_text)
+            output_text, usage = self.request_ai(input_text)
         except requests.exceptions.RequestException as e:
             logger.error(f"网络请求失败 (URL: {self.base_url}): {e}")
             # 向上抛出异常，让 EvalScope 框架识别为错误样本而不是得到一个空答案
@@ -120,9 +172,9 @@ class MyCustomModel(ModelAPI):
             logger.error(f"接口返回格式异常，解析失败: {e}")
             raise RuntimeError(f"Model API response parsing failed: {e}") from e
 
-        return output_text
+        return output_text, usage
 
-    def request_ai(self, content: str) -> str:
+    def request_ai(self, content: str):
         payload = json.dumps({
             "model": self.model_name,
             "messages": [
@@ -139,7 +191,27 @@ class MyCustomModel(ModelAPI):
         }
         response = requests.request("POST", self.base_url, headers=headers, data=payload, timeout=self.timeout)
         response.raise_for_status()  # 如果 HTTP 状态码不是 200，直接抛出异常
-        return response.json()["choices"][0]["message"]["content"]
+        body = response.json()
+        return body["choices"][0]["message"]["content"], body.get("usage", {}) or {}
+
+
+def print_spec_report(stats: Dict[str, Any]) -> None:
+    """Print speculative decoding counters and acceptance metrics."""
+    logger.info("%s", "=" * 60)
+    logger.info("Speculative Decoding acceptance summary (this benchmark)")
+    logger.info("%s", "=" * 60)
+    logger.info("total requests                  : %s", stats["num_requests_total"])
+    logger.info("requests with spec statistics   : %s", stats["num_requests_with_spec"])
+    logger.info("accepted draft tokens           : %s", stats["spec_num_accepted_tokens"])
+    logger.info("draft tokens                    : %s", stats["spec_num_draft_tokens"])
+    logger.info("verification rounds             : %s", stats["spec_num_forward_ct"])
+    logger.info(
+        "acceptance rate (accepted/draft): %.4f (%.2f%%)",
+        stats["acceptance_rate"],
+        stats["acceptance_rate"] * 100,
+    )
+    logger.info("mean acceptance length         : %.4f", stats["mean_accept_length"])
+    logger.info("%s", "=" * 60)
 
 
 def main(args):
@@ -156,7 +228,7 @@ def main(args):
     # 配置评测任务
     task_config = TaskConfig(
         model=custom_model,
-        datasets=['longbench_v2'],
+        datasets=[args.datasets],
         generation_config={
             "max_tokens": args.max_tokens,
             "batch_size": args.batch_size,
@@ -167,12 +239,35 @@ def main(args):
     )
 
     # 运行评测
+    if args.dataset_local_path:
+        task_config.dataset_args = {args.datasets: {"local_path": args.dataset_local_path}}
+    logger.info("Starting evaluation, datasets=%s", args.datasets)
     run_task(task_cfg=task_config)
+    stats = custom_model.spec_stats.report()
+    if stats["num_requests_with_spec"] > 0:
+        print_spec_report(stats)
+        # run_task updates work_dir to the output directory for this run.
+        report_path = Path(task_config.work_dir) / "spec_stats.json"
+        with report_path.open("w", encoding="utf-8") as report_file:
+            json.dump(stats, report_file, ensure_ascii=False, indent=2)
+        logger.info("Speculative decoding report saved to %s", report_path)
 
 
 if __name__ == '__main__':
     # 1. 定义参数解析器
-    parser = argparse.ArgumentParser(description="运行大模型 LongBench 评测脚本")
+    parser = argparse.ArgumentParser(description="通过在线接口运行大模型 EvalScope 评测")
+    parser.add_argument(
+        "--datasets",
+        type=str,
+        default="longbench_v2",
+        help="EvalScope dataset, e.g. longbench_v2, math_500, humaneval, or mmlu",
+    )
+    parser.add_argument(
+        "--dataset-local-path",
+        type=str,
+        default="",
+        help="Optional local dataset path passed to EvalScope",
+    )
 
     # 模型相关参数
     parser.add_argument("--model-name", type=str, default='Qwen/Qwen3-235B-A22B', help="模型名称")

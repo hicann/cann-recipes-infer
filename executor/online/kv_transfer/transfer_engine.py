@@ -76,6 +76,7 @@ class PrefillServerInfo:
     kv_cache_dtype: Optional[str] = None
     max_prefill_tokens: int = 0
     ranks: dict[str, dict[str, int | str]] = field(default_factory=dict)
+    spec_metadata_layout: dict = field(default_factory=dict)
 
     def __post_init__(self):
         self.attn_tp_size = int(self.attn_tp_size)
@@ -163,7 +164,7 @@ class AscendTransferEngine(TransferEngine):
 
     The key mechanism: prefill uses decode's session_id to RDMA-write KV data
     directly into decode's NPU memory. session_id = "<ip>:<rpc_port>" and is
-    computed from engine.get_rpc_port() after construction.
+    computed from engine.get_rpc_port() after initialization.
     """
 
     def __init__(
@@ -191,9 +192,8 @@ class AscendTransferEngine(TransferEngine):
                 "memfabric_hybrid is required for PD disaggregation"
             ) from exc
         self.engine = MemFabricTransferEngine()
-        rpc_port = self.engine.get_rpc_port()
-        self.session_id = f"{self.hostname}:{rpc_port}"
-        self._rank_port = rpc_port
+        self._rank_port: int = 0
+        self.session_id: str = ""
 
     @property
     def rank_port(self) -> int:
@@ -247,7 +247,7 @@ class AscendTransferEngine(TransferEngine):
         for attempt in range(max_retries):
             ret = self.engine.initialize(
                 self.store_url,
-                self.session_id,
+                f"{self.hostname}:0",
                 role,
                 self.npu_id,
                 trans_op_type,
@@ -265,6 +265,14 @@ class AscendTransferEngine(TransferEngine):
                 f"Ascend transfer engine init returned {ret} "
                 f"(store_url={self.store_url}). Check DisaggConfig.store_url."
             )
+
+        rpc_port = int(self.engine.get_rpc_port())
+        if not 0 < rpc_port < 65536:
+            raise RuntimeError(
+                f"MemFabric returned invalid RPC port after initialization: {rpc_port}"
+            )
+        self._rank_port = rpc_port
+        self.session_id = f"{self.hostname}:{rpc_port}"
 
     def batch_register(self, ptrs: Iterable[int], lengths: Iterable[int]) -> None:
         self.engine.batch_register_memory(list(ptrs), list(lengths))

@@ -16,7 +16,7 @@
 """Common contract and lifecycle for speculative decoding workers."""
 
 from abc import ABC, abstractmethod
-from typing import ClassVar, Dict, Optional, Type
+from typing import TYPE_CHECKING, ClassVar, Dict, Optional, Type
 
 import torch
 
@@ -24,6 +24,10 @@ from executor.core.config import InferenceConfig
 from executor.core.model_worker.model_worker import ModelWorker
 from executor.utils.forward_metadata import get_forward_metadata
 from ..forward_data_info import BaseSpeculativeInfo, Batch
+
+
+if TYPE_CHECKING:
+    from executor.online.kv_transfer.buffer import SpeculativeMetadataCodec
 
 
 class BaseSpeculativeWorker(ABC):
@@ -36,6 +40,8 @@ class BaseSpeculativeWorker(ABC):
 
     method: ClassVar[str]
     state_cls: ClassVar[Type[BaseSpeculativeInfo]]
+    pd_require_matching_parallelism: ClassVar[bool] = False
+    pd_preserve_prefill_cache: ClassVar[bool] = False
 
     def __init__(
         self,
@@ -61,6 +67,14 @@ class BaseSpeculativeWorker(ABC):
     def prefill_lookahead_tokens(self) -> int:
         """Extra cache slots required while the target prefill is scheduled."""
         return 0
+
+    def build_pd_metadata(self) -> Optional["SpeculativeMetadataCodec"]:
+        """Optional proposal payload appended to the legacy PD metadata header."""
+        return None
+
+    def on_pd_restore(self, request) -> None:
+        """Prepare a transferred request before its first decode step."""
+        pass
 
     @staticmethod
     def _pad_seq_len_to_size(

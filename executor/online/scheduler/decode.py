@@ -116,8 +116,16 @@ class DecodeDisaggScheduler(Scheduler):
         Finished/failed requests are recorded in finished_requests; dispatch
         iterates that dict directly, so nothing is returned here.
         """
-        self.prealloc_queue.pop_preallocated(next_n=engine.next_n)
-        ready = self.transfer_queue.pop_transferred()
+        draft_worker = engine.draft_worker
+        self.prealloc_queue.pop_preallocated(
+            next_n=engine.next_n,
+            preserve_prefill_cache=(
+                draft_worker.pd_preserve_prefill_cache if draft_worker is not None else False
+            ),
+        )
+        ready = self.transfer_queue.pop_transferred(
+            on_pd_restore=draft_worker.on_pd_restore if draft_worker is not None else None,
+        )
         failed = list(self.transfer_queue.terminal_failed)
         self.transfer_queue.terminal_failed.clear()
         for decode_req in ready:

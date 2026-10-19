@@ -239,7 +239,12 @@ class PrefillDisaggScheduler(Scheduler):
             "output_id": request.output_id_list[-1] if request.output_id_list else 0,
             "kv_len": request.computed_len,
         }
-        if request.mtp_info is not None and request.mtp_info.spec_tokens is not None:
+        if self.kv_transfer_manager.speculative_metadata is not None:
+            # Release batch views and hand a completed snapshot to the transfer thread.
+            state = request.draft_info.snapshot()
+            request.update_draft_info(state)
+            meta["draft_info"] = state
+        elif request.mtp_info is not None and request.mtp_info.spec_tokens is not None:
             meta["mtp_spec_tokens"] = request.mtp_info.spec_tokens.cpu().tolist()
         return meta
 

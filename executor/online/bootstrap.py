@@ -42,6 +42,7 @@ class BootstrapState:
     attn_cp_size: int = field(init=False)
     attn_dp_size: int = field(init=False)
     block_sizes: list[int] = field(default_factory=list)
+    spec_metadata_layout: dict = field(default_factory=dict)
     kv_cache_dtype: str = field(init=False, default="bfloat16")
     max_prefill_tokens: int = field(init=False, default=0)
     rank_table: Dict[Tuple[int, int, int], Dict[str, int | str]] = field(
@@ -103,7 +104,14 @@ def init_bootstrap(app: FastAPI, yaml_dict: dict) -> BootstrapState:
             state.max_prefill_tokens = int(payload.get("max_prefill_tokens", state.max_prefill_tokens))
         except (TypeError, ValueError) as exc:
             raise HTTPException(status_code=400, detail="Invalid max_prefill_tokens") from exc
+        # Codecs define the layout; bootstrap only checks agreement across ranks.
+        spec_metadata_layout = payload.get("spec_metadata_layout", {})
+        if not isinstance(spec_metadata_layout, dict):
+            raise HTTPException(status_code=400, detail="Invalid spec_metadata_layout")
         async with state.lock:
+            if state.rank_table and spec_metadata_layout != state.spec_metadata_layout:
+                raise HTTPException(status_code=400, detail="Inconsistent metadata layout across ranks")
+            state.spec_metadata_layout = spec_metadata_layout
             state.rank_table[(dp, cp, tp)] = {"rank_ip": ip, "rank_port": port}
             size = len(state.rank_table)
         logger.info(
@@ -124,6 +132,7 @@ def init_bootstrap(app: FastAPI, yaml_dict: dict) -> BootstrapState:
                 "block_sizes": list(state.block_sizes),
                 "kv_cache_dtype": state.kv_cache_dtype,
                 "max_prefill_tokens": state.max_prefill_tokens,
+                "spec_metadata_layout": state.spec_metadata_layout,
                 "ranks": {
                     f"{dp},{cp},{tp}": endpoint
                     for (dp, cp, tp), endpoint in state.rank_table.items()

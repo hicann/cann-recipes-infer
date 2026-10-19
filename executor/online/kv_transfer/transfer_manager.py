@@ -49,7 +49,7 @@ from executor.online.kv_transfer.transfer_engine import (
     _KVTransferTask,
     build_transfer_engine,
 )
-from executor.online.kv_transfer.buffer import MetadataBufferPool
+from executor.online.kv_transfer.buffer import MetadataBufferPool, SpeculativeMetadataCodec
 
 try:
     import zmq
@@ -86,6 +86,8 @@ class KVTransferManager:
         waiting_timeout: float = 60.0,
         heartbeat_interval: float = 5.0,
         heartbeat_max_failures: int = 3,
+        speculative_metadata: Optional[SpeculativeMetadataCodec] = None,
+        require_matching_parallelism: bool = False,
     ):
         engine_backend = getattr(disagg_config, "engine_backend", "memfabric")
         if engine_backend == "memfabric" and not disagg_config.store_url:
@@ -114,6 +116,8 @@ class KVTransferManager:
         # RDMA-writes into. PREFILL passes None: its RDMA source is the
         # per-thread _metadata_scratch pool allocated in _start_listener_thread.
         self.metadata_pool = metadata_pool
+        self.speculative_metadata = speculative_metadata
+        self.require_matching_parallelism = require_matching_parallelism
         self.state_lock = threading.RLock()
         self._running = threading.Event()
         self._running.set()
@@ -204,7 +208,9 @@ class KVTransferManager:
                 max_workers=n_threads, thread_name_prefix="kv-transfer"
             )
             # Scratch metadata buffer: one slot per transfer thread.
-            self._metadata_scratch = MetadataBufferPool(capacity=n_threads)
+            self._metadata_scratch = MetadataBufferPool(
+                capacity=n_threads, speculative_metadata=self.speculative_metadata
+            )
         elif disaggregation_mode == "DECODE":
             t = threading.Thread(target=self._decode_listener_loop, daemon=True)
             t.start()
@@ -533,6 +539,8 @@ class KVTransferManager:
                 "transfer_info missing metadata_slot_ptr/size; skipping metadata write"
             )
             return
+        if int(slot_size) != scratch.slot_size:
+            raise ValueError(f"Metadata slot size mismatch: local={scratch.slot_size}, remote={slot_size}")
         scratch_idx = scratch.alloc()
         try:
             scratch.write(scratch_idx, metadata)
@@ -703,6 +711,16 @@ class KVTransferManager:
         return True
 
     def validate_prefill_info(self, info: PrefillServerInfo) -> None:
+        spec_metadata_layout = self.speculative_metadata.layout if self.speculative_metadata is not None else {}
+        if info.spec_metadata_layout != spec_metadata_layout:
+            raise ValueError(
+                "Speculative metadata layout mismatch: "
+                f"decode={spec_metadata_layout}, prefill={info.spec_metadata_layout}"
+            )
+        if self.require_matching_parallelism and (
+            info.attn_tp_size != self.attn_tp_size or info.attn_cp_size != self.attn_cp_size
+        ):
+            raise ValueError("PD requires matching attention TP and CP sizes on both sides")
         if info.block_sizes is not None and self.kv_block_sizes:
             if list(info.block_sizes) != self.kv_block_sizes:
                 raise ValueError(
@@ -851,6 +869,7 @@ class KVTransferManager:
             "block_sizes": list(self.kv_block_sizes),
             "kv_cache_dtype": self.kv_cache_dtype,
             "max_prefill_tokens": self.max_prefill_tokens,
+            "spec_metadata_layout": self.speculative_metadata.layout if self.speculative_metadata is not None else {},
         }
         max_attempts = 10
         last_exc: Exception | None = None

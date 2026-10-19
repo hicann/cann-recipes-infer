@@ -606,15 +606,6 @@ class InferenceConfig:
             disagg_config=disagg_config or DisaggConfig(),
         )
 
-        if (
-            speculative_config.uses_method("dspark")
-            and infer_config.disagg_config.disaggregation_mode in ("PREFILL", "DECODE")
-        ):
-            raise ValueError(
-                "DSpark does not support prefill/decode disaggregation; "
-                "set disaggregation_mode to NONE."
-            )
-
         attn_dp_size = infer_config.parallel_config.attn_dp_size
         if infer_config.model_config.custom_params.get("enable_afd", False):
             attn_dp_size = infer_config._update_afd_parallel_config()

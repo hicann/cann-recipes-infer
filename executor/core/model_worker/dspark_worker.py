@@ -18,6 +18,7 @@
 
 """DSpark speculative draft-model worker."""
 
+import hashlib
 from typing import Dict, Optional, Tuple
 
 import torch
@@ -27,10 +28,70 @@ from executor.core.model_worker.model_worker import ModelWorker
 from executor.utils.forward_metadata import get_forward_metadata
 from .base_speculative_worker import BaseSpeculativeWorker
 from ..engine.sampler import Sampler, SpeculativeRejectionSampler
-from ..forward_data_info import Batch, DSparkInfo
+from ..forward_data_info import BaseSpeculativeInfo, Batch, DSparkInfo
 
 
 SAMPLING_EPS = 1e-5
+
+
+TOKEN_DTYPE = torch.int64
+PROB_DTYPE = torch.float32
+TOKEN_SIZE = torch.empty((), dtype=TOKEN_DTYPE).element_size()
+PROB_SIZE = torch.empty((), dtype=PROB_DTYPE).element_size()
+
+
+class DSparkMetadata:
+    def __init__(self, draft_len: int, vocab_size: int):
+        self.shape = (draft_len, vocab_size)
+        if any(type(size) is not int or size <= 0 for size in self.shape):
+            raise ValueError("DSpark metadata requires positive draft and vocabulary sizes together")
+        self.alignment = TOKEN_SIZE
+        self.payload_size = (draft_len + 1) * TOKEN_SIZE + draft_len * vocab_size * PROB_SIZE
+        self.layout = {
+            "format": "dspark_v1",
+            "alignment": self.alignment,
+            "tensors": [
+                {"name": "spec_tokens", "dtype": str(TOKEN_DTYPE), "shape": [draft_len]},
+                {"name": "proposal_lens", "dtype": str(TOKEN_DTYPE), "shape": []},
+                {"name": "draft_probs", "dtype": str(PROB_DTYPE), "shape": [draft_len, vocab_size]},
+            ],
+        }
+
+    def read(self, buffer: torch.Tensor) -> DSparkInfo:
+        tokens, length, probs = self._views(buffer)
+        # The slot is returned to the pool immediately after request restore.
+        return DSparkInfo(
+            spec_tokens=tokens.clone(),
+            proposal_lens=length.clone(),
+            draft_probs=probs.clone(),
+            # Keep stack-compatible state when new arrivals join running
+            # requests. The next target verification overwrites this value.
+            accepted_num=length.new_zeros(()),
+        )
+
+    def write(self, buffer: torch.Tensor, state: BaseSpeculativeInfo | None) -> None:
+        if not isinstance(state, DSparkInfo):
+            raise ValueError("DSpark metadata state does not match the registered slot layout")
+        tokens, length, probs = self._views(buffer)
+        if any(value is None for value in (state.spec_tokens, state.draft_probs, state.proposal_lens)):
+            raise ValueError("Incomplete or mismatched DSpark proposal metadata")
+        if (
+            state.spec_tokens.shape != tokens.shape
+            or state.draft_probs.shape != self.shape
+            or state.proposal_lens.numel() != 1
+        ):
+            raise ValueError("Incomplete or mismatched DSpark proposal metadata")
+        tokens.copy_(state.spec_tokens)
+        length.copy_(state.proposal_lens.reshape(()))
+        probs.copy_(state.draft_probs)
+
+    def _views(self, buffer: torch.Tensor):
+        draft_len, vocab_size = self.shape
+        token_bytes = draft_len * TOKEN_SIZE
+        tokens = buffer[:token_bytes].view(TOKEN_DTYPE)
+        length = buffer[token_bytes:token_bytes + TOKEN_SIZE].view(TOKEN_DTYPE).reshape(())
+        probs = buffer[token_bytes + TOKEN_SIZE:self.payload_size].view(PROB_DTYPE)
+        return tokens, length, probs.view(draft_len, vocab_size)
 
 
 class DSparkWorker(BaseSpeculativeWorker):
@@ -46,6 +107,8 @@ class DSparkWorker(BaseSpeculativeWorker):
 
     method = "dspark"
     state_cls = DSparkInfo
+    pd_require_matching_parallelism = True
+    pd_preserve_prefill_cache = True
 
     def __init__(
         self,
@@ -73,6 +136,18 @@ class DSparkWorker(BaseSpeculativeWorker):
     def prefill_lookahead_tokens(self) -> int:
         # Reserve space for the first proposal immediately after target prefill.
         return self.next_n
+
+    def build_pd_metadata(self) -> DSparkMetadata:
+        return DSparkMetadata(self.next_n, self.model.config.vocab_size)
+
+    def on_pd_restore(self, request) -> None:
+        generator = request.generator
+        if isinstance(request.draft_info, DSparkInfo) and generator is not None:
+            # P already consumed this request's seed. D needs a distinct,
+            # reproducible stream for verification, not the same draws again.
+            seed_bytes = f"dspark-decode:{generator.initial_seed()}".encode("ascii")
+            decode_seed = hashlib.blake2b(seed_bytes, digest_size=8).digest()
+            generator.manual_seed(int.from_bytes(decode_seed, "little"))
 
     def configure_main_model(self, main_model):
         configure_layers = getattr(main_model, "set_auxiliary_hidden_layers", None)
@@ -222,6 +297,13 @@ class DSparkWorker(BaseSpeculativeWorker):
         """Verify stochastic DSpark proposals while preserving the target distribution."""
         batch_size = batch.input_ids.shape[0]
         draft_len = spec_tokens.shape[-1]
+
+        if batch.is_dummy:
+            # Idle DP ranks have no proposal distribution, but must still run
+            # target and draft forwards to match the active ranks' collectives.
+            accepted_num = spec_tokens.new_zeros(batch_size, dtype=torch.int64)
+            proposal_lens = torch.zeros_like(accepted_num)
+            return accepted_num, main_next_tokens, proposal_lens
 
         state = batch.draft_info
         proposal_lens = self._get_proposal_lens(

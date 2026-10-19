@@ -283,13 +283,14 @@ LongBench 为长上下文测评任务，根据 LongBench 论文及其代码仓�
 相关脚本位于：
 
 ```text
-benchmark/evalscope_scripts/eval_longbench.py
+benchmark/evalscope_scripts/eval_online.py
 ```
 
-执行方式如下：
+在 `benchmark/evalscope_scripts/` 目录下执行：
 
 ```bash
-python eval_longbench.py \
+python eval_online.py \
+    --datasets longbench_v2 \
     --model-name Qwen/Qwen3-235B-A22B \
     --base-url http://localhost:8000/v1/chat/completions \
     --model-path /data/models/Qwen3-235B-A22B \
@@ -297,6 +298,39 @@ python eval_longbench.py \
     --max-tokens 8192 \
     --limit 10 # 正式评测时请删除该参数
 ```
+
+该脚本也可通过 `--datasets` 选择其他 EvalScope 数据集，例如 `math_500`、`mmlu`；每次运行选择一个数据集，默认是 `longbench_v2`。如需使用本地数据集，可通过 `--dataset-local-path` 指定对应数据集适配器支持的本地路径。
+
+### 1.3 投机推理接受率统计与自动保存
+
+`eval_online.py` 支持在评测结束后汇总投机推理统计。服务端需启用投机推理（`speculative_config.num_speculative_tokens > 0`），且 `/v1/chat/completions` 响应的 `usage` 中包含 `spec_num_accepted_tokens`、`spec_num_draft_tokens` 和 `spec_num_forward_ct`。
+
+例如，在 `benchmark/evalscope_scripts/` 目录下运行 MATH-500 评测，将 `--model-path` 替换为实际部署的 DeepSeek-V4 主模型路径：
+
+```bash
+python eval_online.py \
+    --datasets math_500 \
+    --model-name deepseek_V4 \
+    --base-url http://localhost:8000/v1/chat/completions \
+    --model-path /data/models/deepseek_v4_model \
+    --max-tokens 8192 \
+    --batch-size 2 \
+    --limit 10 # 正式评测时请删除该参数
+```
+
+脚本根据本次运行收到的响应先累加原始计数，再计算总体指标，不直接平均各请求的接受率：
+
+| 报告字段 | 含义 |
+| --- | --- |
+| `num_requests_total` | 本次脚本调用中完成响应解析并进入统计的请求数 |
+| `num_requests_with_spec` | 响应 `usage` 包含 `spec_num_accepted_tokens` 的请求数 |
+| `spec_num_accepted_tokens` | 累计接受的 draft token 数 |
+| `spec_num_draft_tokens` | 累计参与验证的有效 draft token 数 |
+| `spec_num_forward_ct` | 累计投机验证轮数 |
+| `acceptance_rate` | 累计接受 token 数 / 累计 draft token 数；分母为零时为 `0.0` |
+| `mean_accept_length` | 每轮投机验证平均产生的 token 数，包括接受的 draft token 和主模型补充的一个 token |
+
+评测结束后，若响应包含投机统计字段，脚本会打印统计摘要，并自动保存到本次 EvalScope 输出目录下的 `spec_stats.json`；无投机统计字段时不打印、不生成文件。
 
 ---
 
