@@ -565,6 +565,11 @@ class DSparkWorker(BaseSpeculativeWorker):
         seq_lens = batch.seq_lens.to(device=self.device, dtype=torch.long)
         target_hidden_states = target_hidden_states.to(self.device).view(-1, target_hidden_states.shape[-1])
         cp_metadata = getattr(model_inputs_main.get("forward_metadata"), "cp_metadata", None)
+        if getattr(self.main_model.model, "enable_ced_prefill_tail", False):
+            # CED hands over the packed tail window (last sliding_window tokens per
+            # request) for both non-CP and CP; the packed rows are re-grouped by
+            # per-request tail length.
+            return self._build_prefill_proposal_tails_packed(input_ids, seq_lens, target_hidden_states)
         if cp_metadata is not None and cp_metadata.enabled:
             # Prefill CP splits the prompt across ranks, so the main model hands over only the
             # sliding window each request ends with. Everything else follows that tail.
@@ -600,6 +605,37 @@ class DSparkWorker(BaseSpeculativeWorker):
         return (
             self._pack_prefill_to_dense(torch.cat(id_tails, dim=0), tail_lens),
             self._pack_prefill_to_dense(target_hidden_states, tail_lens),
+            self._pack_prefill_to_dense(torch.cat(position_tails, dim=0), tail_lens, pad_value=-1),
+        )
+
+    def _build_prefill_proposal_tails_packed(
+        self,
+        input_ids: torch.Tensor,
+        seq_lens: torch.Tensor,
+        target_hidden_states: torch.Tensor,
+    ):
+        """Assemble proposal inputs from the CED packed tail.
+
+        Prefill CP hands over a window-padded ``[bsz * window, H]`` tail, while CED
+        hands over a packed ``[sum(min(l, window)), H]`` tail in request order. Both
+        slice the same per-request trailing window; only the hidden-state layout
+        differs, so the packed rows are re-grouped by ``tail_lens`` here.
+        """
+        window = self.main_model.model.ced_tail_len
+        tail_lens = seq_lens.clamp(max=window)
+        input_ids = input_ids.view(-1)
+        id_tails, position_tails, hidden_tails = [], [], []
+        id_start, hidden_start = 0, 0
+        for seq_len, tail_len in zip(seq_lens.tolist(), tail_lens.tolist()):
+            id_tails.append(input_ids[id_start + seq_len - tail_len:id_start + seq_len])
+            position_tails.append(torch.arange(
+                seq_len - tail_len, seq_len, device=self.device, dtype=torch.long))
+            hidden_tails.append(target_hidden_states[hidden_start:hidden_start + tail_len])
+            id_start += seq_len
+            hidden_start += tail_len
+        return (
+            self._pack_prefill_to_dense(torch.cat(id_tails, dim=0), tail_lens),
+            self._pack_prefill_to_dense(torch.cat(hidden_tails, dim=0), tail_lens),
             self._pack_prefill_to_dense(torch.cat(position_tails, dim=0), tail_lens, pad_value=-1),
         )
 

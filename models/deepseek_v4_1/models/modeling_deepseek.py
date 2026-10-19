@@ -106,7 +106,6 @@ class KVCache:
         self.source_layer = source_layer
         self.is_source = source_layer is not None and layer_idx == source_layer
         self.shared_idx = None
-        self.candidates = None
         self.cmp_cache = None
         self.indexer_cache = None
         self.indexer_cache_scale = None
@@ -948,6 +947,7 @@ class Attention(nn.Module):
 
         self.is_kv_source = layer_idx in config.kv_source_layers
         self.is_index_source = layer_idx in config.index_source_layers
+        self.ced_boundary = config.kv_source_layers[-1] if config.kv_source_layers else -1
         if self.low_latency_tp and self.compress_ratio > 0 and not self.is_mla_rank and self.is_kv_source:
             self.compressor_stream = kwargs["separate_mla_compressor_stream"]
         runs_mla = self.is_mla_rank
@@ -1052,7 +1052,8 @@ class Attention(nn.Module):
         return x
 
     def compute_win_cache(self, x: torch.Tensor, kv_cache: KVCache, attn_metadata):
-        if attn_metadata["is_prefill"] and self.cp_size > 1:
+        is_ced_prefill_tail = attn_metadata.get("is_ced_prefill_tail", False)
+        if attn_metadata["is_prefill"] and self.cp_size > 1 and not is_ced_prefill_tail:
             return self.compute_win_cache_cp(x, kv_cache, attn_metadata)
         # The recipe Linear modules handle their own weight/activation quantization.
         # Keep normalized qr in BF16 for the Indexer; quantize KV only when writing cache.
@@ -1062,9 +1063,16 @@ class Attention(nn.Module):
         q = self.apply_rope(q, attn_metadata)
         kv = self.apply_rope(kv, attn_metadata)
 
+        if is_ced_prefill_tail and self.cp_size > 1:
+            # CP tail only when layer_idx > ced_boundary: update win cache for prefill attn; update win kv for decode
+            win_kv = attn_metadata["full_kv_cache"]
+            self.update_win_kv(kv, attn_metadata["cache_slot_mapping"]["full_kv"], win_kv)
+            self.update_decode_win_kv_tail(kv, attn_metadata, kv_cache)
+            return win_kv, qr, q
+
         self.update_win_kv(kv, attn_metadata["cache_slot_mapping"]["win_kv"], kv_cache.win_kv)
         win_kv = kv_cache.win_kv
-        if attn_metadata["is_prefill"]:
+        if attn_metadata["is_prefill"] and not is_ced_prefill_tail:
             # The persistent SWA pages only retain the tail; early prefill queries
             # need the full current prompt. This temporary buffer is reused by layers.
             win_kv = attn_metadata["full_kv_cache"]
@@ -1132,6 +1140,18 @@ class Attention(nn.Module):
             slots.append(win_slots[request * self.window_size:(request + 1) * self.window_size])
         scatter_cache_rows(kv_cache.win_kv, torch.cat(slots, dim=0), torch.cat(last_wins, dim=0))
 
+    def update_decode_win_kv_tail(self, kv, attn_metadata, kv_cache: KVCache):
+        """Write requests' CED tail window into the persistent decode win_kv.
+        KV is in TND format without padding on request.
+        """
+        cp_metadata = attn_metadata["cp_metadata"]
+        if not has_cp_decode_requests(cp_metadata):
+            return
+        win_slots = cp_metadata["slot_mapping_last_win"]
+        rows = kv.index_select(0, attn_metadata["ced_tail_decode_row_idx"])
+        slots = win_slots.index_select(0, attn_metadata["ced_tail_decode_slot_idx"])
+        self.update_win_kv(rows, slots, kv_cache.win_kv)
+
     def update_win_kv(self, kv, slot_mapping, cache):
         torch.ops.custom.kv_compress_epilog_v2(
             cache=cache.view(-1, cache.shape[-1]),
@@ -1177,7 +1197,14 @@ class Attention(nn.Module):
     ):
         # V4.1 ratio 0 is window-only; ratio 1 still has indexed shared KV.
         has_cmp_kv = self.compress_ratio > 0
-        win_key = "full_kv" if is_prefill else "win_kv"
+        is_ced_prefill_tail = attn_metadata.get("is_ced_prefill_tail", False)
+        if is_ced_prefill_tail:
+            # CP scatters KV across ranks, so the tail window is gathered into a per-rank
+            # scratch buffer (full_kv); non-CP already has it in the persistent win_kv.
+            win_key = "full_kv" if self.cp_size > 1 else "win_kv"
+        else:
+            win_key = "full_kv" if is_prefill else "win_kv"
+
         attn_kwargs = {
             "q": q,
             "ori_kv": win_kv.view(torch.uint8),
@@ -1211,7 +1238,7 @@ class Attention(nn.Module):
         return attn_kwargs
 
     def sparse_attn(self, q, win_kv, cmp_kv, cmp_sparse_indices, attn_metadata, is_prefill):
-        if is_prefill and self.cp_size > 1:
+        if is_prefill and self.cp_size > 1 and not attn_metadata.get("is_ced_prefill_tail", False):
             if self.layer_idx == 0:
                 wait_event(self.enable_multi_streams, attn_metadata["metadata_event"], 1)
             # The two zigzag segments see different causal ranges, so each runs with its own metadata.
@@ -1227,7 +1254,8 @@ class Attention(nn.Module):
             output = torch.cat([o_prev, o_next], dim=0)
             return self.select_local_attn_heads(output)
         fa_kwargs = self.prepare_fa_kwargs(q, win_kv, cmp_kv, cmp_sparse_indices, attn_metadata, is_prefill)
-        if self.layer_idx == 0:
+        is_ced_prefill_tail = attn_metadata.get("is_ced_prefill_tail", False)
+        if self.layer_idx == 0 or (is_ced_prefill_tail and self.layer_idx == self.ced_boundary + 1):
             wait_event(self.enable_multi_streams, attn_metadata["metadata_event"], 1)
         return self.select_local_attn_heads(self.sparse_attn_ops(**fa_kwargs)[0])
 
@@ -1485,10 +1513,12 @@ class Attention(nn.Module):
         if self.low_latency_tp and self.compress_ratio > 0:
             return self.forward_separate_mla(x, attn_metadata, is_prefill, kv_cache)
         win_kv, qr, q = self.compute_win_cache(x, kv_cache, attn_metadata)
-        if is_prefill:
-            block_table = attn_metadata["block_table"]["full_kv"]
+        is_ced_prefill_tail = attn_metadata.get("is_ced_prefill_tail", False)
+        if is_ced_prefill_tail:
+            win_key = "full_kv" if self.cp_size > 1 else "win_kv"
         else:
-            block_table = attn_metadata["block_table"]["win_kv"]
+            win_key = "full_kv" if is_prefill else "win_kv"
+        block_table = attn_metadata["block_table"][win_key]
         offset = block_table.numel() * win_kv.shape[1]
         compress_kv, compress_idxs = None, None
         if self.compress_ratio > 0:
@@ -1743,6 +1773,12 @@ class DeepseekV41Model(DeepseekV41PreTrainedModel):
         self.hc_mult = config.hc_mult
         self.norm_eps = config.rms_norm_eps
 
+        # CED prefill tail (SWA Bounded Replay): for layers > kv_source[-1] (the decoder half),
+        # prefill recomputes only the last sliding_window tokens
+        self.enable_ced_prefill_tail = bool(custom_params.get("enable_ced_prefill_tail", False))
+        self.ced_boundary = self.kv_source_layers[-1] if self.kv_source_layers else -1
+        self.ced_tail_len = config.sliding_window
+
         self.gradient_checkpointing = False
         # Initialize weights and apply final processing
         self.post_init()
@@ -1797,7 +1833,6 @@ class DeepseekV41Model(DeepseekV41PreTrainedModel):
         }
 
         self.shared_idx = None
-        self.candidates = None
 
         self.head_dim = self.config.head_dim
         self.indexer_head_dim = self.config.index_head_dim
@@ -2030,9 +2065,11 @@ class DeepseekV41Model(DeepseekV41PreTrainedModel):
         cos_sin.update({
             "comp": self.compress_rotary_emb(
                 hidden_states, position_ids, kv_len, self.max_position_embeddings),
-            "c2a": self.compress_rotary_emb(
-                hidden_states, position_ids_c["2"], kv_len, self.max_position_embeddings),
         })
+        # The ratio-2 compressor is only used in prefill encoder part and decode stage
+        if not attn_metadata.get("is_ced_prefill_tail", False):
+            cos_sin["c2a"] = self.compress_rotary_emb(
+                hidden_states, position_ids_c["2"], kv_len, self.max_position_embeddings)
         cos_sin.update({"comp_neg_sin": -cos_sin["comp"][1]})
         cos_sin["c1a"] = cos_sin["comp"]
         return cos_sin
@@ -2184,7 +2221,6 @@ class DeepseekV41Model(DeepseekV41PreTrainedModel):
 
         kv_cache = self.kv_cache_by_layer[layer_idx]
         kv_cache.shared_idx = self.shared_idx
-        kv_cache.candidates = self.candidates
         hidden_states, pre_mix = decoder_layer(
             hidden_states,
             pre_mix,
@@ -2201,7 +2237,6 @@ class DeepseekV41Model(DeepseekV41PreTrainedModel):
             engram_resource_events=resource_events,
         )
         self.shared_idx = kv_cache.shared_idx
-        self.candidates = kv_cache.candidates
 
         early = self.engram_layer_ids[0] if self.engram_layer_ids else None
 
@@ -2234,6 +2269,123 @@ class DeepseekV41Model(DeepseekV41PreTrainedModel):
                 pending_engram[self.engram_layer_ids[-1]] = late_result
 
         return hidden_states, pre_mix
+
+    def gather_cp_tail(self, tensor, attn_metadata):
+        """Gather the last window of every request to all ranks, padded to the window.
+
+        Accepts any per-token tensor; the non-token dims are flattened for the gather
+        and restored afterwards. Returns ``[bsz * window, *tensor.shape[1:]]``.
+        """
+        cp_metadata = attn_metadata["cp_metadata"]
+        window = self.window_size
+        segment_lens = cp_metadata["segment_lens"]
+        rest = tensor.shape[1:]
+        flat = tensor.reshape(tensor.shape[0], -1)
+        row_dim = flat.shape[-1]
+        tails, offset = [], 0
+        for zigzag_flag in ("prev", "next"):
+            for segment_len, cur_kv_len in zip(segment_lens, attn_metadata[zigzag_flag]["cur_kv_len"]):
+                rows = flat[offset:offset + cur_kv_len][-window:]
+                tails.append(F.pad(rows, (0, 0, 0, window - rows.shape[0])))
+                offset += segment_len
+        all_tails = gather_cp_segments(
+            torch.cat(tails, dim=0), cp_metadata, self.comm_manager.get_group("cp_group"))
+        all_tails = all_tails.view(-1, len(segment_lens), window, row_dim)
+        picked = [
+            pick_request_tail(all_tails, cp_metadata, request, window)
+            for request in range(len(segment_lens))
+        ]
+        return torch.cat(picked, dim=0).view(-1, *rest)
+
+    def _prepare_ced_tail(self, hidden_states, pre_mix, attn_metadata, input_ids,
+                          image_mask, cur_topk_list, is_prefill):
+        """Slice per-token state to the tail window and switch to the tail metadata.
+
+        The decoder half only replays the last ``ced_tail_len`` tokens (SWA Bounded
+        Replay), and the boundary source layer's top-k indices cover the full
+        sequence, so both are narrowed to the tail rows here. Returns the decoder-half
+        state together with the tail ``attn_metadata`` and the recomputed MoE chunk
+        count.
+        """
+        tail_attn_metadata = attn_metadata["ced_tail_metadata"]
+        if self.cp_size > 1:
+            return self._prepare_ced_tail_cp(
+                hidden_states, pre_mix, attn_metadata, input_ids,
+                image_mask, cur_topk_list, tail_attn_metadata, is_prefill)
+        tail_idx = tail_attn_metadata["ced_tail_idx"]
+
+        hidden_states = hidden_states.index_select(0, tail_idx)
+        pre_mix = pre_mix.index_select(0, tail_idx)
+        input_ids = input_ids.index_select(0, tail_idx)
+        image_mask = image_mask.index_select(0, tail_idx) if image_mask is not None else None
+        cur_topk_list = cur_topk_list.index_select(0, tail_idx) if cur_topk_list is not None else None
+
+        if self.shared_idx is not None:
+            self.shared_idx = self.shared_idx.index_select(0, tail_idx)
+        li_candidates = attn_metadata["li_candidates"]
+        tail_attn_metadata["li_candidates"] = li_candidates.index_select(0, tail_idx)
+        tail_attn_metadata["li_candidate_lengths"] = (
+            attn_metadata["li_candidate_lengths"].index_select(0, tail_idx))
+
+        tail_attn_metadata["cos_sin"] = self.generate_cos_sin(tail_attn_metadata, hidden_states)
+        tail_attn_metadata["oproj_max_tokens"] = self.get_prefill_oproj_max_tokens(
+            hidden_states, is_prefill)
+        prefill_moe_global_chunks = self.get_prefill_moe_global_chunks(hidden_states, is_prefill)
+        return (hidden_states, pre_mix, input_ids, image_mask, cur_topk_list,
+                tail_attn_metadata, prefill_moe_global_chunks)
+
+    def _prepare_ced_tail_cp(self, hidden_states, pre_mix, attn_metadata, input_ids,
+                             image_mask, cur_topk_list, tail_attn_metadata, is_prefill):
+        """CP variant: gather the tail window to every rank, then unpad to packed rows."""
+        hidden_states = self.gather_cp_tail(hidden_states, attn_metadata)
+        pre_mix = self.gather_cp_tail(pre_mix, attn_metadata)
+        input_ids = self.gather_cp_tail(input_ids.unsqueeze(-1), attn_metadata).squeeze(-1)
+        image_mask = self.gather_cp_tail(
+            image_mask.unsqueeze(-1), attn_metadata).squeeze(-1) if image_mask is not None else None
+        cur_topk_list = self.gather_cp_tail(cur_topk_list, attn_metadata) if cur_topk_list is not None else None
+        if self.shared_idx is not None:
+            self.shared_idx = self.gather_cp_tail(self.shared_idx, attn_metadata)
+        li_candidates = attn_metadata["prev"].get("li_candidates")
+        if li_candidates is not None:
+            li_candidates = self.gather_cp_tail(
+                torch.cat([li_candidates, attn_metadata["next"]["li_candidates"]], dim=0),
+                attn_metadata)
+            li_candidate_lengths = self.gather_cp_tail(
+                torch.cat([attn_metadata["prev"]["li_candidate_lengths"],
+                           attn_metadata["next"]["li_candidate_lengths"]], dim=0),
+                attn_metadata)
+        else:
+            li_candidate_lengths = None
+
+        # Unpad the window-padded gather to packed tail rows.
+        tail_lens = tail_attn_metadata["actual_seq_q"].long()
+        window = self.window_size
+        device = hidden_states.device
+        tail_idx = torch.cat(
+            [
+                torch.arange(r * window, r * window + tail_lens[r], device=device)
+                for r in range(tail_lens.numel())
+            ],
+            dim=0,
+        )
+        hidden_states = hidden_states.index_select(0, tail_idx)
+        pre_mix = pre_mix.index_select(0, tail_idx)
+        input_ids = input_ids.index_select(0, tail_idx)
+        image_mask = image_mask.index_select(0, tail_idx) if image_mask is not None else None
+        cur_topk_list = cur_topk_list.index_select(0, tail_idx) if cur_topk_list is not None else None
+        if self.shared_idx is not None:
+            self.shared_idx = self.shared_idx.index_select(0, tail_idx)
+        if li_candidates is not None:
+            tail_attn_metadata["li_candidates"] = li_candidates.index_select(0, tail_idx)
+            tail_attn_metadata["li_candidate_lengths"] = (
+                li_candidate_lengths.index_select(0, tail_idx))
+
+        tail_attn_metadata["cos_sin"] = self.generate_cos_sin(tail_attn_metadata, hidden_states)
+        tail_attn_metadata["oproj_max_tokens"] = self.get_prefill_oproj_max_tokens(
+            hidden_states, is_prefill)
+        prefill_moe_global_chunks = self.get_prefill_moe_global_chunks(hidden_states, is_prefill)
+        return (hidden_states, pre_mix, input_ids, image_mask, cur_topk_list,
+                tail_attn_metadata, prefill_moe_global_chunks)
 
     @add_start_docstrings_to_model_forward(DEEPSEEKV41_INPUTS_DOCSTRING)
     def forward(
@@ -2302,6 +2454,14 @@ class DeepseekV41Model(DeepseekV41PreTrainedModel):
                 ngram_shift_mask=ngram_shift_mask)
 
         for layer_idx, decoder_layer in enumerate(self.layers):
+            # if enable ced in prefill, cutoff input ids after the boundary layer to run only swa cache
+            if (is_prefill and self.enable_ced_prefill_tail and layer_idx == self.ced_boundary + 1):
+                (hidden_states, pre_mix, input_ids, image_mask, cur_topk_list,
+                 attn_metadata, prefill_moe_global_chunks) = self._prepare_ced_tail(
+                    hidden_states, pre_mix, attn_metadata, input_ids,
+                    image_mask, cur_topk_list, is_prefill)
+
+            # collect hidden states for dspark
             if layer_idx in self.collect_layer_ids:
                 collected_hidden_states.append(hidden_states.mean(dim=1))
             self._wait_engram_ready(decoder_layer, pending_engram, exe_mode)
@@ -2313,7 +2473,6 @@ class DeepseekV41Model(DeepseekV41PreTrainedModel):
                 engram_side_pending=side_pending)
             pending_engram.pop(layer_idx, None)
         self.shared_idx = None
-        self.candidates = None
 
         hidden_states = hc_pre_mix(hidden_states, pre_mix)
         hidden_states = self.norm(hidden_states)
@@ -2381,11 +2540,15 @@ class DeepseekV41ForCausalLM(DeepseekV41PreTrainedModel):
         self.enable_engram_offload = self.infer_config.model_config.custom_params.get("enable_engram_offload", False)
 
         self.metadata_event = []
+        self.metadata_event_tail = []
         if self.enable_multi_streams:
             # event[0]: metadata stream may start after the main stream inputs
             # are ready; event[1]: sparse-attention metadata is ready; event[2]:
             # QLI/QSLI metadata is ready for the first Indexer layer.
             self.metadata_event = [torch.npu.Event() for _ in range(3)]
+            # Independent events for the CED tail metadata, so the encoder layers
+            # (layer 0 / first indexer) never wait on the tail metadata.
+            self.metadata_event_tail = [torch.npu.Event() for _ in range(3)]
 
         self.local_rank = int(os.getenv("LOCAL_RANK", "0"))
         self.rank_offset = int(os.getenv("RANK_OFFSET", "0"))
@@ -2900,27 +3063,6 @@ class DeepseekV41ForCausalLM(DeepseekV41PreTrainedModel):
             platform_version=platform_version,
         )
 
-    def gather_cp_tail_hidden(self, hidden_states, attn_metadata):
-        """Collect the last sliding window of every request, which the draft model seeds its cache with."""
-        cp_metadata = attn_metadata["cp_metadata"]
-        window, row_dim = self.cp_prefill_tail_tokens, hidden_states.shape[-1]
-        segment_lens = cp_metadata["segment_lens"]
-        tails, offset = [], 0
-        for zigzag_flag in ("prev", "next"):
-            for segment_len, cur_kv_len in zip(segment_lens, attn_metadata[zigzag_flag]["cur_kv_len"]):
-                rows = hidden_states[offset:offset + cur_kv_len][-window:]
-                tails.append(F.pad(rows, (0, 0, 0, window - rows.shape[0])))
-                offset += segment_len
-        all_tails = gather_cp_segments(
-            torch.cat(tails, dim=0), cp_metadata, self.comm_manager.get_group("cp_group"))
-        all_tails = all_tails.view(-1, len(segment_lens), window, row_dim)
-
-        picked = [
-            pick_request_tail(all_tails, cp_metadata, request, window)
-            for request in range(len(segment_lens))
-        ]
-        return torch.cat(picked, dim=0)
-
     def gather_cp_last_token_hidden(self, outputs, attn_metadata):
         num_tokens, hidden_size = outputs.shape
         cp_metadata = attn_metadata["cp_metadata"]
@@ -2950,10 +3092,16 @@ class DeepseekV41ForCausalLM(DeepseekV41PreTrainedModel):
         seq_used_q = attn_metadata.get("seq_used_q")
         bs = seq_used_q.numel()
         if is_prefill:
-            if self.cp_size > 1:
+            if self.cp_size > 1 and not self.model.enable_ced_prefill_tail:
                 outputs = self.gather_cp_last_token_hidden(outputs, attn_metadata)
             else:
-                gather_index = kv_len - 1
+                if self.model.enable_ced_prefill_tail:
+                    # CED tail outputs hold only the last window tokens; the final token
+                    # of each request is the last row of its packed tail block.
+                    tail_lens = seq_used_q.clamp(max=self.model.ced_tail_len)
+                    gather_index = torch.cumsum(tail_lens, dim=0) - 1
+                else:
+                    gather_index = kv_len - 1
                 gather_index = gather_index.unsqueeze(1).repeat(1, outputs.shape[-1])
                 outputs = torch.gather(outputs, 0, gather_index).view(-1, 1, hidden_size)
             q_len = 1 # prefill takes the last token
@@ -2990,16 +3138,18 @@ class DeepseekV41ForCausalLM(DeepseekV41PreTrainedModel):
     def generate_kernel_metadata(self, attn_metadata):
         enable_metadata_multi_streams = self.enable_multi_streams
         metadata_stream = attn_metadata.get("metadata_stream")
+        metadata_event = attn_metadata.get("metadata_event", self.metadata_event)
         main_stream = torch.npu.current_stream() if enable_metadata_multi_streams else None
-        if attn_metadata["is_prefill"] and self.cp_size > 1:
+        if (attn_metadata["is_prefill"] and self.cp_size > 1
+                and not attn_metadata.get("is_ced_prefill_tail", False)):
             # Each zigzag segment runs its own attention call and needs its own tiling metadata.
             target_metadata = [attn_metadata["prev"], attn_metadata["next"]]
         else:
             target_metadata = [attn_metadata]
 
-        record_event(enable_metadata_multi_streams, self.metadata_event, 0)
+        record_event(enable_metadata_multi_streams, metadata_event, 0)
         with npu_stream_switch(enable_metadata_multi_streams, metadata_stream):
-            wait_event(enable_metadata_multi_streams, self.metadata_event, 0)
+            wait_event(enable_metadata_multi_streams, metadata_event, 0)
             device = attn_metadata["position_ids"].device
             for cur_metadata in target_metadata:
                 win_topk_length = cur_metadata["win_topk_length"]
@@ -3027,12 +3177,12 @@ class DeepseekV41ForCausalLM(DeepseekV41PreTrainedModel):
 
             # Layer 0 only needs sparse-attention metadata.  Let it start
             # before the independent Indexer metadata is completed.
-            record_event(enable_metadata_multi_streams, self.metadata_event, 1)
+            record_event(enable_metadata_multi_streams, metadata_event, 1)
             # Each zigzag segment scores the cache on its own lengths, so it needs its own
             # Indexer metadata as well.
             for cur_metadata in target_metadata:
                 self._generate_li_kernel_metadata(cur_metadata, main_stream)
-            record_event(enable_metadata_multi_streams, self.metadata_event, 2)
+            record_event(enable_metadata_multi_streams, metadata_event, 2)
 
     def _generate_li_kernel_metadata(self, attn_metadata, main_stream):
         """Generate and publish the fixed V4.1 QLI/QSLI metadata."""
@@ -3144,6 +3294,18 @@ class DeepseekV41ForCausalLM(DeepseekV41PreTrainedModel):
         is_prefill = forward_metadata.is_prefill
         self.generate_kernel_metadata(attn_metadata)
 
+        # CED prefill tail: precompute the decoder-half metadata (and its attention
+        # tiling) so the model can switch to the last sliding_window tokens after the
+        # encoder boundary.
+        if is_prefill and self.model.enable_ced_prefill_tail:
+            if self.cp_size > 1:
+                tail_attn_metadata = self.attention_data.build_ced_tail_metadata_cp(attn_metadata)
+            else:
+                tail_attn_metadata = self.attention_data.build_ced_tail_metadata(attn_metadata)
+            tail_attn_metadata["metadata_event"] = self.metadata_event_tail
+            self.generate_kernel_metadata(tail_attn_metadata)
+            attn_metadata["ced_tail_metadata"] = tail_attn_metadata
+
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         outputs = self.model(
             input_ids=input_ids,
@@ -3157,8 +3319,8 @@ class DeepseekV41ForCausalLM(DeepseekV41PreTrainedModel):
         auxiliary_hidden_states = None
         if isinstance(outputs, tuple):
             outputs, auxiliary_hidden_states = outputs
-            if is_prefill and self.cp_size > 1:
-                auxiliary_hidden_states = self.gather_cp_tail_hidden(auxiliary_hidden_states, attn_metadata)
+            if is_prefill and self.cp_size > 1 and not self.model.enable_ced_prefill_tail:
+                auxiliary_hidden_states = self.model.gather_cp_tail(auxiliary_hidden_states, attn_metadata)
         prev_hidden_states = outputs
         if auxiliary_hidden_states is not None:
             prev_hidden_states = {

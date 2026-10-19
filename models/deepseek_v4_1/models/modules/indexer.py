@@ -225,7 +225,7 @@ class Indexer(nn.Module):
         kv_cache,
         offset: int = 0
     ):
-        if self.is_first_indexer:
+        if self.is_first_indexer or attn_metadata.get("is_ced_prefill_tail", False):
             wait_event(
                 self.enable_metadata_multi_streams,
                 attn_metadata.get("metadata_event"),
@@ -236,9 +236,16 @@ class Indexer(nn.Module):
         # partial RoPE on Q, MXFP4 Q quantization, and weights_proj(x) with
         # softmax scaling. The native implementation preserves this same scope.
         q, q_scale, weights = OpKernel.indexer_prolog_qw(self, x, qr, cos, sin)
-
-        if attn_metadata["is_prefill"] and self.cp_size > 1:
+        is_ced_prefill_tail = attn_metadata.get("is_ced_prefill_tail", False)
+        if (attn_metadata["is_prefill"] and self.cp_size > 1 and not is_ced_prefill_tail):
             return self.forward_cp(q, q_scale, weights, latent, attn_metadata, kv_cache, offset)
+
+        if is_ced_prefill_tail and self.cp_size > 1:
+            # CED CP tail only contains reindex and reuse layers: tail against the full-length temporary index cache.
+            tmp_cache = get_cp_tmp_cache(attn_metadata, self.compress_ratio)
+            return self.compute_sparse_indices(
+                q, q_scale, weights, tmp_cache["indexer_cache"], tmp_cache["indexer_cache_scale"],
+                attn_metadata, offset, tmp_cache.get("qsli_cache"))
 
         if self.owns_k and latent is not None:
             self.update_indexer_cache(latent, attn_metadata, kv_cache)

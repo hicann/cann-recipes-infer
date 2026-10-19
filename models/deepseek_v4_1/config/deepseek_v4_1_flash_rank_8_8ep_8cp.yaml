@@ -25,6 +25,7 @@ model_config:
     enable_superkernel: False
     enable_engram_offload: True
     engram_tp_size: 8
+    enable_ced_prefill_tail: True  # CED prefill tail: only replay the last window tokens after the boundary layer
 
 speculative_config:  # Speculative decoding
   num_speculative_tokens: 5  # Maximum draft tokens per proposal

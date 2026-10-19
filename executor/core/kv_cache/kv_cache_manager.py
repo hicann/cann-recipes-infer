@@ -71,6 +71,7 @@ class KVCacheManager:
                 request_id=request_id,
                 num_tokens=num_tokens_need_slot,
                 reserved_tokens=reserved_tokens,
+                lookahead_tokens=lookahead_tokens
             )
             if not status:
                 return False
@@ -84,6 +85,7 @@ class KVCacheManager:
                 request_id=request_id,
                 block_num_to_allocate=block_num_to_allocate,
                 num_tokens=num_tokens_need_slot,
+                lookahead_tokens=lookahead_tokens,
             )
         return True
 

@@ -56,6 +56,7 @@ class SingleTypeKVCacheManager:
         request_id: int,
         num_tokens: int,
         reserved_tokens: int = 0,
+        lookahead_tokens: int = 0,
     ) -> tuple:
         """Return required blocks and whether the current pool can satisfy it."""
         if num_tokens < 0:
@@ -88,6 +89,7 @@ class SingleTypeKVCacheManager:
         request_id: int,
         block_num_to_allocate: int,
         num_tokens: Optional[int] = None,
+        lookahead_tokens: int = 0,
     ):
         """Allocate blocks for a request."""
         new_blocks = self.block_pool.get_new_blocks(block_num_to_allocate)
@@ -203,12 +205,14 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         )
         self.sliding_window = sliding_window
 
-    def _get_logical_block_layout(self, num_tokens: int) -> tuple[int, int, int]:
+    def _get_logical_block_layout(self, num_tokens: int, lookahead_tokens: int = 0) -> tuple[int, int, int]:
         """Return total logical blocks, first valid block, and valid block count."""
         total_block_num = ceil(num_tokens / self.block_size)
+        # The sliding window is bounded by the real sequence length, not the lookahead reservation.
+        valid_tokens = num_tokens - lookahead_tokens
         last_token_idx = num_tokens - 1
         last_block_idx = last_token_idx // self.block_size
-        first_valid_token_idx = max(0, last_token_idx - self.sliding_window)
+        first_valid_token_idx = max(0, (valid_tokens - 1) - self.sliding_window)
         first_valid_block_idx = first_valid_token_idx // self.block_size
         valid_block_num = last_block_idx - first_valid_block_idx + 1
         return total_block_num, first_valid_block_idx, valid_block_num
@@ -218,6 +222,7 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         request_id: int,
         num_tokens: int,
         reserved_tokens: int = 0,
+        lookahead_tokens: int = 0,
     ) -> tuple:
         """Return required blocks and whether the current pool can satisfy it."""
         if num_tokens < 0:
@@ -231,7 +236,7 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
             return need_block_num, need_block_num <= self.get_num_free_blocks()
 
         # prefill returns real physical block count only.
-        _, _, need_block_num = self._get_logical_block_layout(num_tokens)
+        _, _, need_block_num = self._get_logical_block_layout(num_tokens, lookahead_tokens)
         return need_block_num, need_block_num <= self.get_num_free_blocks()
 
     def allocate_new_blocks(
@@ -239,6 +244,7 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         request_id: int,
         block_num_to_allocate: int,
         num_tokens: Optional[int] = None,
+        lookahead_tokens: int = 0,
     ):
         """Allocate SWA blocks while keeping logical block positions aligned to kv_len."""
         new_blocks = self.block_pool.get_new_blocks(block_num_to_allocate)
@@ -246,7 +252,7 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
 
         if not request_blocks:
             # prefill
-            total_block_num, first_valid_block_idx, valid_block_num = self._get_logical_block_layout(num_tokens)
+            total_block_num, first_valid_block_idx, valid_block_num = self._get_logical_block_layout(num_tokens, lookahead_tokens)
 
             request_blocks.extend([self._null_block] * first_valid_block_idx)
             request_blocks.extend(new_blocks)
@@ -285,6 +291,7 @@ class RingCacheManager(SingleTypeKVCacheManager):
         request_id: int,
         num_tokens: int,
         reserved_tokens: int = 0,
+        lookahead_tokens: int = 0,
     ) -> tuple:
         """Claim one block on admission and reuse it until the request ends."""
         if num_tokens < 0:
@@ -328,6 +335,7 @@ class MambaManager(SingleTypeKVCacheManager):
         request_id: int,
         num_tokens: int,
         reserved_tokens: int = 0,
+        lookahead_tokens: int = 0,
     ) -> tuple:
         """Return required state blocks and whether the current pool can satisfy it."""
         if num_tokens < 0:
