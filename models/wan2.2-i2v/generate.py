@@ -69,9 +69,9 @@ def _validate_args(args):
     if args.ckpt_dir is None:
         raise ValueError("Please specify the checkpoint directory.")
     if args.task not in WAN_CONFIGS:
-        raise ValueError(f"Unsupport task: {args.task}")
+        raise ValueError(f"Unsupported task: {args.task}")
     if args.task not in EXAMPLE_PROMPT:
-        raise ValueError(f"Unsupport task: {args.task}")
+        raise ValueError(f"Unsupported task: {args.task}")
 
     if args.prompt is None:
         args.prompt = EXAMPLE_PROMPT[args.task]["prompt"]
@@ -102,7 +102,7 @@ def _validate_args(args):
     if args.size not in SUPPORTED_SIZES[args.task]:
         supported = ', '.join(SUPPORTED_SIZES[args.task])
         raise ValueError(
-            f"Unsupport size {args.size} for task {args.task}, "
+            f"Unsupported size {args.size} for task {args.task}, "
             f"supported sizes are: {supported}"
         )
 
@@ -249,7 +249,7 @@ def _parse_args():
         "--convert_model_dtype",
         action="store_true",
         default=False,
-        help="Whether to convert model paramerters dtype.")
+        help="Whether to convert model parameters dtype.")
     parser.add_argument(
         "--quant_mode",
         type=int,
@@ -314,9 +314,9 @@ def generate(args):
                 "t5_fsdp and dit_fsdp are not supported in non-distributed environments."
             )
         context_parallel_enabled = (
-            args.cfg_size > 1 
-            or args.ulysses_size > 1 
-            or args.ring_size > 1 
+            args.cfg_size > 1
+            or args.ulysses_size > 1
+            or args.ring_size > 1
             or args.tp_size > 1
         )
         if context_parallel_enabled:
@@ -328,7 +328,7 @@ def generate(args):
             raise ValueError(
                 "VAE parallel is not supported in non-distributed environments."
             )
-    
+
     if args.tp_size > 1:
         raise NotImplementedError("Tensor Parallel is not supported now")
 
@@ -369,7 +369,7 @@ def generate(args):
                 device=rank)
         else:
             raise NotImplementedError(
-                f"Unsupport prompt_extend_method: {args.prompt_extend_method}")
+                f"Unsupported prompt_extend_method: {args.prompt_extend_method}")
 
     cfg = WAN_CONFIGS[args.task]
     if args.ulysses_size > 1:
@@ -493,13 +493,13 @@ def generate(args):
         )
 
         transformer = wan_ti2v.model
-        
+
         if args.tp_size > 1:
             logging.info("Initializing Tensor Parallel ...")
             applicator = TensorParallelApplicator(args.tp_size, device_map="cpu")
             applicator.apply_to_model(transformer)
         # wan_ti2v.model.to("npu")
-        
+
         if args.quant_mode == 2:
             logging.info(f"quantize weights saved, will be return")
             return

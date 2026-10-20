@@ -109,7 +109,7 @@ case "${QUANT_MODE,,}" in
             --quant_param_path "./quantization/w4a8c8"
         ;;
     *)
-        echo "Error: Unsupport Quant_mode: $QUANT_MODE"
+        echo "Error: Unsupported Quant_mode: $QUANT_MODE"
         echo "Supported Mode: bfloat16, w8a8c16, w8a8c8, w4a8c8"
         exit 1
         ;;
