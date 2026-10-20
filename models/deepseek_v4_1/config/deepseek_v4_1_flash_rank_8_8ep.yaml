@@ -18,6 +18,8 @@ model_config:
       megamoe: ascendc  # ascendc or deepgemm (DeepSeek opensource MegaMoE kernel)
       gate_topk: ascendc
       hc_post: ascendc
+      # swiglu kernel: custom (repo op) or cann_ops_nn (mainline).
+      swiglu: custom
     enable_multi_streams: True
     # Only applies to npugraph_ex; leave unset or False for eager/ge_graph.
     unsafe_skip_npugraph_capture_validation: False

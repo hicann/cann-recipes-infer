@@ -4,11 +4,11 @@ model_config:
   platform_version: "950"
   with_ckpt: True
   exe_mode: "npugraph_ex"
-  enable_static_kernel: False
+  enable_static_kernel: True
   enable_dynamic_graph: False
   enable_profiler: False
   force_eplb: False
-  enable_cache_compile: False
+  enable_cache_compile: True
   custom_params:
     low_latency_tp: True
     enable_multi_streams: True

@@ -19,6 +19,8 @@ model_config:
       gate_topk: tilelang
       hc_post: tilelang
       engram: tilelang
+      # swiglu kernel: custom (repo op) or cann_ops_nn (mainline).
+      swiglu: custom
 
 data_config:
   dataset: "default_multimodal"

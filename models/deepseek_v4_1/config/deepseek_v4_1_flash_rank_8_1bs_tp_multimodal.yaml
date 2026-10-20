@@ -6,7 +6,6 @@ model_config:
   platform_version: "950"
   with_ckpt: True
   exe_mode: "npugraph_ex"
-  next_n: 0
   enable_static_kernel: True
   enable_dynamic_graph: False
   enable_profiler: False
@@ -29,6 +28,13 @@ model_config:
     # GMM/swiglu consume group_list_type=2. Requires an op package with the
     # KEY_VALUE empty-expert fix.
     enable_sparse_grouplist: True
+
+speculative_config:
+  num_speculative_tokens: 5
+  method: "dspark"
+  markov_lmhead_tp_size: 8
+  draft_model_path: ""
+  confidence_threshold: 0.0
 
 data_config:
   dataset: "default_multimodal"
