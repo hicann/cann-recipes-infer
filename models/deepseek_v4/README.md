@@ -226,9 +226,9 @@ docker run -u root -itd --name cann_recipes_infer --ulimit nproc=65535:65535 --i
 
 ### Ascend 950 低时延 TP 配置
 
-低时延 TP 将 Attention 和 O-Projection 按 TP 切分，减少中间结果的跨卡聚合，适用于低 batch size 的推理场景。该功能默认关闭，仅支持 Ascend 950。
+低时延 TP 通过 MLA / LI 分卡及 Attention、O-Projection 的 TP 切分降低推理时延，适用于低 batch size 的推理场景。该功能默认关闭，仅支持 Ascend 950 离线推理（`disaggregation_mode="NONE"`），不支持 `enable_pypto=True`。
 
-启用时在 `model_config.custom_params` 中设置 `low_latency_tp: True`，并在 `parallel_config` 中显式设置 `attn_tp_size = o_proj_tp_size = moe_tp_size = embed_tp_size = lmhead_tp_size = world_size > 1`、`cp_size = 1`。普通推理和 DSpark 的 4 卡示例见下方启动命令。
+启用时在 `model_config.custom_params` 中设置 `low_latency_tp: True`，并在 `parallel_config` 中显式设置 `attn_tp_size = o_proj_tp_size = moe_tp_size = embed_tp_size = lmhead_tp_size = world_size > 1`、`cp_size = 1`，卡数须为偶数。普通推理和 DSpark 的 4 卡示例见下方启动命令。
 
 ### DSpark投机推理配置
 

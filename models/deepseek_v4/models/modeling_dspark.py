@@ -44,6 +44,7 @@ from executor.model_loader.weight_utils import default_weight_loader
 from module.fuse_moe_gmm import FusedMoEGMM
 from module.linear import ColumnParallelLinear, ReplicatedLinear, VocabParallelEmbedding
 
+from .modules.separate_mla import reduce_separate_mla_output
 from .configuration_deepseek import DeepseekV3Config
 from .modeling_deepseek import (PREFETCH_ATTN_EVENT_NUM, Attention, DeepseekV3ForCausalLM,
                                 DeepseekV3Model, DeepseekV3MoE)
@@ -334,7 +335,7 @@ class DSparkAttention(Attention):
             sparse_kwargs["ori_topk_length"] = metadata_inputs["ori_topk_length"]
         sinks = self.attn_sink
         if self.low_latency_tp:
-            head_start = self.attn_tp_rank * self.num_heads_per_rank
+            head_start = self.mla_tp_rank * self.num_heads_per_rank
             sinks = sinks[head_start:head_start + self.num_heads_per_rank]
 
         return self.dspark_sparse_attn_ops(
@@ -365,6 +366,11 @@ class DSparkAttention(Attention):
         )[0].to(q.dtype)
 
     def _dspark_attn_post_eager(self, attn_output: torch.Tensor, attn_metadata: Dict):
+        if self.low_latency_tp:
+            output = self.attn_post(
+                attn_output.flatten(0, 1), attn_metadata, is_prefill=False, reduce_output=False,
+            )
+            return output.unflatten(0, attn_output.shape[:2])
         if self.oproj_tp_size > 1 or self.platform_version == PlatformVersion.A3:
             output = self.attn_post(
                 attn_output.flatten(0, 1), attn_metadata, is_prefill=False)
@@ -424,6 +430,12 @@ class DSparkAttention(Attention):
         **kwargs,
     ):
         is_prefill = kwargs.get("is_prefill", True)
+        if self.low_latency_tp and not self.separate_mla.is_mla_rank:
+            if is_prefill:
+                return x
+            # C1A draft attention has no LI/compressor work on odd ranks.
+            output = torch.zeros((*x.shape[:-1], self.dim), dtype=torch.bfloat16, device=x.device)
+            return reduce_separate_mla_output(self, output)
         cos_sin = attn_metadata["cos_sin"]
         if is_prefill:
             # Prefill only seeds the proposal cache; token proposals start in decode.
@@ -461,6 +473,8 @@ class DSparkAttention(Attention):
             attn_output,
             self._draft_attn_metadata(attn_metadata),
         )
+        if self.low_latency_tp:
+            output = reduce_separate_mla_output(self, output)
         return output
 
 
@@ -1146,17 +1160,19 @@ class DeepseekV4DSparkProposalModel(DeepseekV3ForCausalLM):
         batch_size = input_ids.shape[0]
 
         draft_attn_metadata = dict(attn_metadata)
-        # Metadata runs independently and is consumed only when the first
-        # proposal attention reaches its fused FA call.
-        enable_metadata_stream = self.enable_multi_streams
-        record_event(enable_metadata_stream, draft_attn_metadata.get("metadata_event"), 0)
-        with npu_stream_switch(
-            enable_metadata_stream,
-            draft_attn_metadata.get("metadata_stream"),
-        ):
-            wait_event(enable_metadata_stream, draft_attn_metadata.get("metadata_event"), 0)
-            self.mtp[0].attn.generate_dspark_fused_fa_metadata(draft_attn_metadata)
-            record_event(enable_metadata_stream, draft_attn_metadata.get("metadata_event"), 1)
+        # Only MLA ranks consume draft FA metadata. Avoid launching an unused
+        # metadata stream on LI ranks, which return through the output reduce.
+        first_attn = self.mtp[0].attn
+        if not self.low_latency_tp or first_attn.separate_mla.is_mla_rank:
+            enable_metadata_stream = self.enable_multi_streams
+            record_event(enable_metadata_stream, draft_attn_metadata.get("metadata_event"), 0)
+            with npu_stream_switch(
+                enable_metadata_stream,
+                draft_attn_metadata.get("metadata_stream"),
+            ):
+                wait_event(enable_metadata_stream, draft_attn_metadata.get("metadata_event"), 0)
+                first_attn.generate_dspark_fused_fa_metadata(draft_attn_metadata)
+                record_event(enable_metadata_stream, draft_attn_metadata.get("metadata_event"), 1)
 
         main_x = self.mtp[0].project_main_hidden(main_hidden)
         hidden_states = self.model.calc_input_embeddings(

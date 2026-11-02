@@ -88,6 +88,9 @@ from .modules import (get_window_topk_idxs, get_compress_topk_idxs,
                       get_total_aic_num
                     )
 from .modules import Indexer, Compressor
+from .modules.separate_mla import (
+    SeparateMLATopology, forward_separate_mla, validate_separate_mla_config,
+)
 from .modules.indexer import MXFP4_SCALE_GROUP_SIZE, MXFP4_SCALE_LANES
 from .modules.registry import OpKernel, auto_import_modules
 logger = logging.get_logger(__name__)
@@ -867,8 +870,18 @@ class Attention(nn.Module):
         self.low_latency_tp = bool(
             self.infer_config.model_config.custom_params.get("low_latency_tp", False)
         )
+        self.separate_mla = None
+        if self.low_latency_tp:
+            self.separate_mla = SeparateMLATopology(
+                self.infer_config.parallel_config.world_size,
+                self.infer_config.parallel_config.global_rank,
+            )
+        self.mla_tp_size = self.separate_mla.tp_size if self.low_latency_tp else self.attn_tp_size
         self.attn_dp_size = self.infer_config.parallel_config.attn_dp_size
-        self.oproj_tp_size = self.infer_config.parallel_config.o_proj_tp_size
+        self.oproj_tp_size = (
+            self.mla_tp_size if self.low_latency_tp
+            else self.infer_config.parallel_config.o_proj_tp_size
+        )
         if self.oproj_tp_size > config.o_groups:
             raise ValueError(f"{self.oproj_tp_size=} should not be greater than {config.o_groups =}")
         self.moe_tp_size = self.infer_config.parallel_config.moe_tp_size
@@ -914,6 +927,10 @@ class Attention(nn.Module):
                 self.enable_compressor_parallel = self.enable_limit_core
         else:
             self.enable_compressor_parallel = False
+        if self.low_latency_tp:
+            # Role-local compression runs on the current stream. MLA and LI
+            # still overlap across ranks; retain Q/KV and indexer multistream.
+            self.enable_compressor_parallel = False
         self.total_aic_num = get_total_aic_num()
         self.cmpr_aic_num = 0
         self.cmpr_events = []
@@ -932,7 +949,8 @@ class Attention(nn.Module):
         self.n_heads = config.num_attention_heads
 
         self.attn_tp_rank = self.comm_manager.get_rank("attn_tp_group") if self.attn_tp_size > 1 else 0
-        self.num_heads_per_rank = self.n_heads // self.attn_tp_size
+        self.mla_tp_rank = self.separate_mla.tp_rank if self.low_latency_tp else self.attn_tp_rank
+        self.num_heads_per_rank = self.n_heads // self.mla_tp_size
         self.q_lora_rank = config.q_lora_rank
         self.o_lora_rank = config.o_lora_rank
         self.head_dim = config.head_dim
@@ -942,7 +960,7 @@ class Attention(nn.Module):
         self.nope_head_dim = config.head_dim - config.qk_rope_head_dim
         self.n_groups = config.o_groups
 
-        self.num_groups_per_rank = max(self.n_groups // self.attn_tp_size, 1)
+        self.num_groups_per_rank = max(self.n_groups // self.mla_tp_size, 1)
         self.window_size = config.sliding_window
         self.eps = config.rms_norm_eps
 
@@ -960,8 +978,8 @@ class Attention(nn.Module):
                                         self.n_heads * self.head_dim,
                                         bias=False,
                                         quant_config=config.quant_config,
-                                        tp_size=self.attn_tp_size,
-                                        tp_rank=self.attn_tp_rank,
+                                        tp_size=self.mla_tp_size,
+                                        tp_rank=self.mla_tp_rank,
                                         prefix=f"{prefix}.wq_b",
                                         )
         self.wkv = ReplicatedLinear(self.dim,
@@ -973,7 +991,10 @@ class Attention(nn.Module):
         self.kv_norm = DeepseekV3RMSNorm(self.head_dim, self.eps)
 
         wo_tp_size = self.oproj_tp_size
-        self.oproj_tp_rank = self.comm_manager.get_rank("oproj_tp_group") if self.oproj_tp_size > 1 else 0
+        self.oproj_tp_rank = (
+            self.mla_tp_rank if self.low_latency_tp
+            else self.comm_manager.get_rank("oproj_tp_group") if self.oproj_tp_size > 1 else 0
+        )
         quant_config = config.quant_config if self.mm_quant_mode == "w8a8mxfloat8" \
             or self.mm_quant_mode == "w8a8hifloat8" else None
         self.wo_a = ColumnParallelLinear(self.n_heads * self.head_dim // self.n_groups,
@@ -1546,7 +1567,7 @@ class Attention(nn.Module):
 
         # start compressor and li qb stream after wq_b, to run parallel with wkv vectors
         record_event(enable_cmpr_stream, self.cmpr_events, 0)
-        if self.compress_ratio == 4:
+        if self.compress_ratio == 4 and not self.low_latency_tp:
             record_stream(enable_multi_streams, qr, attn_metadata.get('indexer_stream', None))
             record_stream(enable_multi_streams, qr_scale, attn_metadata.get('indexer_stream', None))
             record_event(enable_multi_streams, self.indexer.indexer_events, 0)
@@ -1613,7 +1634,7 @@ class Attention(nn.Module):
         metadata = attn_metadata["kernel_metadata"][f'c{self.compress_ratio}a_metadata']
         attn_sinks = self.attn_sink
         if self.low_latency_tp:
-            head_start = self.attn_tp_rank * self.num_heads_per_rank
+            head_start = self.mla_tp_rank * self.num_heads_per_rank
             attn_sinks = attn_sinks[head_start:head_start + self.num_heads_per_rank]
 
         cu_seqlens_q = attn_metadata["cu_seq_lens_q"]
@@ -1780,6 +1801,8 @@ class Attention(nn.Module):
         o: torch.Tensor,
         attn_metadata: Optional[Dict] = None,
         is_prefill: bool = True,
+        *,
+        reduce_output: bool = True,
     ):
         '''
         oproj_tp: split on group dim, o: [B, S, G, N, D/G] -> [B, S, G/tp_size, N, D/G]
@@ -1874,7 +1897,8 @@ class Attention(nn.Module):
         x = self.wo_b(o)
 
         if self.low_latency_tp:
-            dist.all_reduce(x, group=self.comm_manager.get_group("oproj_tp_group"))
+            if reduce_output:
+                dist.all_reduce(x, group=self.comm_manager.get_group("oproj_tp_group"))
         elif self.oproj_tp_size > 1:
             # [oproj_tp_size, num_tokens, dim] --> [oproj_tp_size * num_tokens, dim]
             x = x.view(self.oproj_tp_size * num_tokens, -1)
@@ -1891,6 +1915,8 @@ class Attention(nn.Module):
         is_prefill: bool = True,
         **kwargs,
     ):
+        if self.low_latency_tp:
+            return forward_separate_mla(self, x, attn_metadata, is_prefill, **kwargs)
         q, qr, qr_scale, x = self.mla_prolog(x, attn_metadata, is_prefill, **kwargs)
 
         # o TND
@@ -2535,6 +2561,8 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
         self.rank_offset = int(os.getenv("RANK_OFFSET", "0"))
         self.global_rank = self.local_rank + self.rank_offset
         self.world_size = self.infer_config.parallel_config.world_size
+        if self.low_latency_tp and self.global_rank != self.infer_config.parallel_config.global_rank:
+            raise ValueError("separate MLA requires LOCAL_RANK + RANK_OFFSET == parallel_config.global_rank.")
         kwargs = {
                     "global_rank": self.global_rank,
                     "is_mtp": is_mtp
@@ -2633,23 +2661,7 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
 
         if exe_mode not in ["eager", "npugraph_ex"]:
             raise ValueError(f"{exe_mode=} does not supported!")
-        if low_latency_tp:
-            if platform_version != PlatformVersion.ASCEND_950:
-                raise ValueError("low_latency_tp only supports Ascend 950.")
-            if parallel_config.attn_tp_size <= 1:
-                raise ValueError("low_latency_tp requires attn_tp_size > 1.")
-            if parallel_config.attn_tp_size != parallel_config.world_size or parallel_config.cp_size != 1:
-                raise ValueError("low_latency_tp requires attn_tp_size == world_size and cp_size == 1.")
-            if parallel_config.o_proj_tp_size != parallel_config.attn_tp_size:
-                raise ValueError("low_latency_tp requires o_proj_tp_size == attn_tp_size.")
-            for tp_name in ("moe_tp_size", "embed_tp_size", "lmhead_tp_size"):
-                if getattr(parallel_config, tp_name) != parallel_config.world_size:
-                    raise ValueError(f"low_latency_tp requires {tp_name} == world_size.")
-            if self.config.num_attention_heads % parallel_config.attn_tp_size != 0:
-                raise ValueError("num_attention_heads must be divisible by attn_tp_size.")
-            if self.config.o_groups % parallel_config.attn_tp_size != 0:
-                raise ValueError("o_groups must be divisible by attn_tp_size.")
-        elif parallel_config.attn_tp_size > 1:
+        if not low_latency_tp and parallel_config.attn_tp_size > 1:
             raise ValueError(
                 f"{parallel_config.attn_tp_size=} is not supported unless low_latency_tp is enabled."
             )
@@ -2858,6 +2870,14 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
                 self.config.quant_config.gmm_quant_mode.replace("float", "mxfloat")
 
     def get_parallel_settings(self):
+        validate_separate_mla_config(self.config, self.infer_config)
+        self.low_latency_tp = bool(
+            self.infer_config.model_config.custom_params.get("low_latency_tp", False)
+        )
+        self.mla_tp_size = (
+            self.infer_config.parallel_config.world_size // 2 if self.low_latency_tp
+            else self.infer_config.parallel_config.attn_tp_size
+        )
         self.embed_tp_size = self.infer_config.parallel_config.embed_tp_size
         self.attn_dp_size = self.infer_config.parallel_config.attn_dp_size
         self.attn_tp_size = self.infer_config.parallel_config.attn_tp_size
@@ -2881,6 +2901,14 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
             group_size=self.attn_tp_size,
             platform_version=platform_version,
         )
+        if self.low_latency_tp:
+            topology = SeparateMLATopology(world_size, self.global_rank)
+            self.comm_manager.register_group(
+                name="separate_mla_group",
+                subgroups=topology.pairs,
+                allow_physical_reuse=False,
+                platform_version=platform_version,
+            )
         self.comm_manager.register_group(
             name="oproj_tp_group",
             group_num=world_size // self.oproj_tp_size,
@@ -3060,7 +3088,7 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
             "ori_win_right": 0,
             "layout_q": "TND",
             "layout_kv": "PA_BBND",
-            "num_heads_q": self.config.num_attention_heads // self.attn_tp_size,
+            "num_heads_q": self.config.num_attention_heads // self.mla_tp_size,
             "num_heads_kv": 1,
             "head_dim": self.config.kv_lora_rank,
             "has_ori_kv": True,
