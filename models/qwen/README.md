@@ -2,10 +2,11 @@
 
 ## 概述
 
-`models/qwen` 适配 Qwen2/Qwen3 Dense（非 MoE）系列模型，包含 **Qwen3-8B** 与 **Qwen2.5-7B-Instruct**，共用统一建模代码与启动入口，通过 HuggingFace `config.json` 自动识别模型变体。本文给出 BF16 与 W8A8 量化在 1卡 / 2卡 TP 配置下的部署流程与实测性能基线（Qwen3-8B）。
+`models/qwen` 适配 Qwen2/Qwen3 Dense（非 MoE）系列模型，包含 **Qwen3-1.7B**、**Qwen3-8B** 与 **Qwen2.5-7B-Instruct**，共用统一建模代码与启动入口，通过 HuggingFace `config.json` 自动识别模型变体。本文给出 BF16 与 W8A8 量化在 1卡 / 2卡 TP 配置下的部署流程与实测性能基线（Qwen3-8B）。
 
 | 模型 | model_name | 特性 |
 |---|---|---|
+| Qwen3-1.7B | `qwen3_1_7b` | BF16 单卡，QK-Norm，官方配置启用 tied embeddings |
 | Qwen3-8B | `qwen3_8b` | QK-Norm，attention_bias=False，支持 W8A8 INT8 量化 |
 | Qwen2.5-7B-Instruct | `qwen25_7b_instruct` | 无 QK-Norm，attention_bias=True |
 
@@ -84,6 +85,7 @@
 从 HuggingFace 下载原始权重到本地路径，例如 `/data/models/origin/Qwen3-8B`：
 
 - [Qwen/Qwen3-8B](https://huggingface.co/Qwen/Qwen3-8B)
+- [Qwen/Qwen3-1.7B](https://huggingface.co/Qwen/Qwen3-1.7B)
 - [Qwen/Qwen2.5-7B-Instruct](https://huggingface.co/Qwen/Qwen2.5-7B-Instruct)
 
 下载方式（任选其一）：
@@ -168,6 +170,7 @@ git clone https://huggingface.co/Qwen/Qwen3-8B /data/models/origin/Qwen3-8B
 
    | YAML | 精度 | 卡数 | 适用场景 |
    |---|---|---|---|
+   | `qwen3_1_7b_1tp.yaml` | BF16 | 1 | Qwen3-1.7B单卡部署 |
    | `qwen3_8b_1tp.yaml` | BF16 | 1 | Qwen3-8B 单卡部署 |
    | `qwen3_8b_2tp.yaml` | BF16 | 2 | Qwen3-8B 2 卡 TP 并行 |
    | `qwen3_8b_w8a8_1tp.yaml` | W8A8 INT8 | 1 | Qwen3-8B 单卡量化部署 |

@@ -1,0 +1,28 @@
+model_config:
+  model_name: "qwen3_1_7b"
+  model_path: "/path/to/Qwen3-1.7B"
+  dtype: "bfloat16"
+  exe_mode: "npugraph_ex"
+  enable_profiler: False
+  with_ckpt: True
+  enable_cache_compile: False
+  enable_static_kernel: False
+
+data_config:
+  dataset: "default"
+  input_truncated_len: 2048
+  temperature: 0.0
+  top_p: 1.0
+  top_k: 0
+  seed: 17
+
+parallel_config:
+  world_size: 1
+  attn_tp_size: 1
+  moe_tp_size: 1
+  embed_tp_size: 1
+  lmhead_tp_size: 1
+
+scheduler_config:
+  max_new_tokens: 128
+  batch_size: 2

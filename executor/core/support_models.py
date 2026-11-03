@@ -89,6 +89,10 @@ _specs: dict[str, list[tuple[str, str]]] = {
         ("models.qwen.models.modeling_qwen", "QwenForCausalLM"),
         ("models.qwen.models.configuration_qwen", "Qwen2Config"),
     ],
+    "qwen3_1_7b": [
+        ("models.qwen.models.modeling_qwen", "QwenForCausalLM"),
+        ("models.qwen.models.configuration_qwen", "Qwen3Config"),
+    ],
     "qwen3_8b": [
         ("models.qwen.models.modeling_qwen", "QwenForCausalLM"),
         ("models.qwen.models.configuration_qwen", "Qwen3Config"),
