@@ -1,303 +1,308 @@
 ---
 name: model-infer-precision-debug
-description: 基于 PyTorch 框架的昇腾 NPU 模型推理精度问题诊断技能。当前主要覆盖 KVCache / FlashAttention 相关精度问题，包括 Prefill/Decode 对齐、cache 更新错误、slot/block mapping 错误、attention 路径切换后的精度异常等。触发场景：优化改造后精度验证未通过、模型输出与基线存在显著偏差、Prefill 和 Decode 精度表现不一致、出现 NaN/Inf、量化模式下精度异常放大等。
+description: 基于 PyTorch 框架的昇腾 NPU 模型推理精度问题定位技能。按定界、建立可复现场景、建立对比基准、定位可疑对象、根因确认与归类逐级收敛，覆盖算子、模型实现、权重与输入数据、框架实现四类来源。触发场景：精度验证未通过或与基线存在偏差、NaN/Inf、输出质量劣化、多次运行不稳定、同请求跨 batch 组成结果不一致、加 dump 后现象改变、KVCache 与 FlashAttention 相关的精度异常。
 ---
 
-# 推理精度问题诊断技能
+# 推理精度问题定位技能
 
-> 当前主要覆盖 KVCache / FA 相关精度问题，其他推理精度问题后续补充。
-> 不覆盖运行时错误（crash、hang、OOM、算子约束违反等见 model-infer-runtime-debug）。
-
-按"症状分类 → 快速验证 → 分模块定位 → 逐层对比 → 陷阱修复"的分层策略排查精度问题。完整校验工具见 `references/fa_debug_utils.md`。
-
-> **部署模式适配**：诊断流程对框架部署 / 独立部署两模式均适用，差异仅在参数获取路径——框架部署从 `forward_metadata.{block_table, slot_mapping, actual_seq_lengths_*, is_prefill}` 取，独立部署从 Runner 自管的 ParallelContext / forward_metadata 实例取。`block_table` / `slot_mapping` 在框架部署下是 `Dict[attn_type → Tensor]`，attention 内按 `self.attn_type` 取出对应 tensor；独立部署 Runner 自管的形态是单 Tensor。
->
-> **packed sequence 协议**（框架部署 modeling 强制要求）：`input_ids` / `position_ids` 是 `[TotalTokens]` 一维；`hidden_states` 全程保持 `[TotalTokens, hidden_size]` 二维（不要 reshape 成 `[B, S, H]`）；阶段分支统一用 `forward_metadata.is_prefill`。详见 `model-infer-kvcache` skill §3.1。
->
-> **sparse_mode 写法（按路径分类）**：标准 LLM TND PA 路径 Prefill + Decode 统一 `sparse_mode=3` + causal mask；滑窗层 Prefill + Decode 统一 `sparse_mode=4` + band mask；MLA absorb 路径 Prefill `sparse_mode=3` / Decode `sparse_mode=0`+`mask=None`。详见 `model-infer-kvcache` skill §2.7。
+定位数值结果不符合预期的问题，含内存越界未导致崩溃、只表现为数值异常的情形。崩溃、卡死、OOM、算子约束违反等运行时错误见 `model-infer-runtime-debug`。
 
 ## 重要原则
 
-- **对比驱动**：所有精度判定必须基于与基线（eager 模式 / 优化前）的数值对比，不可凭直觉
-- **逐步缩小范围**：先定位阶段（Prefill/Decode）→ 再定位模块（KVCache 写入/FA 计算/后处理）→ 最后定位参数
+- **对比驱动**：精度判定基于数值对比或自证信号，不凭直觉
+- **先有可比较的对象再定位**：既无正常版本又无 NaN 这类自证信号，不进入定位
+- **先降复杂度再分析**：关闭全部加速特性、切 eager 之后再开始
+- **逐步缩小范围**：先按成本选收敛维度，落到执行位置上再按阶段 → 层 → 模块 → 算子逐级收敛
+- **定位首个偏差点**：后继算子的异常往往只是前面错误的传播结果
 - **最小改动验证**：每次只修改一个变量，验证后再进入下一个
-- **保留现场**：调试过程中的中间 tensor 和日志必须保留，用于后续分析
-- **实际执行测试**：所有调试步骤由 Agent 实际执行，不将测试工作委托给用户
 
 ---
 
-## 排查工作流
+## 排查流程总览
 
-接到精度调试任务后，按以下步骤执行：
-
-**第一步：收集信息** — 获取精度症状、优化阶段、执行/量化模式、基线输出
-
-**第二步：快速诊断** — 根据症状分类表判断方向 → 执行快速验证清单（含 FA 入参检查）→ 发现问题直接修复
-
-**第三步：分模块定位** — 二分法确定 Prefill/Decode → 针对性插桩验证 → PA 场景执行专项排查
-
-**第四步：精细定位（按需）** — 使用逐层对比框架，dump 基线 → compare 优化后 → 定位首次偏差层
-
-**第五步：修复与验证** — 参照常见陷阱表修复 → 重新运行完整精度验证
-
-**第六步：输出调试报告** — 问题概要、根因分析、修复措施、修复验证、遗留风险
-
----
-
-## 第二步：快速诊断
-
-### 2.1 症状分类
-
-| 症状 | 可能原因 | 优先排查方向 |
-|------|---------|-------------|
-| 输出全为重复 token 或乱码 | KVCache 写入位置错误 | slot_mapping 构造 / 写入算子（PA 用 `npu_scatter_nd_update_`，BSH legacy 用 `scatter_update_`） |
-| 首个 token 正确，后续偏移 | Decode 阶段 kv_len 更新错误 | kv_len 生命周期 |
-| Prefill 正确，Decode 偏差大 | Decode FA 入参错位（按路径分类：MLA absorb Decode 应切 sparse_mode=0 / mask=None；标准 LLM TND PA 保持与 Prefill 同 sparse_mode=3） | sparse_mode 路径分类 / actual_seq_lengths_kv |
-| 输出含 NaN/Inf | 数值溢出 | scale 参数、dtype 不匹配 |
-| 精度逐层累积偏差 | FA 算子数值精度 | input_layout / NZ 格式 / 量化参数 |
-| 多 batch 部分样本错误 | batch 间缓存交叉污染 | block_table / slot_mapping 构造 |
-| 量化模式下偏差显著放大 | 量化参数不匹配 | dequant_scale / antiquant_mode |
-
-### 2.2 快速验证清单
-
-- [ ] 1. dtype 一致性：KVCache tensor 与模型计算 dtype 一致（BF16 / FP16）
-- [ ] 2. device 一致性：所有 tensor 均在 NPU 上，无意外的 CPU tensor
-- [ ] 3. block_table dtype：必须为 torch.int32
-- [ ] 4. sparse_mode 按路径正确：标准 LLM TND PA Prefill+Decode 统一 3；滑窗层统一 4；MLA absorb Prefill 3 / Decode 0（详见 `model-infer-kvcache` §2.7）
-- [ ] 5. Prefill 和 Decode 的 FA 调用参数按路径配置（atten_mask、actual_seq_lengths 等；阶段分支取自 `forward_metadata.is_prefill`）
-- [ ] 6. scale 参数：1.0 / sqrt(head_dim)，确认 head_dim 值正确
-- [ ] 7. num_heads / num_kv_heads：与模型配置一致，多卡时已按 rank 切分（`num_kv_heads_per_rank = max(num_kv_heads // attn_tp_size, 1)`）
-- [ ] 8. kv_len 初始值：Prefill 后 kv_len 等于输入序列长度，非 0
-- [ ] 9. input_layout 与 tensor shape 匹配（标准 LLM TND PA 默认 TND；MLA absorb 用 TND_NTD）
-- [ ] 10. actual_seq_lengths 构造方式与 layout 匹配（TND 用 cumsum，BSH 用原值；框架部署对应 `forward_metadata.actual_seq_lengths_cu_q` / `actual_seq_lengths_kv`）
-- [ ] 11. atten_mask 与 sparse_mode 匹配（详见附录 F.1）；MLA absorb Decode 用 None
-- [ ] 12. FA v1 vs v2 参数名：未混用（详见附录 F.2）
-- [ ] 13. PA 场景下 mask 最后一维 >= block_table 第二维 × block_size
-- [ ] 14. MLA rope 参数：query_rope/key_rope 同时传或同时不传；rope D=64，query D 仅支持 512/128
-- [ ] 15. inner_precise 行无效：Prefill + 自定义 mask 有全遮蔽行时需设为 2/3
-- [ ] 16. kv_len 层内只读：kv_len 在 attention/cache 内部未被修改（禁止层内递增，否则各层写入位置错位导致精度彻底损坏）
-- [ ] 17. hidden_states 全程保持 `[TotalTokens, hidden_size]` 二维形态，未被 reshape 成 `[B, S, H]`（变长 batch 不能简单 reshape）
-
----
-
-## 第三步：分模块定位
-
-### 3.1 排查策略：二分法定位
-
-```
-模型输出与基线不一致
-    │
-    ├─ 1. 仅运行 Prefill，对比输出
-    │   ├─ Prefill 输出一致 → 问题在 Decode 阶段（跳到 3.3）
-    │   └─ Prefill 输出不一致 → 问题在 Prefill 阶段（跳到 3.2）
-    │
-    ├─ 2. Decode 第 1 步 vs 第 N 步
-    │   ├─ 第 1 步就不一致 → FA 入参或 KVCache 初始状态问题
-    │   └─ 第 N 步开始不一致 → kv_len 累计更新或缓存溢出问题
-    │
-    └─ 3. 逐层对比（跳到第四步）
-```
-
-### 3.2 Prefill 阶段精度排查
-
-**KVCache 写入验证**：在写入算子（PA 模式 `npu_scatter_nd_update_` / MLA 融合写入 `npu_kv_rmsnorm_rope_cache` / BSH legacy 骨架 `scatter_update_`）调用前后插桩，检查：
-1. 写入前缓存是否为零（首次 Prefill）
-2. 写入后缓存内容与 key_states 是否一致（阈值 1e-6）
-3. PA 路径：cache / states 都需 view 为 `[total, num_kv_heads, head_dim]`；slot_mapping 取 `forward_metadata.slot_mapping[self.attn_type].view(-1, 1)`
-4. BSH legacy 路径：scatter_update_ 的 axis 与 layout 匹配（BSH → axis=1）
-
-**FA 入参验证**：打印并校验 Q/K/V shape、actual_seq_qlen/kvlen、sparse_mode、是否含 NaN/Inf
-
-### 3.3 Decode 阶段精度排查
-
-**KVCache 写入验证**：
-1. 验证 slot_mapping 计算（独立部署连续缓存：`expected_slot = kv_len.view(-1,1) + kv_len_offset`；PA 模式：框架部署由 `prepare_slot_mapping()` 生成，独立部署 Runner 自管按 block_table 索引构造）
-2. 验证写入位置未越界
-3. 验证 kv_len 逐步递增正确
-
-**FA 入参验证**（按路径分类）：
-1. 标准 LLM TND PA：sparse_mode=3 + causal mask（与 Prefill 一致）
-2. 滑窗层：sparse_mode=4 + band mask + `pre_tokens=sliding_window`
-3. MLA absorb Decode：sparse_mode=0 + `mask=None`
-4. actual_seq_qlen 每个值通常为 1（MTP 场景为 `next_n+1`）
-5. block_table dtype 必须为 int32
-6. KV cache 已写入区域无 NaN/Inf
-
-### 3.4 分页注意力（PA）专项排查
-
-1. **block_table 静态校验**：`numel == batch_size × (max_seq_len // block_size)`
-2. **block_table 值域校验**：应为 `[0, total_blocks)` 的排列，无重复
-3. **slot_mapping 与 block_table 交叉验证**
-
----
-
-## 第四步：逐层精细对比
-
-### 4.1 逐层对比框架
-
-在 Transformer Block 的 8 个关键位置插入 checkpoint，与基线对比：
-
-| 序号 | 位置 | 重要程度 |
-|:----:|------|:--------:|
-| 1 | Block 输入 | 普通 |
-| 2 | Attention Norm 后 | 普通 |
-| 3 | QKV 投影后 | 普通 |
-| 4 | RoPE 后 | 普通 |
-| 5 | KVCache 写入后 | **关键** |
-| 6 | FA 输出 | **关键** |
-| 7 | Attention 残差后 | 普通 |
-| 8 | Block 输出 | 普通 |
-
-**对比指标**（均转为 float32 计算）：max_abs_diff / max_rel_diff / cosine_similarity
-
-**判定阈值**：BF16 模式 max_rel < 1e-3，量化模式 max_rel < 1e-2
-
-**使用流程**：dump 基线 → compare 优化后 → 定位首次出现偏差的层和位置
-
----
-
-## 第五步：常见精度陷阱与修复
-
-### 5.1 KVCache 写入相关
-
-| 问题 | 根因 | 修复方案 |
+| 步骤 | 目标 | 出口判据 |
 |------|------|---------|
-| 缓存写入位置偏移（PA 模式） | `npu_scatter_nd_update_` 的 cache / states view 形态不一致或 slot_mapping 索引错误 | cache 和 states 都 view 为 `[total, num_kv_heads, head_dim]`；slot_mapping 取 `forward_metadata.slot_mapping[self.attn_type].view(-1, 1)` |
-| 缓存写入位置偏移（BSH legacy 骨架） | `scatter_update_` 的 axis 与 layout 不匹配 | BSH → axis=1 |
-| 多 batch 缓存交叉写入（独立部署）| kv_len_offset 未按 max_seq_len 对齐 | `kv_len_offset = arange(0, batch*max_seq_len, max_seq_len)` |
-| Prefill 后缓存部分为零 | kv_len 计算错误 | 检查 kv_len 是否等于实际有效序列长度（具体值视框架约定） |
-| NZ 格式下缓存异常 | cache_mode 设置错误 | PA 模式使用 `cache_mode="PA_NZ"` |
-| 融合写入算子结果不一致 | npu_kv_rmsnorm_rope_cache 参数不匹配 | 对齐 epsilon（用 `kv_a_layernorm.variance_epsilon` 而非硬编码）和 RoPE 频率 |
+| 一 定界与信息收集 | 收齐必需信息，排除已知模式 | 必需项齐备，已知模式未命中 |
+| 二 建立可复现的最简场景 | 拿到稳定复现且单次成本最小的场景 | 必现、随机性已固定、特性已关到最简、成本已裁剪 |
+| 三 建立对比基准 | 定下整网判定口径，需要时选参考后端 | 整网口径已定，需要参考后端的已选定 |
+| 四 定位可疑对象 | 从整网缩到单个算子或内存位置 | 产出首个偏差点或候选排序 |
+| 五 根因确认与归类 | 确认根因并归类 | 根因有数值或代码证据 |
+| 六 修复与验证 | 修复并在完整配置下复验 | 整网口径达标，特性与规模已还原 |
 
-### 5.2 FA 算子相关
+用户只要求定位根因的，做到第五步为止；明确要求修复的才进第六步。
 
-| 问题 | 根因 | 修复方案 |
-|------|------|---------|
-| MLA absorb Decode 偏差大 | Decode 仍用 sparse_mode=3 + causal mask | MLA absorb Decode 切 `sparse_mode=0` + `atten_mask=None` |
-| 标准 LLM Decode 偏差 | Decode 误改成 `sparse_mode=0` + `mask=None` | 标准 LLM TND PA 路径 Decode 保持与 Prefill 一致 `sparse_mode=3` + causal mask |
-| 滑窗层 Decode 偏差 | Decode 误改成 `sparse_mode=0` | 滑窗层 Prefill+Decode 统一 `sparse_mode=4` + band，配 `pre_tokens=sliding_window` / `next_tokens=0` |
-| actual_seq_lengths 错误 | TND 应用 cumsum，BSH 用原始值；框架部署字段名 `actual_seq_lengths_cu_q` vs `actual_seq_lengths_kv` | 参考 `model-infer-kvcache` skill §2.4 |
-| Decode 首步输出为零 | actual_seq_qlen 为 0 | Decode 时应为 1 或 cumsum([1,...]) |
-| MLA absorb 模式 key≠value | cache_nope 读写不一致 | FA 中 key 和 value 都传 cache_nope |
-| scale 参数错误 | FA v1 用 `scale`，v2 用 `softmax_scale` | 确认参数名与版本匹配 |
+按症状选定位主线：
 
-### 5.3 量化相关
+| 症状 | 机判信号 | 主线 | 是否需基准 |
+|------|---------|------|-----------|
+| 与基线存在数值偏差 | 有，超阈即信号 | 有历史正常版本走版本二分；基准侧能重跑取中间值走 4.1，否则 4.2 | 自带，即改造前或已知正常版本 |
+| NaN / Inf / 异常大值 | 有 | 逐级插点，判张量自身（4.1） | 否 |
+| 多次运行输出不稳定 | 有，两次差异即信号 | 运行实例对比（4.1） | 自带 |
+| batch 一致性偏差 | 有，同请求跨 batch 组成不一致 | 两种 batch 组成互为基准，走 4.1 | 自带 |
+| 输出质量劣化 | 无 | 先建基准，再走 4.1 或 4.2 的替换扫描 | 是 |
+| 加 dump 后现象改变 | 有，现象随观测动作改变即信号 | 内存类（4.3） | 否 |
 
-| 问题 | 根因 | 修复方案 |
-|------|------|---------|
-| W8A8 精度从某层开始放大 | dequant_scale 与权重不匹配 | 检查 per-channel/per-tensor scale |
-| W8A8C8 KVCache 精度差 | KV 缓存量化精度损失 | 检查 KV 量化 scale；考虑 BF16 KV |
-| antiquant_mode 不匹配 | FA v1/v2 量化接口不同 | v1 用 antiquant_*，v2 用 dequant_* |
+**输出质量劣化**指数值指标未超阈或无法机判，但输出内容存在可见错误，例如个别 token 错误、混入非预期语种字符、重复或退化。
 
-### 5.4 Prefill/Decode 一致性
-
-| 问题 | 根因 | 修复方案 |
-|------|------|---------|
-| Prefill 不走 KVCache 写入 | 条件分支逻辑错误 | 确保 Prefill 也执行写入算子 |
-| Decode 使用了与路径不符的 FA 参数 | 阶段分支判断或路径分类错误 | 阶段分支取自 `forward_metadata.is_prefill`；按路径分类配 sparse_mode / atten_mask（标准 LLM TND PA 不分阶段统一配置；MLA absorb 才显式分支 Decode 切到 0+None） |
-| 切换阶段时 kv_len 未更新 | Prefill 后未执行 kv_len += seq_len | 在 Prefill→Decode 切换时由 Runner 层（独立部署）或 ExecutionEngine（框架部署）更新 |
-| MLA absorb Decode 误传 atten_mask | 切到 sparse_mode=0 后没把 mask 设 None | MLA absorb Decode 同时设 `sparse_mode=0` + `atten_mask=None` |
+第一、二步对所有路径必做，路由只决定其后的步骤。
 
 ---
 
-## 附录 F：FA 入参配置参考
+## 第一步：定界与信息收集
 
-> 表格供快速验证清单引用，完整校验代码见 `references/fa_debug_utils.md`，可在 FA 调用前插入 `debug_fa_all_params()` 一键检查。
+### 1.1 候选责任方
 
-### F.1 atten_mask 与 sparse_mode 联合校验
+| 类别 | 含义 | 典型信号 | 确认时机 |
+|------|--------|---------|---------|
+| 权重与输入数据 | 送进计算的数据本身，含权重加载映射、量化 scale、输入构造与解码配置 | 权重统计或输入构造核对即发现异常 | 1.3 已知模式核对 |
+| 框架实现 | 框架侧代码的实现或其与模型的配合，含执行器流程、公共模块与加速特性 | 关掉某特性即恢复；或特性全关仍偏离而模型侧代码与框架契约相符 | 2.3 关特性；非特性类在 5.2 按代码归属定性 |
+| 算子 | 单个算子内部的实现，输入正确而输出不对 | 单算子与参考实现比对即偏离 | 5.1 参考实现重算 |
+| 模型实现 | 模型侧代码中算子之间的组织方式，每个算子都对但连接、顺序或分支选错 | 其余各类均排除，整网仍偏离 | 5.2 根因归类 |
 
-| sparse_mode | 含义 | atten_mask 要求 | 适用路径 | 常见错误 |
-|:-----------:|------|----------------|---------|---------|
-| 0 | defaultMask | 可选，通常 **None** | **MLA absorb Decode**（q_len=1） | 误把标准 LLM TND PA Decode 也切到此路径 |
-| 1 | allMask | **必传** `(Q_S, KV_S)` | 特殊 | 忘记传 mask |
-| 2 | leftUpCausal | **不推荐** | — | — |
-| 3 | rightDownCausal | **必传** `(2048, 2048)` 下三角 | **标准 LLM TND PA（Prefill+Decode 统一）**、MLA absorb Prefill | mask 不是下三角；MLA absorb Decode 误用 |
-| 4 | band（滑窗） | **必传** `(2048, 2048)` | 滑窗层 Prefill+Decode 统一 | pre_tokens/next_tokens 错误；FA v1 + BSH + Q_S=1 Decode 路径 op 内部忽略 |
+本表按责任归属分，用于定界时列候选；5.2 按缺陷性质分，用于确认后定性，两者不是一一对应。「算子」在 5.2 细分为算子实现错误、数值精度、参数配置三种；运行时内存与并行与通信横跨多个责任方，只在 5.2 独立成类——例如内存问题可能出自算子内部，也可能出自框架的内存分配或图模式复用。
 
-### F.2 FA v1 vs v2 关键参数名映射
+### 1.2 定位所需信息
 
-| 功能 | FA v1 | FA v2 | 易错点 |
-|------|-------|-------|--------|
-| 缩放系数 | `scale` | `softmax_scale` | 默认 1.0，传错名精度崩溃 |
-| Q head 数 | `num_heads` | `num_query_heads` | 传错名默认 1 |
-| Q 长度 | `actual_seq_lengths` | `actual_seq_qlen` | 名称完全不同 |
-| KV 长度 | `actual_seq_lengths_kv` | `actual_seq_kvlen` | 名称完全不同 |
-| KV 量化 | `antiquant_scale/offset` | `dequant_scale_key/value` | v2 分离 key/value |
+**必需项**：模型与权重路径、复现命令、异常输出样例、验收判据、硬件与并行配置、当前开启的特性列表、输入构造与解码配置（chat template、tokenizer、采样参数、eos 处理）。
 
-### F.3 input_layout 与 tensor shape 匹配
+**条件必需项**：走对比路径的还需要正常输出或期望输出，有 NaN 这类自证信号的不需要。
 
-| layout | Q 维度 | K/V 维度 | 适用场景 |
-|--------|--------|---------|---------|
-| **TND** ★ | 3D `[T, N, D]` | 3D `[T, N, D]` | **框架部署 PA 标准 LLM 默认推荐**，T = packed tokens |
-| **TND_NTD** ★ | 3D `[T, N, D]` | 3D `[N, T, D]` | **框架部署 PA + MLA absorb 默认推荐**，KV 是 NZ 格式 |
-| BSH | 3D `[B, S, H*D]` | 3D `[B, S, H*D]` | migrator 骨架 / 独立部署连续缓存（非 PA） |
-| BNSD | 4D `[B, N, S, D]` | 4D `[B, N, S, D]` | 非 PA，扩散模型 |
-| BSND_NBSD | 4D `[B, S, N, D]` | 4D `[N, B, S, D]` | KVP 长序列场景（普通 PA 模型走 TND/TND_NTD） |
+**可选项**：是否有历史正常版本、是否有其他框架或硬件的正常结果、能否逐个关闭特性、是否允许长时间运行、dump 接口是否可用、cache 有效位如何获取。这些决定后续能走哪条主线。
 
-> ★ 标注的 TND / TND_NTD 是框架部署默认推荐 layout（详见 `model-infer-kvcache` §2.7）。PA 模式下 KV 按 block_table 索引，物理存储 shape `[total_blocks, block_size, num_kv_heads, head_dim]`，FA 调用时 view 为 `[bn, bs, num_head*dim]`。
+**模型结构分析**：各层的模块组成与算子调用序列、attention 形态（含 MLA、滑窗、分页）、量化方式。
 
-### F.4 actual_seq_lengths 构造
+必需项缺失时不猜测、不硬编码，输出补充诉求，不进入定位。
 
-| layout | actual_seq_qlen | actual_seq_kvlen |
-|--------|----------------|-----------------|
-| TND | 累积和 `cumsum([s1, s2, ...])` | 累积和 |
-| BSH / BNSD | 原始值 `[s1, s2, ...]` | 原始值 |
+### 1.3 已知模式先行
 
-Decode 时 actual_seq_qlen 每个值通常为 1（MTP 场景除外）。
+进第二步前做一轮低成本核对：
 
-### F.5 inner_precise 行无效
+- 对照 `references/known_issues.md`
+- KVCache / FA 相关现象走 `references/kvcache_fa_checklist.md` 的症状分类与快速验证清单，入参类各项用 `scripts/fa_debug_utils.py` 在 FA 调用前一键校验
+- 本模型的 FA 调用写法与同路径既有实现对照，见 `model-infer-kvcache` 的 `references/fa-code-examples.md`
+- 权重与输入数据类做加载后的权重统计核对与输入构造核对
 
-| 值 | 精度模式 | 行无效修正 | 适用场景 |
-|:-:|------|:---:|---------|
-| 0 | 高精度 | 否 | 默认 |
-| 1 | 高性能 | 否 | 精度要求不高 |
-| 2 | 高精度 | **是** | Prefill + 自定义 mask 有全遮蔽行 |
-| 3 | 高性能 | **是** | 同上但允许精度损失 |
-
-### F.6 MLA rope 约束
-
-- `query_rope` 和 `key_rope` 必须同时传或同时不传
-- rope D 必须为 64，query D 仅支持 512 或 128
-- D=512 时仅支持 `sparse_mode` 为 0、3、4
+命中即形成修复假设，改完回第二步取一个可复现场景，按 3.1 定下整网判定口径，再进第六步验证。未做过规模裁剪与特性关闭的，第六步只做第 1 条。
 
 ---
 
-## 精度调试报告模板
+## 第二步：建立可复现的最简场景
 
-```markdown
-## 精度调试报告
+### 2.1 必现性判定
 
-### 问题概要
-- 症状：{描述}
-- 定位阶段：{Prefill / Decode / 两者}
-- 定位模块：{KVCache 写入 / FA 计算 / 量化参数 / ...}
+同一 Case 连跑两次比对输出。两次一致只说明这两次没观察到变化，不等于确定性，后续每轮收敛仍按同样次数复跑。
 
-### 根因分析
-- 原因：{具体原因}
-- 影响范围：{受影响的层/模块}
+| 观察 | 结论 | 下一步 |
+|------|------|--------|
+| 每次都在同一判据上失败 | 可按确定性问题处理 | 2.2 只做第 1 条，再进 2.3 |
+| 时对时错 | 存在随机性或时序问题 | 先固定随机源；仍变动的转运行实例对比 |
+| 输出内容每次不同但都错 | 存在随机性 | 先固定随机源；仍变动的转运行实例对比 |
 
-### 修复措施
-| 修改文件 | 修改内容 | 修改原因 |
-|---------|---------|---------|
-| {file} | {change} | {reason} |
+### 2.2 构造必现场景
 
-### 修复验证
-- 精度对比：{通过/未通过，max_rel_diff, cosine_similarity}
-- 输出一致性：{token 序列对比结果}
+按序执行，任一步拿到必现即停：
 
-### 遗留风险
-- {如有，列出可能的后续风险}
-```
+1. 固定随机源：seed、采样参数、输入内容与顺序、batch 组成、并行配置、cache 初始状态。排查 batch 一致性偏差时 batch 组成本身是被测变量，固定其余项即可
+2. 打开 NPU 侧的确定性计算。这几项都以性能为代价，只在定位期间开，定位完恢复：
+
+   ```bash
+   export HCCL_DETERMINISTIC=true
+   export CLOSE_MATMUL_K_SHIFT=1
+   export HCCL_OP_EXPANSION_MODE=HOST
+   ```
+
+   上面是配置样例，实际要设哪些取决于所在平台与模型已有的设置，先核对 `models/{model_name}/` 的启动脚本与 README 已导出的相关变量。`HCCL_OP_EXPANSION_MODE` 就属这类：部分模型已设为 `AIV` 求性能，定位期间改 `HOST`，完成后改回原值。`CLOSE_MATMUL_K_SHIFT` 是算子侧环境变量，仓内无用例，使用前按 CANN 文档确认。
+
+   开关都设上仍有非确定性的，成因可能在算子侧：部分算子会按运行时信息在多种实现间选择
+3. 放大触发条件：增大 batch、加长序列、提高并发、拉长生成轮数；或在怀疑维度上扫参数空间
+
+按序走完仍不必现的，转第四步的运行实例对比。
+
+本步排查中加 print 或 dump 后现象改变的，属内存问题，观测本身会改变它，转 4.3，不要在本步继续加点。
+
+### 2.3 降复杂度与逐项关特性
+
+**关闭顺序**：多流 → MTP → SuperKernel → prefetch → 图模式 → 复杂融合，收敛到单流 eager 固定输入。
+
+**并行规模**：不作为收敛项。降到单卡会让 rank 间分叉类问题消失。需要单卡结果作对照时另起一次运行，原多卡必现场景保留不动。
+
+**收敛到某个特性**：该特性开启复现、关闭不复现，即收敛到它的实现路径，对照该特性对应单点 skill 复核实施有无偏差。这只是第一层收敛，不等于根因——特性实现、被特性暴露的算子缺陷、调度或内存问题都会有同样表现，仍需给出根因证据并完整复验。
+
+**仅多卡复现**：先按 3.2 取同配置单卡结果作基准，再按第四步收敛。
+
+**仅图模式复现**：先在 eager 下确认。eager 下不复现的按 `references/graph_mode_debug.md` 的分层排查逐层剥离。
+
+### 2.4 裁剪单次成本
+
+减层数、缩序列、降 batch、减生成轮数，保持复现的前提下压到最短；也可反向用最小配置让问题孤立暴露。裁剪放在关特性之后：关特性产出的是定性结论，规模变化会成为混淆项。
 
 ---
 
-## 其他已知精度问题
+## 第三步：建立对比基准
 
-> 以下问题来自本仓已适配模型的调试经验，不属于 KVCache/FA 范畴但会导致精度异常。
+整网判定口径所有路径必做。症状自带基准或有自证信号的（总览路由表「是否需基准」列为「自带」或「否」），只做 3.1，不做 3.2。
 
-| 问题 | 症状 | 根因 | 修复 |
+### 3.1 整网判定口径
+
+后续的替换扫描与复验都用这一口径，全程不改。按可机判程度选，有自证信号的用「自证信号归零」，其余按表中顺序依次取：
+
+| 口径 | 取法 |
+|------|------|
+| 自证信号归零 | NaN / Inf 消失，数值回到正常范围 |
+| token 序列完全一致 | 固定采样后逐 token 比对生成结果 |
+| logits cosine similarity | 取末层 logits 与基准算余弦相似度 |
+| 任务指标 | 数据集评测得分，如 GSM8K 准确率 |
+
+选连续口径的在此一并定下达标线并全程不改，达标线未定不进第四步。
+
+### 3.2 参考后端选择
+
+| 来源 | 前提 | 代价 | 粒度 |
 |------|------|------|------|
-| **MoE 专家权重未加载** | MoE 输出全零或接近零，cosine~0.4-0.8 | Checkpoint 用 packed tensor 但 load_weights 用 per-expert mapping，权重未正确拷贝 | 添加 packed expert weight loader，按 EP rank 切片后 copy_ 到参数 |
-| **Zero expert 处理错误** | MoE 输出偏差或切换路由算子后精度骤降至 ~40-50% | 零专家 identity 贡献公式错（应用 original_input 而非 MoE 输出），或路由算子 v1 无 `active_expert_range` 导致零专家 ID 污染 token 排列 | 路由前用 mask 分离零专家，路由后加回 `original_input * weight` 的 identity 贡献 |
-| **DP+EP token 不同步 → NaN** | Decode 若干步后出现 NaN，之后全部 NaN | EP all_to_all 有浮点非确定性，DP 各 rank token 选择分叉 → KV cache 累积偏差 | 每步 Decode 后 `dist.broadcast(next_token, src=0)` 强制所有 DP rank 使用相同 token |
-| **跳过训练组件的 scale 缺失** | 输出语义正确但严重重复/退化 | 模型训练时有额外组件，跳过后 embedding 幅度不匹配 | 保留训练时的 normalization factor |
+| 历史正常版本 | 曾正常、之后异常 | 低 | 版本二分 |
+| 同配置单卡结果 | 仅多卡复现 | 低 | 整网到算子 |
+| 同请求的另一种 batch 组成 | 症状是 batch 一致性偏差 | 低 | 整网到算子 |
+| 其他框架或异构参考硬件的正常结果 | 同模型在别处跑通 | 中 | 整网到算子 |
+| 参考实现重算 | 可按算法定义重写 | 高 | 单算子 |
+| 关特性凑出的正常版本 | 其余来源都不可得 | 高 | 整网到算子 |
+
+单卡结果与另一种 batch 组成只能定位分歧点，哪侧正确需在第五步确认。
+
+粒度列决定第四步能用哪个手段：「整网到算子」可走 4.1 的与基准比对；「单算子」只能走 4.2 扫描出候选再进第五步；「版本二分」先在版本维度上收敛，收敛到具体改动后再决定要不要进 4.1。关特性凑出的正常版本只作对比侧用，特性维度本身的收敛已在 2.3 完成，不重复。
+
+选参考实现重算的，要求数值正确不要求性能，只跑问题算子或局部子图，不整网重算。
+
+表中来源都拿不到时，特性已关到最简、配置维度也已用尽，不必回头重试，改在其余维度上找——换权重版本、换输入、换硬件或框架。仍拿不到则报告阻塞，不凭现象指认算子。
+
+---
+
+## 第四步：定位可疑对象
+
+先看能否在成本更低的维度上收敛：
+
+| 维度 | 适用 | 手段 | 收敛后 |
+|------|------|------|--------|
+| 版本二分 | 有历史正常版本 | git bisect，改动条数少时直接逐个回退 | 收敛到那次改动后，在改动内部继续定位 |
+| 运行实例对比 | 固定随机源后输出仍变动 | 取一次运行作基准，另一次与之比对 | 仅得基准，续走 4.1 |
+
+配置维度已在第二步用过，不再重试。都不适用的进 4.1；观测会改变现象的直接进 4.3。
+
+### 4.1 逐级插点收敛
+
+按阶段 → 层 → 模块 → 算子四级由外向内逐级插点。每级在该级单元序列的中点插一个点，判出偏差落在哪半后继续二分，收敛到单个单元再进它内部。一轮只推进一级，插点越多越会改变时序。
+
+| 层次 | 插点位置 |
+|------|--------|
+| 阶段 | Prefill 与 Decode 之间、Decode 第 1 步与第 N 步之间 |
+| 层 | 相邻 decoder layer 之间 |
+| 模块 | 出问题层内的 norm、attention、MLP 之间 |
+| 算子 | 出问题模块内的各 NPU 算子调用之间 |
+
+判据分两种，收敛结构相同，差别只在判据的来源。
+
+**判张量自身**：有 NaN、Inf、异常大值这类自证信号时用。跑一次即可，每点只留一个布尔，不必存张量：含 NaN、含 Inf、全零、或量级明显偏离同层其他位置，任一成立即判该点已坏。
+
+**与基准比对**：无自证信号时用，两侧同一份插桩各跑一次，逐点比对，取第一个偏离的位置进入下一级。停止判据是输入一致而输出偏离，该算子即引入点；输入已偏离的只是传播者，继续上溯。记录项、取点位置与比对方法见 `references/operator_compare.md`。
+
+两种判据都只追每级第一个出问题的位置，不在后续位置上继续比对。定位到 attention 或 cache 相关算子后，该处的现象与根因对应见 `references/kvcache_fa_checklist.md`。
+
+插点引入的读取会改变内存类问题的暴露形态，插入后现象改变即转 4.3，不再增加插点。
+
+### 4.2 逐算子替换扫描（4.1 不可用时）
+
+优先走 4.1，拿不到可逐点配对的中间张量时才用替换扫描，典型情形是两侧张量按语义位置也对不齐（跨框架、跨硬件）、无法插桩（图模式或代码不可改）、基准粒度只到整网。
+
+做法是把可疑算子替换为参考实现（构造方式见 `references/operator_compare.md` 的「没有基准侧时」），看整网口径是否改善，按改善程度给候选排序，连续口径同样可用。这里拿整网当探针间接判断，一次扫多个候选；第五步则直接看单个算子的输出，一次确认一个。两者观测点不同，不可互相替代。
+
+口径改善只说明该算子的实现与参考实现存在可观测差异，不等于该算子有误：参考实现本身可能写错；差异也可能是合理的累加顺序或中间精度差异恰好被放大；替换还可能连带改变下游数值路径，掩盖或引出别的问题。哪一侧正确、差异是否超出该算子的合理范围，都要进第五步逐点确认。
+
+反过来，口径没有改善也不能说明该算子无误。多个算子同时劣化时单个替换观察不到变化，这种情形要按模块整组替换，命中后再在模块内细分。
+
+扫描顺序按高风险优先，高风险两类：
+
+1. 新算子，含 `ops/` 下的自研实现与任何非官方 API 实现
+2. 已有算子的入参组合超出已验证范围，典型是不支持的 shape，也包括 dtype、layout、head 数、序列长度的边界组合
+
+第二类用 `../model-infer-fusion/scripts/torch_npu_query.py` 查 API 约束，或对照 `model-infer-runtime-debug` 的算子约束速查。
+
+需预先设定时间预算，耗尽即停止，输出当前候选排序并按第六步的产出项报告阻塞。
+
+### 4.3 内存类问题（观测会改变现象时）
+
+**含义**：计算过程读写了不该读写的内存——内存未清零就当作有效数据用，读到上一次残留的脏值；或写到本不属于它的地址，覆盖其他数据。缺陷可能在算子内部，也可能在框架的内存分配或图模式的内存复用。
+
+**判别信号**：加 dump 或 print 后现象改变——位置挪了、现象消失了、或同一位置的错误值变了。任何改变内存排布或访问顺序的动作都会改变它，4.1 与 4.2 因此失效，观测点加得越多，现象与未插桩时的差距越大。同步只是会改变它的动作之一，不是唯一成因。
+
+**候选来源**：逐级收敛这条路已失效，按 4.2 的高风险两类取候选——新算子，以及入参组合超出已验证范围的已有算子。
+
+**检查方向**：候选对象的内存初始化与写入范围，观测用 `references/operator_compare.md` 的低扰动异步探针。定位到位置后转 5.2 归到运行时内存；缩不下去按第六步的产出项报告阻塞，不凭现象指认。
+
+**假原地算子**：算子声明为不修改入参，实际却把结果写回某个输入张量。写入不在调用方的预期内，下游读到的可能是被覆盖后的值。判定方式见 `references/graph_mode_debug.md` 的分层 backend 排查。
+
+---
+
+## 第五步：根因确认与归类
+
+### 5.1 参考实现重算
+
+判断该算子的计算是否正确，需要它的一份输入输出记录。4.1 与 4.2 都不产出这份记录，在该算子处单独补录一次即可——补录只取本侧输入，不需要与基准逐点配对，因此拿不到配对记录的情形同样适用。
+
+参考实现的构造方式见 `references/operator_compare.md` 的「没有基准侧时」。
+
+取记录的输入在参考后端重算，与记录的输出比对。比对方式与容差取值见 `references/operator_compare.md`，容差按数据精度格式与算子性质定，不是一个固定值。
+
+比对不达标即确认该算子引入偏差，转 5.2 定性。区分算子实现错误与数值精度看一个动作：提高中间精度或改累加顺序后偏差是否收敛到容差内，收敛的归数值精度，不变的归算子实现错误。
+
+比对达标只说明该算子在这份输入下算得对，不排除输入里的常量本身有误。还有未确认的候选就取下一个继续，候选用尽后转 5.2：引入点由 4.1 定出的查权重与输入数据，候选由 4.2 扫出的还要查模型实现。
+
+偏差随层单调放大是辅助信号，不单独定性——单个关键算子的有界误差也可能改变 token，正常舍入误差也可能累积。定性以参考实现比对、整网口径、以及修复前后对照为准。
+
+### 5.2 根因归类
+
+| 类别 | 含义 | 修复方向 |
+|------|------|---------|
+| 算子实现错误 | 算子内部计算逻辑与算法定义不符 | 对照算法定义修正 |
+| 数值精度 | 逻辑正确但中间精度或累加顺序导致误差超出可接受范围 | 调整中间精度、累加顺序或算子精度模式 |
+| 运行时内存 | 读写了不该读写的内存，见 4.3 | 补内存初始化、修正写入范围与原地写回处理 |
+| 参数配置 | 逻辑与数值都对，但算子入参与该路径的要求不符 | 按路径分类核对算子入参 |
+| 权重与输入数据 | 送进计算的数据本身就不对 | 修正权重加载映射、量化 scale 或输入构造 |
+| 模型实现 | 各算子自身都对，但调用顺序、连接或分支条件选错 | 对照算法定义修正调用顺序与分支条件 |
+| 并行与通信 | 切分或通信引入偏差，rank 间结果分叉 | 核对切分维度与通信算子的调用与入参 |
+| 框架实现 | 框架侧代码的流程编排或加速特性实现有误 | 特性类对照该特性对应的单点 skill 修正，其余核对执行器流程与公共模块的实现 |
+
+---
+
+## 第六步：修复与验证
+
+修复遵循最小改动、单变量，修在根因所属的那一层——算子入参不符就改调用点，不在下游加钳制掩盖。
+
+定位期间引入的东西不进交付：插桩与 dump 落盘、为对照替换上的参考实现、以及配套的择一开关，定型后全部删除。
+
+**验证**：按定位时的施加顺序逆序还原，每还原一项判定一次，前一条不达标不进下一条。
+
+1. 按第三步定下的整网口径判定达标
+2. 还原 2.4 裁剪掉的规模
+3. 2.3 关闭的特性逐项开回。某项开回后不达标的，把该特性作为新的收敛结论重走定位，不改已验证通过的修复
+4. 恢复 2.2 设置的确定性环境变量
+
+**产出**：按序输出。
+
+1. 症状
+2. 定位路径，含所走主线与所用基准
+3. 根因与归类
+4. 修复点
+5. 验证结果
+6. 遗留风险
+7. 阻塞点
+
+---
+
+## 参考文档索引
+
+| 文档 | 用途 |
+|------|------|
+| `references/kvcache_fa_checklist.md` | KVCache 写入、FA 入参、Prefill/Decode 对齐、PA 的症状分类、验证清单、陷阱表与入参参考 |
+| `references/operator_compare.md` | 记录项与取点位置、比对方法与容差、低扰动异步探针 |
+| `references/graph_mode_debug.md` | 分层 backend 排查、假原地算子判定、图模式下的取值方法 |
+| `references/known_issues.md` | 历史排查沉淀的现象与根因对照 |
+| `scripts/fa_debug_utils.py` | FA 入参一键校验，插入 FA 调用前 |
