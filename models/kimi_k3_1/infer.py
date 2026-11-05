@@ -23,6 +23,7 @@ from models.dspark_registry import (
 )
 from models.model_infer import KimiK3Infer
 from models.modules.attention_data import validate_mega_kda_replayssm_switch
+from models.modules.parallel_layout import vocab_tp_group_spec
 from runner_kimi_k3 import KimiK3DSparkRunner, KimiK3Runner
 
 
@@ -56,20 +57,37 @@ def check_settings(world_size, settings):
     ):
         raise ValueError("prefill_stub_token_id must be a non-negative integer")
     attn_tp = parallel.get("attn_tp_size", 1)
+    kda_tp = parallel.get("kda_tp_size", attn_tp)
+    cp_size = parallel.get("cp_size", 1)
     if attn_tp <= 0:
         raise ValueError("attn_tp_size must be greater than 0")
     if world_size <= 0 or world_size % attn_tp:
         raise ValueError(f"world_size={world_size} must be divisible by attn_tp_size={attn_tp}")
+    if cp_size <= 0 or world_size % cp_size:
+        raise ValueError(
+            f"world_size={world_size} must be divisible by cp_size={cp_size}"
+        )
+    if cp_size > 1 and attn_tp * cp_size != world_size:
+        raise ValueError("Kimi K3 CP requires attn_tp_size * cp_size == world_size")
+    if cp_size > 1 and kda_tp != attn_tp:
+        raise ValueError(
+            "Kimi K3 context parallelism requires kda_tp_size == attn_tp_size"
+        )
     if parallel.get("moe_tp_size", 1) != 1:
         raise ValueError("Kimi K3 requires moe_tp_size=1")
     for label in ("dense_tp_size", "embed_tp_size", "lmhead_tp_size", "oproj_tp_size"):
         size = parallel.get(label, 1)
         if size <= 0 or world_size % size:
             raise ValueError(f"world_size={world_size} must be divisible by {label}={size}")
-        if attn_tp % size:
+        if cp_size == 1 and attn_tp % size:
             raise ValueError(
                 f"attn_tp_size={attn_tp} must be divisible by {label}={size}"
             )
+        if cp_size > 1 and label in ("embed_tp_size", "lmhead_tp_size"):
+            try:
+                vocab_tp_group_spec(world_size, attn_tp, cp_size, size)
+            except ValueError as exc:
+                raise ValueError(f"invalid {label}: {exc}") from exc
     if parallel.get("oproj_tp_size", attn_tp) != attn_tp:
         raise ValueError("Kimi K3 requires oproj_tp_size=attn_tp_size")
     batch_size = data.get("batch_size", 1)
@@ -128,18 +146,24 @@ def check_settings(world_size, settings):
             f"moe_ep_size={world_size}"
         )
     prefill_mini_batch_size = model.get("prefill_mini_batch_size", 0)
+    prefill_batch_size = batch_size if cp_size > 1 else batch_size_per_rank
     if prefill_mini_batch_size < 0:
         raise ValueError("prefill_mini_batch_size must be greater than or equal to 0")
     if prefill_mini_batch_size > 0 and (
-        prefill_mini_batch_size > batch_size_per_rank
-        or batch_size_per_rank % prefill_mini_batch_size
+        prefill_mini_batch_size > prefill_batch_size
+        or prefill_batch_size % prefill_mini_batch_size
     ):
         raise ValueError(
-            f"batch_size_per_rank={batch_size_per_rank} must be divisible by "
+            f"prefill batch size={prefill_batch_size} must be divisible by "
             f"prefill_mini_batch_size={prefill_mini_batch_size}"
         )
-    if model.get("prefill_chunk_size", 0) < 0:
+    prefill_chunk_size = model.get("prefill_chunk_size", 0)
+    if prefill_chunk_size < 0:
         raise ValueError("prefill_chunk_size must be greater than or equal to 0")
+    if cp_size > 1 and prefill_mini_batch_size != 1:
+        raise ValueError("Kimi K3 context-parallel prefill requires mini batch size 1")
+    if cp_size > 1 and prefill_chunk_size > 0:
+        raise ValueError("chunked Prefill does not support context parallelism")
     if not isinstance(model.get("skip_warm_up", True), bool):
         raise ValueError("skip_warm_up must be a boolean")
     if not isinstance(model.get("force_eplb", False), bool):
@@ -325,15 +349,6 @@ def check_settings(world_size, settings):
             )
         if draft_config.vocab_size != target_config.vocab_size:
             raise ValueError("draft and target vocab_size must match")
-    if parallel.get("cp_size", 1) != 1:
-        raise ValueError("Kimi K3 offline mode does not support context parallel")
-    if custom_params.get("enable_superkernel", False):
-        if settings.get("exe_mode") != "npugraph_ex":
-            raise ValueError("enable_superkernel requires exe_mode npugraph_ex")
-        if not model.get("enable_static_kernel", False):
-            raise ValueError("enable_superkernel requires enable_static_kernel")
-        if not custom_params.get("enable_multi_streams", False):
-            raise ValueError("enable_superkernel requires enable_multi_streams")
     block_size = model.get("pa_block_size", 128)
     if block_size % 16:
         raise ValueError("pa_block_size must be divisible by 16 for the NZ MLA cache")

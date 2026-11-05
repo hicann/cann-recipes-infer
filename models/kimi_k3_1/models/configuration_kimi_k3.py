@@ -17,11 +17,32 @@
 
 from __future__ import annotations
 
-from copy import deepcopy
+import hashlib
+import json
 import re
+from copy import deepcopy
 from typing import Optional
 
 from transformers.configuration_utils import PretrainedConfig
+
+
+def dsa_compile_cache_tag(config, backend: str = "npu") -> str:
+    """Keep sparse graphs separate from dense MLA and other DSA contracts."""
+    dsa_config = getattr(config, "dsa_config", None)
+    if not dsa_config:
+        return "dense_mla"
+    contract = {
+        "dsa": dsa_config,
+        "backend": backend,
+        "epsilon": 1e-6,
+        "cache_layout": "PA_BSND_BF16",
+        "prolog": "cannbot" if backend == "npu" else "explicit",
+        "abi": 4,
+    }
+    digest = hashlib.sha256(
+        json.dumps(contract, sort_keys=True).encode(),
+    ).hexdigest()[:12]
+    return f"dsa_{digest}"
 
 
 def mla_uses_mxfp8(config):
@@ -215,6 +236,7 @@ class KimiLinearConfig(PretrainedConfig):
         mla_use_output_gate: bool = False,
         num_nextn_predict_layers: int = 0,
         linear_attn_config: Optional[dict] = None,
+        dsa_config: Optional[dict] = None,
         attn_res_block_size: Optional[int] = None,
         latent_moe_use_norm: bool = False,
         activation_situ_beta: Optional[float] = None,
@@ -270,6 +292,7 @@ class KimiLinearConfig(PretrainedConfig):
             topk_group=topk_group,
             num_nextn_predict_layers=num_nextn_predict_layers,
             linear_attn_config=deepcopy(linear_attn_config),
+            dsa_config=deepcopy(dsa_config),
             attn_res_block_size=attn_res_block_size,
             latent_moe_use_norm=latent_moe_use_norm,
             activation_situ_beta=activation_situ_beta,
@@ -278,6 +301,8 @@ class KimiLinearConfig(PretrainedConfig):
             routed_expert_hidden_size=routed_expert_hidden_size,
             topk_method=topk_method,
         )
+
+        self._validate_dsa_config(dsa_config, linear_attn_config, num_hidden_layers)
 
         for key in ("quantization_config", "compression_config"):
             if key in kwargs:
@@ -320,6 +345,49 @@ class KimiLinearConfig(PretrainedConfig):
             self.linear_attn_config
             and layer_idx + 1 in self.linear_attn_config["kda_layers"]
         )
+
+    def is_dsa_layer(self, layer_idx: int) -> bool:
+        return bool(self.dsa_config and layer_idx + 1 in self.dsa_config["dsa_layers"])
+
+    @staticmethod
+    def _validate_dsa_config(
+        dsa_config: Optional[dict],
+        linear_attn_config: Optional[dict],
+        num_hidden_layers: int,
+    ) -> None:
+        if dsa_config is None:
+            return
+        if not isinstance(dsa_config, dict) or not isinstance(
+            dsa_config.get("dsa_layers"), list
+        ):
+            raise ValueError("dsa_config requires a one-based dsa_layers list")
+        layers = dsa_config["dsa_layers"]
+        if any(
+            type(layer_number) is not int or not 1 <= layer_number <= num_hidden_layers
+            for layer_number in layers
+        ):
+            raise ValueError("dsa_layers must contain in-range integer layer numbers")
+        if len(set(layers)) != len(layers):
+            raise ValueError("duplicate dsa_layers")
+        if not linear_attn_config or not set(layers) <= set(
+            linear_attn_config.get("full_attn_layers", [])
+        ):
+            raise ValueError("DSA layers must be a subset of full_attn_layers")
+        for field in ("index_topk", "index_num_heads", "index_head_dim"):
+            if type(dsa_config.get(field)) is not int or dsa_config[field] <= 0:
+                raise ValueError(f"{field} must be a positive integer")
+        supported = {
+            "index_rope_dim": 0,
+            "index_k_norm_type": "layernorm",
+            "indexer_use_fp8": False,
+            "index_topk_freq": 1,
+            "index_skip_topk_offset": 1,
+        }
+        for field, expected in supported.items():
+            if dsa_config.get(field) != expected or type(dsa_config.get(field)) is not type(
+                expected
+            ):
+                raise ValueError(f"K3.1 DSA currently requires {field}={expected!r}")
 
     def _validate_architecture(self) -> None:
         if self.moe_router_activation_func not in ("softmax", "sigmoid"):

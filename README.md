@@ -22,7 +22,8 @@
 
 ## 📰 最新动态
 
-- [2026/10] [Kimi K3](models/kimi_k3/README.md) 在昇腾 950PR/DT 系列上新增 MegaKDA、ReplaySSM、SuperKernel 与 W8A8C8 量化支持，结合多流优化实现 **约 2.8× 推理加速**
+- [2026/11] [Kimi K3.1 Pro](models/kimi_k3_1/README.md) 模型在昇腾 950PR/DT 系列上已 **Day0 支持推理部署**，接入 DSA 融合算子、Indexer 多流、LI MXFP8 与 SFA FP8 KV 量化，并支持 Prefill CP
+- [2026/10] [Kimi K3](models/kimi_k3_1/README.md) 在昇腾 950PR/DT 系列上新增 MegaKDA、ReplaySSM、SuperKernel 与 W8A8C8 量化支持，结合多流优化实现 **约 2.8× 推理加速**
 - [2026/10] [LongCat-Next](models/longcat_next/README.md) 多模态模型在昇腾 Atlas A3 系列完成 NPU 推理适配，支持文本、图像和语音生成。
 - [2026/09] 新增 [DeepSeek-V4 Attention-FFN 分离样例](integration/vllm/dsv4-afd/deepseek_v4_afd_deployment_guide.md)：基于 vLLM 和 afd-plugin，提供昇腾 A5 上的 P2P 同步与 Window 异步方案，支持双 microbatch、ACLGraph 和 DSpark
 - [2026/09] [DeepSeek-V4.1-Flash](integration/vllm/dsv41-flash-single-npu-moe-offload/README.md) 模型在昇腾 950PR/DT 系列上已支持 **单卡推理部署**
@@ -35,7 +36,7 @@
 <summary>📜 更多历史动态</summary>
 
 - [2026/07] [daVinci-MagiHuman](models/davinci-magihuman/README.md)模型在昇腾Atlas A2/A3系列上已支持推理部署
-- [2026/07] [Kimi K3](models/kimi_k3/README.md) 模型在昇腾 950PR/DT 系列上已 **0day 支持推理部署**
+- [2026/07] [Kimi K3](models/kimi_k3_1/README.md) 模型在昇腾 950PR/DT 系列上已 **0day 支持推理部署**
 - [2026/07] [Ling-2.5](models/bailing_2_5/README.md) 模型在昇腾 950DT 系列上已支持推理部署
 - [2026/07] [Hy3](models/hy3/README.md) 模型在 Atlas A3 系列和昇腾 950PR/DT 系列上已 **0day 支持推理部署**
 - [2026/06] [GLM-5.2](models/glm_5_2/README.md)模型在昇腾Atlas A3系列上已支持推理部署
@@ -163,7 +164,7 @@ bash infer.sh
 |------|------|
 | [DeepSeek-V4.1-Flash](models/deepseek_v4_1/README.md)             |950PR/DT昇腾芯片，原生支持多模态推理，Engram offload等优化特性。
 | [daVinci-MagiHuman](models/davinci-magihuman/README.md)                     |基于Transformers库，在Atlas A2/A3环境中完成daVinci-MagiHuman模型部署，使能融合算子等优化特性。
-| [Kimi-K3](models/kimi_k3/README.md)                     |基于Transformers库，在昇腾950PR/DT环境中完成Kimi-K3混合注意力MoE模型的推理部署，KDA接入框架Mamba Cache，Routed Expert采用原生MXFP4权重与动态MXFP8激活，使能图模式编译与多流并行等优化特性。
+| [Kimi-K3](models/kimi_k3_1/README.md)                     |基于Transformers库，在昇腾950PR/DT环境中完成Kimi-K3混合注意力MoE模型的推理部署，KDA接入框架Mamba Cache，Routed Expert采用原生MXFP4权重与动态MXFP8激活，使能图模式编译与多流并行等优化特性。
 | [Ling-2.5](models/bailing_2_5/README.md)                |基于Transformers库，在昇腾950DT环境中完成Ling-2.5混合注意力MoE模型的推理部署，GLA线性注意力与MLA全注意力按层交替，Linear采用MXFP w8a8量化、MoE路由专家采用MXFP w4a8量化，使能图模式编译与多流并行等优化特性。
 | [GLM-5.2](models/glm_5_2/README.md)                     |基于Transformers库，沿用 DSA + MoE + MTP 结构，新增 IndexShare（跨层 top-k 复用），支持 W8A8 量化与 KV Offload 长序列部署。
 | [DeepSeek-V4](models/deepseek_v4/README.md)             |支持Atlas A3和950PR/DT多代际昇腾芯片，兼具1M长序列推理能力与超低交互时延表现，为DeepSeek模型支持Agentic应用提供计算底座，满足千行百业灵活要求。
@@ -267,7 +268,7 @@ bash infer.sh
 │   ├── hunyuan-video                           # HunyuanVideo 的模型脚本及执行配置
 │   ├── hy3                                     # Hy3 的模型脚本及执行配置
 │   ├── kimi_k2_thinking                        # Kimi-K2-Thinking 的模型脚本及执行配置
-│   ├── kimi_k3                                 # Kimi-K3 的模型脚本及执行配置
+│   ├── kimi_k3_1                               # Kimi-K3 的模型脚本及执行配置
 │   ├── longcat_flash                           # LongCat-Flash 的模型脚本及执行配置
 │   ├── longcat_flash_lite                      # LongCat-Flash-Lite 的模型脚本及执行配置
 │   ├── longcat_next                            # LongCat-Next 的模型脚本及执行配置

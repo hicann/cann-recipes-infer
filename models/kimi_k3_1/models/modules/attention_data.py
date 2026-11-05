@@ -29,12 +29,73 @@ from executor.utils.stream_utils import (
 
 from ..configuration_kimi_k3 import mla_uses_mxfp8
 from ..dspark_registry import DSPARK_DRAFT_MODEL_TYPES
+from executor.utils.forward_metadata import PrefillCPMetaData
+from .parallel_layout import rank_coordinates
 
 
 _NULL_BLOCKS = 1
 _BF16_CACHE_NZ_DIM = 16
 # Kept for callers that imported the historical private constant.
 _KV_CACHE_NZ_DIM = _BF16_CACHE_NZ_DIM
+
+
+def build_dsa_indexer_metadata(
+    num_heads: int,
+    head_dim: int,
+    topk: int,
+    cu_seqlens_q: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    layout_k: str = "PA_BBND",
+    *,
+    enable_quant: bool = True,
+    cu_seqlens_k: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """LI v2 scheduling for right-aligned keys in the selected layout."""
+    if enable_quant:
+        metadata_op = torch.ops.cann_ops_transformer.quant_lightning_indexer_metadata
+        quant_args = {"quant_mode": 3}
+    else:
+        metadata_op = torch.ops.cann_ops_transformer.lightning_indexer_metadata
+        quant_args = {}
+    layout_args = {"cu_seqlens_k": cu_seqlens_k} if layout_k == "TND" else {}
+    return metadata_op(
+        num_heads_q=num_heads,
+        num_heads_k=1,
+        head_dim=head_dim,
+        topk=topk,
+        cu_seqlens_q=cu_seqlens_q,
+        seqused_k=cache_seqlens,
+        batch_size=cache_seqlens.numel(),
+        max_seqlen_q=-1,
+        max_seqlen_k=-1,
+        layout_q="TND",
+        layout_k=layout_k,
+        mask_mode=3,
+        cmp_ratio=1,
+        **quant_args,
+        **layout_args,
+    )
+
+
+def build_dsa_decode_metadata(mla_metadata: dict) -> dict[str, torch.Tensor]:
+    """Run inside the compiled forward; never retain dynamic values across steps."""
+    block_table = mla_metadata["block_table"]["FullAttention"].to(torch.int32)
+    cu_seqlens_q = mla_metadata["actual_seq_lengths_cu_q"].to(torch.int32)
+    cache_seqlens = mla_metadata["actual_seq_lengths_kv"].to(torch.int32)
+    cache_seqlens = torch.where(block_table[:, 0] != 0, cache_seqlens, 0)
+    slots = mla_metadata["slot_mapping"]["FullAttention"].reshape(-1).to(torch.int64)
+    indexer_cu_q = torch.cat((cu_seqlens_q.new_zeros(1), cu_seqlens_q))
+    q_lengths = cu_seqlens_q - indexer_cu_q[:-1]
+    return {
+        "block_table": block_table,
+        "cu_q": cu_seqlens_q,
+        "indexer_cu_q": indexer_cu_q,
+        "kv_lengths": cache_seqlens,
+        "q_lengths": q_lengths,
+        "kernel_lengths": torch.where(cache_seqlens > 0, cache_seqlens, q_lengths),
+        "slots": slots,
+        "scatter_indices": slots.view(-1, 1),
+    }
 
 
 def build_paged_slot_mapping(
@@ -123,6 +184,65 @@ def gather_sp_shards_to_owner(
     return output.view(-1, local_hidden.shape[-1])[:input_len].contiguous()
 
 
+def gather_cp_sp_shards_to_owner(
+    local_hidden: torch.Tensor,
+    input_len: int,
+    owner_global_rank: int,
+    global_rank: int,
+    world_size: int,
+    attn_tp_size: int,
+    cp_size: int,
+):
+    """Route and reconstruct one CP Prefill prompt on its Decode owner.
+
+    Every physical rank contributes one equal-sized CP x TP sequence shard.
+    The world all-to-all sends those shards only to ``owner_global_rank``. The
+    physical CP-major/TP-minor rank order is already the contiguous sequence
+    order, so the owner only flattens the shards and trims global padding.
+    """
+    if cp_size <= 1:
+        raise ValueError("CP hidden routing requires cp_size greater than 1")
+    if attn_tp_size * cp_size != world_size:
+        raise ValueError("CP hidden routing requires attn_tp_size * cp_size == world_size")
+    if global_rank < 0 or global_rank >= world_size:
+        raise ValueError(f"global_rank must be in [0, {world_size})")
+    if owner_global_rank < 0 or owner_global_rank >= world_size:
+        raise ValueError(f"owner_global_rank must be in [0, {world_size})")
+    if input_len < 0:
+        raise ValueError("input_len must be non-negative")
+    if not dist.is_initialized():
+        raise RuntimeError("DSpark CP Prefill hidden routing requires initialized distributed")
+
+    flat = local_hidden.contiguous().view(-1)
+    shard_elements = flat.numel()
+    input_splits = [0] * world_size
+    input_splits[owner_global_rank] = shard_elements
+    if global_rank == owner_global_rank:
+        output = flat.new_empty(shard_elements * world_size)
+        output_splits = [shard_elements] * world_size
+    else:
+        output = flat.new_empty(0)
+        output_splits = [0] * world_size
+    dist.all_to_all_single(
+        output,
+        flat,
+        output_split_sizes=output_splits,
+        input_split_sizes=input_splits,
+    )
+    if global_rank != owner_global_rank:
+        return None
+
+    physical_shards = output.view(
+        world_size, local_hidden.shape[0], local_hidden.shape[-1]
+    )
+    context = physical_shards.reshape(-1, local_hidden.shape[-1])
+    if input_len > context.shape[0]:
+        raise ValueError(
+            f"input_len={input_len} exceeds reconstructed rows={context.shape[0]}"
+        )
+    return context[:input_len].contiguous()
+
+
 def _settings_get(settings: dict, section: str, key: str, default=None):
     return settings.get(section, {}).get(key, default)
 
@@ -207,15 +327,29 @@ class CacheData:
         custom_params = _settings_get(
             runner_settings, "model_config", "custom_params", {}
         ) or {}
+        self.enable_dsa_quant = custom_params.get("enable_dsa_quant", True)
         self.use_mla_w8a8c8 = mla_uses_mxfp8(config)
         self.enable_mega_kda_replayssm = _mega_kda_replayssm_enabled(
             runner_settings
         )
         self.attn_tp_size = _settings_get(runner_settings, "parallel_config", "attn_tp_size", 1)
+        self.cp_size = _settings_get(runner_settings, "parallel_config", "cp_size", 1)
         self.local_rank = int(os.getenv("LOCAL_RANK", "0"))
         self.rank_offset = int(os.getenv("RANK_OFFSET", "0"))
         self.global_rank = self.local_rank + self.rank_offset
-        self.attn_tp_rank = self.global_rank % self.attn_tp_size
+        self.attn_tp_rank, self.cp_rank = rank_coordinates(
+            self.global_rank, self.attn_tp_size, self.cp_size
+        )
+        if self.cp_size > 1 and self.draft_model_type in DSPARK_DRAFT_MODEL_TYPES:
+            dspark_tp = _settings_get(
+                runner_settings, "model_config", "dspark_tp_size", 8
+            )
+            if dspark_tp <= 0 or self.attn_tp_size % dspark_tp:
+                raise ValueError(
+                    "DSpark TP size must divide attn_tp_size when context "
+                    f"parallelism is enabled: attn_tp_size={self.attn_tp_size}, "
+                    f"dspark_tp_size={dspark_tp}"
+                )
 
         if self.batch_size % self.attn_tp_size:
             raise ValueError(
@@ -319,11 +453,51 @@ class CacheData:
             )
         return cache
 
+    def _init_dsa_cache(self, layer_idx: int) -> Dict[str, torch.Tensor]:
+        """DSA caches share MLA request ownership, not its NZ layout."""
+        if self.use_mla_w8a8c8:
+            raise ValueError("K3.1 DSA requires BF16 MLA projections")
+        blocks = _NULL_BLOCKS + self.mla_batch_per_rank * self.blocks_per_request
+        cache = {"attn_type": "DSA", "layer_idx": layer_idx}
+        index_dim = self.config.dsa_config["index_head_dim"]
+        if self.enable_dsa_quant:
+            widths = {
+                # FP8 latent, BF16 auxiliary values and per-128 FP32 descales.
+                "nope_cache": (
+                    self.config.kv_lora_rank
+                    + self.config.qk_rope_head_dim * 2
+                    + self.config.kv_lora_rank // 128 * 4
+                ),
+                "indexer_key_cache": index_dim,
+                "indexer_key_scale_cache": index_dim // 32,
+            }
+            dtype = torch.uint8
+        else:
+            widths = {
+                "nope_cache": self.config.kv_lora_rank,
+                "rope_cache": self.config.qk_rope_head_dim,
+                "indexer_key_cache": index_dim,
+            }
+            dtype = torch.bfloat16
+        for name, width in widths.items():
+            cache[name] = self._new_zeros((blocks, self.block_size, 1, width), dtype)
+            if self.prefill_chunk_size > 0:
+                prefill_blocks = _NULL_BLOCKS + self.prefill_batch_size * self.blocks_per_request
+                cache["prefill_" + name] = self._new_zeros(
+                    (prefill_blocks, self.block_size, 1, width), dtype
+                )
+        if self.enable_dsa_quant:
+            # Keep the Prolog input's dtype view outside the compiled Decode graph.
+            cache["nope_cache"] = cache["nope_cache"].view(torch.float8_e4m3fn)
+        return cache
+
     def init_cache_data(self) -> Tuple[Dict[str, torch.Tensor], ...]:
         cache_data = []
         for layer_idx in range(self.config.num_hidden_layers):
             if self.config.is_kda_layer(layer_idx):
                 cache_data.append(self._init_kda_cache(layer_idx))
+            elif getattr(self.config, "dsa_config", None) and self.config.is_dsa_layer(layer_idx):
+                cache_data.append(self._init_dsa_cache(layer_idx))
             else:
                 cache_data.append(self._init_mla_cache(layer_idx))
         return tuple(cache_data)
@@ -431,6 +605,9 @@ class AttnMetaData:
             "batch_size_per_rank",
             _settings_get(runner_settings, "data_config", "batch_size", 1),
         )
+        configured_batch_size = _settings_get(
+            runner_settings, "data_config", "batch_size", self.batch_size
+        )
         self.input_max_len = _settings_get(runner_settings, "data_config", "input_max_len", 128)
         self.max_new_tokens = _settings_get(runner_settings, "data_config", "max_new_tokens", 128)
         self.next_n = _settings_get(runner_settings, "model_config", "next_n", 0)
@@ -447,9 +624,13 @@ class AttnMetaData:
         self.prefill_chunk_size = _settings_get(
             runner_settings, "model_config", "prefill_chunk_size", 0
         )
-        self.prefill_batch_size = _settings_get(
+        self.cp_size = _settings_get(runner_settings, "parallel_config", "cp_size", 1)
+        self.prefill_batch_size = (
+            configured_batch_size if self.cp_size > 1 else self.batch_size
+        )
+        self.prefill_scratch_batch_size = _settings_get(
             runner_settings, "model_config", "prefill_mini_batch_size", 0
-        ) or self.batch_size
+        ) or self.prefill_batch_size
         self.attn_tp_size = _settings_get(runner_settings, "parallel_config", "attn_tp_size", 1)
         self.exe_mode = runner_settings.get("exe_mode", "eager")
         custom_params = _settings_get(
@@ -461,6 +642,8 @@ class AttnMetaData:
         )
         self.enable_multi_streams = custom_params.get("enable_multi_streams", False)
         self.enable_mega_kda = custom_params.get("enable_mega_kda", False)
+        self.dsa_backend = custom_params.get("dsa_backend", "npu")
+        self.enable_dsa_quant = custom_params.get("enable_dsa_quant", True)
         self.metadata_stream = (
             create_stream("mla_metadata", self.exe_mode)
             if self.enable_multi_streams and self.exe_mode != "ge_graph"
@@ -474,7 +657,14 @@ class AttnMetaData:
         self.local_rank = int(os.getenv("LOCAL_RANK", "0"))
         self.rank_offset = int(os.getenv("RANK_OFFSET", "0"))
         self.global_rank = self.local_rank + self.rank_offset
-        self.attn_tp_rank = self.global_rank % self.attn_tp_size
+        self.attn_tp_rank, self.cp_rank = rank_coordinates(
+            self.global_rank, self.attn_tp_size, self.cp_size
+        )
+        if self.cp_size > 1 and self.prefill_batch_size != self.batch_size * self.cp_size:
+            raise ValueError(
+                f"global batch_size={self.prefill_batch_size} must equal "
+                f"batch_size_per_rank={self.batch_size} * cp_size={self.cp_size}"
+            )
         if self.batch_size % self.attn_tp_size:
             raise ValueError(
                 f"batch_size={self.batch_size} must be divisible by "
@@ -527,6 +717,65 @@ class AttnMetaData:
             else None
         )
 
+    def _prefill_dsa_cp_metadata(self, cp_metadata, owner_slots: torch.Tensor) -> dict:
+        """Share paged KV between the two zigzag query segments and all layers."""
+        local_tokens = cp_metadata.local_token_num
+        fragment_len = local_tokens // 2
+        blocks = math.ceil(cp_metadata.global_padded_token_num / self.block_size)
+        block_table = torch.arange(
+            1, blocks + 1, dtype=torch.int32, device=self.device
+        ).view(1, -1).expand(2, -1).contiguous()
+        cu_q = torch.tensor(
+            [fragment_len, local_tokens], dtype=torch.int32, device=self.device
+        )
+        indexer_cu_q = torch.cat((cu_q.new_zeros(1), cu_q))
+        # Keep padded coordinates: right-aligned causal masking then gives
+        # each real query exactly its original prefix, including on the tail.
+        kv_lengths = cu_q.new_tensor([
+            (self.cp_rank + 1) * fragment_len,
+            (2 * self.cp_size - self.cp_rank) * fragment_len,
+        ])
+        metadata = {
+            "num_blocks": blocks + _NULL_BLOCKS,
+            "block_table": block_table,
+            "cu_q": cu_q,
+            "indexer_cu_q": indexer_cu_q,
+            "kv_lengths": kv_lengths,
+            "kernel_lengths": kv_lengths,
+            "persistent_scatter_indices": owner_slots.reshape(-1, 1).to(torch.int64),
+        }
+        if self.dsa_backend == "npu":
+            dsa = self.config.dsa_config
+            metadata["indexer_metadata"] = build_dsa_indexer_metadata(
+                dsa["index_num_heads"], dsa["index_head_dim"], dsa["index_topk"],
+                indexer_cu_q, kv_lengths, enable_quant=self.enable_dsa_quant,
+            )
+        return metadata
+
+    def prepare_dsa_decode_metadata(self, metadata: dict) -> None:
+        """Refresh shared DSA inputs once per compiled Decode/Verify forward."""
+        if metadata.get("is_prefill", False) or not getattr(self.config, "dsa_config", None):
+            return
+        mla_metadata = metadata.get("mla_decode_metadata")
+        if mla_metadata is not None:
+            # Always rebuild: a reused Python dict must not freeze lengths or
+            # request activity on a later eager call or graph capture.
+            mla_metadata["dsa_step"] = build_dsa_decode_metadata(mla_metadata)
+            if self.dsa_backend == "npu":
+                dsa_config = self.config.dsa_config
+                dsa_step = mla_metadata["dsa_step"]
+                dsa_step["indexer_metadata"] = build_dsa_indexer_metadata(
+                    dsa_config["index_num_heads"],
+                    dsa_config["index_head_dim"],
+                    dsa_config["index_topk"],
+                    dsa_step["indexer_cu_q"],
+                    dsa_step["kernel_lengths"],
+                    enable_quant=self.enable_dsa_quant,
+                )
+                slots = dsa_step["slots"]
+                # Finished requests share slot zero; Prolog skips negative slots.
+                dsa_step["prolog_slots"] = torch.where(slots == 0, -1, slots)
+
     def prepare_flash_mla_metadata(self, metadata: dict) -> None:
         """Build merged Flash MLA metadata inside the Decode execution path.
 
@@ -534,6 +783,12 @@ class AttnMetaData:
         metadata stream and its record/wait events share the graph's
         capture/replay lifecycle.
         """
+        dsa = getattr(self.config, "dsa_config", None)
+        if dsa and not (
+            set(self.config.linear_attn_config.get("full_attn_layers", []))
+            - set(dsa["dsa_layers"])
+        ):
+            return
         if metadata.get("is_prefill", False):
             return
         mla_metadata = metadata.get("mla_decode_metadata")
@@ -601,11 +856,13 @@ class AttnMetaData:
             return None
         block_ids = torch.arange(
             1,
-            1 + self.prefill_batch_size * self.blocks_per_request,
+            1 + self.prefill_scratch_batch_size * self.blocks_per_request,
             dtype=torch.int32,
             device=self.device,
         )
-        return block_ids.view(self.prefill_batch_size, self.blocks_per_request)
+        return block_ids.view(
+            self.prefill_scratch_batch_size, self.blocks_per_request
+        )
 
     def _slot_mapping(
         self,
@@ -638,6 +895,60 @@ class AttnMetaData:
             return torch.empty(0, dtype=torch.int64, device=self.device)
         return torch.cat(slots)
 
+    def _prefill_owned_request_ids(self) -> torch.Tensor:
+        """Global request IDs whose MLA latent this rank persists."""
+        base = self.attn_tp_rank * self.mla_batch_per_rank
+        return (
+            torch.arange(
+                base,
+                base + self.mla_batch_per_rank,
+                dtype=torch.long,
+                device=self.device,
+            )
+            * self.cp_size
+            + self.cp_rank
+        )
+
+    def _decode_owner_ids(self) -> torch.Tensor:
+        """Decode-local request rows owned by this CP/TP rank."""
+        start = self.attn_tp_rank * self.mla_batch_per_rank
+        local = torch.arange(
+            start, start + self.mla_batch_per_rank,
+            dtype=torch.long, device=self.device
+        )
+        return local
+
+    def _prefill_cp_metadata(self, seq_len: int, request_id: int) -> PrefillCPMetaData | None:
+        if self.cp_size <= 1:
+            return None
+        alignment = self.cp_size * math.lcm(self.attn_tp_size, 2)
+        padded_tokens = ((seq_len + alignment - 1) // alignment) * alignment
+        local_tokens = padded_tokens // self.cp_size
+        local_start = self.cp_rank * local_tokens
+        local_valid = max(0, min(seq_len - local_start, local_tokens))
+        owns_request = request_id % self.cp_size == self.cp_rank
+        empty = torch.empty(0, dtype=torch.long, device=self.device)
+        return PrefillCPMetaData(
+            enabled=True,
+            cp_size=self.cp_size,
+            global_padded_token_num=padded_tokens,
+            local_token_num=local_tokens,
+            local_indices=torch.arange(local_start, local_start + local_tokens, dtype=torch.long, device=self.device),
+            restore_indices=torch.arange(padded_tokens, dtype=torch.long, device=self.device),
+            global_valid_indices=torch.arange(seq_len, dtype=torch.long, device=self.device),
+            persistent_valid_indices=(torch.arange(seq_len, dtype=torch.long, device=self.device) if owns_request else empty),
+            output_request_indices=(torch.tensor([request_id // self.cp_size], dtype=torch.long, device=self.device) if owns_request else empty),
+            actual_seq_q_prev=torch.tensor([local_valid], dtype=torch.int32, device=self.device),
+            actual_seq_q_next=torch.empty(0, dtype=torch.int32, device=self.device),
+            kv_len_prev=torch.tensor(
+                [min(seq_len, local_start + local_tokens)],
+                dtype=torch.int32, device=self.device,
+            ),
+            kv_len_next=torch.empty(0, dtype=torch.int32, device=self.device),
+            local_prev_token_num=local_valid,
+            local_next_token_num=0,
+        )
+
     def _owner_slice(self):
         start = self.attn_tp_rank * self.mla_batch_per_rank
         return start, start + self.mla_batch_per_rank
@@ -649,7 +960,11 @@ class AttnMetaData:
         request_indices: torch.Tensor,
     ):
         """Select this rank's MLA writes from one global-request mini batch."""
-        owner_start, owner_end = self._owner_slice()
+        # Global request ID -> local cache row, for the requests this rank owns.
+        owner_rows = {
+            int(request_id): row
+            for row, request_id in enumerate(self._prefill_owned_request_ids().tolist())
+        }
         owner_token_indices = []
         owner_lens = []
         owner_cache_rows = []
@@ -660,7 +975,8 @@ class AttnMetaData:
         ):
             request_id = int(request_id_tensor.item())
             length = int(length_tensor.item())
-            if owner_start <= request_id < owner_end:
+            cache_row = owner_rows.get(request_id)
+            if cache_row is not None:
                 owner_token_indices.append(
                     torch.arange(
                         packed_start,
@@ -671,7 +987,7 @@ class AttnMetaData:
                 )
                 owner_lens.append(length)
                 owner_starts.append(int(start_tensor.item()))
-                owner_cache_rows.append(request_id - owner_start)
+                owner_cache_rows.append(cache_row)
             packed_start += length
 
         if not owner_lens:
@@ -722,11 +1038,13 @@ class AttnMetaData:
                 )
             if request_indices.numel() and (
                 int(request_indices.min().item()) < 0
-                or int(request_indices.max().item()) >= self.batch_size
+                or int(request_indices.max().item()) >= self.prefill_batch_size
             ):
                 raise ValueError(
-                    f"Prefill request indices must be in [0, {self.batch_size})"
+                    f"Prefill request indices must be in [0, {self.prefill_batch_size})"
                 )
+            if self.cp_size > 1 and actual_q.numel() != 1:
+                raise ValueError("Kimi K3 context-parallel prefill requires mini batch size 1")
             actual_kv = past_kv + actual_q
             cu_q = actual_q.cumsum(0)
             cu_kv = actual_kv.cumsum(0)
@@ -756,12 +1074,39 @@ class AttnMetaData:
                     cu_q,
                     block_table=self.prefill_mla_block_table,
                 )
-            kda_conv_block_table = self.kda_conv_block_table.index_select(
-                0, request_indices
-            )
-            kda_recurrent_block_table = self.kda_recurrent_block_table.index_select(
-                0, request_indices
-            )[:, :1]
+            if self.cp_size > 1:
+                owns_request = request_indices.remainder(self.cp_size).eq(self.cp_rank)
+                local_request_indices = request_indices.div(
+                    self.cp_size, rounding_mode="floor"
+                )
+                safe_indices = local_request_indices.clamp_max(self.batch_size - 1)
+                kda_conv_block_table = self.kda_conv_block_table.index_select(
+                    0, safe_indices
+                )
+                kda_recurrent_block_table = self.kda_recurrent_block_table.index_select(
+                    0, safe_indices
+                )[:, :1]
+                kda_conv_block_table = torch.where(
+                    owns_request.view(-1, 1),
+                    kda_conv_block_table,
+                    torch.zeros_like(kda_conv_block_table),
+                )
+                kda_recurrent_block_table = torch.where(
+                    owns_request.view(-1, 1),
+                    kda_recurrent_block_table,
+                    torch.zeros_like(kda_recurrent_block_table),
+                )
+                cp_metadata = self._prefill_cp_metadata(
+                    int(actual_q[0].item()), int(request_indices[0].item())
+                )
+            else:
+                kda_conv_block_table = self.kda_conv_block_table.index_select(
+                    0, request_indices
+                )
+                kda_recurrent_block_table = self.kda_recurrent_block_table.index_select(
+                    0, request_indices
+                )[:, :1]
+                cp_metadata = None
             metadata = {
                 "is_prefill": True,
                 "is_chunked_prefill": chunked_prefill,
@@ -796,8 +1141,12 @@ class AttnMetaData:
                     "PrefillFullAttention": prefill_slots,
                 },
                 "mla_owner_token_indices": owner_indices,
+                "cp_metadata": cp_metadata,
+                "kda_decode_metadata": None,
                 "mla_decode_metadata": None,
             }
+            if cp_metadata is not None and getattr(self.config, "dsa_config", None):
+                metadata["dsa_cp"] = self._prefill_dsa_cp_metadata(cp_metadata, owner_slots)
             return metadata
 
         if kv_len is None:
@@ -814,14 +1163,18 @@ class AttnMetaData:
             + torch.arange(q_len, dtype=torch.int32, device=self.device).unsqueeze(0)
         ).view(-1)
 
-        owner_start, owner_end = self._owner_slice()
-        local_q = actual_q[owner_start:owner_end]
-        local_kv = actual_kv[owner_start:owner_end]
+        # Under CP the owned requests are cp_size-strided, so gather rather than
+        # slice. With cp_size == 1 these indices are a contiguous span.
+        owner_ids = self._decode_owner_ids()
+        local_q = actual_q.index_select(0, owner_ids)
+        local_kv = actual_kv.index_select(0, owner_ids)
         local_cu_q = local_q.cumsum(0)
         local_cu_kv = local_kv.cumsum(0)
-        local_positions = position_ids.view(self.batch_size, q_len)[
-            owner_start:owner_end
-        ].view(-1)
+        local_positions = (
+            position_ids.view(self.batch_size, q_len)
+            .index_select(0, owner_ids)
+            .view(-1)
+        )
         local_slots = self._slot_mapping(local_positions, local_cu_q)
         if active_mask is None:
             active_mask = torch.ones(
@@ -829,7 +1182,7 @@ class AttnMetaData:
             )
         else:
             active_mask = active_mask
-        local_active = active_mask[owner_start:owner_end]
+        local_active = active_mask.index_select(0, owner_ids)
         local_slots = torch.where(
             local_active.repeat_interleave(q_len), local_slots, torch.zeros_like(local_slots)
         )
@@ -897,7 +1250,7 @@ class AttnMetaData:
             if q_len == 1
             else self.flash_attention_mask,
             "position_ids": local_positions,
-            "kv_len": kv_len[owner_start:owner_end],
+            "kv_len": kv_len.index_select(0, owner_ids),
             "actual_seq_lengths_q": local_q,
             "actual_seq_lengths_kv": local_kv,
             "actual_seq_lengths_cu_q": local_cu_q,

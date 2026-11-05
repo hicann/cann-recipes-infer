@@ -28,7 +28,12 @@ import torch
 import torch.distributed as dist
 
 from .dspark_registry import DSPARK_DRAFT_MODEL_TYPES
-from .modules import CacheData, gather_sp_shards_to_owner
+from .modules import (
+    CacheData,
+    gather_cp_sp_shards_to_owner,
+    gather_sp_shards_to_owner,
+    request_owner_coordinates,
+)
 
 
 @dataclass
@@ -64,6 +69,12 @@ class KimiK3Infer:
         self.batch_size = data_config.get(
             "batch_size_per_rank", data_config.get("batch_size", 1)
         )
+        self.cp_size = runner_settings.get("parallel_config", {}).get("cp_size", 1)
+        self.prefill_batch_size = (
+            data_config.get("batch_size", self.batch_size)
+            if self.cp_size > 1
+            else self.batch_size
+        )
         self.input_max_len = data_config.get("input_max_len", 128)
         self.max_new_tokens = data_config.get("max_new_tokens", 128)
         self.temperature = data_config.get("temperature", 1.0)
@@ -79,14 +90,17 @@ class KimiK3Infer:
         self.mini_batch = (
             self.prefill_mini_batch_size
             if self.prefill_mini_batch_size > 0
-            else self.batch_size
+            else self.prefill_batch_size
         )
         self.prefill_cycles = model_runner.prefill_cycles
         self.cache_manager = CacheData(self.model.config, runner_settings, self.device)
         self.attn_metadata = self.model.attn_metadata
         self.attn_tp_size = self.model.infer_config.parallel_config.attn_tp_size
+        self.world_size = self.model.infer_config.parallel_config.world_size
+        self.global_rank = self.model.infer_config.parallel_config.global_rank
         self.attn_tp_rank = self.model.model.attn_tp_rank
         self.attn_tp_group = self.model.model.attn_tp_group
+        self.cp_rank = self.model.cp_rank
         self.local_batch = self.batch_size // self.attn_tp_size
         self.eos_ids = self._collect_eos_token_ids()
         self.pad_token_id = int(self.tokenizer.pad_token_id)
@@ -188,12 +202,13 @@ class KimiK3Infer:
         return gathered
 
     def _tokenize(self, prompts):
-        if len(prompts) != self.batch_size:
+        if len(prompts) != self.prefill_batch_size:
             if len(prompts) == 1:
-                prompts = prompts * self.batch_size
+                prompts = prompts * self.prefill_batch_size
             else:
                 raise ValueError(
-                    f"offline Kimi K3 requires exactly batch_size={self.batch_size} prompts, "
+                    "offline Kimi K3 requires exactly "
+                    f"batch_size={self.prefill_batch_size} prompts, "
                     f"got {len(prompts)}"
                 )
         token_rows = []
@@ -217,6 +232,7 @@ class KimiK3Infer:
             "generate_ids": list(token_rows),
             "prompt_token_rows": tuple(token_rows),
             "input_lens": input_lens,
+            "global_input_lens": input_lens,
             "kv_len": None,
             "cache_data": cache_data,
             "draft_cache_data": draft_cache_data,
@@ -309,9 +325,15 @@ class KimiK3Infer:
         )
         return logits, aux, elapsed
 
-    def _append_tokens(self, input_dict, next_tokens, request_offset=0):
+    def _append_tokens(
+        self, input_dict, next_tokens, request_offset=0, request_indices=None
+    ):
         for local_idx, token in enumerate(next_tokens):
-            request_idx = request_offset + local_idx
+            request_idx = (
+                request_offset + local_idx
+                if request_indices is None
+                else int(request_indices[local_idx].item())
+            )
             input_dict["generate_ids"][request_idx] = torch.cat(
                 (input_dict["generate_ids"][request_idx], token.view(1))
             )
@@ -319,7 +341,11 @@ class KimiK3Infer:
     def _post_process(self, input_dict, logits):
         next_tokens = self.sample(logits)
         next_tokens = self._gather_owner_rows(next_tokens)
-        self._append_tokens(input_dict, next_tokens)
+        self._append_tokens(
+            input_dict,
+            next_tokens,
+            request_indices=input_dict.get("decode_request_indices"),
+        )
         input_dict["input_ids"] = next_tokens.view(-1)
         if input_dict["is_prefill"]:
             input_dict["kv_len"] = input_dict["input_lens"].clone()
@@ -407,6 +433,9 @@ class KimiK3Infer:
                     cycle_input["input_lens"].tolist(),
                     position_start=chunk_start,
                     cycle_idx=cycle_idx,
+                    cp_metadata=model_inputs["forward_metadata"].get(
+                        "cp_metadata"
+                    ),
                     warm_up=warm_up,
                 )
             return logits, aux, elapsed
@@ -428,7 +457,21 @@ class KimiK3Infer:
 
     def merge_multi_cycle_res(self, input_dict, cycle_next_tokens):
         """Switch from mini-batch Prefill SP to full-batch request-DP Decode."""
-        input_dict["input_ids"] = torch.cat(cycle_next_tokens, dim=0)
+        global_tokens = torch.cat(cycle_next_tokens, dim=0)
+        global_lens = input_dict["global_input_lens"]
+        if self.cp_size > 1:
+            request_indices = torch.arange(
+                self.cp_rank,
+                self.prefill_batch_size,
+                self.cp_size,
+                dtype=torch.long,
+                device=self.device,
+            )
+            input_dict["decode_request_indices"] = request_indices
+            input_dict["input_ids"] = global_tokens.index_select(0, request_indices)
+            input_dict["input_lens"] = global_lens.index_select(0, request_indices)
+        else:
+            input_dict["input_ids"] = global_tokens
         input_dict["kv_len"] = input_dict["input_lens"].clone()
         input_dict["is_prefill"] = False
         return input_dict
@@ -436,7 +479,7 @@ class KimiK3Infer:
     def _get_prefill_stub_tokens(self, input_dict):
         if self.prefill_stub_token_id is not None:
             return torch.full(
-                (self.batch_size,),
+                (self.prefill_batch_size,),
                 self.prefill_stub_token_id,
                 dtype=torch.long,
                 device=self.device,
@@ -497,8 +540,13 @@ class KimiK3Infer:
     def _log_outputs(self, input_dict):
         if self.attn_tp_rank != 0:
             return
-        prompt_lens = input_dict["input_lens"].tolist()
-        for request_idx, token_ids in enumerate(input_dict["generate_ids"]):
+        if self.cp_size > 1:
+            request_indices = input_dict["decode_request_indices"].tolist()
+        else:
+            request_indices = range(len(input_dict["generate_ids"]))
+        prompt_lens = input_dict["global_input_lens"].tolist()
+        for request_idx in request_indices:
+            token_ids = input_dict["generate_ids"][request_idx]
             ids = token_ids.tolist()
             prompt_len = int(prompt_lens[request_idx])
             completion = ids[prompt_len:]
@@ -581,18 +629,31 @@ class KimiK3Infer:
             self._log_outputs(input_dict)
         return input_dict
 
-    def _generated_count(self, input_dict, request_idx):
+    def _global_request_index(self, input_dict, decode_row):
+        request_indices = input_dict.get("decode_request_indices")
+        if request_indices is None:
+            return decode_row
+        if decode_row < 0 or decode_row >= request_indices.numel():
+            raise IndexError(
+                f"Decode row {decode_row} is outside the lane-local batch"
+            )
+        return int(request_indices[decode_row].item())
+
+    def _generated_count(self, input_dict, decode_row):
+        request_idx = self._global_request_index(input_dict, decode_row)
         return int(input_dict["generate_ids"][request_idx].numel()) - int(
-            input_dict["input_lens"][request_idx].item()
+            input_dict["input_lens"][decode_row].item()
         )
 
     def _active_mask(self, input_dict, ignore_eos=False):
         active = []
-        for request_idx, row in enumerate(input_dict["generate_ids"]):
+        for decode_row in range(input_dict["input_lens"].numel()):
+            request_idx = self._global_request_index(input_dict, decode_row)
+            row = input_dict["generate_ids"][request_idx]
             last_token = int(row[-1].item())
             active.append(
                 (ignore_eos or last_token not in self.eos_ids)
-                and self._generated_count(input_dict, request_idx) < self.max_new_tokens
+                and self._generated_count(input_dict, decode_row) < self.max_new_tokens
             )
         return torch.tensor(active, dtype=torch.bool, device=self.device)
 
@@ -609,6 +670,7 @@ class KimiK3Infer:
         input_lens,
         position_start,
         cycle_idx,
+        cp_metadata=None,
         warm_up=False,
     ):
         torch.npu.synchronize()
@@ -616,51 +678,70 @@ class KimiK3Infer:
         context_states = self.draft_model.prepare_target_hidden_states(
             target_hidden_states
         )
-        total_tokens = sum(input_lens)
-        offsets = [0]
-        for length in input_lens:
-            offsets.append(offsets[-1] + length)
-        owners = sorted({request_id // self.local_batch for request_id in request_ids})
-        for owner_rank in owners:
-            gathered = gather_sp_shards_to_owner(
-                context_states,
-                total_tokens,
-                owner_rank,
-                self.attn_tp_rank,
+        if self.cp_size > 1:
+            if len(request_ids) != 1 or len(input_lens) != 1:
+                raise RuntimeError("DSpark CP Prefill requires mini batch size 1")
+            if cp_metadata is None or not cp_metadata.enabled:
+                raise RuntimeError("DSpark CP Prefill requires CP metadata")
+            input_len = int(input_lens[0])
+            if cp_metadata.global_valid_indices.numel() != input_len:
+                raise RuntimeError(
+                    "DSpark CP Prefill length does not match CP metadata"
+                )
+            if context_states.shape[0] * self.world_size != (
+                cp_metadata.global_padded_token_num
+            ):
+                raise RuntimeError(
+                    "DSpark CP Prefill shard rows do not match global padding"
+                )
+            _, _, owner_row, owner_global_rank = request_owner_coordinates(
+                request_ids[0],
                 self.attn_tp_size,
-                self.attn_tp_group,
+                self.cp_size,
+                self.local_batch,
             )
-            if gathered is None:
-                continue
-            for local_idx, request_id in enumerate(request_ids):
-                if request_id // self.local_batch != owner_rank:
+            prompt_context = gather_cp_sp_shards_to_owner(
+                context_states,
+                input_len,
+                owner_global_rank,
+                self.global_rank,
+                self.world_size,
+                self.attn_tp_size,
+                self.cp_size,
+            )
+            if prompt_context is not None:
+                self._populate_dspark_prefill_cache(
+                    prompt_context, input_len, owner_row, position_start
+                )
+        else:
+            total_tokens = sum(input_lens)
+            offsets = [0]
+            for length in input_lens:
+                offsets.append(offsets[-1] + length)
+            owners = sorted(
+                {request_id // self.local_batch for request_id in request_ids}
+            )
+            for owner_rank in owners:
+                gathered = gather_sp_shards_to_owner(
+                    context_states,
+                    total_tokens,
+                    owner_rank,
+                    self.attn_tp_rank,
+                    self.attn_tp_size,
+                    self.attn_tp_group,
+                )
+                if gathered is None:
                     continue
-                input_len = input_lens[local_idx]
-                owner_row = request_id % self.local_batch
-                prompt_context = gathered[
-                    offsets[local_idx] : offsets[local_idx + 1]
-                ]
-                positions = torch.arange(
-                    position_start,
-                    position_start + input_len,
-                    dtype=torch.long,
-                    device=self.device,
-                ).view(1, -1)
-                with torch.no_grad():
-                    self.draft_model.propose(
-                        {
-                            "is_prefill": True,
-                            "target_hidden_positions": positions,
-                            "block_table": self.attn_metadata.mla_block_table[
-                                owner_row : owner_row + 1
-                            ],
-                            "slot_block_table": self.attn_metadata.mla_slot_block_table[
-                                owner_row : owner_row + 1
-                            ],
-                            "cache_data": self._dspark_input["draft_cache_data"],
-                        },
-                        self._dspark_input["input_ids"].new_zeros((1, 1)),
-                        prompt_context.unsqueeze(0),
+                for local_idx, request_id in enumerate(request_ids):
+                    if request_id // self.local_batch != owner_rank:
+                        continue
+                    input_len = input_lens[local_idx]
+                    owner_row = request_id % self.local_batch
+                    prompt_context = gathered[
+                        offsets[local_idx] : offsets[local_idx + 1]
+                    ]
+                    self._populate_dspark_prefill_cache(
+                        prompt_context, input_len, owner_row, position_start
                     )
         torch.npu.synchronize()
         elapsed = time.time() - start
@@ -678,6 +759,32 @@ class KimiK3Infer:
             elapsed * 1000,
         )
         return elapsed
+
+    def _populate_dspark_prefill_cache(
+        self, prompt_context, input_len, owner_row, position_start
+    ):
+        positions = torch.arange(
+            position_start,
+            position_start + input_len,
+            dtype=torch.long,
+            device=self.device,
+        ).view(1, -1)
+        with torch.no_grad():
+            self.draft_model.propose(
+                {
+                    "is_prefill": True,
+                    "target_hidden_positions": positions,
+                    "block_table": self.attn_metadata.mla_block_table[
+                        owner_row : owner_row + 1
+                    ],
+                    "slot_block_table": self.attn_metadata.mla_slot_block_table[
+                        owner_row : owner_row + 1
+                    ],
+                    "cache_data": self._dspark_input["draft_cache_data"],
+                },
+                self._dspark_input["input_ids"].new_zeros((1, 1)),
+                prompt_context.unsqueeze(0),
+            )
 
     @staticmethod
     def _speculative_round_times(decode_times, draft_times, skip_rounds=0):
@@ -781,10 +888,12 @@ class KimiK3Infer:
         committed_lengths = local_counts.new_zeros(self.local_batch)
         local_start = self.attn_tp_rank * self.local_batch
         for local_idx in range(self.local_batch):
-            request_idx = local_start + local_idx
-            if not bool(active[request_idx].item()):
+            decode_row = local_start + local_idx
+            if not bool(active[decode_row].item()):
                 continue
-            remaining = self.max_new_tokens - self._generated_count(input_dict, request_idx)
+            remaining = self.max_new_tokens - self._generated_count(
+                input_dict, decode_row
+            )
             max_drafts = min(self.next_n, max(remaining - 1, 0))
             committed = []
             accepted_drafts = 0
@@ -841,19 +950,23 @@ class KimiK3Infer:
                 committed_lengths[local_idx] = token_tensor.numel()
                 local_anchors[local_idx, 0] = token_tensor[-1]
             else:
-                local_anchors[local_idx, 0] = input_dict["generate_ids"][request_idx][-1]
+                request_idx = self._global_request_index(input_dict, decode_row)
+                local_anchors[local_idx, 0] = input_dict["generate_ids"][
+                    request_idx
+                ][-1]
 
         anchors = self._gather_owner_rows(local_anchors)
         counts = self._gather_owner_rows(local_counts)
         all_tokens = self._gather_owner_rows(committed_tokens)
         all_lengths = self._gather_owner_rows(committed_lengths)
-        for request_idx in range(self.batch_size):
-            length = int(all_lengths[request_idx].item())
+        for decode_row in range(self.batch_size):
+            length = int(all_lengths[decode_row].item())
             if length:
+                request_idx = self._global_request_index(input_dict, decode_row)
                 input_dict["generate_ids"][request_idx] = torch.cat(
                     (
                         input_dict["generate_ids"][request_idx],
-                        all_tokens[request_idx, :length],
+                        all_tokens[decode_row, :length],
                     )
                 )
         return anchors, counts
@@ -940,11 +1053,14 @@ class KimiK3Infer:
         anchors = sampled_anchors.new_full(
             sampled_anchors.shape, self.pad_token_id
         )
-        for request_idx in range(self.batch_size):
-            if bool(input_dict["active_mask"][request_idx].item()):
-                anchors[request_idx] = sampled_anchors[request_idx]
+        for decode_row in range(self.batch_size):
+            if bool(input_dict["active_mask"][decode_row].item()):
+                anchors[decode_row] = sampled_anchors[decode_row]
+                request_idx = self._global_request_index(input_dict, decode_row)
                 self._append_tokens(
-                    input_dict, sampled_anchors[request_idx : request_idx + 1], request_idx
+                    input_dict,
+                    sampled_anchors[decode_row : decode_row + 1],
+                    request_idx,
                 )
         old_kv_len = input_dict["kv_len"].clone()
         input_dict["kv_len"].add_(input_dict["active_mask"].to(torch.int32))

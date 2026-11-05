@@ -12,7 +12,7 @@ from transformers import GenerationConfig
 
 from executor.model_runner import ModelRunner
 from executor.utils import override
-from models.configuration_kimi_k3 import KimiLinearConfig
+from models.configuration_kimi_k3 import KimiLinearConfig, dsa_compile_cache_tag
 from models.dspark_registry import (
     DRAFT_MODEL_DSPARK_GQA,
     get_draft_model_type,
@@ -47,12 +47,19 @@ class KimiK3Runner(ModelRunner):
         self.batch_size_per_rank = data_config.get(
             "batch_size_per_rank", data_config.get("batch_size", 1)
         )
+        parallel_config = runner_settings.get("parallel_config", {})
+        cp_size = parallel_config.get("cp_size", 1)
+        self.prefill_batch_size = (
+            data_config.get("batch_size", 1)
+            if cp_size > 1
+            else self.batch_size_per_rank
+        )
         effective_prefill_batch = (
             self.prefill_mini_batch_size
             if self.prefill_mini_batch_size > 0
-            else self.batch_size_per_rank
+            else self.prefill_batch_size
         )
-        self.prefill_cycles = self.batch_size_per_rank // effective_prefill_batch
+        self.prefill_cycles = self.prefill_batch_size // effective_prefill_batch
 
     @override
     def init_model(self):
@@ -110,6 +117,20 @@ class KimiK3Runner(ModelRunner):
             import torchair.ge_concrete_graph.ge_converter.experimental.patch_for_hcom_allreduce
 
             tng.patch_for_hcom()
+            custom_params = self.runner_settings.get("model_config", {}).get("custom_params", {})
+            if getattr(self.model.config, "dsa_config", None) and not custom_params.get(
+                "enable_dsa_quant", True
+            ):
+                from npugraph_ex._acl_concrete_graph import graph_pass
+
+                # Register in the namespace used by the torch_npu 2.10 backend.
+                graph_pass.inplaceable_npu_ops[
+                    torch.ops.cann_ops_transformer.mla_prolog_functional.default
+                ] = graph_pass.InplaceableNpuOp(
+                    inplace_op=torch.ops.cann_ops_transformer.mla_prolog.default,
+                    mutated_arg=[7, 8],
+                    extra_check=graph_pass.check_multi_stream_for_multi_reinplace,
+                )
             options = {
                 "frozen_parameter": True,
                 "static_kernel_compile": self.enable_static_kernel,
@@ -127,6 +148,29 @@ class KimiK3Runner(ModelRunner):
                     "compile_cache",
                     self.model_name,
                 )
+                # The target graph also changes with Verify width and state ABI.
+                cfg = self.runner_settings.get("model_config", {})
+                width = cfg.get("next_n", 0) + 1
+                replay = cfg.get("custom_params", {}).get(
+                    "enable_mega_kda_replayssm", False
+                )
+                cache_dir = os.path.join(cache_dir, f"verify{width}_replay{int(replay)}")
+                if getattr(self.model.config, "dsa_config", None):
+                    cache_dir = os.path.join(
+                        cache_dir,
+                        dsa_compile_cache_tag(
+                            self.model.config,
+                            cfg.get("custom_params", {}).get("dsa_backend", "npu"),
+                        ),
+                    )
+                    # cache_compile skips guards; keep the Indexer stream graphs separate.
+                    indexer_multi_streams = cfg.get("custom_params", {}).get(
+                        "enable_multi_streams", False
+                    )
+                    cache_dir = os.path.join(
+                        cache_dir,
+                        "indexer_multistream" if indexer_multi_streams else "indexer_serial",
+                    )
                 if self.enable_superkernel:
                     # Keep fused and unfused graph artifacts separate.
                     cache_dir = os.path.join(cache_dir, "superkernel")

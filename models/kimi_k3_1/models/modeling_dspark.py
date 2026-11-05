@@ -746,6 +746,7 @@ class K3DSparkForCausalLM(K3DSparkForCausalLMBase):
         ]
         params = dict(self.named_parameters())
         loaded: set[str] = set()
+        fused_shards_loaded: dict[str, set[int]] = {}
 
         def resolve(name: str) -> Optional[str]:
             return next(
@@ -771,8 +772,15 @@ class K3DSparkForCausalLM(K3DSparkForCausalLMBase):
                 if param_name is None:
                     continue
                 param = params[param_name]
+                shards = fused_shards_loaded.setdefault(param_name, set())
+                if shard_id in shards:
+                    raise RuntimeError(
+                        f"duplicate checkpoint shard {shard_id} for {param_name}"
+                    )
                 param.weight_loader(param, tensor, shard_id)
-                loaded.add(param_name)
+                shards.add(shard_id)
+                if shards == {0, 1}:
+                    loaded.add(param_name)
                 break
             else:
                 param_name = resolve(name)
@@ -781,7 +789,20 @@ class K3DSparkForCausalLM(K3DSparkForCausalLMBase):
                     continue
                 param = params[param_name]
                 loader = getattr(param, "weight_loader", default_weight_loader)
-                loader(param, tensor)
+                if loader is default_weight_loader:
+                    # The shared default loader logs and swallows copy errors.
+                    # A checkpoint must not pass completeness after a failed copy.
+                    if param.numel() == 1 and tensor.numel() == 1:
+                        param.data.fill_(tensor.item())
+                    else:
+                        if param.shape != tensor.shape:
+                            raise ValueError(
+                                f"{param_name}: checkpoint gives {tuple(tensor.shape)}, "
+                                f"parameter is {tuple(param.shape)}"
+                            )
+                        param.data.copy_(tensor)
+                else:
+                    loader(param, tensor)
                 loaded.add(param_name)
 
         missing = sorted(set(params) - loaded)

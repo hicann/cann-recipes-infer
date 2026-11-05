@@ -1,10 +1,15 @@
-# Kimi K3 模型在 NPU 上的推理实现
+# Kimi K3 / Kimi K3.1 模型在 NPU 上的推理实现
 
-模型架构、并行策略、量化方案与性能优化详见技术报告：[Kimi K3 昇腾 NPU 推理优化实践](../../docs/models/kimi_k3/kimi_k3_inference_guide.md)。
+模型架构、并行策略、量化方案与性能优化详见技术报告：[Kimi K3 昇腾 NPU 推理优化实践](../../docs/models/kimi_k3/kimi_k3_inference_guide.md)、[Kimi K3.1 昇腾 NPU 推理优化实践](../../docs/models/kimi_k3/kimi_k31_inference_guide.md)。
 
 ## 概述
 
-本目录提供 Kimi K3 在昇腾 NPU 上的推理实现与部署配置，支持分块 Prefill、DSpark 投机推理，以及 eager 和 npugraph_ex Decode。
+本目录提供 Kimi K3 和 Kimi K3.1 在昇腾 NPU 上的推理实现与部署配置。两者复用 KDA、AttnRes、MoE、DSpark 和推理入口；K3.1 将 K3 的 MLA 注意力替换为 DSA 稀疏注意力。两者均支持分块 Prefill、DSpark 投机推理，以及 eager 和 npugraph_ex Decode。
+
+| 模型 | 注意力结构 | YAML 中的 `model_name` | 配置文件 |
+| --- | --- | --- | --- |
+| Kimi K3 | KDA + MLA | `kimi_k3` | [kimi_k3_rank_32P_100k_1batch.yaml](config/kimi_k3_rank_32P_100k_1batch.yaml) |
+| Kimi K3.1 | KDA + DSA | `kimi_k3_1` | [kimi_k31_rank_32P_100k_1batch.yaml](config/kimi_k31_rank_32P_100k_1batch.yaml) |
 
 ## 硬件要求
 
@@ -16,11 +21,11 @@
 
    本样例的编译执行依赖 CANN 开发套件包（toolkit）与昇腾 950 对应的二进制算子包（ops）。支持9.2.0版本cann包，下载选择[weekly版本](https://www.hiascend.com/cann/download)， 并参考链接中的指导方式完成安装。
 
-   Kimi K3 使用 KDA、MLA 和 MoE 相关昇腾算子，建议所有节点使用相同的 CANN、驱动和固件版本。当前实现面向昇腾 950PR/DT，不支持在其他产品上直接运行。
+   Kimi K3 / K3.1 使用 KDA、MLA/DSA 和 MoE 相关昇腾算子，建议所有节点使用相同的 CANN、驱动和固件版本。当前实现面向昇腾 950PR/DT，不支持在其他产品上直接运行。
 
 2. 安装 Ascend Extension for PyTorch（torch_npu）。
 
-   `torch_npu` 为 PyTorch 在 NPU 上运行提供适配。请安装与当前 CANN 和 Python 版本匹配的 `torch_npu`、PyTorch 及其依赖；本目录的依赖版本记录在 `models/kimi_k3/requirements.txt` 中。安装[torch_npu](https://pypi.org/project/torch-npu/2.10.0.post4/)时，按照链接中的指导方法完成安装，建议安装对应python版本为3.12。或者通过命令行完成安装：
+   `torch_npu` 为 PyTorch 在 NPU 上运行提供适配。请安装与当前 CANN 和 Python 版本匹配的 `torch_npu`、PyTorch 及其依赖；本目录的依赖版本记录在 `models/kimi_k3_1/requirements.txt` 中。安装[torch_npu](https://pypi.org/project/torch-npu/2.10.0.post4/)时，按照链接中的指导方法完成安装，建议安装对应python版本为3.12。或者通过命令行完成安装：
     ```bash
    # 推荐2.10.0版本
    pip install torch==2.10.0
@@ -29,7 +34,7 @@
 
 3. 安装 CANNBot-DSL 算子依赖包
 
-    CANNBot-DSL 提供 Kimi K3 所需的高性能融合算子，算子编译依赖 `ninja==1.13.0`，该版本已列入 `requirements.txt`。
+    CANNBot-DSL 提供 Kimi K3 / K3.1 所需的高性能融合算子，算子编译依赖 `ninja==1.13.0`，该版本已列入 `requirements.txt`。
     ```bash
    pip install cannbot-dsl
    ```
@@ -41,8 +46,8 @@
    git clone https://gitcode.com/cann/cann-recipes-infer.git
    cd cann-recipes-infer
 
-   # Kimi K3 依赖，仅支持项目 requirements.txt 声明的 Python/依赖版本
-   pip3 install -r ./models/kimi_k3/requirements.txt
+   # Kimi K3 / K3.1 共用依赖
+   pip3 install -r ./models/kimi_k3_1/requirements.txt
    ```
 
 5. 安装 SiTU 自定义算子（`situ_and_mul_sparse` 与融合算子 `grouped_situ_mx_quant`）。
@@ -71,7 +76,7 @@
 
 6. 配置样例运行环境。
 
-   修改 `models/kimi_k3/set_env.sh` 中的如下字段：
+   修改 `models/kimi_k3_1/set_env.sh` 中的如下字段：
 
    - `IPs`：配置所有节点的 IP，按 rank id 排序，多个节点的 IP 以空格分隔，例如：`('xxx.xxx.xxx.xxx' 'xxx.xxx.xxx.xxx')`。
    - `cann_path`：CANN 软件包安装路径，例如 `/home/code/Ascend/cann/`。
@@ -87,7 +92,7 @@
 从 [ModelScope Kimi-K3 模型页面](https://www.modelscope.cn/models/moonshotai/Kimi-K3/files) 下载模型权重，并将完整 checkpoint 上传到各节点可访问的相同路径。在配置文件中填写该路径：
 
 ```yaml
-# models/kimi_k3/config/kimi_k3_rank_32P_100k_1batch.yaml
+# models/kimi_k3_1/config/kimi_k3_rank_32P_100k_1batch.yaml
 model_path: "/data/models/kimi_k3"
 ```
 
@@ -158,7 +163,11 @@ python3 amct_pytorch/cli/llm/deploy.py \
 
 ### 修改配置
 
-`infer.sh` 默认使用 [config/kimi_k3_rank_32P_100k_1batch.yaml](config/kimi_k3_rank_32P_100k_1batch.yaml)。该配置使用 32 卡、Attention TP16/DP2、global batch 32、102400-token 输入上限，启用 DSpark GQA 和 MegaKDA ReplaySSM。注意 `data_config.batch_size=32`，`model_config.prefill_mini_batch_size=1` 表示每个 Attention DP group 每个 Prefill mini cycle 处理 1 个请求。以下内容与该 YAML 一致；模型路径需按部署环境填写：
+按模型版本选择概述表中的 YAML，并填写实际的 `model_path` 和 `draft_model_path`。`infer.sh` 默认使用 K3 配置；K3.1 通过 `YAML_FILE_NAME=kimi_k31_rank_32P_100k_1batch.yaml` 选择对应配置。
+
+两份配置均使用 32 卡、global batch 32、102400-token 输入上限，启用 DSpark GQA 和 MegaKDA ReplaySSM。K3 使用 CP1、8192-token 分块 Prefill；K3.1 使用 TP16 × CP2，不启用分块 Prefill。Decode 均使用 Attention TP16/DP2，每组 16 个请求。
+
+以下为 K3 的完整配置示例；K3.1 配置见 [kimi_k31_rank_32P_100k_1batch.yaml](config/kimi_k31_rank_32P_100k_1batch.yaml)：
 
 ```yaml
 model_name: "kimi_k3"
@@ -211,19 +220,20 @@ parallel_config:
   cp_size: 1
 ```
 
-当前实现要求：
+运行要求与开关说明：
 
 - `batch_size` 固定；每个 Attention DP group 分到的请求数必须能被 `attn_tp_size` 整除。
-- `world_size` 和模型的 KDA/MLA head 数必须能被 `attn_tp_size` 整除。
-- `dense_tp_size`、`embed_tp_size`、`lmhead_tp_size` 和 `oproj_tp_size` 必须整除 `attn_tp_size`，避免通信组跨越不同请求的 Attention DP group。
+- `world_size` 和模型的 KDA、MLA/DSA 主注意力 head 数必须能被 `attn_tp_size` 整除；DSA 的 Indexer heads 不按 Attention TP 切分。
+- CP1 下，`dense_tp_size`、`embed_tp_size`、`lmhead_tp_size` 和 `oproj_tp_size` 必须整除 `attn_tp_size`，避免通信组跨越不同请求的 Attention DP group；本文 CP2 配置也保持这些 TP 设置。
 - `moe_tp_size=1`，由本地入口派生 `moe_ep_size=world_size`。
-- `oproj_tp_size=attn_tp_size`、`cp_size=1`。当前唯一配置使用 `draft_model_type=dspark_gqa,next_n=7`。
-- `prefill_mini_batch_size=0` 表示每个 Attention DP group 不再拆分 Prefill mini batch；大于 0 时必须能整除 `batch_size_per_rank`。当前配置为 `1`，每个 Attention DP group 执行 16 个 Prefill mini cycle。
-- `prefill_chunk_size=0` 表示每个请求一次完成 Prefill；大于 0 时按固定 token chunk 续写 KDA、MLA 和 DSpark cache。当前 chunked Prefill 要求同一 Attention DP group 内请求等长。
+- `oproj_tp_size=attn_tp_size`。两份配置均使用 `draft_model_type=dspark_gqa,next_n=7`；K3 为 CP1，K3.1 为 CP2。
+- CP1 下，`prefill_mini_batch_size=0` 表示每个 Attention DP group 不再拆分 Prefill mini batch；大于 0 时必须能整除 `batch_size_per_rank`。K3 配置为 `1`，每组执行 16 个 Prefill mini cycle。CP2 下该参数必须为 `1`，K3.1 的 32 个请求由全部 rank 依次执行 32 个 mini cycle。
+- `prefill_chunk_size=0` 表示每个请求一次完成 Prefill；大于 0 时按固定 token chunk 续写 KDA、MLA/DSA 和 DSpark cache。当前 chunked Prefill 要求同一 Attention DP group 内请求等长。
 - `skip_warm_up=True` 可跳过启动时的完整 Prefill/Decode warm-up，默认开启。图模式下，未命中编译缓存时首次 Decode 需要编译，命中时加载缓存；首次推理仍可能包含图捕获和算子冷启动开销。设置为 `False` 可恢复完整 warm-up。
 - `skip_prefill=True` 时不执行 Prefill，KDA/MLA（以及启用 DSpark 时的草稿模型）cache 保持全零，使用占位 token 直接进入 Decode。该模式仅用于 Decode 执行和性能测试，生成文本无精度意义；可用 `prefill_stub_token_id` 指定非 EOS 占位 token。
 - `pa_block_size` 必须是 16 的倍数，以满足 MLA PA cache 布局。
-- MLA Decode 支持 BF16 和 C8/W8A8C8，使用与所选精度路径兼容的 checkpoint；不支持 MLA 投影部分量化或 MLA 层间混用 BF16/MXFP8。量化方案见[技术报告](../../docs/models/kimi_k3/kimi_k3_inference_guide.md#量化策略)。
+- K3 MLA Decode 支持 BF16 和 C8/W8A8C8，使用与所选精度路径兼容的 checkpoint；不支持 MLA 投影部分量化或 MLA 层间混用 BF16/MXFP8。量化方案见[K3 技术报告](../../docs/models/kimi_k3/kimi_k3_inference_guide.md#量化策略)。
+- K3.1 DSA 保留 BF16 投影，`enable_dsa_quant=True` 时，LI 的 Q/K 使用 MXFP8，SFA 的 latent KV 使用 FP8、辅助 64 维保留 BF16，SFA 的 Query 保持 BF16；该开关同时作用于 Prefill 和 Decode。切换开关后清理对应编译缓存。
 - 切换权重、输入形状、算子路径或编译选项后，应重新生成对应的编译缓存。
 - Decode 支持 `eager` 和 `npugraph_ex`；Prefill 固定 eager。当前 YAML 开启 SuperKernel，切换 eager 时需同时设置 `custom_params.enable_superkernel=False`。
 - 默认开启 MegaKDA ReplaySSM。关闭 ReplaySSM 后使用 MegaKDA snapshot；两者均关闭时使用 snapshot fused recurrent。
@@ -235,7 +245,7 @@ parallel_config:
 
 当前 YAML 中的主要执行参数：
 
-下表的值均为 YAML 显式填写的值。`exe_mode` 位于顶层；从 `enable_multi_streams` 到 `enable_prefill_mega_moe` 的开关及 `moe_chunk_max_len` 位于 `model_config.custom_params`；其余表内参数位于 `model_config`。配置为 `True` 表示此配置启用，不等于代码固定开启。
+下表的值均为 YAML 显式填写的值，差异项分别标注 K3 / K3.1。`exe_mode` 位于顶层；从 `enable_multi_streams` 到 `enable_prefill_mega_moe` 的开关及 `moe_chunk_max_len` 位于 `model_config.custom_params`；其余表内参数位于 `model_config`。配置为 `True` 表示此配置启用，不等于代码固定开启。
 
 | 参数名 | 类型 | YAML 值 | 含义 |
 | --- | --- | --- | --- |
@@ -250,10 +260,10 @@ parallel_config:
 | `next_n` | int | `7` | DSpark 生成的草稿 token 数；对应 Verify width 8。 |
 | `dspark_tp_size` | int | `8` | DSpark MLP/Markov TP；必须整除 Attention TP，当前部署配置使用默认 TP8。 |
 | `skip_warm_up` | bool | `True` | 是否跳过 warm-up；开启后首次正式推理可能包含编译、图捕获和冷启动开销。 |
-| `prefill_mini_batch_size` | int | `1` | 每个 Attention DP group 每个 Prefill mini cycle 处理的请求数。 |
-| `prefill_chunk_size` | int | `8192` | 每个请求单次 Prefill 的 token chunk 上限。 |
-| `pa_block_size` | int | `128` | MLA paged cache 的 block size。 |
-| `enable_multi_streams` | bool | `True` | 控制 Decode 多流执行；MoE Decode 使用 router/shared/shared_comm 流，MoE Prefill 固定在当前流执行。 |
+| `prefill_mini_batch_size` | int | `1` | K3：每个 DP group 每 cycle 处理 1 个请求；K3.1：全部 rank 共同处理 1 个请求。 |
+| `prefill_chunk_size` | int | K3：`8192`；K3.1：`0` | 每个请求单次 Prefill 的 token chunk 上限；`0` 表示不分块。 |
+| `pa_block_size` | int | `128` | MLA/DSA paged cache 的 block size。 |
+| `enable_multi_streams` | bool | `True` | 控制 Decode 多流执行；MoE Decode 使用 router/shared/shared_comm 流，K3.1 在 `npugraph_ex` 下还启用 Indexer 多流；MoE Prefill 固定在当前流执行。 |
 | `enable_superkernel` | bool | `True` | 控制 MoE Decode 融合 scope、编译选项及缓存目录；开启要求 `npugraph_ex`、静态 kernel、多流和 shared experts。省略此参数时默认 `False`。 |
 | `enable_dspark_confidence_head` | bool | `False` | 是否使用 DSpark confidence head；开启要求草稿 checkpoint 提供对应模块。 |
 | `enable_mega_kda` | bool | `True` | Decode 是否进入 MegaKDA 路径；与 ReplaySSM 同时关闭时使用 snapshot fused recurrent。 |
@@ -275,27 +285,33 @@ parallel_config:
 
 ### 拉起多卡推理
 
-在每个节点执行：
+在每个节点进入共用代码目录，并按模型版本选择一条启动命令：
 
 ```shell
-cd /home/code/cann-recipes-infer/models/kimi_k3
-bash infer.sh
+cd /home/code/cann-recipes-infer/models/kimi_k3_1
+
+# Kimi K3
+YAML_FILE_NAME=kimi_k3_rank_32P_100k_1batch.yaml bash infer.sh
+
+# Kimi K3.1
+YAML_FILE_NAME=kimi_k31_rank_32P_100k_1batch.yaml bash infer.sh
 ```
 
-脚本默认使用 `kimi_k3_rank_32P_100k_1batch.yaml`；选择其他配置时，在启动前设置 `YAML_FILE_NAME`。脚本会将 K3 内置的 100K 请求复制到 `dataset/default_prompt.json`，供 `dataset: "default"` 使用。若改用 `InfiniteBench`，请提前将数据放到各节点的 `dataset/InfiniteBench` 目录下。
+直接执行 `bash infer.sh` 时默认使用 K3 配置。两种模型共用脚本内置的 100K 请求，启动时会将其复制到 `dataset/default_prompt.json`，供 `dataset: "default"` 使用。若改用 `InfiniteBench`，请提前将数据放到各节点的 `dataset/InfiniteBench` 目录下。
 
 默认跳过 warm-up；设置 `skip_warm_up=False` 后，先执行 warm-up，再清空主模型和 DSpark 的 cache，开始正式推理。
 
-**复现最优性能时，请开启 `model_config.enable_cache_compile=True`，使用相同配置完整运行两遍 `bash infer.sh`：第一遍生成编译缓存，第二遍复用缓存，以第二遍的性能结果为准。两次运行之间保留 `compile_cache` 目录。**
+**复现最优性能时，请开启 `model_config.enable_cache_compile=True`，使用相同 YAML 完整运行两遍对应的启动命令：第一遍生成编译缓存，第二遍复用缓存，以第二遍的性能结果为准。两次运行之间保留 `compile_cache` 目录。**
 
 ### 日志与性能采集
 
 - 日志输出生成结果、主模型 Verify 和 DSpark 的平均耗时，以及实测平均接受长度和接受率。
 - `enable_profiler=True` 时，仅采集 Decode：跳过前 10 轮，再采集 5 轮，结果写入运行输出目录下的 `prof/decode`。Prefill 和 warm-up 不采集。
 
-性能结果见[技术报告总结](../../docs/models/kimi_k3/kimi_k3_inference_guide.md#总结)。
+性能结果分别见[K3 技术报告总结](../../docs/models/kimi_k3/kimi_k3_inference_guide.md#总结)与[K3.1 技术报告性能章节](../../docs/models/kimi_k3/kimi_k31_inference_guide.md#性能)。K3.1 技术报告中的性能数据使用 CP1，与当前 CP2 YAML 的配置不同。
 
 ## 已知限制
 
 - 当前支持固定批次生成；Prefill mini batch 是静态多 cycle，不支持在线请求加入、退出或动态调度。
-- Chunked Prefill 当前仅支持等长请求；不支持 MTP、PD 分离和 Context Parallel，投机推理仅支持显式配置的 DSpark。
+- Chunked Prefill 当前仅支持等长请求，不能与 Prefill CP 同时启用。CP 要求 `attn_tp_size * cp_size == world_size`、`kda_tp_size == attn_tp_size`、`prefill_mini_batch_size=1`、`prefill_chunk_size=0`；K3.1 YAML 已按此配置开启 CP2，未显式设置的 `kda_tp_size` 默认取 `attn_tp_size=16`。实现说明见[K3.1 Prefill CP](../../docs/models/kimi_k3/kimi_k31_inference_guide.md#prefill-cp)。
+- 不支持 MTP 和 PD 分离，投机推理仅支持显式配置的 DSpark。

@@ -20,6 +20,7 @@ import logging
 import math
 import os
 import re
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Iterable, NamedTuple, Optional, Tuple
@@ -69,11 +70,26 @@ from .weight_loader import is_local_expert_weight
 from .modules import (
     AttnMetaData,
     all_gather_first_dim,
+    build_dsa_indexer_metadata,
     distributed_argmax,
     dp_to_tp_all_to_all,
+    get_zigzag_layout,
     reduce_scatter_first_dim,
     validate_mega_kda_replayssm_switch,
     vocab_tp_to_owner,
+)
+from .modules.kcp import (
+    gather_cp_padded_tokens,
+    gather_kcp_summaries,
+    kcp_prefix_scan,
+    previous_conv_state,
+    sync_last_cp_state,
+    temporary_conv_cache_ids,
+)
+from .modules.parallel_layout import (
+    cp_last_token_location,
+    vocab_tp_group_ranks,
+    vocab_tp_group_spec,
 )
 
 _flash_kda_import_error = None
@@ -106,6 +122,25 @@ except ImportError as error:
     _block_attn_res_prepare_impl = None
     _block_attn_res_update_impl = None
 
+_flash_kda_cp_import_error = None
+try:
+    from ops.flash_kda_cp_main import flash_kda_cp_main as _flash_kda_cp_main_impl
+    from ops.flash_kda_cp_preprocess import (
+        flash_kda_cp_preprocess as _flash_kda_cp_preprocess_impl,
+    )
+    from ops.flash_kda_cp_main_metadata import (
+        flash_kda_cp_main_metadata as _flash_kda_cp_main_metadata_impl,
+    )
+    from ops.flash_kda_cp_preprocess_metadata import (
+        flash_kda_cp_preprocess_metadata as _flash_kda_cp_preprocess_metadata_impl,
+    )
+except ImportError as error:
+    _flash_kda_cp_import_error = error
+    _flash_kda_cp_main_impl = None
+    _flash_kda_cp_preprocess_impl = None
+    _flash_kda_cp_main_metadata_impl = None
+    _flash_kda_cp_preprocess_metadata_impl = None
+
 logger = logging.getLogger(__name__)
 
 try:
@@ -135,6 +170,7 @@ except ImportError:
 
 ForwardMetaData = dict
 InferenceConfig = SimpleNamespace
+_DSA_REFERENCE_MAX_KV = 4096
 
 
 def _load_situ_fusion_op() -> None:
@@ -190,6 +226,10 @@ def _offline_infer_config(settings):
             world_size=settings.get("world_size", int(os.getenv("WORLD_SIZE", "1"))),
             global_rank=_global_rank(),
             attn_tp_size=parallel.get("attn_tp_size", 1),
+            cp_size=parallel.get("cp_size", 1),
+            kda_tp_size=parallel.get(
+                "kda_tp_size", parallel.get("attn_tp_size", 1)
+            ),
             attn_dp_size=parallel.get("attn_dp_size", 1),
             moe_tp_size=parallel.get("moe_tp_size", 1),
             moe_dp_size=parallel.get("moe_dp_size", 1),
@@ -853,16 +893,24 @@ class KimiMoEGate(nn.Module):
 
 
 class MLAContext:
-    """Share streams/events across sequential MLA layers, outside ModuleList."""
+    """Share streams/events across sequential MLA/DSA layers, outside ModuleList."""
 
-    def __init__(self, infer_config: InferenceConfig) -> None:
+    def __init__(self, infer_config: InferenceConfig, *, enable_dsa: bool = False) -> None:
         enable = infer_config.model_config.custom_params.get("enable_multi_streams", False)
         exe_mode = infer_config.model_config.exe_mode
+        self.exe_mode = exe_mode
         self.gate_stream = create_stream('mla_gate', exe_mode) if enable else None
         # Each MLA joins its gate work before returning. The next MLA may
         # reuse these events; metadata completion spans all layers separately.
         self.gate_events = tuple(create_event(exe_mode, enable) for _ in range(4))
         self.metadata_events = None
+        self.indexer_enabled = enable_dsa and enable and exe_mode == "npugraph_ex"
+        self.indexer_prolog_stream = (
+            create_stream("indexer_prolog", exe_mode) if self.indexer_enabled else None
+        )
+        self.indexer_weight_stream = (
+            create_stream("indexer_weight", exe_mode) if self.indexer_enabled else None
+        )
 
 
 class ReplaySSMContext:
@@ -1693,6 +1741,10 @@ class KimiShortConvolution(nn.Module):
     ) -> tuple[torch.Tensor]:
         if is_prefill:
             if has_initial_state is None:
+                # A fresh request starts from a zero convolution history, which
+                # is exactly the operator's left zero pad. Under CP every rank
+                # but the first continues the previous rank's tail, so the
+                # caller supplies its own flags.
                 has_initial_state = torch.zeros(
                     size=[query_start_loc.shape[0] - 1],
                     dtype=torch.int32,
@@ -1760,13 +1812,35 @@ class KimiDeltaAttention(nn.Module):
         self.attn_tp_rank = (
             0 if self.attn_tp_size == 1 else comm_manager.get_rank("attn_tp_group")
         )
+        self.cp_size = 1 if parallel is None else parallel.cp_size
+        self.cp_group = (
+            comm_manager.get_group("cp_group") if self.cp_size > 1 else None
+        )
+        self.cp_rank = (
+            comm_manager.get_rank("cp_group") if self.cp_size > 1 else 0
+        )
         quant_config = getattr(config, "quant_config", None)
         if quant_config is not None:
             quant_config.packed_modules_mapping["qkv_proj"] = ["q_proj", "k_proj", "v_proj"]
-        if _flash_kda_impl is None:
+        if self.cp_size <= 1 and (
+            _flash_kda_impl is None or _flash_kda_metadata_impl is None
+        ):
             raise ImportError(
                 "KimiDeltaAttention requires ops.flash_kda and ops.flash_kda_metadata"
             ) from _flash_kda_import_error
+        if self.cp_size > 1 and any(
+            operator is None
+            for operator in (
+                _flash_kda_cp_main_impl,
+                _flash_kda_cp_main_metadata_impl,
+                _flash_kda_cp_preprocess_impl,
+                _flash_kda_cp_preprocess_metadata_impl,
+            )
+        ):
+            raise ImportError(
+                "context-parallel KDA requires flash_kda_cp_main and "
+                "flash_kda_cp_preprocess with metadata wrappers"
+            ) from _flash_kda_cp_import_error
         self.use_mega_kda = infer_config.model_config.custom_params.get("enable_mega_kda", False)
         if not isinstance(self.use_mega_kda, bool):
             raise TypeError("enable_mega_kda must be a boolean")
@@ -1943,6 +2017,85 @@ class KimiDeltaAttention(nn.Module):
         if cache_kind == "KDARecurrent":
             return block_table
         return block_table[:, 0]
+
+    def _prefill_cp_kda(
+        self,
+        inputs: KdaInputs,
+        gate_params: KdaGateParams,
+        initial_state: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        shard_lengths: tuple[int, ...],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run CP KDA preprocess, prefix scan, and main for one local shard."""
+        q, k, v, raw_gate, raw_beta = inputs
+        cu_seqlens = query_start_loc.to(dtype=torch.int32).contiguous()
+        if q.shape[0]:
+            q, k, v, raw_gate, raw_beta = (
+                tensor.contiguous()
+                for tensor in (q, k, v, raw_gate, raw_beta)
+            )
+            preprocess_metadata = _flash_kda_cp_preprocess_metadata_impl(
+                q, v, "TND", cu_seqlens
+            )
+            cp_inputs = _flash_kda_cp_preprocess_impl(
+                q,
+                k,
+                v,
+                raw_gate,
+                raw_beta,
+                1.0 / math.sqrt(self.head_dim),
+                gate_params.a_log.data,
+                gate_params.dt_bias,
+                gate_params.lower_bound,
+                "TND",
+                preprocess_metadata,
+                cu_seqlens,
+            )
+            cp_inputs = tuple(tensor.contiguous() for tensor in cp_inputs)
+            transition, state_ext = cp_inputs[:2]
+        else:
+            transition = torch.eye(
+                self.head_dim, dtype=torch.float32, device=q.device
+            ).view(1, 1, self.head_dim, self.head_dim).expand(
+                1, self.num_heads, self.head_dim, self.head_dim
+            ).clone()
+            state_ext = torch.zeros_like(transition)
+
+        transitions, state_exts = gather_kcp_summaries(
+            transition, state_ext, self.cp_group, self.cp_size
+        )
+        # The CP operators expose state storage as [Dv, Dk], while the affine
+        # prefix scan composes maps in [Dk, Dv] form.  K3 uses equal dimensions,
+        # so the transpose is required for semantics even though the shapes
+        # look identical.
+        local_initial_state = kcp_prefix_scan(
+            transitions.transpose(-1, -2),
+            state_exts.transpose(-1, -2),
+            initial_state.transpose(-1, -2).contiguous(),
+            self.cp_rank,
+        ).transpose(-1, -2).contiguous()
+        if q.shape[0]:
+            main_metadata = _flash_kda_cp_main_metadata_impl(
+                cp_inputs[3], local_initial_state, "TND", cu_seqlens
+            )
+            output, state = _flash_kda_cp_main_impl(
+                *cp_inputs,
+                local_initial_state,
+                "TND",
+                main_metadata,
+                cu_seqlens,
+            )
+        else:
+            output, state = v, local_initial_state
+
+        last_nonempty_rank = next(
+            (rank for rank in range(self.cp_size - 1, -1, -1) if shard_lengths[rank]),
+            0,
+        )
+        state = sync_last_cp_state(
+            state, self.cp_group, self.cp_size, last_nonempty_rank
+        )
+        return output, state
 
     def _prefill_flash_kda(
         self,
@@ -2140,18 +2293,54 @@ class KimiDeltaAttention(nn.Module):
         # gathered tensor until output projection.
         gate = self._project_gate(hidden_states)
         tokens = hidden_states.shape[0]
-        sp_pad_len = (
-            tokens - forward_metadata["prompt_tokens"]
-            if self.attn_tp_size > 1 and forward_metadata["is_prefill"]
-            else 0
+        cp_metadata = forward_metadata.get("cp_metadata")
+        enable_cp = (
+            forward_metadata["is_prefill"]
+            and cp_metadata is not None
+            and cp_metadata.enabled
         )
+        if enable_cp:
+            sp_pad_len = tokens - cp_metadata.local_prev_token_num
+        else:
+            sp_pad_len = (
+                tokens - forward_metadata["prompt_tokens"]
+                if self.attn_tp_size > 1 and forward_metadata["is_prefill"]
+                else 0
+            )
         if forward_metadata["is_prefill"]:
             hidden_states = _unpad_kda_input(hidden_states, sp_pad_len)
             batch = len(query_boundaries) - 1
         else:
             batch = forward_metadata["actual_seq_lengths_q"].shape[0]
         tokens = hidden_states.shape[0]
-        state_ids = self._state_block_ids(forward_metadata, "KDAConv")
+        cp_shard_lengths = None
+        last_nonempty_cp_rank = None
+        if enable_cp:
+            seq_len = cp_metadata.global_valid_indices.numel()
+            shard_size = cp_metadata.local_token_num
+            cp_shard_lengths = tuple(
+                max(0, min(seq_len - rank * shard_size, shard_size))
+                for rank in range(self.cp_size)
+            )
+            last_nonempty_cp_rank = next(
+                (
+                    rank
+                    for rank in range(self.cp_size - 1, -1, -1)
+                    if cp_shard_lengths[rank]
+                ),
+                0,
+            )
+        # Under CP only the request's owner group holds a framework state block;
+        # the other ranks compute through layer-local temporaries.
+        has_persistent_state = not enable_cp or (
+            cp_metadata.persistent_valid_indices is not None
+            and cp_metadata.persistent_valid_indices.numel() > 0
+        )
+        state_ids = (
+            self._state_block_ids(forward_metadata, "KDAConv")
+            if has_persistent_state
+            else None
+        )
 
         input_states = (
             hidden_states
@@ -2161,16 +2350,85 @@ class KimiDeltaAttention(nn.Module):
 
         fused_qkv = self.qkv_proj(input_states)
         num_accepted_tokens = forward_metadata.get("conv_num_accepted_tokens")
+        conv_has_initial_state = forward_metadata.get("prefill_has_initial_state")
+        if enable_cp:
+            # Like DeepSeek-V4's CP compressor state, the ShortConv workspace is
+            # local to prefill. Only the request's CP owner group flushes its
+            # rank-local final state to the framework cache consumed by decode.
+            conv_cache = fused_qkv.new_zeros(
+                batch + 1,
+                self.qkv_conv1d.kernel_size - 1,
+                self.qkv_projection_size,
+            )
+            conv_state_ids = temporary_conv_cache_ids(batch, fused_qkv.device)
+            conv_initial_state = previous_conv_state(
+                fused_qkv,
+                query_boundaries,
+                self.qkv_conv1d.kernel_size - 1,
+                self.cp_group,
+                self.cp_size,
+                self.cp_rank,
+                cp_shard_lengths,
+            )
+            torch_npu.npu_scatter_nd_update_(
+                conv_cache,
+                conv_state_ids.to(torch.long).view(-1, 1),
+                conv_initial_state.to(conv_cache.dtype),
+            )
+            conv_has_initial_state = torch.full(
+                (batch,),
+                int(self.cp_rank > 0),
+                dtype=torch.int32,
+                device=fused_qkv.device,
+            )
+        else:
+            conv_cache = layer_cache["conv_state"]
+            conv_state_ids = state_ids
         mixqkv = self.qkv_conv1d(
             fused_qkv,
-            layer_cache["conv_state"],
-            state_ids,
+            conv_cache,
+            conv_state_ids,
             forward_metadata["is_prefill"],
             query_start_loc,
             num_accepted_tokens,
-            forward_metadata.get("prefill_has_initial_state"),
+            conv_has_initial_state,
         )
-
+        if enable_cp:
+            local_conv_state = torch.index_select(
+                conv_cache, 0, conv_state_ids.to(torch.long)
+            )
+            final_conv_state = sync_last_cp_state(
+                local_conv_state,
+                self.cp_group,
+                self.cp_size,
+                last_nonempty_cp_rank,
+            )
+            if has_persistent_state:
+                # DSpark extends each persistent row with ``next_n`` slots for
+                # speculative tokens.  CP prefill only produces the committed
+                # convolution history (kernel_size - 1), so fill the reserved
+                # suffix with zeros before scattering the complete cache row.
+                # ScatterNdUpdate requires every trailing update dimension to
+                # match the destination after the indexed row dimension.
+                conv_state_pad_len = (
+                    layer_cache["conv_state"].shape[1]
+                    - final_conv_state.shape[1]
+                )
+                if conv_state_pad_len < 0:
+                    raise ValueError(
+                        "CP convolution state is wider than its persistent cache: "
+                        f"state={final_conv_state.shape[1]}, "
+                        f"cache={layer_cache['conv_state'].shape[1]}"
+                    )
+                if conv_state_pad_len:
+                    final_conv_state = F.pad(
+                        final_conv_state, (0, 0, 0, conv_state_pad_len)
+                    )
+                torch_npu.npu_scatter_nd_update_(
+                    layer_cache["conv_state"],
+                    state_ids.to(torch.long).view(-1, 1),
+                    final_conv_state.to(layer_cache["conv_state"].dtype),
+                )
 
         shape = (*input_states.shape[:-1], self.num_heads, self.head_dim)
         raw_decay = self.f_b_proj(self.f_a_proj(input_states)).view(shape)
@@ -2180,10 +2438,11 @@ class KimiDeltaAttention(nn.Module):
         if forward_metadata["is_prefill"]:
             q, k, v = mixqkv.split(self.projection_size, dim=-1)
             q, k, v = q.view(shape), k.view(shape), v.view(shape)
-            recurrent_state_ids = self._state_block_ids(
-                forward_metadata, "KDARecurrent"
-            )[:, 0]
+            recurrent_state_ids = None
             if forward_metadata.get("is_chunked_prefill", False):
+                recurrent_state_ids = self._state_block_ids(
+                    forward_metadata, "KDARecurrent"
+                )[:, 0]
                 initial_state = layer_cache["recurrent_state"].index_select(
                     0, recurrent_state_ids.to(torch.long)
                 )
@@ -2193,15 +2452,30 @@ class KimiDeltaAttention(nn.Module):
                     self.head_dim, self.head_dim,
                     dtype=torch.float32, device=q.device,
                 )
-            output, state = self._prefill_flash_kda(
-                KdaInputs(q, k, v, raw_decay, raw_beta),
-                KdaGateParams(self.A_log, dt_bias, self.gate_lower_bound),
-                initial_state,
-                query_start_loc,
+            kda_inputs = KdaInputs(q, k, v, raw_decay, raw_beta)
+            gate_params = KdaGateParams(
+                self.A_log, dt_bias, self.gate_lower_bound
             )
-            self.update_mamba_cache(
-                recurrent_state_ids, state, layer_cache["recurrent_state"]
-            )
+            if enable_cp:
+                output, state = self._prefill_cp_kda(
+                    kda_inputs,
+                    gate_params,
+                    initial_state,
+                    query_start_loc,
+                    cp_shard_lengths,
+                )
+            else:
+                output, state = self._prefill_flash_kda(
+                    kda_inputs, gate_params, initial_state, query_start_loc
+                )
+            if has_persistent_state:
+                if recurrent_state_ids is None:
+                    recurrent_state_ids = self._state_block_ids(
+                        forward_metadata, "KDARecurrent"
+                    )[:, 0]
+                self.update_mamba_cache(
+                    recurrent_state_ids, state, layer_cache["recurrent_state"]
+                )
             output = _pad_kda_output(output, sp_pad_len)
         else:
             output = self._decode_fused_kda(
@@ -2435,6 +2709,13 @@ class KimiMLAAttention(nn.Module):
             if self.attn_tp_size == 1
             else comm_manager.get_group("attn_tp_group")
         )
+        self.cp_size = 1 if parallel is None else parallel.cp_size
+        self.cp_group = (
+            comm_manager.get_group("cp_group") if self.cp_size > 1 else None
+        )
+        self.cp_rank = (
+            comm_manager.get_rank("cp_group") if self.cp_size > 1 else 0
+        )
         self.attn_reduce_scatter_group = (
             None
             if self.attn_tp_size == 1
@@ -2560,9 +2841,9 @@ class KimiMLAAttention(nn.Module):
 
             self.mla_prolog_op = quant_mla_prolog_op
         else:
-            from ops.mla_prolog_bf16 import mla_prolog_bf16
+            from ops.mla_prolog import mla_prolog
 
-            self.mla_prolog_op = mla_prolog_bf16
+            self.mla_prolog_op = mla_prolog
         for name, linear in (("qa", self.q_a_proj), ("qb", self.q_b_proj_decode),
                              ("kva", self.kv_a_proj_with_mqa)):
             weight = linear.weight.detach()
@@ -2866,6 +3147,125 @@ class KimiMLAAttention(nn.Module):
             query_nope, query_rope, k_nope, k_rope, tokens, forward_metadata
         )
 
+    def _forward_prefill_cp(
+        self,
+        hidden_states: torch.Tensor,
+        forward_metadata: ForwardMetaData,
+        layer_cache: dict,
+    ) -> torch.Tensor:
+        """Run balanced MLA CP while preserving contiguous layer boundaries.
+
+        KDA needs each CP rank to retain a contiguous sequence range. MLA alone
+        exchanges that range into a head fragment and its mirrored tail
+        fragment, runs the two causal prefixes, and exchanges the output back.
+        """
+        cp_metadata = forward_metadata["cp_metadata"]
+        local_valid = cp_metadata.local_prev_token_num
+        layout = get_zigzag_layout(
+            self.cp_size,
+            self.cp_rank,
+            cp_metadata.local_token_num,
+            self.cp_group,
+        )
+        local_hidden = hidden_states[:local_valid]
+        if local_valid:
+            normalized_q = self.q_a_layernorm(self.q_a_proj(local_hidden))
+            query = (
+                self.q_b_proj(normalized_q)
+                if self.q_lora_rank is not None
+                else self.q_proj(local_hidden)
+            ).view(local_valid, self.num_heads, self.q_head_dim)
+            compressed = self.kv_a_proj_with_mqa(local_hidden)
+        else:
+            query = hidden_states.new_empty(
+                0, self.num_heads, self.q_head_dim
+            )
+            compressed = hidden_states.new_empty(
+                0, self.kv_lora_rank + self.qk_rope_head_dim
+            )
+        local_padded = layout.pad_local(compressed)
+        global_compressed = gather_cp_padded_tokens(
+            local_padded,
+            self.cp_group,
+            self.cp_size,
+            cp_metadata.restore_indices,
+            cp_metadata.global_valid_indices,
+        )
+        owner_indices = forward_metadata["mla_owner_token_indices"]
+        if owner_indices.numel() > 0:
+            self._write_latent_cache(
+                global_compressed,
+                forward_metadata["slot_mapping"][self.attn_type],
+                layer_cache,
+            )
+
+        k_nope, k_rope = torch.split(
+            global_compressed,
+            [self.kv_lora_rank, self.qk_rope_head_dim],
+            dim=-1,
+        )
+        k_nope = layout.pad_global(self.kv_a_layernorm(k_nope))
+        k_rope = layout.pad_global(k_rope)
+
+        zigzag_query = layout.sp_to_cp(layout.pad_local(query))
+        head_query, tail_query = zigzag_query.split(
+            layout.fragment_len, dim=0
+        )
+        fragment_seq_q, kv_seq_head, kv_seq_tail = layout.length_tensors(
+            cp_metadata.kv_len_prev
+        )
+        halves = []
+        for half_query, kv_len, kv_seq in (
+            (head_query, layout.kv_len_head, kv_seq_head),
+            (tail_query, layout.kv_len_tail, kv_seq_tail),
+        ):
+            query_nope, query_rope = self._prepare_query_inputs(half_query)
+            halves.append(
+                self._prefill_attention(
+                    query_nope,
+                    query_rope,
+                    k_nope[:kv_len],
+                    k_rope[:kv_len],
+                    layout.fragment_len,
+                    forward_metadata,
+                    actual_seq_q=fragment_seq_q,
+                    actual_seq_kv=kv_seq,
+                )
+            )
+        output = layout.cp_to_sp(torch.cat(halves, dim=0))
+        if local_valid < cp_metadata.local_token_num:
+            output = F.pad(
+                output[:local_valid],
+                (0, 0, 0, cp_metadata.local_token_num - local_valid),
+            )
+        return output
+
+    def _forward_decode(
+            self,
+            query: torch.Tensor,
+            forward_metadata: ForwardMetaData,
+            layer_cache: dict,
+            kv_stream: Optional[torch.npu.Stream],
+    ) -> torch.Tensor:
+        """Attend against the cached latent with kv_b_proj absorbed in."""
+        tokens = query.shape[0]
+        query_nope, query_rope = self._prepare_query_inputs(query)
+        block_table = forward_metadata["block_table"][self.attn_type]
+
+        actual_seq_qlen = forward_metadata["actual_seq_lengths_cu_list_q"]
+        actual_seq_kvlen = forward_metadata["actual_seq_lengths_list_kv"]
+
+        return self._decode_attention(
+            query_nope,
+            query_rope,
+            tokens,
+            block_table,
+            actual_seq_qlen,
+            actual_seq_kvlen,
+            forward_metadata.get("attention_mask"),
+            layer_cache,
+            kv_stream,
+        )
 
     def _prefill_attention(
         self,
@@ -2875,6 +3275,8 @@ class KimiMLAAttention(nn.Module):
         k_rope: torch.Tensor,
         tokens: int,
         forward_metadata: ForwardMetaData,
+        actual_seq_q: Optional[torch.Tensor] = None,
+        actual_seq_kv: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Expand this step's own latent through kv_b_proj and attend over it.
 
@@ -2882,14 +3284,18 @@ class KimiMLAAttention(nn.Module):
         than token chunks, so attention uses only this cycle's expanded K/V and
         never reads earlier paged blocks back.
         """
-        latent = k_nope.view(1, tokens, self.kv_lora_rank)
+        kv_tokens = k_nope.shape[0]
+        latent = k_nope.view(1, kv_tokens, self.kv_lora_rank)
         # [N, T, qk_nope_head_dim] and [N, T, v_head_dim]
         key_nope = torch.matmul(latent, self.kv_b_proj_w_k.permute(0, 2, 1))
         value = torch.matmul(latent, self.kv_b_proj_w_v)
-        key_rope = k_rope.view(1, tokens, self.qk_rope_head_dim).repeat(
+        key_rope = k_rope.view(1, kv_tokens, self.qk_rope_head_dim).repeat(
             self.num_heads, 1, 1
         )
-        cu_kvlen = forward_metadata["actual_seq_lengths_cu_list_kv"]
+        if actual_seq_q is None:
+            actual_seq_q = forward_metadata["actual_seq_lengths_cu_list_kv"]
+        if actual_seq_kv is None:
+            actual_seq_kv = forward_metadata["actual_seq_lengths_cu_list_kv"]
         output, _ = torch_npu.npu_fused_infer_attention_score_v2(
             query_nope.transpose(0, 1),
             key_nope,
@@ -2901,8 +3307,8 @@ class KimiMLAAttention(nn.Module):
             input_layout="NTD_TND",
             atten_mask=forward_metadata["attention_mask"],
             sparse_mode=3,
-            actual_seq_qlen=cu_kvlen,
-            actual_seq_kvlen=cu_kvlen,
+            actual_seq_qlen=actual_seq_q,
+            actual_seq_kvlen=actual_seq_kv,
             softmax_scale=self.scaling,
             next_tokens=0,
         )
@@ -3024,24 +3430,45 @@ class KimiMLAAttention(nn.Module):
                     hidden_states = hidden_states[:-sp_pad_len]
         tokens = hidden_states.shape[0]
 
+        cp_metadata = forward_metadata.get("cp_metadata")
+        enable_cp = (
+            is_prefill
+            and cp_metadata is not None
+            and cp_metadata.enabled
+        )
+
         main_stream = torch.npu.current_stream()
         gate = None
         full_hidden = None
-        if is_prefill:
-            normalized_q = self.q_a_layernorm(self.q_a_proj(hidden_states))
-            query = self.q_b_proj(normalized_q).view(
-                tokens, self.num_heads, self.q_head_dim
+        normalized_q = None
+        if getattr(self, "uses_dsa", False):
+            output, full_hidden = self._forward_dsa(
+                hidden_states, forward_metadata, layer_cache, mla_ctx
             )
+        elif enable_cp:
+            output = self._forward_prefill_cp(
+                hidden_states, forward_metadata, layer_cache
+            )
+        else:
+            normalized_q = self.q_a_layernorm(self.q_a_proj(hidden_states))
+        if not getattr(self, "uses_dsa", False) and is_prefill and not enable_cp:
+            query = (
+                self.q_b_proj(normalized_q)
+                if self.q_lora_rank is not None
+                else self.q_proj(hidden_states)
+            ).view(tokens, self.num_heads, self.q_head_dim)
             compressed = self.kv_a_proj_with_mqa(hidden_states)
             output = self._forward_prefill(
                 query, compressed, forward_metadata, layer_cache
             )
-        else:
+        elif not getattr(self, "uses_dsa", False) and not is_prefill:
             output, full_hidden = self._forward_decode_flash(
                 hidden_states, forward_metadata, layer_cache,
                 metadata_events=mla_ctx.metadata_events if mla_ctx is not None else None,
                 gate_stream=gate_stream, gate_events=gate_events,
             )
+
+        if not is_prefill:
             record_event(self.enable_multi_streams, gate_events, 2, self.exe_mode)
 
         if not is_prefill:
@@ -3107,6 +3534,1041 @@ class KimiMLAAttention(nn.Module):
         )
 
 
+def _read_dsa_cache(
+    cache: torch.Tensor, table_row: torch.Tensor, length: int
+) -> torch.Tensor:
+    positions = torch.arange(length, device=cache.device)
+    block_size = cache.shape[1]
+    return cache[table_row[positions // block_size].long(), positions % block_size, 0]
+
+
+def _dsa_reference_segments(
+    cu_seqlens_q: torch.Tensor, cache_seqlens: torch.Tensor, tokens: int
+) -> Iterable[tuple[int, int, int, int]]:
+    query_ends = cu_seqlens_q.tolist()
+    kv_lengths = cache_seqlens.tolist()
+    if len(query_ends) != len(kv_lengths) or not query_ends or query_ends[-1] != tokens:
+        raise ValueError("DSA expects cumulative query ends and per-request KV lengths")
+    query_start = 0
+    for request_idx, (query_end, kv_len) in enumerate(zip(query_ends, kv_lengths)):
+        if query_end < query_start or kv_len < 0 or kv_len > _DSA_REFERENCE_MAX_KV:
+            raise ValueError(
+                f"reference DSA requires 0 <= kv_length <= {_DSA_REFERENCE_MAX_KV}"
+            )
+        if kv_len and kv_len < query_end - query_start:
+            raise ValueError("KV length must include the current query block")
+        yield request_idx, query_start, query_end, kv_len
+        query_start = query_end
+
+
+class KimiDSAIndexer(nn.Module):
+    """BF16 projections with optional MXFP8 Q/K and request-local key caches."""
+
+    def __init__(
+        self,
+        config: KimiLinearConfig,
+        *,
+        enable_multi_streams: bool = False,
+        enable_quant: bool = True,
+    ) -> None:
+        super().__init__()
+        self.enable_quant = enable_quant
+        # Per-layer input, Q-projection, weights and optional quantized-Q readiness.
+        self.npu_events = []
+        if enable_multi_streams:
+            self.npu_events = [torch.npu.Event() for _ in range(4 if enable_quant else 3)]
+        dsa_config = config.dsa_config
+        self.num_heads = dsa_config["index_num_heads"]
+        self.head_dim = dsa_config["index_head_dim"]
+        self.topk = dsa_config["index_topk"]
+        # Native Linear intentionally bypasses the routed-expert quantizer and
+        # its post-load NZ transpose. These five names match the checkpoint.
+        self.wq_b = nn.Linear(
+            config.q_lora_rank,
+            self.num_heads * self.head_dim,
+            bias=False,
+            dtype=torch.bfloat16,
+        )
+        self.wk = nn.Linear(
+            config.hidden_size, self.head_dim, bias=False, dtype=torch.bfloat16
+        )
+        self.weights_proj = nn.Linear(
+            config.hidden_size, self.num_heads, bias=False, dtype=torch.bfloat16
+        )
+        self.k_norm = nn.LayerNorm(self.head_dim, eps=1e-6, dtype=torch.bfloat16)
+        self.register_buffer("weights_proj_fp32", None, persistent=False)
+        self.register_buffer("hadamard_matrix", None, persistent=False)
+        self.register_load_state_dict_post_hook(self._refresh_inference_weights)
+
+    @torch.no_grad()
+    def prepare_inference_weights(self) -> None:
+        """Refresh after final checkpoint copies/device placement, before capture."""
+        self.weights_proj_fp32 = self.weights_proj.weight.detach().float()
+        if self.enable_quant:
+            if self.head_dim <= 0 or self.head_dim & (self.head_dim - 1):
+                raise ValueError("Indexer Hadamard requires a power-of-two head dimension")
+            # Build outside graph capture and regenerate after device/dtype moves.
+            # Normalize once in FP32 before casting, avoiding BF16 accumulation.
+            matrix = torch.ones(1, 1, device=self.wq_b.weight.device, dtype=torch.float32)
+            while matrix.shape[0] < self.head_dim:
+                matrix = torch.cat((torch.cat((matrix, matrix), 1),
+                                    torch.cat((matrix, -matrix), 1)), 0)
+            self.hadamard_matrix = (matrix * self.head_dim**-0.5).to(self.wq_b.weight.dtype)
+
+    def _refresh_inference_weights(self, module: nn.Module, incompatible_keys) -> None:
+        self.prepare_inference_weights()
+
+    def _apply(self, fn, recurse: bool = True):
+        prepared = self.weights_proj_fp32 is not None
+        result = super()._apply(fn, recurse=recurse)
+        if prepared:
+            self.prepare_inference_weights()
+        return result
+
+    def project(
+        self,
+        hidden_states: torch.Tensor,
+        normalized_q: torch.Tensor,
+        mla_ctx: Optional[MLAContext] = None,
+    ) -> tuple[
+        torch.Tensor, torch.Tensor, torch.Tensor,
+        Optional[torch.Tensor], Optional[torch.Tensor],
+    ]:
+        """Project Q/K with optional quantization; join weights before select."""
+        multi_streams = mla_ctx is not None
+        prolog_stream = mla_ctx.indexer_prolog_stream if multi_streams else None
+        weight_stream = mla_ctx.indexer_weight_stream if multi_streams else None
+        events = self.npu_events if multi_streams else None
+        exe_mode = mla_ctx.exe_mode if multi_streams else None
+        main_stream = torch.npu.current_stream() if multi_streams else None
+        query_scale = key_scale = None
+
+        record_stream(multi_streams, normalized_q, prolog_stream, exe_mode)
+        record_event(multi_streams, events, 0, exe_mode)
+        with npu_stream_switch(multi_streams, prolog_stream, exe_mode=exe_mode):
+            wait_event(multi_streams, events, 0, exe_mode)
+            query = self.wq_b(normalized_q).view(-1, self.num_heads, self.head_dim)
+            record_event(multi_streams, events, 1, exe_mode)
+            if self.enable_quant:
+                query = query @ self.hadamard_matrix
+                query, query_scale = torch_npu.npu_dynamic_mx_quant(
+                    query, dst_type=torch.float8_e4m3fn, block_size=32
+                )
+                record_event(multi_streams, events, 3, exe_mode)
+            record_stream(multi_streams, query, main_stream, exe_mode)
+            if self.enable_quant:
+                record_stream(multi_streams, query_scale, main_stream, exe_mode)
+
+        if multi_streams:
+            record_stream(True, hidden_states, weight_stream, exe_mode)
+            with npu_stream_switch(True, weight_stream, exe_mode=exe_mode):
+                # Keep DeepSeek V3.2's Q-projection-to-weights scheduling edge.
+                wait_event(True, events, 1, exe_mode)
+                proj_weight = (
+                    self.weights_proj.weight.float()
+                    if self.weights_proj_fp32 is None
+                    else self.weights_proj_fp32
+                )
+                weights = F.linear(hidden_states.float(), proj_weight) * self.num_heads**-0.5
+                record_event(True, events, 2, exe_mode)
+                record_stream(True, weights, main_stream, exe_mode)
+
+        projected_key = self.wk(hidden_states)
+        if not multi_streams:
+            proj_weight = (
+                self.weights_proj.weight.float()
+                if self.weights_proj_fp32 is None
+                else self.weights_proj_fp32
+            )
+        key = self.k_norm(projected_key).view(-1, 1, self.head_dim)
+        if self.enable_quant:
+            key = key @ self.hadamard_matrix
+            key, key_scale = torch_npu.npu_dynamic_mx_quant(
+                key, dst_type=torch.float8_e4m3fn, block_size=32
+            )
+        if not multi_streams:
+            weights = F.linear(hidden_states.float(), proj_weight) * self.num_heads**-0.5
+        if not self.enable_quant:
+            wait_event(multi_streams, events, 1, exe_mode)
+        return query, key, weights, query_scale, key_scale
+
+    def _lightning_index(
+        self,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        weights: torch.Tensor,
+        query_scale: Optional[torch.Tensor],
+        key_scale_cache: Optional[torch.Tensor],
+        block_table: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        topk: int,
+        *,
+        prepared: Optional[dict] = None,
+    ) -> torch.Tensor:
+        if prepared is None:
+            indexer_cu_q = torch.cat(
+                (cu_seqlens_q.new_zeros(1), cu_seqlens_q)
+            ).to(torch.int32)
+            q_lengths = cu_seqlens_q - indexer_cu_q[:-1]
+            kernel_lengths = torch.where(
+                cache_seqlens > 0, cache_seqlens, q_lengths
+            ).to(torch.int32)
+            indexer_metadata = build_dsa_indexer_metadata(
+                query.shape[1], query.shape[-1], topk, indexer_cu_q, kernel_lengths,
+                enable_quant=self.enable_quant,
+            )
+        else:
+            kernel_lengths = prepared["kernel_lengths"]
+            indexer_cu_q = prepared["indexer_cu_q"]
+            indexer_metadata = prepared["indexer_metadata"]
+        if not self.enable_quant:
+            result, _ = torch.ops.cann_ops_transformer.lightning_indexer(
+                q=query.contiguous(),
+                k=key_cache,
+                w=(weights * query.shape[-1] ** -0.5).contiguous(),
+                topk=topk,
+                cu_seqlens_q=indexer_cu_q,
+                seqused_k=kernel_lengths,
+                block_table=block_table.to(torch.int32),
+                metadata=indexer_metadata,
+                layout_q="TND",
+                layout_k="PA_BBND",
+                mask_mode=3,
+                cmp_ratio=1,
+                return_value=0,
+            )
+            return result.reshape(query.shape[0], 1, topk).to(torch.int32)
+        # MX scale bytes must be reinterpreted, not numerically cast to E8M0.
+        key_scale = key_scale_cache.view(
+            *key_scale_cache.shape[:-1], query.shape[-1] // 64, 2
+        )
+        result, _ = torch.ops.cann_ops_transformer.quant_lightning_indexer(
+            query=query.contiguous(),
+            key=key_cache.view(torch.float8_e4m3fn),
+            weights=(weights * query.shape[-1] ** -0.5).contiguous(),
+            query_dequant_scale=query_scale.view(torch.float8_e8m0fnu),
+            key_dequant_scale=key_scale.view(torch.float8_e8m0fnu),
+            topk=topk,
+            quant_mode=3,
+            cu_seqlens_q=indexer_cu_q,
+            seqused_k=kernel_lengths,
+            block_table=block_table.to(torch.int32),
+            metadata=indexer_metadata,
+            layout_q="TND",
+            layout_k="PA_BBND",
+            mask_mode=3,
+            cmp_ratio=1,
+            return_value=0,
+        )
+        return result.reshape(query.shape[0], 1, topk).to(torch.int32)
+
+    def _reference_index(
+        self,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        weights: torch.Tensor,
+        query_scale: Optional[torch.Tensor],
+        key_scale_cache: Optional[torch.Tensor],
+        block_table: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        topk: int,
+    ) -> torch.Tensor:
+        """FP32 candidate score; positive head/dimension scaling is explicit.
+
+        weights already includes 1/sqrt(index_num_heads); apply 1/sqrt(D) here.
+        Equal scores follow torch.topk's backend-dependent tie order.
+        """
+        if self.enable_quant:
+            query = (
+                query.float().unflatten(-1, (-1, 32))
+                * query_scale.view(torch.float8_e8m0fnu).float().flatten(-2).unsqueeze(-1)
+            ).flatten(-2)
+        result = torch.full(
+            (query.shape[0], 1, topk), -1, dtype=torch.int32, device=query.device
+        )
+        for request_idx, query_start, query_end, kv_len in _dsa_reference_segments(
+            cu_seqlens_q, cache_seqlens, query.shape[0]
+        ):
+            if not kv_len:
+                continue
+            if self.enable_quant:
+                keys = (
+                    _read_dsa_cache(key_cache, block_table[request_idx], kv_len)
+                    .view(torch.float8_e4m3fn)
+                    .float()
+                )
+                key_scale = (
+                    _read_dsa_cache(key_scale_cache, block_table[request_idx], kv_len)
+                    .view(torch.float8_e8m0fnu)
+                    .float()
+                )
+                keys = (keys.unflatten(-1, (-1, 32)) * key_scale.unsqueeze(-1)).flatten(-2)
+            else:
+                keys = _read_dsa_cache(key_cache, block_table[request_idx], kv_len).float()
+            for token_idx in range(query_start, query_end):
+                visible_len = kv_len - (query_end - token_idx) + 1
+                scores = (
+                    query[token_idx].float()
+                    @ keys[:visible_len].T
+                    * query.shape[-1] ** -0.5
+                ).relu()
+                scores = (weights[token_idx].float().unsqueeze(-1) * scores).sum(0)
+                count = min(topk, visible_len)
+                result[token_idx, 0, :count] = scores.topk(count).indices.to(
+                    torch.int32
+                )
+        return result
+
+    def select(
+        self,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        weights: torch.Tensor,
+        query_scale: Optional[torch.Tensor],
+        key_scale_cache: Optional[torch.Tensor],
+        metadata: dict,
+        backend: str,
+    ) -> torch.Tensor:
+        if backend == "reference":
+            indexer_op = self._reference_index
+        elif backend == "npu":
+            indexer_op = self._lightning_index
+        else:
+            raise ValueError(f"unknown DSA backend: {backend}")
+        indexer_kwargs = (
+            {"prepared": metadata}
+            if backend == "npu" and "kernel_lengths" in metadata
+            else {}
+        )
+        return indexer_op(
+            query,
+            key_cache,
+            weights,
+            query_scale,
+            key_scale_cache,
+            metadata["block_table"],
+            metadata["cu_q"],
+            metadata["kv_lengths"],
+            self.topk,
+            **indexer_kwargs,
+        )
+
+
+class KimiDSAAttention(KimiMLAAttention):
+    """Sparse MLA sharing K3 projections, output gate and TP/DP epilog."""
+
+    uses_dsa = True
+
+    # KDA carries its recurrent state across CP ranks with a KCP prefix scan,
+    # so the framework's blanket Mamba-under-CP rejection does not apply.
+    supports_prefill_cp_mamba = True
+    # That prefix scan composes rank-local affine summaries in sequence order,
+    # which requires each rank to own a contiguous token range.
+    prefill_cp_partition_style = "contiguous"
+
+    def __init__(
+        self,
+        config: KimiLinearConfig,
+        layer_idx: int,
+        infer_config: Optional[InferenceConfig] = None,
+        comm_manager=None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__(config, layer_idx, infer_config, comm_manager, prefix)
+        if self.use_w8a8c8 or not config.mla_use_nope:
+            raise ValueError("K3.1 DSA currently requires BF16 NoPE MLA")
+        custom_params = infer_config.model_config.custom_params
+        self.dsa_backend = custom_params.get("dsa_backend", "npu")
+        self.enable_dsa_quant = custom_params.get("enable_dsa_quant", True)
+        if self.dsa_backend not in ("npu", "reference"):
+            raise ValueError("dsa_backend must be npu or reference")
+        if self.dsa_backend == "reference" and self.exe_mode != "eager":
+            raise ValueError("reference DSA is limited to small eager validation")
+        self.indexer = KimiDSAIndexer(
+            config,
+            enable_multi_streams=self.enable_multi_streams and self.exe_mode == "npugraph_ex",
+            enable_quant=self.enable_dsa_quant,
+        )
+
+    def prepare_prolog_weights(self) -> None:
+        if self.dsa_backend == "npu":
+            if (
+                self.q_a_layernorm.variance_epsilon
+                != self.kv_a_layernorm.variance_epsilon
+            ):
+                raise ValueError(
+                    "CANNBot DSA Prolog requires identical Q/KV RMSNorm epsilon"
+                )
+            if self.enable_dsa_quant:
+                from ops.mla_prolog import CacheMode, QkvQuantMode, RopeMode, mla_prolog
+
+                self.mla_prolog_op = partial(
+                    mla_prolog,
+                    qkv_quant_mode=QkvQuantMode.KV_FP8_PER_TOKEN_GROUP,
+                    cache_mode=CacheMode.PA_BSND,
+                    rope_mode=RopeMode.NONE,
+                    return_qr=True,
+                )
+            else:
+                self.mla_prolog_op = torch.ops.cann_ops_transformer.mla_prolog
+            for name, linear in (
+                ("qa", self.q_a_proj),
+                ("qb", self.q_b_proj_decode),
+                ("kva", self.kv_a_proj_with_mqa),
+            ):
+                # The BF16 Prolog reuses Linear's [K, O] NZ weights.
+                weight = linear.weight.detach()
+                if self.enable_dsa_quant:
+                    # The DSL Prolog takes true NZ [O, K].
+                    weight = torch_npu.npu_format_cast(weight, 2)
+                    weight = torch_npu.npu_format_cast(weight.T.contiguous(), 29)
+                self.register_buffer(f"mla_w_{name}", weight)
+            gamma_dtype = torch.float32 if self.enable_dsa_quant else self.q_a_proj.weight.dtype
+            self.register_buffer(
+                "mla_gamma_qa", self.q_a_layernorm.weight.detach().to(gamma_dtype).contiguous()
+            )
+            self.register_buffer(
+                "mla_gamma_kva", self.kv_a_layernorm.weight.detach().to(gamma_dtype).contiguous()
+            )
+        self.indexer.prepare_inference_weights()
+
+    def _dsa_prolog(
+        self,
+        hidden_states: torch.Tensor,
+        layer_cache: dict,
+        forward_metadata: ForwardMetaData,
+    ) -> tuple[torch.Tensor, ...]:
+        """Write resident KV caches and reuse Prolog q_norm for the Indexer."""
+        prepared = forward_metadata.get("dsa_step")
+        if prepared is not None:
+            slots = prepared["prolog_slots"]
+        else:
+            slots = (
+                forward_metadata["slot_mapping"]["FullAttention"]
+                .reshape(-1)
+                .to(torch.int64)
+            )
+            slots = torch.where(slots == 0, -1, slots)
+        if not self.enable_dsa_quant:
+            query, query_rope, _, normalized_q, _ = self.mla_prolog_op(
+                hidden_states.contiguous(),
+                self.mla_w_qa,
+                self.mla_w_qb,
+                self.kv_b_proj_decode_w_k,
+                self.mla_w_kva,
+                self.mla_gamma_qa,
+                self.mla_gamma_kva,
+                layer_cache["nope_cache"],
+                layer_cache["rope_cache"],
+                cache_index=slots,
+                rmsnorm_epsilon_cq=self.q_a_layernorm.variance_epsilon,
+                rmsnorm_epsilon_ckv=self.kv_a_layernorm.variance_epsilon,
+                cache_mode="PA_BSND",
+                query_norm_flag=True,
+            )
+            return query, query_rope, normalized_q
+        query, _, normalized_q = self.mla_prolog_op(
+            hidden_states.contiguous(),
+            self.mla_w_qa,
+            self.mla_w_qb,
+            self.mla_w_kva,
+            self.kv_b_proj_decode_w_k,
+            self.mla_gamma_qa,
+            self.mla_gamma_kva,
+            layer_cache["nope_cache"],
+            slots,
+            norm_eps=self.q_a_layernorm.variance_epsilon,
+        )
+        return query, normalized_q
+
+    @staticmethod
+    def _quantize_kv(
+        key_latent: torch.Tensor, key_rope: torch.Tensor
+    ) -> torch.Tensor:
+        key, key_scale = torch_npu.npu_dynamic_block_quant(
+            key_latent,
+            dst_type=torch.float8_e4m3fn,
+            row_block_size=1,
+            col_block_size=128,
+        )
+        # Packed SFA rows: 512 FP8 bytes, 64 BF16 values, four FP32 descales.
+        return torch.cat(
+            (
+                key.view(torch.uint8),
+                key_rope.view(torch.uint8),
+                key_scale.view(torch.uint8),
+            ),
+            dim=-1,
+        )
+
+    @staticmethod
+    def _prepare_metadata(
+        forward_metadata: ForwardMetaData, block_table: torch.Tensor, *, resident: bool
+    ) -> dict:
+        cache_seqlens = forward_metadata["actual_seq_lengths_kv"].to(torch.int32)
+        if resident:
+            # Completed requests point to the reserved null page. Keep query
+            # packing fixed for Verify, but make their visible history empty.
+            cache_seqlens = torch.where(block_table[:, 0] != 0, cache_seqlens, 0)
+        return {
+            "block_table": block_table.to(torch.int32),
+            "cu_q": forward_metadata["actual_seq_lengths_cu_q"].to(torch.int32),
+            "kv_lengths": cache_seqlens,
+        }
+
+    @staticmethod
+    def _write_cache(
+        cache: torch.Tensor,
+        keys: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        *,
+        scatter_indices: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Write logical PA_BSND rows; slot zero belongs to the reserved null page."""
+        if slot_mapping.numel() == 0:
+            return
+        # Packed FP8 KV rows are written as bytes, including BF16 values and scales.
+        if cache.dtype == torch.float8_e4m3fn:
+            cache = cache.view(torch.uint8)
+        rows = cache.view(-1, cache.shape[-1])
+        values = keys.reshape(-1, cache.shape[-1]).to(cache.dtype).contiguous()
+        if scatter_indices is None:
+            scatter_indices = slot_mapping.reshape(-1, 1).to(torch.int64)
+        if cache.device.type == "cpu":
+            rows.index_copy_(0, scatter_indices.view(-1), values)
+        else:
+            torch_npu.npu_scatter_nd_update_(rows, scatter_indices, values)
+
+    def _prepare_cache_inputs(
+        self,
+        keys: tuple[torch.Tensor, ...],
+        layer_cache: dict,
+        forward_metadata: ForwardMetaData,
+    ) -> tuple[dict, dict]:
+        cache_names = (
+            ("nope_cache", "indexer_key_cache", "indexer_key_scale_cache")
+            if self.enable_dsa_quant
+            else ("nope_cache", "rope_cache", "indexer_key_cache")
+        )
+        if not forward_metadata["is_prefill"]:
+            if self.dsa_backend == "npu":
+                # Prolog has already written the SFA caches in place.
+                cache_names = cache_names[1:] if self.enable_dsa_quant else cache_names[2:]
+            prepared_metadata = forward_metadata.get("dsa_step")
+            slot_mapping = (
+                prepared_metadata["slots"]
+                if prepared_metadata is not None
+                else forward_metadata["slot_mapping"]["FullAttention"]
+            )
+            scatter_indices = (
+                prepared_metadata["scatter_indices"]
+                if prepared_metadata is not None
+                else None
+            )
+            for name, key in zip(cache_names, keys):
+                self._write_cache(
+                    layer_cache[name],
+                    key,
+                    slot_mapping,
+                    scatter_indices=scatter_indices,
+                )
+            if prepared_metadata is not None:
+                return layer_cache, prepared_metadata
+            return layer_cache, self._prepare_metadata(
+                forward_metadata,
+                forward_metadata["block_table"]["FullAttention"],
+                resident=True,
+            )
+
+        owner_indices = forward_metadata["mla_owner_token_indices"]
+        if owner_indices.numel():
+            slot_mapping = forward_metadata["slot_mapping"]["FullAttention"]
+            for name, key in zip(cache_names, keys):
+                self._write_cache(
+                    layer_cache[name], key.index_select(0, owner_indices), slot_mapping
+                )
+
+        if forward_metadata.get("is_chunked_prefill", False):
+            # These buffers survive all chunks of the mini-batch. Old bytes
+            # from a prior mini-batch are hidden by lengths and overwritten.
+            cache_inputs = {
+                name: layer_cache["prefill_" + name] for name in cache_names
+            }
+            batch_size = forward_metadata["actual_seq_lengths_kv"].numel()
+            block_table = forward_metadata["block_table"]["PrefillFullAttention"][
+                :batch_size
+            ]
+            slot_mapping = forward_metadata["slot_mapping"]["PrefillFullAttention"]
+        else:
+            # Every TP rank computes every prefill request, while only its DP
+            # owners retain history for decode. Full-prefill temporary pages
+            # live for this layer call, not for all 24 layers at once.
+            cache_seqlens = forward_metadata["actual_seq_lengths_kv"]
+            blocks_per_request = max(
+                1,
+                (int(cache_seqlens.max().item()) + self.block_size - 1)
+                // self.block_size,
+            )
+            batch_size = cache_seqlens.numel()
+            block_table = torch.arange(
+                1,
+                1 + batch_size * blocks_per_request,
+                device=keys[0].device,
+                dtype=torch.int32,
+            ).view(batch_size, blocks_per_request)
+            cache_inputs = {
+                name: key.new_zeros(
+                    (
+                        1 + batch_size * blocks_per_request,
+                        self.block_size,
+                        1,
+                        key.shape[-1],
+                    )
+                )
+                for name, key in zip(cache_names, keys)
+            }
+            cu_seqlens_q = forward_metadata["actual_seq_lengths_cu_q"].to(torch.int32)
+            token_indices = torch.arange(
+                keys[0].shape[0], device=keys[0].device, dtype=torch.int32
+            )
+            request_indices = torch.bucketize(
+                token_indices, cu_seqlens_q.contiguous(), right=True
+            )
+            query_starts = torch.cat((cu_seqlens_q.new_zeros(1), cu_seqlens_q[:-1]))
+            token_positions = token_indices - query_starts[request_indices]
+            slot_mapping = (
+                block_table[
+                    request_indices.long(), (token_positions // self.block_size).long()
+                ].long()
+                * self.block_size
+            )
+            slot_mapping = slot_mapping + token_positions % self.block_size
+        for name, key in zip(cache_names, keys):
+            self._write_cache(cache_inputs[name], key, slot_mapping)
+        return cache_inputs, self._prepare_metadata(
+            forward_metadata, block_table, resident=False
+        )
+
+    def _sparse_attention(
+        self,
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        sparse_indices: torch.Tensor,
+        block_table: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        softmax_scale: float,
+        *,
+        prepared: Optional[dict] = None,
+        query_rope: Optional[torch.Tensor] = None,
+        rope_cache: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if prepared is None:
+            q_lengths = cu_seqlens_q - torch.cat(
+                (cu_seqlens_q.new_zeros(1), cu_seqlens_q[:-1])
+            )
+            kernel_lengths = torch.where(
+                cache_seqlens > 0, cache_seqlens, q_lengths
+            ).to(torch.int32)
+        else:
+            kernel_lengths = prepared["kernel_lengths"]
+        if not self.enable_dsa_quant:
+            output, _, _ = torch_npu.npu_sparse_flash_attention(
+                query=query.contiguous(),
+                query_rope=query_rope.contiguous(),
+                key=kv_cache,
+                value=kv_cache,
+                key_rope=rope_cache,
+                sparse_indices=sparse_indices.contiguous(),
+                scale_value=softmax_scale,
+                actual_seq_lengths_query=cu_seqlens_q.to(torch.int32),
+                actual_seq_lengths_kv=kernel_lengths,
+                block_table=block_table.to(torch.int32),
+                sparse_block_size=1,
+                layout_query="TND",
+                layout_kv="PA_BSND",
+                sparse_mode=3,
+                attention_mode=2,
+            )
+            return output
+        num_heads = query.shape[1]
+        # Quantized SFA supports these query head counts on 950.
+        padded_heads = next(
+            heads for heads in (1, 2, 4, 8, 16, 32, 48, 64, 96, 128) if heads >= num_heads
+        )
+        if padded_heads != num_heads:
+            query = F.pad(query, (0, 0, 0, padded_heads - num_heads))
+        kv_cache = kv_cache.view(torch.float8_e4m3fn)
+        output = torch_npu.npu_kv_quant_sparse_flash_attention(
+            query=query.contiguous(),
+            key=kv_cache,
+            value=kv_cache,
+            sparse_indices=sparse_indices.contiguous(),
+            scale_value=softmax_scale,
+            key_quant_mode=2,
+            value_quant_mode=2,
+            quant_scale_repo_mode=1,
+            tile_size=128,
+            rope_head_dim=64,
+            actual_seq_lengths_query=cu_seqlens_q.to(torch.int32),
+            actual_seq_lengths_kv=kernel_lengths,
+            block_table=block_table.to(torch.int32),
+            sparse_block_size=1,
+            layout_query="TND",
+            layout_kv="PA_BSND",
+            sparse_mode=3,
+            attention_mode=2,
+        )
+        if padded_heads != num_heads:
+            output = output[:, :num_heads, :]
+        return output
+
+    def _reference_attention(
+        self,
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        sparse_indices: torch.Tensor,
+        block_table: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        softmax_scale: float,
+        *,
+        query_rope: Optional[torch.Tensor] = None,
+        rope_cache: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Sparse absorbed MLA, with an unrotated BF16 auxiliary QK branch."""
+        if self.enable_dsa_quant:
+            query, query_rope = query.split([512, 64], dim=-1)
+            kv_cache = kv_cache.view(torch.uint8)
+        output = torch.zeros_like(query)
+        for request_idx, query_start, query_end, kv_len in _dsa_reference_segments(
+            cu_seqlens_q, cache_seqlens, query.shape[0]
+        ):
+            if not kv_len:
+                continue
+            if self.enable_dsa_quant:
+                packed_kv = _read_dsa_cache(kv_cache, block_table[request_idx], kv_len)
+                key_scale = packed_kv[:, 640:].view(torch.float32)
+                keys = (
+                    packed_kv[:, :512].view(torch.float8_e4m3fn).float().view(-1, 4, 128)
+                    * key_scale.unsqueeze(-1)
+                ).reshape(-1, 512)
+                rope_keys = packed_kv[:, 512:640].view(query.dtype).float()
+            else:
+                keys = _read_dsa_cache(kv_cache, block_table[request_idx], kv_len).float()
+                rope_keys = _read_dsa_cache(rope_cache, block_table[request_idx], kv_len).float()
+            for token_idx in range(query_start, query_end):
+                visible_len = kv_len - (query_end - token_idx) + 1
+                selected = sparse_indices[token_idx, 0].long()
+                selected = selected[(selected >= 0) & (selected < visible_len)]
+                if selected.numel():
+                    logits = (
+                        query[token_idx].float() @ keys[selected].T
+                        + query_rope[token_idx].float() @ rope_keys[selected].T
+                    ) * softmax_scale
+                    output[token_idx] = (logits.softmax(-1) @ keys[selected]).to(
+                        query.dtype
+                    )
+        return output
+
+    def _gather_prefill_cp_cache(
+        self, keys: dict, forward_metadata: ForwardMetaData, layer_cache: dict,
+    ) -> dict:
+        """Gather contiguous CP shards directly into this layer's temporary pages.
+
+        As in DeepSeek 3.2, compute pages and persistent Decode pages have
+        separate ownership. K3 uses contiguous shards, so AllGather can write
+        the compute pages without an intermediate restore/scatter copy.
+        """
+        cp = forward_metadata["cp_metadata"]
+        metadata = forward_metadata["dsa_cp"]
+        slots = forward_metadata["slot_mapping"]["FullAttention"]
+        caches = {}
+        for name, key in keys.items():
+            cache = key.new_empty(
+                metadata["num_blocks"], self.block_size, 1, key.shape[-1]
+            )
+            rows = cache.view(-1, key.shape[-1])
+            rows[:self.block_size].zero_()
+            rows[self.block_size + cp.global_padded_token_num:].zero_()
+            gathered = rows.narrow(
+                0, self.block_size, cp.global_padded_token_num
+            )
+            if key.shape[0] < cp.local_token_num:
+                key = F.pad(key, (0, 0, 0, cp.local_token_num - key.shape[0]))
+            dist.all_gather_into_tensor(gathered, key.contiguous(), group=self.cp_group)
+            # The single CP request is either wholly owned by this TP rank or
+            # has no slots here. Do not persist padding or duplicate its cache.
+            if slots.numel():
+                self._write_cache(
+                    layer_cache[name], gathered[:slots.numel()], slots,
+                    scatter_indices=metadata["persistent_scatter_indices"],
+                )
+            caches[name] = cache
+        return caches
+
+    def _forward_prefill_cp(
+        self, hidden_states: torch.Tensor, forward_metadata: ForwardMetaData,
+        layer_cache: dict,
+    ) -> torch.Tensor:
+        """Absorbed paged DSA with zigzag queries and optional MXFP8/FP8 data."""
+        cp = forward_metadata["cp_metadata"]
+        metadata = forward_metadata["dsa_cp"]
+        local_tokens = cp.local_token_num
+        local_valid = cp.local_prev_token_num
+        layout = get_zigzag_layout(
+            self.cp_size, self.cp_rank, local_tokens, self.cp_group
+        )
+        query_scale = None
+        if local_valid:
+            local_hidden = hidden_states[:local_valid]
+            normalized_q = self.q_a_layernorm(self.q_a_proj(local_hidden))
+            query = self.q_b_proj(normalized_q).view(
+                local_valid, self.num_heads, self.q_head_dim
+            )
+            compressed = self.kv_a_proj_with_mqa(local_hidden)
+            latent, aux = compressed.split(
+                [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+            )
+            latent = self.kv_a_layernorm(latent)
+            index_q, index_k, weights, query_scale, key_scale = self.indexer.project(
+                local_hidden, normalized_q
+            )
+            if self.enable_dsa_quant:
+                # Quantize before communication. Carry FP8/E8M0 as raw bytes;
+                # numeric casts would change the quantized values or scales.
+                keys = {
+                    "nope_cache": self._quantize_kv(latent, aux.contiguous()),
+                    "indexer_key_cache": index_k[:, 0].view(torch.uint8),
+                    "indexer_key_scale_cache": key_scale.view(torch.uint8).reshape(
+                        local_valid, self.indexer.head_dim // 32
+                    ),
+                }
+            else:
+                keys = {
+                    "nope_cache": latent,
+                    "rope_cache": aux.contiguous(),
+                    "indexer_key_cache": index_k[:, 0],
+                }
+            del compressed, latent, aux, normalized_q, index_k, key_scale
+        else:
+            query = hidden_states.new_empty(0, self.num_heads, self.q_head_dim)
+            index_q = hidden_states.new_empty(
+                0, self.indexer.num_heads, self.indexer.head_dim,
+                dtype=torch.float8_e4m3fn if self.enable_dsa_quant else hidden_states.dtype,
+            )
+            weights = hidden_states.new_empty(0, self.indexer.num_heads, dtype=torch.float32)
+            if self.enable_dsa_quant:
+                query_scale = hidden_states.new_empty(
+                    0, self.indexer.num_heads, self.indexer.head_dim // 64, 2,
+                    dtype=torch.uint8,
+                )
+                names = ("nope_cache", "indexer_key_cache", "indexer_key_scale_cache")
+            else:
+                names = ("nope_cache", "rope_cache", "indexer_key_cache")
+            keys = {
+                name: layer_cache[name].new_empty(0, layer_cache[name].shape[-1])
+                for name in names
+            }
+
+        cache_inputs = self._gather_prefill_cp_cache(keys, forward_metadata, layer_cache)
+        del keys
+        # Exchange the smaller pre-absorption Q, then expand in latent space.
+        # W_K is identical across CP ranks, so token permutation commutes with it.
+        query = layout.sp_to_cp(layout.pad_local(query))
+        q_content, q_aux = query.split(
+            [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
+        )
+        q_latent = torch.matmul(
+            q_content.transpose(0, 1), self.kv_b_proj_w_k
+        ).transpose(0, 1).contiguous()
+        attention_kwargs = {}
+        if self.enable_dsa_quant:
+            query = torch.cat((q_latent, q_aux), dim=-1)
+            index_q = layout.sp_to_cp(
+                layout.pad_local(index_q.view(torch.uint8))
+            ).view(torch.float8_e4m3fn)
+            query_scale = layout.sp_to_cp(layout.pad_local(query_scale.view(torch.uint8)))
+        else:
+            query = q_latent
+            index_q = layout.sp_to_cp(layout.pad_local(index_q))
+            attention_kwargs.update(
+                query_rope=q_aux.contiguous(), rope_cache=cache_inputs["rope_cache"]
+            )
+        del q_content, q_aux, q_latent
+        weights = layout.sp_to_cp(layout.pad_local(weights))
+        sparse_indices = self.indexer.select(
+            index_q, cache_inputs["indexer_key_cache"], weights, query_scale,
+            cache_inputs.get("indexer_key_scale_cache"), metadata, self.dsa_backend,
+        )
+        del index_q, weights, query_scale
+        attention_op = (
+            self._reference_attention if self.dsa_backend == "reference"
+            else self._sparse_attention
+        )
+        if self.dsa_backend == "npu":
+            attention_kwargs["prepared"] = metadata
+        latent_out = attention_op(
+            query, cache_inputs["nope_cache"], sparse_indices,
+            metadata["block_table"], metadata["cu_q"], metadata["kv_lengths"],
+            self.scaling, **attention_kwargs,
+        )
+        del cache_inputs, attention_kwargs, query, sparse_indices
+        # Project 512 latent values back to the smaller V head before exchanging
+        # tokens. This preserves absorption and reduces the return traffic.
+        output = torch.matmul(
+            latent_out.transpose(0, 1), self.kv_b_proj_w_v
+        ).transpose(0, 1).contiguous()
+        del latent_out
+        output = layout.cp_to_sp(output)
+        if local_valid < local_tokens:
+            output = F.pad(
+                output[:local_valid], (0, 0, 0, 0, 0, local_tokens - local_valid)
+            )
+        return output.reshape(local_tokens, -1)
+
+    def _forward_dsa(
+        self,
+        hidden_states: torch.Tensor,
+        forward_metadata: ForwardMetaData,
+        layer_cache: dict,
+        mla_ctx: Optional[MLAContext] = None,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        is_prefill = forward_metadata["is_prefill"]
+        cp_metadata = forward_metadata.get("cp_metadata")
+        if is_prefill and cp_metadata is not None and cp_metadata.enabled:
+            return self._forward_prefill_cp(
+                hidden_states, forward_metadata, layer_cache
+            ), None
+        tokens = hidden_states.shape[0]
+        if not is_prefill and self.dsa_backend == "npu":
+            prolog_output = self._dsa_prolog(
+                hidden_states, layer_cache, forward_metadata
+            )
+            if self.enable_dsa_quant:
+                query, normalized_q = prolog_output
+            else:
+                query, query_rope, normalized_q = prolog_output
+            w_v = self.kv_b_proj_decode_w_v
+        else:
+            normalized_q = self.q_a_layernorm(self.q_a_proj(hidden_states))
+            if is_prefill:
+                query = self.q_b_proj(normalized_q).view(
+                    tokens, self.num_heads, self.q_head_dim
+                )
+                w_k, w_v = self.kv_b_proj_w_k, self.kv_b_proj_w_v
+            else:
+                query = self.q_b_proj_decode(normalized_q).view(
+                    tokens, self.total_num_heads, self.q_head_dim
+                )
+                w_k, w_v = self.kv_b_proj_decode_w_k, self.kv_b_proj_decode_w_v
+            query_nope, query_rope = query.split(
+                [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
+            )
+            query_latent = (
+                torch.matmul(query_nope.transpose(0, 1), w_k)
+                .transpose(0, 1)
+                .contiguous()
+            )
+            query = (
+                torch.cat((query_latent, query_rope), dim=-1)
+                if self.enable_dsa_quant
+                else query_latent
+            )
+            compressed = self.kv_a_proj_with_mqa(hidden_states)
+            key_latent, key_rope = compressed.split(
+                [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+            )
+            key_latent = self.kv_a_layernorm(key_latent)
+        indexer_ctx = (
+            mla_ctx
+            if not is_prefill
+            and self.dsa_backend == "npu"
+            and mla_ctx is not None
+            and mla_ctx.indexer_enabled
+            else None
+        )
+        (
+            index_query,
+            index_key,
+            index_weights,
+            index_query_scale,
+            index_key_scale,
+        ) = self.indexer.project(hidden_states, normalized_q, mla_ctx=indexer_ctx)
+        if self.enable_dsa_quant:
+            keys = (
+                index_key.view(torch.uint8),
+                index_key_scale.reshape(tokens, -1),
+            )
+            if is_prefill or self.dsa_backend == "reference":
+                keys = (self._quantize_kv(key_latent, key_rope),) + keys
+        else:
+            keys = (index_key,)
+            if is_prefill or self.dsa_backend == "reference":
+                keys = (key_latent, key_rope) + keys
+        cache_inputs, dsa_metadata = self._prepare_cache_inputs(
+            keys, layer_cache, forward_metadata
+        )
+
+        full_hidden = None
+        if not is_prefill and self.use_output_gate and self.enable_multi_streams:
+            full_hidden = self._launch_gate_allgather(
+                hidden_states, mla_ctx.gate_stream, mla_ctx.gate_events
+            )
+        if indexer_ctx is not None:
+            if self.enable_dsa_quant:
+                wait_event(True, self.indexer.npu_events, 3, self.exe_mode)
+            wait_event(True, self.indexer.npu_events, 2, self.exe_mode)
+        sparse_indices = self.indexer.select(
+            index_query,
+            cache_inputs["indexer_key_cache"],
+            index_weights,
+            index_query_scale,
+            cache_inputs["indexer_key_scale_cache"] if self.enable_dsa_quant else None,
+            dsa_metadata,
+            self.dsa_backend,
+        )
+        attention_op = (
+            self._reference_attention
+            if self.dsa_backend == "reference"
+            else self._sparse_attention
+        )
+        attention_kwargs = (
+            {"prepared": dsa_metadata}
+            if self.dsa_backend == "npu" and "kernel_lengths" in dsa_metadata
+            else {}
+        )
+        if not self.enable_dsa_quant:
+            attention_kwargs.update(
+                query_rope=query_rope, rope_cache=cache_inputs["rope_cache"]
+            )
+        latent_output = attention_op(
+            query,
+            cache_inputs["nope_cache"],
+            sparse_indices,
+            dsa_metadata["block_table"],
+            dsa_metadata["cu_q"],
+            dsa_metadata["kv_lengths"],
+            self.scaling,
+            **attention_kwargs,
+        )
+        output = torch_npu.npu_transpose_batchmatmul(
+            latent_output,
+            w_v,
+            bias=None,
+            scale=None,
+            perm_x1=(1, 0, 2),
+            perm_x2=(0, 1, 2),
+            perm_y=(1, 0, 2),
+            batch_split_factor=1 if is_prefill else self.attn_tp_size,
+        )
+        if is_prefill or self.attn_tp_size == 1:
+            output = output.reshape(tokens, -1)
+        return output, full_hidden
+
+
 def _apply_attn_res(
     prefix_sum: torch.Tensor,
     block_residual: torch.Tensor,
@@ -3167,13 +4629,16 @@ class KimiDecoderLayer(nn.Module):
         self.layer_idx = layer_idx
         parallel = None if infer_config is None else infer_config.parallel_config
         self.is_linear_attn = config.is_kda_layer(layer_idx)
+        attention_cls = KimiMLAAttention
+        if config.is_dsa_layer(layer_idx):
+            attention_cls = KimiDSAAttention
         self.self_attn = (
             KimiDeltaAttention(
                 config, layer_idx, infer_config, comm_manager,
                 prefix=f"{prefix}.self_attn",
             )
             if self.is_linear_attn
-            else KimiMLAAttention(
+            else attention_cls(
                 config, layer_idx, infer_config, comm_manager,
                 prefix=f"{prefix}.self_attn",
             )
@@ -3280,6 +4745,8 @@ class KimiLinearModel(nn.Module):
         )
         self.dspark_target_layer_ids = ()
         parallel = None if infer_config is None else infer_config.parallel_config
+        self.world_size = 1 if parallel is None else parallel.world_size
+        self.global_rank = 0 if parallel is None else parallel.global_rank
         self.attn_tp_size = 1 if parallel is None else parallel.attn_tp_size
         # Prefill shards packed tokens; Decode shards requests (DP-TP-DP).
         # KDA keeps its existing gather-at-entry TP path. Only MLA stays DP
@@ -3289,6 +4756,13 @@ class KimiLinearModel(nn.Module):
         )
         self.attn_tp_rank = (
             comm_manager.get_rank("attn_tp_group") if self.attn_tp_size > 1 else 0
+        )
+        self.cp_size = 1 if parallel is None else parallel.cp_size
+        self.cp_group = (
+            comm_manager.get_group("cp_group") if self.cp_size > 1 else None
+        )
+        self.cp_rank = (
+            comm_manager.get_rank("cp_group") if self.cp_size > 1 else 0
         )
         self.embed_tp_size = 1 if parallel is None else parallel.embed_tp_size
         self.embed_tp_rank = (
@@ -3307,6 +4781,18 @@ class KimiLinearModel(nn.Module):
                 == dist.get_process_group_ranks(scatter_group)
             ):
                 self.embed_reduce_scatter_group = scatter_group
+        embed_tp_global_ranks = vocab_tp_group_ranks(
+            self.global_rank,
+            self.world_size,
+            self.attn_tp_size,
+            self.cp_size,
+            self.embed_tp_size,
+        )
+        self.register_buffer(
+            "embed_tp_global_ranks",
+            torch.tensor(embed_tp_global_ranks, dtype=torch.long),
+            persistent=False,
+        )
         if self.embed_tp_size > 1:
             # Vocab-parallel embedding: each rank holds vocab/embed_tp rows,
             # then sums contributions using ReduceScatter when its rank layout
@@ -3325,7 +4811,7 @@ class KimiLinearModel(nn.Module):
             )
 
 
-        self.mla_ctx = MLAContext(infer_config)
+        self.mla_ctx = MLAContext(infer_config, enable_dsa=bool(config.dsa_config))
         self.replayssm_ctx = ReplaySSMContext(infer_config)
 
         # MoEContext creates the shared stream and sym_buffer used by mega_moe.
@@ -3353,13 +4839,19 @@ class KimiLinearModel(nn.Module):
         # being rebuilt by new_zeros() on every forward.
         #
         # Row count is the rank-local token shard, which differs by phase:
-        #   prefill: ceil(max_prefill_tokens / attn_tp_size)
+        #   prefill: ceil(max_prefill_tokens / (attn_tp_size * cp_size))
         #   decode : ceil(batch_size_per_dp_rank * (next_n + 1) / attn_tp_size)
+        # Prefill is split by CP and TP; decode keeps the request DP-TP-DP split
+        # and so does not divide by cp_size.
+        # Take the max of the two.  The decode slice length is a compile-time
+        # constant (fixed batch, fixed next_n), so slicing introduces no new
+        # dynamic shape in the decode graph.
         if infer_config is not None:
             scheduler = infer_config.scheduler_config
+            prefill_shards = self.attn_tp_size * self.cp_size
             prefill_tokens = (
-                int(scheduler.max_prefill_tokens) + self.attn_tp_size - 1
-            ) // self.attn_tp_size
+                int(scheduler.max_prefill_tokens) + prefill_shards - 1
+            ) // prefill_shards
             decode_tokens = scheduler.batch_size_per_dp_rank * (
                 infer_config.model_config.next_n + 1
             )
@@ -3489,16 +4981,22 @@ class KimiLinearModel(nn.Module):
             )
         return buffer[:tokens]
 
-    def _embed(
-        self, input_ids: torch.Tensor, *, shard_output: bool = False, pad_len: int = 0
-    ) -> torch.Tensor:
-        """Sum vocab-shard contributions, optionally producing local token rows."""
+    def _embed_local_vocab_shard(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Embed the local vocabulary shard before its TP reduction."""
         if self.embed_tp_size <= 1:
             return self.embed_tokens(input_ids)
         vocab_per_rank = self.config.vocab_size // self.embed_tp_size
         local_ids = input_ids - self.embed_tp_rank * vocab_per_rank
         mask = (local_ids >= 0) & (local_ids < vocab_per_rank)
-        embeds = self.embed_tokens(local_ids * mask) * mask.unsqueeze(-1)
+        return self.embed_tokens(local_ids * mask) * mask.unsqueeze(-1)
+
+    def _embed(
+        self, input_ids: torch.Tensor, *, shard_output: bool = False, pad_len: int = 0
+    ) -> torch.Tensor:
+        """Sum vocab-shard contributions, optionally producing local token rows."""
+        embeds = self._embed_local_vocab_shard(input_ids)
+        if self.embed_tp_size <= 1:
+            return embeds
         if shard_output:
             # Pad hidden rows with zeros, not token IDs with a real embedding.
             if pad_len:
@@ -3509,6 +5007,72 @@ class KimiLinearModel(nn.Module):
         dist.all_reduce(embeds, group=self.embed_tp_group)
         return embeds
 
+    def _embed_prefill_sp(
+        self,
+        input_ids: torch.Tensor,
+        cp_metadata,
+    ) -> torch.Tensor:
+        """Fuse the vocab-TP reduction with the CP x TP token distribution.
+
+        Without CP, embedding all_reduces the full stream and every rank then
+        slices its own shard. Under CP the stream is cp_size * attn_tp_size
+        times wider than any rank needs, so reduce_scatter does both at once.
+        """
+        if input_ids.shape[0] != cp_metadata.global_padded_token_num:
+            raise ValueError(
+                "CP prefill expects the globally padded input stream before "
+                "Embedding"
+            )
+        tokens_per_tp_rank = cp_metadata.local_token_num // self.attn_tp_size
+        # The padded stream and physical ranks are both CP-major/TP-minor, so
+        # each contiguous token block already belongs to the matching rank.
+        rank_order_ids = input_ids.view(
+            self.world_size,
+            tokens_per_tp_rank,
+        )
+        group_input_ids = torch.index_select(
+            rank_order_ids,
+            0,
+            self.embed_tp_global_ranks,
+        ).reshape(-1)
+        rank_order_embeds = self._embed_local_vocab_shard(group_input_ids)
+        if self.embed_tp_size <= 1:
+            return rank_order_embeds
+        hidden_states = rank_order_embeds.new_empty(
+            tokens_per_tp_rank,
+            rank_order_embeds.shape[-1],
+        )
+        dist.reduce_scatter_tensor(
+            hidden_states,
+            rank_order_embeds.contiguous(),
+            group=self.embed_tp_group,
+        )
+        return hidden_states
+
+    def _embed_decode_dp(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Adapt one Attention-DP request batch to world-wide vocab TP.
+
+        Decode assigns a different request batch to every former CP rank. The
+        CP group first exchanges those small token-id batches so every rank sees
+        the same global order; embed TP can then reduce the vocab shards over
+        the world and select this rank's Attention-DP batch.
+        """
+        if self.cp_size <= 1:
+            return self._embed(input_ids)
+        global_input_ids = input_ids.new_empty(
+            input_ids.shape[0] * self.cp_size,
+            *input_ids.shape[1:],
+        )
+        dist.all_gather_into_tensor(
+            global_input_ids,
+            input_ids.contiguous(),
+            group=self.cp_group,
+        )
+        global_embeds = self._embed(global_input_ids)
+        return global_embeds.narrow(
+            0, self.cp_rank * input_ids.shape[0], input_ids.shape[0]
+        )
+
     def forward(
         self,
         input_ids: Optional[torch.Tensor],
@@ -3518,27 +5082,43 @@ class KimiLinearModel(nn.Module):
         query_start_loc: Optional[torch.Tensor] = None,
         query_boundaries: Optional[list[int]] = None,
     ) -> torch.Tensor:
+        cp_metadata = forward_metadata.get("cp_metadata")
+        enable_cp = (
+            forward_metadata["is_prefill"]
+            and cp_metadata is not None
+            and cp_metadata.enabled
+        )
+        hidden_is_sp = False
         embed_sharded = False
         embed_pad_len = 0
         if inputs_embeds is None:
             if input_ids is None:
                 raise ValueError("input_ids or inputs_embeds must be provided")
-            embed_sharded = self.embed_reduce_scatter_group is not None and (
-                forward_metadata["is_prefill"] or input_ids.shape[0] % self.attn_tp_size == 0
-            )
-            if embed_sharded and forward_metadata["is_prefill"]:
-                embed_pad_len = -input_ids.shape[0] % self.attn_tp_size
-            hidden_states = self._embed(
-                input_ids, shard_output=embed_sharded, pad_len=embed_pad_len
-            )
+            if enable_cp:
+                hidden_states = self._embed_prefill_sp(input_ids, cp_metadata)
+                hidden_is_sp = True
+            elif self.cp_size > 1 and self.embed_tp_size == self.world_size:
+                hidden_states = self._embed_decode_dp(input_ids)
+            else:
+                embed_sharded = self.embed_reduce_scatter_group is not None and (
+                    forward_metadata["is_prefill"] or input_ids.shape[0] % self.attn_tp_size == 0
+                )
+                if embed_sharded and forward_metadata["is_prefill"]:
+                    embed_pad_len = -input_ids.shape[0] % self.attn_tp_size
+                hidden_states = self._embed(
+                    input_ids, shard_output=embed_sharded, pad_len=embed_pad_len
+                )
         else:
             hidden_states = inputs_embeds
+            if enable_cp:
+                hidden_states = hidden_states.index_select(0, cp_metadata.local_indices)
         if self.attn_metadata is not None:
+            self.attn_metadata.prepare_dsa_decode_metadata(forward_metadata)
             self.attn_metadata.prepare_flash_mla_metadata(forward_metadata)
         if embed_sharded:
             if embed_pad_len:
                 forward_metadata = _sp_pad_metadata(forward_metadata, embed_pad_len)
-        elif self.attn_tp_size > 1:
+        elif self.attn_tp_size > 1 and not hidden_is_sp:
             if forward_metadata["is_prefill"]:
                 pad_len = -hidden_states.shape[0] % self.attn_tp_size
                 if pad_len:
@@ -3590,7 +5170,7 @@ class KimiLinearModel(nn.Module):
                 ],
                 dim=-1,
             )
-        if forward_metadata["is_prefill"]:
+        if forward_metadata["is_prefill"] and self.cp_size == 1:
             segment_ends = forward_metadata["segment_end_indices"]
             if self.attn_tp_size > 1:
                 local_tokens = hidden_states.shape[0]
@@ -3613,6 +5193,17 @@ class KimiLinearModel(nn.Module):
                 hidden_states = last_hidden
             else:
                 hidden_states = hidden_states.index_select(0, segment_ends)
+        elif self.attn_tp_size > 1 and not forward_metadata["is_prefill"] and self.cp_size > 1:
+            gathered_states = hidden_states.new_empty(
+                hidden_states.shape[0] * self.attn_tp_size,
+                hidden_states.shape[1],
+            )
+            dist.all_gather_into_tensor(
+                gathered_states,
+                hidden_states.contiguous(),
+                group=self.attn_tp_group,
+            )
+            hidden_states = gathered_states
         return hidden_states, target_hidden_states
 
     def _forward_attn_res(
@@ -3845,6 +5436,15 @@ class KimiLinearForCausalLM(nn.Module):
             prefix=f"{prefix}.model" if prefix else "model",
         )
         parallel = self.infer_config.parallel_config
+        self.world_size = parallel.world_size
+        self.attn_tp_size = parallel.attn_tp_size
+        self.cp_size = parallel.cp_size
+        self.cp_group = (
+            self.comm_manager.get_group("cp_group") if self.cp_size > 1 else None
+        )
+        self.cp_rank = (
+            self.comm_manager.get_rank("cp_group") if self.cp_size > 1 else 0
+        )
         self.lmhead_tp_size = parallel.lmhead_tp_size
         self.lmhead_tp_rank = (
             self.comm_manager.get_rank("lmhead_tp_group") if self.lmhead_tp_size > 1 else 0
@@ -3966,6 +5566,13 @@ class KimiLinearForCausalLM(nn.Module):
                     # Keep MLA decode gather/all-to-all on the CCU-MS path.
                     group_type=5,
                 )
+        if parallel.cp_size > 1:
+            self.comm_manager.register_group(
+                name="cp_group",
+                group_num=parallel.world_size // parallel.cp_size,
+                group_size=parallel.cp_size,
+                group_stride=parallel.attn_tp_size,
+            )
         if parallel.moe_ep_size > 1:
             group_num = parallel.world_size // parallel.moe_ep_size
             self.comm_manager.register_group(
@@ -4067,11 +5674,28 @@ class KimiLinearForCausalLM(nn.Module):
             first_verify=first_verify,
             active_mask=active_mask,
         )
+        query_start_loc = metadata.get("query_start_loc")
+        query_boundaries = metadata.get("query_boundaries")
+        cp_metadata = metadata.get("cp_metadata")
+        if is_prefill and cp_metadata is not None and cp_metadata.enabled:
+            # Under CP each rank runs KDA over its own contiguous slice, so the
+            # segment boundaries are the local lengths, not the global ones.
+            cu_q = cp_metadata.actual_seq_q_prev
+            query_start_loc = torch.cat((cu_q.new_zeros(1), cu_q)).to(torch.int32)
+            query_boundaries = query_start_loc.tolist()
+            metadata["actual_seq_lengths_cu_list_kv"] = cu_q.tolist()
+            metadata["query_start_loc"] = query_start_loc
+            metadata["query_boundaries"] = query_boundaries
+            if input_ids.shape[0] < cp_metadata.global_padded_token_num:
+                input_ids = F.pad(
+                    input_ids,
+                    (0, cp_metadata.global_padded_token_num - input_ids.shape[0]),
+                )
         return {
             "input_ids": input_ids,
             "forward_metadata": metadata,
-            "query_start_loc": metadata.get("query_start_loc"),
-            "query_boundaries": metadata.get("query_boundaries"),
+            "query_start_loc": query_start_loc,
+            "query_boundaries": query_boundaries,
         }
 
     def prefill(self, **model_inputs) -> torch.Tensor:
@@ -4121,10 +5745,69 @@ class KimiLinearForCausalLM(nn.Module):
                     "target_hidden_states": target_hidden_states,
                 }
             return output
+        if is_prefill:
+            cp_metadata = forward_metadata.get("cp_metadata")
+            if cp_metadata is not None and cp_metadata.enabled:
+                # CP prefill left the hidden as this rank's CP x TP shard, so
+                # the sequence's last row lives on exactly one world rank.
+                hidden_states = self._cp_prefill_last_hidden(
+                    hidden_states, cp_metadata
+                )
         # The engine samples from [requests, steps, vocab] (execution_engine
         # slices logits[:, -1:, :] on prefill), so the packed layout stops at
         # this boundary. One step per request either way: prefill just reduced
         # to its last token, and decode carries one token per request.
+        if self.cp_size > 1 and is_prefill:
+            hidden_states = hidden_states.view(1, 1, hidden_states.shape[-1])
+            logits = self.lm_head(hidden_states)
+            if self.temperature <= 0:
+                output = distributed_argmax(
+                    logits,
+                    self.lmhead_tp_group,
+                    self.lmhead_tp_rank,
+                    self.lmhead_tp_size,
+                    owner_local=False,
+                ).unsqueeze(-1)
+            else:
+                output = self._gather_vocab_logits(logits)
+            if self.uses_dspark_draft:
+                return output, {
+                    "prev_hidden_states": prev_hidden_states,
+                    "target_hidden_states": target_hidden_states,
+                }
+            return output
+
+        if self.cp_size > 1 and not self.uses_dspark_draft:
+            if self.lmhead_tp_size == self.world_size:
+                logits = self._decode_lmhead(hidden_states)
+                if self.temperature <= 0:
+                    return logits.argmax(dim=-1, keepdim=True)
+                return logits
+            return self._decode_dp_lmhead(hidden_states)
+
+        if self.cp_size > 1:
+            # Main Decode reconstructs the complete request batch inside each
+            # CP lane. DSpark keeps request-DP ownership, so select this TP
+            # rank's rows before entering the usual owner-local LMHead path.
+            decode_batch_size = forward_metadata["actual_seq_lengths_q"].shape[0]
+            if decode_batch_size % self.attn_tp_size:
+                raise RuntimeError(
+                    "DSpark Decode batch must be divisible by attn_tp_size"
+                )
+            local_batch = decode_batch_size // self.attn_tp_size
+            hidden_by_request = hidden_states.view(
+                decode_batch_size, -1, hidden_states.shape[-1]
+            )
+            owner_start = self.model.attn_tp_rank * local_batch
+            hidden_states = hidden_by_request[
+                owner_start : owner_start + local_batch
+            ].reshape(-1, hidden_states.shape[-1]).contiguous()
+            prev_hidden_states = hidden_states
+            if target_hidden_states.shape[0] != hidden_states.shape[0]:
+                raise RuntimeError(
+                    "DSpark target hidden rows must match owner-local Decode rows"
+                )
+
         batch_size = (
             forward_metadata["actual_seq_lengths_q"].shape[0]
             if is_prefill
@@ -4167,6 +5850,83 @@ class KimiLinearForCausalLM(nn.Module):
                 "target_hidden_states": target_hidden_states,
             }
         return logits
+
+    def _cp_prefill_last_hidden(
+        self,
+        hidden_states: torch.Tensor,
+        cp_metadata,
+    ) -> torch.Tensor:
+        """Replicate the last valid CP Prefill row to every LMHead replica."""
+        owner_cp_rank, owner_tp_rank, local_offset = cp_last_token_location(
+            cp_metadata.global_valid_indices.numel(),
+            cp_metadata.local_token_num,
+            self.model.attn_tp_size,
+        )
+        local_tail = hidden_states.new_zeros(1, hidden_states.shape[-1])
+        if self.cp_rank == owner_cp_rank and self.model.attn_tp_rank == owner_tp_rank:
+            local_tail[0].copy_(hidden_states[local_offset])
+        # The tail is an activation-layout concern, independent of LMHead's
+        # weight TP degree.  Exactly one world rank contributes a non-zero row.
+        dist.all_reduce(local_tail)
+        return local_tail
+
+    def _gather_vocab_logits(self, logits: torch.Tensor) -> torch.Tensor:
+        """Concat the per-rank vocab shards back to the full vocabulary."""
+        if self.lmhead_tp_size <= 1:
+            return logits
+        # ColumnParallelLinear gives this rank vocab/lmhead_tp logits; gather
+        # the shards across the group and concat back to the full vocab.
+        gathered = [torch.empty_like(logits) for _ in range(self.lmhead_tp_size)]
+        dist.all_gather(gathered, logits.contiguous(), group=self.lmhead_tp_group)
+        return torch.cat(gathered, dim=-1)
+
+    def _decode_lmhead(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Project global Decode rows through world-wide vocabulary TP."""
+        rows_per_rank = hidden_states.shape[0]
+        global_hidden = hidden_states.new_empty(
+            rows_per_rank * self.lmhead_tp_size,
+            hidden_states.shape[-1],
+        )
+        dist.all_gather_into_tensor(
+            global_hidden,
+            hidden_states.contiguous(),
+            group=self.lmhead_tp_group,
+        )
+        local_logits = self.lm_head(
+            global_hidden.view(global_hidden.shape[0], 1, -1)
+        )
+        logits = torch.empty_like(local_logits)
+        dist.all_to_all_single(
+            logits.view(-1),
+            local_logits.contiguous().view(-1),
+            group=self.lmhead_tp_group,
+        )
+        logits = logits.reshape(
+            self.lmhead_tp_size,
+            rows_per_rank,
+            local_logits.shape[1],
+            -1,
+        ).permute(1, 2, 0, 3)
+        return logits.reshape(
+            rows_per_rank,
+            local_logits.shape[1],
+            self.config.vocab_size,
+        )
+
+    def _decode_dp_lmhead(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Project Decode rows through a lane-local vocabulary TP group."""
+        local_logits = self.lm_head(
+            hidden_states.view(hidden_states.shape[0], 1, -1)
+        )
+        if self.temperature <= 0:
+            return distributed_argmax(
+                local_logits,
+                self.lmhead_tp_group,
+                self.lmhead_tp_rank,
+                self.lmhead_tp_size,
+                owner_local=False,
+            ).unsqueeze(-1)
+        return self._gather_vocab_logits(local_logits)
 
     def main_decode(self, **model_inputs):
         return self.forward(**model_inputs)
@@ -4235,6 +5995,13 @@ class KimiLinearForCausalLM(nn.Module):
         fused_gate_up_loaded: dict[str, set[int]] = {}
         fused_qkv_loaded: dict[str, set[str]] = {}
         fused_conv_loaded: dict[str, set[int]] = {}
+        expert_shards_expected: dict[str, set[tuple[int, str]]] = {}
+        expert_shards_loaded: dict[str, set[tuple[int, str]]] = {}
+        for target, expert_id, shard_id in expert_mapping.values():
+            if self.local_expert_start <= expert_id < self.local_expert_end:
+                expert_shards_expected.setdefault(target, set()).add(
+                    (expert_id, shard_id)
+                )
 
         def store(param_name: str, tensor: torch.Tensor) -> None:
             param = params[param_name]
@@ -4247,6 +6014,8 @@ class KimiLinearForCausalLM(nn.Module):
             loaded.add(param_name)
 
         for name, tensor in weights:
+            if not self.should_load_weight(name):
+                continue
             # The registered kimi_k3 path is text-only. Release checkpoints can
             # still contain vision tower/projector tensors, which intentionally
             # have no parameter in this model.
@@ -4272,10 +6041,29 @@ class KimiLinearForCausalLM(nn.Module):
                         f"{name} maps to {param_name}, which is not a parameter"
                     )
                 param = params[param_name]
+                shard = (expert_id, shard_id)
+                shards = expert_shards_loaded.setdefault(param_name, set())
+                if shard in shards:
+                    raise RuntimeError(
+                        f"duplicate checkpoint expert shard {shard} for {param_name}"
+                    )
+                # K3 requires moe_tp_size=1, so one checkpoint matrix must
+                # exactly fill this expert's shard, never broadcast or truncate.
+                expected_shape = list(param.shape[1:])
+                if shard_id in ("w1", "w3"):
+                    shard_dim = -1 if getattr(param, "is_transposed", False) else 0
+                    expected_shape[shard_dim] //= 2
+                if tuple(tensor.shape) != tuple(expected_shape):
+                    raise ValueError(
+                        f"{name}: checkpoint gives {tuple(tensor.shape)}, "
+                        f"expert shard of {param_name} expects {tuple(expected_shape)}"
+                    )
                 param.weight_loader(
                     param, tensor, name, shard_id=shard_id, expert_id=expert_id
                 )
-                loaded.add(param_name)
+                shards.add(shard)
+                if shards == expert_shards_expected[param_target]:
+                    loaded.add(param_name)
                 continue
 
             # Dense MLP and shared experts: fold gate/up weights and their MXFP8
@@ -4555,6 +6343,15 @@ class KimiLinearForCausalLM(nn.Module):
             raise RuntimeError(
                 "next_n must be 0 without a draft model and positive for DSpark"
             )
+        if parallel.cp_size > 1:
+            if parallel.attn_tp_size * parallel.cp_size != parallel.world_size:
+                raise RuntimeError(
+                    "K3 Prefill CP requires cp_size * attn_tp_size == world_size"
+                )
+            if parallel.kda_tp_size != parallel.attn_tp_size:
+                raise RuntimeError(
+                    "K3 context parallelism requires kda_tp_size == attn_tp_size"
+                )
         if parallel.moe_tp_size != 1:
             raise RuntimeError("K3 requires moe_tp_size=1")
         if parallel.shared_tp_size != 1:
@@ -4580,6 +6377,15 @@ class KimiLinearForCausalLM(nn.Module):
             ("embed_tp_size", parallel.embed_tp_size),
             ("lmhead_tp_size", parallel.lmhead_tp_size),
         ):
+            try:
+                vocab_tp_group_spec(
+                    parallel.world_size,
+                    parallel.attn_tp_size,
+                    parallel.cp_size,
+                    size,
+                )
+            except ValueError as exc:
+                raise RuntimeError(f"invalid {label}: {exc}") from exc
             if self.config.vocab_size % size:
                 raise RuntimeError(f"vocab_size must be divisible by {label}={size}")
         if self.config.num_experts % parallel.moe_ep_size:

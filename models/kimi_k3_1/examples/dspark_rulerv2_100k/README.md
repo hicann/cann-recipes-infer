@@ -10,7 +10,7 @@
 
 ## 使用
 
-请求保存在 `models/kimi_k3/examples/dspark_rulerv2_100k/default_prompt.json`。`models/kimi_k3/infer.sh` 在 launch 前将它复制到公共 `dataset/default_prompt.json`，沿用 `dataset: default` 加载流程。测试时修改本目录的示例文件即可，启动时会同步到公共文件；其他使用公共 default 的模型也会读取复制后的内容。
+请求保存在 `models/kimi_k3_1/examples/dspark_rulerv2_100k/default_prompt.json`。`models/kimi_k3_1/infer.sh` 在 launch 前将它复制到公共 `dataset/default_prompt.json`，沿用 `dataset: default` 加载流程。测试时修改本目录的示例文件即可，启动时会同步到公共文件；其他使用公共 default 的模型也会读取复制后的内容。
 
 沿用原 DSpark 启动方式，在现有 YAML 的数据配置位置设置：
 

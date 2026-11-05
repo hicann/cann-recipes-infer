@@ -4,7 +4,7 @@ Kimi K3 采用 2.8T 参数的混合注意力 MoE 架构，交错使用 Kimi Delt
 
 cann-recipes-infer 提供 Kimi K3 在昇腾 950PR/DT 4机 32卡集群上的推理实现参考，采用 Embedding TP、Attention DP/TP、Dense TP、Prefill SP、Decode DP 与 Routed Expert EP 的组合部署策略。KDA、MLA 与 MoE 均接入融合算子。Stable LatentMoE 支持原生 MXFP4 权重、动态 MXFP8 激活及 Decode Shared Expert 多流。AttnRes 两阶段融合、Prefill MegaMoE、MegaKDA/ReplaySSM 和 DSpark 投机推理均提供对应配置路径。
 
-完整运行方法见[模型 README](../../../models/kimi_k3/README.md)。
+完整运行方法见[模型 README](../../../models/kimi_k3_1/README.md)。
 
 ## Highlights
 
@@ -143,7 +143,7 @@ KDA 的长期状态大小与序列长度无关；每个请求、每个 KDA 层�
 
 上图展示 Prefill 与非 MegaKDA 的 snapshot 路径。`qkv_proj` 按通道生成 Q/K/V。融合 QKV ShortConv 在 Prefill 调用 [`causal_conv1d_fn`](https://gitcode.com/cann/ops-transformer/blob/master/torch_extension/cann_ops_transformer/docs/zh/causal_conv1d_fn.md)，在 snapshot fused recurrent 路径调用 [`causal_conv1d_update`](https://gitcode.com/cann/ops-transformer/blob/master/torch_extension/cann_ops_transformer/docs/zh/causal_conv1d_update.md)，完成逐通道因果卷积与 SiLU 后再拆分三路。三组通道使用各自的卷积权重，共同维护一份拼接的 `conv_state`。
 
-推理实现由 `models/kimi_k3/models/modules/attention_data.py` 为每层分配 `conv_state` 与 KDA SSM State，并在本地 metadata 字典中维护请求到状态行的映射。Prefill 通过 `causal_conv1d_fn` 更新 `conv_state`，Fused KDA 完成前处理、分块计算和状态递推；在 Decode 和 DSpark Verify 中，模型沿请求已有的状态继续处理新增 token：ShortConv 先更新卷积状态并生成当前 Q/K/V，随后 KDA 按序更新 SSM State，完成递推计算并输出结果。
+推理实现由 `models/kimi_k3_1/models/modules/attention_data.py` 为每层分配 `conv_state` 与 KDA SSM State，并在本地 metadata 字典中维护请求到状态行的映射。Prefill 通过 `causal_conv1d_fn` 更新 `conv_state`，Fused KDA 完成前处理、分块计算和状态递推；在 Decode 和 DSpark Verify 中，模型沿请求已有的状态继续处理新增 token：ShortConv 先更新卷积状态并生成当前 Q/K/V，随后 KDA 按序更新 SSM State，完成递推计算并输出结果。
 
 ##### KDA 融合算子
 
@@ -326,7 +326,7 @@ MLA、MoE 和 ReplaySSM 使用模型级 Context 管理流与可复用 Event，�
   <img src="./figures/kimi_k3_performance_waterfall.svg" width="100%" alt="Kimi K3 累计性能优化收益：28 ms 降至 10.3 ms">
 </p>
 
-相关实现见 [Kimi K3 推理样例](../../../models/kimi_k3)，为 Kimi K3 在昇腾上的低时延部署与算子优化提供实践参考，欢迎交流。
+相关实现见 [Kimi K3 推理样例](../../../models/kimi_k3_1)，为 Kimi K3 在昇腾上的低时延部署与算子优化提供实践参考，欢迎交流。
 
 ## Future Plan
 
