@@ -1,0 +1,210 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1280" viewBox="0 0 1800 1280" role="img" aria-describedby="desc">
+  <desc id="desc">Sequence Parallelism 原理图：在 TP 组内沿序列维切分激活，LayerNorm、Dropout 和残差在本地分片上执行；Attention 前 AllGather 恢复完整序列，Attention 后 ReduceScatter 再次切回序列分片。</desc>
+
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8.2" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0,0 L10,5 L0,10 Z" fill="#202A52"/>
+    </marker>
+    <marker id="arrowCoral" viewBox="0 0 10 10" refX="8.2" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0,0 L10,5 L0,10 Z" fill="#D96868"/>
+    </marker>
+    <style>
+      text { font-family: Inter, "PingFang SC", "Microsoft YaHei", Arial, sans-serif; fill:#12172B; }
+      .boxtext { font-size:22px; font-weight:620; }
+      .small { font-size:17px; fill:#5F667E; }
+      .tiny { font-size:15px; fill:#5F667E; }
+      .rank { font-size:18px; font-weight:720; }
+      .panel-title { font-size:25px; font-weight:760; fill:#D96868; }
+      .sp { fill:#EEF4FF; stroke:#202A52; stroke-width:2; }
+      .tp { fill:#F1EDFF; stroke:#202A52; stroke-width:2; }
+      .comm { fill:#FFF0ED; stroke:#202A52; stroke-width:2; }
+      .residual { fill:#FFF8DF; stroke:#202A52; stroke-width:2; }
+      .plain { fill:#FFFFFF; stroke:#202A52; stroke-width:2; }
+      .dash { fill:#FFFFFF; stroke:#202A52; stroke-width:2.2; stroke-dasharray:15 10; }
+      .flow { fill:none; stroke:#202A52; stroke-width:2.6; marker-end:url(#arrow); }
+      .commflow { fill:none; stroke:#D96868; stroke-width:2.8; marker-end:url(#arrowCoral); }
+      .callout { fill:none; stroke:#202A52; stroke-width:2.5; marker-end:url(#arrow); }
+      .mono { font-family:"SFMono-Regular", Consolas, monospace; }
+    </style>
+  </defs>
+
+  <rect width="1800" height="1280" fill="#FFFFFF"/>
+
+  <!-- Legend -->
+  <g transform="translate(49,25)">
+    <rect x="0" y="0" width="26" height="21" class="sp"/><text x="36" y="17" class="tiny">SP：本地序列分片计算</text>
+    <rect x="226" y="0" width="26" height="21" class="tp"/><text x="262" y="17" class="tiny">TP：hidden / 权重并行计算</text>
+    <rect x="507" y="0" width="26" height="21" class="comm"/><text x="543" y="17" class="tiny">序列维通信</text>
+    <rect x="688" y="0" width="26" height="21" class="residual"/><text x="724" y="17" class="tiny">残差路径</text>
+  </g>
+
+  <!-- Main continuous Transformer flow -->
+  <g id="main-flow">
+    <rect x="44" y="65" width="740" height="1170" rx="22" class="dash"/>
+    <text x="62" y="101" font-size="24" font-weight="760" fill="#D96868">TP Group：TP + SP</text>
+    <text x="746" y="101" text-anchor="end" class="small mono">tp_size = N</text>
+
+    <!-- rank shards -->
+    <text x="102" y="148" class="rank">输入激活沿 Seq 维切分</text>
+    <g transform="translate(102,166)">
+      <rect x="0" y="0" width="145" height="58" fill="#DDEAFF" stroke="#202A52" stroke-width="2"/>
+      <rect x="145" y="0" width="145" height="58" fill="#E6F5F1" stroke="#202A52" stroke-width="2"/>
+      <rect x="290" y="0" width="145" height="58" fill="#FFF3D9" stroke="#202A52" stroke-width="2"/>
+      <rect x="435" y="0" width="145" height="58" fill="#FFE6E2" stroke="#202A52" stroke-width="2"/>
+      <g text-anchor="middle">
+        <text x="72.5" y="25" class="rank">Rank 0</text><text x="72.5" y="46" class="tiny">L/N</text>
+        <text x="217.5" y="25" class="rank">Rank 1</text><text x="217.5" y="46" class="tiny">L/N</text>
+        <text x="362.5" y="25" class="rank">Rank 2</text><text x="362.5" y="46" class="tiny">L/N</text>
+        <text x="507.5" y="25" class="rank">Rank 3</text><text x="507.5" y="46" class="tiny">L/N</text>
+      </g>
+    </g>
+    <text x="392" y="249" text-anchor="middle" class="small mono">每卡 xᵣ : [B, L/N, H]</text>
+
+    <path d="M392 260 L392 292" class="flow"/>
+    <rect x="164" y="294" width="456" height="62" class="sp"/>
+    <text x="392" y="332" text-anchor="middle" class="boxtext">LayerNorm + Dropout（本地）</text>
+
+    <path d="M392 356 L392 388" class="flow"/>
+    <rect x="164" y="390" width="456" height="72" class="tp"/>
+    <text x="392" y="421" text-anchor="middle" class="boxtext">QKV Projection（标准 TP）</text>
+    <text x="392" y="448" text-anchor="middle" class="small">权重沿 hidden 维切分</text>
+
+    <path d="M392 462 L392 494" class="commflow"/>
+    <rect x="164" y="496" width="456" height="66" class="comm"/>
+    <text x="392" y="537" text-anchor="middle" class="boxtext">AllGather (sequence)</text>
+    <text x="638" y="523" class="small">恢复 L</text>
+    <path d="M620 530 L685 530" fill="none" stroke="#D96868" stroke-width="2" marker-end="url(#arrowCoral)"/>
+
+    <path d="M392 562 L392 594" class="commflow"/>
+    <rect x="164" y="596" width="456" height="82" class="tp"/>
+    <text x="392" y="630" text-anchor="middle" class="boxtext">Attention（完整序列）</text>
+    <text x="392" y="659" text-anchor="middle" class="small mono">Q, K, V cover SeqLen = L</text>
+
+    <path d="M392 678 L392 710" class="commflow"/>
+    <rect x="164" y="712" width="456" height="66" class="comm"/>
+    <text x="392" y="753" text-anchor="middle" class="boxtext">ReduceScatter (sequence)</text>
+    <text x="638" y="740" class="small">切回 L/N</text>
+    <path d="M685 747 L620 747" fill="none" stroke="#D96868" stroke-width="2" marker-end="url(#arrowCoral)"/>
+
+    <!-- first residual skip -->
+    <path d="M136 325 L92 325 L92 824 L164 824" fill="none" stroke="#B28A2E" stroke-width="2.5" marker-end="url(#arrow)"/>
+    <text x="77" y="584" transform="rotate(-90 77 584)" text-anchor="middle" class="tiny">本地分片残差 xᵣ</text>
+    <path d="M392 778 L392 806" class="flow"/>
+    <rect x="164" y="808" width="456" height="58" class="residual"/>
+    <text x="392" y="844" text-anchor="middle" class="boxtext">Dropout + Residual Add（本地）</text>
+
+    <path d="M392 866 L392 894" class="flow"/>
+    <rect x="164" y="896" width="456" height="58" class="sp"/>
+    <text x="392" y="932" text-anchor="middle" class="boxtext">LayerNorm（本地序列分片）</text>
+
+    <path d="M392 954 L392 982" class="flow"/>
+    <rect x="164" y="984" width="456" height="68" class="tp"/>
+    <text x="392" y="1015" text-anchor="middle" class="boxtext">FFN / MLP（TP）</text>
+    <text x="392" y="1040" text-anchor="middle" class="small">中间激活保持序列分片</text>
+
+    <!-- second residual skip -->
+    <path d="M620 925 L684 925 L684 1098 L620 1098" fill="none" stroke="#B28A2E" stroke-width="2.5" marker-end="url(#arrow)"/>
+    <text x="704" y="1012" transform="rotate(90 704 1012)" text-anchor="middle" class="tiny">本地分片残差</text>
+    <path d="M392 1052 L392 1078" class="flow"/>
+    <rect x="164" y="1080" width="456" height="58" class="residual"/>
+    <text x="392" y="1116" text-anchor="middle" class="boxtext">Dropout + Residual Add（本地）</text>
+
+    <path d="M392 1138 L392 1164" class="flow"/>
+    <rect x="164" y="1166" width="456" height="52" rx="26" class="plain"/>
+    <text x="392" y="1199" text-anchor="middle" class="boxtext">输出分片 → 下一层</text>
+  </g>
+
+  <!-- Right upper: motivation and memory comparison -->
+  <g id="motivation">
+    <rect x="820" y="65" width="934" height="416" rx="22" class="dash"/>
+    <text x="850" y="107" class="panel-title">为什么标准 TP 仍会遇到激活显存瓶颈？</text>
+    <text x="850" y="139" class="small">TP 切分 QKV / FFN 权重的 hidden 维，但 LayerNorm、Dropout、残差仍需完整激活。</text>
+
+    <text x="850" y="195" class="rank">仅使用 TP</text>
+    <text x="850" y="221" class="small mono">每个 Rank：[B, L, H]</text>
+    <g transform="translate(1100,170)">
+      <g>
+        <rect x="0" y="0" width="570" height="42" fill="#FFE6E2" stroke="#202A52" stroke-width="2"/>
+        <rect x="0" y="52" width="570" height="42" fill="#FFE6E2" stroke="#202A52" stroke-width="2"/>
+        <rect x="0" y="104" width="570" height="42" fill="#FFE6E2" stroke="#202A52" stroke-width="2"/>
+      </g>
+      <g class="tiny">
+        <text x="12" y="27">Rank 0：完整 SeqLen = L</text>
+        <text x="12" y="79">Rank 1：完整 SeqLen = L</text>
+        <text x="12" y="131">Rank N−1：完整 SeqLen = L</text>
+      </g>
+    </g>
+    <text x="1385" y="342" text-anchor="middle" font-size="19" font-weight="700" fill="#D96868">L 越长，每张卡的激活显存都同步增长</text>
+
+    <line x1="850" y1="372" x2="1718" y2="372" stroke="#D6DAE6" stroke-width="2"/>
+    <text x="850" y="411" class="rank">引入 SP</text>
+    <text x="982" y="411" class="small">将中间激活沿 sequence 切分，LayerNorm / Dropout / 残差也能分片保存与计算。</text>
+    <rect x="850" y="432" width="868" height="30" rx="15" fill="#EEF4FF"/>
+    <text x="1284" y="453" text-anchor="middle" font-size="18" font-weight="700">每卡激活显存约降为 1 / tp_size</text>
+  </g>
+
+  <!-- callouts -->
+  <path d="M620 196 C706 196 726 245 808 245" class="callout"/>
+  <path d="M620 637 C708 637 730 667 808 667" class="callout"/>
+
+  <!-- Right lower: communication and shard evolution -->
+  <g id="communication-detail">
+    <rect x="820" y="510" width="934" height="725" rx="22" class="dash"/>
+    <text x="850" y="552" class="panel-title">序列分片如何在 Attention 前后流动</text>
+
+    <text x="850" y="606" class="rank">本地 QKV</text>
+    <text x="850" y="632" class="small mono">[B, L/N, ·]</text>
+    <g transform="translate(1038,581)">
+      <rect x="0" y="0" width="135" height="62" fill="#DDEAFF" stroke="#202A52" stroke-width="2"/>
+      <rect x="145" y="0" width="135" height="62" fill="#E6F5F1" stroke="#202A52" stroke-width="2"/>
+      <rect x="290" y="0" width="135" height="62" fill="#FFF3D9" stroke="#202A52" stroke-width="2"/>
+      <rect x="435" y="0" width="135" height="62" fill="#FFE6E2" stroke="#202A52" stroke-width="2"/>
+      <g text-anchor="middle" class="rank">
+        <text x="67.5" y="38">Rank 0</text><text x="212.5" y="38">Rank 1</text><text x="357.5" y="38">Rank 2</text><text x="502.5" y="38">Rank 3</text>
+      </g>
+    </g>
+
+    <path d="M1323 652 L1323 698" class="commflow"/>
+    <rect x="1112" y="700" width="422" height="60" class="comm"/>
+    <text x="1323" y="738" text-anchor="middle" class="boxtext">AllGather (seq)</text>
+
+    <path d="M1323 760 L1323 800" class="commflow"/>
+    <text x="850" y="841" class="rank">每个 Rank</text>
+    <text x="850" y="867" class="small mono">恢复 [B, L, ·]</text>
+    <g transform="translate(1038,806)">
+      <rect x="0" y="0" width="142.5" height="62" fill="#DDEAFF" stroke="#202A52" stroke-width="2"/>
+      <rect x="142.5" y="0" width="142.5" height="62" fill="#E6F5F1" stroke="#202A52" stroke-width="2"/>
+      <rect x="285" y="0" width="142.5" height="62" fill="#FFF3D9" stroke="#202A52" stroke-width="2"/>
+      <rect x="427.5" y="0" width="142.5" height="62" fill="#FFE6E2" stroke="#202A52" stroke-width="2"/>
+      <text x="285" y="39" text-anchor="middle" class="boxtext">完整序列 L</text>
+    </g>
+
+    <path d="M1323 868 L1323 908" class="flow"/>
+    <rect x="1112" y="910" width="422" height="66" class="tp"/>
+    <text x="1323" y="951" text-anchor="middle" class="boxtext">Attention</text>
+
+    <path d="M1323 976 L1323 1016" class="commflow"/>
+    <rect x="1112" y="1018" width="422" height="60" class="comm"/>
+    <text x="1323" y="1056" text-anchor="middle" class="boxtext">ReduceScatter (seq)</text>
+
+    <path d="M1323 1078 L1323 1118" class="commflow"/>
+    <text x="850" y="1161" class="rank">本地输出</text>
+    <text x="850" y="1187" class="small mono">[B, L/N, H]</text>
+    <g transform="translate(1038,1126)">
+      <rect x="0" y="0" width="135" height="62" fill="#DDEAFF" stroke="#202A52" stroke-width="2"/>
+      <rect x="145" y="0" width="135" height="62" fill="#E6F5F1" stroke="#202A52" stroke-width="2"/>
+      <rect x="290" y="0" width="135" height="62" fill="#FFF3D9" stroke="#202A52" stroke-width="2"/>
+      <rect x="435" y="0" width="135" height="62" fill="#FFE6E2" stroke="#202A52" stroke-width="2"/>
+      <g text-anchor="middle" class="rank">
+        <text x="67.5" y="38">O₀</text><text x="212.5" y="38">O₁</text><text x="357.5" y="38">O₂</text><text x="502.5" y="38">O₃</text>
+      </g>
+    </g>
+
+    <rect x="850" y="1201" width="868" height="22" rx="11" fill="#FFF0ED"/>
+    <text x="1284" y="1218" text-anchor="middle" font-size="16" font-weight="700" fill="#B94F4F">核心通信：AllGather(seq) → Attention → ReduceScatter(seq)</text>
+  </g>
+
+  <!-- Optional handoff note -->
+  <path d="M620 1192 C690 1192 714 1250 790 1250" fill="none" stroke="#202A52" stroke-width="2" stroke-dasharray="7 6" marker-end="url(#arrow)"/>
+  <text x="812" y="1256" class="small">若下一算子需要完整序列，可按需执行 AllGather；否则保持分片进入下一层。</text>
+</svg>

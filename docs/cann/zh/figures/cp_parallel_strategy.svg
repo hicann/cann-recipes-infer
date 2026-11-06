@@ -1,0 +1,199 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1195" viewBox="0 0 1800 1195" role="img" aria-describedby="desc">
+  <desc id="desc">左侧为从输入 token 到本地 Attention 输出的连续计算流；右侧放大说明按二倍 CP 大小切片并头尾对称分配，以及各 Rank 通过 AllGather 得到全局 KV 的过程。</desc>
+
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8.2" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0,0 L10,5 L0,10 Z" fill="#202A52"/>
+    </marker>
+    <marker id="arrowCoral" viewBox="0 0 10 10" refX="8.2" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0,0 L10,5 L0,10 Z" fill="#DC6C6C"/>
+    </marker>
+    <style>
+      text { font-family: Inter, "PingFang SC", "Microsoft YaHei", Arial, sans-serif; fill:#12172B; }
+      .boxtext { font-size:23px; font-weight:600; }
+      .small { font-size:17px; fill:#5F667E; }
+      .tiny { font-size:15px; fill:#5F667E; }
+      .rank { font-size:21px; font-weight:720; }
+      .panel-title { font-size:25px; font-weight:760; fill:#DC6C6C; }
+      .node { fill:#EEF4FF; stroke:#202A52; stroke-width:2; }
+      .comm { fill:#FFF0ED; stroke:#202A52; stroke-width:2; }
+      .plain { fill:#FFFFFF; stroke:#202A52; stroke-width:2; }
+      .dash { fill:#FFFFFF; stroke:#202A52; stroke-width:2.2; stroke-dasharray:15 10; }
+      .flow { fill:none; stroke:#202A52; stroke-width:2.6; marker-end:url(#arrow); }
+      .callout { fill:none; stroke:#202A52; stroke-width:2.6; marker-end:url(#arrow); }
+      .mono { font-family:"SFMono-Regular", Consolas, monospace; }
+    </style>
+  </defs>
+
+  <rect width="1800" height="1195" fill="#FFFFFF"/>
+
+  <g transform="translate(0,-85)">
+
+  <!-- LEFT: one continuous pipeline -->
+  <g id="main-flow">
+    <rect x="44" y="116" width="500" height="1108" rx="22" class="dash"/>
+    <text x="60" y="151" font-size="24" font-weight="760" fill="#DC6C6C">CP</text>
+
+    <rect x="128" y="152" width="332" height="58" rx="29" class="plain"/>
+    <text x="294" y="189" text-anchor="middle" class="boxtext mono">input tokens [L, d]</text>
+
+    <path d="M294 210 L294 246" class="flow"/>
+    <rect x="102" y="248" width="384" height="62" class="comm"/>
+    <text x="294" y="286" text-anchor="middle" class="boxtext">Split：切成 2N 个连续片段</text>
+
+    <path d="M294 310 L294 346" class="flow"/>
+    <rect x="102" y="348" width="384" height="62" class="comm"/>
+    <text x="294" y="386" text-anchor="middle" class="boxtext">Token 对称重排</text>
+
+    <path d="M294 410 L294 446" class="flow"/>
+    <rect x="102" y="448" width="384" height="72" class="node"/>
+    <text x="294" y="480" text-anchor="middle" class="boxtext">Rank r 本地 tokens</text>
+    <text x="294" y="505" text-anchor="middle" class="small">片 r + 片 (2N−1−r)</text>
+
+    <path d="M294 520 L294 558" class="flow"/>
+    <rect x="102" y="560" width="384" height="64" class="node"/>
+    <text x="294" y="600" text-anchor="middle" class="boxtext">Q / K / V Projection</text>
+
+    <!-- Q bypasses communication -->
+    <path d="M195 624 L195 674 L118 674 L118 1022 L174 1022" fill="none" stroke="#202A52" stroke-width="2.6" marker-end="url(#arrow)"/>
+    <rect x="72" y="700" width="92" height="54" rx="8" fill="#DDEAFF" stroke="#202A52" stroke-width="2"/>
+    <text x="118" y="735" text-anchor="middle" class="boxtext">Q<tspan baseline-shift="sub" font-size="15">r</tspan></text>
+    <text x="82" y="788" class="tiny">本地 Query</text>
+    <text x="82" y="810" class="tiny">不参与聚合</text>
+
+    <!-- KV continues vertically -->
+    <path d="M376 624 L376 662" class="flow"/>
+    <rect x="232" y="664" width="254" height="62" class="node"/>
+    <text x="359" y="701" text-anchor="middle" class="boxtext">局部 K<tspan baseline-shift="sub" font-size="15">r</tspan> / V<tspan baseline-shift="sub" font-size="15">r</tspan></text>
+
+    <path d="M359 726 L359 764" class="flow"/>
+    <rect x="194" y="766" width="292" height="66" class="comm"/>
+    <text x="340" y="807" text-anchor="middle" class="boxtext">AllGather K / V</text>
+
+    <path d="M340 832 L340 868" class="flow"/>
+    <rect x="194" y="870" width="292" height="64" class="node"/>
+    <text x="340" y="909" text-anchor="middle" class="boxtext">全局 K / V [L, d<tspan baseline-shift="sub" font-size="15">k</tspan>]</text>
+
+    <path d="M340 934 L340 964" class="flow"/>
+    <rect x="174" y="966" width="312" height="112" class="node"/>
+    <text x="330" y="1004" text-anchor="middle" class="boxtext">完整 Attention</text>
+    <text x="330" y="1038" text-anchor="middle" font-size="18" class="mono">softmax(Q<tspan baseline-shift="sub" font-size="12">r</tspan>K<tspan baseline-shift="super" font-size="12">T</tspan>/√d<tspan baseline-shift="sub" font-size="12">k</tspan>)V</text>
+    <text x="330" y="1064" text-anchor="middle" class="tiny">本地 Q × 全局 K/V</text>
+
+    <path d="M330 1078 L330 1114" class="flow"/>
+    <rect x="142" y="1116" width="376" height="66" class="plain"/>
+    <text x="330" y="1156" text-anchor="middle" class="boxtext">本地输出 O<tspan baseline-shift="sub" font-size="15">r</tspan> [L/N, d]</text>
+    <text x="294" y="1210" text-anchor="middle" class="small">只保留 Rank r 所负责 token 的输出</text>
+  </g>
+
+  <!-- Callout arrows from main flow -->
+  <path d="M486 379 C565 379 588 300 654 300" class="callout"/>
+  <path d="M486 799 C566 799 586 790 654 790" class="callout"/>
+
+  <!-- RIGHT TOP: token rearrange detail -->
+  <g id="rearrange-detail">
+    <rect x="664" y="116" width="1088" height="444" rx="22" class="dash"/>
+    <text x="694" y="157" class="panel-title">Token rearrange for load balance</text>
+    <text x="694" y="187" class="small">全局序列按顺序均分为 2 × cp_size 个片段，再从首尾向中间配对。</text>
+
+    <text x="706" y="249" class="rank">原始序列</text>
+    <g transform="translate(854,216)">
+      <rect x="0" y="0" width="102" height="60" fill="#E0ECFF" stroke="#202A52" stroke-width="2"/>
+      <rect x="102" y="0" width="102" height="60" fill="#EAF7F5" stroke="#202A52" stroke-width="2"/>
+      <rect x="204" y="0" width="102" height="60" fill="#FFF3D9" stroke="#202A52" stroke-width="2"/>
+      <rect x="306" y="0" width="102" height="60" fill="#FFE6E2" stroke="#202A52" stroke-width="2"/>
+      <rect x="408" y="0" width="102" height="60" fill="#FFE6E2" stroke="#202A52" stroke-width="2"/>
+      <rect x="510" y="0" width="102" height="60" fill="#FFF3D9" stroke="#202A52" stroke-width="2"/>
+      <rect x="612" y="0" width="102" height="60" fill="#EAF7F5" stroke="#202A52" stroke-width="2"/>
+      <rect x="714" y="0" width="102" height="60" fill="#E0ECFF" stroke="#202A52" stroke-width="2"/>
+      <g class="boxtext" text-anchor="middle">
+        <text x="51" y="38">0</text><text x="153" y="38">1</text><text x="255" y="38">2</text><text x="357" y="38">3</text>
+        <text x="459" y="38">4</text><text x="561" y="38">5</text><text x="663" y="38">6</text><text x="765" y="38">7</text>
+      </g>
+    </g>
+    <path d="M1262 286 L1262 329" class="flow"/>
+    <text x="1300" y="314" font-size="18" fill="#DC6C6C">头尾对称配对</text>
+
+    <g transform="translate(704,348)">
+      <text x="0" y="37" class="rank">Rank 0</text>
+      <rect x="150" y="0" width="104" height="58" fill="#E0ECFF" stroke="#202A52" stroke-width="2"/>
+      <rect x="254" y="0" width="104" height="58" fill="#E0ECFF" stroke="#202A52" stroke-width="2"/>
+      <text x="202" y="37" text-anchor="middle" class="boxtext">0</text><text x="306" y="37" text-anchor="middle" class="boxtext">7</text>
+
+      <text x="420" y="37" class="rank">Rank 1</text>
+      <rect x="570" y="0" width="104" height="58" fill="#EAF7F5" stroke="#202A52" stroke-width="2"/>
+      <rect x="674" y="0" width="104" height="58" fill="#EAF7F5" stroke="#202A52" stroke-width="2"/>
+      <text x="622" y="37" text-anchor="middle" class="boxtext">1</text><text x="726" y="37" text-anchor="middle" class="boxtext">6</text>
+
+      <text x="0" y="118" class="rank">Rank 2</text>
+      <rect x="150" y="81" width="104" height="58" fill="#FFF3D9" stroke="#202A52" stroke-width="2"/>
+      <rect x="254" y="81" width="104" height="58" fill="#FFF3D9" stroke="#202A52" stroke-width="2"/>
+      <text x="202" y="118" text-anchor="middle" class="boxtext">2</text><text x="306" y="118" text-anchor="middle" class="boxtext">5</text>
+
+      <text x="420" y="118" class="rank">Rank 3</text>
+      <rect x="570" y="81" width="104" height="58" fill="#FFE6E2" stroke="#202A52" stroke-width="2"/>
+      <rect x="674" y="81" width="104" height="58" fill="#FFE6E2" stroke="#202A52" stroke-width="2"/>
+      <text x="622" y="118" text-anchor="middle" class="boxtext">3</text><text x="726" y="118" text-anchor="middle" class="boxtext">4</text>
+
+      <path d="M827 14 C882 -12 930 -12 986 14" fill="none" stroke="#202A52" stroke-width="2"/>
+      <path d="M827 126 C882 152 930 152 986 126" fill="none" stroke="#202A52" stroke-width="2"/>
+      <text x="906" y="67" text-anchor="middle" class="small">每卡 token 数</text>
+      <text x="906" y="95" text-anchor="middle" font-size="23" font-weight="700" class="mono">L / N</text>
+    </g>
+  </g>
+
+  <!-- RIGHT BOTTOM: AllGather + local attention detail -->
+  <g id="attention-detail">
+    <rect x="664" y="586" width="1088" height="638" rx="22" class="dash"/>
+    <text x="694" y="627" class="panel-title">Attention：Q 保持本地，K/V 通过 AllGather 变为全局</text>
+
+    <!-- Inputs by rank -->
+    <text x="700" y="700" class="rank">Rank 0</text>
+    <text x="700" y="786" class="rank">Rank 1</text>
+    <text x="716" y="852" font-size="30" font-weight="700">⋮</text>
+    <text x="682" y="928" class="rank">Rank N−1</text>
+
+    <g>
+      <rect x="810" y="658" width="126" height="58" class="node"/><text x="873" y="694" text-anchor="middle" class="boxtext">Q₀</text>
+      <rect x="958" y="658" width="168" height="58" fill="#FFF3D9" stroke="#202A52" stroke-width="2"/><text x="1042" y="694" text-anchor="middle" class="boxtext">K₀ / V₀</text>
+
+      <rect x="810" y="744" width="126" height="58" class="node"/><text x="873" y="780" text-anchor="middle" class="boxtext">Q₁</text>
+      <rect x="958" y="744" width="168" height="58" fill="#FFE6E2" stroke="#202A52" stroke-width="2"/><text x="1042" y="780" text-anchor="middle" class="boxtext">K₁ / V₁</text>
+
+      <rect x="810" y="886" width="126" height="58" class="node"/><text x="873" y="922" text-anchor="middle" class="boxtext">Qₙ₋₁</text>
+      <rect x="958" y="886" width="168" height="58" fill="#EAF7F5" stroke="#202A52" stroke-width="2"/><text x="1042" y="922" text-anchor="middle" class="boxtext">Kₙ₋₁ / Vₙ₋₁</text>
+    </g>
+
+    <!-- Gather funnel -->
+    <path d="M1126 687 C1184 687 1180 786 1224 786" fill="none" stroke="#DC6C6C" stroke-width="2.6" marker-end="url(#arrowCoral)"/>
+    <path d="M1126 773 L1224 773" fill="none" stroke="#DC6C6C" stroke-width="2.6" marker-end="url(#arrowCoral)"/>
+    <path d="M1126 915 C1184 915 1180 800 1224 800" fill="none" stroke="#DC6C6C" stroke-width="2.6" marker-end="url(#arrowCoral)"/>
+    <rect x="1226" y="743" width="224" height="82" class="comm"/>
+    <text x="1338" y="778" text-anchor="middle" class="boxtext">AllGather</text>
+    <text x="1338" y="807" text-anchor="middle" class="small">交换所有局部 K/V</text>
+
+    <path d="M1450 784 L1496 784" class="flow"/>
+    <rect x="1498" y="730" width="214" height="108" class="node"/>
+    <text x="1605" y="769" text-anchor="middle" class="boxtext">全局 K / V</text>
+    <text x="1605" y="799" text-anchor="middle" class="small">K₀…Kₙ₋₁</text>
+    <text x="1605" y="824" text-anchor="middle" class="small">V₀…Vₙ₋₁</text>
+
+    <!-- Local rank attention example -->
+    <path d="M873 716 L873 1005 L1054 1005" class="flow"/>
+    <text x="890" y="990" class="tiny">以 Rank 0 为例：Q₀</text>
+    <path d="M1605 838 L1605 1005 L1416 1005" class="flow"/>
+    <text x="1435" y="990" class="tiny">全局 K/V</text>
+
+    <rect x="1056" y="958" width="358" height="98" class="node"/>
+    <text x="1235" y="994" text-anchor="middle" class="boxtext">Local Attention</text>
+    <text x="1235" y="1029" text-anchor="middle" font-size="18" class="mono">O₀ = softmax(Q₀Kᵀ/√dₖ)V</text>
+
+    <path d="M1235 1056 L1235 1096" class="flow"/>
+    <rect x="1056" y="1098" width="358" height="72" class="plain"/>
+    <text x="1235" y="1129" text-anchor="middle" class="boxtext">仅输出 Rank 0 的 O₀</text>
+    <text x="1235" y="1156" text-anchor="middle" class="small">其他 Rank 同样并行计算各自 O<tspan baseline-shift="sub" font-size="12">r</tspan></text>
+
+    <text x="700" y="1188" class="small">关键：切分的是 Q / 输出所在的 token 行；每个本地 Q 仍需访问完整序列的 K/V。</text>
+  </g>
+  </g>
+</svg>

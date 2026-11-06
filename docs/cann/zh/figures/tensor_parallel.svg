@@ -1,0 +1,393 @@
+<svg xmlns="http://www.w3.org/2000/svg"
+     width="1680"
+     height="900"
+     viewBox="0 0 1680 900"
+     preserveAspectRatio="xMinYMin meet"
+     role="img"
+     aria-labelledby="title desc">
+  <title id="title">矩阵乘法的两种并行计算方式</title>
+  <desc id="desc">左侧展示一乘四向量与四乘二矩阵相乘。右上展示复制输入、按列拆分权重并拼接结果；右下展示切分输入、按行拆分权重并对结果求和。</desc>
+
+  <defs>
+    <style>
+      .sans {
+        font-family: -apple-system, BlinkMacSystemFont, "PingFang SC",
+                     "Microsoft YaHei", Arial, sans-serif;
+      }
+      .math {
+        font-family: "Times New Roman", "Songti SC", serif;
+        font-style: italic;
+        fill: #202A52;
+      }
+      .cell {
+        stroke: #202A52;
+        stroke-width: 2;
+        shape-rendering: crispEdges;
+      }
+      .cell-text {
+        font-family: -apple-system, BlinkMacSystemFont, "PingFang SC",
+                     "Microsoft YaHei", Arial, sans-serif;
+        font-size: 21px;
+        text-anchor: middle;
+        dominant-baseline: middle;
+        fill: #12172B;
+      }
+      .cell-text-light {
+        font-family: -apple-system, BlinkMacSystemFont, "PingFang SC",
+                     "Microsoft YaHei", Arial, sans-serif;
+        font-size: 21px;
+        text-anchor: middle;
+        dominant-baseline: middle;
+        fill: #12172B;
+      }
+      .panel-title {
+        font-size: 24px;
+        fill: #202A52;
+      }
+      .parallel-label {
+        font-size: 34px;
+        font-weight: 700;
+        text-anchor: middle;
+        fill: #202A52;
+      }
+      .operator {
+        font-family: "Times New Roman", serif;
+        font-size: 42px;
+        text-anchor: middle;
+        dominant-baseline: middle;
+        fill: #202A52;
+      }
+      .matrix-label {
+        font-size: 24px;
+        text-anchor: middle;
+        fill: #202A52;
+      }
+      .action-red {
+        font-size: 28px;
+        font-weight: 600;
+        fill: #D96868;
+      }
+      .action-blue {
+        font-size: 28px;
+        font-weight: 600;
+        fill: #5069B2;
+      }
+      .flow-red {
+        fill: none;
+        stroke: #D96868;
+        stroke-width: 4;
+        marker-end: url(#arrow-red);
+      }
+      .flow-blue {
+        fill: none;
+        stroke: #5069B2;
+        stroke-width: 4;
+        marker-end: url(#arrow-blue);
+      }
+
+      /* 与 CP / SP 原理图统一的低饱和粉彩色板 */
+      rect[fill="#ff6868"] { fill: #FFE6E2; }
+      rect[fill="#ffc400"] { fill: #FFF3D9; }
+      rect[fill="#92cf4c"] { fill: #E6F5F1; }
+      rect[fill="#bb83e7"] { fill: #F1EDFF; }
+      rect[fill="#aaa"] { fill: #E8ECF4; }
+      rect[fill="#008fe8"] { fill: #DDEAFF; }
+      rect[fill="#66a9dc"] { fill: #E8EEFF; }
+      rect[fill="#f0f0f0"] {
+        fill: #F8FAFF;
+        stroke: #202A52;
+        stroke-width: 2;
+      }
+      rect[fill="#bdbdbd"] {
+        fill: #F3F5FA;
+        stroke: #202A52;
+        stroke-width: 2;
+      }
+      #arrow-red path { fill: #D96868; }
+      #arrow-blue path { fill: #5069B2; }
+    </style>
+
+    <marker id="arrow-red"
+            viewBox="0 0 10 10"
+            refX="9"
+            refY="5"
+            markerWidth="8"
+            markerHeight="8"
+            orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#D96868"/>
+    </marker>
+    <marker id="arrow-blue"
+            viewBox="0 0 10 10"
+            refX="9"
+            refY="5"
+            markerWidth="8"
+            markerHeight="8"
+            orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#5069B2"/>
+    </marker>
+  </defs>
+
+  <rect width="1680" height="900" fill="#FFFFFF"/>
+
+  <!-- 左侧：原始矩阵乘法 -->
+  <g aria-label="原始矩阵乘法">
+    <!-- X = [0 1 2 3] -->
+    <g aria-label="X 等于零一二三">
+      <rect class="cell" x="1" y="446" width="41" height="40" fill="#ff6868"/>
+      <rect class="cell" x="42" y="446" width="41" height="40" fill="#ff6868"/>
+      <rect class="cell" x="83" y="446" width="41" height="40" fill="#ff6868"/>
+      <rect class="cell" x="124" y="446" width="41" height="40" fill="#ff6868"/>
+      <text class="cell-text" x="21.5" y="466">0</text>
+      <text class="cell-text" x="62.5" y="466">1</text>
+      <text class="cell-text" x="103.5" y="466">2</text>
+      <text class="cell-text" x="144.5" y="466">3</text>
+      <text class="math" x="83" y="520" font-size="25" text-anchor="middle" fill="#111">X</text>
+    </g>
+
+    <text class="operator" x="204" y="466">×</text>
+
+    <!-- W = [[4,8],[5,9],[6,10],[7,11]] -->
+    <g aria-label="权重矩阵 W">
+      <rect class="cell" x="242" y="386" width="41" height="41" fill="#ffc400"/>
+      <rect class="cell" x="283" y="386" width="41" height="41" fill="#92cf4c"/>
+      <rect class="cell" x="242" y="427" width="41" height="41" fill="#ffc400"/>
+      <rect class="cell" x="283" y="427" width="41" height="41" fill="#92cf4c"/>
+      <rect class="cell" x="242" y="468" width="41" height="41" fill="#bb83e7"/>
+      <rect class="cell" x="283" y="468" width="41" height="41" fill="#aaa"/>
+      <rect class="cell" x="242" y="509" width="41" height="41" fill="#bb83e7"/>
+      <rect class="cell" x="283" y="509" width="41" height="41" fill="#aaa"/>
+      <text class="cell-text" x="262.5" y="406.5">4</text>
+      <text class="cell-text" x="303.5" y="406.5">8</text>
+      <text class="cell-text" x="262.5" y="447.5">5</text>
+      <text class="cell-text" x="303.5" y="447.5">9</text>
+      <text class="cell-text" x="262.5" y="488.5">6</text>
+      <text class="cell-text" x="303.5" y="488.5">10</text>
+      <text class="cell-text" x="262.5" y="529.5">7</text>
+      <text class="cell-text" x="303.5" y="529.5">11</text>
+      <text class="math" x="283" y="584" font-size="25" text-anchor="middle" fill="#111">W</text>
+    </g>
+
+    <text class="operator" x="362" y="466">=</text>
+
+    <!-- Y = [38 62] -->
+    <g aria-label="结果 Y 等于三十八六十二">
+      <rect class="cell" x="400" y="446" width="41" height="40" fill="#008fe8"/>
+      <rect class="cell" x="441" y="446" width="41" height="40" fill="#008fe8"/>
+      <text class="cell-text-light" x="420.5" y="466">38</text>
+      <text class="cell-text-light" x="461.5" y="466">62</text>
+      <text class="math" x="441" y="520" font-size="25" text-anchor="middle" fill="#111">Y</text>
+    </g>
+  </g>
+
+  <!-- 右上：列并行 -->
+  <g aria-label="列并行，复制输入并拼接结果">
+    <text class="sans parallel-label" x="804" y="120">列并行</text>
+    <!-- 输入与分发 -->
+    <g>
+      <rect class="cell" x="722" y="189" width="41" height="40" fill="#ff6868"/>
+      <rect class="cell" x="763" y="189" width="41" height="40" fill="#ff6868"/>
+      <rect class="cell" x="804" y="189" width="41" height="40" fill="#ff6868"/>
+      <rect class="cell" x="845" y="189" width="41" height="40" fill="#ff6868"/>
+      <text class="cell-text" x="742.5" y="209">0</text>
+      <text class="cell-text" x="783.5" y="209">1</text>
+      <text class="cell-text" x="824.5" y="209">2</text>
+      <text class="cell-text" x="865.5" y="209">3</text>
+    </g>
+    <path class="flow-red" d="M 897 181 L 970 136"/>
+    <path class="flow-red" d="M 897 235 L 970 277"/>
+    <text class="sans action-red" x="909" y="221">拷贝</text>
+
+    <!-- 节点 1 -->
+    <g>
+      <rect x="982" y="2" width="457" height="195" rx="22"
+            fill="#f0f0f0" stroke="#979797" stroke-width="3"/>
+      <text class="sans panel-title" x="997" y="31">节点1</text>
+
+      <rect class="cell" x="1007" y="77" width="42" height="41" fill="#ff6868"/>
+      <rect class="cell" x="1049" y="77" width="42" height="41" fill="#ff6868"/>
+      <rect class="cell" x="1091" y="77" width="42" height="41" fill="#ff6868"/>
+      <rect class="cell" x="1133" y="77" width="42" height="41" fill="#ff6868"/>
+      <text class="cell-text" x="1028" y="97.5">0</text>
+      <text class="cell-text" x="1070" y="97.5">1</text>
+      <text class="cell-text" x="1112" y="97.5">2</text>
+      <text class="cell-text" x="1154" y="97.5">3</text>
+      <text class="math matrix-label" x="1091" y="151">X</text>
+
+      <text class="operator" x="1210" y="101">×</text>
+
+      <rect class="cell" x="1248" y="17" width="42" height="42" fill="#ffc400"/>
+      <rect class="cell" x="1248" y="59" width="42" height="42" fill="#ffc400"/>
+      <rect class="cell" x="1248" y="101" width="42" height="42" fill="#bb83e7"/>
+      <rect class="cell" x="1248" y="143" width="42" height="42" fill="#bb83e7"/>
+      <text class="cell-text" x="1269" y="38">4</text>
+      <text class="cell-text" x="1269" y="80">5</text>
+      <text class="cell-text" x="1269" y="122">6</text>
+      <text class="cell-text" x="1269" y="164">7</text>
+      <text class="math matrix-label" x="1316" y="183">
+        W<tspan baseline-shift="sub" font-size="16">1</tspan>
+      </text>
+
+      <text class="operator" x="1328" y="101">=</text>
+
+      <rect class="cell" x="1365" y="77" width="42" height="42" fill="#008fe8"/>
+      <text class="cell-text-light" x="1386" y="98">38</text>
+      <text class="math matrix-label" x="1386" y="145">
+        Y<tspan baseline-shift="sub" font-size="16">1</tspan>
+      </text>
+    </g>
+
+    <!-- 节点 2 -->
+    <g>
+      <rect x="982" y="216" width="457" height="196" rx="22"
+            fill="#bdbdbd" stroke="#8a8a8a" stroke-width="3"/>
+      <text class="sans panel-title" x="997" y="247">节点2</text>
+
+      <rect class="cell" x="1007" y="290" width="42" height="42" fill="#ff6868"/>
+      <rect class="cell" x="1049" y="290" width="42" height="42" fill="#ff6868"/>
+      <rect class="cell" x="1091" y="290" width="42" height="42" fill="#ff6868"/>
+      <rect class="cell" x="1133" y="290" width="42" height="42" fill="#ff6868"/>
+      <text class="cell-text" x="1028" y="311">0</text>
+      <text class="cell-text" x="1070" y="311">1</text>
+      <text class="cell-text" x="1112" y="311">2</text>
+      <text class="cell-text" x="1154" y="311">3</text>
+      <text class="math matrix-label" x="1091" y="364">X</text>
+
+      <text class="operator" x="1210" y="314">×</text>
+
+      <rect class="cell" x="1248" y="230" width="42" height="42" fill="#92cf4c"/>
+      <rect class="cell" x="1248" y="272" width="42" height="42" fill="#92cf4c"/>
+      <rect class="cell" x="1248" y="314" width="42" height="42" fill="#aaa"/>
+      <rect class="cell" x="1248" y="356" width="42" height="42" fill="#aaa"/>
+      <text class="cell-text" x="1269" y="251">8</text>
+      <text class="cell-text" x="1269" y="293">9</text>
+      <text class="cell-text" x="1269" y="335">10</text>
+      <text class="cell-text" x="1269" y="377">11</text>
+      <text class="math matrix-label" x="1316" y="393">
+        W<tspan baseline-shift="sub" font-size="16">2</tspan>
+      </text>
+
+      <text class="operator" x="1328" y="314">=</text>
+
+      <rect class="cell" x="1365" y="290" width="42" height="42" fill="#008fe8"/>
+      <text class="cell-text-light" x="1386" y="311">62</text>
+      <text class="math matrix-label" x="1386" y="359">
+        Y<tspan baseline-shift="sub" font-size="16">2</tspan>
+      </text>
+    </g>
+
+    <!-- 拼接 -->
+    <path class="flow-blue" d="M 1453 136 L 1527 183"/>
+    <path class="flow-blue" d="M 1453 281 L 1527 237"/>
+    <text class="sans action-blue" x="1453" y="220">拼接</text>
+    <rect class="cell" x="1536" y="188" width="41" height="40" fill="#008fe8"/>
+    <rect class="cell" x="1577" y="188" width="41" height="40" fill="#008fe8"/>
+    <text class="cell-text-light" x="1556.5" y="208">38</text>
+    <text class="cell-text-light" x="1597.5" y="208">62</text>
+  </g>
+
+  <!-- 右下：行并行 -->
+  <g aria-label="行并行，切分输入并对结果求和">
+    <text class="sans parallel-label" x="804" y="635">行并行</text>
+    <!-- 输入与切片 -->
+    <g>
+      <rect class="cell" x="722" y="701" width="41" height="40" fill="#ff6868"/>
+      <rect class="cell" x="763" y="701" width="41" height="40" fill="#ff6868"/>
+      <rect class="cell" x="804" y="701" width="41" height="40" fill="#ff6868"/>
+      <rect class="cell" x="845" y="701" width="41" height="40" fill="#ff6868"/>
+      <text class="cell-text" x="742.5" y="721">0</text>
+      <text class="cell-text" x="783.5" y="721">1</text>
+      <text class="cell-text" x="824.5" y="721">2</text>
+      <text class="cell-text" x="865.5" y="721">3</text>
+    </g>
+    <path class="flow-red" d="M 897 693 L 970 650"/>
+    <path class="flow-red" d="M 897 747 L 970 790"/>
+    <text class="sans action-red" x="912" y="735">切片</text>
+
+    <!-- 节点 1 -->
+    <g>
+      <rect x="982" y="542" width="457" height="169" rx="22"
+            fill="#f0f0f0" stroke="#979797" stroke-width="3"/>
+      <text class="sans panel-title" x="997" y="575">节点1</text>
+
+      <rect class="cell" x="1011" y="606" width="42" height="41" fill="#ff6868"/>
+      <rect class="cell" x="1053" y="606" width="42" height="41" fill="#ff6868"/>
+      <text class="cell-text" x="1032" y="626.5">0</text>
+      <text class="cell-text" x="1074" y="626.5">1</text>
+      <text class="math matrix-label" x="1053" y="679">
+        X<tspan baseline-shift="sub" font-size="16">1</tspan>
+      </text>
+
+      <text class="operator" x="1127" y="630">×</text>
+
+      <rect class="cell" x="1166" y="586" width="42" height="42" fill="#ffc400"/>
+      <rect class="cell" x="1208" y="586" width="42" height="42" fill="#92cf4c"/>
+      <rect class="cell" x="1166" y="628" width="42" height="42" fill="#ffc400"/>
+      <rect class="cell" x="1208" y="628" width="42" height="42" fill="#92cf4c"/>
+      <text class="cell-text" x="1187" y="607">4</text>
+      <text class="cell-text" x="1229" y="607">8</text>
+      <text class="cell-text" x="1187" y="649">5</text>
+      <text class="cell-text" x="1229" y="649">9</text>
+      <text class="math matrix-label" x="1208" y="698">
+        W<tspan baseline-shift="sub" font-size="16">1</tspan>
+      </text>
+
+      <text class="operator" x="1287" y="630">=</text>
+
+      <rect class="cell" x="1324" y="606" width="42" height="42" fill="#66a9dc"/>
+      <rect class="cell" x="1366" y="606" width="42" height="42" fill="#66a9dc"/>
+      <text class="cell-text" x="1345" y="627">5</text>
+      <text class="cell-text" x="1387" y="627">9</text>
+      <text class="math matrix-label" x="1366" y="680">
+        Y<tspan baseline-shift="sub" font-size="16">1</tspan>
+      </text>
+    </g>
+
+    <!-- 节点 2 -->
+    <g>
+      <rect x="982" y="728" width="457" height="169" rx="22"
+            fill="#bdbdbd" stroke="#8a8a8a" stroke-width="3"/>
+      <text class="sans panel-title" x="997" y="762">节点2</text>
+
+      <rect class="cell" x="1011" y="795" width="42" height="41" fill="#ff6868"/>
+      <rect class="cell" x="1053" y="795" width="42" height="41" fill="#ff6868"/>
+      <text class="cell-text" x="1032" y="815.5">2</text>
+      <text class="cell-text" x="1074" y="815.5">3</text>
+      <text class="math matrix-label" x="1053" y="868">
+        X<tspan baseline-shift="sub" font-size="16">2</tspan>
+      </text>
+
+      <text class="operator" x="1127" y="819">×</text>
+
+      <rect class="cell" x="1166" y="774" width="42" height="42" fill="#bb83e7"/>
+      <rect class="cell" x="1208" y="774" width="42" height="42" fill="#aaa"/>
+      <rect class="cell" x="1166" y="816" width="42" height="42" fill="#bb83e7"/>
+      <rect class="cell" x="1208" y="816" width="42" height="42" fill="#aaa"/>
+      <text class="cell-text" x="1187" y="795">6</text>
+      <text class="cell-text" x="1229" y="795">10</text>
+      <text class="cell-text" x="1187" y="837">7</text>
+      <text class="cell-text" x="1229" y="837">11</text>
+      <text class="math matrix-label" x="1208" y="886">
+        W<tspan baseline-shift="sub" font-size="16">2</tspan>
+      </text>
+
+      <text class="operator" x="1287" y="819">=</text>
+
+      <rect class="cell" x="1324" y="795" width="42" height="42" fill="#66a9dc"/>
+      <rect class="cell" x="1366" y="795" width="42" height="42" fill="#66a9dc"/>
+      <text class="cell-text" x="1345" y="816">33</text>
+      <text class="cell-text" x="1387" y="816">53</text>
+      <text class="math matrix-label" x="1366" y="869">
+        Y<tspan baseline-shift="sub" font-size="16">2</tspan>
+      </text>
+    </g>
+
+    <!-- 求和 -->
+    <path class="flow-blue" d="M 1453 647 L 1527 696"/>
+    <path class="flow-blue" d="M 1453 834 L 1527 748"/>
+    <text class="sans action-blue" x="1453" y="733">求和</text>
+    <rect class="cell" x="1536" y="701" width="41" height="40" fill="#008fe8"/>
+    <rect class="cell" x="1577" y="701" width="41" height="40" fill="#008fe8"/>
+    <text class="cell-text-light" x="1556.5" y="721">38</text>
+    <text class="cell-text-light" x="1597.5" y="721">62</text>
+  </g>
+</svg>

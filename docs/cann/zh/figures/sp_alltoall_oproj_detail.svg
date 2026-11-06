@@ -1,0 +1,93 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="980" height="1080" viewBox="0 0 980 1080" role="img" aria-labelledby="title desc">
+  <title id="title">序列分片如何在 Attention 前后流动：AlltoAll</title>
+  <desc id="desc">本地注意力输入经 AllGather 恢复完整序列，各 Rank 计算局部 Head 的 Attention。AlltoAll 转为本地 Token、完整 Head，再使用每卡复制的完整 o_proj 权重，得到本地序列输出。</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8.2" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0,0 L10,5 L0,10 Z" fill="#202A52" />
+    </marker>
+    <marker id="arrowCoral" viewBox="0 0 10 10" refX="8.2" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0,0 L10,5 L0,10 Z" fill="#D96868" />
+    </marker>
+    <style>
+      text { font-family: Inter, "PingFang SC", "Microsoft YaHei", Arial, sans-serif; fill:#12172B; }
+      .boxtext { font-size:22px; font-weight:620; }
+      .small { font-size:17px; fill:#5F667E; }
+      .tiny { font-size:15px; fill:#5F667E; }
+      .rank { font-size:18px; font-weight:720; }
+      .panel-title { font-size:25px; font-weight:760; fill:#D96868; }
+      .sp { fill:#EEF4FF; stroke:#202A52; stroke-width:2; }
+      .tp { fill:#F1EDFF; stroke:#202A52; stroke-width:2; }
+      .comm { fill:#FFF0ED; stroke:#202A52; stroke-width:2; }
+      .residual { fill:#FFF8DF; stroke:#202A52; stroke-width:2; }
+      .plain { fill:#FFFFFF; stroke:#202A52; stroke-width:2; }
+      .dash { fill:#FFFFFF; stroke:#202A52; stroke-width:2.2; stroke-dasharray:15 10; }
+      .flow { fill:none; stroke:#202A52; stroke-width:2.6; marker-end:url(#arrow); }
+      .commflow { fill:none; stroke:#D96868; stroke-width:2.8; marker-end:url(#arrowCoral); }
+      .callout { fill:none; stroke:#202A52; stroke-width:2.5; marker-end:url(#arrow); }
+      .mono { font-family:"SFMono-Regular", Consolas, monospace; }
+    </style>
+  </defs>
+  <rect width="980" height="1080" fill="#FFFFFF" />
+  <rect x="23" y="20" width="934" height="1040" rx="22" class="dash" />
+  <text x="53" y="62" class="panel-title">序列分片如何在 Attention 前后流动（AlltoAll）</text>
+  <text x="53" y="123" text-anchor="start" class="rank">本地注意力输入</text>
+  <text x="53" y="151" text-anchor="start" class="small mono">[B, L/N, ·]</text>
+  <rect x="241" y="98" width="135" height="62" fill="#DDEAFF" stroke="#202A52" stroke-width="2" />
+  <text x="308.5" y="136" text-anchor="middle" class="rank">Rank 0</text>
+  <rect x="386" y="98" width="135" height="62" fill="#E6F5F1" stroke="#202A52" stroke-width="2" />
+  <text x="453.5" y="136" text-anchor="middle" class="rank">Rank 1</text>
+  <rect x="531" y="98" width="135" height="62" fill="#FFF3D9" stroke="#202A52" stroke-width="2" />
+  <text x="598.5" y="136" text-anchor="middle" class="rank">Rank 2</text>
+  <rect x="676" y="98" width="135" height="62" fill="#FFE6E2" stroke="#202A52" stroke-width="2" />
+  <text x="743.5" y="136" text-anchor="middle" class="rank">Rank 3</text>
+  <path d="M526 169 L526 204" class="commflow" />
+  <rect x="315" y="206" width="422" height="60" class="comm" />
+  <text x="526" y="244" text-anchor="middle" class="boxtext">AllGather (seq)</text>
+  <path d="M526 266 L526 303" class="commflow" />
+  <text x="53" y="341" text-anchor="start" class="rank">每个 Rank</text>
+  <text x="53" y="369" text-anchor="start" class="small mono">恢复 [B, L, ·]</text>
+  <rect x="241.0" y="307" width="142.5" height="62" fill="#DDEAFF" stroke="#202A52" stroke-width="2" />
+  <rect x="383.5" y="307" width="142.5" height="62" fill="#E6F5F1" stroke="#202A52" stroke-width="2" />
+  <rect x="526.0" y="307" width="142.5" height="62" fill="#FFF3D9" stroke="#202A52" stroke-width="2" />
+  <rect x="668.5" y="307" width="142.5" height="62" fill="#FFE6E2" stroke="#202A52" stroke-width="2" />
+  <text x="526" y="346" text-anchor="middle" class="boxtext">完整序列 L</text>
+  <path d="M526 369 L526 406" class="flow" />
+  <rect x="315" y="410" width="422" height="80" class="tp" />
+  <text x="526" y="443" text-anchor="middle" class="boxtext">Attention</text>
+  <text x="526" y="471" text-anchor="middle" class="small">完整序列，局部 Head</text>
+  <text x="756" y="440" text-anchor="start" class="small">每卡输出</text>
+  <text x="756" y="467" text-anchor="start" class="small mono">[B, L, C/N]</text>
+  <path d="M526 490 L526 528" class="commflow" />
+  <rect x="315" y="532" width="422" height="60" class="comm" />
+  <text x="526" y="570" text-anchor="middle" class="boxtext">AlltoAll</text>
+  <path d="M526 592 L526 628" class="commflow" />
+  <text x="53" y="668" text-anchor="start" class="rank">本地 Token</text>
+  <text x="53" y="696" text-anchor="start" class="small mono">[B, L/N, C]</text>
+  <rect x="241" y="632" width="135" height="62" fill="#DDEAFF" stroke="#202A52" stroke-width="2" />
+  <text x="308.5" y="670" text-anchor="middle" class="rank">Rank 0</text>
+  <rect x="386" y="632" width="135" height="62" fill="#E6F5F1" stroke="#202A52" stroke-width="2" />
+  <text x="453.5" y="670" text-anchor="middle" class="rank">Rank 1</text>
+  <rect x="531" y="632" width="135" height="62" fill="#FFF3D9" stroke="#202A52" stroke-width="2" />
+  <text x="598.5" y="670" text-anchor="middle" class="rank">Rank 2</text>
+  <rect x="676" y="632" width="135" height="62" fill="#FFE6E2" stroke="#202A52" stroke-width="2" />
+  <text x="743.5" y="670" text-anchor="middle" class="rank">Rank 3</text>
+  <text x="526" y="720" text-anchor="middle" class="small">各 Rank 拼齐完整 Head（含本地重排）</text>
+  <path d="M526 730 L526 767" class="flow" />
+  <rect x="315" y="771" width="422" height="82" class="sp" />
+  <text x="526" y="804" text-anchor="middle" class="boxtext">o_proj（完整权重）</text>
+  <text x="526" y="832" text-anchor="middle" class="small">每卡持有相同的完整权重，本地 Token 计算</text>
+  <path d="M526 853 L526 890" class="flow" />
+  <text x="53" y="932" text-anchor="start" class="rank">本地输出</text>
+  <text x="53" y="960" text-anchor="start" class="small mono">[B, L/N, H]</text>
+  <rect x="241" y="896" width="135" height="62" fill="#DDEAFF" stroke="#202A52" stroke-width="2" />
+  <text x="308.5" y="934" text-anchor="middle" class="rank">O₀</text>
+  <rect x="386" y="896" width="135" height="62" fill="#E6F5F1" stroke="#202A52" stroke-width="2" />
+  <text x="453.5" y="934" text-anchor="middle" class="rank">O₁</text>
+  <rect x="531" y="896" width="135" height="62" fill="#FFF3D9" stroke="#202A52" stroke-width="2" />
+  <text x="598.5" y="934" text-anchor="middle" class="rank">O₂</text>
+  <rect x="676" y="896" width="135" height="62" fill="#FFE6E2" stroke="#202A52" stroke-width="2" />
+  <text x="743.5" y="934" text-anchor="middle" class="rank">O₃</text>
+  <rect x="53" y="981" width="868" height="30" rx="15" fill="#FFF0ED" />
+  <text x="487" y="1002" text-anchor="middle" class="rank">AllGather(seq) → Attention → AlltoAll → o_proj（完整权重）</text>
+  <text x="53" y="1041" text-anchor="start" class="tiny">N：并行度；C：全部 Head 拼接宽度；H：隐藏维度。色块表示不同 Rank 的序列分片。</text>
+</svg>
