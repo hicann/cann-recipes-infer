@@ -36,7 +36,7 @@ while [[ $# -gt 0 ]]; do
         *)
             echo "Unknown Parameters: $1"
             echo "Usage: $0 --input_hf_path <input_path> --output_hf_path <output_path> --quant_mode <mode>"
-            echo "Supported Quant Mode: bfloat16, w8a8c16, w8a8c8, w4a8c8"
+            echo "Supported Quant Mode: bfloat16, w8a8c16"
             exit 1
             ;;
     esac
@@ -45,7 +45,7 @@ done
 
 if [[ -z "$INPUT_HF_PATH" ]] || [[ -z "$OUTPUT_HF_PATH" ]] || [[ -z "$QUANT_MODE" ]]; then
     echo "Usage: $0 --input_hf_path <input_path> --output_hf_path <output_path> --quant_mode <mode>"
-    echo "Supported Quant Mode: bfloat16, w8a8c16, w8a8c8, w4a8c8"
+    echo "Supported Quant Mode: bfloat16, w8a8c16"
     exit 1
 fi
 
@@ -64,59 +64,9 @@ case "${QUANT_MODE,,}" in
             --output_hf_path "$OUTPUT_HF_PATH" \
             --quant_type "w8a8c16"
         ;;
-    w8a8c8)
-        export QUANT_URL=https://cann-ai.obs.cn-north-4.myhuaweicloud.com/cann-quantization/DeepSeek-V3.2-Exp/w8a8c8.zip
-        mkdir -p ./quantization
-
-        # Download the quantization zip file
-        if ! wget --no-check-certificate -P ./quantization "$QUANT_URL"; then
-            echo "Error: Failed to download quantization parameters from $QUANT_URL"
-            exit 1
-        fi
-
-        # Unzip the file
-        echo "Extracting quantization parameters..."
-        if ! unzip -o "./quantization/w8a8c8.zip" -d ./quantization; then
-            echo "Error: Failed to extract ./quantization/w8a8c8.zip"
-            exit 1
-        fi
-
-        echo "Convert to w8a8c8 weights..."
-        python utils/convert_model.py \
-            --input_hf_path "$INPUT_HF_PATH" \
-            --output_hf_path "$OUTPUT_HF_PATH" \
-            --quant_type "w8a8c8" \
-            --clip \
-            --quant_param_path "./quantization/w8a8c8"
-        ;;
-    w4a8c8)
-        export QUANT_URL=https://cann-ai.obs.cn-north-4.myhuaweicloud.com/cann-quantization/DeepSeek-V3.2-Exp/w4a8c8.zip
-        mkdir -p ./quantization
-
-        # Download the quantization zip file
-        if ! wget --no-check-certificate -P ./quantization "$QUANT_URL"; then
-            echo "Error: Failed to download quantization parameters from $QUANT_URL"
-            exit 1
-        fi
-
-        # Unzip the file
-        echo "Extracting quantization parameters..."
-        if ! unzip -o "./quantization/w4a8c8.zip" -d ./quantization; then
-            echo "Error: Failed to extract ./quantization/w4a8c8.zip"
-            exit 1
-        fi
-
-        echo "Convert to w4a8c8 weights..."
-        python utils/convert_model.py \
-            --input_hf_path "$INPUT_HF_PATH" \
-            --output_hf_path "$OUTPUT_HF_PATH" \
-            --quant_type "w4a8c8" \
-            --clip \
-            --quant_param_path "./quantization/w4a8c8"
-        ;;
     *)
         echo "Error: Unsupport Quant_mode: $QUANT_MODE"
-        echo "Supported Mode: bfloat16, w8a8c16, w8a8c8, w4a8c8"
+        echo "Supported Mode: bfloat16, w8a8c16"
         exit 1
         ;;
 esac
