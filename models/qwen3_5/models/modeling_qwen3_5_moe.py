@@ -15,7 +15,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import json
 import math
 import os
 import logging
@@ -60,7 +59,6 @@ from module.linear import (
     UnquantizedLinearMethod,
     VocabParallelEmbedding,
 )
-from module.quantization import get_quant_config
 from module.quantization.mxfp8 import BLOCK_K, MxFp8Config, MxFp8LinearMethod, MxFp8MoEGMMMethod
 from module.utils import set_weight_attrs
 
@@ -373,12 +371,6 @@ def _apply_qwen3_5_online_mxfp8_quantization(
     return converted_linear + converted_gmm
 
 
-def _normalize_quantization_method(quantization: str | None) -> str | None:
-    if quantization is None:
-        return None
-    return quantization.lower().replace("compressed_tensors", "compressed-tensors")
-
-
 def _get_platform_version(infer_config: InferenceConfig | dict) -> str:
     global _PLATFORM_VERSION
     if _PLATFORM_VERSION is not None:
@@ -399,10 +391,8 @@ def _validate_qwen3_5_quantization_support(
 
     exe_mode = model_config.exe_mode
 
-    quantization = None
-    quant_config = _get_qwen3_5_quantization_config(config, infer_config)
-    if isinstance(quant_config, dict):
-        quantization = _normalize_quantization_method(quant_config.get("quant_method"))
+    quant_config = getattr(config, "quant_config", None)
+    quantization = quant_config.get_name() if quant_config is not None else None
 
     if custom_params.get("enable_online_mxfp8_quantization", False):
         quantization = "mxfp8"
@@ -453,56 +443,6 @@ def _configure_qwen3_5_npugraph(infer_config: InferenceConfig) -> None:
         torch.npu.set_compile_mode(jit_compile=False)
 
 
-def _normalize_qwen3_5_quantization_config(quant_config: dict | None) -> dict | None:
-    if not isinstance(quant_config, dict):
-        return quant_config
-
-    normalized = dict(quant_config)
-    ignored_layers = normalized.get("ignored_layers")
-    if ignored_layers is None:
-        ignored_layers = normalized.get("modules_to_not_convert")
-    if ignored_layers is not None:
-        normalized["ignored_layers"] = [
-            layer_name.replace("model.language_model.", "model.", 1)
-            for layer_name in ignored_layers
-        ]
-    return normalized
-
-
-def _load_quantization_config_from_model_path(model_path: str) -> dict | None:
-    config_path = os.path.join(model_path, "config.json")
-    if not os.path.exists(config_path):
-        return None
-    with open(config_path, "r", encoding="utf-8") as config_file:
-        model_config = json.load(config_file)
-    return model_config.get("quantization_config") or model_config.get("compression_config")
-
-
-def _get_qwen3_5_quantization_config(config, infer_config: InferenceConfig) -> dict | None:
-    custom_params = infer_config.model_config.custom_params or {}
-    quant_config = custom_params.get("quantization_config")
-    if quant_config is None:
-        quant_config = getattr(config, "quantization_config", None)
-    if quant_config is None:
-        quant_config = getattr(config, "compression_config", None)
-    if quant_config is None:
-        quant_config = _load_quantization_config_from_model_path(infer_config.model_config.model_path)
-    return _normalize_qwen3_5_quantization_config(quant_config)
-
-
-def _sync_qwen3_5_ignored_layers(config, infer_config: InferenceConfig) -> None:
-    quant_method_config = getattr(config, "quant_config", None)
-    if quant_method_config is None or not hasattr(quant_method_config, "ignored_layers"):
-        return
-
-    quant_config = _get_qwen3_5_quantization_config(config, infer_config)
-    if not quant_config:
-        return
-    ignored_layers = quant_config.get("ignored_layers")
-    if ignored_layers is not None:
-        quant_method_config.ignored_layers = ignored_layers
-
-
 def _register_qwen3_5_packed_modules_mapping(config) -> None:
     quant_method_config = getattr(config, "quant_config", None)
     if quant_method_config is None:
@@ -514,29 +454,6 @@ def _register_qwen3_5_packed_modules_mapping(config) -> None:
         "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
         "in_proj_ba": ["in_proj_b", "in_proj_a"],
     })
-
-
-def _init_qwen3_5_quant_config(config, infer_config: InferenceConfig) -> None:
-    if getattr(config, "quant_config", None) is not None:
-        _sync_qwen3_5_ignored_layers(config, infer_config)
-        _register_qwen3_5_packed_modules_mapping(config)
-        return
-
-    quant_config = _get_qwen3_5_quantization_config(config, infer_config)
-    if quant_config is not None:
-        config.quantization_config = quant_config
-
-    quantization = None
-    if isinstance(quant_config, dict):
-        quantization = _normalize_quantization_method(quant_config.get("quant_method"))
-
-    if quantization:
-        config.quant_config = get_quant_config(
-            config,
-            quantization,
-            infer_config.model_config.model_path,
-        )
-        _register_qwen3_5_packed_modules_mapping(config)
 
 
 def _map_quant_scale_name(param_name: str, params_dict: dict[str, torch.nn.Parameter]) -> str:
@@ -2683,7 +2600,7 @@ class Qwen3_5MoeForCausalLM(nn.Module):
             "Qwen3.5 only supports non-speculative decoding (next_n=0)."
         )
         _get_platform_version(infer_config)
-        _init_qwen3_5_quant_config(config, infer_config)
+        _register_qwen3_5_packed_modules_mapping(config)
         _validate_qwen3_5_quantization_support(config, infer_config)
         _validate_qwen3_5_mm_all_reduce_base_support(infer_config)
         _validate_qwen3_5_moe_parallel_support(infer_config)

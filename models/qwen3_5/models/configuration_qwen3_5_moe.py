@@ -26,6 +26,28 @@ from transformers.utils import logging
 logger = logging.get_logger(__name__)
 
 
+def _normalize_qwen3_5_quantization_config(quant_config):
+    if not isinstance(quant_config, dict):
+        return quant_config
+
+    normalized = dict(quant_config)
+    ignored_layers_key = "ignored_layers"
+    ignored_layers = normalized.get(ignored_layers_key)
+    if ignored_layers is None:
+        ignored_layers_key = "modules_to_not_convert"
+        ignored_layers = normalized.get(ignored_layers_key)
+    if ignored_layers is not None:
+        if not isinstance(ignored_layers, list) or not all(isinstance(name, str) for name in ignored_layers):
+            raise ValueError(
+                f'{ignored_layers_key} must be a list of strings, '
+                'for example ["model.layers.0.self_attn.q_proj"].'
+            )
+        normalized["ignored_layers"] = [
+            name.replace("model.language_model.", "model.", 1) for name in ignored_layers
+        ]
+    return normalized
+
+
 class Qwen3_5MoeTextConfig(PretrainedConfig):
     r"""
     This is the configuration class to store the configuration of a [`Qwen3_5MoeTextModel`].
@@ -100,6 +122,68 @@ class Qwen3_5MoeTextConfig(PretrainedConfig):
 
     model_type = "qwen3_5_moe_text"
     keys_to_ignore_at_inference = ["past_key_values"]
+
+    @classmethod
+    def get_config_dict(cls, pretrained_model_name_or_path, **kwargs):
+        root_config, kwargs = super().get_config_dict(pretrained_model_name_or_path, **kwargs)
+        config_dict = dict(root_config)
+        text_config = root_config.get("text_config")
+        is_text_config = (
+            "model_type" in root_config
+            and root_config["model_type"] != cls.model_type
+            and isinstance(text_config, dict)
+            and text_config.get("model_type") == cls.model_type
+        )
+        if is_text_config:
+            config_dict = dict(text_config)
+
+        runner_settings = kwargs.get("runner_settings")
+        model_config = getattr(runner_settings, "model_config", None)
+        custom_params = getattr(model_config, "custom_params", None) or {}
+        yaml_quant_config = custom_params.get("quantization_config")
+
+        quant_key = "quantization_config"
+        quant_config = config_dict.get(quant_key)
+        if quant_config is None:
+            quant_key = "compression_config"
+            quant_config = config_dict.get(quant_key)
+        file_quant_config = quant_config
+
+        # Keep schemes already visible to the public loader; YAML was a fallback
+        # for initialization, and otherwise only overrode native ignored layers.
+        # An explicit {} allows YAML fallback but blocks fallback to the root config.
+        if not file_quant_config:
+            if yaml_quant_config is not None:
+                quant_key = "quantization_config"
+                quant_config = yaml_quant_config
+                # A methodless YAML declaration did not construct a quant object.
+                if not isinstance(quant_config, dict) or not quant_config.get("quant_method"):
+                    quant_config = {}
+            elif quant_config is None and is_text_config:
+                quant_key = "quantization_config"
+                quant_config = root_config.get("quantization_config") or root_config.get("compression_config")
+                # The removed modeling fallback also left methodless root metadata unquantized.
+                if quant_config is not None and (
+                    not isinstance(quant_config, dict) or not quant_config.get("quant_method")
+                ):
+                    quant_config = {}
+
+        quant_config = _normalize_qwen3_5_quantization_config(quant_config)
+        if (
+            isinstance(file_quant_config, dict)
+            and file_quant_config
+            and isinstance(yaml_quant_config, dict)
+            and file_quant_config.get("quant_method", "").lower() in {"fp8", "mxfp8"}
+        ):
+            normalized_yaml = _normalize_qwen3_5_quantization_config(yaml_quant_config)
+            ignored_layers = normalized_yaml.get("ignored_layers")
+            if ignored_layers is not None:
+                quant_config["ignored_layers"] = ignored_layers
+
+        if quant_config is not None:
+            config_dict[quant_key] = quant_config
+
+        return config_dict, kwargs
 
     base_model_tp_plan = {
         "layers.*.self_attn.q_proj": "colwise",
