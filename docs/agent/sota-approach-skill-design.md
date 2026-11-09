@@ -1,6 +1,6 @@
 # 模型推理极致性能优化技能设计文档（model-infer-sota-approach）
 
-本文档描述 `model-infer-sota-approach` 这一**模型推理极致性能优化技能**的设计。Skill 体系的通用约定（目录结构、SKILL.md 规范、命名规范、Hook 机制、贡献流程等）见 [skill-design.md](skill-design.md)，本文档不重复，只聚焦本技能独有的编排架构、潜在优化项发现、Plan 自循环、分层状态管理与证据口径设计。
+本文档描述 `model-infer-sota-approach` 这一**模型推理极致性能优化技能**的设计。Skill 体系的通用约定（目录结构、SKILL.md 规范、命名规范、Hook 机制、贡献流程等）见 [.agents/README.md](../../.agents/README.md)，本文档不重复，只聚焦本技能独有的编排架构、潜在优化项发现、Plan 自循环、分层状态管理与证据口径设计。
 
 ## 1. 概述与定位
 
@@ -427,4 +427,4 @@ TF5. 汇总最终方案、淘汰原因与剩余风险
 - **scenario 操作细则**：[`references/scenario-setup.md`](../../.agents/skills/model-infer-sota-approach/references/scenario-setup.md)
 - **Plan Dashboard 模板**：[`references/plan-dashboard-template.md`](../../.agents/skills/model-infer-sota-approach/references/plan-dashboard-template.md)
 - **Plan 文件模板**：[`references/plan-file-template.md`](../../.agents/skills/model-infer-sota-approach/references/plan-file-template.md)
-- **Skill 体系通用设计（目录结构 / 命名 / Hook / 贡献等）**：[skill-design.md](skill-design.md)
+- **Skill 体系通用设计（目录结构 / 命名 / Hook / 贡献等）**：[.agents/README.md](../../.agents/README.md)
