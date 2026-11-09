@@ -78,13 +78,15 @@ hunyuan-image-3.0/
 使用`weight_convert.sh` 脚本完成权重转换:
 
 ```
-python convert_model.py \
-    --model-path ../ckpts/HunyuanImage-3.0 \   # 模型原始权重路径
-    --output-path ../ckpts/weight_ep8 \        # 模型权重输出路径
-    --tp-attn 8 \                              # attn TP 切分份数
-    --tp-moe 1 \                               # moe TP 切分份数
-    --ep 8 \                                   # EP 切分份数
-    --max-shard-size 5.0                       # 权重每块最大限制（G）
+# 从 cann-recipes-infer 仓库根目录执行。
+# 输入为原始权重，输出为 EP8 切分权重；Attention TP8、MoE TP1、EP8。
+python models/hunyuan-image-3.0/utils/convert_model.py \
+    --model-path models/hunyuan-image-3.0/ckpts/HunyuanImage-3.0 \
+    --output-path models/hunyuan-image-3.0/ckpts/weight_ep8 \
+    --tp-attn 8 \
+    --tp-moe 1 \
+    --ep 8 \
+    --max-shard-size 5.0
 ```
 模型的Attention部分目前仅支持TP切分，可以通过`tp-attn`参数来设置并行度。模型的MoE部分支持使用TP切分方案或EP切分方案，分别可以通过`tp-moe`和`ep`两个参数来设置所要切分权重的并行度。这几个并行度需要满足以下约束：
 - MoE部分的TP与EP只能选一，不能同时使能；
