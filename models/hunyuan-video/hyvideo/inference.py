@@ -1,5 +1,5 @@
 # coding=utf-8
-# Adapted from  
+# Adapted from
 # https://github.com/Tencent-Hunyuan/HunyuanVideo,
 # Copyright (c) Huawei Technologies Co., Ltd. 2025-2026.
 # Copyright (C) 2024 THL A29 Limited, a Tencent company. All rights reserved.
@@ -48,7 +48,7 @@ from hyvideo.diffusion.pipelines import HunyuanVideoPipeline
 from hyvideo.vae.vae_parallel import decode
 from module.unified_sp.core import UnifiedSPAttention
 from module.unified_sp.uaa import split_func, all_gather_anything
-from module.dit_cache.cache_method import cache_manager 
+from module.dit_cache.cache_method import cache_manager
 
 try:
     import xfuser
@@ -81,15 +81,15 @@ def parallelize_transformer(pipe):
         fa_mxfp8=pipe.args.fa_mxfp8
     )
 
-    # Set SP group for cache_manager to enable multi-card cache synchronization 
-    # For pure SP (ring_degree=1), use ulysses_group; otherwise use the combined SP group 
-    sp_world_size = get_sequence_parallel_world_size() 
-    sp_rank = get_sequence_parallel_rank() 
-    # Use ulysses_group for synchronization (covers pure Ulysses and hybrid cases) 
-    cache_manager.set_sp_group( 
-        sp_group=get_sp_group().ulysses_group, 
-        sp_world_size=sp_world_size, 
-        sp_rank=sp_rank 
+    # Set SP group for cache_manager to enable multi-card cache synchronization
+    # For pure SP (ring_degree=1), use ulysses_group; otherwise use the combined SP group
+    sp_world_size = get_sequence_parallel_world_size()
+    sp_rank = get_sequence_parallel_rank()
+    # Use ulysses_group for synchronization (covers pure Ulysses and hybrid cases)
+    cache_manager.set_sp_group(
+        sp_group=get_sp_group().ulysses_group,
+        sp_world_size=sp_world_size,
+        sp_rank=sp_rank
     )
 
     @functools.wraps(transformer.__class__.forward)
@@ -109,21 +109,32 @@ def parallelize_transformer(pipe):
         split_dim = -1
 
         # patch sizes for the temporal, height, and width dimensions are 1, 2, and 2.
-        temporal_size, h, w = x.shape[2], x.shape[3] // 2, x.shape[4] // 2
+        patch_size_hw = 2
+
+        if x.shape[split_dim] // patch_size_hw % get_sequence_parallel_world_size() != 0:
+            raise ValueError(
+                f"Cannot split video sequence into ulysses_degree x ring_degree "
+                f"({get_sequence_parallel_world_size()}) parts evenly. \n"
+                f"Please adjust the length of video size to be a multiple of "
+                f"{patch_size_hw * get_sequence_parallel_world_size()}, "
+                f"or use the parameter '--ulysses-anything'."
+            )
+
+        temporal_size, h, w = x.shape[2], x.shape[3] // patch_size_hw, x.shape[4] // patch_size_hw
 
         x = split_func(x, sp_size, dim=split_dim)[get_sequence_parallel_rank()]
 
         dim_thw = freqs_cos.shape[-1]
         freqs_cos = freqs_cos.reshape(temporal_size, h, w, dim_thw)
         freqs_cos = freqs_cos.tensor_split(sp_size, dim=split_dim - 1)[get_sequence_parallel_rank()]
-        
+
         freqs_cos = freqs_cos.reshape(1, -1, 1, dim_thw)
         dim_thw = freqs_sin.shape[-1]
         freqs_sin = freqs_sin.reshape(temporal_size, h, w, dim_thw)
         freqs_sin = freqs_sin.tensor_split(sp_size, dim=split_dim - 1)[get_sequence_parallel_rank()]
 
         freqs_sin = freqs_sin.reshape(1, -1, 1, dim_thw)
-        
+
         for block in transformer.double_blocks + transformer.single_blocks:
             block.hybrid_seq_parallel_attn = sp_attn.forward
 
@@ -143,14 +154,14 @@ def parallelize_transformer(pipe):
         sample = output["x"]
         if self.args.ulysses_anything:
             sample = all_gather_anything(
-                sample, 
-                dim=split_dim, 
-                world_size=sp_attn.ulysses_world_size, 
+                sample,
+                dim=split_dim,
+                world_size=sp_attn.ulysses_world_size,
                 group=sp_attn.ulysses_pg
             )
         else:
             sample = get_sp_group().all_gather(
-                sample, 
+                sample,
                 dim=split_dim
             )
         output["x"] = sample
@@ -158,7 +169,7 @@ def parallelize_transformer(pipe):
 
     new_forward = new_forward.__get__(transformer)
     transformer.forward = new_forward
-    
+
 
 class Inference(object):
     def __init__(
@@ -195,7 +206,7 @@ class Inference(object):
         )
         self.logger = logger
         self.parallel_args = parallel_args
-        
+
         if args.use_vae_parallel:
             self.vae.decode = types.MethodType(decode, self.vae)
 
@@ -213,7 +224,7 @@ class Inference(object):
         # ========================================================================
         if os.environ.get('LOCAL_RANK', 0) == "0":
             logger.info(f"Got text-to-video model root path: {pretrained_model_path}")
-        
+
         # ==================== Initialize Distributed Environment ================
         if args.ulysses_degree > 1 or args.ring_degree > 1:
             assert xfuser is not None, \
@@ -232,7 +243,7 @@ class Inference(object):
                 "number of NPUs should be equal to ring_degree * ulysses_degree."
 
             init_distributed_environment(rank=dist.get_rank(), world_size=dist.get_world_size())
-            
+
             initialize_model_parallel(
                 sequence_parallel_degree=dist.get_world_size(),
                 ring_degree=args.ring_degree,
@@ -244,8 +255,8 @@ class Inference(object):
                 device = "npu" if torch.cuda.is_available() else "cpu"
 
         parallel_args = {
-            "ulysses_degree": args.ulysses_degree, 
-            "ring_degree": args.ring_degree, 
+            "ulysses_degree": args.ulysses_degree,
+            "ring_degree": args.ring_degree,
             "ulysses_anything": args.ulysses_anything
         }
 
@@ -259,7 +270,7 @@ class Inference(object):
         use_quant = args.use_fp8 or args.mm_mxfp8 or args.fa_mxfp8
         device_name = torch.npu.get_device_name()
         not_950 = any(device_prefix in device_name for device_prefix in ["Ascend910B", "Ascend910_93"])
-        
+
         if use_quant and not_950:
             raise RuntimeError(
                 f"Only Atlas A5 supports FP8 and MXFP8. "
@@ -286,7 +297,7 @@ class Inference(object):
         model = Inference.load_state_dict(args, model, pretrained_model_path)
 
         if args.mm_mxfp8:
-            # Enable dynamic quantization converts the weights to mxfp8. 
+            # Enable dynamic quantization converts the weights to mxfp8.
             dynamic_convert_mxfp8_linear(model, original_dtype=PRECISION_TO_TYPE[args.precision])
 
         model.eval()
@@ -427,7 +438,7 @@ class Inference(object):
 
         if not model_path.exists():
             raise ValueError(f"model_path not exists: {model_path}")
-            
+
         if os.environ.get('LOCAL_RANK', 0) == "0":
             logger.info(f"Loading torch model {model_path}...")
         state_dict = torch.load(model_path, map_location=lambda storage, loc: storage)
@@ -736,7 +747,7 @@ class HunyuanVideoSampler(Inference):
                       n_tokens: {n_tokens}
                     flow_shift: {flow_shift}
        embedded_guidance_scale: {embedded_guidance_scale}"""
-       
+
         if os.environ.get('LOCAL_RANK', 0) == "0":
             logger.debug(debug_str)
 
