@@ -299,12 +299,12 @@ cd $REPO
 NPU_DEVICE_ID=<空闲卡> PORT=8020 \
   KT_GGUF_TEMPLATE="$GGUF_CACHE/dsv4_layer{layer_idx}_mxfp4.gguf" \
   MODEL_PATH="$W8A8_DIR" \
-  CHUNKED_PREFILL_SIZE=32768 \
+  CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-32768}" \
   bash tools/launch_ds4flash_npu.sh 2>&1 | tee /tmp/kt_serve.log
 ```
 
 - ⚠️ **`CHUNKED_PREFILL_SIZE` 当前必须不小于最长 prompt 的 token 数**：NSA compressor 当前不支持跨 chunk 的
-  prefill，prompt 超过该值时会在跨 chunk 处失败。脚本默认 8192，上面显式设为 32768 以覆盖 §7.1 吞吐测试
+  prefill，prompt 超过该值时会在跨 chunk 处失败。脚本默认 8192，上例在未设置该变量时使用 32768，以覆盖 §8.1.1 吞吐测试
   的最长档（32k）；若要处理更长的 prompt，需同步调高（`context-length` 上限 65536，prompt + 输出合计）。
   该值须为 page-size(128) 的整数倍。调高不是免费的：单块 prefill 的激活占用随之增长（64k 单块峰值
   约 20 GB），因此脚本默认值保持在 8192，按实际 prompt 长度按需调高即可。
@@ -318,7 +318,7 @@ NPU_DEVICE_ID=<空闲卡> PORT=8020 \
 
 ### 7.1 功能开关
 
-启动脚本已按最优配置设置默认值，通常无需调整。
+默认不开启 MTP；需要时按 §7.2 配置。
 
 | 环境变量 | 默认 | 说明 |
 |---|---|---|
@@ -329,7 +329,36 @@ NPU_DEVICE_ID=<空闲卡> PORT=8020 \
 | `KT_PREFILL_STREAM` | 1 | 长 prefill 流式加载专家到 NPU |
 | `KT_PREFILL_STREAM_THRESHOLD` | 512 | 触发流式的 token 数阈值 |
 | `KT_SIDE_STREAM` / `KT_SHARED_EXPERTS_STREAM` | 1 | CPU MoE 与 NPU 计算重叠 |
+| `SGLANG_ENABLE_SPEC_V2` | False | 选择 SGLang 的 V2 投机执行路径；本身不启用 MTP，还需 §7.2 的 `--speculative-*` 参数 |
 | `KT_NSA_COMPRESSOR_MODE` | 由 CANN 版本派生 | `single`（CANN 9.0.0+，公开 18 参算子）/ `split`（CANN 8.5.0，私有 19 参算子）。启动脚本按已安装的 CANN 版本自动设置；显式设置则以显式值为准。设错会导致 NSA compressor 调用失败 |
+
+### 7.2 可选：MTP 投机解码
+
+MTP 使用同一份 W8A8 检查点中的 `mtp.0.*` 权重（`num_nextn_predict_layers=1`），无需另下模型。
+target 的 43 层继续使用 KT 混合计算，MTP 层在 NPU 上计算。按以下方式启动：
+新增路径已在 A3、CANN 9.1、Torch/Torch-NPU 2.8、单请求图模式下验证。
+
+```bash
+export MODEL_PATH="$W8A8_DIR"
+export CHUNKED_PREFILL_SIZE=8192
+export SGLANG_ENABLE_SPEC_V2=True
+export EXTRA_FLAGS="--context-length 16384 \
+--max-prefill-tokens 16383 --max-total-tokens 32768 \
+--max-running-requests 1 --cuda-graph-bs 1 \
+--speculative-algorithm EAGLE \
+--speculative-draft-model-path ${MODEL_PATH} \
+--speculative-num-steps 3 \
+--speculative-eagle-topk 1 \
+--speculative-num-draft-tokens 4"
+
+export KT_NUM_GPU_EXPERTS=16
+# 随后执行 §7 的启动命令
+```
+
+MTP 增加 NPU 占用，上例使用已验证的 16 常驻配置；同配置改为 32 常驻时，MTP 权重 NZ 布局转换的临时分配触发 OOM。
+上例一次验证 4 行；较短配置将 steps / draft-tokens 改为 1 / 2，一次验证 2 行。
+验证行数不再加 1；专家 **K=6** 与投机分支宽度 `eagle-topk=1` 不同。
+移除五个 `--speculative-*` 参数并取消 `SGLANG_ENABLE_SPEC_V2` 后，重启即可关闭 MTP。
 
 ## 8. 验收
 
@@ -358,6 +387,8 @@ grep KT_DECODE_TIMING /tmp/kt_serve.log    # cpu_moe_wall，A3 生产配置、�
 ```
 
 ### 8.1 性能复现
+
+#### 8.1.1 无 MTP 默认配置
 
 ```bash
 PORT=8020 bash tools/decode_throughput_test.sh
@@ -399,6 +430,27 @@ CPU MoE wall/token 约 18.3 ms（A3 生产配置、resident 命中率 H≈26%、
 
 > 使用 `--max-running-requests 1`，不要并发发送请求。
 > 停止服务用 `Ctrl-C`（SIGTERM 会正常释放 HBM），不要使用 `pkill -f sglang.launch_server`。
+
+#### 8.1.2 MTP 性能参考
+
+A3、CANN 9.1、图模式、TP=1；CPU 128 线程 / 8 池（参考环境 NUMA 映射 `0,0,0,1,1,2,3,3`），每层 16 个 NPU 常驻专家，专家 **K=6**。
+相同 128 条 GSM8K 输入，并发 1，预热 8 条，固定输出 256 token，`temperature=0`、`ignore_eos=true`。
+输入 51–166 token（平均 84.867）；上下文 16384、`max-total-tokens=32768`、
+`chunked-prefill-size=8192`，随机种子 215102194。按 §7.2 切换投机参数，其余条件保持一致。
+
+| MTP 配置 | 平均 TPOT，ms | 平均 TTFT，ms | 全程输出吞吐，tok/s | 平均接受长度 |
+|---|---:|---:|---:|---:|
+| 关闭 | 41.113 | 736.350 | 22.802 | — |
+| B：1 step / 2 行 | 22.687 | 740.859 | 39.226 | 1.774 |
+| D：3 step / 4 行 | 34.544 | 773.056 | 26.705 | 2.221 |
+
+TPOT 为每请求首末文本增长间隔 /（输出 token 数 − 1）的均值；TTFT 为请求至首次文本增长时间的均值。
+全程吞吐包含 prefill；接受长度为每请求 `completion_tokens / spec_verify_ct` 的均值。
+
+数据来自 2026-10-27 的参考实现（KT `e2cc4dc`、llama.cpp `5a8ebd6`、SGLang `d5c201d`），
+已包含 CPU 优化，未启用专家裁剪。当前补丁另在 NUMA `0..7`、相同 16 条输入的 MTP 4 行配对中完成图重放及端到端验证：同分组阈值 2 下，内核优化前后 TPOT 为 35.291 / 31.544 ms，TTFT 为 771.960 / 642.939 ms，全程输出吞吐为 26.199 / 29.469 tok/s；每条输出及接受计数一致。
+该小样本对照不替代上表 128 条参考数据，也未覆盖旧默认分组阈值 10；与 §8.1.1 的环境不同，GSM8K 仅用作性能负载。
+固定问题测试脚本不能精确复现本表；需使用相同输入及计时口径。TTFT 变化尚未做独立归因。
 
 ### 8.2 精度评测（GPQA-Diamond）
 
@@ -498,25 +550,35 @@ evalscope eval --model "$MODEL_PATH" --api-url http://127.0.0.1:8020/v1 --api-ke
 ```
 main_repo/   → ktransformers @ d7b5b49
   0001-kt-kernel-ascend-npu-backend.patch          NPU 后端 + ACL callback worker + 构建系统
-  0002-kt-kernel-cpu-moe-mxfp4-kernel.patch        CPU MoE 原生 MXFP4 GEMV kernel + GGUF loader
+  0002-kt-kernel-cpu-moe-mxfp4-kernel.patch        CPU MoE MXFP4 kernel + GGUF loader + 多 token 计算优化
 sglang/      → sglang @ 298193eb3
-  0001-sglang-npu-kv-triton-fallback.patch         triton×ascend KV/MoE 回退 torch 等价路径
-  0002-sglang-kt-ep-cpu-moe-offload.patch          KT EP wrapper（CPU MoE offload）+ 专家放置
+  0001-sglang-npu-kv-triton-fallback.patch         triton×ascend 回退 + MTP 位置元数据 + KT 层级开关
+  0002-sglang-kt-ep-cpu-moe-offload.patch          KT EP wrapper + 专家放置 + DSv4 target/MTP 隔离
   0003-sglang-streaming-prefill-depool.patch       流式 prefill + depool + 动态常驻 + GGUF dedup
   0004-sglang-nsa-compressor-and-mem-pools.patch   NSA compressor 模式 + NPU 内存池
   0005-sglang-packaging.patch                      Ascend/NPU 打包配置
 llama_cpp/   → llama.cpp @ a94e6ff
   0001-fix-gguf-NumPy-2-GGUFReader.patch           gguf-py NumPy 2.0 兼容
-  0002-add-ggml-type-mxfp4.patch                   注册 GGML_TYPE_MXFP4=39 + NEON kernel
+  0002-add-ggml-type-mxfp4.patch                   注册 GGML_TYPE_MXFP4=39 + NEON kernel + 多激活点积
 ```
 
-等价的手动操作：
+CPU 优化让最多 4 条同专家激活共享 MXFP4 权重块的加载和解码，单条沿用原内核。
+仅当扩展编译为 ARM/no-SVE、三个投影均为 MXFP4 且复用开启时，默认分组阈值从 10 降为 2；
+x86 等其他构建保持原默认值 10。这影响 CPU 输入为 2–9 行的调用，包括 MTP、多请求合批和短 prefill，
+不是专家 Top-K 或内核的 4 行 tile 上限。目前没有 x86 机器，未做 x86 实机性能验证。
+
+`KT_GROUP_MIN_LEN` 显式设置始终优先，包括复用关闭时。
+完整回退需设置 `KT_MOE_MXFP4_TOKEN_REUSE=0` 并取消 `KT_GROUP_MIN_LEN`，重启后使用原内核及默认阈值 10。
+
+等价的手动操作（在 §0 的干净基线上按编号应用，不对已有补丁重复 apply）：
 
 ```bash
 cd $REPO                        && for p in <release_dir>/main_repo/*.patch;  do git apply "$p"; done
 cd $REPO/third_party/sglang     && for p in <release_dir>/sglang/*.patch;     do git apply "$p"; done
 cd $REPO/third_party/llama.cpp  && for p in <release_dir>/llama_cpp/*.patch;  do git apply -p1 "$p"; done
 ```
+
+应用后按 §4 重建 kt-kernel 并重启服务。CPU 优化默认生效，MTP 按 §7.2 开启。
 
 ---
 

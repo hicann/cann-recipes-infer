@@ -27,9 +27,9 @@ DeepSeek-V4-Flash 为 43 层全 MoE 模型（`first_k_dense_replace=0`），每�
 
 ### 模型与硬件
 
-模型其余规格：`hidden_size=4096`、`moe_intermediate_size=2048`、`head_dim=512`、`num_attention_heads=64`、`num_key_value_heads=1`；attention 为 MLA + NSA + Lightning Indexer（`index_topk=512`）。MTP（`num_nextn_predict_layers=1`）本项目未使能。
+模型其余规格：`hidden_size=4096`、`moe_intermediate_size=2048`、`head_dim=512`、`num_attention_heads=64`、`num_key_value_heads=1`；attention 为 MLA + NSA + Lightning Indexer（`index_topk=512`）。默认不启用 MTP；可选使用同一 W8A8 检查点内的 MTP 模块（`num_nextn_predict_layers=1`），开启方法见使用指南 §7.2。
 
-本项目在两套环境上均已验证可运行：
+默认无 MTP 的部署方案在两套环境上均已验证可运行：
 
 | | 环境一：A3 CANN Lab lite-infer-and-train 镜像 | 环境二：910B + K920 裸机 |
 |---|---|---|
@@ -113,6 +113,7 @@ MXFP4 是官方发布的量化（训练侧已对齐），转 GGUF 全程 bit 级
 - graph decode 提速：kt-cpuinfer 24→128 + GEMV 行内预取（`main_repo/0002`）
 - CPU MoE 直接读取原生 MXFP4（无损 repack、不重新量化），叠加 kernel 行内预取 2.4×（`main_repo/0002` + `llama_cpp/0002`）
 - triton×ascend 自动回退 torch 等价实现（KV / MoE，无需 env）（`sglang/0001`）
+- 可选 MTP：通过 SGLang EAGLE 入口加载 W8A8 检查点内的 `mtp.0.*`，MTP 专家保留 NPU 计算，只有 target 的 43 层使用 KT GGUF（`sglang/0001` + `0002`）；默认仍关闭 MTP。
 
 **device-offload 主线（默认开启）**
 
@@ -140,6 +141,9 @@ A3，graph 模式、单请求、预热后的稳态 decode（inter-token 中位�
 prefill（预热后）：130/1k/8k/16k/32k = 15.4 / 15.6 / 16.5 / 17.6 / 20.3 s。流式 prefill 有约 15 s 固定开销（每次请求都需将全套专家权重从 DDR 搬到 HBM），几乎不随长度增长；页缓存未热时 32k 可达约 63 s。
 
 `cpu_moe_wall` 约 18.3 ms/token（A3 生产配置、H≈26%）。复现方法见使用指南 §8.1。
+
+上述为无 MTP 的历史默认配置。普通解码、MTP 2 行 / 4 行的性能参考见使用指南 §8.1.2；
+其 CPU/NUMA、常驻专家数和 CANN 版本不同，不与本节数据混算。
 
 ### 精度
 
@@ -195,6 +199,9 @@ side-stream 相对串行模式的净收益实测约 9.4 ms/token，由两部分�
 
 流式 prefill 仍有约 15 s 固定开销，来自每次请求都需将全套专家权重从 DDR 搬到 HBM，与 prompt 长度基本无关，是长 prompt TTFT 的主要构成。
 
+新增可选 MTP 适配：target 一次验证多个位置，预测层保留检查点权重和 NPU 计算。
+开启方法见使用指南 §7.2；CPU 内核改动见该指南附录 B。当前补丁已在 A3、CANN 9.1、16 常驻专家、单请求 MTP 4 行图模式下完成小样本验证，其他组合仍需回归。
+
 ### 后续方向
 
 按上节模型，H 从当前 26% 提高到 50–60% 对应 +13~20%（22–24 tok/s），H≈80% 的理论上限对应 +37%（约 27 tok/s）。后续方向分为提高命中率与扩展模型/特性两类：
@@ -202,7 +209,7 @@ side-stream 相对串行模式的净收益实测约 9.4 ms/token，由两部分�
 - **改进热专家常驻策略**：当前动态常驻的 H 约为 26–31%。通过跨请求频率统计、按层差异化、hot-tail 采样等策略使 H 达到 50–60%，是 decode 收益最直接的来源。
 - **专家预测 + H2D 预取**：提前一个 token 或一层预测将命中的 expert，利用当前计算时间异步预取权重，使搬运与计算重叠。
 - **加大 `KT_NUM_GPU_EXPERTS`**：上调常驻专家数可直接提高 H，达到 80% 上限主要依赖该项；代价是 HBM 占用（32→48 约增加十几 GB），受静态权重 48.3 GB、剩余约 8.8 GB 的约束，需与 KV/context 一起权衡。
-- **MTP（多 token 预测）**：模型自带 `num_nextn_predict_layers=1`，本项目未使能。使能后可在 decode 侧摊薄单 token 成本。
+- **MTP 参数调优与部署回归**：基础适配已加入可选路径，继续核查图重放、内存占用、接受率及不同验证长度下的性能。
 - **推广到同类模型**：把这套单卡 CPU-offload 方案用于 dspark / dflash 等模型，复用 MXFP4 CPU MoE + 热专家常驻 + 流式 prefill 的整条链路。
 
 当命中率使 CPU MoE 完全被重叠覆盖后，decode 转为 NPU-bound，继续提速需改动 NPU 侧的 attention / NSA / resident GEMM，属本项目当前范围之外。

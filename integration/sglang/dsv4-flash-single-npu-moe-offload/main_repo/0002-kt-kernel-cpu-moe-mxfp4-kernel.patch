@@ -1,8 +1,8 @@
 diff --git a/kt-kernel/operators/llamafile/moe.hpp b/kt-kernel/operators/llamafile/moe.hpp
-index 3a0d761..71ff03d 100644
+index 3a0d761..1bd630a 100644
 --- a/kt-kernel/operators/llamafile/moe.hpp
 +++ b/kt-kernel/operators/llamafile/moe.hpp
-@@ -5,6 +5,8 @@
+@@ -5,12 +5,16 @@
  #endif
  #include <numa.h>
  #include <numaif.h>
@@ -11,7 +11,15 @@ index 3a0d761..71ff03d 100644
  
  #include <algorithm>
  #include <cassert>
-@@ -21,6 +23,29 @@
+ #include <cmath>
+ #include <cstdint>
+ #include <cstdio>
++#include <cstdlib>
++#include <cstring>
+ #include <functional>
+ #include <vector>
+ 
+@@ -21,6 +25,29 @@
  #include "llama.cpp/ggml-quants.h"
  #include "llama.cpp/ggml.h"
  #include "llamafile/sgemm.h"
@@ -41,7 +49,7 @@ index 3a0d761..71ff03d 100644
  
  inline void debug_quant(void* input, ggml_type type) {
    std::vector<float> output(ggml_blck_size(type));
-@@ -31,6 +56,156 @@ inline void debug_quant(void* input, ggml_type type) {
+@@ -31,6 +58,204 @@ inline void debug_quant(void* input, ggml_type type) {
    printf("\n");
  }
  
@@ -74,6 +82,26 @@ index 3a0d761..71ff03d 100644
 +  }
 +#endif
 +  return ggml_internal_get_type_traits(weight_type).vec_dot_type;
++}
++
++static constexpr bool kt_mxfp4_token_reuse_supported() {
++#if defined(__aarch64__) && !defined(__ARM_FEATURE_SVE)
++  return true;
++#else
++  return false;
++#endif
++}
++
++static inline bool kt_mxfp4_token_reuse_on() {
++  static const bool on = [] {
++    const char* value = std::getenv("KT_MOE_MXFP4_TOKEN_REUSE");
++    if (value == nullptr || std::strcmp(value, "1") == 0) return true;
++    if (std::strcmp(value, "0") == 0) return false;
++    // Direct C++ callers may bypass Python validation. Do not throw in a worker.
++    std::fprintf(stderr, "KT_MOE_MXFP4_TOKEN_REUSE must be 0 or 1; using the original kernel\n");
++    return false;
++  }();
++  return on;
 +}
 +
 +// Kunpeng 920 (aarch64, dotprod, no SVE/i8mm): iqk_mul_mat and tinyBLAS_Q0_ARM both
@@ -163,20 +191,48 @@ index 3a0d761..71ff03d 100644
 +    // min identical): the in-row +512B prefetch inside ggml_vec_dot_mxfp4_q8_0
 +    // already streams across contiguous short rows (down rows are 136B), so the
 +    // short-row penalty it targeted is gone. Reverted to keep the kernel simple.
-+    for (long j = 0; j < n; ++j) {
-+      const auto* b_col = b + ldb * j;
++    if (kt_mxfp4_token_reuse_on() && n >= 2) {
++      // One weight row serves up to four activations per tile. Keep each
++      // activation's accumulation chain and the original output stride.
 +      for (long i = 0; i < m; ++i) {
 +        if (i + 1 < m) {
 +          const char* nxt = reinterpret_cast<const char*>(a + lda * (i + 1));
 +          __builtin_prefetch(nxt, 0, 1);
 +          __builtin_prefetch(nxt + 64, 0, 1);
 +        }
-+        float sum = 0.f;
-+        ggml_vec_dot_mxfp4_q8_0(ne, &sum, 0, a + lda * i, bx, b_col, by, 1);
-+        if (!std::isfinite(sum)) {
-+          sum = 0.f;  // defensive; should not happen with valid weights/activations
++        for (long j = 0; j < n;) {
++          const int tile = static_cast<int>(std::min<long>(4, n - j));
++          const auto* b_col = b + ldb * j;
++          if (tile == 1) {
++            float sum = 0.f;
++            ggml_vec_dot_mxfp4_q8_0(ne, &sum, 0, a + lda * i, bx, b_col, by, 1);
++            if (!std::isfinite(sum)) sum = 0.f;
++            c[ldc * j + i] = sum;
++          } else {
++            float sums[4] = {0.f, 0.f, 0.f, 0.f};
++            ggml_vec_dot_mxfp4_q8_0_many(ne, sums, 0, a + lda * i, bx, b_col, by, tile);
++            for (int r = 0; r < tile; ++r) {
++              if (!std::isfinite(sums[r])) sums[r] = 0.f;
++              c[ldc * (j + r) + i] = sums[r];
++            }
++          }
++          j += tile;
 +        }
-+        c[ldc * j + i] = sum;
++      }
++    } else {
++      for (long j = 0; j < n; ++j) {
++        const auto* b_col = b + ldb * j;
++        for (long i = 0; i < m; ++i) {
++          if (i + 1 < m) {
++            const char* nxt = reinterpret_cast<const char*>(a + lda * (i + 1));
++            __builtin_prefetch(nxt, 0, 1);
++            __builtin_prefetch(nxt + 64, 0, 1);
++          }
++          float sum = 0.f;
++          ggml_vec_dot_mxfp4_q8_0(ne, &sum, 0, a + lda * i, bx, b_col, by, 1);
++          if (!std::isfinite(sum)) sum = 0.f;
++          c[ldc * j + i] = sum;
++        }
 +      }
 +    }
 +    (void)task;
@@ -198,7 +254,7 @@ index 3a0d761..71ff03d 100644
  class LLAMA_MOE_TP {
   private:
    GeneralMOEConfig config_;
-@@ -39,6 +214,10 @@ class LLAMA_MOE_TP {
+@@ -39,6 +264,10 @@ class LLAMA_MOE_TP {
    uint8_t* m_local_gate_proj_;  // [expert_num * intermediate_size * hidden_size ( /32 if quantized)]
    uint8_t* m_local_up_proj_;    // [expert_num * intermediate_size * hidden_size ( /32 if quantized)]
    uint8_t* m_local_down_proj_;  // [expert_num * hidden_size * intermediate_size ( /32 if quantized)]
@@ -209,7 +265,7 @@ index 3a0d761..71ff03d 100644
  
    float* s_input_fp32_;    // [hidden_size]
    uint8_t* s_gate_input_;  // [hidden_size * ggml_type_size(ggml_internal_get_type_traits(gate_type).vec_dot_type) /
-@@ -94,13 +273,11 @@ class LLAMA_MOE_TP {
+@@ -94,13 +323,11 @@ class LLAMA_MOE_TP {
      MemoryRequest mem_requests;
      mem_requests.append_pointer(&s_input_fp32_, sizeof(float) * config_.hidden_size);
      mem_requests.append_pointer(
@@ -227,7 +283,7 @@ index 3a0d761..71ff03d 100644
      s_gate_output_.resize(config_.num_experts_per_tok);
      s_up_output_.resize(config_.num_experts_per_tok);
      s_intermediate_fp32_.resize(config_.num_experts_per_tok);
-@@ -110,11 +287,10 @@ class LLAMA_MOE_TP {
+@@ -110,11 +337,10 @@ class LLAMA_MOE_TP {
        mem_requests.append_pointer(&s_gate_output_[i], sizeof(float) * config_.intermediate_size);
        mem_requests.append_pointer(&s_up_output_[i], sizeof(float) * config_.intermediate_size);
        mem_requests.append_pointer(&s_intermediate_fp32_[i], sizeof(float) * config_.intermediate_size);
@@ -243,7 +299,7 @@ index 3a0d761..71ff03d 100644
        mem_requests.append_pointer(&s_down_output_[i], sizeof(float) * config_.hidden_size);
      }
      mem_requests.append_pointer(&s_output_fp32_, sizeof(float) * config_.hidden_size);
-@@ -126,36 +302,32 @@ class LLAMA_MOE_TP {
+@@ -126,36 +352,32 @@ class LLAMA_MOE_TP {
      m_up_input_.resize(config_.group_max_len);
      for (int i = 0; i < config_.group_max_len; i++) {
        mem_requests.append_pointer(&m_input_fp32_[i], sizeof(float) * config_.hidden_size);
@@ -298,7 +354,7 @@ index 3a0d761..71ff03d 100644
      mem_requests.append_pointer(&m_local_down_output_, sizeof(float) * config_.num_experts_per_tok *
                                                             config_.group_max_len * config_.hidden_size);
      m_output_fp32_.resize(config_.group_max_len);
-@@ -190,9 +362,6 @@ class LLAMA_MOE_TP {
+@@ -190,9 +412,6 @@ class LLAMA_MOE_TP {
    }
  
    void load_weights(int complete_intermediate_size, int offset) {
@@ -308,7 +364,7 @@ index 3a0d761..71ff03d 100644
      auto& config = config_;
      // printf("gate load weights:");
      // debug_quant(config.gate_proj, (ggml_type)config.gate_type);
-@@ -221,31 +390,92 @@ class LLAMA_MOE_TP {
+@@ -221,31 +440,92 @@ class LLAMA_MOE_TP {
      uint8_t* down_proj = (uint8_t*)config.down_proj + offset * ggml_type_size((ggml_type)config.down_type) /
                                                            ggml_blck_size((ggml_type)config.down_type);
  
@@ -424,7 +480,7 @@ index 3a0d761..71ff03d 100644
    }
  
    void warm_up() {
-@@ -271,30 +501,32 @@ class LLAMA_MOE_TP {
+@@ -271,30 +551,32 @@ class LLAMA_MOE_TP {
  #ifdef FORWARD_TIME_PROFILE
      auto t0 = std::chrono::high_resolution_clock::now();
  #endif
@@ -467,7 +523,7 @@ index 3a0d761..71ff03d 100644
            up_input_ptr = s_up_input_;
          } else {
            up_input_ptr = input;
-@@ -305,16 +537,18 @@ class LLAMA_MOE_TP {
+@@ -305,16 +587,18 @@ class LLAMA_MOE_TP {
  #ifdef FORWARD_TIME_PROFILE
      // printf("gate_input: ");
      // debug_quant(const_cast<void *>(gate_input_ptr),
@@ -488,7 +544,7 @@ index 3a0d761..71ff03d 100644
      int activated_expert = 0;
      for (int i = 0; i < k; i++) {
        if (config_.should_skip_expert(expert_ids[i])) {
-@@ -323,7 +557,6 @@ class LLAMA_MOE_TP {
+@@ -323,7 +607,6 @@ class LLAMA_MOE_TP {
        m_expert_id_map_[activated_expert] = expert_ids[i];
        activated_expert++;
      }
@@ -496,7 +552,7 @@ index 3a0d761..71ff03d 100644
      int nth = config_.intermediate_size / config_.m_block;
  
      // Only process activated (CPU) experts; skip GPU experts entirely to keep buffers aligned.
-@@ -344,13 +577,12 @@ class LLAMA_MOE_TP {
+@@ -344,13 +627,12 @@ class LLAMA_MOE_TP {
                                                     ggml_blck_size((ggml_type)config_.gate_type);
  
              float* gate_output_ptr = s_gate_output_[act_idx] + ith * config_.m_block;
@@ -512,7 +568,7 @@ index 3a0d761..71ff03d 100644
              if (ok == false) [[unlikely]] {
                throw std::runtime_error("llamafile not supported");
              }
-@@ -361,37 +593,32 @@ class LLAMA_MOE_TP {
+@@ -361,37 +643,32 @@ class LLAMA_MOE_TP {
                                                   ggml_blck_size((ggml_type)config_.up_type);
  
              float* up_output_ptr = s_up_output_[act_idx] + ith * config_.m_block;
@@ -562,7 +618,7 @@ index 3a0d761..71ff03d 100644
        }
      }
  
-@@ -402,6 +629,7 @@ class LLAMA_MOE_TP {
+@@ -402,6 +679,7 @@ class LLAMA_MOE_TP {
      fmt::print("numa_node: {}, gate/up time: {}\n", tp_part_idx,
                 std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t1).count());
  #endif
@@ -570,7 +626,7 @@ index 3a0d761..71ff03d 100644
  
      nth = config_.hidden_size / config_.m_block;
      pool->do_work_stealing_job(
-@@ -424,13 +652,12 @@ class LLAMA_MOE_TP {
+@@ -424,13 +702,12 @@ class LLAMA_MOE_TP {
                                                                       ggml_blck_size((ggml_type)config_.down_type);
  
              float* down_output_ptr = s_down_output_[expert_idx] + ith * config_.m_block;
@@ -586,7 +642,7 @@ index 3a0d761..71ff03d 100644
  
              float expert_weight = 0.0f;
              for (int j = 0; j < k; j++) {
-@@ -454,6 +681,22 @@ class LLAMA_MOE_TP {
+@@ -454,6 +731,22 @@ class LLAMA_MOE_TP {
      fmt::print("numa_node: {}, total time: {}\n", tp_part_idx,
                 std::chrono::duration_cast<std::chrono::nanoseconds>(t3 - t0).count());
  #endif
@@ -609,7 +665,7 @@ index 3a0d761..71ff03d 100644
    }
  
    void forward_many(int qlen, int k, const int64_t* expert_ids, const float* weights, const void* input,
-@@ -462,10 +705,10 @@ class LLAMA_MOE_TP {
+@@ -462,10 +755,10 @@ class LLAMA_MOE_TP {
  #ifdef FORWARD_TIME_PROFILE
      auto start_time = std::chrono::high_resolution_clock::now();
      auto last = start_time;
@@ -622,7 +678,7 @@ index 3a0d761..71ff03d 100644
  #endif
  
      int activated_expert = 0;
-@@ -483,23 +726,20 @@ class LLAMA_MOE_TP {
+@@ -483,23 +776,20 @@ class LLAMA_MOE_TP {
      uint64_t offset = 0;
      for (int i = 0; i < config_.expert_num; i++) {
        m_local_gate_input_ptr_[i] =
@@ -655,7 +711,7 @@ index 3a0d761..71ff03d 100644
        m_local_down_output_ptr_[i] = m_local_down_output_ + offset * config_.hidden_size;
        offset += m_local_num_[i];
        if (m_local_num_[i] > 0) {
-@@ -524,10 +764,8 @@ class LLAMA_MOE_TP {
+@@ -524,10 +814,8 @@ class LLAMA_MOE_TP {
          [&](int i) {
            const void* gate_input_ptr;
            const void* up_input_ptr;
@@ -668,7 +724,7 @@ index 3a0d761..71ff03d 100644
              gate_input_ptr = up_input_ptr = (uint8_t*)input + i * config_.hidden_size *
                                                                    ggml_type_size((ggml_type)config_.hidden_type) /
                                                                    ggml_blck_size((ggml_type)config_.hidden_type);
-@@ -535,26 +773,24 @@ class LLAMA_MOE_TP {
+@@ -535,26 +823,24 @@ class LLAMA_MOE_TP {
              to_float((uint8_t*)input + i * config_.hidden_size * ggml_type_size((ggml_type)config_.hidden_type) /
                                             ggml_blck_size((ggml_type)config_.hidden_type),
                       m_input_fp32_[i], config_.hidden_size, (ggml_type)config_.hidden_type);
@@ -702,7 +758,7 @@ index 3a0d761..71ff03d 100644
                  up_input_ptr = m_up_input_[i];
                } else {
                  up_input_ptr = (uint8_t*)input + i * config_.hidden_size *
-@@ -569,20 +805,18 @@ class LLAMA_MOE_TP {
+@@ -569,20 +855,18 @@ class LLAMA_MOE_TP {
              }
              memcpy(m_local_gate_input_ptr_[expert_ids[i * k + j]] +
                         m_local_pos_[i][j] * config_.hidden_size *
@@ -731,7 +787,7 @@ index 3a0d761..71ff03d 100644
            }
          },
          nullptr);
-@@ -618,13 +852,12 @@ class LLAMA_MOE_TP {
+@@ -618,13 +902,12 @@ class LLAMA_MOE_TP {
            //   printf("matrix size: m:%d, n:%d, k:%d\n", m_block, m_local_num_[expert_idx],
            //          config_.hidden_size / ggml_blck_size((ggml_type)config_.gate_type));
            // }
@@ -751,7 +807,7 @@ index 3a0d761..71ff03d 100644
            void* up_input_ptr = m_local_up_input_ptr_[expert_idx];
  
            void* up_proj_ptr = (uint8_t*)m_local_up_proj_ + (expert_idx * config_.intermediate_size + ith * m_block) *
-@@ -633,12 +866,12 @@ class LLAMA_MOE_TP {
+@@ -633,12 +916,12 @@ class LLAMA_MOE_TP {
                                                                 ggml_blck_size((ggml_type)config_.up_type);
  
            float* up_output_ptr = m_local_up_output_ptr_[expert_idx] + ith * m_block;
@@ -770,7 +826,7 @@ index 3a0d761..71ff03d 100644
            for (int i = 0; i < m_local_num_[expert_idx]; i++) {
              for (int j = ith * m_block; j < (ith + 1) * m_block; j++) {
                m_local_intermediate_fp32_ptr_[expert_idx][i * config_.intermediate_size + j] =
-@@ -647,16 +880,15 @@ class LLAMA_MOE_TP {
+@@ -647,16 +930,15 @@ class LLAMA_MOE_TP {
              }
              float* intermediate_fp32_ptr =
                  m_local_intermediate_fp32_ptr_[expert_idx] + i * config_.intermediate_size + ith * m_block;
@@ -795,7 +851,7 @@ index 3a0d761..71ff03d 100644
            }
          },
          nullptr);
-@@ -686,13 +918,12 @@ class LLAMA_MOE_TP {
+@@ -686,13 +968,12 @@ class LLAMA_MOE_TP {
                                                                     ggml_blck_size((ggml_type)config_.down_type);
  
            float* down_output_ptr = m_local_down_output_ptr_[expert_idx] + ith * m_block;
@@ -815,7 +871,7 @@ index 3a0d761..71ff03d 100644
          },
          nullptr);
  
-@@ -733,7 +964,7 @@ class LLAMA_MOE_TP {
+@@ -733,7 +1014,7 @@ class LLAMA_MOE_TP {
      }
      auto end_time = std::chrono::high_resolution_clock::now();
      auto forward_total_time = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
@@ -824,7 +880,7 @@ index 3a0d761..71ff03d 100644
      printf(
          "Profiling Results (numa[%d]): activated_expert: %d, prepare: %ld us, cpy_input: %ld us, q_input: %ld us, "
          "up_gate: %ld us, act: %ld us, q_down: %ld us, down: %ld us, weight: %ld us, total: %ld us, max_local_num: "
-@@ -788,31 +1019,58 @@ class TP_MOE<LLAMA_MOE_TP> : public TP_MOE_Common<LLAMA_MOE_TP> {
+@@ -788,31 +1069,58 @@ class TP_MOE<LLAMA_MOE_TP> : public TP_MOE_Common<LLAMA_MOE_TP> {
  
    void merge_results(int qlen, void* output, bool incremental) {
      auto pool = this->config.pool;
@@ -1562,10 +1618,10 @@ index d8fb657..bd13949 100644
 diff --git a/kt-kernel/python/utils/llamafile.py b/kt-kernel/python/utils/llamafile.py
 old mode 100644
 new mode 100755
-index 0f1c440..3ca3f5a
+index 0f1c440..5180225
 --- a/kt-kernel/python/utils/llamafile.py
 +++ b/kt-kernel/python/utils/llamafile.py
-@@ -1,6 +1,9 @@
+@@ -1,10 +1,14 @@
 -import torch
 -from typing import List, Optional
 +from __future__ import annotations
@@ -1574,10 +1630,16 @@ index 0f1c440..3ca3f5a
 +from typing import Dict, List, Optional
 +
 +import torch
++from kt_kernel import kt_kernel_ext
  
  # Use relative imports for package structure
  from ..experts_base import BaseMoEWrapper
-@@ -22,9 +25,13 @@ class LlamafileMoEWrapper(BaseMoEWrapper):
+-from .loader import GGUFLoader
++from .loader import GGMLQuantizationType, GGUFLoader
+ from kt_kernel_ext.moe import MOEConfig
+ 
+ try:
+@@ -22,9 +26,13 @@ class LlamafileMoEWrapper(BaseMoEWrapper):
      """
      Llamafile-based MoE wrapper implementation.
      Supports GGUF quantized weights with llamafile backend.
@@ -1592,7 +1654,13 @@ index 0f1c440..3ca3f5a
  
      def __init__(
          self,
-@@ -73,10 +80,10 @@ class LlamafileMoEWrapper(BaseMoEWrapper):
+@@ -70,13 +78,16 @@ class LlamafileMoEWrapper(BaseMoEWrapper):
+                 "Please recompile with Llamafile enabled."
+             )
+ 
++        if os.environ.get("KT_MOE_MXFP4_TOKEN_REUSE", "1") not in ("0", "1"):
++            raise ValueError("KT_MOE_MXFP4_TOKEN_REUSE must be 0 or 1")
++
          if not os.path.exists(weight_path):
              raise FileNotFoundError(f"GGUF weight path not found: {weight_path}")
  
@@ -1607,7 +1675,7 @@ index 0f1c440..3ca3f5a
  
          # Validate TP configuration with QK_K alignment
          QK_K = 256
-@@ -176,12 +183,14 @@ class LlamafileMoEWrapper(BaseMoEWrapper):
+@@ -176,12 +187,14 @@ class LlamafileMoEWrapper(BaseMoEWrapper):
  
          base_key = f"blk.{self.layer_idx}"
  
@@ -1625,12 +1693,28 @@ index 0f1c440..3ca3f5a
  
          # Keep tensors alive
          self.weights_to_keep = (gate_data, up_data, down_data)
-@@ -202,8 +211,24 @@ class LlamafileMoEWrapper(BaseMoEWrapper):
+@@ -201,9 +214,39 @@ class LlamafileMoEWrapper(BaseMoEWrapper):
+ 
          # Llamafile-specific configuration
          moe_config.m_block = 32  # Parallel block size
-         moe_config.group_min_len = 10  # Use forward_one when qlen < 10
+-        moe_config.group_min_len = 10  # Use forward_one when qlen < 10
 -        moe_config.max_len = self.chunked_prefill_size
 -        moe_config.group_max_len = max(1, int(self.chunked_prefill_size))
++        # Lower the default only when the compiled kernel can reuse MXFP4 weights.
++        # Explicit KT_GROUP_MIN_LEN always takes precedence, including rollback.
++        reuse_mxfp4 = (
++            getattr(kt_kernel_ext, "mxfp4_token_reuse_supported", False)
++            and os.environ.get("KT_MOE_MXFP4_TOKEN_REUSE", "1") == "1"
++            and all(t == GGMLQuantizationType.MXFP4 for t in (gate_type, up_type, down_type))
++        )
++        default_group_min = "2" if reuse_mxfp4 else "10"
++        try:
++            group_min_len = int(os.environ.get("KT_GROUP_MIN_LEN", default_group_min))
++        except ValueError as exc:
++            raise ValueError("KT_GROUP_MIN_LEN must be an integer") from exc
++        if group_min_len < 1:
++            raise ValueError("KT_GROUP_MIN_LEN must be at least 1")
++        moe_config.group_min_len = group_min_len
 +        # Defensive fallback: chunked_prefill_size <= 0 (e.g. -1 meaning "disabled" in sglang
 +        # baseline) would otherwise let C++ compute max_possible_qlen() = max(max_len=-1,
 +        # group_max_len=max(1,-1)=1) = 1, sizing per-NUMA fp32 output buffer
@@ -1652,7 +1736,7 @@ index 0f1c440..3ca3f5a
  
          # Set weight pointers
          moe_config.gate_proj = gate_data.data_ptr()
-@@ -211,10 +236,10 @@ class LlamafileMoEWrapper(BaseMoEWrapper):
+@@ -211,10 +254,10 @@ class LlamafileMoEWrapper(BaseMoEWrapper):
          moe_config.down_proj = down_data.data_ptr()
  
          # Set quantization types

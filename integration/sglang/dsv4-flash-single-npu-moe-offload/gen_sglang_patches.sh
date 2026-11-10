@@ -27,13 +27,14 @@ gen() { local out="$1"; shift
   printf "  %-52s %5s lines\n" "$out" "$(wc -l < "$OUT/$out")"; }
 
 echo "Generating sglang patches (base=$BASE):"
-# 0001 — NPU KV / triton-ascend fallback to torch-equivalent (auto-detect, no env switch)
+# 0001 — NPU fallbacks + MTP metadata and layer-level KT opt-out
 gen 0001-sglang-npu-kv-triton-fallback.patch \
   python/sglang/srt/hardware_backend/npu/allocator_npu.py \
   python/sglang/srt/mem_cache/common.py \
   python/sglang/srt/hardware_backend/npu/attention/ascend_backend.py \
-  python/sglang/srt/layers/moe/fused_moe_triton/layer.py
-# 0002 — KT EP wrapper (CPU MoE offload) + expert placement + scheduler/accel/args
+  python/sglang/srt/layers/moe/fused_moe_triton/layer.py \
+  python/sglang/srt/model_executor/forward_batch_info.py
+# 0002 — KT EP wrapper + expert placement + target/MTP scope + scheduler/accel/args
 gen 0002-sglang-kt-ep-cpu-moe-offload.patch \
   python/sglang/srt/layers/moe/kt_ep_wrapper.py \
   python/sglang/srt/layers/moe/kt_expert_masks.py \
@@ -42,6 +43,7 @@ gen 0002-sglang-kt-ep-cpu-moe-offload.patch \
   python/sglang/srt/environ.py \
   python/sglang/srt/server_args.py \
   python/sglang/srt/models/deepseek_v2.py \
+  python/sglang/srt/models/deepseek_v4.py \
   test/manual/ascend/test_kt_cleanup_equiv.py
 # 0003 — streaming prefill + depool (AscendC MXFP4 op) + dynamic-resident + GGUF dedup
 gen 0003-sglang-streaming-prefill-depool.patch \

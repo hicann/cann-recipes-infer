@@ -29,6 +29,11 @@ Usage::
     --model-dir <native MXFP4 model directory> \
     --gguf <GGUF cache directory>/dsv4_layer16_mxfp4.gguf \
     --layer-idx 16 --batch 4 --seed 1
+
+Add --check-token-reuse to compare old-default, grouped-OFF and default-ON outputs
+in separate processes using
+shared, disjoint, CPU/NPU-mixed, empty-CPU and zero-input routes. This mode
+checks exact BF16 equivalence, not performance or the floating-point reference.
 """
 from __future__ import annotations
 
@@ -36,7 +41,9 @@ import argparse
 import logging
 import math
 import os
+import subprocess
 import sys
+import tempfile
 from collections import namedtuple
 from pathlib import Path
 
@@ -194,6 +201,102 @@ def reference_moe_forward_dict(hidden, topk_ids, topk_weights, experts: Experts)
     return out
 
 
+def _write_token_reuse_outputs(args) -> int:
+    from unittest.mock import patch
+
+    from kt_kernel import kt_kernel_ext
+    from kt_kernel_ext.moe import MOE
+    from kt_kernel.utils.llamafile import LlamafileMoEWrapper
+
+    rows_to_check = (1, 2, 3, 4, 5, 8, 9, 10, 17)
+    k = args.num_experts_per_tok
+    if not 0 < k < args.num_experts:
+        raise ValueError("token-reuse checks require 0 < top-k < num-experts")
+    # Expert 0 stands for NPU-owned routes, which the CPU must skip.
+    mask = torch.zeros(args.num_experts, dtype=torch.bool)
+    mask[0] = True
+    wrapper = LlamafileMoEWrapper(
+        layer_idx=args.layer_idx, num_experts=args.num_experts,
+        num_experts_per_tok=k, hidden_size=args.hidden_size,
+        moe_intermediate_size=args.moe_intermediate_size, gpu_experts_mask=mask,
+        cpuinfer_threads=args.cpuinfer_threads, threadpool_count=args.threadpool_count,
+        weight_path=str(args.gguf),
+        chunked_prefill_size=max(args.chunked_prefill_size, max(rows_to_check)),
+        numa_nodes=None,
+    )
+    # Capture the actual C++ configuration, rather than testing a duplicate formula.
+    with patch("kt_kernel.utils.llamafile.MOE", wraps=MOE) as factory:
+        wrapper.load_weights()
+    group_min = factory.call_args.args[0].group_min_len
+    supported = getattr(kt_kernel_ext, "mxfp4_token_reuse_supported", False)
+    reuse = os.environ.get("KT_MOE_MXFP4_TOKEN_REUSE", "1") == "1"
+    expected_group_min = int(os.environ.get("KT_GROUP_MIN_LEN", "2" if supported and reuse else "10"))
+    if group_min != expected_group_min:
+        raise AssertionError(f"group threshold: {group_min} != {expected_group_min}")
+    logger.info("reuse=%s supported=%s actual group_min_len=%d", reuse, supported, group_min)
+    torch.manual_seed(args.seed)
+    outputs = {}
+    for rows in rows_to_check:
+        for pattern in ("shared", "disjoint", "mixed", "no_cpu", "zero"):
+            hidden = (torch.randn(rows, args.hidden_size) * 0.01).bfloat16()
+            ids = torch.arange(1, k + 1).expand(rows, k).contiguous()
+            if pattern == "disjoint":
+                ids = (torch.arange(rows * k).reshape(rows, k) % (args.num_experts - 1) + 1)
+            elif pattern == "mixed":
+                ids[:, 0] = 0
+            elif pattern == "no_cpu":
+                ids.zero_()
+            elif pattern == "zero":
+                hidden.zero_()
+            weights = torch.rand(rows, k)
+            weights /= weights.sum(dim=1, keepdim=True)
+            count = torch.tensor([rows], dtype=torch.int32)
+            output = torch.full_like(hidden, float("nan"))
+            wrapper.cpu_infer.submit(wrapper.moe.forward_task(
+                count.data_ptr(), k, ids.data_ptr(), weights.data_ptr(),
+                hidden.data_ptr(), output.data_ptr(), False,
+            ))
+            wrapper.cpu_infer.sync()
+            if not torch.isfinite(output.float()).all():
+                raise AssertionError(f"non-finite output: {rows}/{pattern}")
+            if pattern in ("no_cpu", "zero") and torch.count_nonzero(output):
+                raise AssertionError(f"expected zero output: {rows}/{pattern}")
+            outputs[f"{rows}/{pattern}"] = output
+    torch.save(outputs, args.reuse_output)
+    return 0
+
+
+def _check_token_reuse(args) -> int:
+    # C++ caches the switch: each configuration must run in a separate process.
+    arguments = [arg for arg in sys.argv[1:] if arg != "--check-token-reuse"]
+    configurations = (("old-default", "0", None), ("grouped-off", "0", "2"), ("default-on", "1", None))
+    with tempfile.TemporaryDirectory(prefix="mxfp4-reuse-") as directory:
+        outputs = []
+        for name, reuse, group_min in configurations:
+            path = Path(directory) / f"{name}.pt"
+            env = dict(os.environ, KT_MOE_MXFP4_TOKEN_REUSE=reuse)
+            env.pop("KT_GROUP_MIN_LEN", None)
+            if group_min is not None:
+                env["KT_GROUP_MIN_LEN"] = group_min
+            logger.info("Checking %s (reuse=%s group=%s)", name, reuse, group_min or "default")
+            try:
+                subprocess.run(
+                    [sys.executable, str(Path(__file__).resolve()), *arguments,
+                     "--reuse-output", str(path)], env=env, check=True, timeout=args.reuse_timeout,
+                )
+            except (subprocess.TimeoutExpired, subprocess.CalledProcessError) as exc:
+                raise RuntimeError(f"token-reuse check failed: {name}") from exc
+            outputs.append(torch.load(path, map_location="cpu", weights_only=True))
+        for (name, _, _), candidate in zip(configurations[1:], outputs[1:]):
+            if outputs[0].keys() != candidate.keys():
+                raise AssertionError(f"old-default/{name} case keys differ")
+            for key in outputs[0]:
+                if not torch.equal(outputs[0][key], candidate[key]):
+                    raise AssertionError(f"old-default/{name} BF16 mismatch: {key}")
+        logger.info("RESULT: PASS - all three configurations match exactly (%d cases each).", len(outputs[0]))
+    return 0
+
+
 def main() -> int:
     _setup_logging()
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -214,13 +317,26 @@ def main() -> int:
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--cos-min", type=float, default=0.999)
     ap.add_argument("--rel-tol", type=float, default=0.03)
+    ap.add_argument("--check-token-reuse", action="store_true",
+                    help="Check old-default/grouped-OFF/default-ON outputs; no benchmark")
+    ap.add_argument("--reuse-timeout", type=int, default=600,
+                    help="Timeout in seconds per token-reuse subprocess (default: 600)")
+    ap.add_argument("--reuse-output", type=Path, help=argparse.SUPPRESS)
     args = ap.parse_args()
 
     model_dir = args.model_dir.expanduser().resolve()
     gguf_file = args.gguf.expanduser().resolve()
+    args.model_dir, args.gguf = model_dir, gguf_file
+    if args.reuse_timeout <= 0:
+        ap.error("--reuse-timeout must be positive")
     if not gguf_file.is_file():
         logger.error(f"ERROR: GGUF not found: {gguf_file}")
         return 2
+
+    if args.check_token_reuse:
+        return _check_token_reuse(args)
+    if args.reuse_output is not None:
+        return _write_token_reuse_outputs(args)
 
     device, stream_handle = _resolve_device_and_stream(args.device, args.npu_id)
     logger.info(f"[env] device={device} stream_handle={stream_handle}")

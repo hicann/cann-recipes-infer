@@ -41,11 +41,15 @@ diff --git a/ggml-quants.h b/ggml-quants.h
  
  // Dot product
  void ggml_vec_dot_q4_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
-@@ -97,6 +98,7 @@
+@@ -97,6 +98,11 @@
  void ggml_vec_dot_iq1_s_q8_K  (int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
  void ggml_vec_dot_iq1_m_q8_K  (int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
  void ggml_vec_dot_iq4_nl_q8_0 (int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 +void ggml_vec_dot_mxfp4_q8_0  (int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
++// One MXFP4 weight row against Q8_0 activation rows, separated by by bytes.
++// Tiles of 2..4 share weight decoding; other positive counts use the original dot.
++// Results are contiguous in s; bs and bx are unused, as in the single-row path.
++void ggml_vec_dot_mxfp4_q8_0_many(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
  void ggml_vec_dot_iq4_xs_q8_K (int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
  void ggml_vec_dot_iq3_s_q8_K  (int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
  
@@ -95,7 +99,7 @@ diff --git a/ggml-quants.c b/ggml-quants.c
  void dequantize_row_iq4_xs(const block_iq4_xs * restrict x, float * restrict y, int64_t k) {
      assert(k % QK_K == 0);
      const int64_t nb = k / QK_K;
-@@ -11289,6 +11325,78 @@
+@@ -11289,6 +11325,176 @@
  #endif
  }
  
@@ -169,6 +173,104 @@ diff --git a/ggml-quants.c b/ggml-quants.c
 +        sumf += d * (sumi1 + sumi2);
 +    }
 +    *s = sumf;
++}
++
++static inline __attribute__((always_inline)) void ggml_vec_dot_mxfp4_q8_0_many_impl(int n, float * restrict s, size_t bs, const void * restrict vx, size_t bx, const void * restrict vy, size_t by, int nrc) {
++    assert(nrc >= 2 && nrc <= 4);
++    UNUSED(bs);
++    UNUSED(bx);
++    assert(by > 0);
++    assert(n % QK_MXFP4 == 0);
++    static_assert(QK_MXFP4 == QK8_0, "QK_MXFP4 and QK8_0 must be the same");
++
++    const block_mxfp4 * restrict x = vx;
++    const char * restrict ybase = vy;
++    const block_q8_0 * y[4] = { NULL, NULL, NULL, NULL };
++    for (int r = 0; r < nrc; ++r) {
++        y[r] = (const block_q8_0 *) (ybase + (size_t) r * by);
++    }
++
++    const int nb = n / QK_MXFP4;
++    int ib = 0;
++    float sumf[4] = { 0.f, 0.f, 0.f, 0.f };
++
++#if defined __ARM_NEON
++    const int8x16_t values = vld1q_s8(kvalues_mxfp4);
++    const uint8x16_t m4b = vdupq_n_u8(0x0f);
++    float32x4_t sumv0[4];
++    float32x4_t sumv1[4];
++    for (int r = 0; r < nrc; ++r) {
++        sumv0[r] = vdupq_n_f32(0.0f);
++        sumv1[r] = vdupq_n_f32(0.0f);
++    }
++
++    for (; ib + 1 < nb; ib += 2) {
++        __builtin_prefetch((const char *)&x[ib] + 512, 0, 0);
++
++        // Decode the weight blocks and their scales once for this token tile.
++        const uint8x16_t q4bits0 = vld1q_u8(x[ib + 0].qs);
++        const uint8x16_t q4bits1 = vld1q_u8(x[ib + 1].qs);
++        const int8x16_t q4_00 = ggml_vqtbl1q_s8(values, vandq_u8(q4bits0, m4b));
++        const int8x16_t q4_01 = ggml_vqtbl1q_s8(values, vshrq_n_u8(q4bits0, 4));
++        const int8x16_t q4_10 = ggml_vqtbl1q_s8(values, vandq_u8(q4bits1, m4b));
++        const int8x16_t q4_11 = ggml_vqtbl1q_s8(values, vshrq_n_u8(q4bits1, 4));
++        const float wx0 = GGML_E8M0_TO_FP32_HALF(x[ib + 0].e);
++        const float wx1 = GGML_E8M0_TO_FP32_HALF(x[ib + 1].e);
++
++        for (int r = 0; r < nrc; ++r) {
++            const int8x16_t q8_00 = vld1q_s8(y[r][ib + 0].qs);
++            const int8x16_t q8_01 = vld1q_s8(y[r][ib + 0].qs + 16);
++            const int8x16_t q8_10 = vld1q_s8(y[r][ib + 1].qs);
++            const int8x16_t q8_11 = vld1q_s8(y[r][ib + 1].qs + 16);
++            const int32x4_t prod0 = ggml_vdotq_s32(
++                ggml_vdotq_s32(vdupq_n_s32(0), q4_00, q8_00), q4_01, q8_01);
++            const int32x4_t prod1 = ggml_vdotq_s32(
++                ggml_vdotq_s32(vdupq_n_s32(0), q4_10, q8_10), q4_11, q8_11);
++            sumv0[r] = vfmaq_n_f32(sumv0[r], vcvtq_f32_s32(prod0),
++                                   wx0 * GGML_FP16_TO_FP32(y[r][ib + 0].d));
++            sumv1[r] = vfmaq_n_f32(sumv1[r], vcvtq_f32_s32(prod1),
++                                   wx1 * GGML_FP16_TO_FP32(y[r][ib + 1].d));
++        }
++    }
++    for (int r = 0; r < nrc; ++r) {
++        sumf[r] = vaddvq_f32(vaddq_f32(sumv0[r], sumv1[r]));
++    }
++#endif
++
++    // Keep the scalar path and odd-block tail in the original accumulation order.
++    for (; ib < nb; ++ib) {
++        const float wx = GGML_E8M0_TO_FP32_HALF(x[ib].e);
++        for (int r = 0; r < nrc; ++r) {
++            int sumi1 = 0, sumi2 = 0;
++            for (int j = 0; j < QK_MXFP4/2; ++j) {
++                sumi1 += y[r][ib].qs[j +           0] * kvalues_mxfp4[x[ib].qs[j] & 0xf];
++                sumi2 += y[r][ib].qs[j + QK_MXFP4/2] * kvalues_mxfp4[x[ib].qs[j] >>  4];
++            }
++            sumf[r] += wx * GGML_FP16_TO_FP32(y[r][ib].d) * (sumi1 + sumi2);
++        }
++    }
++    for (int r = 0; r < nrc; ++r) {
++        s[r] = sumf[r];
++    }
++}
++
++void ggml_vec_dot_mxfp4_q8_0_many(int n, float * restrict s, size_t bs, const void * restrict vx, size_t bx, const void * restrict vy, size_t by, int nrc) {
++    GGML_ASSERT(nrc > 0 && n >= 0 && n % QK_MXFP4 == 0);
++    GGML_ASSERT(s != NULL && vx != NULL && vy != NULL);
++    GGML_ASSERT(nrc == 1 || by > 0);
++    // Constant tile sizes let the compiler unroll the inner activation loop.
++    switch (nrc) {
++        case 2: ggml_vec_dot_mxfp4_q8_0_many_impl(n, s, bs, vx, bx, vy, by, 2); return;
++        case 3: ggml_vec_dot_mxfp4_q8_0_many_impl(n, s, bs, vx, bx, vy, by, 3); return;
++        case 4: ggml_vec_dot_mxfp4_q8_0_many_impl(n, s, bs, vx, bx, vy, by, 4); return;
++        default:
++            // Retain defined output for non-tiled callers, also with NDEBUG.
++            for (int r = 0; r < nrc; ++r) {
++                ggml_vec_dot_mxfp4_q8_0(n, s + r, bs, vx, bx,
++                                       (const char *) vy + (size_t) r * by, by, 1);
++            }
++            return;
++    }
 +}
 +
  void ggml_vec_dot_iq4_xs_q8_K(int n, float * restrict s, size_t bs, const void * restrict vx, size_t bx, const void * restrict vy, size_t by, int nrc) {

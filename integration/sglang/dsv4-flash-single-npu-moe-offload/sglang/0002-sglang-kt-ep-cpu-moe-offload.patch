@@ -962,6 +962,34 @@ index 7f71c837e..767b2df29 100644
              final_hidden_states += shared_output
          if (
              self.tp_size > 1
+diff --git a/python/sglang/srt/models/deepseek_v4.py b/python/sglang/srt/models/deepseek_v4.py
+index e6439460c..49306dd89 100644
+--- a/python/sglang/srt/models/deepseek_v4.py
++++ b/python/sglang/srt/models/deepseek_v4.py
+@@ -857,7 +857,23 @@ class DeepseekV4MoE(nn.Module):
+                 config, "routing_method_type", RoutingMethodType.DeepSeekV3
+             ),
+             prefix=add_prefix("experts", prefix),
++            enable_kt_offload=not is_nextn,
+         )
++        if get_global_server_args().kt_weight_path is not None:
++            uses_kt = isinstance(self.experts.quant_method, KTEPWrapperMethod)
++            if is_nextn and uses_kt:
++                raise RuntimeError(
++                    "MTP MoE must use its checkpoint experts, not target layer-0 GGUF."
++                )
++            if not is_nextn and not uses_kt:
++                raise RuntimeError(
++                    f"Target MoE layer {self.layer_id} did not receive the KT wrapper."
++                )
++            if is_nextn or self.layer_id == config.num_hidden_layers - 1:
++                logger.info(
++                    "[KT_SCOPE] target KT layers=%d, MTP KT layers=0",
++                    config.num_hidden_layers,
++                )
+         self.experts.should_fuse_routed_scaling_factor_in_topk = True
+ 
+         self.topk = TopK(
 diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
 index 753d18c21..35ce41cd0 100644
 --- a/python/sglang/srt/server_args.py

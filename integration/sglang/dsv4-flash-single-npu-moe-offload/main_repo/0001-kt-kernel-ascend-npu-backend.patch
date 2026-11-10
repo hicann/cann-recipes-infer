@@ -433,7 +433,7 @@ index 8470438..796bcc2 100644
  #endif  // CPUINFER_VENDOR_VENDOR_H
 \ No newline at end of file
 diff --git a/kt-kernel/ext_bindings.cpp b/kt-kernel/ext_bindings.cpp
-index f22207f..e77f81a 100644
+index f22207f..aa43fbc 100644
 --- a/kt-kernel/ext_bindings.cpp
 +++ b/kt-kernel/ext_bindings.cpp
 @@ -21,6 +21,9 @@
@@ -446,10 +446,11 @@ index f22207f..e77f81a 100644
  #include "operators/common.hpp"
  
  #if defined(USE_MOE_KERNEL)
-@@ -477,6 +480,23 @@ void bind_moe_module(py::module_& moe_module, const char* name) {
+@@ -477,6 +480,24 @@ void bind_moe_module(py::module_& moe_module, const char* name) {
  }
  
  PYBIND11_MODULE(kt_kernel_ext, m) {
++  m.attr("mxfp4_token_reuse_supported") = kt_mxfp4_token_reuse_supported();
 +#if defined(KTRANSFORMERS_USE_ASCEND_NPU)
 +  m.def(
 +      "init_ascend_callback_worker",
