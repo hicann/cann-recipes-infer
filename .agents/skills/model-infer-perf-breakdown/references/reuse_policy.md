@@ -16,7 +16,7 @@
 |------|--------|------|
 | **kernel 集合 diff** | `set(new.normalized_name) Δ set(old.normalized_name)` | 出现新算子 → 至少中改 |
 | **anchor count 偏差** | 选 1-2 个 anchor kernel（HISTORY 中 stream sample 的代表算子），比 new/old 总 count | 偏差大 = 层数 / phase 变了 |
-| **总 op 数偏差** | `(|new| - |old|) / |old|` | > 30% 视为大改 |
+| **总 op 数偏差** | `(\|new\| - \|old\|) / \|old\|` | > 30% 视为大改 |
 | **sample 锚点试探** | 拿上一 run 的 stream sample op 名 + shape，在新 raw_ops 的相近 stream-local 位置试探命中 | 命中位置漂移度量 |
 | **shape 分布** | 同名 anchor 的 input_shapes top-3 是否一致 | shape 漂移 = 中改 |
 
