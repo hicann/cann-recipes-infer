@@ -28,7 +28,8 @@
 #   KT_GGUF_TEMPLATE  required: MXFP4 GGUF template, e.g.
 #                     /your/cache/dsv4_layer{layer_idx}_mxfp4.gguf (single-quoted)
 #   PORT              default 8020 (matches decode_throughput_test.sh / gpqa_accuracy_repeat.sh)
-#   ASCEND_TOOLKIT_HOME  default /usr/local/Ascend/ascend-toolkit/latest
+#   CANN_HOME         optional CANN root (A3: 9.0.0-9.2.0)
+#   PYTHON_BIN        optional Python 3.11/3.12 interpreter
 #   NPU_DEVICE_ID     optional physical NPU index (e.g. 2); exports ASCEND_RT_VISIBLE_DEVICES
 #   CHUNKED_PREFILL_SIZE  default 2048 (must be a multiple of page-size=128, and >= page-size).
 #                         Do NOT pass -1: the KT(LLAMAFILE) C++ MoE sizes its fp32 output buffer
@@ -40,6 +41,30 @@
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="${REPO:-$(cd "$SCRIPT_DIR/.." && pwd)}"
+source "${SCRIPT_DIR}/setup_dsv4_env_from_clean_cann.sh" env runtime
+
+set +eu
+ASCEND_OPP_VENDORS_DIR="${ASCEND_TOOLKIT_HOME}/opp/vendors"
+if [[ -z "${ATB_SET_ENV:-}" ]]; then
+  _ascend_root="$(dirname "${ASCEND_TOOLKIT_HOME}")"
+  [[ "$(basename "${_ascend_root}")" == "ascend-toolkit" ]] && _ascend_root="$(dirname "${_ascend_root}")"
+  for _atb in "${_ascend_root}/nnal/atb/set_env.sh" \
+              /usr/local/Ascend/nnal/atb/set_env.sh; do
+    [[ -f "${_atb}" ]] && { ATB_SET_ENV="${_atb}"; break; }
+  done
+fi
+[[ -n "${ATB_SET_ENV:-}" ]] && echo "[launch] ATB set_env: ${ATB_SET_ENV}" || echo "[launch][warn] ATB set_env not found (ATB ops may be unavailable); set ATB_SET_ENV=<path> if needed"
+for _kt_env in \
+  "${ATB_SET_ENV:-/nonexistent}" \
+  "${ASCEND_OPP_VENDORS_DIR}/customize/bin/set_env.bash" \
+  "${ASCEND_OPP_VENDORS_DIR}/custom_transformer/bin/set_env.bash"; do
+  if [[ -f "${_kt_env}" ]]; then
+    source "${_kt_env}"
+  fi
+done
+unset _kt_env _atb _ascend_root
+set -eu
+
 # shellcheck source=tools/ensure_kt_kernel.sh
 source "${SCRIPT_DIR}/ensure_kt_kernel.sh"
 ensure_kt_kernel "$REPO"
@@ -130,29 +155,6 @@ KT_CPUINFER="${KT_CPUINFER:-32}"
 # threads/subpool = KT_CPUINFER / KT_THREADPOOL_COUNT.
 KT_THREADPOOL_COUNT="${KT_THREADPOOL_COUNT:-1}"
 PORT="${PORT:-8020}"
-# ASCEND_TOOLKIT_HOME is the SINGLE anchor — ATB(nnal), opp vendors, custom-op paths all derive
-# from it. Take it from the environment (CANN's set_env.sh exports both ASCEND_TOOLKIT_HOME and
-# ASCEND_HOME_PATH); if absent, auto-detect known layouts; if still not found, HARD-FAIL with
-# guidance instead of silently using a wrong hardcoded path (that's what broke on new containers).
-if [[ -z "${ASCEND_TOOLKIT_HOME:-}" ]]; then
-  ASCEND_TOOLKIT_HOME="${ASCEND_HOME_PATH:-}"
-fi
-if [[ -z "${ASCEND_TOOLKIT_HOME:-}" ]]; then
-  for _cand in /usr/local/Ascend/ascend-toolkit/latest \
-               "${HOME}"/Ascend/ascend-toolkit/latest \
-               "${HOME}"/Ascend/cann-* \
-               /home/*/Ascend/cann-* ; do
-    [[ -f "${_cand}/set_env.sh" ]] && { ASCEND_TOOLKIT_HOME="${_cand}"; break; }
-  done
-  unset _cand
-fi
-if [[ -z "${ASCEND_TOOLKIT_HOME:-}" || ! -f "${ASCEND_TOOLKIT_HOME}/set_env.sh" ]]; then
-  echo "[launch][ERROR] No valid ASCEND_TOOLKIT_HOME (CANN root). Set it explicitly," \
-       "or source CANN's set_env.sh first:" >&2
-  echo "  export ASCEND_TOOLKIT_HOME=/path/to/Ascend/cann-9.0.0   # use your actual path" >&2
-  exit 1
-fi
-export ASCEND_TOOLKIT_HOME
 
 # NSA compressor calling convention depends on the CANN version:
 #   CANN 9.0.0+ -> public 18-arg single-state op   (KT_NSA_COMPRESSOR_MODE=single)
@@ -215,36 +217,6 @@ if [[ "${SGLANG_NPU_PROFILE_ENABLE}" == "1" && "${EXTRA_FLAGS:-}" != *"--disable
   echo "[launch] SGLANG_NPU_PROFILE_ENABLE=1: auto append EXTRA_FLAGS=--disable-cuda-graph"
 fi
 
-# Source the CANN toolkit, ATB and custom-operator vendor environments here rather than relying on
-# the shell profile, so a non-interactive shell or a clean container also finds the operators
-# (they are located through ASCEND_CUSTOM_OPP_PATH, which the vendor set_env.bash files set).
-# -e/-u are relaxed while sourcing: the vendor scripts are not `set -u` clean and would abort.
-set +eu
-ASCEND_OPP_VENDORS_DIR="${ASCEND_TOOLKIT_HOME}/opp/vendors"
-# ATB (nnal) set_env sits outside the toolkit directory, in the `nnal/atb` sibling of the Ascend
-# root, and its exact path varies per image. ATB_SET_ENV overrides the search below.
-if [[ -z "${ATB_SET_ENV:-}" ]]; then
-  # .../Ascend/cann-9.0.0 and .../Ascend/ascend-toolkit both resolve to .../Ascend
-  _ascend_root="$(dirname "${ASCEND_TOOLKIT_HOME}")"
-  [[ "$(basename "${_ascend_root}")" == "ascend-toolkit" ]] && _ascend_root="$(dirname "${_ascend_root}")"
-  for _atb in "${_ascend_root}/nnal/atb/set_env.sh" \
-              /usr/local/Ascend/nnal/atb/set_env.sh; do
-    [[ -f "${_atb}" ]] && { ATB_SET_ENV="${_atb}"; break; }
-  done
-fi
-[[ -n "${ATB_SET_ENV:-}" ]] && echo "[launch] ATB set_env: ${ATB_SET_ENV}" || echo "[launch][warn] ATB set_env not found (ATB ops may be unavailable); set ATB_SET_ENV=<path> if needed"
-for _kt_env in \
-  "${ASCEND_TOOLKIT_HOME}/set_env.sh" \
-  "${ATB_SET_ENV:-/nonexistent}" \
-  "${ASCEND_OPP_VENDORS_DIR}/customize/bin/set_env.bash" \
-  "${ASCEND_OPP_VENDORS_DIR}/custom_transformer/bin/set_env.bash"; do
-  if [[ -f "${_kt_env}" ]]; then
-    # shellcheck source=/dev/null
-    source "${_kt_env}"
-  fi
-done
-unset _kt_env _atb _ascend_root
-set -eu
 
 ulimit -n 65536 2>/dev/null || true
 

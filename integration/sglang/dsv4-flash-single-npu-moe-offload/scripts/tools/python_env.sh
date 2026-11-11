@@ -47,7 +47,7 @@ resolve_python_bin() {
     printf '%s\n' "${PYTHON_BIN}"
     return 0
   fi
-  for cand in python3 python3.11 /usr/local/python3.11.14/bin/python3.11 \
+  for cand in python3 python3.11 python3.12 /usr/local/python3.11.14/bin/python3.11 \
               /usr/local/python3.11.14/bin/python3 /opt/conda/bin/python3; do
     command -v "${cand}" >/dev/null 2>&1 || continue
     if _python_has_modules "${cand}" "$@"; then
@@ -57,6 +57,6 @@ resolve_python_bin() {
   done
   echo "[${tag}][ERROR] No python interpreter found that can import: ${*}" >&2
   echo "[${tag}][ERROR]   python3 on PATH = $(command -v python3 || echo none)" >&2
-  echo "[${tag}][ERROR]   Set it explicitly, e.g. PYTHON_BIN=/usr/local/python3.11.14/bin/python3.11" >&2
+  echo "[${tag}][ERROR]   Set PYTHON_BIN to the Python 3.11/3.12 interpreter used for setup." >&2
   return 1
 }

@@ -1,9 +1,11 @@
-# Base dependencies of sglang (dsv4_release fork), copied verbatim from
+# Base dependencies of sglang (dsv4_release fork), derived from
 # third_party/sglang/python/pyproject.toml. Extras such as diffusion / test / tracing are excluded
 # (the server does not need them), and so is the torch family, which is already in place and
 # pinned by dsv4_torch_lock.txt.
 # Install with:  pip install -r tools/dsv4_sglang_base_reqs.txt -c tools/dsv4_torch_lock.txt
-IPython
+# IPython >=9.13 requires psutil>=7, conflicting with triton-ascend.
+IPython==9.10.0; python_version < "3.12"
+IPython==9.12.0; python_version >= "3.12"
 aiohttp
 anthropic>=0.20.0
 blobfile==3.0.0
@@ -30,7 +32,7 @@ packaging
 partial_json_parser
 pillow
 prometheus-client>=0.20.0
-psutil
+psutil==6.0.0
 py-spy
 pybase64
 pydantic

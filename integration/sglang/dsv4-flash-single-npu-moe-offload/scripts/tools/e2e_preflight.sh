@@ -23,6 +23,7 @@
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="${REPO:-$(cd "$SCRIPT_DIR/.." && pwd)}"
+source "${SCRIPT_DIR}/setup_dsv4_env_from_clean_cann.sh" env runtime
 # shellcheck source=tools/ensure_kt_kernel.sh
 source "${SCRIPT_DIR}/ensure_kt_kernel.sh"
 ensure_kt_kernel "$REPO"

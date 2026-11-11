@@ -95,8 +95,51 @@ for i in $(seq 1 "$REPEATS"); do
     # What is wanted here is "not found", not "abort".
     RPT="$(find "$WD" -name gpqa_diamond.json -path '*reports*' 2>/dev/null | tail -1 || true)"
     if [ -n "$RPT" ] && [ -f "$RPT" ]; then
-      S="$("$PY" -c "import json,sys;print(json.load(open(sys.argv[1])).get('score','?'))" "$RPT")" \
-        || { echo "[gpqa][ERROR] R$i could not parse the report: $RPT" >&2; S='?'; }
+      S="$("$PY" - "$RPT" <<'PYEOF'
+import json
+import math
+import sys
+
+
+def find_scores(node, path='$'):
+    if isinstance(node, dict):
+        value = node.get('score')
+        if isinstance(value, (int, float, str)) and not isinstance(value, bool):
+            try:
+                score = float(value)
+            except (ValueError, OverflowError):
+                pass
+            else:
+                if math.isfinite(score):
+                    # Keep aggregate scores instead of counting their subsets again.
+                    return [(path + '.score', score)]
+        primary = node.get('primary_metric_identity')
+        if primary is not None:
+            metrics = node.get('metrics', [])
+            matches = [(i, m) for i, m in enumerate(metrics)
+                       if isinstance(m, dict) and m.get('identity') == primary]
+            if len(matches) != 1:
+                raise ValueError(f'{path}: primary metric must match exactly one metric')
+            i, metric = matches[0]
+            return find_scores(metric, f'{path}.metrics[{i}]')
+        if node.get('primary_metric_unavailable_reason'):
+            raise ValueError(f'{path}: {node["primary_metric_unavailable_reason"]}')
+        children = [(f'{path}.{key}', value) for key, value in node.items()]
+    elif isinstance(node, list):
+        children = [(f'{path}[{i}]', value) for i, value in enumerate(node)]
+    else:
+        return []
+    return [score for child_path, child in children
+            for score in find_scores(child, child_path)]
+
+
+with open(sys.argv[1], encoding='utf-8') as report:
+    scores = find_scores(json.load(report))
+if len(scores) != 1:
+    raise ValueError(f'Expected one aggregate score, found {len(scores)}: {scores}')
+print(scores[0][1])
+PYEOF
+)" || { echo "[gpqa][ERROR] R$i could not parse the report: $RPT" >&2; S='?'; }
     else
       echo "[gpqa][ERROR] R$i found no report (*/reports/**/gpqa_diamond.json); recording the round as failed." >&2
     fi

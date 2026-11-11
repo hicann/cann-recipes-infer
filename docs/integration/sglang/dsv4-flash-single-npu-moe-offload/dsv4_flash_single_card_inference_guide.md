@@ -25,9 +25,9 @@
 
 | 仓库 | 来源 | SHA | 补丁目录 |
 |---|---|---|---|
-| ktransformers | `github.com/kvcache-ai/ktransformers`（`0.6.2.post1`） | `d7b5b49` | `main_repo/` |
+| ktransformers | `github.com/kvcache-ai/ktransformers`（`0.6.2.post1`） | `d7b5b49a3` | `main_repo/` |
 | sglang | `github.com/iforgetmyname/sglang`（`dsv4_release`） | `298193eb3` | `sglang/` |
-| llama.cpp | `github.com/ggerganov/llama.cpp`（tag `b3173`） | `a94e6ff` | `llama_cpp/` |
+| llama.cpp | `github.com/ggerganov/llama.cpp`（tag `b3173`） | `a94e6ff87` | `llama_cpp/` |
 
 `third_party/pybind11`、`third_party/custom_flashinfer` 使用父仓自带子模块，无需打补丁。
 
@@ -37,11 +37,18 @@
 
 ## 1. 环境准备
 
+在仓库根目录执行：
+
+```bash
+cd integration/sglang/dsv4-flash-single-npu-moe-offload
+export RELEASE_DIR="$(pwd)"
+```
+
 按硬件选择一条路径；§2 起的流程两者共通。
 
 | 硬件 | 环境准备 | CANN | 自定义算子 | 参见 |
 |---|---|---|---|---|
-| **A3** —— CANN Lab 镜像 | 未定制的 CANN 9.0.0 镜像（lite-infer-and-train） + 源码构建 | 9.0.0 | 从源码构建 | **§1A** |
+| **A3** | CANNLab 的 lite-and-infer 镜像 + 源码构建 | 9.0.0–9.2.0 | 从源码构建 | **§1A** |
 | Atlas 910B + K920 裸机 | 已集成依赖的镜像 | 8.5.0（镜像自带） | 镜像自带 | §1B |
 
 两套环境均已验证可运行，功能一致；本文的性能数据测自 A3。
@@ -66,24 +73,20 @@ export MXFP4_SRC=/workspace/models/DeepSeek-V4-Flash       # CPU 转换源（根
 export GGUF_CACHE=/workspace/models/cache                  # GGUF 输出目录，需 ≥150 GiB（根据需求自定义路径）
 ```
 
-### 1A. A3 —— 从未定制的 CANN 9.0.0 镜像
+### 1A. A3 —— CANNLab 的 lite-and-infer 镜像（CANN 9.0.0–9.2.0）
 
-镜像仅提供 CANN 9.0.0，依赖与自定义算子由脚本一次装完：
+支持 Python 3.11 / 3.12，可直接使用系统 Python。
+脚本支持自动选择 CANN 和 Python，也可显式指定安装路径、解释器和编译器：
 
 ```bash
-# 在交付目录 integration/sglang/dsv4-flash-single-npu-moe-offload/ 内执行
-cd integration/sglang/dsv4-flash-single-npu-moe-offload
-
-# 系统依赖（非 root 环境在 apt-get 前加 sudo）
-apt-get update && apt-get install -y pkg-config libhwloc-dev libhwloc15
-
-export CANN_HOME=$HOME/Ascend/cann-9.0.0
+export CANN_HOME=$HOME/Ascend/cann-9.0.0   # 按实际安装路径修改
+export PYTHON_BIN="$(command -v python3.11 || command -v python3.12)"
 export CC_BIN=/usr/bin/gcc-13 CXX_BIN=/usr/bin/g++-13
 
-bash scripts/tools/setup_dsv4_env_from_clean_cann.sh all
+bash "$RELEASE_DIR/scripts/tools/setup_dsv4_env_from_clean_cann.sh" all
 ```
 
-`all` 无需先 clone 代码，末尾会自动跑一次 `verify`；通过后转 §2。
+`all` 安装依赖并执行 `verify`；随后按 §2–§4 获取代码、打补丁并构建 kt-kernel。
 
 环境前提、所装的第三方算子仓库、以及分阶段执行（排障用）见[附录 A](#附录-a-a3-环境准备细节)。
 
@@ -99,9 +102,10 @@ WORKSPACE=<宿主机代码目录> MODEL_DIR=<宿主机权重目录> \
 脚本挂载 NPU 驱动与设备、代码（`/workspace/code`）、权重（`/workspace/models`），并映射服务端口。
 可配置 `IMAGE` / `NAME` / `SERVICE_PORT`（默认 8020）/ `SHM_SIZE` / `NPU_VISIBLE_DEVICES`。
 
-容器内安装系统依赖：
+容器内设置交付目录并安装系统依赖：
 
 ```bash
+export RELEASE_DIR=/workspace/code/integration/sglang/dsv4-flash-single-npu-moe-offload
 apt-get update && apt-get install -y git build-essential cmake libhwloc-dev libhwloc15
 ```
 
@@ -113,7 +117,7 @@ libhwloc 为 kt-kernel 的运行期与编译期依赖，容器重启后需重新
 
 ## 2. 获取代码并设置 third_party
 
-pristine `d7b5b49` 的 `.gitmodules` 指向的 sglang / llama.cpp 与本方案所需基线不一致，
+pristine `d7b5b49a3` 的 `.gitmodules` 指向的 sglang / llama.cpp 与本方案所需基线不一致，
 因此这两个子目录需手动 clone 到指定 SHA，不能用 `git submodule update`。
 
 ```bash
@@ -124,7 +128,7 @@ mkdir -p "$WORKSPACE" && cd "$WORKSPACE"
 # 父仓
 git clone https://github.com/kvcache-ai/ktransformers.git ktransformers-AK
 cd ktransformers-AK
-git checkout -b dsv4-npu-release d7b5b49
+git checkout -b dsv4-npu-release d7b5b49a3
 export REPO=$(pwd)   # export：§3 apply_all.sh、§4 setup kt_kernel 同一 shell 直接用
 
 # 上游子模块（无需补丁）
@@ -138,16 +142,16 @@ git -C third_party/sglang checkout -b dsv4-release-base 298193eb3
 # llama.cpp
 rm -rf third_party/llama.cpp
 git clone https://github.com/ggerganov/llama.cpp.git third_party/llama.cpp
-git -C third_party/llama.cpp checkout -b b3173-base a94e6ff
+git -C third_party/llama.cpp checkout -b b3173-base a94e6ff87
 ```
 
 `third_party/sglang`、`third_party/llama.cpp` 此时为独立仓库，父仓会将其显示为 modified submodule，
 不影响后续构建。校验：
 
 ```bash
-git -C $REPO rev-parse --short HEAD                       # d7b5b49
-git -C $REPO/third_party/sglang rev-parse --short HEAD    # 298193eb3
-git -C $REPO/third_party/llama.cpp rev-parse --short HEAD # a94e6ff
+git -C $REPO rev-parse --short=9 HEAD                       # d7b5b49a3
+git -C $REPO/third_party/sglang rev-parse --short=9 HEAD    # 298193eb3
+git -C $REPO/third_party/llama.cpp rev-parse --short=9 HEAD # a94e6ff87
 ```
 
 ---
@@ -155,7 +159,7 @@ git -C $REPO/third_party/llama.cpp rev-parse --short HEAD # a94e6ff
 ## 3. 打补丁
 
 ```bash
-bash <release_dir>/apply_all.sh $REPO
+bash "$RELEASE_DIR/apply_all.sh" "$REPO"
 ```
 
 `apply_all.sh` 逐仓先 `git apply --check` 再 apply，任一检查失败即中止（通常是基线 SHA 不匹配）。
@@ -165,64 +169,54 @@ bash <release_dir>/apply_all.sh $REPO
 安装独立脚本：
 
 ```bash
-mkdir $REPO/tools/
-cp -r <release_dir>/scripts/tools/* $REPO/tools/
+mkdir -p "$REPO/tools"
+cp -r "$RELEASE_DIR/scripts/tools/." "$REPO/tools/"
 ```
 
 ---
 
 ## 4. 构建 kt-kernel
 
-下列命令中的 `python` 指目标解释器（本方案验证于 python3.11）。构建产出的
-`kt_kernel_ext.cpython-311-*.so` 与该解释器的 ABI 绑定，其他版本无法加载，因此后续所有步骤
-（预检、转换、启动）都须使用同一解释器。预检与启动脚本按 `python3` → `python3.11` → 已知安装
-路径探测，取第一个具备运行期依赖的解释器；若它不是此处构建用的那个，用 `PYTHON_BIN` 指向：
+加载 CANN 和 Python 环境：
 
 ```bash
-export PYTHON_BIN=/usr/local/python3.11.14/bin/python3.11   # 按实际路径填写
+source "$RELEASE_DIR/scripts/tools/setup_dsv4_env_from_clean_cann.sh" env
 ```
 
-**A3 走 §1A 环境的话，直接用 setup 脚本的 `kt_kernel` 阶段即可**（已带下面的开关和 gcc-13，与
-`all` 中一致）。它编的是 `$REPO/kt-kernel`，用 §2 export 的 `REPO`（新开 shell 需重新
-`export REPO=<ktransformers-AK 的实际路径>`）：
+A3 环境执行 `kt_kernel` 阶段：
 
 ```bash
-REPO=$REPO bash <release_dir>/scripts/tools/setup_dsv4_env_from_clean_cann.sh kt_kernel
+REPO="$REPO" bash "$RELEASE_DIR/scripts/tools/setup_dsv4_env_from_clean_cann.sh" kt_kernel
 ```
 
-等价的手动命令（**A3 必须显式关掉 ARM 扩展**，否则 `setup.py` 会据 `/proc/cpuinfo` 自动开启 sve/bf16/i8mm、
-SVE=ON 会让 MXFP4 MoE 报 `llamafile not supported`；910B 的 K920 无这些扩展，加上也无副作用）：
+等价的手工编译命令：
 
 ```bash
 cd $REPO/kt-kernel
 CC=/usr/bin/gcc-13 CXX=/usr/bin/g++-13 CPUINFER_USE_ASCEND_NPU=1 \
   CPUINFER_ARM_SVE=OFF CPUINFER_ARM_BF16=OFF CPUINFER_ARM_I8MM=OFF \
-  python setup.py build_ext --inplace
+  "$PYTHON_BIN" setup.py build_ext --inplace --force
 ```
 
 校验：
 
 ```bash
 find $REPO/kt-kernel -name "kt_kernel_ext*.so"
-python -c "import ctypes,glob; ctypes.CDLL(glob.glob('$REPO/kt-kernel/python/kt_kernel_ext*.so')[0]); print('dlopen OK')"
+"$PYTHON_BIN" -c "import ctypes,glob; ctypes.CDLL(glob.glob('$REPO/kt-kernel/python/kt_kernel_ext*.so')[0]); print('dlopen OK')"
 ```
 
 ### 4.1 使 `import kt_kernel` 生效
 
-`build_ext --inplace` 只产出 `.so`，不注册包名；setup.py 将包名 `kt_kernel` 映射到 `python/` 目录。
-二选一：
+注册包路径：
 
 ```bash
-# 方式 A：符号链接（不写 site-packages）
+# 符号链接（不写 site-packages）
 ln -sfn python $REPO/kt-kernel/kt_kernel
 export PYTHONPATH="$REPO/third_party/sglang/python:$REPO/kt-kernel${PYTHONPATH:+:$PYTHONPATH}"
 # 等价 helper：source tools/ensure_kt_kernel.sh && ensure_kt_kernel $REPO
-
-# 方式 B：editable 安装
-cd $REPO/kt-kernel && python -m pip install -e .
 ```
 
-验证：`python -c "import kt_kernel"`。
+验证：`"$PYTHON_BIN" -c "import kt_kernel"`。
 
 启动脚本已内置该 helper；单独运行其他脚本（§5、[附录 D](#附录-d-数值对账可选)）前需先完成本步。
 
@@ -232,7 +226,7 @@ cd $REPO/kt-kernel && python -m pip install -e .
 
 ```bash
 mkdir -p "$GGUF_CACHE"
-nohup python tools/batch_convert_mxfp4_layers_mp.py \
+nohup "$PYTHON_BIN" tools/batch_convert_mxfp4_layers_mp.py \
   --input "$MXFP4_SRC" --output-dir "$GGUF_CACHE" \
   --layer-start 0 --layer-end 42 --jobs 16 --verify-sample 3 \
   > /tmp/kt_mxfp4_convert.log 2>&1 &
@@ -243,7 +237,7 @@ nohup python tools/batch_convert_mxfp4_layers_mp.py \
 转换完成后执行全集校验（文件齐全 + 尺寸 + sha256 + 抽样 bit-exact）：
 
 ```bash
-python tools/verify_mxfp4_gguf_set.py --dir "$GGUF_CACHE" --sha256-manifest tools/mxfp4_gguf_sha256.txt
+"$PYTHON_BIN" tools/verify_mxfp4_gguf_set.py --dir "$GGUF_CACHE" --sha256-manifest tools/mxfp4_gguf_sha256.txt
 ```
 
 > 并发转换可能产生截断文件，必须执行全集校验。
@@ -251,8 +245,8 @@ python tools/verify_mxfp4_gguf_set.py --dir "$GGUF_CACHE" --sha256-manifest tool
 单层快速校验：
 
 ```bash
-python tools/convert_mxfp4_layer_to_gguf.py --input "$MXFP4_SRC" --layer-idx 16 --output /tmp/l16.gguf
-python tools/verify_mxfp4_layer.py --gguf /tmp/l16.gguf --model-dir "$MXFP4_SRC" --layer-idx 16
+"$PYTHON_BIN" tools/convert_mxfp4_layer_to_gguf.py --input "$MXFP4_SRC" --layer-idx 16 --output /tmp/l16.gguf
+"$PYTHON_BIN" tools/verify_mxfp4_layer.py --gguf /tmp/l16.gguf --model-dir "$MXFP4_SRC" --layer-idx 16
 ```
 
 校验通过后，`$MXFP4_SRC` 可删除以回收磁盘：启动服务只使用 `$GGUF_CACHE` 与 `$W8A8_DIR`。
@@ -271,7 +265,7 @@ sha256 与尺寸校验不依赖源目录，删除后仍可复验 GGUF 完整性�
 
 首次调用时自动用 bisheng 编译并缓存；源码较 `.so` 新时自动重编。
 运行时从 **`$REPO/tools/ascendc_mxfp4/`** 加载，即 §3「安装独立脚本」那步
-`cp -r <release_dir>/scripts/tools/* $REPO/tools/` 的目标位置——**更新算子源码后需重新拷贝一次**，
+`cp -r "$RELEASE_DIR/scripts/tools/." "$REPO/tools/"` 的目标位置——**更新算子源码后需重新拷贝一次**，
 否则服务用的仍是旧副本。要指向别处（例如直接用交付目录）时设 `KT_MXFP4_OP_DIR`。
 
 想在部署前先验证编译链，可按[附录 C](#附录-c-构建的预期输出与手工编译)手工编一次。
@@ -312,7 +306,7 @@ NPU_DEVICE_ID=<空闲卡> PORT=8020 \
 - `KT_GGUF_TEMPLATE`、`MODEL_PATH` 均为必填，未设置时脚本报错退出。
   `{layer_idx}` 为脚本的层号占位符，需保持字面量。
 - `PYTHON_BIN` 指定解释器，须与 §4 构建 kt-kernel 的一致；未设置时按
-  `python3` → `python3.11` → 已知安装路径探测，取第一个可 import
+  `python3` → `python3.11` → `python3.12` → 已知安装路径探测，取第一个可 import
   `numpy`/`torch`/`torch_npu`/`sglang` 的（`tools/python_env.sh`，预检脚本共用）。
 - graph 模式为默认，不要传 `--disable-cuda-graph`。
 
@@ -362,16 +356,24 @@ MTP 增加 NPU 占用，上例使用已验证的 16 常驻配置；同配置改�
 
 ## 8. 验收
 
-模型加载约需 2–3.5 分钟（page cache 命中时）。等服务就绪后发一条请求，输出连贯即表示部署完成：
+模型加载约需 2–3.5 分钟（page cache 命中时）。等服务就绪后，通过对话接口使用 DeepSeek-V4 对话模板验证：
 
 ```bash
 until curl -sf http://127.0.0.1:8020/health >/dev/null; do sleep 5; done
 
-curl -sS -X POST http://127.0.0.1:8020/generate -H 'Content-Type: application/json' \
-  -d '{"text":"中国的首都是","sampling_params":{"max_new_tokens":64,"temperature":0}}'
+curl -sS -X POST http://127.0.0.1:8020/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "default",
+    "messages": [{"role": "user", "content": "中国的首都是什么？请用一句话回答。"}],
+    "chat_template_kwargs": {"thinking": true},
+    "temperature": 0,
+    "max_tokens": 64
+  }'
 ```
 
-输出应是连贯的中文（"北京…"）。若出现乱码、全为重复字符或 NaN，说明链路有问题——常见原因见 [附录 G](#附录-g-常见问题)。
+响应的 `choices[0].message.content` 应是连贯的中文（如“中国的首都是北京。”），正常结束时 `choices[0].finish_reason` 为 `stop`。
+若出现乱码、全为重复字符或 NaN，说明链路有问题——常见原因见 [附录 G](#附录-g-常见问题)。
 
 性能观测：
 
@@ -391,7 +393,7 @@ grep KT_DECODE_TIMING /tmp/kt_serve.log    # cpu_moe_wall，A3 生产配置、�
 #### 8.1.1 无 MTP 默认配置
 
 ```bash
-PORT=8020 bash tools/decode_throughput_test.sh
+PY="$PYTHON_BIN" PORT=8020 bash tools/decode_throughput_test.sh
 # 默认档位 130/1k/8k/16k/32k：每档先预热、再循环多次，报稳态 decode（均值/中位/min/max）与 prefill
 # 可配置：TARGET_TOKENS_LIST / MAX_NEW / REPEAT / WARMUP / PORT
 ```
@@ -506,14 +508,13 @@ evalscope eval --model "$MODEL_PATH" --api-url http://127.0.0.1:8020/v1 --api-ke
 | 项 | 要求 |
 |---|---|
 | 硬件 | Ascend A3 |
-| CANN | 9.0.0（`CANN_HOME`，默认 `$HOME/Ascend/cann-9.0.0`） |
-| Python | 3.11（torch、torch_npu、算子 wheel 均为 cp311） |
+| CANN | 9.0.0–9.2.0（自动选择已安装版本，可通过 `CANN_HOME` 指定） |
+| Python | 3.11 / 3.12（可使用系统 Python，无需 conda） |
 | 编译器 | gcc-13 / g++-13（gcc-9 不支持 `+bf16/+i8mm` 与 `-std=gnu++20`） |
 | 系统库 | `pkg-config`、`libhwloc-dev`（kt-kernel 的 CMake 对 hwloc 是 REQUIRED）、`libhwloc15`（`kt_kernel_ext` 运行期依赖） |
 | torch | 2.8.0 + torch_npu 2.8.0.post4（不可升级到 2.10，`kt_kernel_ext.so` 为 torch-2.8 ABI） |
 
-`prereq` 阶段会校验系统库，缺失即报错并给出安装命令。`PYTHON_BIN`、`GITCODE`（第三方仓库根目录）
-可用环境变量覆盖。
+`system_deps` 阶段安装系统库，`prereq` 阶段校验环境。`PYTHON_BIN`、`GITCODE` 可用环境变量指定。
 
 **第三方算子仓库（均固定版本）**
 
@@ -531,6 +532,7 @@ evalscope eval --model "$MODEL_PATH" --api-url http://127.0.0.1:8020/v1 --api-ke
 
 | phase | 内容 | 注意 |
 |---|---|---|
+| `system_deps` | 安装 `pkg-config`、`libhwloc-dev`、`libhwloc15` | 非 root 用户使用 sudo |
 | `prereq` | 工具链与版本检查，`umask 0022` | umask 为 0002 时 CANN `msopgen` 会因安全检查中止构建 |
 | `torch` | 校验 torch 2.8 / torch_npu 2.8.0.post4 | — |
 | `triton` | 安装 triton-ascend | 版本不匹配时 import 即失败（CANN 9.0.0 缺符号） |
@@ -548,7 +550,7 @@ evalscope eval --model "$MODEL_PATH" --api-url http://127.0.0.1:8020/v1 --api-ke
 ## 附录 B. 补丁清单与手工操作
 
 ```
-main_repo/   → ktransformers @ d7b5b49
+main_repo/   → ktransformers @ d7b5b49a3
   0001-kt-kernel-ascend-npu-backend.patch          NPU 后端 + ACL callback worker + 构建系统
   0002-kt-kernel-cpu-moe-mxfp4-kernel.patch        CPU MoE MXFP4 kernel + GGUF loader + 多 token 计算优化
 sglang/      → sglang @ 298193eb3
@@ -557,7 +559,7 @@ sglang/      → sglang @ 298193eb3
   0003-sglang-streaming-prefill-depool.patch       流式 prefill + depool + 动态常驻 + GGUF dedup
   0004-sglang-nsa-compressor-and-mem-pools.patch   NSA compressor 模式 + NPU 内存池
   0005-sglang-packaging.patch                      Ascend/NPU 打包配置
-llama_cpp/   → llama.cpp @ a94e6ff
+llama_cpp/   → llama.cpp @ a94e6ff87
   0001-fix-gguf-NumPy-2-GGUFReader.patch           gguf-py NumPy 2.0 兼容
   0002-add-ggml-type-mxfp4.patch                   注册 GGML_TYPE_MXFP4=39 + NEON kernel + 多激活点积
 ```
@@ -573,9 +575,9 @@ x86 等其他构建保持原默认值 10。这影响 CPU 输入为 2–9 行的�
 等价的手动操作（在 §0 的干净基线上按编号应用，不对已有补丁重复 apply）：
 
 ```bash
-cd $REPO                        && for p in <release_dir>/main_repo/*.patch;  do git apply "$p"; done
-cd $REPO/third_party/sglang     && for p in <release_dir>/sglang/*.patch;     do git apply "$p"; done
-cd $REPO/third_party/llama.cpp  && for p in <release_dir>/llama_cpp/*.patch;  do git apply -p1 "$p"; done
+cd "$REPO"                       && for p in "$RELEASE_DIR"/main_repo/*.patch; do git apply "$p"; done
+cd "$REPO/third_party/sglang"     && for p in "$RELEASE_DIR"/sglang/*.patch;    do git apply "$p"; done
+cd "$REPO/third_party/llama.cpp"  && for p in "$RELEASE_DIR"/llama_cpp/*.patch; do git apply -p1 "$p"; done
 ```
 
 应用后按 §4 重建 kt-kernel 并重启服务。CPU 优化默认生效，MTP 按 §7.2 开启。
@@ -622,7 +624,7 @@ bisheng -x asc --cce-aicore-arch=dav-c220 -O2 -std=c++17 -fPIC -shared \
 ```bash
 source tools/ensure_kt_kernel.sh && ensure_kt_kernel "$REPO"
 
-python tools/cpu_moe_reference_check_mxfp4.py --model-dir "$MXFP4_SRC" \
+"$PYTHON_BIN" tools/cpu_moe_reference_check_mxfp4.py --model-dir "$MXFP4_SRC" \
   --gguf "$GGUF_CACHE/dsv4_layer16_mxfp4.gguf" --layer-idx 16
 ```
 
@@ -747,7 +749,7 @@ CPU MoE 的行内预取与优化 GEMV 恒定生效；triton 与 ascend 版本不
 
 ```bash
 # 相对 pristine 的全量 diff（交付用）
-git -C $REPO diff d7b5b49 -- kt-kernel/... > /tmp/my_kt_kernel.patch
+git -C $REPO diff d7b5b49a3 -- kt-kernel/... > /tmp/my_kt_kernel.patch
 git -C $REPO/third_party/sglang diff 298193eb3 -- python/sglang/... > /tmp/my_sglang.patch
 ```
 

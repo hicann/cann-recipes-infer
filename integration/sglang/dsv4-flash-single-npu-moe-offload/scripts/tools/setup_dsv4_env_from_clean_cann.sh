@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # =============================================================================
-# DeepSeek-V4-Flash on a single A3 card: bring-up from a clean CANN 9.0.0 image.
+# DeepSeek-V4-Flash on a single A3 card: bring-up from a clean CANN 9.0.0-9.2.0 image.
 # Installs the three custom-operator pieces (custom_ops / customize / custom_transformer),
 # the sglang dependencies, sgl_kernel_npu and kt-kernel.
 # =============================================================================
@@ -22,34 +22,74 @@
 # pitfall already applied.
 #
 # Usage:
+#   source setup_dsv4_env_from_clean_cann.sh env [runtime]
 #   1) Adjust the configurable variables below (paths, Python, CANN version) as needed.
 #   2) Run a phase at a time:  bash setup_dsv4_env_from_clean_cann.sh <phase>
-#      phase ∈ {all, prereq, torch, triton, sglang_deps,
+#      phase ∈ {all, system_deps, prereq, torch, triton, sglang_deps,
 #               vendor_customize, custom_ops, vendor_transformer,
 #               sgl_kernel_npu, kt_kernel, verify}
-#      No argument runs `all`, i.e. every phase in order.
+#      all prepares dependencies; kt_kernel runs after cloning and patching.
 #
 # The companion document is
 #   docs/integration/sglang/dsv4-flash-single-npu-moe-offload/dsv4_flash_single_card_inference_guide.md (the A3 section)
 # =============================================================================
+dsv4_init_env(){
+  local env_mode="$1" cann_shell_flags="$-" cann_env_rc _dsv4_cann
+  set --
+  if [[ -z "${CANN_HOME:-}" ]]; then
+    for _dsv4_cann in "${ASCEND_TOOLKIT_HOME:-}" "${ASCEND_HOME_PATH:-}" \
+        /usr/local/Ascend/ascend-toolkit/latest "$HOME/Ascend/ascend-toolkit/latest" \
+        "$HOME/Ascend/cann-9.2.0" /usr/local/Ascend/cann-9.2.0 \
+        "$HOME/Ascend/cann-9.1.0" /usr/local/Ascend/cann-9.1.0 \
+        "$HOME/Ascend/cann-9.0.0" /usr/local/Ascend/cann-9.0.0; do
+      if [[ -f "$_dsv4_cann/set_env.sh" ]]; then
+        CANN_HOME="$_dsv4_cann"
+        break
+      fi
+    done
+  fi
+  if [[ ! -f "${CANN_HOME:-}/set_env.sh" ]]; then
+    echo "[env][ERROR] Set CANN_HOME to the installed CANN directory." >&2
+    return 1
+  fi
+  export CANN_HOME
+  set +eu
+  source "$CANN_HOME/set_env.sh"
+  cann_env_rc=$?
+  if [[ "$cann_shell_flags" == *e* ]]; then set -e; else set +e; fi
+  if [[ "$cann_shell_flags" == *u* ]]; then set -u; else set +u; fi
+  if [[ "$cann_env_rc" -ne 0 ]]; then return "$cann_env_rc"; fi
+  export ASCEND_TOOLKIT_HOME="$CANN_HOME" ASCEND_HOME_PATH="$CANN_HOME"
+  if [[ "$env_mode" != runtime ]]; then
+    if [[ -z "${PYTHON_BIN:-}" ]]; then
+      PYTHON_BIN="$(command -v python3.11 || command -v python3.12 || command -v python3 || true)"
+    fi
+    if [[ -z "$PYTHON_BIN" ]]; then
+      echo "[env][ERROR] Set PYTHON_BIN to Python 3.11 or 3.12." >&2
+      return 1
+    fi
+    export PYTHON_BIN
+  fi
+  return 0
+}
+
+if [[ "${1:-}" == env ]]; then
+  _dsv4_env_rc=0
+  dsv4_init_env "${2:-setup}" || _dsv4_env_rc=$?
+  if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+    return "$_dsv4_env_rc"
+  fi
+  exit "$_dsv4_env_rc"
+fi
+
 set -euo pipefail
+dsv4_init_env setup
 
 # ----------------------------- configurable variables ------------------------
-# No machine-specific path is hardcoded: the interpreter is detected on PATH and the workspace root
-# defaults to the parent of this repo. All three can be overridden through the environment:
-# PYTHON_BIN / CANN_HOME / GITCODE.
-if [[ -z "${PYTHON_BIN:-}" ]]; then
-  PYTHON_BIN="$(command -v python3.11 || command -v python3 || true)"
-  if [[ -z "$PYTHON_BIN" ]]; then
-    echo "[setup][ERROR] No python3.11/python3 found. Set it explicitly: PYTHON_BIN=/path/to/python3.11 bash $0" >&2
-    exit 2
-  fi
-fi
-: "${CANN_HOME:=$HOME/Ascend/cann-9.0.0}"                         # CANN 9.0.0 as shipped in the clean image
+_SETUP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Clone root for the third-party repositories (ops-transformer / cann-recipes-infer /
 # sgl-kernel-npu). Defaults to the parent of the repo holding this script; override with
 # GITCODE=/your/workspace elsewhere.
-_SETUP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${GITCODE:=$(cd "$_SETUP_DIR/../.." && pwd)/..}"               # repository root
 GITCODE="$(cd "$GITCODE" 2>/dev/null && pwd || echo "$GITCODE")"
 : "${REPO:=$GITCODE/ktransformers-AK}"                            # this repo (holds kt-kernel and the sglang submodule)
@@ -91,6 +131,16 @@ die(){ echo -e "\033[1;31m[setup][FATAL] $*\033[0m" >&2; exit 1; }
 source_env(){ set +u; . "$1"; set -u; }
 
 # ----------------------------- 0. prerequisites ------------------------------
+phase_system_deps(){
+  log "phase system_deps: install system packages"
+  local apt_command=(apt-get)
+  if [[ "$EUID" -ne 0 ]]; then
+    apt_command=(sudo apt-get)
+  fi
+  "${apt_command[@]}" update
+  "${apt_command[@]}" install -y pkg-config libhwloc-dev libhwloc15
+}
+
 phase_prereq(){
   log "phase prereq: toolchain and permission checks"
   # umask 0002 makes the artifacts group-writable and CANN msopgen's security check aborts
@@ -110,8 +160,8 @@ phase_prereq(){
   apt-get install -y pkg-config libhwloc-dev libhwloc15"
   ldconfig -p 2>/dev/null | grep -q libhwloc.so.15 \
     || die "libhwloc.so.15 missing (runtime dependency of kt_kernel_ext). Ubuntu/Debian: apt-get install -y libhwloc15"
-  "$PYTHON_BIN" -c 'import sys;assert sys.version_info[:2]==(3,11),"need py3.11"' \
-    || die "Python must be 3.11 (the torch, torch_npu and custom-operator wheels are all cp311)"
+  "$PYTHON_BIN" -c 'import sys;assert sys.version_info[:2] in ((3,11),(3,12)),"need py3.11 or py3.12"' \
+    || die "Python must be 3.11 or 3.12; native extensions must match the selected interpreter ABI"
   echo "  CANN=$CANN_HOME  PY=$PYTHON_BIN  CC=$CC_BIN  SOC=$SOC"
   source_env "$CANN_HOME/set_env.sh"
   echo "  ASCEND_OPP_PATH=$ASCEND_OPP_PATH"
@@ -274,15 +324,20 @@ phase_kt_kernel(){
   section 3 to apply the patches with apply_all.sh, then rerun this phase
   (or override REPO=<your clone path>)."
   cd "$REPO/kt-kernel"
-  rm -rf build/temp.linux-aarch64-cpython-311
+  local py_cache_tag py_ext_suffix
+  py_cache_tag="$("$PYTHON_BIN" -c 'import sys; print(sys.implementation.cache_tag)')"
+  py_ext_suffix="$("$PYTHON_BIN" -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX"))')"
+  rm -rf "build/temp.linux-aarch64-${py_cache_tag}"
   # With ARM SVE=ON the MXFP4 CPU MoE takes the SVE branch and reports "llamafile not supported"
   # (moe.hpp:73/77), so SVE/BF16/I8MM must all be off, leaving the verified NEON
   # armv8.2+fp16+dotprod path. The CMakeLists used to force /usr/bin/gcc and now honours CC/CXX.
   CC="$CC_BIN" CXX="$CXX_BIN" CPUINFER_USE_ASCEND_NPU=1 \
     CPUINFER_ARM_SVE=OFF CPUINFER_ARM_BF16=OFF CPUINFER_ARM_I8MM=OFF \
-    "$PYTHON_BIN" setup.py build_ext --inplace
-  ls python/kt_kernel_ext.cpython-311-aarch64-linux-gnu.so \
-    && echo "  kt_kernel_ext.so built OK"
+    "$PYTHON_BIN" setup.py build_ext --inplace --force
+  local built_ext="build/lib.linux-aarch64-${py_cache_tag}/kt_kernel/kt_kernel_ext${py_ext_suffix}"
+  cmp -s "$built_ext" "python/kt_kernel_ext${py_ext_suffix}" \
+    || die "kt-kernel build/inplace extension missing or different: $built_ext"
+  echo "  kt_kernel_ext.so built and inplace copy verified OK"
 }
 
 # ----------------------------- 9. import gate --------------------------------
@@ -313,14 +368,13 @@ for op in ("compressor","npu_sparse_attn_sharedkv","npu_quant_lightning_indexer"
         raise RuntimeError(f"missing torch.ops.custom.{op}")
 print("torch.ops.custom.* all present OK")
 PY
-  echo "  == Environment bring-up and checks complete. Continue with the guide:" \
-       "section 2 clone -> 3 apply patches -> 4 build kt-kernel (incl. its import check)" \
-       "-> 5 convert GGUF -> 8 start the server. =="
+  echo "  Dependencies ready. Continue with guide sections 2-4."
 }
 
 # ----------------------------- dispatch --------------------------------------
 phase="${1:-all}"
 case "$phase" in
+  system_deps) phase_system_deps;;
   prereq) phase_prereq;;
   torch) phase_prereq; phase_torch;;
   triton) phase_prereq; phase_triton;;
@@ -332,9 +386,7 @@ case "$phase" in
   kt_kernel) phase_prereq; phase_kt_kernel;;
   verify) phase_verify;;
   all)
-    # Environment and dependency bring-up only: this does not touch the project's own repo
-    # (no clone, no patches, no kt-kernel build). kt-kernel is project code and belongs to
-    # section 4, built after the clone in section 2 and the patches in section 3.
+    phase_system_deps
     phase_prereq
     phase_torch
     phase_triton
