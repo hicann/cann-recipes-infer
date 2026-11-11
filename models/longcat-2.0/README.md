@@ -1,7 +1,7 @@
 # LongCat 2.0模型在NPU上推理优化实践样例
 
 ## 概述
-本样例介绍[LongCat 2.0开源代码](https://github.com/meituan-longcat/SGLang-FluentLLM.git) 在CANN平台上完成性能优化，支持在昇腾Atlas A2 Pod平台部署。推理部署优化的技术报告可见[NPU LongCat-2.0推理优化实践](./../../docs/models/longcat-2.0/longcat_2.0_optimization.md)。
+本样例介绍[LongCat 2.0开源代码](https://github.com/meituan-longcat/SGLang-FluentLLM/tree/npu) 在CANN平台上完成性能优化，支持在昇腾Atlas A2 Pod平台部署。推理部署优化的技术报告可见[NPU LongCat-2.0推理优化实践](./../../docs/models/longcat-2.0/longcat_2.0_optimization.md)。
 
 ### 部署规模
 
@@ -45,8 +45,8 @@ PyTorch版本：2.6
 
 3. 下载项目源码并安装依赖的python库。
     ```bash
-    # 下载项目源码，以master分支为例
-    git clone  https://github.com/meituan-longcat/SGLang-FluentLLM.git
+    # 下载项目源码，以npu分支为例
+    git clone  https://github.com/meituan-longcat/SGLang-FluentLLM/tree/npu
     # 安装依赖的python库
     cd SGLang-FluentLLM
     pip3 install -r ./npu_test/requirements.txt --no-deps
