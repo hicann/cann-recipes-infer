@@ -35,10 +35,9 @@ The following sections describe in detail the steps to run the GPT-OSS inference
    git clone https://gitcode.com/cann/cann-recipes-infer.git
 
    # Install the required Python libraries
-   cd cann-recipes-infer/models/gpt_oss
-   pip3 install -r requirements.txt
-
-   pip3 install -r requirements.txt
+   cd cann-recipes-infer
+   pip3 install -r models/gpt_oss/requirements.txt
+   ```
 
 4. Configure the environment variables required for running the example.
 
@@ -91,6 +90,8 @@ Developers can choose based on their model tasks and download the original weigh
      > **Note:** When using the LongBench dataset, the default task is text summarization. You can modify the default system prompt in the `build_dataset_input` function in `cann-recipes-infer/executor/utils/data_utils.py`.
 
 3. Execute the unified inference script.
+
+   Run the commands below from the `cann-recipes-infer` repository root.
 
    The unified entry script is located at `executor/scripts/infer.sh` and is controlled by the following parameters:
 

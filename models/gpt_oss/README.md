@@ -36,8 +36,8 @@
     git clone https://gitcode.com/cann/cann-recipes-infer.git
 
     # 安装依赖的python库
-    cd cann-recipes-infer/models/gpt_oss
-    pip3 install -r requirements.txt
+    cd cann-recipes-infer
+    pip3 install -r models/gpt_oss/requirements.txt
     ```
 
 4. 配置样例运行所需环境信息。
@@ -61,8 +61,8 @@
 
 1. 将原始权重目录与转换输出目录作为入参，运行转换程序
    ```shell
-   cd cann-recipes-infer/models/gpt_oss
-   python3 converter/convert.py --input /path/to/your/original/mxfp4/weights --output /path/to/your/output/bf16/weights 
+   cd cann-recipes-infer
+   python3 models/gpt_oss/converter/convert.py --input /path/to/your/original/mxfp4/weights --output /path/to/your/output/bf16/weights
    ```
 
 >转换完成后，输出目录里会包含本框架推理所需要的全部文件，可直接作为后续输入
@@ -100,6 +100,8 @@
       > 说明：使用LongBench数据集时，默认执行文本摘要任务，可在`cann-recipes-infer/executor/utils/data_utils.py`的`build_dataset_input`函数里修改默认的system prompt。
 
 3. 执行统一推理脚本。
+
+   以下命令均从 `cann-recipes-infer` 仓库根目录执行。
 
    统一入口脚本位于 `executor/scripts/infer.sh`，通过以下参数控制启动：
 
