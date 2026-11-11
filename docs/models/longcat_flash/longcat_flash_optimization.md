@@ -8,24 +8,22 @@
 LongCat-Flash结构中的与Llama类似的部分，可参考通用优化点[Llama](https://gitcode.com/Ascend/torchair/tree/master/npu_tuned_model/llm/llama)的改动，如固定KV Cache大小、cos/sin优化、AddRMSNorm融合等。
 
 ### 使能图模式
-使用静态图可以获得更好的推理性能。LongCat-Flash使用推理框架的图编译流程，在`executor/core/model_worker.py`的`ModelWorker.compile_model`中触发，并调用`executor/utils/graph_utils.py`中的`compile_model_forward`完成编译。
+使用静态图可以获得更好的推理性能。LongCat-Flash使用推理框架的图编译流程，在`executor/core/model_worker/model_worker.py`的`ModelWorker.compile_model`中触发，并调用`executor/utils/graph_utils.py`中的`compile_model_forward`完成编译。
 
-执行模式通过YAML中`model_config.exe_mode`配置，当前支持`eager`、`ge_graph`和`npugraph_ex`。其中`ge_graph`和`npugraph_ex`会在Decode阶段使用编译后的`model.forward`，Prefill阶段按`eager`模式执行。
+执行模式通过YAML中`model_config.exe_mode`配置，当前支持`eager`、`ge_graph`和`npugraph_ex`。其中`ge_graph`和`npugraph_ex`会在Decode阶段使用编译后的Decode接口（`main_decode`或`mtp_decode`），Prefill阶段按`eager`模式执行。
 
 #### 使能图编译缓存
 torch.compile是一种即时编译器（Just-In-Time compiler），成图首次编译时间通常较长，在时延敏感的模型推理场景下，使能图编译缓存可以缓存编译后的静态图，有效缩短服务启动后的首次推理时延，从而提高推理性能。当前编译入口如下：
 
 ```python
+# model_forward为ModelWorker选择的main_decode或mtp_decode接口
 self.model_compiled = compile_model_forward(
-    self.model.forward,
-    exe_mode=self.exe_mode,
-    enable_cache_compile=self.enable_cache_compile,
-    cache_dir=os.path.join(self.infer_config.model_config.output_path, "cache_compile"),
-    enable_static_kernel=self.enable_static_kernel,
+    model_forward,
+    self.infer_config,
 )
 ```
 
-图编译缓存通过YAML中`model_config.enable_cache_compile`开关使能，缓存目录为`model_config.output_path/cache_compile`。`ge_graph`模式下使用`torchair.inference.cache_compile`，`npugraph_ex`模式下使用`torch.npu.npugraph_ex.inference.cache_compile`；`npugraph_ex`还可通过`model_config.enable_static_kernel`使能静态kernel编译。
+图编译缓存通过YAML中`model_config.enable_cache_compile`开关使能，缓存目录为`model_config.output_path/compile_cache`。`ge_graph`模式下使用`torchair.inference.cache_compile`，`npugraph_ex`模式下使用`torch.npu.npugraph_ex.inference.cache_compile`；`npugraph_ex`还可通过`model_config.enable_static_kernel`使能静态kernel编译。
 
 ### 多流并行与控核
 大模型推理场景下，对于一些可并行的场景，可以划分多个stream做并行计算，多个stream上的计算形成overlap，从而降低整体计算耗时。多流并行技术的详细介绍，请参考[官方文档](https://www.hiascend.com/document/detail/zh/Pytorch/720/modthirdparty/torchairuseguide/torchair_00026.html)
