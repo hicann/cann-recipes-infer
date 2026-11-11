@@ -29,7 +29,7 @@ cd xxxxxx
 bash build_and_install.sh
 ```
 
-执行之后会完成源码编译与自定安装。编译完成之后，会在当前路径新生成一个dist文件夹存放新编译的wheel包。
+执行之后会完成源码编译与自动安装。编译完成之后，会在当前路径新生成一个dist文件夹存放新编译的wheel包。
 
 
 ## 快速上手
@@ -84,7 +84,7 @@ C++ extensions插件提供了将自定义算子映射到昇腾AI处理器的功�
 
 #### 注册自定义算子schema
 PyTorch提供TORCH_LIBRARY宏来定义新的命名空间，并在该命名空间里注册schema。注意命名空间的名字必须是唯一的。具体示例如下：
-```cpp 
+```cpp
 -- custom_pypto/csrc/ops_def_registration.cpp中添加如下代码
 
 #include <torch/library.h>
@@ -96,7 +96,7 @@ TORCH_LIBRARY_IMPL(custom_pypto, Meta, m) {
 
 #### 注册Meta函数
 通过PyTorch的Meta后端帮助算子完成入图时所需要的shape和data type推导。具体示例如下：
-```cpp 
+```cpp
 -- 创建custom_pypto/csrc/npu_lightning_indexer_pto.cpp
 #include <torch/library.h>
 #include "ops_common.h"
@@ -113,7 +113,7 @@ const int DIM_3 = 3;
 
 // 推导输出shape和data type
 at::Tensor construct_lightning_indexer_pto_output_tensor(
-    const at::Tensor &query, const at::Tensor &key, const at::Tensor &weights, 
+    const at::Tensor &query, const at::Tensor &key, const at::Tensor &weights,
     const c10::optional<at::Tensor> &actual_seq_lengths_key, const c10::optional<at::Tensor> &block_table)
 {
     at::SmallVector<int64_t, SIZE> output_size;
@@ -185,10 +185,10 @@ def convert_npu_lightning_indexer_pto(
     ):
 
     '''NB: npu_lightning_indexer_pto(Tensor query, Tensor key, Tensor weights, Tensor actual_seq_lengths_key, *, Tensor? block_table=None) -> Tensor'''
-    
+
     return torchair.ge.custom_op(
         "LightningIndexerPto",                 # 和REG_OP中算子原型名称保持一致，例如AddCustom
-        inputs={"x0": query,                   
+        inputs={"x0": query,
                 "x1": key,
                 "x2": weights,
                 "x3": actual_seq_lengths_key,

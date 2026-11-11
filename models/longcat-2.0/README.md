@@ -167,7 +167,7 @@ hf download meituan-longcat/LongCat-2.0-INT8 --local-dir /data/meituan-longcat/L
    #修改npu_test/flash26b/run_pro_dsa_pp.sh脚本中如下参数
    #testpath和logdir为实际测试执行路径
    #iplist为实际测试节点ip
-   #port为测试节点ssh登陆端口
+   #port为测试节点ssh登录端口
    bash npu_test/flash26b/run_pro_dsa_pp.sh code #分发网络脚本到各个节点
    bash npu_test/flash26b/run_pro_dsa_pp.sh start #启动服务
    ```

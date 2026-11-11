@@ -78,7 +78,7 @@
       ├── build_and_install.sh                  # 自定义算子wheel包编译与安装脚本
   |
   ├── build.sh                                  # 项目工程编译脚本
-  ├── CMakeList.txt                             # 项目工程编译配置文件
+  ├── CMakeLists.txt                             # 项目工程编译配置文件
   ├── README.md
   ├── version.info                              # 项目版本信息
   ```

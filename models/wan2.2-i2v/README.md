@@ -26,7 +26,7 @@ Wan2.2-I2V模型是一款多模态视频生成模型，提供了图生视频功�
 
 可选择：手动安装或直接使用cann两种方式
 **a. cann镜像**
-请登陆[cann镜像地址](https://www.hiascend.com/developer/ascendhub/detail/17da20d1c2b6493cb38765adeba85884)，点击**镜像下载**，根据芯片，cann版本，系统架构选择对应镜像，比如`8.5.0-910b-ubuntu22.04-py3.11` 或者 `9.0.1-950-ubuntu22.04-py3.12`，点击**立即下载**按指导进行docker pull。 完成镜像拉取后，使用如下指令开启镜像：
+请登录[cann镜像地址](https://www.hiascend.com/developer/ascendhub/detail/17da20d1c2b6493cb38765adeba85884)，点击**镜像下载**，根据芯片，cann版本，系统架构选择对应镜像，比如`8.5.0-910b-ubuntu22.04-py3.11` 或者 `9.0.1-950-ubuntu22.04-py3.12`，点击**立即下载**按指导进行docker pull。 完成镜像拉取后，使用如下指令开启镜像：
 ```
 docker run -u root -itd --name cann_recipes_infer_image --ulimit nproc=65535:65535 --ipc=host \
 --device=/dev/davinci0 \
@@ -117,11 +117,11 @@ pip install -r requirements.txt
 
 ### 准备模型权重
 
-  
+
 | 模型 |版本  |
 |--|--|
 | Wan2.2-I2V | [BF16](https://www.modelscope.cn/models/Wan-AI/Wan2.2-I2V-A14B-BF16/files?version=) |
-  
+
 
   下载Wan2.2-I2V-A14B-BF16模型权重到本地路径`ckpts`。
 ```
@@ -132,22 +132,22 @@ Wan2.2-I2V-A14B-BF16/
 │   └── umt5-xxl/
 │       ├── special_tokens_map.json
 │       ├── spiece.model
-│       ├── ...  
+│       ├── ...
 ├── high_noise_model/
 │   ├── config.json
 │   ├── diffusion_pytorch_model-00001-of-00006
-│   ├── ...  
+│   ├── ...
 │   └── diffusion_pytorch_model.index.json
 ├── low_noise_model/
 │   ├── config.json
 │   ├── diffusion_pytorch_model-00001-of-00006
-│   ├── ...  
+│   ├── ...
 │   └── diffusion_pytorch_model.index.json
 ├── models_t5_umt5-xxl-enc-bf16.pth
 ├── README.md
 └── Wan2.1_VAE.pth
 ```
-  
+
 
 ## 快速启动
 
