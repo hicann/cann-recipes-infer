@@ -67,7 +67,7 @@ with limit_core_num(True, "16", "32"):
 ### 权重预取
 该优化提供网络weight预取功能，在算子计算的同时，利用空闲的带宽，提前将一些访存bound算子的权重从HBM搬运到L2 Cache中，提升算子性能。npu_prefetch技术的详细介绍，请参考[官方文档](https://www.hiascend.com/document/detail/zh/Pytorch/730/apiref/torchnpuCustomsapi/docs/context/torch_npu-npu_prefetch.md)。npu_prefetch优化功能可通过`model_config.custom_params.enable_prefetch`开关使能；当前LongCat-Flash中该开关依赖多流优化，需要同时设置`enable_multi_streams > 0`。
 
-以下图为例，`Matmul`的权重有20 MB，前序的算子`RmsNorm`对内存带宽的需求较小，执行时间为10us，此时可以通过预取技术，将`Matmul`的权重提前写入到L2 Cache中，理想情况下，最大可预取的大小为 `HBM_brandwidth / time_available`，实际可预取大小因网络与前序算子对带宽的占用程度而异。假设此时可预取的大小为10 MB，与`RmsNorm`并行执行，则在`Matmul`算子执行时，只需要再额外读10 MB权重，访存的耗时开销减少明显。
+以下图为例，`Matmul`的权重有20 MB，前序的算子`RmsNorm`对内存带宽的需求较小，执行时间为10us，此时可以通过预取技术，将`Matmul`的权重提前写入到L2 Cache中，理想情况下，最大可预取的大小为 `HBM_bandwidth * time_available`，其中带宽使用字节/秒，时间使用秒，乘积才是字节数；实际可预取大小因网络与前序算子对带宽的占用程度而异。假设此时可预取的大小为10 MB，与`RmsNorm`并行执行，则在`Matmul`算子执行时，只需要再额外读10 MB权重，访存的耗时开销减少明显。
 <div align="center">
     <img src="./figures/prefetch_demo.jpg" width="300" />
 </div>
