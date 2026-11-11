@@ -114,7 +114,7 @@ pip uninstall -y sglang
    # 将修改本仓中的修改patch应用到sglang代码中
    git am ../cann-recipes-infer/integration/sglang/llada2.x/patches/*.patch
    ```
-3. 基于patched之后的代码，重装sglang. 
+3. 基于patched之后的代码，重装sglang.
    ```shell
    cd  ./python/
    cp  ../../cann-recipes-infer/integration/sglang/llada2.x/install_sglang_dev.sh ./
@@ -122,7 +122,7 @@ pip uninstall -y sglang
    chmod +x install_sglang_dev.sh
    ./install_sglang_dev.sh
    ```
-   
+
 ## 推理执行
 1. llada 2.1拉起服务, 如果模型文件以及下载到本地，替换--model-path的参数为本地参数路径
    ```shell
@@ -166,7 +166,7 @@ pip uninstall -y sglang
             --enable-cache-report \
             --tp 1 \
    ```
-   
+
 2. 执行推理
 	```shell
     curl http://localhost:8000/v1/chat/completions
@@ -263,11 +263,9 @@ python test_llada2_mini_ascend.py
 |[0007-NPU-Update-dllm-llada2.0-ci-for-npu.patch](patches/0007-NPU-Update-dllm-llada2.0-ci-for-npu.patch)|  Update dllm-llada2.0 ci for npu
 |[0008-NPU-dllm-update-format-code-with-pre-commit.patch](patches/0008-NPU-dllm-update-format-code-with-pre-commit.patch)|   dllm update: format code with pre-commit
 |[0009-NPU-update-ci-by-introducing-the-SGLANG_NPU_DISABLE_.patch](patches/0009-NPU-update-ci-by-introducing-the-SGLANG_NPU_DISABLE_.patch)|   update ci by introducing the SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT env parameter, to avoid oom with tp1
-|[0011-Update-joint_threshold.py.patch](patches/0009-NPU-update-ci-by-introducing-the-SGLANG_NPU_DISABLE_.patch)|   在npu上加速update-joint threhold 算法（for llada2.1
+|[0011-Update-joint_threshold.py.patch](patches/0011-Update-joint_threshold.py.patch)|   在npu上加速update-joint threhold 算法（for llada2.1
 |[0012-fuse-shared-output-into-moe-groupmatmul2-to-speedup-.patch](patches/0012-fuse-shared-output-into-moe-groupmatmul2-to-speedup-.patch)|  fuse shared output into moe groupmatmul2 to speedup on npu
 |[0013-Update-unquant.py.patch](patches/0013-Update-unquant.py.patch)|  cache the row idx for fusedMoE with NPU inference
 |[0014-update-the-ascend-dllm-accuracy-test-config.patch](patches/0014-update-the-ascend-dllm-accuracy-test-config.patch)|  update the accuracy test config file
-|[0015-update-the-comments-in-test_llada2_mini_ascend.py.patch](py.patch)|  update the commaccuracy test config file
+|[0015-update-the-comments-in-test_llada2_mini_ascend.py.patch](patches/0015-update-the-comments-in-test_llada2_mini_ascend.py.patch)|  update the commaccuracy test config file
 |[0016-revert-the-moe-gate-accuracy-to-the-model-prededfine.patch](patches/0016-revert-the-moe-gate-accuracy-to-the-model-prededfine.patch)|  revert the moe gate accuracy to the model predefined accuracy
-
-

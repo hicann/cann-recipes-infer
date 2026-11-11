@@ -235,7 +235,7 @@ int main()
 
 ### 多卡模式（nPes = 2）
 
-每个 PE 对应一个进程，各进程可运行在不同 Device 上。完整代码见 [test/test_rank2.cpp](../distributed_embedding/test/test_rank2.cpp)，核心用法如下：
+每个 PE 对应一个进程，各进程可运行在不同 Device 上。完整代码见 [test/d2d/test_rank2.cpp](../distributed_embedding/test/d2d/test_rank2.cpp)，核心用法如下：
 
 ```cpp
 const int rank = /* 从环境变量 RANK_ID 读取 */;
