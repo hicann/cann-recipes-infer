@@ -61,6 +61,13 @@ def parse_arguments():
     parser.add_argument("--output_width", type=int)
     parser.add_argument("--output_height", type=int)
     parser.add_argument("--upsample_mode", type=str)
+
+    # FA MXFP8 dynamic quantization switches (see `bash infer.sh fa_mxfp8`).
+    parser.add_argument("--fa-mxfp8", action="store_true", default=False,
+                        help="Enable MXFP8 dynamic quantization for flash attention paths.")
+    parser.add_argument("--fa-mxfp8-fallback", action="store_true", default=False,
+                        help="With --fa-mxfp8: fall back to BF16 (with an auditable log) on "
+                             "unsupported shapes instead of failing fast.")
     args, _ = parser.parse_known_args()
     return args
 
@@ -70,6 +77,12 @@ def main(config=None):
     if config is None:
         config = parse_config()
     model = get_dit(config.arch_config, config.engine_config)
+    if args.fa_mxfp8:
+        from inference.model.dit.dit_module import FaMxfp8Runtime
+
+        # Per-model instance config (no module-level state); attached before any
+        # forward and read-only from then on -- see FaMxfp8Runtime.
+        model.block.fa_mxfp8 = FaMxfp8Runtime(enabled=True, fallback=args.fa_mxfp8_fallback)
     pipeline = MagiPipeline(
         model,
         config.evaluation_config,

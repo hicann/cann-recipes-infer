@@ -1,5 +1,5 @@
 # 在昇腾Atlas A2/A3环境上适配daVinci-MagiHuman模型的推理
-daVinci-MagiHuman 模型是一款多模态视频生成模型，提供了文生视频、图文生视频功能。本项目旨在提供 daVinci-MagiHuman 模型的 Atlas A2/A3 适配版本，为开发者开展相关 NPU 迁移工作提供参考。
+daVinci-MagiHuman 模型是一款多模态视频生成模型，提供了文生视频、图文生视频功能。本项目旨在提供 daVinci-MagiHuman 模型的 Atlas A2/A3 适配版本，为开发者开展相关 NPU 迁移工作提供参考；其中 `fa_mxfp8` 量化模式需 Ascend 950（CANN ≥ 9.1.0）。
 
 本项目基于NPU主要完成以下优化点，具体内容可至[NPU daVinci-MagiHuman模型推理优化实践](https://gitcode.com/cann/cann-recipes-infer/blob/master/docs/models/davinci-magihuman/davinci-magihuman_optimization.md)查看：
 
@@ -13,7 +13,7 @@ daVinci-MagiHuman 模型是一款多模态视频生成模型，提供了文生�
 
 
 ## 执行样例
-本样例支持支持Atlas A2/A3环境的单卡推理。
+本样例支持 Atlas A2/A3 环境的单卡推理；`fa_mxfp8` 量化模式需 Ascend 950（CANN ≥ 9.1.0）。
 
 ### 创建conda环境
 
@@ -29,13 +29,14 @@ conda install ffmpeg
 
 1. 安装CANN软件包
 
-   本样例的编译执行依赖CANN开发套件包与CANN二进制算子包，支持的CANN软件版本为`CANN 9.0.0`。
-  
-   请从[软件包下载地址](https://www.hiascend.com/developer/download/community/result?module=cann&cann=9.0.0)下载`Ascend-cann-toolkit_${version}_linux-${arch}.run`和`Ascend-cann-${soc}-ops_${version}_linux-${arch}.run`软件包，并参考[CANN安装文档](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/900/softwareinst/instg/instg_0000.html?OS=Debian&InstallType=netconda)进行安装。
-   
+   本样例的编译执行依赖CANN开发套件包与CANN二进制算子包。base/distill/sr 等常规模式支持的CANN软件版本为`CANN 9.0.0`。
+
+   请从[软件包下载地址](https://www.hiascend.com/developer/download/community/result?module=cann)下载`Ascend-cann-toolkit_${version}_linux-${arch}.run`和`Ascend-cann-${soc}-ops_${version}_linux-${arch}.run`软件包，并参考[CANN安装文档](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/900/softwareinst/instg/instg_0000.html?OS=Debian&InstallType=netconda)进行安装。
+
    - `${soc}`表示芯片版本，如910b、A3。
    - `${version}`表示CANN包版本号，如9.0.0。
    - `${arch}`表示CPU架构，如aarch64、x86_64。
+   - **fa_mxfp8 模式附加要求**：`fa_mxfp8` 模式（FA MXFP8 动态量化）需 **Ascend 950** 与 `CANN 9.1.0` 及以上（下载页最新版本如 9.2.0 亦可），且须同时安装 `Ascend-cann-toolkit` 与 `Ascend-cann-950-ops` 两个软件包；低于 9.1.0 时按 `fa-mxfp8-fallback` 开关回退 BF16（开关默认 `false`，即 fail-fast 硬报错）。
 
 2. 安装Ascend Extension for PyTorch（torch_npu）。
 
@@ -117,14 +118,14 @@ pip install --no-deps -r requirements-nodeps.txt
 
 ### 准备模型权重
 
-  
+
 | 模型 |下载链接  |
 |--|--|
 | daVinci-MagiHuman | [daVinci-MagiHuman](https://www.modelscope.cn/models/GAIR/daVinci-MagiHuman/files) |
 | Text Encoder | [t5gemma-9b-9b-ul2](https://www.modelscope.cn/models/google/t5gemma-9b-9b-ul2/files) |
 | Audio Model | [stable-audio-open-1.0](https://www.modelscope.cn/models/stabilityai/stable-audio-open-1.0/files) |
 | VAE | [Wan2.2-TI2V-5B](https://www.modelscope.cn/models/Wan-AI/Wan2.2-TI2V-5B/files) |
-  
+
 
 下载上述4个模型权重到本地路径`models`，下载完成后，本地的模型权重目录结构如下图所示：
 
@@ -239,7 +240,7 @@ models/
 
 本样例通过 `bash infer.sh ${mode}` 拉起，推理参数集中在 `config/*.yaml`、`config/.json` 维护。
 
-- `${mode}`表示模式，如base、base_ti2v、distill、sr_540p等，共8种模式，详见下表关于模式的说明。
+- `${mode}`表示模式，如base、base_ti2v、distill、sr_540p、fa_mxfp8等，共9种模式，详见下表关于模式的说明。
 
 
 |模式|说明|配置文件|
@@ -252,6 +253,11 @@ models/
 |sr_540p_ti2v | 使用distill模型，图文生视频，超分辨率到540p|sr_540p_ti2v.yaml, sr_540p_config.json|
 |sr_1080p | 使用distill模型，文生视频，超分辨率到1080p|sr_1080p.yaml, sr_1080p_config.json|
 |sr_1080p_ti2v | 使用distill模型，图文生视频，超分辨率到1080p|sr_1080p_ti2v.yaml, sr_1080p_config.json|
+|fa_mxfp8 | 使用base模型，文生视频，输出256p，注意力走 MXFP8 动态量化（需 Ascend 950 + CANN ≥ 9.1.0，不支持时回退 BF16）|base.yaml（运行时注入 fa-mxfp8 开关）, base_config.json|
+
+`fa_mxfp8` 模式的配置方式：该模式不维护独立的 `fa_mxfp8.yaml`，而是复用 `base.yaml`——`infer.sh` 拉起前会在运行时生成 `config/fa_mxfp8_runtime.yaml`（以 `base.yaml` 为底，向 `model_args` 注入 `fa-mxfp8: true`、`fa-mxfp8-fallback: true`，并将 `output_path` 改为 `output_fa_mxfp8`）。因此调整该模式的时长、分辨率等推理参数时，直接修改 `base.yaml` 即可（与 `base` 模式共享同一份配置）。
+
+关于开关默认值：`base.yaml` 的 `model_args` 不携带 `fa-mxfp8` / `fa-mxfp8-fallback` 两个开关，入口脚本 `inference/pipeline/entry.py` 中同名 argparse 参数的默认值均为 `False`；`mm_function.sh` 将 YAML `model_args` 转为命令行参数的规则为「布尔值 `false` 不下发、由 argparse 使用默认值」，两侧默认行为一致（未显式开启时量化默认关闭）。
 
 #### 1. 配置 CANN 环境变量
 
@@ -301,7 +307,7 @@ unset ENABLE_PROFILER
 
 Profiling输出的目录为`prof/${mode}_prof`。
 
-- `${mode}`表示模式，如base、base_ti2v、distill、sr_540p等，共8种模式，详见前述关于模式的表格。
+- `${mode}`表示模式，如base、base_ti2v、distill、sr_540p、fa_mxfp8等，共9种模式，详见前述关于模式的表格。
 
 #### 5. 拉起推理
 
@@ -324,7 +330,16 @@ bash infer.sh sr_540p_ti2v
 bash infer.sh sr_1080p
 # 使用distill模型，图文生视频，超分辨率到1080p
 bash infer.sh sr_1080p_ti2v
+# 使用base模型 + MXFP8 注意力量化（Ascend 950 + CANN >= 9.1.0；不支持组合自动回退 BF16）
+bash infer.sh fa_mxfp8
 ```
+
+
+## FA MXFP8 量化说明（Ascend 950）
+
+`fa_mxfp8` 模式将 DiT 注意力切换为 MXFP8 动态量化执行（FP8 E4M3 + e8m0 动态 scale，`npu_fused_infer_attention_score_v2` MX quant mode），需 Ascend 950 + CANN ≥ 9.1.0。量化策略为 `scale_alg=1` 全局生效，并仅对首层 K 做中心化（模型侧精度策略：量化前减去 K 沿序列维的逐头均值，再调用通用量化接口；softmax 对 key 维常数平移不变，数学无损，仅收窄量化动态范围）。支持范围以实测为准：dense `flash_attn_func` 路径（GQA 40:8）实测支持（实机命中并经数值对齐验证）；`flex_flash_attn_func` 局部/变长路径不提供 MXFP8 实现，与 context-parallel>1 同为不支持组合——`fa-mxfp8` 开启时这些路径自动回退 BF16（`fa-mxfp8-fallback: false` 时 fail-fast 硬报错）。
+
+`fa-mxfp8-fallback` 默认 `false`，即遇不支持组合（flex 局部/变长、context-parallel>1、head_dim 非 32 倍数、CANN 版本过低等）fail-fast 硬报错；置 `true` 时回退 BF16 并打印 `[FA_MXFP8] fallback:` 审计日志（审计日志经仓库统一 logging 输出，级别由 `CANN_RECIPES_LOG_LEVEL` 控制）。一键入口 `bash infer.sh fa_mxfp8` 基于 `config/base.yaml` 运行时注入 `fa-mxfp8: true`、`fa-mxfp8-fallback: true` 与 `output_path: output_fa_mxfp8`，无独立 YAML。原理与精度验证方法详见 [NPU daVinci-MagiHuman模型推理优化实践](../../docs/models/davinci-magihuman/davinci-magihuman_optimization.md) 与 [module/fa_quant/README.md](../../module/fa_quant/README.md)。
 
 
 ## 性能数据
@@ -463,6 +478,8 @@ dit_cache:
 | sr_width | int | - | SR（super-resolution）去噪输出的视频帧宽度 |
 | sr_height | int | - | SR（super-resolution）去噪输出的视频帧高度 |
 | output_path | str | - | 输出视频文件路径 |
+| fa-mxfp8 | bool | false | 开启 FA MXFP8 动态量化（需 Ascend 950 + CANN ≥ 9.1.0；一键入口 `bash infer.sh fa_mxfp8`，基于 base.yaml 运行时注入） |
+| fa-mxfp8-fallback | bool | false | 遇不支持组合（flex 局部/变长、context-parallel>1、head_dim 非 32 倍数、CANN 版本过低等）时回退 BF16 并输出审计日志；false 时 fail-fast 硬报错 |
 
 一层配置项说明如下：
 

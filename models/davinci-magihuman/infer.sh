@@ -18,6 +18,7 @@
 #   bash infer.sh sr_540p_ti2v      # TI2V super-resolution 540p
 #   bash infer.sh sr_1080p          # T2V super-resolution 1080p
 #   bash infer.sh sr_1080p_ti2v     # TI2V super-resolution 1080p
+#   bash infer.sh fa_mxfp8          # T2V base with MXFP8 flash attention
 
 set -euo pipefail
 
@@ -33,11 +34,11 @@ export MODEL_DIR="$(basename "$SCRIPT_PATH")"
 export YAML_PARENT_PATH="${SCRIPT_PATH}/config"
 
 case "${MODE}" in
-    base|base_ti2v|distill|distill_ti2v|sr_540p|sr_540p_ti2v|sr_1080p|sr_1080p_ti2v)
+    base|base_ti2v|distill|distill_ti2v|sr_540p|sr_540p_ti2v|sr_1080p|sr_1080p_ti2v|fa_mxfp8)
         ;;
     *)
         echo "[ERROR] Unknown mode: ${MODE}"
-        echo "Usage: bash infer.sh <base|base_ti2v|distill|distill_ti2v|sr_540p|sr_540p_ti2v|sr_1080p|sr_1080p_ti2v>"
+        echo "Usage: bash infer.sh <base|base_ti2v|distill|distill_ti2v|sr_540p|sr_540p_ti2v|sr_1080p|sr_1080p_ti2v|fa_mxfp8>"
         exit 1
         ;;
 esac
@@ -59,10 +60,13 @@ esac
 PROMPT_FILE="${SCRIPT_PATH}/example/assets/prompt.txt"
 RUNTIME_YAML="${YAML_PARENT_PATH}/${MODE}_runtime.yaml"
 
+# fa_mxfp8 mode reuses config/base.yaml and injects the fa-mxfp8 switches at
+# runtime below, instead of keeping a near-duplicate copy of the base YAML.
 python3 <<GEN_RUNTIME_YAML
 import yaml, sys, os
 
-yaml_path = '${YAML_PARENT_PATH}/${MODE}.yaml'
+src_mode = 'base' if '${MODE}' == 'fa_mxfp8' else '${MODE}'
+yaml_path = '${YAML_PARENT_PATH}/' + src_mode + '.yaml'
 runtime_path = '${RUNTIME_YAML}'
 prompt_file = '${PROMPT_FILE}'
 
@@ -74,6 +78,10 @@ try:
     if prompt.startswith('"') and prompt.endswith('"'):
         prompt = prompt[1:-1]
     cfg['model_args']['prompt'] = prompt
+    if '${MODE}' == 'fa_mxfp8':
+        cfg['model_args']['fa-mxfp8'] = True
+        cfg['model_args']['fa-mxfp8-fallback'] = True
+        cfg['model_args']['output_path'] = 'output_fa_mxfp8'
     if os.path.exists(runtime_path):
         os.remove(runtime_path)
     with open(runtime_path, 'w') as f:

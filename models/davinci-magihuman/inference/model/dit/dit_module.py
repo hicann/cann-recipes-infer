@@ -16,6 +16,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 import weakref
 from dataclasses import dataclass
 from enum import Enum
@@ -25,13 +26,20 @@ import torch
 import torch_npu
 import torch.nn as nn
 from einops import rearrange, repeat
+from torch import Tensor
+from torch.nn import Parameter
 from inference.common import Modality, VarlenHandler
 from inference.infra.parallelism import ulysses_scheduler
 from magi_compiler import magi_compile
 from magi_compiler.api import magi_register_custom_op
 from magi_compiler.config import CompileConfig
-from torch import Tensor
-from torch.nn import Parameter
+from module.fa_quant import FaMxfp8Unsupported, npu_mxfp8_dense_attn
+
+
+# Audit logging goes through the repository-wide logging setup
+# (executor/utils/logging_config.py, level controlled by CANN_RECIPES_LOG_LEVEL);
+# this module only grabs a named logger and adds no handler of its own.
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -189,7 +197,7 @@ class ElementWiseFourierEmbed(nn.Module):
         Args:
             dim: Output feature dimension, total channels, must be divisible by 6
             max_res: Max pixel-frequency resolution for pixel-domain bands
-            temperature: Temperature in inverse-frequency mode
+            temperature: Inverse of temperature in inverse-frequency mode
             in_pixels: True -> pixel-frequency bands, False -> inverse-frequency bands
             linear_bands: Whether pixel-frequency bands are linearly spaced
             learnable: Whether frequency bands are trainable
@@ -411,6 +419,73 @@ def create_linear(
     else:
         return NativeMoELinear(in_features, out_features, num_layers, num_experts, bias, device, dtype)
 
+
+class FaMxfp8Runtime:
+    """Explicit per-model configuration for the MXFP8 flash-attention path.
+
+    Created once by the inference entry (pipeline/entry.py) before inference starts
+    and attached to the DiT block instance (``model.block.fa_mxfp8 = FaMxfp8Runtime(...)``);
+    treated as read-only from then on. Per-call behaviour (``center_key``) flows through
+    explicit forward arguments, so the module keeps no global mutable state and two
+    pipelines with different configs can coexist in one process.
+
+    enabled=False (or leaving the attribute unset): attention keeps the original BF16
+    npu_fused_infer_attention_score path, behaviour is bit-for-bit unchanged.
+    enabled=True: Q/K/V are dynamically quantized to MXFP8 (fp8 e4m3 + e8m0 scale) and
+    dense attention runs through npu_fused_infer_attention_score_v2 with MX quant modes.
+    Unsupported shapes or environments raise immediately (fallback=False, the default)
+    or fall back to BF16 with an auditable log (fallback=True).
+    """
+
+    def __init__(self, enabled: bool, fallback: bool = False):
+        self.enabled = bool(enabled)
+        self.fallback = bool(fallback)
+        self._logged = set()
+        logger.info(f"[FA_MXFP8] configure: enabled={self.enabled} fallback={self.fallback}")
+
+    def log_once(self, event: str, detail: str):
+        key = (event, detail)
+        if key not in self._logged:
+            self._logged.add(key)
+            logger.info(f"[FA_MXFP8] {event}: {detail}")
+
+
+@magi_register_custom_op(name="infra::flash_attn_func_mxfp8", is_subgraph_boundary=True)
+def flash_attn_func_mxfp8(
+    query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, center_key: bool = False
+) -> torch.Tensor:
+    """MXFP8 variant of infra::flash_attn_func (enable/fallback policy: FaMxfp8Runtime).
+
+    The MXFP8 implementation (support guard, BF16 cast, quantization, FA v2 call)
+    lives in module/fa_quant (npu_mxfp8_dense_attn); this wrapper keeps only the
+    model-side pieces: the custom-op registration, the first-layer K centering
+    accuracy policy and the context-parallel world size. Raises
+    FaMxfp8Unsupported for unsupported shapes/environments; the fail-fast vs
+    BF16-fallback decision belongs to the caller.
+    """
+    original_dtype = query.dtype
+    # scale_alg=1 rounds block scales up so no activation block exceeds the
+    # fp8 range (zero clipping); see module/fa_quant.
+    key = key.to(torch.bfloat16).contiguous()
+    if center_key:
+        # Purpose: first-layer K centering is a model-side quantization
+        # accuracy policy, kept out of the public fa_quant API on purpose.
+        # Exactness: softmax over keys is invariant to the constant
+        # per-query logit shift the centering introduces, so the attention
+        # output is unchanged in exact arithmetic.
+        # Benefit: K quantizes over a narrower dynamic range.
+        key = (key.float() - key.float().mean(1, keepdim=True)).to(key.dtype)
+    from inference.infra.distributed import get_cp_world_size
+
+    output = npu_mxfp8_dense_attn(
+        query,
+        key,
+        value,
+        softmax_scale=1.0 / (query.shape[-1] ** 0.5),
+        scale_alg=1,
+        cp_world_size=get_cp_world_size(),
+    )
+    return output.to(original_dtype)
 
 
 @magi_register_custom_op(name="infra::flash_attn_func", is_subgraph_boundary=True)
@@ -682,6 +757,8 @@ class Attention(torch.nn.Module):
         modality_dispatcher: ModalityDispatcher,
         cp_split_sizes: List[int],
         residual: Optional[torch.Tensor] = None,
+        fa_mxfp8: Optional[FaMxfp8Runtime] = None,
+        center_key: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         normed = self.pre_norm(hidden_states, modality_dispatcher=modality_dispatcher, residual=residual)
         if residual is not None:
@@ -710,10 +787,31 @@ class Attention(torch.nn.Module):
             q = apply_rotary_emb_torch(q, cos_emb, sin_emb)
             k = apply_rotary_emb_torch(k, cos_emb, sin_emb)
 
+        mxfp8 = fa_mxfp8 is not None and fa_mxfp8.enabled
         if self.config.use_local_attn:
+            if mxfp8:
+                # The flex (local/varlen) path has no MXFP8 implementation; per the
+                # support matrix it must fall back to BF16 (or fail fast) with an
+                # audited reason instead of executing silently.
+                reason = "flex/local-varlen attention has no MXFP8 implementation (see the model README)"
+                if not fa_mxfp8.fallback:
+                    raise RuntimeError(f"[FA_MXFP8] fa-mxfp8 is enabled but unsupported: {reason}")
+                fa_mxfp8.log_once("fallback", f"flex_flash_attn_func -> BF16: {reason}")
             self_attn_out = flex_flash_attn_with_cp(
                 q, k, v, local_attn_handler.q_ranges, local_attn_handler.k_ranges, cp_split_sizes
             )
+        elif mxfp8:
+            try:
+                self_attn_out = flash_attn_func_mxfp8(q, k, v, center_key=center_key).squeeze(0)
+                fa_mxfp8.log_once(
+                    "mxfp8-hit",
+                    f"flash_attn_func b={q.shape[0]} s={q.shape[1]} n={q.shape[2]} kv_n={k.shape[2]} d={q.shape[3]}",
+                )
+            except FaMxfp8Unsupported as exc:
+                if not fa_mxfp8.fallback:
+                    raise RuntimeError(f"[FA_MXFP8] fa-mxfp8 is enabled but unsupported: {exc}") from exc
+                fa_mxfp8.log_once("fallback", f"flash_attn_func -> BF16: {exc}")
+                self_attn_out = flash_attn_with_cp(q, k, v, cp_split_sizes)
         else:
             self_attn_out = flash_attn_with_cp(q, k, v, cp_split_sizes)
         self_attn_out = ModalityDispatcher.permute(self_attn_out, permute_mapping)
@@ -885,6 +983,8 @@ class TransFormerLayer(torch.nn.Module):
         modality_dispatcher: ModalityDispatcher,
         cp_split_sizes: List[int],
         residual: Optional[torch.Tensor] = None,
+        fa_mxfp8: Optional[FaMxfp8Runtime] = None,
+        center_key: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         attn_out, hidden_states = self.attention(
             hidden_states,
@@ -896,6 +996,8 @@ class TransFormerLayer(torch.nn.Module):
             modality_dispatcher,
             cp_split_sizes,
             residual=residual,
+            fa_mxfp8=fa_mxfp8,
+            center_key=center_key,
         )
         if self.post_norm:
             attn_out = self.attn_post_norm(attn_out, modality_dispatcher=modality_dispatcher)
@@ -928,6 +1030,10 @@ class TransformerBlock(torch.nn.Module):
         self.layers: list[TransFormerLayer] = nn.ModuleList()
         for layer_idx in range(model_config.num_layers):
             self.layers.append(TransFormerLayer(model_config, layer_idx))
+        # Optional MXFP8 attention runtime (see FaMxfp8Runtime). Attached by the
+        # inference entry before inference starts, read-only afterwards;
+        # None (default) keeps the BF16 path only.
+        self.fa_mxfp8: Optional[FaMxfp8Runtime] = None
 
     def forward(
         self,
@@ -941,7 +1047,11 @@ class TransformerBlock(torch.nn.Module):
         cp_split_sizes: List[int],
     ) -> torch.Tensor:
         residual = None
-        for _, layer in enumerate(self.layers):
+        fa_mxfp8 = self.fa_mxfp8
+        for layer_idx, layer in enumerate(self.layers):
+            # K centering benefits the first layer, whose K distribution carries
+            # the largest mean offset; later layers keep it off.
+            center_key = fa_mxfp8 is not None and fa_mxfp8.enabled and layer_idx == 0
             x, residual = layer(
                 x,
                 rope,
@@ -952,6 +1062,8 @@ class TransformerBlock(torch.nn.Module):
                 modality_dispatcher,
                 cp_split_sizes,
                 residual=residual,
+                fa_mxfp8=fa_mxfp8,
+                center_key=center_key,
             )
         if residual is not None:
             x = x + residual

@@ -157,3 +157,33 @@ daVinci-MagiHuman开源代码是在H100 GPU（显存80GB）设备上运行的，
 其次，在`models/davinci-magihuman/inference/pipeline/video_generate.py`中调用`CPUOffloadWrapper`类的`prepare_resident_backup`、`disable_offload`、`enable_offload`函数。
 
 详细改动可以对比本仓库与开源代码仓这2个文件的差异。
+
+## FA MXFP8 动态量化（Ascend 950）
+
+daVinci-MagiHuman 的 DiT 注意力支持通过配置开关切换到 MXFP8 动态量化执行：Q/K/V 经 `module/fa_quant` 的 `npu_mxfp8_quant` 动态量化为 FP8 E4M3（scale 为 e8m0，逐 token / 每 64-token 组动态产出），注意力经 `npu_fused_infer_attention_score_v2` 以 MXFP8 quant mode 计算，输出恢复原 dtype。该能力依赖 **CANN ≥ 9.1.0** 与 Ascend 950（950PR 实测通过）。支持范围以实测为准，见下表：
+
+| 注意力路径 | fa-mxfp8 | 行为 |
+|---|---|---|
+| dense `flash_attn_func`（含 GQA） | 支持（950PR 实测） | MXFP8 量化执行（FA v2 quant mode） |
+| `flex_flash_attn_func`（局部/变长） | 不支持（无 MXFP8 实现） | 回退 BF16（审计日志）或 fail-fast |
+| context-parallel（cp_size>1） | 不支持（未验证） | 同上 |
+
+### 启用方式
+
+一键入口：`bash infer.sh fa_mxfp8`。该模式复用 `config/base.yaml`，由 `infer.sh` 在生成 runtime yaml 时注入以下开关（无独立 YAML）：
+
+```yaml
+model_args:
+  fa-mxfp8: true
+  fa-mxfp8-fallback: true
+  output_path: "output_fa_mxfp8"
+```
+
+- `fa-mxfp8`（默认 `false`）：开启后 DiT 注意力切换 MXFP8 路径；`false` 时保持 BF16 `npu_fused_infer_attention_score` 路径，行为不变；
+- `fa-mxfp8-fallback`（默认 `false`）：遇不支持的组合（`flex_flash_attn_func` 局部/变长、context-parallel>1、head_dim 非 32 倍数、非 NPU 张量、CANN 版本过低等）时置 `true` 自动回退 BF16 并输出 `[FA_MXFP8] fallback: ...` 审计日志（经仓库统一 logging 输出，级别由 `CANN_RECIPES_LOG_LEVEL` 控制）；`false`（默认）时 fail-fast 硬报错。`bash infer.sh fa_mxfp8` 的注入值为 `true`。
+
+### 实现要点
+
+- 实现收敛在公共模块 `module/fa_quant`：`npu_mxfp8_quant` / `npu_mxfp8_attn` 为通用量化与 FA v2 封装，`npu_mxfp8_dense_attn` 为带守卫的 dense 封装（不支持时抛 `FaMxfp8Unsupported`）；DiT 侧注册算子 `infra::flash_attn_func_mxfp8` 复用之，仅保留模型侧策略（首层 K 中心化、context-parallel 世界大小获取）；
+- 量化策略：`scale_alg=1`（scale 指数向上取整）全局生效；仅首层 K 中心化为模型侧精度策略（量化前减去 K 沿序列维的逐头均值，softmax 对 key 维常数平移不变）；
+- 精度验证：BF16/MXFP8 同 seed 双跑 dump 对比（FA 输出 cos 0.99967，DiT block0 rel 2.43%），方法与材料见 #490。

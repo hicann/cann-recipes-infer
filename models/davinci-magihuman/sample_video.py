@@ -17,5 +17,11 @@ from inference.infra import initialize_infra
 from inference.pipeline.entry import main
 
 if __name__ == "__main__":
+    try:
+        from executor.utils.logging_config import setup_logging
+        setup_logging()
+    except ImportError:
+        import logging
+        logging.basicConfig(level=logging.INFO)
     config = initialize_infra()
     main(config)
