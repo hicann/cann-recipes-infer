@@ -42,6 +42,7 @@ from module.fa_quant import FaMxfp8Unsupported, npu_mxfp8_dense_attn
 logger = logging.getLogger(__name__)
 
 
+
 @dataclass
 class FFAHandler:
     q_ranges: torch.Tensor
@@ -62,6 +63,10 @@ class MLPActivationType(Enum):
 
 def swiglu7(x, alpha: float = 1.702, limit: float = 7.0, out_dtype: Optional[torch.dtype] = None):
     out_dtype = x.dtype if out_dtype is None else out_dtype
+    if x.dtype == torch.bfloat16 and out_dtype == torch.bfloat16:
+        x_in = x if x.is_contiguous() else x.contiguous()
+        out = torch_npu.npu_clipped_swiglu(x_in, alpha=alpha, limit=limit, bias=1.0, interleaved=True)
+        return out.to(out_dtype)
     x_f32 = x.to(torch.float32).contiguous()
     out = torch_npu.npu_clipped_swiglu(x_f32, alpha=alpha, limit=limit, bias=1.0, interleaved=True)
     return out.to(out_dtype)
@@ -76,6 +81,7 @@ def gelu7(x, limit: float = 7.0, out_dtype: Optional[torch.dtype] = None):
 
 
 def create_activation_func(activation_type: MLPActivationType) -> Callable:
+    # if/elif keeps this file parseable under CI pre-commit (CPython 3.9).
     if activation_type == MLPActivationType.SWIGLU7:
         return swiglu7
     if activation_type == MLPActivationType.GELU7:
@@ -276,7 +282,11 @@ class MultiModalityRMSNorm(nn.Module):
         self.eps = eps
         self.num_modality = num_modality
 
+        # Keep fp32 Parameter: aclnnRmsNorm (non-residual) rejects bf16 gamma.
+        # Residual path needs bf16 gamma for npu_add_rms_norm — use cached bf16
+        # (weight+1) so per-step fp32→bf16 Cast is paid once, not every forward.
         self.weight = torch.nn.Parameter(torch.zeros(dim * num_modality, device=device, dtype=torch.float32))
+        self._gamma_bf16_cache: Optional[torch.Tensor] = None
         if num_modality > 1:
             self.forward = self.forward_multi_experts
         else:
@@ -286,21 +296,33 @@ class MultiModalityRMSNorm(nn.Module):
 
     def reset_parameters(self):
         nn.init.zeros_(self.weight)
+        self._gamma_bf16_cache = None
+
+    def _gamma_bf16(self) -> torch.Tensor:
+        # Inference weights are frozen; cache avoids repeating Cast in the DiT loop.
+        if self._gamma_bf16_cache is None or self._gamma_bf16_cache.device != self.weight.device:
+            self._gamma_bf16_cache = (self.weight + 1).to(torch.bfloat16).contiguous()
+        return self._gamma_bf16_cache
 
     def forward_multi_experts(
         self, x: torch.Tensor, modality_dispatcher: ModalityDispatcher, residual: Optional[torch.Tensor] = None
     ):
         x_list = modality_dispatcher.dispatch(x)
-        weight_chunked = self.weight.chunk(self.num_modality, dim=0)
         if residual is not None:
             residual_list = modality_dispatcher.dispatch(residual)
+            gamma_chunked = self._gamma_bf16().chunk(self.num_modality, dim=0)
             for i in range(self.num_modality):
-                gamma_i = (weight_chunked[i] + 1).to(torch.bfloat16).contiguous()
+                gamma_i = gamma_chunked[i]
                 x_list[i], _, residual_list[i] = torch_npu.npu_add_rms_norm(
-                    residual_list[i].to(gamma_i.dtype), x_list[i].to(gamma_i.dtype), gamma_i, self.eps)
+                    residual_list[i].to(gamma_i.dtype),
+                    x_list[i].to(gamma_i.dtype),
+                    gamma_i,
+                    self.eps,
+                )
             t = modality_dispatcher.undispatch(*x_list)
             new_residual = modality_dispatcher.undispatch(*residual_list)
             return t, new_residual
+        weight_chunked = self.weight.chunk(self.num_modality, dim=0)
         for i in range(self.num_modality):
             gamma_i = (weight_chunked[i] + 1).contiguous()
             x_list[i] = torch_npu.npu_rms_norm(x_list[i], gamma_i, self.eps)[0]
@@ -313,12 +335,16 @@ class MultiModalityRMSNorm(nn.Module):
         modality_dispatcher: Optional[ModalityDispatcher] = None,
         residual: Optional[torch.Tensor] = None,
     ):
-        gamma = (self.weight + 1).contiguous()
         if residual is not None:
-            gamma = gamma.to(torch.bfloat16)
+            gamma = self._gamma_bf16()
             out, _, new_residual = torch_npu.npu_add_rms_norm(
-                residual.to(gamma.dtype), x.to(gamma.dtype), gamma, self.eps)
+                residual.to(gamma.dtype),
+                x.to(gamma.dtype),
+                gamma,
+                self.eps,
+            )
             return out, new_residual
+        gamma = (self.weight + 1).contiguous()
         out = torch_npu.npu_rms_norm(x, gamma, self.eps)[0]
         return out
 
@@ -333,21 +359,16 @@ class _BF16ComputeLinear(torch.autograd.Function):
         output_dtype: Optional[torch.dtype],
         compute_dtype: torch.dtype = torch.bfloat16,
     ):
-        # Convert input to specified input data type
+        # Weight/bias are constructed as bf16 in BaseLinear; rely on that contract
+        # instead of re-checking on every forward. Only input may still need Cast.
         input_cast = input.to(compute_dtype)
-        # Convert weight to computation data type
-        weight_cast = weight.to(compute_dtype)
-        # Perform linear operation
-        output = torch.matmul(input_cast, weight_cast.t())
+        output = torch.matmul(input_cast, weight.t())
 
-        # Add bias if present
         if bias is not None:
-            bias_cast = bias.to(compute_dtype)
-            output = output + bias_cast
-        else:
-            bias_cast = None
+            output = output + bias
 
-        # Convert output to specified output data type
+        if output_dtype is None or output.dtype == output_dtype:
+            return output
         return output.to(output_dtype)
 
 
@@ -381,6 +402,8 @@ class BaseLinear(nn.Module):
         output_dtype: Optional[torch.dtype] = None,
         modality_dispatcher: Optional[ModalityDispatcher] = None,
     ) -> torch.Tensor:
+        # Preserve upstream contract: None means follow input dtype.
+        # Call sites that need a BF16 pipeline cast the input before Linear.
         output_dtype = input.dtype if output_dtype is None else output_dtype
         return _BF16ComputeLinear.apply(input, self.weight, self.bias, output_dtype, torch.bfloat16)
 
@@ -495,7 +518,7 @@ def flash_attn_func(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor)
     scale = 1.0 / (d ** 0.5)
 
     original_dtype = query.dtype
-
+    # FA kernel requires bf16; Attention.forward feeds bf16 Q/K/V after Linear + RMSNorm + RoPE.
     query = query.to(torch.bfloat16).contiguous()
     key = key.to(torch.bfloat16).contiguous()
     value = value.to(torch.bfloat16).contiguous()
@@ -639,8 +662,7 @@ def _attention_with_cp_infer_output_meta(q: torch.Tensor, *args, **kwargs) -> to
     is_subgraph_boundary=True,
 )
 def flash_attn_with_cp(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, cp_split_sizes: List[int]) -> torch.Tensor:
-    q, k, v = q.to(torch.bfloat16), k.to(torch.bfloat16), v.to(torch.bfloat16)
-
+    # Q/K/V dtype is fixed by Attention.forward (bf16); FA boundary casts in flash_attn_func.
     from inference.infra.distributed import get_cp_group, get_cp_world_size
     from inference.infra.parallelism.all_to_all_primitive import (
         batch_scatter_head_gather_seqlen, scatter_seqlen_gather_head,
@@ -677,7 +699,10 @@ def flex_flash_attn_with_cp(
     k_ranges: torch.Tensor,
     cp_split_sizes: List[int],
 ) -> torch.Tensor:
-    q, k, v = q.to(torch.bfloat16).squeeze(0), k.to(torch.bfloat16).squeeze(0), v.to(torch.bfloat16).squeeze(0)
+    # Q/K/V dtype is fixed by Attention.forward (bf16); FA boundary casts in flex_flash_attn_func.
+    q = q.squeeze(0)
+    k = k.squeeze(0)
+    v = v.squeeze(0)
 
     from inference.infra.distributed import get_cp_group, get_cp_world_size
     from inference.infra.parallelism.all_to_all_primitive import (
@@ -763,7 +788,10 @@ class Attention(torch.nn.Module):
         normed = self.pre_norm(hidden_states, modality_dispatcher=modality_dispatcher, residual=residual)
         if residual is not None:
             normed, hidden_states = normed
-        qkv: torch.Tensor = self.linear_qkv(normed.to(torch.bfloat16), modality_dispatcher=modality_dispatcher)
+        # Cast to bf16 before Linear so output_dtype=None follows bf16 (not fp32).
+        qkv: torch.Tensor = self.linear_qkv(
+            normed.to(torch.bfloat16), modality_dispatcher=modality_dispatcher
+        )
 
         q, k, v, g = torch.split(qkv, [self.q_size, self.kv_size, self.kv_size, self.gating_size], dim=1)
         q = q.view(-1, self.config.num_heads_q, self.config.head_dim)
@@ -871,9 +899,11 @@ class MLP(torch.nn.Module):
         normed = self.pre_norm(x, modality_dispatcher=modality_dispatcher, residual=residual)
         if residual is not None:
             normed, x = normed
+        # Enter Linear/activation in bf16; activations return input dtype when
+        # out_dtype is omitted, so no second Cast before down_proj.
         normed = normed.to(torch.bfloat16)
-        normed = self.up_gate_proj(normed, modality_dispatcher=modality_dispatcher).to(torch.float32)
-        normed = self.activation_func(normed).to(torch.bfloat16)
+        normed = self.up_gate_proj(normed, modality_dispatcher=modality_dispatcher)
+        normed = self.activation_func(normed)
         out = self.down_proj(normed, modality_dispatcher=modality_dispatcher)
         return out, x
 

@@ -23,7 +23,7 @@ from inference.infra.checkpoint import load_model_checkpoint
 from inference.infra.distributed import get_cp_rank, get_pp_rank, get_tp_rank
 from inference.utils import print_mem_info_rank_0, print_model_size, print_rank_0
 
-from .dit_module import DiTModel
+from .dit_module import DiTModel, MultiModalityRMSNorm
 
 
 def get_dit(model_config, engine_config, device=None):
@@ -44,6 +44,13 @@ def get_dit(model_config, engine_config, device=None):
     else:
         model.to(device)
     model.eval()
+    # Pre-build bf16 RMSNorm gamma caches after weights are on device so the
+    # profiled / timed DiT loop does not pay per-step fp32→bf16 Cast.
+    # Only MultiModalityRMSNorm exposes this cache; do not swallow errors.
+    with torch.no_grad():
+        for m in model.modules():
+            if isinstance(m, MultiModalityRMSNorm):
+                m._gamma_bf16()
     print_mem_info_rank_0("Load model successfully")
 
     gc.collect()
