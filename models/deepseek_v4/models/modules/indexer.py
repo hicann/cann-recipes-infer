@@ -128,17 +128,25 @@ class Indexer(nn.Module):
             )
 
     def get_cache(self, cache_name: str) -> torch.Tensor:
-        if self.cache_getter is None:
-            raise RuntimeError(f"cache_getter is required when accessing {cache_name}.")
         return self.cache_getter(cache_name)
 
     def get_runtime_cache(self, cache_name: str, attn_metadata: Dict, is_prefill: bool) -> torch.Tensor:
-        if is_prefill and self.cp_size > 1 and not self.is_online and attn_metadata["cp_metadata"]:
-            tmp_cache = attn_metadata["cp_metadata"].get("cp_tmp_cache", None)
-            if tmp_cache is not None:
-                return tmp_cache["4"][cache_name]
-            else:
-                raise ValueError("When cp is enabled, a temporary cache is required, but no temporary cache is found.")
+        if is_prefill and self.cp_size > 1 and not self.is_online:
+            cp_metadata = attn_metadata.get("cp_metadata")
+            tmp_cache = (
+                cp_metadata.get("cp_tmp_cache")
+                if isinstance(cp_metadata, dict) else None
+            )
+            if (
+                not isinstance(tmp_cache, dict)
+                or not tmp_cache
+                or not isinstance(tmp_cache.get("4"), dict)
+            ):
+                raise ValueError(
+                    f"Missing CP temporary cache for indexer layer {self.layer_idx}, "
+                    "ratio 4 during offline prefill."
+                )
+            return tmp_cache["4"][cache_name]
         return self.get_cache(cache_name)
 
     def forward(
@@ -151,15 +159,14 @@ class Indexer(nn.Module):
         cmpr_event: tuple[torch.npu.Event],
         cmpr_event_idx: int,
         is_prefill: bool = True,
+        *,
+        indexer_current_x: Optional[torch.Tensor] = None,
     ):
         enable_multi_streams = self.enable_multi_streams and not is_prefill
         enable_limit_core = self.enable_limit_core and not is_prefill
 
         if is_prefill and self.cp_size > 1:
-            cos_prev, sin_prev = attn_metadata["prev"]["cos_sin"]["comp"]
-            cos_next, sin_next = attn_metadata["next"]["cos_sin"]["comp"]
-            cos = torch.cat([cos_prev, cos_next], dim=0)
-            sin = torch.cat([sin_prev, sin_next], dim=0)
+            cos, sin = attn_metadata["cp_cos_sin"]["comp"]
         else:
             cos, sin = attn_metadata["cos_sin"]["comp"]
 
@@ -167,11 +174,20 @@ class Indexer(nn.Module):
                             exe_mode=self.infer_config.model_config.exe_mode):
             # weight project
             if is_prefill and self.cp_size > 1:
-                q_len = qr.shape[0] // 2
-                if attn_metadata["prev"]["is_start"]:
-                    x_for_weights_proj = torch.cat([x[0][:q_len], x[1][-q_len:]], dim=0)
+                # Reuse the packed [prev, next] current-segment input.
+                if indexer_current_x is not None:
+                    x_for_weights_proj = indexer_current_x
                 else:
-                    x_for_weights_proj = torch.cat([x[0][-q_len:], x[1][-q_len:]], dim=0)
+                    # Fallback for callers that provide only augmented streams.
+                    q_len = qr.shape[0] // 2
+                    if attn_metadata["prev"]["is_start"]:
+                        x_for_weights_proj = torch.cat(
+                            [x[0][:q_len], x[1][-q_len:]], dim=0
+                        )
+                    else:
+                        x_for_weights_proj = torch.cat(
+                            [x[0][-q_len:], x[1][-q_len:]], dim=0
+                        )
             else:
                 x_for_weights_proj = x
             # compressor
@@ -245,14 +261,55 @@ class Indexer(nn.Module):
         # LI fusion kernel
         wait_event(enable_multi_streams, self.indexer_events, 1)
         if is_prefill and self.cp_size > 1:
-            q_prev, q_next = q.split(q.shape[0] // 2, dim=0)
+            cp_metadata = attn_metadata.get("cp_metadata")
+            if not isinstance(cp_metadata, dict):
+                cp_metadata = {}
+            indexer_plan = cp_metadata.get("indexer_plan", {}) \
+                if isinstance(cp_metadata, dict) else None
+            local_half_tokens = cp_metadata.get("local_prev_token_num") \
+                if isinstance(cp_metadata, dict) else None
+            if local_half_tokens is None and isinstance(indexer_plan, dict):
+                for flag in ("prev", "next"):
+                    flag_plan = indexer_plan.get(flag, {})
+                    if isinstance(flag_plan, dict) and flag_plan.get("local_half_tokens") is not None:
+                        local_half_tokens = flag_plan["local_half_tokens"]
+                        break
+            if isinstance(local_half_tokens, torch.Tensor):
+                # Prefer the host shape value to avoid per-layer device ``item()``.
+                if local_half_tokens.numel() == 1 and local_half_tokens.device.type == "cpu":
+                    local_half_tokens = int(local_half_tokens)
+                else:
+                    local_half_tokens = None
+            if local_half_tokens is None:
+                segment_lens = cp_metadata.get("segment_lens")
+                if segment_lens is not None:
+                    local_half_tokens = sum(segment_lens)
+            # Fall back to the tensor shape when metadata is stale or incomplete.
+            if not isinstance(local_half_tokens, int) \
+                    or local_half_tokens <= 0 \
+                    or local_half_tokens >= q.shape[0] \
+                    or local_half_tokens * 2 != q.shape[0]:
+                local_half_tokens = q.shape[0] // 2
+
+            def split_rows(tensor, preferred_half):
+                # Derive a complete split for legacy or alternate layouts.
+                half = (
+                    preferred_half
+                    if tensor.shape[0] == 2 * preferred_half
+                    else tensor.shape[0] // 2
+                )
+                return torch.split(
+                    tensor, (half, tensor.shape[0] - half), dim=0
+                )
+
+            q_prev, q_next = split_rows(q, local_half_tokens)
             q_dict = {"prev": q_prev, "next": q_next}
             if self.li_cache_quant_mode == "hifloat8":
                 q_scale_prev, q_scale_next = q_scale, q_scale
             else:
-                q_scale_prev, q_scale_next = q_scale.split(q_scale.shape[0] // 2, dim=0)
+                q_scale_prev, q_scale_next = split_rows(q_scale, local_half_tokens)
             q_scale_dict = {"prev": q_scale_prev, "next": q_scale_next}
-            weights_prev, weights_next = weights.split(weights.shape[0] // 2, dim=0)
+            weights_prev, weights_next = split_rows(weights, local_half_tokens)
             weights_dict = {"prev": weights_prev, "next": weights_next}
             topk_list = []
             for zz_flag in ["prev", "next"]:

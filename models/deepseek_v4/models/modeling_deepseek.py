@@ -88,6 +88,7 @@ from .modules import (get_window_topk_idxs, get_compress_topk_idxs,
                       get_total_aic_num
                     )
 from .modules import Indexer, Compressor
+from .modules.cp_metadata import prepare_prefill_cp_inputs
 from .modules.separate_mla import (
     SeparateMLATopology, forward_separate_mla, validate_separate_mla_config,
 )
@@ -1097,11 +1098,8 @@ class Attention(nn.Module):
 
     def _get_runtime_cmp_cache(self, attn_metadata, is_prefill):
         if is_prefill and self.cp_size > 1 and not self.is_online and attn_metadata["cp_tmp_cache"]:
-            tmp_cache = attn_metadata["cp_tmp_cache"]
-            if tmp_cache is not None:
-                return tmp_cache[f"{self.compress_ratio}"]["sfa_cmp_kv"]
-            else:
-                raise ValueError("When cp is enabled, a temporary cache is required, but no temporary cache is found.")
+            # Use the planner's per-ratio temporary cache during offline CP prefill.
+            return attn_metadata["cp_tmp_cache"][f"{self.compress_ratio}"]["sfa_cmp_kv"]
         return self.sfa_cmp_kv
 
     def _init_cache_entries(self):
@@ -1331,6 +1329,12 @@ class Attention(nn.Module):
 
         win_cache = self.win_kv
         win_kv_slot_mapping = attn_metadata["slot_mapping"]["win_kv"]
+        if is_prefill and self.cp_size > 1:
+            # Persist only owner requests; keep the expanded B*W map separate
+            # from the scheduler's compact map so MTP can reuse metadata.
+            win_kv_slot_mapping = attn_metadata["cp_metadata"].get(
+                "persistent_win_slot_mapping", win_kv_slot_mapping
+            )
         self.update_win_kv(kv, win_kv_slot_mapping, win_cache)
         return q, qr, qr_scale, x
 
@@ -1341,54 +1345,77 @@ class Attention(nn.Module):
     ):
         hidden_size = x.shape[-1]
         cp_metadata = attn_metadata["cp_metadata"]
-        cp_rank = cp_metadata.get("cp_rank", self.global_rank % self.cp_size)
+        batch_size = len(cp_metadata["split_list"]) // (2 * self.cp_size)
+        window_plan = cp_metadata.get("window_plan") or {}
+        combined_plan = window_plan["combined"]
 
-        # Collect tail windows (last 128 tokens) of all CP segments
-        x_prev, x_next = x.split(x.shape[0] // 2, dim=0)
-        cur_win_list = []
-        for zz_flag in ["prev", "next"]:
-            x_seg = x_prev if zz_flag == "prev" else x_next
-            cur_kv_len = attn_metadata[zz_flag]["cur_kv_len"]
-            if cur_kv_len >= self.window_size:
-                cur_win = x_seg[cur_kv_len - self.window_size: cur_kv_len]
-            else:
-                cur_win = x_seg[:cur_kv_len]
-                pad_win = x.new_zeros((self.window_size - cur_kv_len, hidden_size))
-                cur_win = torch.cat([cur_win, pad_win], dim=0)
-            cur_win_list.append(cur_win)
-        cur_win = torch.cat(cur_win_list, dim=0)
+        # Build the final window only on ranks with persistent owner rows; it
+        # seeds the window cache used by later decode.
+        persistent_valid_rows = cp_metadata.get("persistent_win_valid_row_indices")
+        need_last_win_kv = (
+            persistent_valid_rows is None or persistent_valid_rows.numel() > 0
+        )
+
+        # Uniform valid tails use a view; padded or variable-length tails use
+        # the planner's indexed gather and mask.
+        if combined_plan.get("tail_contiguous", False):
+            segment_len = int(combined_plan["tail_segment_len"])
+            cur_win = x.view(2 * batch_size, segment_len, hidden_size).narrow(
+                1, segment_len - self.window_size, self.window_size
+            )
+        else:
+            tail_source = combined_plan["tail_source_indices"].view(-1)
+            cur_win = x.index_select(0, tail_source).view(
+                2 * batch_size, self.window_size, hidden_size
+            )
+            if not combined_plan["tail_all_valid"]:
+                tail_padding_mask = combined_plan["tail_padding_mask"].view(
+                    2 * batch_size, self.window_size
+                )
+                cur_win = cur_win.masked_fill(tail_padding_mask.unsqueeze(-1), 0)
+        cur_win = cur_win.reshape(-1, hidden_size)
         all_win = x.new_empty((cur_win.shape[0] * self.cp_size, hidden_size))
         dist.all_gather_into_tensor(all_win, cur_win, group=self.comm_manager.get_group("cp_group"))
-        all_win = all_win.view(-1, self.window_size, hidden_size)[cp_metadata["reverse_index"]]
+        pre_window_value_count = int(combined_plan["pre_window_value_count"])
+        window_sources = combined_plan["window_value_source_indices"]
+        if need_last_win_kv:
+            window_values = all_win.index_select(0, window_sources)
+            pre_values = window_values[:pre_window_value_count]
+            last_win = window_values[pre_window_value_count:].view(
+                batch_size, self.window_size, hidden_size
+            )
+        elif pre_window_value_count:
+            # Ranks without persistent rows gather only preceding-window rows.
+            pre_values = all_win.index_select(
+                0, window_sources[:pre_window_value_count]
+            )
+        else:
+            pre_values = all_win[:0]
 
-        # Retrieve the window from the tail of the previous CP segment,
-        # and concatenate it to the current CP segment
-        x_list = []
-        for zz_flag in ["prev", "next"]:
-            x_seg = x_prev if zz_flag == "prev" else x_next
-            if not (attn_metadata[zz_flag]["is_start"] and zz_flag == "prev"):
-                # get pre win except rank 0
-                if zz_flag == "prev":
-                    pre_win = all_win[cp_rank - 1]
-                else:
-                    pre_win = all_win[2 * self.cp_size - cp_rank - 2]
-                x_seg = torch.cat([pre_win, x_seg], dim=0)
-            x_list.append(x_seg)
+        # Assemble the packed [prev-augmented, next-augmented] stream from the
+        # planner's current-row and preceding-window coordinates.
+        augmented = x.new_empty(
+            (int(combined_plan["augmented_total_rows"]), hidden_size)
+        )
+        current_dest = combined_plan["augmented_current_dest_indices"].view(-1)
+        augmented.index_copy_(0, current_dest, x)
+        if pre_window_value_count > 0:
+            pre_dest = combined_plan["pre_window_dest_indices"].view(-1)
+            augmented.index_copy_(0, pre_dest, pre_values)
 
-        # Compute the last window kv of the entire sequence
+        # Build the request-major final window used by the persistent cache.
+        if not need_last_win_kv:
+            return None, augmented
+        last_plan = window_plan.get("last")
+        if not last_plan["last_window_all_valid"]:
+            last_padding_mask = last_plan["last_window_padding_mask"].view(
+                batch_size, self.window_size
+            )
+            last_win = last_win.masked_fill(last_padding_mask.unsqueeze(-1), 0)
+        last_win = last_win.view(-1, hidden_size)
         cos_sin = attn_metadata["prev"]["cos_sin"]
         cos, sin = cos_sin["c1a_last_win"] if self.compress_ratio == 1 \
             else cos_sin["comp_last_win"]
-        last_kv_len = attn_metadata["prev"]["last_kv_len"]
-        last_rank = attn_metadata["cp_metadata"]["last_rank"]
-        if last_kv_len >= self.window_size:
-            last_win = all_win[last_rank]
-        elif last_rank == 0:
-            last_win = all_win[last_rank]
-        else:
-            last_win = all_win[last_rank, :last_kv_len]
-            second_last_win = all_win[last_rank - 1]
-            last_win = torch.cat([second_last_win[-(self.window_size - last_kv_len):], last_win], dim=0)
         last_win_kv = self.wkv(last_win)
         last_win_kv = self.kv_norm(last_win_kv)
         torch.ops.cann_ops_transformer.inplace_partial_rotary_mul(
@@ -1396,7 +1423,7 @@ class Attention(nn.Module):
             rotary_mode="interleave",
             partial_slice=self.partial_slice,
         )
-        return last_win_kv, x_list
+        return last_win_kv, augmented
 
     def mla_prolog_prefill(
         self,
@@ -1428,20 +1455,12 @@ class Attention(nn.Module):
 
         qr = self.wq_a(x_q if move_quant_before else x, dynamic_scale=x_scale).view(num_tokens, -1)
         if self.cp_size > 1:
-            cp_metadata_prev, cp_metadata_next = attn_metadata["prev"], attn_metadata["next"]
-            cos_sin_prev, cos_sin_next = cp_metadata_prev["cos_sin"], cp_metadata_next["cos_sin"]
-            cos_prev, sin_prev = cos_sin_prev["c1a"] if self.compress_ratio == 1 else cos_sin_prev["comp"]
-            cos_next, sin_next = cos_sin_next["c1a"] if self.compress_ratio == 1 else cos_sin_next["comp"]
-            cos_q = torch.cat([cos_prev, cos_next], dim=0)
-            sin_q = torch.cat([sin_prev, sin_next], dim=0)
-            last_win_kv, x_with_pre_win = self.get_cp_window(x, attn_metadata)
-            cos_prev, sin_prev = cos_sin_prev["c1a_with_pre_win"] if self.compress_ratio == 1 \
-                else cos_sin_prev["comp_with_pre_win"]
-            cos_next, sin_next = cos_sin_next["c1a_with_pre_win"] if self.compress_ratio == 1 \
-                else cos_sin_next["comp_with_pre_win"]
-            cos = torch.cat([cos_prev, cos_next], dim=0)
-            sin = torch.cat([sin_prev, sin_next], dim=0)
-            x = torch.cat(x_with_pre_win, dim=0)
+            cp_metadata = attn_metadata["cp_metadata"]
+            cp_cos_sin = attn_metadata["cp_cos_sin"]
+            rope_key = "c1a" if self.compress_ratio == 1 else "comp"
+            cos_q, sin_q = cp_cos_sin[rope_key]
+            last_win_kv, x = self.get_cp_window(x, attn_metadata)
+            cos, sin = cp_cos_sin[f"{rope_key}_with_pre_win"]
         else:
             cos_sin = attn_metadata["cos_sin"]
             cos, sin = cos_sin["c1a"] if self.compress_ratio == 1 else cos_sin["comp"]
@@ -1488,12 +1507,15 @@ class Attention(nn.Module):
         # update temporary full cache
         full_kv_cache = attn_metadata["full_kv_cache"]
         if self.cp_size > 1:
-            full_kv_slot_mapping_prev = cp_metadata_prev["slot_mapping_ori_kv"]
-            full_kv_slot_mapping_next = cp_metadata_next["slot_mapping_ori_kv"]
-            full_kv_slot_mapping = torch.cat([full_kv_slot_mapping_prev, full_kv_slot_mapping_next], dim=-1)
+            full_kv_slot_mapping = cp_metadata["full_kv_slot_mapping"]
+            full_kv_valid_row_indices = cp_metadata["full_kv_valid_row_indices"]
         else:
             full_kv_slot_mapping = attn_metadata["slot_mapping"]["full_kv"]
-        self.update_win_kv(kv, full_kv_slot_mapping, full_kv_cache)
+            full_kv_valid_row_indices = None
+        self.update_win_kv(
+            kv, full_kv_slot_mapping, full_kv_cache,
+            valid_row_indices=full_kv_valid_row_indices,
+        )
 
         # extract tail cache
         if self.cp_size > 1:
@@ -1502,11 +1524,28 @@ class Attention(nn.Module):
             has_decode_requests = decode_token_indices.numel() > 0
             if not has_decode_requests:
                 return q, qr, qr_scale, x
+            if last_win_kv is None:
+                # Full-KV is already updated; this non-owner has no persistent write.
+                return q, qr, qr_scale, x
 
         win_cache = self.win_kv
         win_kv_slot_mapping = attn_metadata["slot_mapping"]["win_kv"]
+        if is_prefill and self.cp_size > 1:
+            # Persist owner rows with the expanded B*W map; keep the scheduler
+            # mapping compact for reuse by MTP.
+            win_kv_slot_mapping = attn_metadata["cp_metadata"].get(
+                "persistent_win_slot_mapping", win_kv_slot_mapping
+            )
+            win_kv_valid_row_indices = attn_metadata["cp_metadata"].get(
+                "persistent_win_valid_row_indices"
+            )
+        else:
+            win_kv_valid_row_indices = None
 
-        self.update_win_kv(kv, win_kv_slot_mapping, win_cache)
+        self.update_win_kv(
+            kv, win_kv_slot_mapping, win_cache,
+            valid_row_indices=win_kv_valid_row_indices,
+        )
         return q, qr, qr_scale, x
 
     def mla_prolog_decode(
@@ -1687,27 +1726,44 @@ class Attention(nn.Module):
         kv: torch.Tensor,
         win_kv_slot_mapping: torch.Tensor,
         win_cache: torch.Tensor,
+        valid_row_indices: Optional[torch.Tensor] = None,
     ):
+        # Reshape supports both contiguous planner maps and legacy slices.
+        flat_slots = win_kv_slot_mapping.reshape(-1)
+        flat_kv = kv.reshape(-1, kv.shape[-1])
+        if valid_row_indices is not None:
+            # Reuse the precomputed valid-row map instead of reducing an NPU mask per layer.
+            if (valid_row_indices.device != flat_slots.device
+                    or valid_row_indices.dtype != torch.long):
+                valid_row_indices = valid_row_indices.to(
+                    device=flat_slots.device, dtype=torch.long
+                )
+            valid_row_indices = valid_row_indices.view(-1)
+            if valid_row_indices.numel() == 0:
+                return
+            if valid_row_indices.numel() != flat_slots.numel():
+                flat_slots = flat_slots.index_select(0, valid_row_indices)
+                flat_kv = flat_kv.index_select(0, valid_row_indices)
         if self.kv_cache_quant_mode == "hifloat8":
-            win_kv_slot_mapping = win_kv_slot_mapping.to(
+            flat_slots = flat_slots.to(
                 device=win_cache.device, dtype=torch.int32
             ).contiguous()
             win_cache_scale = torch.empty(
                 (*win_cache.shape[:-1], 1), dtype=torch.float32, device=win_cache.device
             )
-            slot_mapping_i32 = win_kv_slot_mapping.view(-1)
+            slot_mapping_i32 = flat_slots.view(-1)
             torch.ops.cann_ops_transformer.indexer_quant_cache(
                 cache=win_cache,
                 cache_scale=win_cache_scale,
-                x=kv.view(-1, self.head_dim),
+                x=flat_kv,
                 slot_mapping=slot_mapping_i32,
                 quant_mode="hifloat8",
                 x_scale=1.0,
             )
         elif self.kv_cache_quant_mode == "float8":
             torch.ops.cann_ops_transformer.kv_compress_epilog(
-                x=kv.view(-1, self.head_dim),
-                slot_mapping=win_kv_slot_mapping,
+                x=flat_kv,
+                slot_mapping=flat_slots,
                 cache=win_cache,
                 quant_mode="fp8_bf16"
             )
@@ -1718,8 +1774,8 @@ class Attention(nn.Module):
                 scatter = torch.ops.custom.scatter_nd_update_asc
             scatter(
                 win_cache.view(-1, win_cache.shape[-1]),
-                win_kv_slot_mapping.view(-1, 1),
-                kv.view(-1, self.head_dim),
+                flat_slots.view(-1, 1),
+                flat_kv,
             )
 
     def sparse_attn(
@@ -1730,11 +1786,17 @@ class Attention(nn.Module):
         qr_scale: torch.Tensor,
         attn_metadata: Optional[Dict] = None,
         is_prefill: bool = True,
+        indexer_current_x: Optional[torch.Tensor] = None,
         **kwargs
     ):
         if is_prefill and self.cp_size > 1:
-            q_len = q.shape[0] // 2
-            x = list(x.split([x.shape[0] - q_len - self.window_size, q_len + self.window_size], dim=0))
+            cp_metadata = attn_metadata["cp_metadata"]
+            window_plan = cp_metadata.get("window_plan") or {}
+            prev_plan = window_plan.get("prev", {})
+            next_plan = window_plan.get("next", {})
+            prev_len = prev_plan.get("augmented_total_rows")
+            next_len = next_plan.get("augmented_total_rows")
+            x = list(x.split([prev_len, next_len], dim=0))
 
         enable_cmpr_stream = self.enable_compressor_parallel and not is_prefill
         enable_limit_core = self.enable_limit_core and not is_prefill
@@ -1758,8 +1820,14 @@ class Attention(nn.Module):
         # separate sfa compressor and li qb dynamic quant
         if self.compress_ratio == 4:
             # wait self.cmpr_events[1] in self.indexer
-            topk_idxs = \
-                self.indexer(x, qr, qr_scale, attn_metadata, enable_cmpr_stream, self.cmpr_events, 1, is_prefill)
+            indexer_args = (
+                {"indexer_current_x": indexer_current_x}
+                if indexer_current_x is not None else {}
+            )
+            topk_idxs = self.indexer(
+                x, qr, qr_scale, attn_metadata, enable_cmpr_stream,
+                self.cmpr_events, 1, is_prefill, **indexer_args,
+            )
         else:
             topk_idxs = None
 
@@ -1767,7 +1835,27 @@ class Attention(nn.Module):
             wait_event(enable_cmpr_stream, self.cmpr_events, 1) # finish compressor before sfa
 
         if is_prefill and self.cp_size > 1:
-            q_prev, q_next = q.split(q.shape[0] // 2, dim=0)
+            cp_metadata = attn_metadata.get("cp_metadata")
+            if not isinstance(cp_metadata, dict):
+                cp_metadata = {}
+            local_half_tokens = cp_metadata.get("local_prev_token_num")
+            if isinstance(local_half_tokens, torch.Tensor):
+                if local_half_tokens.numel() == 1 and local_half_tokens.device.type == "cpu":
+                    local_half_tokens = int(local_half_tokens)
+                else:
+                    local_half_tokens = None
+            if local_half_tokens is None:
+                segment_lens = cp_metadata.get("segment_lens")
+                if segment_lens is not None:
+                    local_half_tokens = sum(segment_lens)
+            if not isinstance(local_half_tokens, int) \
+                    or local_half_tokens <= 0 \
+                    or local_half_tokens >= q.shape[0] \
+                    or local_half_tokens * 2 != q.shape[0]:
+                local_half_tokens = q.shape[0] // 2
+            q_prev, q_next = torch.split(
+                q, (local_half_tokens, q.shape[0] - local_half_tokens), dim=0
+            )
             if self.compress_ratio == 4:
                 topk_idxs_prev, topk_idxs_next = topk_idxs
             else:
@@ -1811,13 +1899,10 @@ class Attention(nn.Module):
         '''
         num_tokens = o.shape[0]
         if is_prefill and self.cp_size > 1:
-            cos_sin_prev, cos_sin_next = attn_metadata["prev"]["cos_sin"], attn_metadata["next"]["cos_sin"]
-            cos_prev = cos_sin_prev["c1a"][0] if self.compress_ratio == 1 else cos_sin_prev["comp"][0]
-            cos_next = cos_sin_next["c1a"][0] if self.compress_ratio == 1 else cos_sin_next["comp"][0]
-            sin_prev = cos_sin_prev["c1a_neg_sin"] if self.compress_ratio == 1 else cos_sin_prev["comp_neg_sin"]
-            sin_next = cos_sin_next["c1a_neg_sin"] if self.compress_ratio == 1 else cos_sin_next["comp_neg_sin"]
-            cos = torch.cat([cos_prev, cos_next], dim=0)
-            sin = torch.cat([sin_prev, sin_next], dim=0)
+            rope_key = "c1a" if self.compress_ratio == 1 else "comp"
+            cp_cos_sin = attn_metadata["cp_cos_sin"]
+            cos = cp_cos_sin[rope_key][0]
+            sin = cp_cos_sin[f"{rope_key}_neg_sin"]
         else:
             cos_sin = attn_metadata["cos_sin"]
             cos = cos_sin["c1a"][0] if self.compress_ratio == 1 else cos_sin["comp"][0]
@@ -1917,11 +2002,15 @@ class Attention(nn.Module):
     ):
         if self.low_latency_tp:
             return forward_separate_mla(self, x, attn_metadata, is_prefill, **kwargs)
+
+        # C4A weights use packed current segments (without borrowed windows); C128A does not.
+        indexer_current_x = x if is_prefill and self.cp_size > 1 and self.compress_ratio == 4 else None
         q, qr, qr_scale, x = self.mla_prolog(x, attn_metadata, is_prefill, **kwargs)
 
         # o TND
         o = self.sparse_attn(
-            x, q, qr, qr_scale, attn_metadata, is_prefill, **kwargs)
+            x, q, qr, qr_scale, attn_metadata, is_prefill,
+            indexer_current_x=indexer_current_x, **kwargs)
         x = self.attn_post(o, attn_metadata, is_prefill)
 
         return x
@@ -2241,18 +2330,26 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
         return hidden_states
 
     def get_cp_input_ids(self, input_ids, attn_metadata):
-        input_ids_split = torch.split(input_ids, attn_metadata["cp_metadata"]["split_list"], dim=0)
-        cp_input_ids = torch.cat(
-            [input_ids_split[i] for i in attn_metadata["cp_metadata"]["zigzag_idx"]], dim=0
+        cp_metadata = attn_metadata["cp_metadata"]
+        local_indices = cp_metadata.get("local_indices")
+        if local_indices is not None:
+            # Reuse the canonical request-major zigzag map.
+            return input_ids.index_select(0, local_indices)
+        input_ids_split = torch.split(input_ids, cp_metadata["split_list"], dim=0)
+        return torch.cat(
+            [input_ids_split[i] for i in cp_metadata["zigzag_idx"]], dim=0
         )
-        return cp_input_ids
 
     def get_cp_hidden_states(self, hidden_states, attn_metadata):
-        hidden_states_split = torch.split(hidden_states, attn_metadata["cp_metadata"]["split_list"], dim=0)
-        hidden_states_cp = torch.cat(
-            [hidden_states_split[i] for i in attn_metadata["cp_metadata"]["zigzag_idx"]], dim=0
+        cp_metadata = attn_metadata["cp_metadata"]
+        local_indices = cp_metadata.get("local_indices")
+        if local_indices is not None:
+            # Reuse the input-id map for the natural padded embedding stream.
+            return hidden_states.index_select(0, local_indices)
+        hidden_states_split = torch.split(hidden_states, cp_metadata["split_list"], dim=0)
+        return torch.cat(
+            [hidden_states_split[i] for i in cp_metadata["zigzag_idx"]], dim=0
         )
-        return hidden_states_cp
 
     def _cast_cos_sin_bf16(self, cos_sin):
         # hif8 rope kernels consume bf16 cos/sin. Cast the whole cos_sin dict once here
@@ -2296,6 +2393,35 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
             attn_metadata[zigzag_flag].update({
                 "cos_sin": cos_sin,
             })
+
+        # Cache packed [prev, next] RoPE tensors once per prefill.
+        prev_cos_sin = attn_metadata["prev"]["cos_sin"]
+        next_cos_sin = attn_metadata["next"]["cos_sin"]
+        pair_keys = ["c1a", "c1a_with_pre_win"]
+        tensor_keys = ["c1a_neg_sin"]
+        if not is_mtp:
+            pair_keys.extend(["comp", "comp_with_pre_win"])
+            tensor_keys.append("comp_neg_sin")
+        cp_cos_sin = {}
+        for key in pair_keys:
+            prev_pair = prev_cos_sin[key]
+            next_pair = next_cos_sin[key]
+            prev_rows = prev_pair[0].shape[0]
+            merged_pair = tuple(
+                torch.cat((prev_value, next_value), dim=0)
+                for prev_value, next_value in zip(prev_pair, next_pair)
+            )
+            cp_cos_sin[key] = merged_pair
+            prev_cos_sin[key] = tuple(value[:prev_rows] for value in merged_pair)
+            next_cos_sin[key] = tuple(value[prev_rows:] for value in merged_pair)
+        for key in tensor_keys:
+            prev_value = prev_cos_sin[key]
+            prev_rows = prev_value.shape[0]
+            merged_value = torch.cat((prev_value, next_cos_sin[key]), dim=0)
+            cp_cos_sin[key] = merged_value
+            prev_cos_sin[key] = merged_value[:prev_rows]
+            next_cos_sin[key] = merged_value[prev_rows:]
+        attn_metadata["cp_cos_sin"] = cp_cos_sin
 
     def generate_cos_sin(self, attn_metadata, hidden_states, is_mtp=False):
         # Hash layer: use cos_sin['c1a'] as position_embdding
@@ -2683,8 +2809,8 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
         if next_n > 3 and not self.infer_config.speculative_config.uses_method("dspark"):
             raise ValueError(f"{next_n=} must equal or smaller than 3")
 
-        if parallel_config.cp_size > 1 and scheduler_config.cp_mini_batch != 1:
-            raise ValueError(f"when cp enabled, {scheduler_config.cp_mini_batch=} should be 1")
+        # Scheduler limits each CP prefill step to cp_mini_batch requests and
+        # assigns owners round-robin through request.cp_rank.
 
         gmm_quant_mode = self.config.quant_config.gmm_quant_mode
         if gmm_quant_mode == "w4a4mxfloat4":
@@ -2974,40 +3100,45 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
         )
 
     def gather_cp_last_token_hidden(self, outputs, attn_metadata):
-        num_tokens, hidden_size = outputs.shape
         cp_metadata = attn_metadata["cp_metadata"]
-        segment_len = num_tokens // 2
-        last_segment_idx = cp_metadata["last_rank"]
-        if last_segment_idx < 0:
-            raise ValueError("CP prefill requires at least one valid token")
-        last_segment_len = cp_metadata["split_kv_len"][last_segment_idx].item()
-
-        local_offset = last_segment_len - 1
-        if cp_metadata["last_rank_flag"] == "next":
-            local_offset += segment_len
-
-        last_hidden = outputs.new_zeros((1, hidden_size))
-        if self.global_rank == cp_metadata["last_rank_zz"]:
-            last_hidden.copy_(outputs[local_offset: local_offset + 1, :])
-        # Only the owner rank writes data; sum broadcasts the selected hidden state across the CP group.
-        dist.all_reduce(last_hidden, group=self.comm_manager.get_group("cp_group"))
-        return last_hidden
+        if outputs.dim() == 3:
+            token_outputs = outputs.reshape(-1, outputs.shape[-1])
+        else:
+            token_outputs = outputs
+        # Gather valid last-token rows and restore request-major order.
+        valid_rows = cp_metadata["last_token_valid_row_indices"]
+        gather_rows = cp_metadata["last_token_gather_rows"]
+        capacity = int(cp_metadata["last_token_slot_capacity"])
+        hidden_size = token_outputs.shape[-1]
+        payload = token_outputs.new_zeros(capacity, hidden_size)
+        payload[: valid_rows.numel()] = token_outputs.index_select(0, valid_rows)
+        gathered = payload.new_empty((capacity * self.cp_size, hidden_size))
+        dist.all_gather_into_tensor(
+            gathered, payload, group=self.comm_manager.get_group("cp_group")
+        )
+        return gathered.index_select(0, gather_rows).unsqueeze(1)
 
     def forward_lm_head(self, outputs, kv_len, is_prefill=True, attn_metadata=None):
-        num_tokens, hidden_size = outputs.shape
-        seq_used_q = attn_metadata.get("seq_used_q")
-        bs = seq_used_q.numel()
+        if outputs.dim() == 3:
+            bs, q_len, hidden_size = outputs.shape
+        else:
+            num_tokens, hidden_size = outputs.shape
+            seq_used_q = attn_metadata.get("seq_used_q")
+            bs = seq_used_q.numel()
+            q_len = num_tokens // bs
+
         if is_prefill:
             if self.cp_size > 1:
                 outputs = self.gather_cp_last_token_hidden(outputs, attn_metadata)
+            elif outputs.dim() == 3:
+                gather_index = (kv_len - 1).view(-1, 1, 1).expand(-1, 1, hidden_size)
+                outputs = torch.gather(outputs, 1, gather_index)
             else:
-                gather_index = kv_len - 1
-                gather_index = gather_index.unsqueeze(1).repeat(1, outputs.shape[-1])
+                gather_index = (kv_len - 1).view(-1, 1).expand(-1, hidden_size)
                 outputs = torch.gather(outputs, 0, gather_index).view(-1, 1, hidden_size)
             q_len = 1 # prefill takes the last token
         else: # combine bs and q_len axes for lm_head
-            outputs = outputs.view(num_tokens, 1, hidden_size)
-            q_len = num_tokens // bs
+            outputs = outputs.reshape(bs * q_len, 1, hidden_size)
         if (self.attn_dp_size == 1) or (self.lmhead_tp_size == 1):
             hidden_states = outputs
         else:
@@ -3166,6 +3297,9 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
                                             is_prefill, "lightning_indexer_quant", is_li=True)
 
     def preprocess_model_inputs(self, model_inputs: Dict, is_prefill=False, is_mtp=False, **kwargs):
+        # Attach V4 plans before attention/cache metadata; update inputs in
+        # place so Engine and MTP reuse padded positions and ForwardMetaData.
+        prepare_prefill_cp_inputs(model_inputs, self.infer_config, self.window_size)
         model_inputs = dict(model_inputs)
 
         attn_metadata = self.attention_data.build_attn_metadata(

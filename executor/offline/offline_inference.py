@@ -191,7 +191,8 @@ class OfflineInference:
             current_cp_rank = parallel_config.global_rank % parallel_config.cp_size
             result_request_ids = [
                 request_id for request_id in result_request_ids
-                if request_id % parallel_config.cp_size == current_cp_rank
+                if self.scheduler.finished_requests.get(request_id, None) is not None
+                and self.scheduler.finished_requests[request_id].cp_rank == current_cp_rank
             ]
 
         use_mm_batch_infer_time = self.engine.enable_mm_encode
