@@ -68,13 +68,11 @@ def gelu7(x, limit: float = 7.0, out_dtype: Optional[torch.dtype] = None):
 
 
 def create_activation_func(activation_type: MLPActivationType) -> Callable:
-    match activation_type:
-        case MLPActivationType.SWIGLU7:
-            return swiglu7
-        case MLPActivationType.GELU7:
-            return gelu7
-        case _:
-            raise ValueError(f"Unknown activation type: {activation_type}")
+    if activation_type == MLPActivationType.SWIGLU7:
+        return swiglu7
+    if activation_type == MLPActivationType.GELU7:
+        return gelu7
+    raise ValueError(f"Unknown activation type: {activation_type}")
 
 
 class ModalityDispatcher:
@@ -807,6 +805,7 @@ class Adapter(torch.nn.Module):
         self.rope = ElementWiseFourierEmbed(
             config.hidden_size // config.num_attention_heads, in_pixels=False, learnable=False
         )
+        self.rope_cache = {}
 
     def forward(
         self,
@@ -816,7 +815,17 @@ class Adapter(torch.nn.Module):
         audio_mask: torch.Tensor,
         text_mask: torch.Tensor,
     ):
-        rope = self.rope(coords_mapping)
+        # CFG branches have different lengths; keep their prepared coefficients separately.
+        cache_key = (coords_mapping.shape[0], coords_mapping.device)
+        cached = self.rope_cache.get(cache_key)
+        # The data proxy rebuilds coordinates each step. Equal lengths alone are insufficient.
+        if cached is None or not torch.equal(cached[0], coords_mapping):
+            rope = self.rope(coords_mapping).to(torch.bfloat16)
+            sin_emb, cos_emb = rope.tensor_split(2, -1)
+            rope_cos = torch.cat([cos_emb, cos_emb], dim=-1).unsqueeze(0).unsqueeze(2).contiguous()
+            rope_sin = torch.cat([sin_emb, sin_emb], dim=-1).unsqueeze(0).unsqueeze(2).contiguous()
+            self.rope_cache[cache_key] = (coords_mapping.clone(), (rope_cos, rope_sin))
+        rope = self.rope_cache[cache_key][1]
         output_x = torch.zeros(x.shape[0], self.config.hidden_size, device=x.device, dtype=x.dtype)
         output_x[text_mask] = self.text_embedder(x[text_mask, : self.config.text_in_channels])
         output_x[audio_mask] = self.audio_embedder(x[audio_mask, : self.config.audio_in_channels])
@@ -1013,11 +1022,6 @@ class DiTModel(torch.nn.Module):
 
         x, rope = self.adapter(x, coords_mapping, video_mask, audio_mask, text_mask)
         x = x.to(self.config.params_dtype)
-        rope = rope.to(torch.bfloat16)
-        sin_emb, cos_emb = rope.tensor_split(2, -1)
-        rope_cos = torch.cat([cos_emb, cos_emb], dim=-1).unsqueeze(0).unsqueeze(2).contiguous()
-        rope_sin = torch.cat([sin_emb, sin_emb], dim=-1).unsqueeze(0).unsqueeze(2).contiguous()
-        rope = (rope_cos, rope_sin)
         x = ModalityDispatcher.permute(x, permute_mapping)
         x = self.block(
             x,
