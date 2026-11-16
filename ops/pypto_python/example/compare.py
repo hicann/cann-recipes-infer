@@ -40,7 +40,7 @@ def compare(t: torch.Tensor, t_ref: torch.Tensor, name, atol, rtol, max_error_ra
         # 2. 检测Inf（包含+Inf和-Inf）
         inf_mask = torch.isinf(t)
         inf_count = inf_mask.sum().item()
- 
+
         # 若存在NaN或Inf，拼接错误信息并报错
         if nan_count > 0 or inf_count > 0:
             error_msg = f"\n========== 张量 {name} 检测到非法值（禁止存在NaN/Inf）=========="
@@ -69,10 +69,11 @@ def compare(t: torch.Tensor, t_ref: torch.Tensor, name, atol, rtol, max_error_ra
 
             # 抛出断言错误，终止函数执行
             assert False, error_msg
- 
+
     # check 是否是nan 或 inf
     check_is_nan_inf()
- 
+    assert torch.isfinite(t_ref).all().item(), f"参考张量 {name} 含NaN/Inf，不能作为精度基准"
+
     # 先验证张量的基本属性一致
     assert t.shape == t_ref.shape, f"张量形状不一致：t.shape={t.shape}, t_ref.shape={t_ref.shape}"
     assert t.dtype == t_ref.dtype, f"张量数据类型不一致：t.dtype={t.dtype}, t_ref.dtype={t_ref.dtype}"
@@ -95,7 +96,7 @@ def compare(t: torch.Tensor, t_ref: torch.Tensor, name, atol, rtol, max_error_ra
     # 打印错误点的逻辑（如果有误差点）
     if error_count > 0:
         print(f"\n========== 张量 {name} 存在 {error_count} 个误差点（阈值：{error_count_threshold}）==========")
- 
+
         # 获取所有误差点的位置
         error_positions = torch.nonzero(diff_mask, as_tuple=False)  # shape: [error_count, dims]
 
@@ -127,5 +128,5 @@ def compare(t: torch.Tensor, t_ref: torch.Tensor, name, atol, rtol, max_error_ra
     assert error_count <= error_count_threshold, \
         (f"compare fail: {name}, max diff: {max_diff.item():.8f} at {max_pos}, "
          f"error_count: {error_count}, error_count_threshold: {error_count_threshold}")
-    
+
     print("compare success !!!!")
