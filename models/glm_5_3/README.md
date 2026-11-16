@@ -2,11 +2,13 @@
 
 **中文** | [English](./README_eng.md)
 
+- 本实践的优化特性参见[GLM-5.3-Flash CANN 优化实践](../../docs/models/glm_5_3/glm_5_3_cann_tech_report.md)。
+
 ## 概述
 
 GLM-5.3-Flash 是智谱发布的**混合注意力 + mHC + MoE** 大模型，本实践适配 GLM-5.3-Flash 权重（~306B 总参数，发布格式为 FP8 量化），在 CANN 平台上完成量化与性能优化，面向昇腾 `950DT` 平台 **Hybrid HiF8-MXFP8-MXFP4** 推理部署。
 
-- **混合注意力**：45 层中 34 层为 **KDA**（Kimi Delta Attention，线性注意力，短卷积 + 门控 delta 递推），每 4 层插入 1 层 **MLA + DSA**（共 11 层：吸收式 MLA 全程 NoPE + k-pool 压缩 indexer 的稀疏注意力）。
+- **混合注意力**：45 层中 34 层为 **KDA**（Kimi Delta Attention，线性注意力，ShortConv + 门控 delta 递推），每 4 层插入 1 层 **MLA + DSA**（共 11 层：吸收式 MLA 全程 NoPE + k-pool 压缩 indexer 的稀疏注意力）。
 - **mHC**（Manifold-Constrained Hyper-Connections）：层间隐藏态是 4 条并行流 `[T, 4, D]`，每个子层前用 Sinkhorn 归一化的组合矩阵折叠、子层后再展开。
 - **MoE**：288 路由专家 top-8 + 1 共享专家，前 `first_k_dense_replace` 层为稠密 MLP，共享专家侧支持多流与路由专家计算并行。
 - **量化方案**：**Hybrid HiF8-MXFP8-MXFP4**，DSA 投影 + dense MLP 走 **HiF8 W8A8**，共享专家走 **MXFP8 W8A8**，路由专家走 **MXFP4 W4A8**。KDA 全部权重、DSA 的 `kv_b_proj`、整个 indexer、mHC 参数、各 norm、`mlp.gate`、embed/lm_head 保持 BF16/FP32。
