@@ -1,25 +1,25 @@
 # Plan 文件模板（`plans/plan-<id>.md`）
 
-每个 Plan 一份，不内联到 dashboard。candidate 落初稿（方案描述 + 方案细节 + 参考 wiki），该 Plan 的 implementer / reviewer 在循环里追加 round 级结论摘要。主 agent 只读它做裁决、把关键信息 + 状态镜像进 dashboard 表，不改其结构。
+主 agent 根据 candidate 草案初始化方案描述、细节与参考资料；implementer / reviewer 追加方案细节和 round 结论。主 agent 核查证据后将状态与摘要写入 dashboard。
 
-实施 / 问题 / 验证的**过程明细**写在 `progress.md` 工作区（共享状态文件，跨 agent 共享，沿用 `model-infer-optimize` 约定）；本文件的实施记录 / Review 记录只放 round 级**结论摘要**，不复制过程流水。
+实施、问题与验证过程写入 `progress.md` 工作区；本文件保留方案与 round 结论。
 
-按下面结构落盘：
+按以下结构记录；多流方案细节使用[多流 Plan 模板](../../model-infer-multi-stream/references/plan-detail-fragment.md)：
 
 ```md
 # <plan_id>：<方案名>
 
 ## 方案描述
 
-<优化什么、为什么可能有收益、怎么验证、主要风险在哪。自由组织，不强制字段。>
+<说明优化对象、预期收益依据、验证方法与主要风险，内容可自由组织。>
 
-## 实施参考 wiki 页面
+## 知识库与实现参考
 
-<candidate 查到的、与本 Plan 实施相关的 wiki 页面 ID；implement / review 时按需参考。没挂载 wiki 或无相关页面则留空。>
+<支撑本 Plan 的知识库条目、代码或文档引用及适用条件，供 implement / review 按需查阅。>
 
-## 方案细节（领域 skill 自填）
+## 方案细节
 
-<结构由该 Plan 的单点 skill 定义。例如多流方向按 model-infer-multi-stream 的 plan-detail-fragment 填写：流分组 / 汇合点 / 方案 DAG / 强度 / GE auto-reorder 风险 / overlap_pct 实测 / enable·回退 / 副作用。裁决要看的信息要上浮到 dashboard 表的「证据摘要」。>
+<按该 Plan 的单点 skill 模板记录。例如多流方向：流分组 / 汇合点 / 方案 DAG / 实施安排 / GE 调度风险（Ascend IR 路径）/ overlap_pct 实测 / enable·回退 / 副作用。裁决所需信息汇总为证据摘要，由主 agent 写入 Dashboard。>
 
 ## 实施记录
 
@@ -28,7 +28,7 @@
 
 ## Review 记录
 
-| round | reviewer 结论 | 功能 / 精度 | 性能 / 指标（引自分析报告） | 副作用 | 建议动作 | 派生建议 |
+| round | reviewer 结论 | 功能 / 精度 | 性能 / 指标（实测与分析证据） | 副作用 | 建议动作 | 派生建议 |
 | --- | --- | --- | --- | --- | --- | --- |
 
 ## 派生记录

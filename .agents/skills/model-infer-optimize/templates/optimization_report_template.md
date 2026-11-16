@@ -11,25 +11,21 @@
 - 过程性标记：状态徽章（emoji / 删除线）、流程编号（"阶段 N" 等）、编排状态（"确认 / 已完成" 等）
 
 可读性约束：
-- 自然语言描述：每个优化点用完整中文句子描述场景、方案与收益；禁止以配置参数或接口名做段落开头，禁止以变量名 / shape 表达式 / 代码片段做主语或谓语，代码块仅用于实现要点 / 伪代码小节
-- 配置参数不入正文：`EP=8` / `attn_tp=1` / `kvp_size > 1` 等具体取值写在表格、yaml 引用或伪代码块中，正文用自然表达如"专家并行切到 8 卡"；优化思路若已在通用文档（如 Llama / DeepSeek）介绍则引用即可
-- 章节引言：每个一级章节开头先写 1-2 句过渡，说明本章涉及哪类优化、与基线或上一章的关系；禁止直接进入表格或子小节
-- 数据 / 表格后补总结句：每个性能或精度表格之后用 1 句自然语言总结收益与精度结论，例如"该改造保持精度不变，Decode 时延从 X 降至 Y，主要收益来自 Z"；禁止只写"精度：与基线一致。性能：X ms / Y ms"这类裸数据
+- 自然语言描述：每个优化点用完整中文句子描述场景、方案与收益，避免堆砌配置参数或接口名；实现细节放代码或伪代码小节
+- 配置参数：具体取值集中写在表格、yaml 引用或伪代码块中，正文说明选择依据；优化思路若已在仓库通用文档介绍则引用
+- 章节与数据说明：交代优化与基线的关系，解释性能、精度数据的结论及依据
 - 章节标题用名词短语而非技术口号：标题示例 "MLA 低秩压缩优化"、"MoE 模块的专家并行与通信适配"；避免 "FA v2 + hybrid TND-sliding + BNSD-full" 这种紧凑拼接式
 - 占位符使用：所有 `{...}` 占位符（包括标 `描述示例：` 的过渡句）仅作格式与风格参考，必须按本模型实际情况重写，禁止直接照抄
 - 术语沿用既有命名：优先使用仓内代码函数名、仓库设计文档和注册模型既有技术文档命名；描述性词汇优先用中文，行业缩写和技术名保留英文（如 MoE / MLA / Decode）；禁止为已有方案自造同义新词。反例：把 double routing 写成 "双轮 AllToAll"
 
-反例：
+表达反例（以下仅示范写法）：
 
-并行化：EP=8（128 experts / 8 = 16 expert/rank）+ embed/lmhead_tp=8 + attn_tp=1。Paged Attention 接入 framework PA 框架管理 KV cache。MoE EP decode 默认走 MC2 dispatch_v2/combine_v2；A2 平台 experts_per_rank > 24 时自动回退 double_routing AllToAll。
+并行化：EP=8（128 experts / 8 = 16 expert/rank）+ embed/lmhead_tp=8 + attn_tp=1。
 
 正例：
 
 本样例采用混合并行部署：MoE 模块按 Expert Parallel (EP) 切分到 8 卡，每张卡承载部分路由专家；Embedding 与 LM Head 采用 Tensor Parallel (TP) 切分到 8 卡以降低单卡显存压力；Attention 模块保持单卡计算，避免引入额外通信开销。具体并行配置参见 yaml 文件中的 `parallel_config` 字段。
 
-KV Cache 采用 Paged Attention 方案管理，由推理框架统一负责 KV Cache 块的分页分配与回收，避免连续显存占用，在长序列与高并发场景下显著提升显存利用率。实现细节可参考 framework 中的 Paged Attention 接口。
-
-MoE 模块在 Decode 阶段通过 [torch_npu.npu_moe_distribute_dispatch_v2](链接) 和 [torch_npu.npu_moe_distribute_combine_v2](链接) 算子实现 EP 并行下多卡间的路由通信。在 Atlas A2 平台上，MC2 路径受算子硬件约束限制，每张卡承载的专家数（`experts_per_rank`）不能超过 24，将切换到 `double_routing + AllToAll` 等回退路径。
 -->
 
 # {model_name} 模型优化报告
@@ -88,8 +84,9 @@ Embedding
 
 ### 3.1 精度基线
 
-测试输入：{标准输入内容或数据集}
-基线输出：{模型输出结果，用于后续精度对比}
+测试输入：{标准输入内容或数据集、解码设置}
+精度参照：{基线输出或参考实现}
+验收判据：{指标与达标线}
 
 ---
 
@@ -114,7 +111,7 @@ Embedding
 - {自然语言段落，解释每个切分选择的依据}
 - {根据实际并行策略补充}
 
-<!-- 若有非常规并行（KVP / SP / o_proj K 轴切分等），按 4.1 / 4.2 子节展开 -->
+<!-- 若有附加并行适配（CP / SP / o_proj K 轴切分等），按 4.1 / 4.2 子节展开 -->
 
 {简要描述本节并行优化的收益与精度结论}
 
@@ -126,12 +123,12 @@ Embedding
 
 ### 5.1 KVCache 管理
 
-{KVCache 方案描述：Paged Attention / Legacy / MLA 压缩}
+{KVCache 管理方案及是否采用 MLA 压缩}
 
 | 参数 | 值 | 说明 |
 |------|-----|------|
-| KV 模式 | {Paged / Legacy / MLA} | {简短说明} |
-| block_size | {32 / 64 / 128} | Paged 模式的块粒度 |
+| KV 管理模式 | {Paged / Legacy} | {简短说明，MLA 压缩另述} |
+| block_size | {实际值} | Paged 模式的块粒度 |
 | cache_mode | {PA_NZ / 其他} | 缓存格式 |
 
 ### 5.2 Flash Attention 算子选型
@@ -142,7 +139,7 @@ Embedding
 |---|---|---|
 | FA op | {torch.ops.npu / torchair.ops} | {同左} |
 | input_layout | {TND / BNSD} | {同左} |
-| sparse_mode | {3 / 4} | {0} |
+| sparse_mode | {实际值及对应 mask 语义} | {同左} |
 
 <!-- 若有 MLA 压缩 / SlidingWindow / 多 attn_type 等特殊处理，按 5.3 / 5.4 子节展开 -->
 
@@ -155,6 +152,7 @@ Embedding
 {描述示例：本节列出本样例引入的所有融合算子，涵盖 KVCache 与 Attention、MoE、Norm 与激活、量化等阶段引入的实现；"来源"列标注算子在哪个章节首次引入。}
 
 <!-- 总览表：包含 KVCache 与 Attention 章节引入的 FA / MLA 类算子、量化章节引入的量化算子、以及算子融合阶段单独引入的 Norm / RoPE / MoE 通信等融合算子 -->
+<!-- 下表为填写示例，按本模型实际采用的算子增删。 -->
 
 | 模块 | 实现 | 来源 | 触发位置 |
 |------|------|------|---------|
@@ -193,7 +191,7 @@ Embedding
 
 ## 8. 图模式
 
-{描述示例：说明本样例支持的图模式后端、切换方式与覆盖范围；npugraph_ex 与 GE graph 通常为并行关系，可按需选择。}
+{描述示例：说明实际采用的图模式后端、切换方式与覆盖范围；仅保留已适配后端的小节。}
 
 ### 8.1 npugraph_ex
 
@@ -201,7 +199,7 @@ Embedding
 
 | 项 | 配置 |
 |----|------|
-| 后端 | torch.compile aclgraph |
+| 后端 | torch.compile，backend="npugraph_ex" |
 | 覆盖范围 | Decode（Prefill 保持 eager） |
 
 {性能数据表与简要描述本后端的收益}
@@ -232,7 +230,7 @@ Embedding
 | + 量化适配 | {简述} | {value} | {value} | {ratio}× |
 | + 图模式 | {简述} | {value} | {value} | {ratio}× |
 
-测试条件：{batch_size / seq_len / 卡数 / 数据类型}
+测试条件：{batch_size / seq_len / 卡数 / 数据类型；条件变化时分组列出}
 
 {简要描述最大收益来源与最终性能定位}
 

@@ -1,12 +1,10 @@
-# 框架契约模板和速查
+# 框架部署模型模板
 
-本文件提供框架部署模式的两类内容：
-1. **模型类契约速查**：构造签名、forward 签名、ForwardMetaData 字段、CommManager 通信组、Packed/TND 约定
-2. **拉起脚本与参考实现**：上游统一入口、已注册模型骨架对照
+本文件提供框架部署模式的 ForCausalLM 与 Attention 骨架及必要接口约束。
 
 YAML 模板与命名规范见共用文件 `yaml_template.md`；README 模板见 `readme_template.md`。
 
-权威接口契约定义见 [docs/design/executor_design.md §6](../../../../docs/design/executor_design.md)。
+接口契约见 [docs/design/executor_design.md §6](../../../../docs/design/executor_design.md)，ForwardMetaData 字段定义见 `executor/utils/forward_metadata.py`。框架接口语义与启动机制可查询 cannbot-knowledge 中的 recipes 框架说明。
 
 替换 `{model_name}`（小写下划线）和 `{ModelName}`（驼峰）后使用。
 
@@ -106,8 +104,8 @@ class {ModelName}Attention(nn.Module):
 
     def forward(self, hidden_states, position_embeddings, forward_metadata: ForwardMetaData, **kwargs):
         is_prefill = forward_metadata.is_prefill
-        kv_len = forward_metadata.kv_len
-        # decode 分支必须把 atten_mask 设为 None（详见 common_issues.md）
+        kv_len = forward_metadata.kv_len  # Prefill cache offsets; decode positions within each request.
+        # decode 分支必须把 atten_mask 设为 None
         atten_mask = forward_metadata.attention_mask if is_prefill else None
 
         # 计算 Q / K / V，写 KV 到 self.k_cache / self.v_cache
@@ -127,6 +125,7 @@ class {ModelName}Attention(nn.Module):
         # ... QKV / O 投影、RoPE 等 ...
 
         self.attn_type = "FullAttention"
+        self.block_size = infer_config.scheduler_config.block_size
         self.k_cache = torch.Tensor([])   # 占位，框架通过 tensor_setter 注入
         self.v_cache = torch.Tensor([])
         cache_dtype = config.torch_dtype or torch.bfloat16
@@ -135,19 +134,21 @@ class {ModelName}Attention(nn.Module):
                 cache_name="k_cache", attn_type=self.attn_type,
                 dim=self.head_dim, num_head=self.num_kv_heads_per_rank,
                 dtype=cache_dtype, needs_block=True,
+                block_size=self.block_size,
                 tensor_setter=lambda t, layer=self: setattr(layer, "k_cache", t),
             ),
             CacheEntry(
                 cache_name="v_cache", attn_type=self.attn_type,
                 dim=self.head_dim, num_head=self.num_kv_heads_per_rank,
                 dtype=cache_dtype, needs_block=True,
+                block_size=self.block_size,
                 tensor_setter=lambda t, layer=self: setattr(layer, "v_cache", t),
             ),
         ]
 
     def forward(self, hidden_states, position_embeddings, forward_metadata: ForwardMetaData, **kwargs):
-        slot_mapping = forward_metadata.slot_mapping[self.attn_type]
-        block_table = forward_metadata.block_table[self.attn_type]
+        slot_mapping = forward_metadata.slot_mapping[self.attn_type]  # Cache slot for each token.
+        block_table = forward_metadata.block_table[self.attn_type]  # Cache block indices for each request.
         # ... QKV 投影 / RoPE → key_states / value_states (packed [TotalTokens, ...]) ...
 
         # 写 cache：按 slot_mapping 写入
@@ -165,51 +166,8 @@ class {ModelName}Attention(nn.Module):
         # Attention：HF 原版 SDPA / 标准 PyTorch，不上 FA
         # - Prefill：直接用刚算的 key_states / value_states + causal mask
         # - Decode：用 block_table 从 cache gather 累计 KV，再走 SDPA
-        # 变长 batch 下按 forward_metadata.actual_seq_lengths_cu_q 切 batch
+        # Split variable-length requests by cumulative query lengths in forward_metadata.actual_seq_lengths_cu_q.
         ...
 ```
 
 > `ForCausalLM` 必须实现 `get_cache_info()`（5 行模板，遍历 `self.model.layers` 收集 `cache_entries`）；`__init__` 保存 `self.block_size = infer_config.scheduler_config.block_size`。完整字段表与 `get_cache_info()` 实现见 model-infer-kvcache skill 的 framework_kv_reference 1.1 节与 3.1 节。FA 算子接入 / MLA absorb / 复杂 attn_type 由 model-infer-kvcache skill 接手。
-
-### 1.3 ForwardMetaData 字段速查
-
-来源：`executor/utils/forward_metadata.py`
-
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `is_prefill` | `bool` | 当前是 prefill 还是 decode |
-| `attention_mask` | `Optional[Tensor]` | prefill 用 causal mask；**decode 必须置 None** |
-| `kv_len` | `Optional[Tensor]` | 每条请求当前 KV 实际长度（packed） |
-| `actual_seq_lengths_kv` | `Optional[Tensor]` | 每请求实际 KV 长度，非累加 |
-| `actual_seq_lengths_q` | `Optional[Tensor]` | 每请求实际 Q 长度，非累加 |
-| `actual_seq_lengths_cu_kv` / `_cu_q` | `Optional[Tensor]` | cumulative 累加版本 |
-| `actual_seq_lengths_cu_list_kv` / `_cu_list_q` | `Optional[list]` | list 版本 |
-| `prompt_tokens` | `int` | 原始 prompt 长度（位置编码偏移用） |
-| `block_table` | `Dict[str, Tensor]` | Paged 模式下每个 attn_type 的 block 索引，从 `forward_metadata` 取 |
-| `slot_mapping` | `Dict[str, Tensor]` | Paged 模式下每 token 的 slot 索引，从 `forward_metadata` 取 |
-
-> CommManager 通信组取用（`comm_manager.get_group(...)`）由 model-infer-parallel-impl skill 详细说明，migrator 阶段 `world_size=1` 不展开。
-
----
-
-## 2. 拉起脚本
-
-框架部署模型**不需要在模型目录单独建 `infer.sh`**，统一使用仓库上游的 `executor/scripts/infer.sh`，按 `--model` / `--yaml` 参数选定模型与配置：
-
-```bash
-bash executor/scripts/infer.sh --model {model_name} --yaml {yaml_name}.yaml
-```
-
-`launch` 函数会自动选用模型目录下的 `infer.py`，缺失时落回 `executor/offline/infer.py`。online / PD 分离用法见 `bash executor/scripts/infer.sh -h`。
-
----
-
-## 3. 参考实现
-
-仓内已注册模型已经历过 kvcache / parallel-impl 等优化阶段，**不是 migrator 阶段产物**：
-
-- 标准 LLM (GQA) → `models/qwen/models/modeling_qwen.py`
-- MoE → `models/qwen3_moe/models/modeling_qwen3_moe.py`、`models/gpt_oss/models/modeling_gpt_oss.py`
-- MoE + MLA + MTP → `models/deepseek_r1/models/modeling_deepseek.py`
-
-migrator 阶段参考其构造签名 / forward 签名 / `load_weights` / `cache_unit` 声明等骨架部分；`get_cache_info()` / `cache_entries` / FA 算子 / `ParallelLinear` / MLA absorb / MoE EP 算子链等是后续 skill 产物，不要带入 migrator 输出。

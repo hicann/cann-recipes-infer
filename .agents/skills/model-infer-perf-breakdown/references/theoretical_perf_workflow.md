@@ -1,8 +1,8 @@
 # Step 1.5 — 理论性能注入（可选，默认不开）
 
-**本步骤可选，默认不跑**：它依赖外部 `operator-theoretical-perf` skill，该 skill 可能不存在。不启用时无需任何额外动作——`render.py` 的 theory median 列自动留空（`—`）、不阻塞，Step 5 理论偏离 insight 自动跳过。仅当用户要理论对比、且外部 skill 可用时按本文启用。
+仅当任务需要理论对比、且外部 `operator-theoretical-perf` skill 可用时启用。未启用时，`render.py` 的 theory median 列留空（`—`），Step 5 跳过理论偏离 insight。
 
-启用后，本步骤把逐 kernel 理论性能接入当前 sample-driven breakdown。当前 skill **不实现**理论性能估算公式，也不复制 `operator-theoretical-perf` skill 的脚本或 TokenSim 内容；agent 只用自然语言调用该 skill，让它按原生方式给 `kernel_details.csv` 加理论性能列。
+逐 kernel 理论耗时由外部 skill 估算，本 skill 负责合并结果与聚合展示。
 
 ## 1. 入口位置
 
@@ -12,8 +12,6 @@ Step 1.5: agent 调用 operator-theoretical-perf -> operator_analysis.csv
 Step 1.5: merge_theoretical_columns.py -> raw_ops_details.json 增加理论列
 Step 3: render.py --raw-ops-details ... -> index.html 增加 theory median 列
 ```
-
-Step 1.5 可选；启用后 Step 3 渲染会从 `raw_ops_details.json` 读取已合并的理论列。
 
 ## 2. Agent 如何调用理论分析 skill
 
@@ -53,19 +51,9 @@ agent 需要检查脚本输出的 matched / supported / missing 数量；missing
 
 ## 4. 渲染与多流口径
 
-Step 3 渲染时仍只传 `raw_ops_details.json`：
+Step 3 通过 `--raw-ops-details` 读取合并后的理论列，基础渲染命令见正文 Step 3。
 
-```bash
-python scripts/render.py \
-  -d <run_dir>/structure_draft.json \
-  -r <run_dir>/raw_ops.json \
-  --raw-ops-details <run_dir>/raw_ops_details.json \
-  -s <run_dir>/<network>_spec.json \
-  --label <label> \
-  -o <run_dir>/runs/<label>/index.html
-```
-
-HTML 主表会在 `median (ms)` 后增加 `theory median (ms)`：
+HTML 主表在 `median` 后展示 `theory median` 列：
 
 - cluster 行：该 cluster 的 critical-stream 理论耗时中位数。
 - TOTAL 行：该 component instance 内所有 kernel 按 stream 分组后，critical-stream 理论耗时中位数。
@@ -76,7 +64,7 @@ HTML 主表会在 `median (ms)` 后增加 `theory median (ms)`：
 - 对每个 component instance + sub-item，脚本按 `stream_id` 分组。
 - 每个流计算 observed timeline union、supported kernel 数、理论耗时和。
 - 默认选择 observed timeline union 最大的流，作为该 sub-item 的 critical stream。
-- 未选中的流视为被覆盖或旁路，不计入 theory median。
+- 未选中的流不计入 theory median；结合流间依赖与实际重叠核对所选流是否代表主要路径。
 - 只要出现多流，agent 应填写语义说明；若第二大流的 observed union 达到最大流的 80% 以上，HTML/metrics 还会标 `review`，agent 需要判断是否改选。
 
 agent 不需要重新计算理论耗时，只负责填清楚多流语义，必要时覆盖脚本选择。`selected_stream` 可省略，省略时沿用脚本默认选择：

@@ -107,8 +107,7 @@ def validate_inputs_json(path: str) -> dict:
     """Validate the Step 0 inputs file, exiting when it cannot drive the run.
 
     Requires a non-empty model_script_paths whose entries all exist on disk, plus
-    an explicit phase and rank — Phase 0b stream sample ack cannot be done without
-    them.
+    an explicit phase and rank.
     """
     import os
     try:
@@ -117,8 +116,7 @@ def validate_inputs_json(path: str) -> dict:
     except FileNotFoundError:
         raise SystemExit(
             f"[Phase 0 物料缺失] 找不到 {path}。\n"
-            f"回 SKILL.md 的「前置物料 checklist」段：必须先和用户敲齐 prof 路径 + "
-            f"模型脚本路径，写到 <run_dir>/inputs.json。"
+            f"按 SKILL.md 的输入约定填写 <run_dir>/inputs.json。"
         )
     except json.JSONDecodeError as e:
         raise SystemExit(f"[Phase 0 物料损坏] {path} 不是合法 JSON: {e}")
@@ -126,8 +124,7 @@ def validate_inputs_json(path: str) -> dict:
     if not isinstance(paths, list) or not paths:
         raise SystemExit(
             f"[Phase 0 物料缺失] {path} 的 model_script_paths 为空。\n"
-            f"模型脚本路径是硬约束，不允许「没有/不方便」——agent 必须先要到，"
-            f"否则 Phase 0b 的 stream sample ack 无法做。"
+            f"请填写用于结构与样本语义核对的模型脚本路径。"
         )
     missing = [p for p in paths if not os.path.exists(p)]
     if missing:
@@ -136,18 +133,17 @@ def validate_inputs_json(path: str) -> dict:
         )
     if data.get("phase") in (None, ""):
         raise SystemExit(
-            f"[Phase 0 物料缺失] {path} 的 phase 字段未填。多卡/多 phase 场景下必须先和"
-            f"用户敲定 (phase, rank) 组合（prefill / decode 各一），不允许 agent 自作主张默认。"
+            f"[Phase 0 物料缺失] {path} 的 phase 字段未填。请填写本次分析的采集阶段。"
         )
     if data.get("rank") is None:
         raise SystemExit(
-            f"[Phase 0 物料缺失] {path} 的 rank 字段未填。必须和用户敲定具体 rank。"
+            f"[Phase 0 物料缺失] {path} 的 rank 字段未填。请填写本次分析的 rank。"
         )
     return data
 
 
 def validate_sample_ack(path: str, expected_components: list) -> dict:
-    """Validate the Phase 0b ack file, exiting when any component is unacked.
+    """Validate stream samples for every expected component.
 
     Every expected component needs a stream_samples entry holding exactly one
     primary sample, and each sample needs both stream_id and op_indices.
@@ -157,18 +153,18 @@ def validate_sample_ack(path: str, expected_components: list) -> dict:
             ack = json.load(f)
     except FileNotFoundError:
         raise SystemExit(
-            f"[Phase 0b 未 ack] 找不到 {path}。\n"
-            f"回 SKILL.md 的「Phase 0b」段：必须先和用户敲定每个 component 的 "
+            f"[Phase 0b 样本缺失] 找不到 {path}。\n"
+            f"按 SKILL.md 的 Phase 0b 核对每个 component 的 "
             f"stream sample 范围，写到 <run_dir>/sample_ack.json 后再跑 detect。"
         )
     except json.JSONDecodeError as e:
-        raise SystemExit(f"[Phase 0b ack 文件损坏] {path}: {e}")
+        raise SystemExit(f"[Phase 0b 样本文件损坏] {path}: {e}")
     comps = ack.get("components") or {}
     if not isinstance(comps, dict):
-        raise SystemExit(f"[Phase 0b ack 格式错] {path} 的 components 应为 dict")
+        raise SystemExit(f"[Phase 0b 样本格式错] {path} 的 components 应为 dict")
     if ack.get("schema_version") != "stream_sample_ack.v1":
         raise SystemExit(
-            f"[Phase 0b ack 格式错] {path} 必须使用 "
+            f"[Phase 0b 样本格式错] {path} 必须使用 "
             f"schema_version='stream_sample_ack.v1'"
         )
     problems = []
@@ -188,8 +184,8 @@ def validate_sample_ack(path: str, expected_components: list) -> dict:
                 problems.append(f"  - {name}[{i}]: 缺 op_indices")
     if problems:
         raise SystemExit(
-            "[Phase 0b 未 ack] sample_ack.json 不全，必须每个 expected_component 都有 "
-            "用户 ack 过的 stream sample：\n" + "\n".join(problems)
+            "[Phase 0b 样本缺失] sample_ack.json 不全，必须每个 expected_component 都有 "
+            "核对后的 stream sample：\n" + "\n".join(problems)
         )
     return ack
 
@@ -504,11 +500,11 @@ def main():
                         "inputs (prof_dir + model_script_paths); exits 1 when absent")
     p.add_argument("--sample-ack", default=None,
                    help="(sample mode, required) <run_dir>/sample_ack.json carrying the "
-                        "Phase 0b acked stream samples for every component; "
+                        "Phase 0b reviewed stream samples for every component; "
                         "exits 1 when absent")
     p.add_argument("--accept-warnings", action="store_true",
                    help="(sample mode) hard and ambiguous warnings exit 1 by default so "
-                        "they are read back to the user; pass this flag once the user accepts them")
+                        "they can be reviewed; pass this flag after recording evidence for acceptance")
     p.add_argument("--explore", action="store_true",
                    help="emit candidates and landmark_candidates, for exploring when no sample is available")
     p.add_argument("--min-count", type=int, default=4,
@@ -539,8 +535,8 @@ def main():
             )
         if not args.sample_ack:
             raise SystemExit(
-                "[Phase 0b 未 ack] sample mode 必传 --sample-ack <run_dir>/sample_ack.json "
-                "(用户 ack 过的每个 component stream sample)。"
+                "[Phase 0b 样本缺失] sample mode 必传 --sample-ack <run_dir>/sample_ack.json "
+                "(每个 component 核对后的 stream sample)。"
             )
         ops_raw = load_ops(args.raw_ops)
         operators = ops_raw[0] if isinstance(ops_raw, tuple) else ops_raw
@@ -551,7 +547,7 @@ def main():
         spec_components = set(spec["expected_components"])
         if spec_components - ack_components:
             raise SystemExit(
-                f"[Phase 0b 未 ack] structure_spec 的 expected_components 包含 "
+                f"[Phase 0b 样本缺失] structure_spec 的 expected_components 包含 "
                 f"{spec_components - ack_components}，但 sample_ack.json 里没对应条目"
             )
 
@@ -570,8 +566,7 @@ def main():
         blocked = hard + ambiguous
         if blocked and not args.accept_warnings:
             print(
-                f"\n[Phase 1.5 未 ack] {len(blocked)} 条 hard/ambiguous 警告，"
-                f"必须复读给用户：",
+                f"\n[结构检测待复查] {len(blocked)} 条 hard/ambiguous 警告：",
                 file=sys.stderr,
             )
             for w in blocked[:10]:
@@ -579,7 +574,7 @@ def main():
             if len(blocked) > 10:
                 print(f"  ... 还有 {len(blocked) - 10} 条", file=sys.stderr)
             print(
-                "用户 ack 完每条后重跑并加 --accept-warnings；不要直接传 flag 跳过。",
+                "修正相关输入后重跑；有证据接受的情况记录依据后加 --accept-warnings。",
                 file=sys.stderr,
             )
             raise SystemExit(1)

@@ -8,11 +8,13 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # ----------------------------------------------------------------------------------------------------------
-"""PostToolUse hook: record that progress.md was read, so pre_tool_use.py can let edits through."""
+"""Associate the subagent with its accessed progress.md."""
 
 import json
 import os
 import sys
+
+from hook_paths import tool_file_paths
 
 
 def main():
@@ -22,13 +24,11 @@ def main():
     if not agent_id:
         sys.exit(0)
 
-    file_path = data.get("tool_input", {}).get("file_path", "")
-    if not file_path or not file_path.endswith("progress.md"):
-        sys.exit(0)
-
-    marker = f"/tmp/hook_read_progress_{agent_id}.marker"
-    with open(marker, "w") as f:
-        f.write(os.path.abspath(file_path))
+    for file_path in tool_file_paths(data):
+        if os.path.basename(file_path) == "progress.md" and os.path.isfile(file_path):
+            marker = f"/tmp/hook_read_progress_{agent_id}.marker"
+            with open(marker, "w") as f:
+                f.write(file_path)
 
     sys.exit(0)
 

@@ -1,140 +1,32 @@
-# NPU性能数据说明
+# 算子 CSV 输入契约
 
-## kernel_details.csv
+## 必需字段
 
-This is the most granular device-side data. Each row is one kernel invocation on the NPU.
+`analyze_kernels.py` 按以下列名读取，每行对应一次算子执行：
 
----
+| 字段 | 用途 |
+|---|---|
+| `Step Id` | 按 step 分组并提取目标 step |
+| `Name` | 原始算子名称 |
+| `Start Time(us)` | 开始时间，单位 µs |
+| `Duration(us)` | 执行时长，单位 µs |
+| `Stream ID` | 所属执行流 |
 
-## 字段列表
+其他采集工具导出的 CSV 也须满足以上字段名称、语义及单位；有差异时，在 `<run_dir>` 生成适配后的副本，保留源数据行对应关系。
 
-### 基础标识
+## 可选字段
 
-| Column | Type | Unit | Description |
-|---|---|---|---|
-| `Step Id` | integer | — | Training/inference step identifier |
-| `Device_id` | integer | — | NPU device identifier |
-| `Model ID` | integer | — | Model identifier |
-| `Task ID` | integer | — | Task identifier |
-| `Stream ID` | integer | — | Device stream this kernel ran on |
-| `Name` | string | — | Kernel or task name, e.g. `MatMul`, `Add`, `HcomAllReduce` |
-| `Type` | string | — | Kernel type name |
+| 字段 | 本工具中的用途 |
+|---|---|
+| `Type` | 优先用作 `normalized_name`；缺失或为空时从 `Name` 提取算子类型名 |
+| `Accelerator Core` | 区分执行核心；用于 AI_CPU 过滤、通信记录去重和 Vector 候选识别 |
+| `Task ID` | 结合 `Stream ID` 等字段的缺失情况，区分通信汇总与任务片段 |
+| `Input Shapes` / `Output Shapes` | 辅助样本匹配和语义判断；缺失时记录为空字符串 |
+| `Input Data Types` / `Output Data Types` | 供 Agent 核对量化计算与融合候选的数据类型 |
+| `Input Formats` / `Output Formats` | 供 Agent 核对布局变换与融合候选的输入输出格式 |
 
-### 执行状态
+其余采集指标可随 `raw_ops_details.json` 保留，供下钻查看。
 
-| Column | Type | Unit | Description |
-|---|---|---|---|
-| `OP State` | string | — | Operation execution state |
-| `Accelerator Core` | string | — | Core type used: `AI_CORE`, `AI_CPU`, `AI_VECTOR_CORE`, `MIX_AIC`, `MIX_AIV`, `COMMUNICATION`, `HCCL` 等（脚本按这套大写下划线形态匹配） |
+## 行号对应
 
-### 时间信息
-
-| Column | Type | Unit | Description |
-|---|---|---|---|
-| `Start Time(us)` | float | μs | Absolute start timestamp on device clock |
-| `Duration(us)` | float | μs | Kernel execution time (device busy) |
-| `Wait Time(us)` | float | μs | Time kernel spent waiting before execution started |
-
-### 并行参数
-
-| Column | Type | Unit | Description |
-|---|---|---|---|
-| `Block Dim` / `Block Num` | integer | — | Parallelism dimension |
-| `Mix Block Dim` / `Mix Block Num` | integer | — | Mixed parallelism dimension |
-| `HF32 Eligible` | string | — | HF32 eligibility flag |
-
-### 张量信息（可选）
-
-以下字段取决于 `record_shapes` 配置，可能为空：
-
-| Column | Type | Unit | Description |
-|---|---|---|---|
-| `Input Shapes` | string | — | e.g. `"[2048,4096];[4096,4096]"` |
-| `Output Shapes` | string | — | e.g. `"[2048,4096]"` |
-| `Input Data Types` | string | — | e.g. `"FLOAT16;FLOAT16"` |
-| `Output Data Types` | string | — | e.g. `"FLOAT16"` |
-| `Input Formats` | string | — | e.g. `"ND;ND"` |
-| `Output Formats` | string | — | e.g. `"ND"` |
-
-### 上下文
-
-| Column | Type | Unit | Description |
-|---|---|---|---|
-| `Context ID` | integer | — | Context identifier |
-
-### AI Core 指标
-
-| Column | Type | Unit | Description |
-|---|---|---|---|
-| `aicore_time(us)` | float | μs | AI Core execution time |
-| `aic_total_cycles` | integer | — | AI Core total cycles |
-
-**AI Core 详细指标（可选，取决于 profiling 配置）**：
-
-| Column | Type | Unit | Description |
-|---|---|---|---|
-| `aic_mac_time(us)` | float | μs | MAC unit time |
-| `aic_mac_ratio` | float | — | MAC time ratio (0-1) |
-| `aic_scalar_time(us)` | float | μs | Scalar unit time |
-| `aic_scalar_ratio` | float | — | Scalar time ratio (0-1) |
-| `aic_mte1_time(us)` | float | μs | MTE1 (memory transfer engine 1) time |
-| `aic_mte1_ratio` | float | — | MTE1 time ratio (0-1) |
-| `aic_mte2_time(us)` | float | μs | MTE2 time |
-| `aic_mte2_ratio` | float | — | MTE2 time ratio (0-1) |
-| `aic_fixpipe_time(us)` | float | μs | FixPipe unit time |
-| `aic_fixpipe_ratio` | float | — | FixPipe time ratio (0-1) |
-| `aic_icache_miss_rate` | float | — | AI Core ICache miss rate |
-| `cube_utilization(%)` | float | % | Cube utilization percentage |
-
-**AI Core FLOPs**：
-
-| Column | Type | Unit | Description |
-|---|---|---|---|
-| `aic_mac_fp16_ratio` | float | — | FP16 MAC ratio |
-| `aic_mac_int8_ratio` | float | — | INT8 MAC ratio |
-| `aic_cube_fops` | integer | — | Cube FLOPs count |
-
-### AI Vector 指标
-
-| Column | Type | Unit | Description |
-|---|---|---|---|
-| `aiv_time(us)` | float | μs | AI Vector execution time |
-| `aiv_total_cycles` | integer | — | AI Vector total cycles |
-
-**AI Vector 详细指标（可选，取决于 profiling 配置）**：
-
-| Column | Type | Unit | Description |
-|---|---|---|---|
-| `aiv_vec_time(us)` | float | μs | Vector unit time |
-| `aiv_vec_ratio` | float | — | Vector time ratio (0-1) |
-| `aiv_scalar_time(us)` | float | μs | AI Vector scalar unit time |
-| `aiv_scalar_ratio` | float | — | AI Vector scalar time ratio (0-1) |
-| `aiv_mte2_time(us)` | float | μs | AI Vector MTE2 time |
-| `aiv_mte2_ratio` | float | — | AI Vector MTE2 time ratio (0-1) |
-| `aiv_mte3_time(us)` | float | μs | AI Vector MTE3 time |
-| `aiv_mte3_ratio` | float | — | AI Vector MTE3 time ratio (0-1) |
-| `aiv_icache_miss_rate` | float | — | AI Vector ICache miss rate |
-
-**AI Vector FLOPs**：
-
-| Column | Type | Unit | Description |
-|---|---|---|---|
-| `aiv_vec_fp32_ratio` | float | — | FP32 vector ratio |
-| `aiv_vec_fp16_ratio` | float | — | FP16 vector ratio |
-| `aiv_vec_int32_ratio` | float | — | INT32 vector ratio |
-| `aiv_vec_misc_ratio` | float | — | Misc vector ratio |
-| `aiv_vector_fops` | integer | — | Vector FLOPs count |
-
----
-
-## Task Type 取值（`Type` 列，与上表的 `Accelerator Core` 列不同）
-
-| Task Type | Description |
-|-----------|-------------|
-| `AI_CORE` | AI Core kernel |
-| `AI_CPU` | AI CPU kernel |
-| `HCCL` | Collective communication |
-| `MIX_AIC` | Mixed AI Core |
-| `MIX_AIV` | Mixed AI Vector |
-| `FFTS_PLUS` | FFTS Plus |
-| `DVPP` | Digital Vision Pre-Processing |
+`org_index` 是传入 CSV 的 0-based 数据行号；`index` 是选定 step 内经过过滤后的致密索引。样本中的 `op_indices` 使用后者，换算见 [行号 domain 速查](phase0b_workflow.md#行号-domain-速查)。理论列合并与 CSV 拆分须使用同一份输入 CSV，保持行号对应。

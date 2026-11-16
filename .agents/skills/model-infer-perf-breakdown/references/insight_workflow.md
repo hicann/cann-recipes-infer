@@ -2,7 +2,7 @@
 
 ## 1. 概述
 
-Step 5 在 Step 3 渲染和 Step 4 切片之后执行，目标是把已有事实产物整理成可审计的性能洞察。它不重新切 layer / component，不改 `network_spec.json`，不把任何未确认的语义规则写死到脚本里。
+Step 5 在 Step 3 渲染和 Step 4 切片之后执行，目标是把已有事实产物整理成可审计的性能洞察。结构或分桶有误时回到对应阶段修正，再更新下游产物。
 
 **输入**：
 
@@ -18,7 +18,7 @@ Step 5 在 Step 3 渲染和 Step 4 切片之后执行，目标是把已有事实
 
 **默认输出目录**：`<run_dir>/runs/<label>/insights/`。Step 5 必须和它消费的 `<run_dir>/runs/<label>/metrics.json` 归属同一个 label，避免多个 run 的洞察互相覆盖。只有没有 `runs/<label>/metrics.json` 的老式单 run 产物，才允许退回 `<run_dir>/insights/`。
 
-**默认输出**只落下列文件，不再新增长期中间文件：
+**交付产物**：
 
 | 输出 | 生成者 | 内容 |
 |------|--------|------|
@@ -37,39 +37,35 @@ Step 5 在 Step 3 渲染和 Step 4 切片之后执行，目标是把已有事实
 |--------|--------|----------|
 | 脚本 | join、group-by、排序、区间扫描、统计分布、选择代表样本、渲染 HTML | 不判断模型语义，不内置搬运/融合 op 规则，不给性能原因 |
 | agent | 读取事实候选，审阅理论偏离可信度，定义本模型 taxonomy，判断是否值得展示，写语义解释和结论 | 不手工匹配全量算子，不静默接受脚本默认语义 |
-| 用户 | 必要时确认 taxonomy 或解释口径 | 不需要逐层逐算子参与 |
+| 调用方 | 确认尚无法消解的 taxonomy 或解释口径疑问 | — |
 
-**脚本落地**：事实提取与 HTML 渲染由 `scripts/gen_insights.py` + `scripts/render_insights.py` 实现，agent **不要**手写提取逻辑。两遍流程：
+**脚本落地**：事实提取与 HTML 渲染由 `scripts/gen_insights.py` + `scripts/render_insights.py` 实现，agent **不要**手写提取逻辑。
 
-1. `gen_insights.py`（pass 1，无 `--annotations`/`--movement-taxonomy`）→ 五类 JSON（`agent_review` 字段全空）+ `_review_stub.json`（所有待审 stable key）+ `_taxonomy_candidates.json`（op×core 频次）。
-2. agent 据 `_taxonomy_candidates.json` 写 `movement_taxonomy.json`（movement family + `movement_kind`），据 `_review_stub.json` 写 `annotations.json`（每条 `agent_review`：`summary` / `confidence` `high|medium|low` / `reason` / `fusion_candidate` / `elimination_direction`）。
-3. `gen_insights.py`（pass 2，带 `--movement-taxonomy` + `--annotations`）→ 合并 agent 判断的五类 JSON。
-4. agent 写 `final_conclusions.md`；`render_insights.py` 读五类 JSON + `final_conclusions.md` + 模板 → `index.html`（按 confidence high→medium→low 排序、Top5）。
+1. agent 准备或复用 `movement_taxonomy.json`（movement family + `movement_kind`）。需要分类线索时，先省略下方命令的 `--movement-taxonomy`，生成 `_taxonomy_candidates.json`（op×core 频次）供判断。
+2. `gen_insights.py` 带 `--movement-taxonomy` → 五类 JSON（`agent_review` 字段全空）+ `_review_stub.json`（含 movement 的待审 stable key）。
+3. agent 据候选证据与 `_review_stub.json` 写 `annotations.json`（每条 `agent_review`：`summary` / `confidence` `high|medium|low` / `reason` / `fusion_candidate` / `elimination_direction`）。
+4. `gen_insights.py` 带 `--movement-taxonomy` + `--annotations` → 合并 agent 判断的五类 JSON。
+5. agent 写 `final_conclusions.md`；`render_insights.py` 读五类 JSON + `final_conclusions.md` + 模板 → `index.html`（按 confidence high→medium→low 排序、Top5）。
+6. 按[报告回填与模板](#8-html-渲染)生成 `main_report_insights.json`，回填同一 run 的主报告。
 
 CLI：
 
 ```bash
-# pass 1：产事实候选（agent_review 留空）+ _review_stub.json + _taxonomy_candidates.json
+# 生成事实候选与待审条目
 python scripts/gen_insights.py \
   --metrics <run_dir>/runs/<label>/metrics.json \
   --raw-ops <run_dir>/raw_ops.json --structure-draft <run_dir>/structure_draft.json \
   --raw-ops-details <run_dir>/raw_ops_details.json \
+  --movement-taxonomy <run_dir>/runs/<label>/insights/movement_taxonomy.json \
   --out-dir <run_dir>/runs/<label>/insights
 
-# pass 2：合并 agent 写好的 movement_taxonomy.json + annotations.json
-python scripts/gen_insights.py ...（同 pass 1）\
-  --movement-taxonomy <run_dir>/runs/<label>/insights/movement_taxonomy.json \
+# 合并 agent 审阅结果
+python scripts/gen_insights.py ...（同上）\
   --annotations <run_dir>/runs/<label>/insights/annotations.json
 
 # 渲染洞察页（需 final_conclusions.md 已写）
 python scripts/render_insights.py --insights-dir <run_dir>/runs/<label>/insights \
   --model-name "<name>" --label <label> -o <run_dir>/runs/<label>/insights/index.html
-
-# 回填主报告 insight 列
-python scripts/render.py -d <run_dir>/structure_draft.json -r <run_dir>/raw_ops.json \
-  --raw-ops-details <run_dir>/raw_ops_details.json -s <run_dir>/<network>_spec.json \
-  --insight-annotations <run_dir>/runs/<label>/insights/main_report_insights.json \
-  --label <label> -o <run_dir>/runs/<label>/index.html
 ```
 
 脚本按**绝对增量**(gap/delta/total_us)排序候选；`confidence` 与所有语义只来自 agent 注解，缺省留空。被 agent 注解过的候选即使不在脚本事实 Top-K 内也会强制保留（agent 可越过脚本排序选要展示项）。`bound_type` 可能为空（取决于理论 skill 版本），不据此判 compute/memory bound。排序口径、`op_records` 反查等实现细节见 `gen_insights.py` docstring。
@@ -80,10 +76,9 @@ python scripts/render.py -d <run_dir>/structure_draft.json -r <run_dir>/raw_ops.
 2. **不写死模型结构**：不同模型的 component 名、cluster 名、op 名都可能不同。Step 5 只能使用当前 run 已经确认过的 `component_type` / cluster，不能假设一定有 attention / mlp / moe。
 3. **同类比较优先**：bubble 和抖动默认只在同一 `component_type` 或同一 cluster/op 语义内比较。跨 component_type 的排序只能作为耗时排行榜，不能自动判异常。
 4. **单 step 与跨 step 分清**：当前 sample-driven 分支的 `raw_ops.json` 是单 step。如果用户要求“同一算子跨 step 抖动”，必须回到完整 `kernel_details.csv` 设计多 step 对齐；不能用单 step 结果伪装成跨 step。
-5. **Top5 而不是刷屏**：每类 insight 的每个数据数组都默认只输出 / 展示 Top5。理论偏离、连续 vector 和数据搬运类 insight 仍按 logical slot / pattern / family / module 聚合，不每层每 step 展开；长尾只保留在原始 JSON 的统计计数或 evidence 链接里，不在 Markdown / HTML 主视图铺开。
+5. **Top5 而不是刷屏**：候选默认保留事实排序 Top-K 及 Agent 注解的条目，主视图展示 Top5。理论偏离、连续 vector 和数据搬运类 insight 仍按 logical slot / pattern / family / module 聚合，不每层每 step 展开；长尾只保留在原始 JSON 的统计计数或 evidence 链接里，不在 Markdown / HTML 主视图铺开。
 6. **证据可回溯**：每条 insight 至少带 `component_type`、`phase`、`layer_idx`、`op_indices`（或展示用 `op_range_envelope`）/ `org_index`、代表样本、可选 split 路径。Tensor movement 候选还必须带前后邻接算子上下文。
-7. **不确定要显式**：agent 对语义解释给 `confidence: high|medium|low`，不能确定时用 `low` 并在 `needs_user_review` 或 `reason` 里说明，不要编原因。HTML 和 Markdown 展示必须按 `high -> medium -> low` 排序；同置信度内按耗时、占比或预期收益降序。
-8. **不修改原始产物**：Step 5 只写 `<run_dir>/runs/<label>/insights/`（或老式 fallback `<run_dir>/insights/`），不改原 prof、`raw_ops.json`、`structure_draft.json`、`network_spec.json`。
+7. **不确定要显式**：agent 对语义解释给 `confidence: high|medium|low`，不能确定时用 `low` 并在 `needs_user_review` 或 `reason` 里说明，不要编原因。
 
 ## 3. Insight 1：模块 Bubble
 
@@ -100,7 +95,7 @@ python scripts/render.py -d <run_dir>/structure_draft.json -r <run_dir>/raw_ops.
 - 结合 `section.total.per_instance_ms` 计算 `bubble_pct_of_total`。
 - 对模块类型计算 `median_bubble_us`、`p90_bubble_us`、`max_bubble_us`、`median_bubble_pct_of_total`、`high_bubble_instance_ratio`。
 - 对具体 instance 只和同一 `component_type` 的 bubble 分布比较，计算 `delta_vs_type_median_us` / `ratio_vs_type_median`。
-- 选择 Top5 代表样本；`selection_policy.top_k` 必须为 `5`，不要隐藏在脚本里。
+- 默认选择 Top5 代表样本；`selection_policy.top_k` 记录实际使用的数量上限。
 
 **agent 操作**：
 
@@ -223,7 +218,6 @@ Step 1.5（理论性能注入）是**可选**步骤，默认不开（外部 `ope
 - `<run_dir>/raw_ops_details.json`，必须已合并 `theoretical_operator_time_us`、`duration_over_theoretical`、`duration_analysis`、`bound_type`、`theory_supported`
 - `<run_dir>/raw_ops.json`
 - `<run_dir>/structure_draft.json`
-- `<run_dir>/<network>_spec.json`
 
 **脚本操作**：
 
@@ -247,7 +241,7 @@ Step 1.5（理论性能注入）是**可选**步骤，默认不开（外部 `ope
 **agent 操作**：
 
 - 对每个候选判断理论数据是否可信，写入 `agent_review.summary`、`confidence`、`reason`、`needs_followup`。
-- 多流 sub-item 需要检查 Step 3 的理论流选择口径：若理论列取的是覆盖范围大的流，必须在 `semantic_note` 或 `reason` 里说明“被 overlap 的流没有重复计入理论耗时”。
+- 多流 sub-item 核对 Step 3 的选流依据，在 `semantic_note` 或 `reason` 中说明所选流的语义及实际重叠情况。
 - 对 fused/custom kernel、shape mismatch、`theory_supported=false` 占比高、通信/host/runtime 项，不要强行写成性能问题；用 `confidence: low` 或放入 `data_limits`。
 - 结论措辞必须是“偏离理论性能候选”，不能直接写成根因。需要源码、shape 或 trace 复核时，写 `needs_followup: true`。
 
@@ -308,22 +302,22 @@ Step 1.5（理论性能注入）是**可选**步骤，默认不开（外部 `ope
 
 - 按 `raw_ops.operators[].index` 顺序扫描连续 `accelerator_core == "AI_VECTOR_CORE"` 的区间。
 - 对每个区间记录 `op_indices`、展示用 `op_range_envelope`、`org_index_range`、`duration_us`、`stream_ids`、`normalized_name` 序列。
-- 通过 `structure_draft.op_to_component` 定位所属 component；通过 `network_spec.json` 尽力映射到 cluster。映射不到时写 `cluster: "unknown"`。
+- 通过 `structure_draft.op_to_component` 定位所属 component；通过 `metrics.json` 的 `op_records` 映射到 cluster。映射不到时写 `cluster: "unknown"`。
 - 将连续区间压成 pattern signature，例如 `RmsNorm x3 -> StridedSliceD x8 -> Mul -> ...`，按 signature 聚合。
-- 只输出 Top5 patterns 和每个 pattern 的少量代表样本；`min_ops`、`min_total_us`、`top_k` 必须写入 `selection_policy`。
+- 保留事实排序 Top-K patterns 及 Agent 注解的条目，每个 pattern 附少量代表样本；`min_ops`、`top_k` 写入 `selection_policy`。
 
 **agent 操作**：
 
 - 审阅每个 pattern，写明“这个模块在做什么语义”，语义来源优先级为 `network_spec` cluster 描述 > component type > op/shape 观察。
 - 判断是否是融合候选：`fusion_candidate: true|false|uncertain`。
-- 对 `uncertain` 给出需要用户/工程师确认的点。
+- 对 `uncertain` 给出待调用方确认的点。
 
 **输出 schema**：
 
 ```json
 {
   "schema_version": "insight.vector_sequence_candidates.v1",
-  "selection_policy": {"min_ops": 5, "min_total_us": 20.0, "top_k": 5, "group_by": "pattern_signature"},
+  "selection_policy": {"min_ops": 5, "top_k": 5, "group_by": "pattern_signature"},
   "patterns": [
     {
       "pattern_signature": "RmsNorm x3 -> StridedSliceD x8 -> Mul -> ...",
@@ -369,9 +363,9 @@ Step 1.5（理论性能注入）是**可选**步骤，默认不开（外部 `ope
 **脚本再做定位统计**：
 
 - 根据 `agent_taxonomy.families[].ops` 在 `raw_ops.json` 中定位算子。
-- 用 `structure_draft.op_to_component` / `components[].op_indices` 反查所属 component；用 `network_spec.json` 尽力反查 cluster。
+- 用 `structure_draft.op_to_component` / `components[].op_indices` 反查所属 component；用 `metrics.json` 的 `op_records` 反查 cluster。
 - 为每个命中 op 记录前后邻接上下文：同 stream 前后 op、全局序列前后 op、所在连续 vector 区间、是否靠近 cube/communication op。
-- 按 `family -> op_name -> component_type -> cluster` 聚合 count、total_us、typical_us、top locations、representative contexts；主输出只保留 Top5 family/module 聚合项，每项内部代表位置也最多 Top5。
+- 按 `family -> op_name -> component_type -> cluster` 聚合 count、total_us、typical_us、top locations、representative contexts；主输出保留 Top-K family/module 聚合项及 Agent 注解的条目，每项内部代表位置默认 Top5。
 
 **agent 最后写冗余消除可能性判断**：
 
@@ -442,22 +436,13 @@ Step 1.5（理论性能注入）是**可选**步骤，默认不开（外部 `ope
 
 ## 8. HTML 渲染
 
-Step 5 HTML 只渲染已落盘的五个 JSON 和 `final_conclusions.md`，不在前端重新计算隐含规则。HTML 主视图和 Markdown 结论都只展示每个数据数组的 Top5，避免长表刷屏。
-
-**输入**：
-
-- `<run_dir>/runs/<label>/insights/module_bubble.json`
-- `<run_dir>/runs/<label>/insights/operator_jitter.json`
-- `<run_dir>/runs/<label>/insights/theoretical_deviation.json`
-- `<run_dir>/runs/<label>/insights/vector_sequence_candidates.json`
-- `<run_dir>/runs/<label>/insights/data_movement_ops.json`
-- `<run_dir>/runs/<label>/insights/final_conclusions.md`
+Step 5 HTML 渲染已落盘的五类洞察 JSON 和 `final_conclusions.md`。
 
 **输出**：`<run_dir>/runs/<label>/insights/index.html`。
 
 **回填 Step 3 主报告**：
 
-Step 3 首次生成的 `<run_dir>/runs/<label>/index.html` 必须已经包含最后一列 `insight`，但默认留空。Step 5 最后由 agent 把五类 insight 的 high / medium 条目回填主报告，并标注 insight 类别，写：
+agent 将五类 insight 中的 high / medium 条目写入以下文件，供 Step 3 主报告回填：
 
 ```text
 <run_dir>/runs/<label>/insights/main_report_insights.json
@@ -499,7 +484,7 @@ schema：
 - `confidence` 只允许 `high` / `medium`；`low` 不回填到主报告。
 - `summary` 必须由 agent 填写，脚本不得从五个 insight JSON 自动推断。
 
-写完后重跑主报告渲染：
+写完后沿用本 run 的渲染参数（含已使用的 `--theory-decisions`），追加 `--insight-annotations` 回填主报告：
 
 ```bash
 python scripts/render.py \
@@ -512,16 +497,6 @@ python scripts/render.py \
   -o <run_dir>/runs/<label>/index.html
 ```
 
-**页面结构**：
-
-1. 常驻通用结论区：显示最终结论、数据来源、限制说明、证据索引；始终可见。
-2. 五个选项卡页面：`Module Bubble` / `Operator Jitter` / `Theoretical Deviation` / `Vector Sequences` / `Tensor Movement`。
-3. Module Bubble 页：分成“模块长期 bubble 偏大 Top5”和“具体层 / 模块异常 bubble Top5”两个表。
-4. Operator Jitter 页：展示 cluster / operator 抖动候选 Top5，强调这是统计候选，不是根因结论。
-5. Theoretical Deviation 页：按 sub-item / TOTAL logical slot 和 operator logical slot 展示理论性能偏离 Top5，单例只作为 evidence。
-6. Vector Sequences 页：按 pattern 聚合展示连续 vector 区间 Top5，列代表样本与 agent 语义解释。
-7. Tensor Movement 页：按 family / module 展示搬运与结构变换算子 Top5，列 taxonomy 来源、前后上下文、冗余消除可能性和方向。
-
 **HTML 模板约束**：
 
 完整 HTML/CSS/JS 骨架放在 `scripts/templates/insight_page.html`，不要 inline 到本文档。渲染脚本 `scripts/render_insights.py` 以该模板为基础、服务端预填各表生成 `<run_dir>/runs/<label>/insights/index.html`（模板 JS 只切 tab，不在前端 fetch/算数）。
@@ -530,9 +505,8 @@ python scripts/render.py \
 
 - 常驻通用结论区：核心结论、数据限制、证据索引，始终可见。
 - 五个选项卡页面：`Module Bubble` / `Operator Jitter` / `Theoretical Deviation` / `Vector Sequences` / `Tensor Movement`。
-- 每个选项卡使用当前 JSON 产物填充表格；每个表默认只渲染 Top5 行，可以动态隐藏空内容，但不能改掉五个页面的含义。
+- 每个选项卡使用对应 JSON 产物填充表格。
 - `component_type` / cluster / family 的显示名来自当前产物，不做固定枚举。
-- 所有“可优化 / 可消除”措辞必须来自 agent review 字段，HTML 渲染层不能自行推断。
 
 **渲染弹性**：
 
@@ -540,9 +514,6 @@ python scripts/render.py \
 - 表格列可以增减，但每行必须保留：对象名称、所属模块、耗时/比例、代表位置、agent 解释、confidence、evidence。
 - 所有 HTML 表格和 Markdown 结论都按 `high -> medium -> low` 显示；同一 confidence 内按耗时、占比、delta 或预期收益降序。
 - 所有 HTML 表格和 Markdown Top5 表都必须标注“Top5”。如果原 JSON 候选不足 5 条，展示实际条数并保留空状态说明；如果原 JSON 超过 5 条，不在主视图继续展示第 6 条以后。
-- 模型没有某类结构时，不要补假数据；例如没有 MoE 就不能渲染 MoE 专属卡片。
-- `component_type` / cluster / family 的显示名来自当前产物，不做固定枚举。
-- 所有“可优化 / 可消除”措辞必须来自 agent review 字段，脚本渲染层不能自行推断。
 
 **`final_conclusions.md` 模板**：
 
@@ -571,7 +542,7 @@ python scripts/render.py \
 ## 数据限制
 
 - 当前是否仅基于单 step。
-- 哪些 taxonomy 或语义解释需要用户确认。
+- 哪些 taxonomy 或语义解释尚待确认。
 - 哪些候选只是统计异常，不代表根因。
 
 ## 建议后续动作

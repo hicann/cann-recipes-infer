@@ -1,18 +1,18 @@
-# 整网模块拆解与候选编排派生
+# 模块拆解与候选编排派生
 
-多流分析分两个拆解层级和一个派生阶段：先把整网拆成模块、判模块间并行，再把每个候选模块拆成算子、判模块内并行，最后基于两层 DAG 和资源标签为每个并行点派生候选编排。本页只讲技术规则，产出怎么记账（Dashboard / round / 状态）由调用方负责。
+多流分析先拆模块、判模块间并行，按需要下钻算子，再基于依赖与资源判断派生候选编排。
 
 ## 总目标
 
-- 把整网中每一种 decoder layer 内的模块拆出来，画出单层模块 DAG，识别模块与模块间的候选并行关系。
-- 对每个候选模块继续拆成算子，画出模块内算子 DAG，识别模块内候选并行关系。
+- 全局候选发现覆盖各类 decoder layer 的代表性完整层；指定模块或已有方案围绕目标及其生产者、消费者、共享状态和通信依赖展开，复用已有分析。
+- 画出分析范围内的模块 DAG；需要判断模块内分流或细化依赖、资源占用时，再补算子清单与 DAG。
 - 基于模块 DAG、算子 DAG 和资源标签，为每个并行点派生候选编排。
 
-## 一、整网模块拆解规则
+## 一、模块拆解规则
 
-### 1. 从一层完整 decoder layer 出发
+### 1. 确定分析范围
 
-第一步必须从整网 decoder layer 的执行路径出发，而不是直接抓某个局部热点函数。先看清：整网主路径从哪开始到哪结束、当前分析的是 `prefill` 还是 `decode`、整网里有哪些模块。
+明确当前分析的是 `prefill` 还是 `decode`，以及目标路径的起止位置、模块和外部依赖。
 
 ### 2. 模块定义
 
@@ -31,11 +31,11 @@
 - 同步边界：`record_event / wait_event` / `wait_stream`
 - 资源边界：明显偏计算、偏通信、偏搬运的切换点
 
-## 二、整网模块 DAG 规则
+## 二、模块 DAG 规则
 
 ### 1. 节点
 
-一个节点对应一个模块，节点名要体现模块语义；汇合点可以单独画成控制节点（如 `merge_shared_router`）。节点不能是 Decoder Layer，要再往下拆至少一到两级。
+一个节点对应一个模块，节点名要体现模块语义；汇合点可以单独画成控制节点（如 `merge_shared_router`）。
 
 ### 2. 边类型
 
@@ -79,45 +79,45 @@ flowchart LR
 
 ## 四、算子级拆解规则
 
-- **每个候选模块都要做算子拆解，每个节点必须是单个算子**（或没必要再拆的算子组）。
+- 对需要下钻的模块，节点对应单个算子或无需再拆的算子组。
 - 仍优先沿计算 / 通信 / 同步 / 状态边界拆；模块内的共同输入、汇合点、同步点要单独标清。
-- 每个模块产出：模块内算子清单、算子级依赖、算子级 DAG。
+- 下钻模块产出：模块内算子清单、算子级依赖、算子级 DAG。
 
 ### resource_hint 填写
 
-`resource_hint` 在生成模块清单和算子清单时同步填写，对每个可并行点从 profiling 的 `kernel_details.csv` 读算子行级资源信息回填。定位某模块 / 节点对应的算子行，靠调用方提供的算子归属信息或源码对照确定；字段查法和命令见 [`kernel-fields-lookup.md`](kernel-fields-lookup.md)。
+`resource_hint` 在生成模块清单和算子清单时同步填写，对每个可并行点从 profiling 的 `kernel_details.csv` 读算子行级资源信息回填。定位某模块 / 节点对应的算子行，靠调用方提供的算子归属信息或源码对照确定，只读取相关算子的必要字段。
 
 推荐读取字段：
 
 | 字段 | 用途 |
 | --- | --- |
 | `Name` | 确认算子身份 |
-| `Stream ID` / `Task ID` | 判断落流和下发顺序 |
+| `Stream ID` / `Task ID` | 确认落流与任务身份；执行顺序结合开始时间核对 |
 | `Input Shapes` / `Output Shapes` | 判断跨流 tensor 尺寸和额外搬运风险 |
 | `Duration(us)` | 判断主路径窗口和副路径耗时 |
 | `Accelerator Core` | 判断 cube / vector / mix 类型 |
-| `Block Dim` | 判断实际占用核数，不用算子类型二元推断 |
-| `Mix Block Dim` | 判断混合算子的另一侧核数 |
+| `Block Dim` / `Block Num` | 结合 Core 类型核对主加速器核数配置 |
+| `Mix Block Dim` / `Mix Block Num` | 核对混合算子的另一侧核数配置 |
 | `aic_mac_ratio` / `aic_mte2_ratio` | 判断 cube 计算 / 搬运占比 |
 | `aiv_vec_ratio` / `aiv_mte2_ratio` | 判断 vector 计算 / 搬运占比 |
 
-`resource_hint` 写成可读摘要，不贴 raw 表，例如：
+`resource_hint` 写成可读摘要，不直接粘贴原始数据表，例如：
 
 - `cube-heavy, blk=20, dur=35us`
 - `vector/mem-heavy, aiv_mte2_ratio high, dur=18us`
-- `light cube, blk=1, can overlap with main matmul`
+- `light cube, blk=1, candidate alongside main matmul`
 
 关键约束：
 
 - MatMul 也可能 `Block Dim=1`，Vector 也可能占满核，**不要用算子类型推资源占用**。
-- 主路径 dominator 算子 + 同时刻副路径候选算子的 `Block Dim` 加和，要和设备 `ai_core_cnt` / `vector_core_cnt` 比较。
+- 按 Core 类型分别比较同时段的 Cube / Vector 核资源需求与设备容量，结合 pipeline 利用率及耗时变化判断争抢。
 - 设备核数从 `CANN 软件安装目录/<arch>-linux/data/platform_config/<soc_version>.ini` 读取。
 
 ## 五、候选编排派生规则
 
-对**每个**可并行点至少给出 2 种不同编排。把共享同一输入、彼此无 `data` 依赖的模块 / 算子看成一个候选集合，优先按集合划分思考分流，而不是只从主流里挑一个"副流子集"。
+把共享同一输入、彼此无 `data` 依赖的模块 / 算子看成一个候选集合，优先按集合划分思考分流，而不是只从主流里挑一个"副流子集"。
 
-每个候选要能看出：并行什么、怎么分流、在哪里汇合、为什么可能有收益、主要风险是什么，并配一张方案 DAG。**并行对象、流分组、汇合点、tag 粒度或跨阶段 overlap 不同，就是不同的候选**，不要把它们塞进同一方案。
+每个候选说明并行对象、流分组、汇合位置、预期收益及依据、主要风险，并配一张方案 DAG。按并行安排或收益假设的实质差异组织候选，同一编排的控核等配置调优记录在对应方案内。
 
 常见派生维度：
 
@@ -126,15 +126,13 @@ flowchart LR
 - **汇合点**：早汇合还是晚汇合
 - **流数量**：双流还是三流
 - **tag 粒度**：同一副流串行下发还是多个独立副流
-- **跨阶段 overlap**：仅本模块内，还是跨层 / 跨阶段掩盖 dominator
-
-实现强度（C1 最小切流 → C2 + 控核 → C3 + 手动同步）是同一候选的复杂度递进，不算不同候选——见 SKILL 正文"分析"一节。
+- **重叠范围**：模块内，或利用跨层 / 跨阶段的并行窗口
 
 ## 六、方向级分析产物模板（`analysis/<direction>.md`）
 
-本页拆解出的整套结果（模块 / 算子 DAG + 并行性判断）就是多流方向的**方向级分析产物**：一个模型一份，被该方向派生出的所有候选 Plan 共享和引用，不要拷进每个 Plan 的方案细节。它在候选发现阶段产出，从编排报告的「候选发现记录」链接出去（建议落到 `analysis/multi-stream.md`）。
+模块 / 算子 DAG 与并行性判断作为**方向级分析产物**供各候选共享引用，建议保存到 `analysis/multi-stream.md`。
 
-**固定按下面骨架落盘**，保证跨 run、跨 agent 的结构一致：
+按下面骨架记录，保持结构一致；内容覆盖本次分析范围，算子级部分按需展开：
 
 ### 1. 分析范围
 
@@ -142,9 +140,9 @@ flowchart LR
 - 阶段：`prefill` / `decode`
 - 分析对象：
 - 代码入口：
-- 执行模式：`Ascend IR / GE 图模式` 或 `npugraph_ex / aclgraph`
+- 执行模式：`eager`、`Ascend IR / GE 图模式` 或 `npugraph_ex / aclgraph`
 
-### 2. 整网模块
+### 2. 模块
 
 #### 2.1 模块清单
 
@@ -164,7 +162,7 @@ flowchart LR
 
 ### 3. 模块内算子
 
-为**每个候选模块**复制一组，不要只写部分模块：
+为每个需要下钻的模块复制一组：
 
 #### 3.x \<module_name\>
 
@@ -174,14 +172,14 @@ flowchart LR
 
 ### 4. 候选编排清单
 
-每个可并行点 ≥2 个候选，每个候选给到"描述 + DAG"这一层：
+每个候选给到"描述 + DAG"这一层：
 
 #### 候选-N：\<名\>
 
-- 方案描述：并行什么 / 怎么分流 / 在哪汇合 / 可能收益 / 主要风险
+- 方案描述：并行对象 / 流分组 / 汇合位置 / 预期收益及依据 / 主要风险
 - 方案 DAG：mermaid
 
-候选进入编排报告后各自成为一个 Plan；更细的流分组、GE auto-reorder 风险、overlap_pct 实测在该 Plan 的方案细节里按 [`plan-detail-fragment.md`](plan-detail-fragment.md) 展开，不写在本产物里。
+各方案的流分组、GE 调度风险及实施后的 overlap_pct 实测，按 [`plan-detail-fragment.md`](plan-detail-fragment.md) 单独记录并引用本分析。
 
 ## 七、最小示例
 
@@ -225,7 +223,7 @@ flowchart LR
 
 ### 候选编排：shared_expert 旁路双流
 
-`router_path` 与 `shared_expert` 共享 `hidden_states` 输入，在 `merge_shared_router` 前汇合。该候选把 `shared_expert` 放到 Side Path，用它掩盖 `router_path` 主路径窗口；资源标签从 `kernel_details.csv` 的 `Block Dim` / pipeline ratio 补齐。主要风险是副流过重导致拖尾，或汇合点过早导致主流空洞。
+`router_path` 与 `shared_expert` 共享 `hidden_states` 输入，在 `merge_shared_router` 前汇合。该候选将 `shared_expert` 放入副流，与 `router_path` 主路径重叠执行；资源标签从 `kernel_details.csv` 的 `Block Dim` / pipeline ratio 补齐。主要风险是副流过重导致拖尾，或汇合点过早导致主流空洞。
 
 ```mermaid
 flowchart LR

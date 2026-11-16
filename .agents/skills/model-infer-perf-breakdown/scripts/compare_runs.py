@@ -12,7 +12,7 @@
 """Aggregate multiple render.py metrics.json files into a comparison HTML.
 
 Each row is one sub-item under a component_type (one cluster, the synthetic
-`bubble`, or TOTAL = the layer end-to-end span max_end - min_start, which
+`bubble`, or TOTAL = the component instance span max_end - min_start, which
 includes bubble). Each column is one run. Cells show
 `median_ms (Δ%)` where Δ is relative to the baseline (first column unless
 overridden). Outliers per (sub-item, run) are listed inline so the reader
@@ -100,7 +100,7 @@ def collect_rows(runs, metric):
                          sub_item="TOTAL",
                          kind="total",
                          description=tot.get("description",
-                                             "layer end-to-end span (max_end - min_start, includes bubble)"))
+                                             "component instance span (max_end - min_start, includes bubble)"))
             row["per_run"][label] = {
                 "value": pick_metric(tot.get("metric", {}), metric),
                 "outliers": tot.get("outliers", []),

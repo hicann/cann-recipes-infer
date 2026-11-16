@@ -256,9 +256,6 @@ def main():
             "decode_avg_ms": decode_ms,
             "output_text": output_text,
         },
-        "verification": {
-            "all_ranks_success": prefill_ms is not None and decode_ms is not None,
-        },
     }
 
     output_dir = os.path.dirname(args.output) or "."

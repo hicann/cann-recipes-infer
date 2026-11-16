@@ -2,14 +2,16 @@
 
 > **API 速查**：`module/linear.py` 中的 `ColumnParallelLinear` / `RowParallelLinear` / `QKVParallelLinear` / `VocabParallelEmbedding` 均使用 `tp_size: int` + `tp_rank: int` 参数（不接受 `tp_group`）。通信组对象通过 `comm_manager.get_group("xxx_group")` 获取，用于显式 collective（all_gather / reduce_scatter 等）。
 >
-> `RowParallelLinear.forward` **不内置 AllReduce**，模型层在调用后显式 `dist.all_reduce(out, group=tp_group)`（参考 `models/qwen/models/modeling_qwen.py` 的 `down_proj` 后写法）。
+> `RowParallelLinear.forward` **不内置 AllReduce**，调用方按输出布局执行 AllReduce 或 ReduceScatter；保留完整 token 布局时可用 AllReduce，token 切分路径用 ReduceScatter。
 
-## Attention 层（当 attn_tp_size > 1）
+并行 Linear 替换时沿用原层的 bias 设置，并透传量化配置 `quant_config` 与完整模块 `prefix`。
+
+## Attention 层
 
 | 原组件 | 替换为 | 通信组 | 说明 |
 |-------|-------|--------|------|
 | QKV Linear | `QKVParallelLinear` | `attn_tp_group` | 列切分，Q/K/V 按头数分 |
-| O Linear | `RowParallelLinear` | `attn_tp_group` | 行切分，调用方负责 AllReduce |
+| O Linear | `RowParallelLinear` | `attn_tp_group` | 行切分，调用方按布局归约（AllReduce / ReduceScatter） |
 
 ```python
 from module.linear import QKVParallelLinear, RowParallelLinear
@@ -28,19 +30,19 @@ self.qkv_proj = QKVParallelLinear(
 
 # O 投影
 self.o_proj = RowParallelLinear(
-    config.hidden_size, config.hidden_size,
+    config.num_attention_heads * config.head_dim, config.hidden_size,
     tp_size=self.attn_tp_size,
     tp_rank=attn_tp_rank,
 )
 ```
 
-**o_proj_tp_size 独立配置**（当 `o_proj_tp_size ≠ attn_tp_size` 时，如 MLA 模型）：
+**o_proj_tp_size 独立配置**（当 `o_proj_tp_size ≠ attn_tp_size` 时）：输入维度按实际 Attention 输出确定，以下以 MLA 的 `num_attention_heads × v_head_dim` 为例。
 
 ```python
 oproj_tp_rank = comm_manager.get_rank("oproj_tp_group")
 
 self.o_proj = RowParallelLinear(
-    config.hidden_size, config.hidden_size,
+    config.num_attention_heads * config.v_head_dim, config.hidden_size,
     tp_size=self.o_proj_tp_size,
     tp_rank=oproj_tp_rank,
 )
@@ -48,13 +50,13 @@ self.o_proj = RowParallelLinear(
 
 ---
 
-## Dense FFN 层（当 dense_tp_size > 1）
+## Dense FFN 层
 
 | 原组件 | 替换为 | 通信组 | 说明 |
 |-------|-------|--------|------|
 | Gate Linear | `ColumnParallelLinear` | `dense_tp_group` | 列切分 |
 | Up Linear | `ColumnParallelLinear` | `dense_tp_group` | 列切分 |
-| Down Linear | `RowParallelLinear` | `dense_tp_group` | 行切分，调用方负责 AllReduce |
+| Down Linear | `RowParallelLinear` | `dense_tp_group` | 行切分，调用方按布局归约（AllReduce / ReduceScatter） |
 
 ```python
 from module.linear import ColumnParallelLinear, RowParallelLinear
@@ -80,7 +82,7 @@ self.down_proj = RowParallelLinear(
 
 ---
 
-## Embedding / LMHead（当 embed_tp_size > 1 或 lmhead_tp_size > 1）
+## Embedding / LMHead
 
 ```python
 from module.linear import VocabParallelEmbedding, ColumnParallelLinear
@@ -107,16 +109,25 @@ self.lm_head = ColumnParallelLinear(
 
 ---
 
-## 模块间数据重排（当相邻模块 TP 度不同时）
+## 模块间数据重排
+
+Embedding 示例对应 `embed_tp_size > 1`、`attn_tp_size = 1`，各 rank 持有等长 token 分片的 Decode 路径；Dense FFN 示例同样以 token 分片作为输入和输出布局。
 
 ```python
 embed_tp_group = comm_manager.get_group("embed_tp_group")
 dense_tp_group = comm_manager.get_group("dense_tp_group")
 
-# Embed(embed_tp=16) → Attention(attn_tp=1)
-dist.all_gather_into_tensor(full_input, embed_output, group=embed_tp_group)
+# Gather token IDs, then reduce vocabulary-shard contributions to local tokens.
+all_input_ids = input_ids.new_empty(input_ids.numel() * self.embed_tp_size)
+dist.all_gather_into_tensor(all_input_ids, input_ids, group=embed_tp_group)
+embed_tp_rank = comm_manager.get_rank("embed_tp_group")
+local_ids = all_input_ids - embed_tp_rank * self.vocab_size_per_rank
+mask = (local_ids >= 0) & (local_ids < self.vocab_size_per_rank)
+embed_output = self.embed_tokens(local_ids * mask) * mask.unsqueeze(-1)
+attn_input = embed_output.new_empty(input_ids.numel(), embed_output.shape[-1])
+dist.reduce_scatter_tensor(attn_input, embed_output, group=embed_tp_group)
 
-# Dense FFN(dense_tp=8) 的输入/输出
+# Gather token shards for FFN, then reduce and scatter output partial sums.
 dist.all_gather_into_tensor(x_output, x, group=dense_tp_group)  # 输入聚合
 # ... FFN 计算 ...
 dist.reduce_scatter_tensor(mlp_res, down_proj, group=dense_tp_group)  # 输出分散

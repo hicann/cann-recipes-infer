@@ -1,28 +1,19 @@
-# Phase 0b — stream sample ack 流程
+# Phase 0b — stream sample 定位
 
-Step 2 Phase 0b 的详细工作流。**核心契约**（SKILL.md 也写了）：每个 `expected_components[*]` 必须有用户 ack 过的 sample 范围，并转换成 `stream_sample_ack.v1`。每个 component 必须有且只有一个 `primary` stream；确认属于该 component 的旁路 / 辅助流写 `auxiliary`；无法确认的流不要硬塞进 component。
+每个 `expected_components[*]` 都需核对 sample 范围，并转换成 `stream_sample_ack.v1`。每个 component 有且只有一个 `primary` stream；语义上属于该 component 的旁路 / 辅助流写 `auxiliary`。
 
-**`auxiliary` 纳入判据（什么样的流该并进 per-layer component）**：按**语义归属**判断，**不**按时间是否重叠判断。
+**辅助流按语义归属**：属于 component 的流即使与本层时间脱节，也保留在该 component；全局通信 / 采样 / embedding / IO 等不属于任何 component 的流留 `unmatched`。pre / post / inter 无需单独提供 sample。
 
-- 流在语义上**属于某 component**（看它算的是哪个模块的什么）→ **写成该 component 的 `auxiliary`**，即使它的算子被调度到独立流、与本层时间脱节。
-- 流**不属于任何 per-layer component**（全局通信 / 采样 / embedding / IO 等 side flow）→ 不写，留 `unmatched`。
+时间脱节触发 `auxiliary_stream_temporally_displaced`：对应 op 仍保留在 `op_indices` 中，供完整切片与逐层查看；`render.py` 按 component type / stream 整体剔除其 cluster / bubble / TOTAL 计时并单独标注。该告警默认阻断，按正文的告警审查流程处理。判定细节见 `sample_matching.py`。
 
-**关键：时间脱节（overlap=0）不是"不写成 `auxiliary`"的理由。** 它只决定 `render.py` 要不要把这条流从 bubble 剔除（见下），**不决定归属**。一条语义上属于某 component 的脱节流，若因为"脱节"就扔进 `unmatched`，会丢失"它属于该 component"的语义、split 时也不再和该 component 关联——所以应写成 `auxiliary` 保留归属，而不是 unmatched。
+## A：已有 sample 范围
 
-**写成 `auxiliary` 后，时间脱节会被自动处理、不污染报告**：`detect_structure.py` 对脱节流发 hard warning `auxiliary_stream_temporally_displaced`（形态无关的并入膨胀体检，细节见 `detect_structure.py` / `sample_matching.py` docstring）；该流的 op **保留在原 component**（matched 不丢、partition 不破、Step 4 split 照切、逐层可查），`render.py` 自动把它从 cluster/bubble/TOTAL **剔除**并在报告标注（"已从 TOTAL/bubble 排除"）。所以默认就是 **① 写成 aux → 保留在 component + 度量剔除 + 标注**（信息最全、bubble 不虚高）；只有当你确认该流**不属于**这个 component 时，才 ② 留 `unmatched`。warning 只为知情，不强制。
-
-输入路径分两档：
-
----
-
-## A 档：用户直接给
-
-最理想：用户给 `component:row_lo-row_hi`（Excel 行号）+ 入口/出口算子提示；或只给入口/出口算子提示，agent 去 raw_ops 定位典型窗口。
+调用方提供 `component:row_lo-row_hi`（Excel 行号）+ 入口/出口算子提示；或只给入口/出口算子提示，agent 去 raw_ops 定位典型窗口。
 
 agent 工作步骤：
 
-1. 把用户给的算子名对照 `raw_ops.json` 的 `normalized_name` 定位实际命中位置。用户给 row 区间时校验窗口开头/结尾附近的算子是否与用户提示一致。
-2. 回贴给用户 ack（**所有行号用 Excel 行号** = `org_index + 2`，并列出邻近 op 辅助核对）：
+1. 把提供的算子名对照 `raw_ops.json` 的 `normalized_name` 定位实际命中位置。提供 row 区间时校验窗口开头/结尾附近的算子是否与入口/出口提示一致。
+2. 核对 sample 首尾和邻近 op，展示时使用 Excel 行号（`org_index + 2`）：
 
    ```
    csa : excel 1210-1455  head=RmsNorm@1210  tail=TransposeBatchMatMul@1455
@@ -31,7 +22,7 @@ agent 工作步骤：
          邻近：HcPost@1751(next)
    ```
 
-3. 用户 ack（或单点纠正）后，agent 只读取这个 sample 小窗口，把窗口内 op 按 `stream_id` 拆成 `stream_samples[]`：
+3. 读取已核对的 sample 小窗口，把窗口内 op 按 `stream_id` 拆成 `stream_samples[]`：
    - 默认把 op 数最多 / duration 最大、且包含主要 compute 路径的 stream 设为 `primary`。
    - 明确属于同一 component 的 index/cache/vector side path 设为 `auxiliary`。
    - 不确定的 stream 不写入 component；保留到 warning / unmatched，不要为了好看硬归属。
@@ -39,17 +30,13 @@ agent 工作步骤：
 
 ---
 
-## B 档：用户给不出 → agent 读模型脚本推（仍必须用户 ack）
+## B：从模型实现定位
 
-用户给不出 sample 范围时，agent **必须读 Step 0 收齐的 `model_script_paths`**。脚本缺失意味着 Step 0 没过关，回去补，不要绕过。
+未提供 sample 范围时，读取 `model_script_paths` 中的模型实现：
 
-1. 读 `forward()` 找每个 component 的第一个 / 最后一个 compute 调用，推断对应 prof 端 kernel 名：
-   - `nn.RMSNorm` → `RmsNorm`
-   - `torch_npu.npu_moe_distribute_dispatch_v2` → `MoeDistributeDispatchV2`
-   - `nn.Linear` / 量化矩乘 → `MatMulV3` / `QuantBatchMatmulV3`
+1. 读 `forward()` 找每个 component 的第一个 / 最后一个 compute 调用，结合实际 prof 确定对应 kernel。对应关系不明确时，查询 cannbot-knowledge 中相关算子实现与映射资料。
 2. （可选）跑 `python scripts/detect_structure.py --explore -r <run_dir>/raw_ops.json -o <run_dir>/explore.json` 看候选算子的频次是否符合预期（count = N × 该 component 在该 phase 出现次数；next_kernels_distinct 低的更适合做锚）。
-3. **同样按 A 档第 2 步格式回贴用户 ack**——明确标注"以下 sample 窗口和入口/出口提示是 agent 读 `<脚本路径>` 的 `<函数名>` 推出来的，请核对"。
-4. 用户 ack 通过才写 `sample_ack.json`；用户单点纠正 → 回到 1 重推该项再 ack。
+3. 按 A 的步骤核对 sample、划分主辅流，记录来源脚本和函数，写入 `sample_ack.json`。
 
 ---
 
@@ -93,11 +80,11 @@ agent 工作步骤：
 ```
 
 `source` 三种取值：
-- `"user"` — 用户原话直接给
+- `"user"` — 调用方直接提供
 - `"agent_inferred_from_script:<path>"` — agent 读脚本推出来的
-- `"user_corrected"` — agent 推完后用户改过一处
+- `"user_corrected"` — 调用方修正过的样本
 
-三种都必须经过用户 ack 才允许写入。`expected_components` 列表中任一缺失即视为 ack 未完成，`detect_structure.py` 启动时 exit 1。
+`source` 记录样本依据，`acked_at` 记录核对时间。`expected_components` 中任一缺失时，`detect_structure.py` 启动校验失败。
 
 若当前只有人工给出的 Excel 区间，agent 必须先读取对应小窗口，按 `stream_id` 拆成 `stream_samples[]`，再写入上面的 v1 schema（Step 2 输入须为此 v1 schema）。
 

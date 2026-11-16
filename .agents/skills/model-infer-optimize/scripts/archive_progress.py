@@ -67,7 +67,7 @@ def archive_progress(progress_path: str) -> None:
     if not os.path.exists(history_path):
         persistent_text = parts[0].strip()
         header = (
-            "<!-- 本文件默认禁止全文读取。需要历史信息时请用 Grep 按关键字查找。 -->\n"
+            "<!-- 历史归档：优先读取 progress.md，按需定位并读取相关历史记录。 -->\n"
             f"# 进度历史归档\n\n## 常驻区快照\n\n{persistent_text}\n"
         )
         with open(history_path, "w", encoding="utf-8") as f:

@@ -471,7 +471,13 @@ def analyze_kernels(csv_file, detail_step_id=None, keep_ai_cpu=False):
                                         key=lambda x: -x[1]))
         })
 
-    check_consistency(result['steps_summary'])
+    try:
+        check_consistency(result['steps_summary'])
+    except ConsistencyError as exc:
+        if detail_step_id is None:
+            raise ConsistencyError(f'{exc}\n请用 -s 显式选择目标 step。') from exc
+        print(f'提示: {str(exc).removeprefix("错误: ")}；按 -s {detail_step_id} 提取。',
+              file=sys.stderr)
 
     if detail_step_id is None:
         detail_step_id = sorted_steps[0] if sorted_steps else None

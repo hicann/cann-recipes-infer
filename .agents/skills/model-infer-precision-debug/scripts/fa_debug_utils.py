@@ -8,17 +8,15 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # ----------------------------------------------------------------------------------------------------------
-"""Validate FlashAttention call parameters at the call site.
+"""Validate fused-inference attention (FIA) v1/v2 parameters at the call site.
 
 Insert debug_fa_all_params() right before the FA call, or call the individual
-checks. Findings are graded: ERROR marks a contradiction the checker can prove
-from the arguments alone, WARN marks a deviation from the recommended value for
-the declared path, which several shipped models legitimately depart from, or a
-value outside the range the checker covers.
+checks. Findings are graded: ERROR marks a violation of the covered parameter
+constraints, WARN marks a value to review or outside the checker's coverage.
+The optional path label identifies the call site without prescribing its parameters.
 
-The mask content checks index a 2048x2048 tensor and reduce it, which forces a
-device-to-host sync on every call. That sync moves the symptom of memory-class
-defects, so do not insert this checker while investigating those.
+Mask content checks may synchronize the device and affect timing-sensitive
+symptoms. Use the low-disturbance probes when observation changes the symptom.
 
 Usage:
     import sys; sys.path.append("<skill>/scripts")
@@ -36,13 +34,6 @@ import argparse
 import sys
 
 import torch
-
-# path -> (recommended prefill sparse_mode, recommended decode sparse_mode, legitimate deviations)
-PATH_RECOMMENDED = {
-    "std_pa": (3, 3, "单 token Decode 有用 0 + mask=None 的实现，按该模型的分支条件核对"),
-    "sliding": (4, 4, "窗口由 pre_tokens / next_tokens 表达，本校验器不接收这两个参数"),
-    "mla_absorb": (3, 0, "q_len>1 的 Decode 用 3 并保留 mask；也有实现两阶段共用一份入参恒用 3"),
-}
 
 # layout -> (query sequence axis, key sequence axis); None means packed, read from actual_seq_*
 SEQ_AXIS = {
@@ -116,22 +107,10 @@ def sequence_lengths(query, key, input_layout, actual_seq_qlen, actual_seq_kvlen
 
 def debug_atten_mask(atten_mask, sparse_mode, is_prefill, path=None,
                      q_seq_len=None, kv_seq_len=None, layer_idx=0):
-    """Check that atten_mask and sparse_mode agree, and compare against the declared path."""
+    """Check that atten_mask and sparse_mode agree."""
     stage = "Prefill" if is_prefill else "Decode"
     print(f"--- Layer {layer_idx} atten_mask Debug ({path or '未声明路径'}, {stage}) ---")
     print(f"  sparse_mode: {sparse_mode}, q_seq_len: {q_seq_len}, kv_seq_len: {kv_seq_len}")
-
-    if path is not None:
-        if path not in PATH_RECOMMENDED:
-            print(f"  [WARN] 未知 path '{path}', 可选 {list(PATH_RECOMMENDED)}，或传 None 跳过路径对照")
-        else:
-            prefill_sm, decode_sm, note = PATH_RECOMMENDED[path]
-            expected = prefill_sm if is_prefill else decode_sm
-            if sparse_mode != expected:
-                print(f"  [WARN] {path} {stage} 推荐 sparse_mode={expected}, 当前 {sparse_mode}；"
-                      f"合理偏离：{note}")
-            else:
-                print(f"  [OK] sparse_mode 与 {path} {stage} 推荐值一致")
 
     if not isinstance(sparse_mode, int) or isinstance(sparse_mode, bool):
         print(f"  [ERROR] sparse_mode 应为整数, 当前 {sparse_mode!r}, 后续 mask 校验跳过")
@@ -143,21 +122,20 @@ def debug_atten_mask(atten_mask, sparse_mode, is_prefill, path=None,
     if sparse_mode in (1, 2, 3, 4) and atten_mask is None:
         print(f"  [ERROR] sparse_mode={sparse_mode} 要求传入 atten_mask, 但收到 None")
         return
+    if atten_mask is not None and not isinstance(atten_mask, torch.Tensor):
+        print(f"  [ERROR] atten_mask 应为张量, 当前 {type(atten_mask).__name__}")
+        return
+    if atten_mask is not None and atten_mask.dtype not in MASK_DTYPES:
+        print(f"  [ERROR] atten_mask dtype 必须为 bool/int8/uint8, 当前为 {atten_mask.dtype}")
+        return
     if sparse_mode == 0:
         if atten_mask is not None:
-            print(f"  [WARN] sparse_mode=0 通常不需要 atten_mask, "
-                  f"当前传入 shape={tuple(atten_mask.shape)}")
+            print(f"  [INFO] sparse_mode=0, atten_mask shape={tuple(atten_mask.shape)}")
         else:
             print(f"  [OK] sparse_mode=0 + mask=None")
         return
 
-    if not hasattr(atten_mask, "shape") or not hasattr(atten_mask, "dtype"):
-        print(f"  [ERROR] atten_mask 应为张量, 当前 {type(atten_mask).__name__}")
-        return
     print(f"  mask shape: {tuple(atten_mask.shape)}, dtype: {atten_mask.dtype}")
-    if atten_mask.dtype not in MASK_DTYPES:
-        print(f"  [ERROR] atten_mask dtype 必须为 bool/int8/uint8, 当前为 {atten_mask.dtype}")
-        return
 
     if sparse_mode in (2, 3, 4):
         if tuple(atten_mask.shape) not in CAUSAL_MASK_SHAPES:
@@ -256,28 +234,29 @@ def debug_fa_layout_shape(query, key, value, input_layout, num_query_heads,
 
 def debug_actual_seq_lengths(actual_seq_qlen, actual_seq_kvlen, input_layout,
                              kv_seq_len=None, layer_idx=0, total_q_tokens=None,
-                             kv_capacity=None, is_prefill=None, is_paged=False):
+                             kv_capacity=None):
     """Check how actual_seq_lengths was built.
 
     total_q_tokens is the length of the query token axis under a packed layout;
     kv_capacity is the KV upper bound derived from the block table under paging.
-    Both feed the length invariants. Under paging the KV length is independent of
-    Q, so the Prefill equality below only holds without it.
+    Both feed the length invariants. Q and KV lengths are checked independently.
     """
     if not isinstance(input_layout, str):
         print(f"  [ERROR] Layer {layer_idx}: input_layout 应为字符串, 当前 {input_layout!r}")
         return
     if input_layout not in SEQ_AXIS:
-        print(f"  [ERROR] Layer {layer_idx}: 未知 input_layout {input_layout!r}, "
-              f"actual_seq_lengths 校验跳过")
+        print(f"  [WARN] Layer {layer_idx}: input_layout {input_layout!r} 未纳入长度校验, "
+              f"请按目标算子 API 核对")
         return
     if input_layout.split("_")[0] == "TND" or input_layout == "NTD_TND":
         qlen = to_list(actual_seq_qlen)
         if not qlen:
             print(f"  [ERROR] Layer {layer_idx}: TND 系列 layout 必须传入 actual_seq_qlen")
             return
-        if qlen and qlen[0] <= 0:
-            print(f"  [ERROR] actual_seq_qlen 首项为 {qlen[0]}, 应为首个序列的正长度")
+        if qlen[0] < 0:
+            print(f"  [ERROR] actual_seq_qlen 首项为 {qlen[0]}, 累计长度必须非负")
+        elif qlen[0] == 0:
+            print(f"  [WARN] actual_seq_qlen 首项为 0, 确认首个请求的 query 长度是否为空")
         for i in range(1, len(qlen)):
             if qlen[i] < qlen[i - 1]:
                 print(f"  [ERROR] TND actual_seq_qlen 必须单调递增 (cumsum), "
@@ -294,9 +273,6 @@ def debug_actual_seq_lengths(actual_seq_qlen, actual_seq_kvlen, input_layout,
         elif len(kvlen) != len(qlen):
             print(f"  [ERROR] actual_seq_kvlen {len(kvlen)} 项与 actual_seq_qlen {len(qlen)} 项 "
                   f"batch 数不一致")
-        elif is_prefill and not is_paged and kvlen != qlen:
-            print(f"  [ERROR] 非分页 TND Prefill 的 K/V 是本次 packed 的完整张量, "
-                  f"actual_seq_kvlen 应与 qlen 同为累积和, 当前 kvlen={kvlen} qlen={qlen}")
         check_kv_capacity(actual_seq_kvlen, kv_capacity, layer_idx)
         return
 
@@ -326,7 +302,9 @@ def check_kv_capacity(actual_seq_kvlen, kv_capacity, layer_idx=0):
 
 def debug_inner_precise(atten_mask, inner_precise, q_seq_len, sparse_mode, layer_idx=0):
     """Check whether fully masked rows require the row-invalid correction mode."""
-    if not q_seq_len or q_seq_len <= 1 or sparse_mode not in (0, 1) or atten_mask is None:
+    if not q_seq_len or q_seq_len <= 1 or sparse_mode not in (0, 1):
+        return
+    if not isinstance(atten_mask, torch.Tensor):
         return
     all_masked_rows = (atten_mask != 0).all(dim=-1)
     num_invalid_rows = int(all_masked_rows.sum().item())
@@ -375,7 +353,8 @@ def debug_fa_all_params(query, key, value, *, path=None, fa_version="v1",
         query, key, input_layout, actual_seq_qlen, actual_seq_kvlen, is_paged=is_paged)
 
     token_axis = PACKED_TOKEN_AXIS.get(input_layout)
-    total_q_tokens = query.shape[token_axis] if token_axis is not None else None
+    total_q_tokens = (query.shape[token_axis]
+                      if token_axis is not None and token_axis < len(query.shape) else None)
     kv_capacity = None
     if is_paged and block_size and getattr(block_table, "ndim", None) == 2:
         kv_capacity = block_table.shape[1] * block_size
@@ -387,15 +366,14 @@ def debug_fa_all_params(query, key, value, *, path=None, fa_version="v1",
     debug_fa_version_params(fa_call_kwargs, fa_version)
     debug_atten_mask(atten_mask, sparse_mode, is_prefill, path, q_seq_len, kv_seq_len, layer_idx)
     debug_actual_seq_lengths(actual_seq_qlen, actual_seq_kvlen, input_layout, kv_seq_len,
-                             layer_idx, total_q_tokens, kv_capacity, is_prefill, is_paged)
+                             layer_idx, total_q_tokens, kv_capacity)
     debug_inner_precise(atten_mask, inner_precise, q_seq_len, sparse_mode, layer_idx)
     debug_mla_rope(query, query_rope, key_rope, sparse_mode, layer_idx)
     print(f"{'='*60}\n")
 
 
 # --------------------------------------------------------------------------------------------------
-# Self-test: configurations taken from models already adapted in this repository must not raise
-# ERROR, and the traps listed in references/kvcache_fa_checklist.md must be caught.
+# Self-test: supported configurations must not raise ERROR, and covered violations must be caught.
 # --------------------------------------------------------------------------------------------------
 
 def _meta(shape):
@@ -406,10 +384,10 @@ def _causal_mask(dtype=torch.bool):
     return torch.triu(torch.ones(2048, 2048, dtype=torch.bool), diagonal=1).to(dtype)
 
 
-def _shipped_cases():
-    """Synthetic configurations built from call sites of models adapted in this repository.
+def _valid_cases():
+    """Build synthetic configurations from repository call sites and FA API contracts.
 
-    Shapes are fixtures; the parameter combinations are the ones the models actually pass.
+    Shapes are fixtures; parameter combinations cover model paths and API-supported variants.
     This is not a run of the models themselves.
     """
     causal = _causal_mask()
@@ -499,11 +477,25 @@ def _shipped_cases():
             atten_mask=None, actual_seq_kvlen=[513, 1025],
             num_heads=8, scale=0.088, is_prefill=False,
             block_table=torch.zeros(2, 16, dtype=torch.int32), block_size=128)),
+        ("FA v2 非分页 TND，Q/KV 长度不同", dict(
+            query=_meta((164, 8, 128)), key=_meta((1024, 8, 128)), value=_meta((1024, 8, 128)),
+            fa_version="v2", input_layout="TND", sparse_mode=0,
+            actual_seq_qlen=[164], actual_seq_kvlen=[1024],
+            num_heads=8, scale=0.088, is_prefill=True)),
+        ("FA v2 支持但校验器未覆盖的 BNSD_BSND", dict(
+            query=_meta((1, 8, 2, 128)), key=_meta((1, 8, 2, 128)), value=_meta((1, 8, 2, 128)),
+            fa_version="v2", input_layout="BNSD_BSND", sparse_mode=0,
+            num_heads=8, scale=0.088, is_prefill=True)),
+        ("TND 首个请求 query 长度为零", dict(
+            query=_meta((128, 8, 128)), key=_meta((256, 8, 128)), value=_meta((256, 8, 128)),
+            fa_version="v2", input_layout="TND", sparse_mode=0,
+            actual_seq_qlen=[0, 128], actual_seq_kvlen=[128, 256],
+            num_heads=8, scale=0.088, is_prefill=True)),
     ]
 
 
 def _trap_cases():
-    """Traps from references/kvcache_fa_checklist.md that must be reported."""
+    """Build violations covered by the checker."""
     causal = _causal_mask()
     base = dict(query=_meta((256, 32, 128)), key=_meta((256, 8, 128)),
                 value=_meta((256, 8, 128)), fa_version="v2", input_layout="TND",
@@ -513,6 +505,8 @@ def _trap_cases():
         ("sparse_mode=3 却未传 mask", {**base, "sparse_mode": 3, "atten_mask": None}),
         ("mask dtype 为 float", {**base, "sparse_mode": 3,
                                  "atten_mask": _causal_mask(torch.float32)}),
+        ("sparse_mode=0 mask dtype 为 float", {**base, "sparse_mode": 0,
+                                               "atten_mask": torch.zeros(256, 256)}),
         ("mask shape 非 2048 系列", {**base, "sparse_mode": 3,
                                      "atten_mask": torch.zeros(512, 512, dtype=torch.bool)}),
         ("sparse_mode=3 mask 非下三角", {**base, "sparse_mode": 3,
@@ -520,13 +514,15 @@ def _trap_cases():
                                             torch.ones(2048, 2048, dtype=torch.bool), -1)}),
         ("TND 未传 actual_seq_qlen", {**base, "sparse_mode": 3, "atten_mask": causal,
                                       "actual_seq_qlen": None}),
-        ("TND Prefill 的 kvlen 误传原始值", {**base, "sparse_mode": 3, "atten_mask": causal,
-                                             "actual_seq_kvlen": [128, 128]}),
+        ("TND Q/KV 请求数不一致", {**base, "sparse_mode": 3, "atten_mask": causal,
+                                     "actual_seq_kvlen": [128]}),
         ("非张量 atten_mask", {**base, "sparse_mode": 3, "atten_mask": [[0, 1], [1, 0]]}),
-        ("input_layout 拼写错误", {**base, "sparse_mode": 3, "atten_mask": causal,
-                                   "input_layout": "tnd"}),
-        ("actual_seq_qlen 首项为 0", {**base, "sparse_mode": 3, "atten_mask": causal,
-                                      "actual_seq_qlen": [0, 128]}),
+        ("sparse_mode=0 非张量 atten_mask", {**base, "sparse_mode": 0,
+                                            "atten_mask": [[0, 1], [0, 0]]}),
+        ("NTD_TND Q 维数不足", {**base, "sparse_mode": 0,
+                                 "input_layout": "NTD_TND", "query": _meta((32,))}),
+        ("actual_seq_qlen 首项为负", {**base, "sparse_mode": 3, "atten_mask": causal,
+                                       "actual_seq_qlen": [-1, 256]}),
         ("actual_seq_qlen 非单调递增", {**base, "sparse_mode": 3, "atten_mask": causal,
                                         "actual_seq_qlen": [256, 128]}),
         ("FA v2 混入 v1 参数名", {**base, "sparse_mode": 3, "atten_mask": causal,
@@ -568,11 +564,11 @@ def _capture(kwargs):
 
 
 def run_self_test():
-    """Assert no false positive on shipped configurations and no miss on known traps."""
+    """Assert no false positive on supported cases and no miss on covered violations."""
     failures = 0
 
-    print("已适配模型的真实配置（不应报 ERROR）")
-    for name, kwargs in _shipped_cases():
+    print("模型调用与 API 支持配置（合成用例，不应报 ERROR）")
+    for name, kwargs in _valid_cases():
         errors = [line.strip() for line in _capture(kwargs).splitlines() if "[ERROR]" in line]
         print(f"  {'OK  ' if not errors else 'FAIL'} {name}")
         for err in errors:

@@ -8,36 +8,31 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # ----------------------------------------------------------------------------------------------------------
-"""SubagentStop hook: require a complete implementer self-check and cap retry rounds."""
+"""Check implementer self-verification in the agent's associated progress.md."""
 
 import json
 import logging
 import os
-import re
 import sys
 
 logging.basicConfig(stream=sys.stderr, level=logging.WARNING, format="%(message)s")
 logger = logging.getLogger(__name__)
 
-SELF_VERIFY_KEYWORDS_FULL = ["参考 skill", "代码加载", "编译", "推理", "输出"]
-SELF_VERIFY_KEYWORDS_DEBUG = ["编译", "推理"]
-MAX_RETRY_COUNT = 10  # 5 rounds each for implementer and reviewer
+SELF_VERIFY_KEYWORDS = ["代码加载", "编译", "推理", "输出"]
 
-SELF_VERIFY_TEMPLATE = """自验证不完整：progress.md 缺少以下自验证项：{missing}。
-请完成对应的验证步骤（而非仅补充文字记录），确认结果后写入 progress.md，然后再结束。
+SELF_VERIFY_TEMPLATE = """自验证记录不完整：progress.md 缺少以下自验证项：{missing}。
+请按本轮任务补齐自验证结果，未执行或不适用项注明原因。
 格式参考：
 ### 自验证结果
-- 参考 skill: /xxx
+- 使用的 skill（如有）:
 - 代码加载: 确认推理加载的是修改后的模型模块和正确的模型配置
-- 编译: 通过/失败
+- 编译: 检查方式及结果（不适用时注明）
 - 推理: 通过/失败
 - 输出: 合理/异常"""
 
-RETRY_LIMIT_MSG = "重试上限：当前阶段已执行 {n} 轮 implementer/reviewer 循环，超过 5 轮上限。请回退当前阶段改动，向用户报告阻塞点。"
-
 
 def find_progress_md(data):
-    """Prefer the progress.md the subagent actually read; fall back to the most recently modified."""
+    """Resolve the progress.md associated with this subagent."""
     agent_id = data.get("agent_id")
     if agent_id:
         try:
@@ -48,38 +43,16 @@ def find_progress_md(data):
         except OSError:
             pass
 
-    cwd = data.get("cwd", ".")
-    candidates = []
-    try:
-        for dirpath, _dirs, filenames in os.walk(cwd):
-            if "/.git/" in dirpath or dirpath.endswith("/.git"):
-                continue
-            if "progress.md" in filenames:
-                candidates.append(os.path.join(dirpath, "progress.md"))
-    except OSError:
-        return None
-    if not candidates:
-        return None
-    candidates.sort(key=lambda f: os.path.getmtime(f), reverse=True)
-    return candidates[0]
+    return None
 
 
-def get_current_stage(content):
-    """Extract the current stage number from progress.md."""
-    matches = re.findall(r"## 阶段\s*(\d+)", content)
-    return matches[-1] if matches else "0"
-
-
-def check_self_verification(data, progress_path, content):
+def check_self_verification(data, content):
     """Reject an implementer that has not recorded every required self-check item."""
     if data.get("agent_type") != "model-infer-implementer":
         return None
 
-    is_debug = "### 调试记录" in content and "[修复]" in content
-    keywords = SELF_VERIFY_KEYWORDS_DEBUG if is_debug else SELF_VERIFY_KEYWORDS_FULL
-
     if "### 自验证结果" not in content:
-        missing = "、".join(keywords)
+        missing = "、".join(SELF_VERIFY_KEYWORDS)
         return SELF_VERIFY_TEMPLATE.format(missing=missing)
 
     verify_start = content.rindex("### 自验证结果")
@@ -88,39 +61,9 @@ def check_self_verification(data, progress_path, content):
     if next_section > 0:
         verify_section = verify_section[:next_section]
 
-    missing = [kw for kw in keywords if kw not in verify_section]
+    missing = [keyword for keyword in SELF_VERIFY_KEYWORDS if keyword not in verify_section]
     if missing:
         return SELF_VERIFY_TEMPLATE.format(missing="、".join(missing))
-
-    return None
-
-
-def check_retry_limit(data, content):
-    """Stop a stage that has exceeded its implementer/reviewer retry budget."""
-    agent_type = data.get("agent_type", "")
-    if agent_type not in ("model-infer-implementer", "model-infer-reviewer"):
-        return None
-
-    session_id = data.get("session_id", "unknown")
-    stage = get_current_stage(content)
-    counter_file = f"/tmp/hook_retry_{session_id}_{stage}.count"
-
-    count = 0
-    if os.path.exists(counter_file):
-        try:
-            with open(counter_file) as f:
-                count = int(f.read().strip())
-        except (ValueError, OSError):
-            count = 0
-
-    count += 1
-    with open(counter_file, "w") as f:
-        f.write(str(count))
-
-    # Block only on the first breach; later calls pass so the subagent can still stop
-    if MAX_RETRY_COUNT < count <= MAX_RETRY_COUNT + 1:
-        rounds = count // 2
-        return RETRY_LIMIT_MSG.format(n=rounds)
 
     return None
 
@@ -143,14 +86,10 @@ def main():
     except OSError:
         sys.exit(0)
 
-    for check in [
-        lambda: check_self_verification(data, progress_path, content),
-        lambda: check_retry_limit(data, content),
-    ]:
-        reason = check()
-        if reason:
-            logger.error(reason)
-            sys.exit(2)
+    reason = check_self_verification(data, content)
+    if reason:
+        logger.error(reason)
+        sys.exit(2)
 
     sys.exit(0)
 

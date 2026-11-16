@@ -5,22 +5,23 @@ description: 昇腾 NPU 性能数据拆解技能。把 kernel_details.csv 按模
 
 # NPU 性能数据拆解技能
 
-输入一份 prof（`kernel_details.csv` + `trace_view.json`），结合用户对模型结构的口头描述，先把 op 序列切成 component 实例，再按 cluster 规则统计每类计算的 wall_ms + bubble_ms 中位数 / 抖动 / 异常 layer，输出一页可读的 HTML。内部指标字段用 `*_ms`，HTML 展示按量级自动使用 `µs` 或 `ms`。
+输入一份算子 CSV（可附原始 trace），结合模型实现与任务上下文，先把 op 序列切成 component 实例，再按 cluster 规则统计每类计算的 wall_ms + bubble_ms 中位数 / 抖动 / 异常 layer，输出一页可读的 HTML。内部指标字段用 `*_ms`，HTML 展示按量级自动使用 `µs` 或 `ms`。
 
 ---
+
+依据任务上下文、模型实现和 prof 确定结构、样本与分桶；影响结果且无法消解的疑问交调用方确认。输出分析结论、证据和优化候选，供调用方安排后续验证与改造。
 
 ## 工作流
 
 ```
-Step 0: 收齐 prof 路径 + 模型脚本路径 (硬约束)  →  <run_dir>/inputs.json
+Step 0: 确定 prof 路径 + 模型脚本路径  →  <run_dir>/inputs.json
 Step 1: kernel_details.csv  →  raw_ops.json (单 step 提取)
 Step 1.5: (可选,默认不开) 调用 operator-theoretical-perf → operator_analysis.csv → 合并理论列到 raw_ops_details.json
-Step 2: Phase 0a 用户描述模型 → structure_spec.json
-        Phase 0b 敲定每个 component 的 stream sample 范围 (必须用户 ack)
+Step 2: Phase 0a 识别模型结构 → structure_spec.json
+        Phase 0b 确定每个 component 的 stream sample 范围
                 → sample_ack.json
-        Phase 1  跑 detect_structure → structure_draft.json (component 实例表)
-        Phase 1.5 复读 warnings 让用户 ack
-Step 3: 用户和 agent 对话定 cluster 规则  →  network_spec.json
+        Phase 1  跑 detect_structure、审查告警 → structure_draft.json (component 实例表)
+Step 3: 按模型语义确定 cluster 规则  →  network_spec.json
         → index.html（含 theory median 列）
 Step 4: 按 component 切 csv / trace  →  splits/ (单层下钻)
 Step 5: 洞察归纳（agent 语义判断 + 脚本统计） → insights/
@@ -32,19 +33,9 @@ Step 5: 洞察归纳（agent 语义判断 + 脚本统计） → insights/
 
 ## 工作目录约定
 
-跑本 skill 的 agent **第一步**（早于 Step 1）必须先和用户敲定一个 **`<run_dir>`**——本次 skill 所有产物的落盘根，下文 CLI 里出现的 `<run_dir>/` 都指这个目录。默认建议 `./perf_breakdown/<label>/`，`<label>` 由用户给（如 `<network>_baseline` / `<network>_variant`）；用户也可以直接指定绝对路径。不存在就 `mkdir -p`。
+本次产物写到 `<run_dir>`，沿用调用方指定的目录，未指定时默认 `./perf_breakdown/<label>/`；`<label>` 标识本次分析。
 
-**进 `<run_dir>` 先查历史产物，再判档复用**：每次跑 skill，agent 在做新的对话 / 脚本调用前，必须先列 `<run_dir>` 已有文件 + 读 `HISTORY.md`（如果有），然后跑 Step 1 出新 `raw_ops.json`（落到 `raw_ops.next.json` 以免覆盖），和上一 run 做自动 diff，判出 **小改 / 中改 / 大改** 三档之一，再按对应档位复用产物：
-
-| 档 | 触发信号 | 复用范围 |
-|----|---------|----------|
-| **小改** | kernel 集合完全相同；anchor count 偏差 = 0；上一 sample 的 stream anchors 在相近位置命中 | `structure_spec` / `structure_draft`（sample 平移） / `<network>_spec` 全复用；跳过所有对话 |
-| **中改** | 出现新 normalized_name；anchor count 偏差 ≤ 10%；sample 偏移 > 5 row；shape 分布漂移 | `structure_spec` 复用 + 回显问；**重走 Phase 0b** 重出 sample；`<network>_spec` 增量补 rule |
-| **大改** | anchor count 偏差 > 10%；总 op 数偏差 > 30%；关键 anchor 消失 | 重走 Phase 0a / 0b；`<network>_spec` 当参考但逐条审 |
-
-判档后 agent 复述一句结论给用户 ack（如"prof 相对 `<prev_label>` 是中改：MoE 新增 `AddRmsNormCast`，sample 偏移约 80 行。打算 B 档复用，对吗？"），用户不同意直接按用户给的档位走。
-
-首次跑（`<run_dir>` 空）跳过 diff 走全量流程。完整信号定义与判档规则见 `references/reuse_policy.md`。
+已有产物时先查看 `HISTORY.md` 和相关规则，优先复用，仅重跑受输入或规则变化影响的阶段。新 prof 的小改 / 中改 / 大改判断及同一份 prof 的复用范围见 `references/reuse_policy.md`。
 
 ---
 
@@ -54,25 +45,23 @@ Step 5: 洞察归纳（agent 语义判断 + 脚本统计） → insights/
 
 ---
 
-## 前置物料 checklist（Step 1 之前必走）
+## 输入
 
-跑本 skill 在做任何 prof 解析之前，agent **必须**和用户敲齐下列物料；任一缺失或未确认即 abort，不要带着空缺/默认值往下走。
+| 物料 | 用途 |
+|------|------|
+| 算子 CSV | Step 1 提取目标 step；Step 4 切片 |
+| 原始 trace（可选） | Step 4 提供时间线上下文；未提供时从 raw_ops 合成 |
+| 模型脚本路径（`modeling*.py` 及相关 module） | 识别结构、核对 sample 和 cluster 语义 |
+| phase、rank 与 `<run_dir>` | 确定分析对象和产物位置 |
 
-| 物料 | 强度 | 缺失/未确认行为 |
-|------|------|----------|
-| **prof 路径**（`kernel_details.csv` + `trace_view.json`） | 硬约束 | 文件不存在直接 abort |
-| **模型脚本路径**（`modeling*.py` + 相关 module 文件） | **硬约束** | 用户说"没有/不方便"也 abort——stream sample ack 流程依赖它；用户应当先去拿到再回来 |
-| **`<run_dir>` 目录** | 硬约束 | 不存在则 `mkdir -p` |
-| **phase + device 选择**（多卡 / 多采集会话时） | **硬约束** | 必须列出可选项让用户挑；不允许 agent 自作主张默认选第一个 |
-
-Ascend prof 有两种主流目录布局（A 类 `torch_npu.profiler` / B 类原生 `msprof`），各自的 csv / json 落在哪、多卡怎么分目录见 `references/prof_layouts.md`。agent 看到 prof 目录后**先识别是哪一类**，再按对应位置取 `kernel_csv` / `trace_json`；多卡 / 多采集 / 多 phase 任一维度组合数 > 1 时枚举所有 `(phase, rank/device)` 让用户挑，每个组合各起一个 sub `<run_dir>` 独立跑。
+从采集产物中定位 `kernel_csv` / `trace_json`，CSV 字段须符合 `references/kernel_data_guide.md` 的输入契约。采集目录、字段含义及版本差异，查询 cannbot-knowledge 中对应版本的 profiling 产物说明。按任务选择采集会话与 `(phase, rank/device)`，每个选中的组合在独立子目录分析。
 
 每个子 run 的 `inputs.json`（agent 写）：
 
 ```json
 {
   "prof_dir": "/abs/path/to/<prof 根目录>",
-  "kernel_csv": "/abs/path/to/.../kernel_details.csv 或 op_summary_*.csv",
+  "kernel_csv": "/abs/path/to/.../kernel_details.csv",
   "trace_json": "/abs/path/to/.../trace_view.json 或 msprof_*.json",
   "model_script_paths": ["/abs/path/to/modeling_xxx.py", "/abs/path/to/moe_module.py"],
   "phase": "decode",
@@ -80,7 +69,7 @@ Ascend prof 有两种主流目录布局（A 类 `torch_npu.profiler` / B 类原�
 }
 ```
 
-`rank` 一般 = `device_id`（每 process 绑一张卡时），分布式训练 rank ≠ device 时由用户给。
+`trace_json` 未提供时可省略。`phase`、`rank` 及其与 `device_id` 的对应关系，从采集元信息、日志或已知部署配置确认。
 
 后续 `detect_structure.py` 启动时会校验 `inputs.json` 存在、`model_script_paths` 非空且文件存在、`phase` / `rank` 字段已填，否则 exit 1。
 
@@ -113,13 +102,13 @@ python scripts/analyze_kernels.py -f <kernel_csv> -s <step_id> \
 
 **作用**：从 csv 抽一个稳定 step，后续所有分析以单 step 为单位。`-s` 不指定时取第一个 step，而第一个 step 可能是 warmup，用 `-s` 显式指定一个稳态 step id。
 
-**一致性门禁**：脚本在多 step 的 kernel 分布不同时报「各 Step 的 Kernel 分布不一致」并以 1 退出，这发生在选 step 之前。若 csv 里含 warmup step 或一次采集同时覆盖 prefill 与 decode，先按阶段拆出只含稳态 step 的 csv 再跑。
+**step 选择**：多 step 的 kernel 分布不同时，未指定 `-s` 会停止并提示选择；显式指定后提取目标 step，其他 step 的差异仅作提示。结合采集阶段与运行记录选择稳态 step。
 
 **输入**：`kernel_details.csv`（同目录通常还有 `trace_view.json`，Step 4 用，Step 1 不消费）。
 
 **输出**：
 - `raw_ops.json` — 单 step `operators[]`，每条含 `index` / `org_index`（csv 0-based 数据行号）/ `normalized_name` / `duration_us` / `start_time_us` / `stream_id` / `input_shapes` / `output_shapes`。Step 2、3 消费。
-- `raw_ops_details.json` — 单 step 详情，含 csv 全部字段。Step 4 切片时用。
+- `raw_ops_details.json` — 单 step 算子详情，用于明细展示、理论统计和洞察。
 
 **行号 domain**（Excel / `org_index` / `index`，三者各自的语义和换算关系）+ AI_CPU drift 注意事项见 `references/phase0b_workflow.md` 末尾的"行号 domain 速查"。
 
@@ -129,11 +118,11 @@ python scripts/analyze_kernels.py -f <kernel_csv> -s <step_id> \
 
 ### Step 1.5 — 理论性能注入（可选，默认不启用）
 
-**可选步骤**——依赖外部 `operator-theoretical-perf` skill。不启用时 `render.py` 的 theory median 列自动留空（`—`）、不阻塞；Step 5 的理论偏离 insight 也自动跳过（输出空 JSON + `data_limits` 说明）。仅当用户要理论对比、且外部 skill 可用时才启用。
+**可选步骤**——依赖外部 `operator-theoretical-perf` skill。不启用时 `render.py` 的 theory median 列自动留空（`—`）、不阻塞；Step 5 的理论偏离 insight 也自动跳过（输出空 JSON + `data_limits` 说明）。仅当任务需要理论对比、且外部 skill 可用时才启用。
 
-**启用时**：chip 配置提问可并入 Step 0 前置物料，或推迟到 Step 2 之后、`render.py` 之前（Phase 0a 的「不要先于此发问」只约束结构类提问，chip 不受限）；理论列合并必须在 `render.py` 之前完成。
+**启用时**：使用已确认的 chip 配置，在 `render.py` 之前完成理论列合并。
 
-调用外部 `operator-theoretical-perf` skill（或直接跑其 `analyze_operators.py --chip-config <chip>.json`），用原始 `kernel_details.csv` + 用户确认的 chip 生成 `<run_dir>/operator_analysis.csv`，再把理论列按原 CSV 行序 / `org_index` 合并回 `<run_dir>/raw_ops_details.json`：
+调用外部 `operator-theoretical-perf` skill（或直接跑其 `analyze_operators.py --chip-config <chip>.json`），用原始 `kernel_details.csv` + 已确认的 chip 生成 `<run_dir>/operator_analysis.csv`，再把理论列按原 CSV 行序 / `org_index` 合并回 `<run_dir>/raw_ops_details.json`：
 
 ```bash
 python scripts/merge_theoretical_columns.py \
@@ -148,9 +137,15 @@ python scripts/merge_theoretical_columns.py \
 
 ### Step 2 — sample-driven 层检测
 
-**Phase 0a：问用户模型结构（必走）**
+**Phase 0a：识别模型结构**
 
-agent **逐字**把 `references/phase0a_prompt.md` 里的 prompt 发给用户，解析答案后自动起 phase 名（①→`main`、②→`mtp_head`、③→用户类别名），写 `<run_dir>/structure_spec.json` 并回显 JSON 让用户确认。schema：
+结合模型实现、本次运行配置和调用方信息，识别本次 prof 的结构：
+
+- 覆盖主模型、投机解码 / MTP / draft 头及其他独立子模型（如 encoder、vision tower），层数按本次实际执行情况填写。
+- `component` 是一层内与 attention / ffn 平级的功能块；一层的 component 组合为 `composition`，记录各 composition 对应的层号。
+- 同一种功能跨阶段使用一致的 component 名；`phase` 按子模型语义命名，如 `main`、`mtp_head`、`encoder`。
+
+写入 `<run_dir>/structure_spec.json`，供后续 sample 定位与结构检测使用。schema：
 
 ```json
 {
@@ -180,16 +175,11 @@ agent **逐字**把 `references/phase0a_prompt.md` 里的 prompt 发给用户，
 
 **同一 phase 内各 composition 的层集合不得重叠**——重叠（同一层被多个 composition 覆盖）会被 `_expand_schedule` 判为 hard error 并中止，而非静默取最后一个。
 
-**Phase 0b：定 stream sample 范围（必走，必须用户 ack）**
+**Phase 0b：确定 stream sample 范围**
 
-**核心契约**：按 `expected_components` 去重列表**逐项**敲定每个 component 的 sample 范围。脚本会把 sample 转成 per-stream `stream_samples`；每个 component 必须有且只有一个 `primary` stream，其他确认属于该 component 的流标 `auxiliary`。**归属看语义、不看时间是否重叠**：语义上属于该 component 的流，即使与本层时间脱节也写 `auxiliary`——`detect_structure` 会发 hard warning `auxiliary_stream_temporally_displaced`，`render` 自动把它从 cluster/bubble/TOTAL 剔除并标注、op 仍 matched 保留在 component（`op_indices` 全集不破、Step 4 split 照切），判定是流级全有全无；只有**不属于任何 component** 的流（全局通信/采样/IO 等）才留 `unmatched`。用户 ack 后写 `<run_dir>/sample_ack.json`；agent 不能跳过 ack 自己往下推。pre / post / inter 不需要给。
+每个 `expected_components` 条目都需提供 sample，并转换为 `stream_sample_ack.v1`：一个 `primary` stream，其他语义上属于该 component 的流标为 `auxiliary`。从调用方提供的范围或模型实现定位 sample，核对实际 prof 后写 `<run_dir>/sample_ack.json`。
 
-两条路径（sample 范围是硬需求，二选一）：
-
-- **A 档**：用户直接给 row 区间或算子名，agent 对照 `raw_ops.json` 校验后回贴 ack
-- **B 档**：用户给不出 → agent 读 Step 0 收齐的 `model_script_paths` 推典型 sample 范围，标注来源后让用户核对
-
-详细步骤、回贴格式、`sample_ack.json` schema 见 `references/phase0b_workflow.md`。`expected_components` 中任一缺失即 ack 未完成，`detect_structure.py` 启动时 exit 1。
+辅助流归属与时间脱节处理、定位步骤及完整 schema 见 `references/phase0b_workflow.md`。
 
 **Phase 1：跑 detect_structure**
 
@@ -205,11 +195,9 @@ python scripts/detect_structure.py \
 `--inputs` 和 `--sample-ack` 在 sample 模式下**必传**：
 - `--inputs <run_dir>/inputs.json`：校验 `model_script_paths` 非空（Step 0 物料）
 - `--sample-ack <run_dir>/sample_ack.json`：使用 `schema_version: "stream_sample_ack.v1"`，校验每个 component 都有 `stream_samples[]` 且只有一个 `primary`
-- 任一校验失败 exit 1，agent 必须回 Phase 0b 补齐
+- 校验失败时修正对应输入后重跑
 
-新写入的 `sample_ack.json` 必须保存为 stream sample schema；Step 2 输入须为此 schema。
-
-hard / ambiguous warnings（含 `auxiliary_stream_temporally_displaced`）默认 exit 1；agent 必须先逐条复读给用户，用户明确接受后才可加 `--accept-warnings` 重跑放行。
+审查 `warnings[]` 的 component、层号和期望 / 实测差异，修正结构或 sample。hard / ambiguous warnings（含 `auxiliary_stream_temporally_displaced`）默认 exit 1；有证据接受的情况记录依据后加 `--accept-warnings` 重跑，未解决的歧义交调用方确认。
 
 **输出 `structure_draft.json`**（下游 Step 3 / Step 4 直接消费）：
 - `mode: "stream_sample_driven"`
@@ -224,27 +212,17 @@ hard / ambiguous warnings（含 `auxiliary_stream_temporally_displaced`）默认
 
 warning codes、validation 字段、匹配算法细节见 `detect_structure.py` / `sample_matching.py` docstring。
 
-**Phase 1.5：复读 warnings 等用户 ack（必走）**
-
-逐条把 `warnings[]` 复读给用户，列 layer_idx / component / 期望 vs 实测。用户选项："忽略" / "改 0a 重跑" / "改 0b 重跑"。无 ack 视为 Step 2 未结束。
-
 ---
 
-### Step 3 — cluster 规则对话 + 渲染
+### Step 3 — cluster 规则与渲染
 
-**Phase 1：agent 引导用户给 cluster 规则**
+**Phase 1：确定 cluster 规则**
 
-`structure_draft.json` 给出 component 实例边界，但每个 component 内部还要进一步分桶才能看出抖动来源。agent 主动和用户对话产出 `<run_dir>/<network>_spec.json`——每个 `component_type` 一个 cluster 列表，每个 cluster 一条或多条匹配规则（`op_name` / `op_name_regex` / `input_shapes_contains` / `output_shapes_regex` / `catch_all` 等），逐 component_type 让用户确认。
-
-跑完 `render.py` 后看 `unmatched ops` 面板，若有未匹配算子回头细化规则直到 unmatched = 0 或用户明确说"剩下的不关心"。
-
-详细工作步骤、规则字段、`network_spec.json` schema、`outlier` 选项、cluster / bubble / TOTAL 数值定义、spec 跨 prof 复用规则见 `references/cluster_dialogue.md`。
-
-**网络 spec 存放位置**：`<run_dir>/<network>_spec.json`。同一模型在不同 prof 上复用——新 run 进入工作目录后优先查同名文件，存在就直接读，不必重跑 cluster 对话。
+结合模型语义和代表实例的算子序列，为每个 `component_type` 编写 cluster 规则，保存为 `<run_dir>/<network>_spec.json`。规则字段、完整模板、数值定义和复用依据见 `references/cluster_dialogue.md`。
 
 **Phase 2：渲染**
 
-**启用理论时**（Step 1.5 已把逐 kernel 理论列合并进 `raw_ops_details.json`），渲染脚本在 cluster / TOTAL 粒度按 critical stream 聚合理论耗时；**未启用则 theory median 列整列留空（`—`）**，本段其余多流口径不适用。多流时默认取 observed timeline union 最大的 stream，未选中流视为被覆盖或旁路，不计入该 sub-item 的理论耗时。若某 sub-item / TOTAL 出现多流，agent 应在 `<run_dir>/theory_stream_decisions.json` 填 `semantic_note` 说明这些流的语义；若候选流覆盖范围接近，还要同时判断是否覆盖 `selected_stream`。没有语义说明的多流项会在理论列标 `semantic note required`。
+**启用理论时**（Step 1.5 已把逐 kernel 理论列合并进 `raw_ops_details.json`），渲染脚本在 cluster / TOTAL 粒度按 critical stream 聚合理论耗时；**未启用则 theory median 列整列留空（`—`）**，本段其余多流口径不适用。多流时默认取 observed timeline union 最大的 stream，该选择用于理论统计；结合流间依赖与实际重叠判断其是否代表主要路径，其他流不计入该 sub-item 的理论耗时。若某 sub-item / TOTAL 出现多流，agent 应在 `<run_dir>/theory_stream_decisions.json` 填 `semantic_note` 说明这些流的语义；若候选流覆盖范围接近，还要同时判断是否覆盖 `selected_stream`。没有语义说明的多流项会在理论列标 `semantic note required`。
 
 ```bash
 python scripts/render.py \
@@ -266,7 +244,7 @@ python scripts/render.py \
 
 HTML 主表在 `median` 后展示 `theory median` 列（数据来自 Step 1.5 合并进 `raw_ops_details.json` 的 `theoretical_operator_time_us`；**未跑 Step 1.5 时整列留空 `—`**）；两列都按量级自动显示 `µs` 或 `ms`。bubble 行没有 kernel 理论耗时，显示 `—`。
 
-主报告最后一列固定为 `insight`：Step 3 初次渲染时保留为空；Step 5 结束后由 agent 写 `<run_dir>/runs/<label>/insights/main_report_insights.json`，再用 `--insight-annotations` 重跑 `render.py` 回填。该列只显示 `confidence = high | medium` 的洞察，`low` 不写入主报告。每条回填必须带 `category`；若不能精准映射到单个模块，由 agent 选择主要归属 `target`，用 `mapping_type: agent_primary` 和 `mapping_note` 说明依据。`TOTAL` 只是可选主归属之一，只有洞察确实是整体性的才放到 `TOTAL`，否则优先放到最相关的具体 cluster / `bubble` 行。同一主报告 row 可以显示多条 insight。
+主报告最后一列为 `insight`，首次渲染留空，Step 5 通过 `--insight-annotations` 回填 high / medium 洞察。类别、目标映射及完整模板见 `references/insight_workflow.md`。
 
 `--raw-ops-details` **必传**：缺了 chip 退化成静态 `<span>`，无法下钻 per-op 明细。
 
@@ -274,7 +252,7 @@ HTML 主表在 `median` 后展示 `theory median` 列（数据来自 Step 1.5 �
 
 **输出**：
 - `index.html` — 单页报告，按 spec 中 component_type 顺序排，每 component_type 一张 cluster / bubble / TOTAL 抖动表，含 `unmatched ops` 面板。若 cluster 桶之间存在 timeline overlap 或覆盖率异常，HTML 顶部按下列规则插提示面板：
-  - **cluster 覆盖率红字**：Σ cluster_wall.median / TOTAL.median < 80% 时插红字 banner，提示大量算子落进 bubble / 未匹配 / 漏算子，查 unmatched 面板与 cluster 规则。
+  - **cluster 覆盖率红字**：Σ cluster_wall.median / TOTAL.median < 80% 时插红字 banner，结合 bubble 与 unmatched 判断时间空隙和分桶遗漏。
   - **overlap 黄字警告**：median gap ≥ 5% TOTAL，提示"分桶不能直接反映真实性能分布"，列主要重叠桶对 + 占比。
   - **overlap 浅蓝 info**：median gap 0 < x < 5% TOTAL，列出仍存在跨 stream 并发的桶对（过滤掉 < 1µs 的噪声项，最多 8 对），方便定位并发来源，但不影响主表读数。
   - **辅流时间脱节提示（浅蓝）**：某 aux 流被判 displaced 时，列其 op_count / median wall / %TOTAL，标注"已从 TOTAL/bubble 排除"、op 仍 matched（逐层明细见 splits/）。
@@ -311,11 +289,11 @@ python scripts/split_artifacts.py \
 
 顶层 `manifest.json` 形如 `{source, n_ops, targets}`，`targets` 是 `{folder, kind, op_range, op_indices?, ops_count, files}` 的列表，给下游 / 用户导航用；`op_indices` 恒存在，目标 op 连续时为 `null`。`files.trace_scope` 标明 trace 是 `op_membership_exact` 还是 `time_envelope_context`。
 
-`-f` / `-t` 在标准 prof 包下必传；缺 csv 跳过 csv 切片，缺 trace 时 trace_view.json 从 raw_ops 合成。`--dry-run` 打印目标清单并跳过 csv / trace 切片，仍会建目录并写 `manifest.json`。
+`-f` 使用 Step 1 的输入 CSV；有原始 trace 时传 `-t`，未提供时省略 `-t`，从 raw_ops 合成 trace_view.json。`--dry-run` 打印目标清单并跳过 csv / trace 切片，仍会建目录并写 `manifest.json`。
 
 ### Step 5 — 洞察归纳
 
-Step 5 在 Step 3 / Step 4 之后执行，只做洞察层归纳与展示，不重新定义模型结构、不修改 cluster 规则。事实提取与渲染由 `scripts/gen_insights.py`（两遍：先产事实候选，agent 写 `movement_taxonomy.json` + `annotations.json` 后带 `--movement-taxonomy`/`--annotations` 再跑）+ `scripts/render_insights.py` 完成，agent 不手写提取逻辑；候选可靠性 / 是否展示由 agent 用 `confidence`（high|medium|low）标注。CLI、脚本/agent 边界、五类 insight、HTML 渲染与落盘契约见 `references/insight_workflow.md`。
+Step 5 在 Step 3 / Step 4 之后执行，基于已核对的结构与 cluster 规则归纳洞察；发现拆解错误时回到对应阶段修正并更新下游产物。事实提取与渲染由 `scripts/gen_insights.py`（先准备 `movement_taxonomy.json`，生成候选后填写 `annotations.json` 并重跑合并）+ `scripts/render_insights.py` 完成，agent 不手写提取逻辑；候选可靠性 / 是否展示由 agent 用 `confidence`（high|medium|low）标注。CLI、脚本/agent 边界、五类 insight、HTML 渲染与落盘契约见 `references/insight_workflow.md`。
 
 默认输出目录：`<run_dir>/runs/<label>/insights/`，和该 run 的 `index.html` / `metrics.json` 放在同一目录下。只有未使用 `runs/<label>/` 的老式单 run 输出，才退回 `<run_dir>/insights/`。Step 5 最后还要生成 `main_report_insights.json`，并重跑主报告渲染（`render.py --insight-annotations`），把 high / medium 洞察连同类别和主映射说明填回 `runs/<label>/index.html` 最后一列。
 
@@ -323,13 +301,9 @@ Step 5 在 Step 3 / Step 4 之后执行，只做洞察层归纳与展示，不�
 
 ## 增量分析（模型迭代 + 历史对比）
 
-模型局部改动后重新 prof 时，**不要**从零再走一遍 Step 2 对话。复用规则：
+按 `references/reuse_policy.md` 复用有效产物，仅更新受变更影响的阶段。
 
-- **`network_spec.json` 跨 prof 复用**：cluster 规则是 op_name + shape pattern，与 layer 位置 / 数量无关，模型改动只要不引入新算子就直接复用。新增算子时只需补一条 rule。
-- **`structure_spec.json` 通常微调**：layer 数 / composition 不变就照搬；改了层数 / 加了 MTP 改 0a 重写。
-- **sample 行号需重出**：op 在 csv 中的位置随改动平移，Phase 0b 每次都要给。
-
-**每个 run 落盘到独立目录**：`render.py` 的 `--label <label>` + `-o <run_dir>/runs/<label>/index.html`（首次起就这样，见 Step 3 Phase 2）让每个 run 独占 `runs/<label>/`；增量 run 只换 `<label>` 值。同目录同时产 `metrics.json`（含 `label` / `model_name` / `outlier` / 每个 `(component_type, cluster)` 的 wall + bubble 指标 + outlier 列表，`compare_runs.py` 消费）。
+**每个 run 落盘到独立目录**：`render.py` 的 `--label <label>` + `-o <run_dir>/runs/<label>/index.html`（首次起就这样，见 Step 3 Phase 2）让每个 run 独占 `runs/<label>/`。同目录同时产 `metrics.json`（含 `label` / `model_name` / `outlier` / 每个 `(component_type, cluster)` 的 wall + bubble 指标 + outlier 列表，`compare_runs.py` 消费）。
 
 **对比表**：
 
@@ -352,12 +326,12 @@ python scripts/compare_runs.py \
 | 文件 | 阶段 | 说明 |
 |------|------|------|
 | `<run_dir>/raw_ops.json` | Step 1 | 单 step kernel 概要，下游所有脚本消费 |
-| `<run_dir>/raw_ops_details.json` | Step 1；Step 1.5 可加列 | 单 step kernel 详情，Step 4 切片用；启用理论性能时合并理论列 |
+| `<run_dir>/raw_ops_details.json` | Step 1；Step 1.5 可加列 | 单 step kernel 详情，供渲染和洞察使用；启用理论性能时合并理论列 |
 | `<run_dir>/operator_analysis.csv` | Step 1.5 | 外部 `operator-theoretical-perf` skill 对原 CSV 加列后的原生产物 |
 | `<run_dir>/theory_stream_decisions.json` | Step 3 / 2 | agent 对多流语义的说明（多流场景必填）；必要时覆盖 critical stream 选择 |
-| `<run_dir>/structure_spec.json` | Step 2 / 0a | 用户描述的模型结构 |
+| `<run_dir>/structure_spec.json` | Step 2 / 0a | 本次运行的模型结构 |
 | `<run_dir>/structure_draft.json` | Step 2 / 1 | component 实例表，Step 3 / 4 输入 |
-| `<run_dir>/<network>_spec.json` | Step 3 / 1 | 用户的 cluster 规则，新 run 优先复用同名文件 |
+| `<run_dir>/<network>_spec.json` | Step 3 / 1 | 本模型的 cluster 规则，新 run 优先复用同名文件 |
 | `<run_dir>/runs/<label>/index.html` | Step 3 / 2 | 单 run 的单页 cluster 抖动报告 |
 | `<run_dir>/runs/<label>/metrics.json` | Step 3 / 2 | 单 run 指标，`compare_runs.py` 消费 |
 | `<run_dir>/runs/<label>/insights/module_bubble.json` | Step 5 | 模块长期 bubble 与具体层/模块 bubble 异常 |
@@ -368,8 +342,8 @@ python scripts/compare_runs.py \
 | `<run_dir>/runs/<label>/insights/final_conclusions.md` | Step 5 | agent 基于五类 insight 汇总的最终结论与证据索引 |
 | `<run_dir>/runs/<label>/insights/index.html` | Step 5 | 五类 insight 的可视化页面 |
 | `<run_dir>/runs/<label>/insights/main_report_insights.json` | Step 5 | agent 选择回填到主报告 `insight` 列的 high / medium 洞察 |
-| `<run_dir>/runs/<label>/insights/_review_stub.json` | Step 5 | pass 1 中间产物，列出待 agent 审阅的 key |
-| `<run_dir>/runs/<label>/insights/_taxonomy_candidates.json` | Step 5 | pass 1 中间产物，movement 分类候选 |
+| `<run_dir>/runs/<label>/insights/_review_stub.json` | Step 5 | 列出待 agent 审阅的 key |
+| `<run_dir>/runs/<label>/insights/_taxonomy_candidates.json` | Step 5 | op×core 频次，供 movement 分类参考 |
 | `<run_dir>/history.html` | 增量 | 多 run 对比表（Δ% vs baseline） |
 | `<run_dir>/HISTORY.md` | 每 run 收尾 | agent append 的运行日志，记录复用 / 变更 / 观察 |
 | `<run_dir>/splits/` | Step 4 | 按 component 切的 csv / trace_view，含 manifest.json |
@@ -378,13 +352,11 @@ python scripts/compare_runs.py \
 
 ## 参考
 
-- `references/kernel_data_guide.md` — `kernel_details.csv` 字段说明
-- `references/prof_layouts.md` — Ascend prof 两类目录布局（torch_npu / msprof）+ 多卡识别要点
-- `references/phase0a_prompt.md` — Step 2 Phase 0a 用户结构描述逐字 prompt
-- `references/phase0b_workflow.md` — Step 2 Phase 0b stream sample ack 流程 + `sample_ack.json` schema + 行号 domain
-- `references/cluster_dialogue.md` — Step 3 cluster 规则对话步骤 + `network_spec.json` schema + 数值定义
+- `references/kernel_data_guide.md` — 算子 CSV 输入契约与行号对应
+- `references/phase0b_workflow.md` — Step 2 Phase 0b stream sample 定位 + `sample_ack.json` schema + 行号 domain
+- `references/cluster_dialogue.md` — Step 3 cluster 规则生成步骤 + `network_spec.json` schema + 数值定义
 - `references/history_template.md` — `HISTORY.md` 条目字段与模板
-- `references/reuse_policy.md` — prof 变更检测信号 + 三档复用规则
+- `references/reuse_policy.md` — 变更检查依据、三档复用动作与重跑范围
 - `references/theoretical_perf_workflow.md` — Step 1.5 理论性能注入：外部 skill 调用、CSV 理论列合并、多流选择口径
 - `references/insight_workflow.md` — Step 5 洞察归纳：五类 insight、脚本/agent 边界、HTML 渲染
 - `scripts/templates/insight_page.html` — Step 5 洞察页 HTML/CSS/JS 骨架，由 `scripts/render_insights.py` 填充

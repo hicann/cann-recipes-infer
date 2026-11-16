@@ -15,8 +15,8 @@ copied in at build time from the op-plugin repository codegen template and
 holds the operator entries whose docstrings were generated; the entry count
 varies with the version.
 
-Results are bound to the torch_npu version actually installed, need no network
-access, and cannot drift from the runtime.
+Use --docs-path to query a target build independently of the local runtime.
+Fallback summaries identify candidates and do not establish version support.
 
 op-plugin codegen coverage is partial: some operators are callable through
 torch_npu yet have no entry in _op_plugin_docs.py. The built-in _FALLBACK_DOCS
@@ -27,7 +27,7 @@ that it is callable without a docstring.
 Subcommands:
   show   details of a single API
   search reverse lookup, matching a keyword against API names and doc text
-  list   enumerate every operator name
+  list   enumerate documented and fallback operator names
 
 Examples:
   python3 torch_npu_query.py show  npu_fusion_attention
@@ -149,16 +149,15 @@ def _fallback_doc_text(api_name: str) -> str | None:
         return None
     summary, url = entry
     return (
-        f"{summary}\n\n"
-        f"[!] 当前 torch_npu build 未生成本地 docstring。请查在线文档：\n"
+        f"[fallback] {summary}\n\n"
+        f"[!] 内置摘要，接口约束请核对目标版本文档。参考链接：\n"
         f"    {url}"
     )
 
 
 _OFFLINE_LIST_HINT = (
     "[!] 无 torch_npu 环境且未指定 --docs-path，已降级到 _FALLBACK_DOCS 兜底集。\n"
-    "    完整算子目录请查离线总表：references/torch_npu_API/torch_npu_list.md\n"
-    "    （该表为版本快照，可能与实际安装版本 drift，签名以本地 docstring 或在线文档为准）"
+    "    更多候选请查 cannbot-knowledge 的 torch_npu 官方文档索引，接口约束请核对目标版本文档。"
 )
 
 
@@ -205,28 +204,21 @@ def parse_doc_entries(docs_path: str | None) -> list[tuple[str, str]]:
     return entries
 
 
-def cmd_show(api_name: str, docs_path: str | None) -> None:
-    """Print the details of a single API.
-
-    Lookup order:
-      1. Runtime torch_npu.<api>.__doc__, covering Category B and normal operators
-      2. parse_doc_entries, i.e. _op_plugin_docs.py plus the _FALLBACK_DOCS dict
-      3. hasattr is True at runtime but neither source matched: report that the
-         operator is callable without a docstring
-      4. Nothing matched: report that the API was not found
-    """
+def cmd_show(api_name: str, docs_path: str | None, *, use_runtime: bool = True) -> None:
+    """Show runtime documentation when enabled, then check the selected file and fallback entries."""
     api_exists_at_runtime = False
-    try:
-        import torch_npu
+    if use_runtime:
+        try:
+            import torch_npu
 
-        if hasattr(torch_npu, api_name):
-            api_exists_at_runtime = True
-            obj = getattr(torch_npu, api_name)
-            if obj is not None and obj.__doc__:
-                _emit(obj.__doc__)
-                return
-    except ImportError:
-        pass
+            if hasattr(torch_npu, api_name):
+                api_exists_at_runtime = True
+                obj = getattr(torch_npu, api_name)
+                if obj is not None and obj.__doc__:
+                    _emit(obj.__doc__)
+                    return
+        except ImportError:
+            pass
 
     entries = parse_doc_entries(docs_path)
     for name, doc in entries:
@@ -247,9 +239,9 @@ def cmd_show(api_name: str, docs_path: str | None) -> None:
 
     if docs_path is None:
         raise QueryError(
-            f"未找到 API: {api_name}\n{_OFFLINE_LIST_HINT}"
+            f"所查询文档中未找到 API 条目: {api_name}\n{_OFFLINE_LIST_HINT}"
         )
-    raise QueryError(f"未找到 API: {api_name}")
+    raise QueryError(f"所查询文档中未找到 API 条目: {api_name}")
 
 
 def cmd_search(keyword: str, max_results: int, docs_path: str | None) -> None:
@@ -267,9 +259,6 @@ def cmd_search(keyword: str, max_results: int, docs_path: str | None) -> None:
             )
             if len(first_line) > 150:
                 first_line = first_line[:147] + "..."
-            # Tag fallback entries so the caller can tell a stub apart from a full docstring
-            if name in _FALLBACK_DOCS:
-                first_line = f"[fallback] {first_line}"
             results.append((name, first_line))
             if len(results) >= max_results:
                 break
@@ -336,7 +325,7 @@ def main() -> int:
     try:
         docs_path = resolve_docs_path(args.docs_path)
         if args.cmd == "show":
-            cmd_show(args.api_name, docs_path)
+            cmd_show(args.api_name, docs_path, use_runtime=args.docs_path is None)
         elif args.cmd == "search":
             cmd_search(args.keyword, args.max_results, docs_path)
         elif args.cmd == "list":

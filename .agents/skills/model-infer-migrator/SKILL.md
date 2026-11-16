@@ -17,53 +17,23 @@ description: 基于 PyTorch 框架的昇腾 NPU 模型推理适配与部署基�
 
 **独立部署模式**：模型不接 `executor/core/`，自管 Runner / KV cache / 推理脚本。适用仓外项目复用 skill 或框架契约不适用的特殊算法。
 
-### 判定优先级
-
-| 优先级 | 判定来源 | 说明 |
-|---|---|---|
-| 1 | **dispatch prompt 显式指定** | prompt 含 `部署模式: 框架部署` 或 `部署模式: 独立部署` → 直接采用，不再自检 |
-| 2 | **用户对话指定** | 仅独立调用（用户直接 invoke skill）时适用，subagent 派发场景不能交互 |
-| 3 | **工作目录自检** | 按下表识别 |
-
-| 自检信号 | 部署模式 |
-|---|---|
-| 模型注册到 `executor/core/support_models.py` | **框架部署模式**（推荐） |
-| 模型目录有 `runner_*.py` 且不继承任何 framework 基类，runner 自管推理循环 | **独立部署模式** |
-| 不确定 / 新模型 | 默认 **框架部署模式** |
-
-> 编排层（如 model-infer-optimize）派发本 skill 时不能与用户交互，应在 dispatch prompt 中显式带 `部署模式: ...`；缺失时按工作目录自检，仍无法确定则默认框架部署。用户直接调用本 skill 且信号不明确时，可向用户确认。
-
-判定后跳转：
-- 框架部署模式 → 「## 框架部署模式」大节
-- 独立部署模式 → 「## 独立部署模式」大节
-
----
-
-## 覆盖场景（共通）
-
-| 场景 | 输入状态 | 处理 |
-|------|---------|------|
-| A | 只有 HF 链接，无代码 | 下载 + 适配 + 生成标准文件 + 基线采集 |
-| B | 有本地代码但跑不通 | 诊断修复（最多 5 轮）+ 基线采集 |
-| C | 代码可运行但无标准化基线 | 直接基线采集 |
+优先采用任务中已明确的部署模式。未指定时，已注册到 `executor/core/support_models.py` 的模型走框架部署，自管 Runner 和推理循环且不接入 `executor/core/` 的模型走独立部署。**新模型或仍无法判定时，默认优先框架部署。**
 
 ---
 
 ## 共通工作流
 
+已有部署分析或适配方案时，从任务说明或 `progress.md` 读取并沿用已确认结论，只补查缺失或与当前实现不一致的信息。
+
 ### Step 1: 环境检测 + 部署模式判定
 
-确认 NPU 可用（`npu-smi info`）、torch 和 torch_npu 版本匹配。按上面「部署模式判定」表选择模式。
+确认 NPU 可用（`npu-smi info`）、torch 和 torch_npu 版本匹配。NPU 环境不可用时停止试跑并报告原因。
 
 ### Step 2: 场景判断
 
-按部署模式分流：
-- **框架部署**：模型已注册到 `executor/core/support_models.py` 且 yaml 已建 → 用 `bash executor/scripts/infer.sh --model {model_name} --yaml {yaml_name}.yaml` 试跑；未注册或 yaml 未建 → 场景 A → Step 3
-- **独立部署**：模型目录无 `infer.sh` → 场景 A → Step 3；有 `infer.sh` → `bash infer.sh` 试跑
+已有匹配当前状态的成功运行记录时，直接进入 Step 4。框架部署缺少模型注册或 YAML、独立部署缺少启动脚本时，进入 Step 3 补齐部署文件。其余情况按 Step 4 的入口试跑。成功或单卡 OOM 时按该步交付，其他模型错误进入 Step 3 诊断修复。
 
-试跑成功 → 场景 C → Step 4；试跑失败 → 场景 B → Step 3；NPU 环境不可用 → 报告环境问题，结束
-
-### Step 3: 代码准备（场景 A/B）
+### Step 3: 补齐或修复部署代码
 
 跳到对应大节执行：
 - 框架部署模式 → 「## 框架部署模式」适配要点
@@ -71,7 +41,7 @@ description: 基于 PyTorch 框架的昇腾 NPU 模型推理适配与部署基�
 
 ### Step 4: 试运行 + 基线采集
 
-按部署模式拉起：
+已有日志（包括 Step 2 的试跑日志）对应的代码、配置、权重和环境与本次基线一致，且数据完整时，可直接提取；否则按部署模式拉起：
 - **框架部署**：`bash executor/scripts/infer.sh --model {model_name} --yaml {yaml_name}.yaml`
 - **独立部署**：模型目录内执行 `bash infer.sh`
 
@@ -86,11 +56,10 @@ description: 基于 PyTorch 框架的昇腾 NPU 模型推理适配与部署基�
       --rank 0
   ```
   在仓库根执行。输出吐字正常（可读、不重复、长度合理），baseline_metadata.json 中的 output_text 需记录完整输出。migrator 阶段是单卡，只产 `log_0.log`，故读 rank 0；多卡场景改读 rank 1（rank 0 经 tee 可能截断）。
-  - **补采子场景**：reviewer log 已有 + 代码未提交新 commit + YAML 未变 → 跳过推理入口重跑，直接用既有 log 调脚本提取即可
 
 - **OOM（显存不足）**：本阶段输出代码骨架并标记"需多卡"，由 optimize 编排进入并行化阶段；并行 + kvcache 等优化跑通后由编排层补采基线。产物：多卡占位 YAML（待 parallel-impl 接入）+ 空 `agentic/baseline/` 目录 + README 标注 OOM 预期与下游 skill 任务；单卡 YAML 跑不通时不必保留。
 
-- **其他错误**：参考 `references/common_issues.md`；NPU 运行时错误 → model-infer-runtime-debug；精度异常 → model-infer-precision-debug。
+- **其他错误**：可查询 cannbot-knowledge 中的依赖兼容、权重加载和推理启动故障排查经验。NPU 运行时错误 → model-infer-runtime-debug；精度异常 → model-infer-precision-debug。
 
 日志路径：
 - 框架部署模式：`models/{model_name}/res/{date}/{model_name}_{yaml_stem}/log_{rank}.log`（由 launch 按 `WORK_DIR/RES_PATH` 创建，多卡读 rank 1）
@@ -108,7 +77,7 @@ description: 基于 PyTorch 框架的昇腾 NPU 模型推理适配与部署基�
 ├── models/
 │   ├── configuration_{model_name}.py
 │   └── modeling_{model_name}.py
-├── infer.py                      # 仅独立部署模式自带；框架部署模式不带，统一走 executor/offline/infer.py
+├── infer.py                      # 独立部署自带；框架离线启动优先使用已有的模型入口，缺省用 executor/offline/infer.py
 ├── infer.sh                      # 仅独立部署模式自带；框架部署模式统一走 executor/scripts/infer.sh
 ├── runner_{model_name}.py        # 独立模式独有
 ├── requirements.txt
@@ -122,11 +91,11 @@ description: 基于 PyTorch 框架的昇腾 NPU 模型推理适配与部署基�
 
 ## 框架部署模式
 
-接入 `executor/core/` 框架，模型走 `InferenceConfig + CommManager + cache_unit` 契约，启动通过 `executor/offline/infer.py + launch`。本阶段为最简部署基线，KV 先用 Legacy 模式跑通；PA 等进一步改造由 kvcache 优化阶段处理。
-
-> 模型类作为框架扩展点与 ModelWorker / ExecutionEngine / Scheduler / InferenceConfig / CommManager / ForwardMetaData 协作；调度、KV 管理、批组装、采样由框架统一负责。
+接入 `executor/core/` 框架，模型走 `InferenceConfig + CommManager + cache_unit` 契约，由统一启动脚本拉起。本阶段为最简部署基线，KV 先用 Legacy 模式跑通；PA 等进一步改造由 kvcache 优化阶段处理。
 
 ### 适配要点
+
+模型类与 Attention 骨架见 `references/framework_templates.md`。可查询 cannbot-knowledge 中的模型接入、权重加载和部署样例，并结合当前 `executor/core/support_models.py` 注册表和模型源码选择参考实现。
 
 1. **复制 HF 实现到 `models/{model_name}/models/`**：vendoring HF modeling 和 configuration（**禁止 `from transformers import 模型类`**）。删除训练专用代码，保留 PyTorch 标准算子。modeling 类基类改为 `nn.Module`。
    - **命名规则**：目录 / 文件 / 模块名用下划线
@@ -138,7 +107,7 @@ description: 基于 PyTorch 框架的昇腾 NPU 模型推理适配与部署基�
 
 2. **改造 ForCausalLM 构造签名**为 `(config, infer_config, comm_manager, prefix)`。读取参数从 `runner_settings.get(...)` 改为 `infer_config.parallel_config.attn_tp_size` 等点访问；通信组从 `comm_manager.get_group(...)` 取。
 
-3. **改造 forward 签名**为 `(input_ids, position_ids, forward_metadata, **kwargs)`。框架只透传这几个 key，`slot_mapping` / `block_table` 从 `forward_metadata` 取再下发给子层。input_ids 是 packed `[TotalTokens]`，返回 packed logits。
+3. **改造 forward 签名**为 `(input_ids, position_ids, forward_metadata, **kwargs)`。框架只透传这几个 key，`slot_mapping` / `block_table` 从 `forward_metadata` 取再下发给子层。input_ids 是 packed `[TotalTokens]`，返回 logits 的布局见模板。
 
 4. **KV 路径选择**（按场景二选一，互斥；框架按是否存在 `get_cache_info()` 分发）：
    - **路径 A — Legacy + HF SDPA**（默认推荐 — 单卡 + 等长 batch baseline，最简）
@@ -166,33 +135,9 @@ description: 基于 PyTorch 框架的昇腾 NPU 模型推理适配与部署基�
    ```
    条目是 `(模块路径, 类名)` 字符串对列表，由 `load_model_classes` 惰性加载。含 MTP 头时把 MTP 类作为第二项插在中间。
 
-7. **写 YAML、requirements、README**：YAML 模板与命名规范见 `references/yaml_template.md`（两模式共用，单卡 / 多卡常用字段、命名维度 / 粒度判定 / 保留策略均在此），README 模板见 `references/readme_template.md`，框架契约速查与拉起脚本见 `references/framework_templates.md`。框架部署模型**不建模型目录下 `infer.sh`**，拉起统一用 `bash executor/scripts/infer.sh --model {model_name} --yaml {yaml_name}.yaml`。`requirements.txt` 优先对齐仓内已注册同架构模型（参考路由表），缺失的再按 HF 原仓补；避免引入与既有模型冲突的版本约束。
+7. **写 YAML、requirements、README**：YAML 模板与命名规范见 `references/yaml_template.md`，README 模板见 `references/readme_template.md`。框架部署模型**不建模型目录下 `infer.sh`**，拉起统一用 `bash executor/scripts/infer.sh --model {model_name} --yaml {yaml_name}.yaml`。`requirements.txt` 优先对齐仓内已注册同架构模型（以当前注册表和实现为准），缺失的再按 HF 原仓补；避免引入与既有模型冲突的版本约束。
 
 > migrator 输出框架契约骨架 + Legacy KV + HF 原版 attention 的 `world_size=1` 单卡代码。FA 算子改造、Paged 改造、复杂架构 KV、多卡部署 / 权重切分由 model-infer-kvcache / model-infer-parallel-impl skill 接手；本阶段不做。
-
-### 模型类契约速查
-
-| 钩子 | 签名 | 职责 |
-|---|---|---|
-| `__init__` | `(config, infer_config, comm_manager, prefix)` | 构造子模块 |
-| `forward` | `(input_ids, position_ids, forward_metadata, **kwargs)` | 走前向，返回每请求末位 token logits `[batch_size, 1, vocab_size]`（Prefill 取 `cu_seq_q - 1`，Decode 本就 1 token） |
-| `load_weights` | `(weights: Iterable[(name, tensor)])` | 加载 HF 权重 |
-| `process_weights_after_loading` | `(self)` | 触发量化/MoE 权重后处理（框架自动调用） |
-| `check_model_settings` | `(self)` | 模型配置一致性校验（attn_tp_size 整除约束、num_heads 切分可行性等），框架自动调用，校验失败 raise RuntimeError |
-| `cache_unit`（migrator 用此走 Legacy） | per-Attention 属性 `(num_kv_heads_per_rank * head_dim,)` | 框架据此为各层静态预分配 `k_cache` / `v_cache` |
-| `get_cache_info`（kvcache 阶段改造为 Paged 时填） | `() -> ModelCacheInfo` | 声明 cache_entries 让框架走 Paged 模式 |
-
-完整签名、ForwardMetaData 字段表、CommManager 通信组命名见 `references/framework_templates.md`。
-
-### 参考模型路由表
-
-已在 `executor/core/support_models.py` 注册的参考实现：
-
-| 架构 | 参考模型 | 路径 |
-|---|---|---|
-| 标准 LLM（MHA/GQA） | `qwen3_8b` / `qwen25_7b_instruct` | `models/qwen/` |
-| MoE（标准 attention） | `qwen3_moe` / `gpt_oss` | `models/qwen3_moe/`、`models/gpt_oss/` |
-| MoE + MLA + MTP | `deepseek_r1` | `models/deepseek_r1/` |
 
 ---
 
@@ -223,28 +168,11 @@ description: 基于 PyTorch 框架的昇腾 NPU 模型推理适配与部署基�
 
 > migrator 输出 Runner 骨架 + 最简 KV 占位 + HF 原版 attention 的单卡代码。FA 算子接入、PA 启用、SlidingWindow / MLA absorb 等优化由 model-infer-kvcache skill 接手；多卡 `dist.*` + ParallelLinear 替换由 model-infer-parallel-impl skill 接手。
 
-### Runner 契约速查
-
-| 方法 | 职责 |
-|---|---|
-| `__init__(yaml_file_path)` | 解析 yaml（model_path / scheduler / data 段）；加载 tokenizer / config / model；预计算 mask、RoPE |
-| `init_static_kvcache(batch, seq)` | 基础 KV 分配（默认连续缓存，list of (k, v) tuples） |
-| `model_generate(prompts, warm_up=False)` | 批量推理：prefill + decode loop + detokenize；warmup 短路计时与输出；日志格式与仓库 framework 模式对齐 |
-| `prefill(...)` / `decode(...)`（可选拆分） | 单步执行；decode 可 torch.compile |
-
 ---
 
 ## 权重管理（共通）
 
 通过 YAML 的 `model_config.model_path` 指定权重路径。
-
-```
-权重已在本地？
-  ├─ 是 → 填入 YAML model_config.model_path
-  └─ 否 → 权重大小？
-           ├─ < 5GB → 下载到本地（huggingface-cli / snapshot_download / modelscope）
-           └─ >= 5GB → 提示用户自行下载并提供路径
-```
 
 > migrator 阶段单卡跑通即可；并行权重切分、在线/离线切分由 model-infer-parallel-impl skill 处理。
 
@@ -272,9 +200,6 @@ description: 基于 PyTorch 框架的昇腾 NPU 模型推理适配与部署基�
     "prefill_ms": <float>,
     "decode_avg_ms": <float>,
     "output_text": "<sample_output>"
-  },
-  "verification": {
-    "all_ranks_success": <bool>
   }
 }
 ```
@@ -285,22 +210,8 @@ description: 基于 PyTorch 框架的昇腾 NPU 模型推理适配与部署基�
 
 ## 结束条件
 
-共通条目（必须）：
-
-1. 标准文件结构完整：
-   - 框架部署：modeling + configuration + YAML + requirements + README + 注册到 `executor/core/support_models.py`（拉起走上游 `executor/scripts/infer.sh`，模型目录不建 `infer.sh`）
-   - 独立部署：modeling + configuration + YAML + runner + infer.sh + requirements + README
-2. modeling 框架契约骨架到位（构造签名 / forward 签名 / 权重契约；KV 按部署模式接入：框架部署用 Legacy `cache_unit`，独立部署用最简 list of (k, v)）
-
-跑通态条目（按场景二选一）：
-
-- **单卡可跑通**：框架部署 `bash executor/scripts/infer.sh --model {model_name} --yaml {yaml_name}.yaml` / 独立部署 `bash infer.sh` 跑通 + 输出吐字正常 + agentic/baseline/baseline_metadata.json 已生成
-- **单卡 OOM**：标记"需多卡"，不必跑通；baseline 由 optimize 编排在并行化后补采
-
-部署模式专属：
-
-- **框架部署模式**：模型已注册到 `executor/core/support_models.py`
-- **独立部署模式**：含 `runner_{model_name}.py` + 自带 `infer.py`
+- **单卡跑通**：推理输出正常，已生成实测的 `agentic/baseline/baseline_metadata.json`。
+- **单卡 OOM**：交付可继续并行适配的模型骨架，标记“需多卡”，基线待并行化后补采。
 
 ---
 
@@ -310,9 +221,8 @@ description: 基于 PyTorch 框架的昇腾 NPU 模型推理适配与部署基�
 |------|------|---|
 | YAML 配置模板与命名规范 | `references/yaml_template.md` | 共通 |
 | README 模板 | `references/readme_template.md` | 共通 |
-| 框架部署契约速查与拉起脚本 | `references/framework_templates.md` | 框架部署 |
+| 框架部署模型类与 Attention 模板 | `references/framework_templates.md` | 框架部署 |
 | 独立部署 Runner 与 infer.py/infer.sh 模板 | `references/standalone_templates.md` | 独立部署 |
-| 常见问题速查 | `references/common_issues.md` | 共通 |
 | 基线采集脚本 | `scripts/collect_baseline.py` | 共通 |
 | InferenceConfig 字段语义（仓库框架） | `docs/common/inference_config_guide.md` | 框架部署 |
 | 框架架构总览（仓库框架设计） | `docs/design/executor_design.md` | 框架部署 |

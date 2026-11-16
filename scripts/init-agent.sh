@@ -1,23 +1,30 @@
 #!/usr/bin/env bash
-# init-agent.sh - Install Agent Skills into Codex, Claude Code, and/or OpenCode.
+# init-agent.sh - Install model agents and cannbot-knowledge for the selected clients.
 #
 # Source of truth: .agents/
 #     .agents/skills/       - skill directories
 #     .agents/agents/       - subagent markdown files
-#     .agents/hooks/        - Claude Code hook scripts
-#     .agents/settings.json - Claude Code settings (hook registration)
+#     .agents/hooks/        - shared hook scripts
+#     .agents/settings.json - shared hook registration
 #
 # Generated (gitignored):
 #     .codex/agents/*.toml                       - Codex custom agent view
+#     .codex/hooks.json                          - Codex hook registration
 #     .claude/{skills,agents,hooks,settings.json} - Claude Code view
 #     .opencode/{skills,agents}                    - OpenCode view
-#     CLAUDE.md -> AGENTS.md                       - Claude Code entry
+#     CLAUDE.md with @AGENTS.md                   - shared project instructions
+#     .cannbot/knowledge.env                      - knowledge repository configuration
 #
 # Usage:
 #     bash scripts/init-agent.sh              # all platforms (default)
 #     bash scripts/init-agent.sh --codex      # Codex only
 #     bash scripts/init-agent.sh --claude     # Claude Code only
 #     bash scripts/init-agent.sh --opencode   # OpenCode only
+#
+# Knowledge options:
+#     --knowledge-profile consumer|contributor  # default: installed profile or consumer
+#     --knowledge-root PATH                    # reuse or install a knowledge checkout
+#     --skip-resources                         # explicitly offline, knowledge-only install
 
 set -euo pipefail
 
@@ -25,20 +32,40 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 SRC="$REPO_ROOT/.agents"
 
-arg="${1:-}"
-case "$arg" in
-    ""|--all)        target="all" ;;
-    --both)          target="legacy" ;;
-    --codex)         target="codex" ;;
-    --claude)        target="claude" ;;
-    --opencode)      target="opencode" ;;
-    -h|--help)
-        sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
-        exit 0 ;;
-    *)
-        echo "Unknown argument: $arg" >&2
-        echo "Usage: $0 [--all|--codex|--claude|--opencode]" >&2
-        exit 1 ;;
+target="all"
+knowledge_profile=""
+knowledge_root=""
+skip_resources=false
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --all)      target="all" ;;
+        --both)     target="legacy" ;;
+        --codex)    target="codex" ;;
+        --claude)   target="claude" ;;
+        --opencode) target="opencode" ;;
+        --knowledge-profile|--knowledge-root)
+            if [ "$#" -lt 2 ] || [ -z "$2" ] || [[ "$2" == -* ]]; then
+                echo "Error: $1 requires a value" >&2
+                exit 1
+            fi
+            case "$1" in
+                --knowledge-profile) knowledge_profile="$2" ;;
+                --knowledge-root) knowledge_root="$2" ;;
+            esac
+            shift ;;
+        --skip-resources) skip_resources=true ;;
+        -h|--help)
+            sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'
+            exit 0 ;;
+        *)
+            echo "Unknown argument: $1" >&2
+            exit 1 ;;
+    esac
+    shift
+done
+case "$knowledge_profile" in
+    ""|consumer|contributor) ;;
+    *) echo "Unknown knowledge profile: $knowledge_profile" >&2; exit 1 ;;
 esac
 
 require_dir() {
@@ -64,6 +91,68 @@ validate_source() {
     require_file "$REPO_ROOT/AGENTS.md" "AGENTS.md"
 }
 
+prepare_claude_entry() {
+    python3 - "$REPO_ROOT" <<'PYTHON'
+from pathlib import Path
+import sys
+
+root = Path(sys.argv[1])
+entry = root / "CLAUDE.md"
+if entry.is_symlink():
+    if entry.resolve() != (root / "AGENTS.md").resolve():
+        raise SystemExit(f"Error: unexpected CLAUDE.md symlink: {entry}")
+    entry.unlink()
+content = entry.read_bytes() if entry.exists() else b""
+if b"@AGENTS.md" not in content.splitlines():
+    entry.write_bytes(b"@AGENTS.md\n" + (b"\n" + content if content else b""))
+PYTHON
+}
+
+install_knowledge() (
+    local requested_root="${knowledge_root:-${CANNBOT_KNOWLEDGE_INSTALL_ROOT:-${CANNBOT_KNOWLEDGE_ROOT:-}}}"
+    local requested_profile="${knowledge_profile:-${CANNBOT_KNOWLEDGE_PROFILE:-}}"
+    if [ -f "$REPO_ROOT/.cannbot/knowledge.env" ]; then
+        source "$REPO_ROOT/.cannbot/knowledge.env"
+    fi
+    local root="${requested_root:-${CANNBOT_KNOWLEDGE_ROOT:-$HOME/.cannbot/cannbot-knowledge}}"
+    local profile="${requested_profile:-${CANNBOT_KNOWLEDGE_PROFILE:-consumer}}"
+    local installer="$root/install.sh"
+    local options=(--knowledge-root "$root")
+    if [ -f "$installer" ]; then
+        options+=(--skip-repository-update)
+    else
+        installer="$(mktemp)"
+        trap 'rm -f "$installer"' EXIT
+        curl -fsSL https://raw.gitcode.com/cann/cannbot-knowledge/raw/master/install.sh -o "$installer"
+    fi
+
+    if [ "$skip_resources" = true ]; then
+        options+=(--skip-resources)
+    fi
+
+    # The codex layout installs the shared .agents/skills entries without client adapters.
+    bash "$installer" codex "$REPO_ROOT" "$profile" "${options[@]}"
+    # Keep the repository's concise knowledge guidance instead of a second managed block.
+    python3 - "$REPO_ROOT" "$installer" <<'PYTHON'
+from pathlib import Path
+import subprocess
+import sys
+
+root = Path(sys.argv[1])
+entries = [("codex", root / "AGENTS.md")]
+claude_entry = root / "CLAUDE.md"
+if claude_entry.is_file() and b"@AGENTS.md" in claude_entry.read_bytes().splitlines():
+    entries.append(("claude", claude_entry))
+for client, path in entries:
+    original = path.read_bytes()
+    subprocess.run(["bash", sys.argv[2], client, str(root), "--prompt-action", "uninstall"], check=True)
+    content = path.read_bytes()
+    if content != original:
+        newline = b"\r\n" if b"\r\n" in original else b"\n"
+        path.write_bytes(content.rstrip(b"\r\n") + newline)
+PYTHON
+)
+
 link_children() {
     # Create child symlinks in $2 for every entry in $1 (absolute paths).
     local src="$1" dst="$2"
@@ -72,9 +161,9 @@ link_children() {
     for entry in "$src"/*; do
         [ -e "$entry" ] || continue
         local target="$dst/$(basename "$entry")"
-        # Replace any pre-existing real file/dir at the target so ln does not nest into it
         if [ -e "$target" ] && [ ! -L "$target" ]; then
-            rm -rf "$target"
+            echo "Error: client view conflicts with an existing file or directory: $target" >&2
+            return 1
         fi
         ln -sfn "$(realpath "$entry")" "$target"
     done
@@ -85,7 +174,6 @@ generate_codex_agents() {
     local dst="$REPO_ROOT/.codex/agents"
 
     mkdir -p "$dst"
-    rm -f "$dst"/*.toml
 
     python3 - "$src" "$dst" <<'PY'
 from pathlib import Path
@@ -157,12 +245,49 @@ for path in sorted(src.glob("*.md")):
 PY
 }
 
+register_hooks() {
+    python3 - "$REPO_ROOT" "$1" <<'PY'
+from pathlib import Path
+import json
+import re
+import shlex
+import sys
+
+root = Path(sys.argv[1])
+destination = Path(sys.argv[2])
+source = json.loads((root / ".agents/settings.json").read_text())
+config = json.loads(destination.read_text()) if destination.exists() else {}
+hooks = config.setdefault("hooks", {})
+script_names = [path.name for path in (root / ".agents/hooks").glob("*.py")]
+owned_command = re.compile(r"\.(?:agents|claude)/hooks/(?:" + "|".join(map(re.escape, script_names)) + r")\b")
+
+for event, groups in source["hooks"].items():
+    retained = []
+    for group in hooks.get(event, []):
+        handlers = [hook for hook in group["hooks"] if not owned_command.search(hook.get("command", ""))]
+        if handlers:
+            retained.append({**group, "hooks": handlers})
+    for group in groups:
+        for hook in group["hooks"]:
+            parts = shlex.split(hook["command"])
+            hook["command"] = shlex.join([
+                str(root / part) if part.startswith(".agents/hooks/") else part for part in parts
+            ])
+    hooks[event] = retained + groups
+
+destination.parent.mkdir(parents=True, exist_ok=True)
+destination.write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n")
+PY
+}
+
 install_codex() {
     validate_source
     echo "Installing Codex -> $REPO_ROOT/.codex/agents/"
     generate_codex_agents
+    register_hooks "$REPO_ROOT/.codex/hooks.json"
     echo "  + Codex reads $SRC/skills directly"
     echo "  + generated $REPO_ROOT/.codex/agents/*.toml"
+    echo "  + generated $REPO_ROOT/.codex/hooks.json; review and trust the hooks in Codex /hooks"
     echo
     echo "Recommended Codex prompt:"
     echo "  请使用 Codex subagent workflow，调用 model-infer-optimize，对 models/{model_name} 做端到端 NPU 推理优化。"
@@ -176,12 +301,9 @@ install_claude() {
     link_children "$SRC/skills" "$base/skills"
     link_children "$SRC/agents" "$base/agents"
     link_children "$SRC/hooks"  "$base/hooks"
-    if [ -f "$SRC/settings.json" ]; then
-        cp "$SRC/settings.json" "$base/settings.json"
-    fi
-    ln -sfn AGENTS.md "$REPO_ROOT/CLAUDE.md"
+    register_hooks "$base/settings.json"
     echo "  + $base/{skills,agents,hooks,settings.json}"
-    echo "  + $REPO_ROOT/CLAUDE.md -> AGENTS.md"
+    echo "  + $REPO_ROOT/CLAUDE.md imports AGENTS.md"
 }
 
 install_opencode() {
@@ -192,6 +314,12 @@ install_opencode() {
     link_children "$SRC/agents" "$base/agents"
     echo "  $base/{skills,agents} linked"
 }
+
+validate_source
+if [ "$target" = all ] || [ "$target" = legacy ] || [ "$target" = claude ] || [ -L "$REPO_ROOT/CLAUDE.md" ]; then
+    prepare_claude_entry
+fi
+install_knowledge
 
 case "$target" in
     all)      install_codex; install_claude; install_opencode ;;

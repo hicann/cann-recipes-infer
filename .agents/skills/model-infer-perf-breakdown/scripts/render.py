@@ -59,17 +59,17 @@ Rule fields (all listed conditions must hold; first matching cluster wins):
 Reported sub-items per component_type:
   - one row per cluster: wall_ms = union duration of that cluster's ops in the
     instance; outliers detected on wall_ms across instances.
-  - one synthetic row 'bubble': layer-level idle gap, computed as
-    span_ms − union_wall_ms (gap between adjacent ops on the layer timeline).
+  - one synthetic row 'bubble': component-level idle gap, computed as
+    span_ms − union_wall_ms (gap between adjacent ops on the component timeline).
     Outliers detected on the bubble series across instances.
-  - TOTAL row: layer end-to-end span = max_op_end − min_op_start, i.e. the
-    wall-clock interval a user sees when framing the layer in trace_view.
+  - TOTAL row: component instance span = max_op_end − min_op_start, i.e. the
+    wall-clock interval a user sees when framing the component in trace_view.
     Equals union_wall + bubble. Outliers on that span series.
 
 Cross-cluster overlap (overlap_summary): the absolute gap is
 Σ cluster_wall − union_wall (time double-counted across buckets); the
-reported pct is gap / TOTAL (span) so it lines up with the layer
-end-to-end time a user sees in trace_view.
+reported pct is gap / TOTAL (span) so it lines up with the component
+span a user sees in trace_view.
 
 Outlier method: IQR (k=1.5 default) or z-score; configured by spec.outlier.
 """
@@ -85,7 +85,7 @@ import time
 from collections import Counter, defaultdict
 
 
-UNMATCHED_PCT_HARD_LIMIT = 0.05    # above 5% unmatched ops, treat Phase 1.5 as missing an ack
+UNMATCHED_PCT_HARD_LIMIT = 0.05    # default review threshold for unmatched compute ops
 CLUSTER_COVERAGE_MIN_PCT = 80.0    # warn in red when Σ cluster_wall.median / TOTAL.median drops below this
 
 
@@ -336,10 +336,10 @@ def analyze_component_type(
     theory_decisions=None,
     theory_review_ratio=0.8,
 ):
-    """For each instance: classify ops, compute per-cluster wall + layer bubble.
+    """For each instance: classify ops, compute per-cluster wall + component bubble.
 
     Returns list of sub-items (clusters in spec order, then synthetic 'bubble')
-    plus a 'total' dict (layer wall) and an 'unmatched' counter.
+    plus a 'total' dict (component span) and an 'unmatched' counter.
     Each sub-item: {name, kind, description, metric, outliers, per_instance_ms,
                     outlier_idx, kernel_outliers}
       outlier_idx flags instance indices whose cluster-wall is an outlier.
@@ -534,7 +534,7 @@ def analyze_component_type(
     sub_items.append({
         "name": "bubble",
         "kind": "bubble",
-        "description": "layer idle gap (span − wall)",
+        "description": "component idle gap (span − wall)",
         "metric": series_metrics(total_bubble),
         "outliers": outs,
         "outlier_idx": sorted(idx),
@@ -543,7 +543,7 @@ def analyze_component_type(
 
     idx, outs = outliers_for(total_span, instances, method, k)
     total = {
-        "description": "layer end-to-end span (max_end − min_start, 含 bubble)",
+        "description": "component instance span (max_end − min_start, 含 bubble)",
         "metric": series_metrics(total_span),
         "outliers": outs,
         "outlier_idx": sorted(idx),
@@ -1301,8 +1301,8 @@ def render_html(model_name, sections, outlier_cfg, details_by_idx=None, row_insi
         f"<div class='meta'>outlier rule: <code>{html.escape(outlier_cfg.get('method', 'iqr'))}</code> "
         f"k={outlier_cfg.get('k', 1.5)} &middot; "
         f"cluster wall = 该 cluster 算子的时间并集 &middot; "
-        f"bubble = 层内算子间空隙（span − 总 wall 并集） &middot; "
-        f"TOTAL = 层 end-to-end span（max_end − min_start, 含 bubble）"
+        f"bubble = component 内算子间空隙（span − 总 wall 并集） &middot; "
+        f"TOTAL = component instance span（max_end − min_start, 含 bubble）"
         f"；HTML 自动按量级显示 µs / ms</div>",
         "<div class='legend'>"
         "<b>读图说明</b><br>"
@@ -1449,9 +1449,8 @@ def render_html(model_name, sections, outlier_cfg, details_by_idx=None, row_insi
                 f"<div class='coverage-warn'>"
                 f"<div class='head'>⚠ cluster wall 中位之和 = {csp:.1f}% TOTAL "
                 f"(&lt; {CLUSTER_COVERAGE_MIN_PCT:.0f}%)</div>"
-                f"<div>该 component 大量算子落进 bubble / 未匹配 / 漏算子。"
-                f"查下方 Unmatched 面板与 cluster 规则；可能是 catch_all 把真正语义"
-                f"算子吞了，或某段 op 完全没被规则覆盖。</div>"
+                f"<div>结合 bubble 与 Unmatched 面板检查时间空隙和分桶遗漏；"
+                f"未分类算子需核对 cluster 规则，空隙需结合 trace 定位。</div>"
                 f"</div>"
             )
         for d in sec.get("displaced") or []:
@@ -1644,7 +1643,7 @@ def enforce_unmatched_gates(draft, operators, *, accept=False,
     )
 
     if accept:
-        print("[--accept-unmatched] 用户已知情放行，继续渲染。", file=sys.stderr)
+        print("[--accept-unmatched] 已接受未归属范围，继续渲染。", file=sys.stderr)
         return
     raise SystemExit(1)
 
@@ -1756,14 +1755,14 @@ def main():
                 "sub_items": [{
                     "name": "bubble",
                     "kind": "bubble",
-                    "description": "layer idle gap (span − wall)",
+                    "description": "component idle gap (span − wall)",
                     "metric": series_metrics(total_bubble),
                     "outliers": b_outs,
                     "outlier_idx": sorted(b_idx),
                     "per_instance_ms": [v / 1000.0 for v in total_bubble],
                 }],
                 "total": {
-                    "description": "layer end-to-end span (max_end − min_start, 含 bubble)",
+                    "description": "component instance span (max_end − min_start, 含 bubble)",
                     "metric": series_metrics(total_span),
                     "outliers": t_outs,
                     "outlier_idx": sorted(t_idx),

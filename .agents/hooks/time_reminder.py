@@ -56,12 +56,11 @@ def main():
     result = {
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
-            "permissionDecision": "allow",
             "additionalContext": (
                 f"你已运行超过 {elapsed} 分钟。请确认："
-                "1) 是否按 skill 流程的实施/调试步骤要求执行 "
-                "2) 关键进展是否已写入 progress.md "
-                "3) 审视当前改动方向是否正确：实施偏差应自行纠正，方案本身不可行应停止并返回主流程报告阻塞。"
+                "1) 是否按当前任务和已确认方案推进 "
+                "2) 关键进展是否已写入本任务的 progress.md 或指定产物 "
+                "3) 审视当前改动方向是否正确：实施偏差应自行纠正，方案本身不可行应返回调用方报告阻塞。"
             ),
         }
     }

@@ -8,16 +8,18 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # ----------------------------------------------------------------------------------------------------------
-"""PreToolUse hook: keep agents inside their role and require progress.md before code edits."""
+"""Enforce model-agent edit boundaries."""
 
+import fnmatch
 import json
 import logging
 import os
 import sys
 
+from hook_paths import tool_file_paths
+
 logging.basicConfig(stream=sys.stderr, level=logging.WARNING, format="%(message)s")
 logger = logging.getLogger(__name__)
-import fnmatch
 
 # agent_type -> file patterns that role must not modify
 PROTECTED_PATTERNS = {
@@ -33,9 +35,6 @@ PROTECTED_PATTERNS = {
     ],
 }
 
-# File patterns that require progress.md to be read first
-CODE_PATTERNS = ["modeling_*.py", "runner_*.py"]
-
 
 def matches_any(basename, full_path, patterns):
     for pat in patterns:
@@ -50,49 +49,28 @@ def check_role_protection(data):
     """Reject edits to files the acting role is not allowed to touch."""
     agent_type = data.get("agent_type", "")
     agent_id = data.get("agent_id", "")
-    file_path = data.get("tool_input", {}).get("file_path", "")
-
-    if not agent_id or not file_path:
+    if not agent_id:
         return None
 
     patterns = PROTECTED_PATTERNS.get(agent_type)
     if not patterns:
         return None
 
-    basename = os.path.basename(file_path)
-    if matches_any(basename, file_path, patterns):
-        return f"禁止：{agent_type} 不允许修改 {basename}。模型代码修改请通过 implementer 执行。"
+    for file_path in tool_file_paths(data):
+        basename = os.path.basename(file_path)
+        if matches_any(basename, file_path, patterns):
+            return f"禁止：{agent_type} 不允许修改 {basename}。模型代码修改请通过 implementer 执行。"
 
     return None
-
-
-def check_read_progress_first(data):
-    """Reject model code edits made before progress.md has been read."""
-    agent_id = data.get("agent_id", "")
-    file_path = data.get("tool_input", {}).get("file_path", "")
-
-    if not agent_id or not file_path:
-        return None
-
-    basename = os.path.basename(file_path)
-    if not matches_any(basename, file_path, CODE_PATTERNS):
-        return None
-
-    marker = f"/tmp/hook_read_progress_{agent_id}.marker"
-    if os.path.exists(marker):
-        return None
-
-    return "禁止：修改模型代码前必须先读取 progress.md，了解当前阶段方案和实施记录后再修改代码。"
 
 
 def main():
     data = json.load(sys.stdin)
 
-    for check in [check_role_protection, check_read_progress_first]:
-        reason = check(data)
-        if reason:
-            logger.error(reason)
-            sys.exit(2)
+    reason = check_role_protection(data)
+    if reason:
+        logger.error(reason)
+        sys.exit(2)
 
     sys.exit(0)
 

@@ -10,3 +10,11 @@
 /.opencode/
 /.codex/
 /CLAUDE.md
+/.cannbot/
+/.agents/skills/knowledge-query
+/.agents/skills/ascendc-api-knowledge-query
+/.agents/skills/runtime-api-knowledge-query
+/.agents/skills/knowledge-ingest
+/.agents/skills/knowledge-lint
+/.agents/skills/ops-knowledge-vv-ingest
+/.agents/skills/ops-knowledge-cv-ingest

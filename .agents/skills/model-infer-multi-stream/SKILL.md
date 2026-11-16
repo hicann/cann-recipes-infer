@@ -1,136 +1,108 @@
 ---
 name: model-infer-multi-stream
-description: NPU 多流技术知识技能。提供整网模块 / 算子 DAG 拆解、模块间与模块内并行性判断、多流候选编排派生、TorchAir(Ascend IR/GE) 与 npugraph_ex/aclgraph 的多流 API 路由、切流 / 同步 / 控核实现，以及假并行（overlap_pct）排查与 Profile 验证等技术规则。供两类工作引用：形成多流优化候选 plan，以及实施 / review 多流改造。触发场景包括：多流、双流、stream overlap、控核、limit_core_num、整网 DAG、模块拆解、npu_stream_switch、npu_wait_tensor、TorchAir 多流、record_stream、多流假并行排查。
+description: NPU 多流技术知识技能。提供整网模块 / 算子 DAG 拆解、模块间与模块内并行性判断、多流候选编排派生、TorchAir(Ascend IR/GE) 与 npugraph_ex/aclgraph 的多流 API 路由、切流 / 同步 / 控核实现，以及假并行（overlap_pct）排查与 Profile 验证等技术规则。供两类工作引用：形成多流优化候选方案，以及实施和复查多流改造。触发场景包括：多流、双流、stream overlap、控核、limit_core_num、整网 DAG、模块拆解、npu_stream_switch、npu_wait_tensor、TorchAir 多流、record_stream、多流假并行排查。
 ---
 
 # NPU 多流技术知识
 
-本技能是多流优化的**技术知识包**，不负责任务编排——它不管 Plan / round / 状态机，也不负责性能数据的采集调度。候选的取舍、轮次推进、Dashboard 记账都交给调用方（例如上层优化编排流程）。本技能只回答一件事：多流这件事**怎么分析、怎么实现、怎么验证**。
+本技能提供多流方案的分析、实现和验证方法；候选取舍、轮次推进与性能数据采集由调用方组织。
 
 它支持两类工作：
 
-- **形成 plan**：给定一个已经 profiling 过的模型，判断哪里能做多流，并为每个并行点提出若干种不同的编排候选。
-- **实施 / review**：把某个多流方案落到代码（选执行路径、切流、加同步、控核），并验证它在物理执行层面是不是真的并行了。
+- **方案分析**：结合模型代码与 profiling，识别多流机会，提出值得验证的编排候选。
+- **实施 / 复查**：实现多流方案，包括选择执行路径、切流、同步和控核，并验证是否实际并行。
 
-## 怎么用这个技能
+## 使用入口
 
-| 你在做的事 | 先读 | 要点 |
+| 任务 | 参考章节 | 要点 |
 | --- | --- | --- |
-| 形成多流候选 plan | 下文"分析"一节 + [`references/module-decomposition.md`](references/module-decomposition.md) + [`references/multi-stream-cases-index.md`](references/multi-stream-cases-index.md) + [`references/ge-reorder-design-check.md`](references/ge-reorder-design-check.md) + [`references/plan-detail-fragment.md`](references/plan-detail-fragment.md) | 拆模块 / 算子 → 判并行性 → 每个并行点派生 ≥2 种编排 |
-| 实施多流方案 | 下文"实现"一节 + [`references/api-routing.md`](references/api-routing.md) + `references/` 下的官方 doc | 先定执行路径，再切流 / 同步 / 控核，始终保留开关和回退路径 |
-| review / 调试多流方案 | 下文"调试与验证"一节 + [`references/timeline-overlap-check.md`](references/timeline-overlap-check.md) + [`references/kernel-fields-lookup.md`](references/kernel-fields-lookup.md) + [`references/plan-detail-fragment.md`](references/plan-detail-fragment.md) | 用 overlap_pct 判真假并行，按五类问题分诊 |
+| 多流方案分析 | 下文「方案分析」一节 + [`references/module-decomposition.md`](references/module-decomposition.md) + [`references/plan-detail-fragment.md`](references/plan-detail-fragment.md) | 按任务范围拆模块 / 算子 → 判断并行性 → 派生有实质差异的编排 |
+| 多流方案实施 | 下文「实施」一节 + [`references/api-routing.md`](references/api-routing.md) | 承接方案与依赖分析，按执行路径切流 / 同步 / 控核 |
+| 多流方案复查与调试 | 下文「调试与验证」一节 + [`references/timeline-overlap-check.md`](references/timeline-overlap-check.md) + [`references/plan-detail-fragment.md`](references/plan-detail-fragment.md) | 验证实际重叠与时延收益，按问题类型排查 |
 
-被调用方（如优化编排流程）消费时，本技能产出两类内容，结构都由本技能定义、调用方不解析：**方向级分析产物**（module / op DAG + 并行性判断，一个模型一份，被所有候选 Plan 共享，结构见 [`references/module-decomposition.md`](references/module-decomposition.md)）和**每个 Plan 的方案细节**（流分组 / GE 风险 / overlap_pct 等，结构见 [`references/plan-detail-fragment.md`](references/plan-detail-fragment.md)）。
+产出包括可共享的**方向级分析**（模块 / 算子 DAG 与并行性判断，模板见 [`references/module-decomposition.md`](references/module-decomposition.md)）和**各方案细节**（流分组、GE 风险及实施后的实测，模板见 [`references/plan-detail-fragment.md`](references/plan-detail-fragment.md)）。各方案引用共享分析。
 
 ## 核心原则
 
-- **Stream ID 切对 ≠ 物理并行成立（最重要）**：`torchair.scope.npu_stream_switch` 给副流贴的是逻辑标签，GE 编译期会重排算子——尤其会把"消费副流输出的轻量 precompute"（如 Cast / Swish / Sigmoid）拉到主流，导致主流被 barrier 卡住、副流跑的时候主流 idle，物理执行仍是串行。任何"副流已落到 side stream"的结论都**不能**直接当方案成立，必须按 [`references/timeline-overlap-check.md`](references/timeline-overlap-check.md) 用 `Start Time(us)` + `Duration(us)` 算 `overlap_pct`。"Stream ID 分裂但 wall 没降"的现象，**必须先排除假并行**，再去谈资源争抢 / host overhead。
-- **先整网后局部**：先回答整网主路径和模块间并行性，再进入模块内算子，不要一上来就抓某个局部热点函数。
-- **模块级目标明确**：模块拆解的目的是判断模块与模块之间哪些可以并行；decoder layer 不能当作单个模块，必须再往下拆。
-- **每个模块都要下钻**：第二层要对每个候选模块补齐算子清单和算子 DAG，把可行编排沉淀成候选。
-- **开关必须可关闭**：多流路径要保留 enable 开关和原始回退路径，方便调试、review 和淘汰时干净隔离。
+- **按实际时间线验证并行**：结合算子落流、`Start Time(us)` 和 `Duration(us)` 检查预期分支的执行重叠，再对比时延收益。测量口径见 [`references/timeline-overlap-check.md`](references/timeline-overlap-check.md)。
+- **按任务范围拆解**：全局候选发现先看代表性完整 decoder layer 的模块关系；指定模块或已有方案围绕目标及其生产者、消费者、共享状态和通信依赖分析，按并行性判断需要下钻算子。
+- **开关必须可关闭**：多流路径要保留 enable 开关和原始回退路径，便于调试、复查及停用优化路径。
 - **先证明正确，再追性能**：先验证依赖、功能和精度，再看 overlap 和时延收益。
 - **overlap 不等于收益**：出现拖尾、资源争抢、host bound、shape 劣化时，overlap 真实成立也可能不降 wall，要继续评估控核和图模式限制。
-- **不要混抄案例**：先确定当前模型走哪条执行模式，再选一套主 API 路径，不要把 eager 和 graph 风格混着套。
-- **编排不唯一，要多试**：同一个并行点的分流编排往往不止一种，调试时多尝试不同编排，选物理上真并行且 wall 下降最大的那个。
-- **官方约束优先看 `references/` 下的官方 doc**：先读对应模式的 multi_stream 文档；只有 overlap 已成立但出现资源争抢、拖尾或卡死风险时，再读对应模式的 limit_cores 文档。
-- **开发与调试穿插**：改造一处 → 看物理布局 → 再改下一处或回滚，是多轮反复的过程；关注算子 / 模块是否真落在目标流上、cube / vector 的利用率与占核情况。
 
 ## 执行路径定界
 
-动手前先确认当前代码走哪条多流路径，两条路径的 API 与约束不能混用。
+分析时确认当前执行模式及多流约束，实施时按对应 API 路径接入，见 [`references/api-routing.md`](references/api-routing.md)。
 
-> **术语辨析**：上游 torchair 文档里「Ascend IR」和「GE 图模式」指同一条路径，只是分别从 IR 侧和执行侧描述——通过 `torchair.CompilerConfig()` 把 PyTorch FX 图转成 Ascend IR，需要指定编译模式时再设 `compiler_config.mode`，再由 GE（Graph Engine）编译执行。所以「multi_stream（Ascend IR）」文档里写「仅适用于 GE 图模式」并不矛盾。
+这里的 Ascend IR 指 TorchAir 的 GE 图模式路径。
 
-- `torchair.CompilerConfig()` + `torchair.get_npu_backend()` + GE 图模式：走 **Ascend IR** 路径。先看 [`references/ascend_ir_multi_stream.md`](references/ascend_ir_multi_stream.md)，需要控核时再看 [`references/ascend_ir_limit_cores.md`](references/ascend_ir_limit_cores.md)。
-- `torch.compile(..., backend="npugraph_ex")`：走 **npugraph_ex / aclgraph** 路径。先看 [`references/npugraph_ex_multi_stream.md`](references/npugraph_ex_multi_stream.md)，需要控核时再看 [`references/npugraph_ex_limit_cores.md`](references/npugraph_ex_limit_cores.md)。
-- 不要把 Ascend IR 的图内 API 和 aclgraph 的显式 stream API 混写进同一套实现。
-- GE 图模式通常通过 `CompilerConfig` + `get_npu_backend()` 定界，不要把 `torch.compile(mode=...)` 当成当前主入口写法。
-- `npugraph_ex` 路径本质是显式 stream / event / 生命周期管理；如果代码已经是这套风格，顺着现有实现继续，不要强改成 TorchAir 图内表达。
+- `torchair.CompilerConfig()` + `torchair.get_npu_backend()`：走 **Ascend IR / GE 图模式** 路径。
+- `torch.compile(..., backend="npugraph_ex")`：走 **npugraph_ex / aclgraph** 路径。
 
-> **`npu_stream_switch` 的 with-block 不是硬边界**：`torchair.scope.npu_stream_switch(stream_tag, stream_priority=0, enable_inner_parallel=True)` 默认 `enable_inner_parallel=True`，GE 仍可在 block 内 / 外做调度——可能把 block 内的小算子（Cast / Reshape / Swish 等）挪到主流，也可能把 block 外但被 block 内 tensor 间接依赖的预计算（典型 `silu(z) = Swish(Cast(z))`）拉到主流。**源码层级 ≠ 物理层级**：切流之后必须用 profiling 的 `Stream ID` + `Start Time(us)` + `Duration(us)` 验证物理布局，绝不能凭 Stream ID 切对就认为方案落地。
+## 方案分析
 
-## 分析：拆解与并行性判断（形成 plan）
+详细规则及完整模板见 [`references/module-decomposition.md`](references/module-decomposition.md)：
 
-详细规则见 [`references/module-decomposition.md`](references/module-decomposition.md)，主线固定为三步：
+1. **拆模块、画模块级 DAG、判模块间并行**：在分析范围内沿子网络 / 通信 / 状态 / 同步 / 资源边界拆成语义完整、输入输出明确、可独立讨论调度的模块；标注依赖类型（`data` / `state` / `event` / `collective_order`），据此把模块对判成 `serial` / `parallel_candidate` / `parallel_pending_validation`。
+2. **按需拆算子、画算子 DAG、判模块内并行**：需要判断模块内分流或细化依赖、资源占用时，沿计算 / 通信 / 同步 / 状态边界拆，识别可并行的算子和需要保持的依赖边。
+3. **派生候选编排**：把共享同一输入、彼此无 `data` 依赖的模块 / 算子看成一个集合，按集合划分思考分流。结合并行对象、流分组、汇合点、tag 粒度或跨阶段 overlap，提出并行安排或收益假设有实质差异的候选。
 
-1. **拆整网模块、画模块级 DAG、判模块间并行**：从整网 decoder layer 的执行路径出发，沿子网络 / 通信 / 状态 / 同步 / 资源边界把每层拆成语义完整、输入输出明确、可独立讨论调度的模块；标注依赖类型（`data` / `state` / `event` / `collective_order`），据此把模块对判成 `serial` / `parallel_candidate` / `parallel_pending_validation`。
-2. **对每个候选模块拆算子、画算子 DAG、判模块内并行**：仍沿计算 / 通信 / 同步 / 状态边界拆，识别模块内部哪些算子可并行、哪些依赖边不能打破。
-3. **为每个并行点派生候选编排**：把共享同一输入、彼此无 `data` 依赖的模块 / 算子看成一个集合，按集合划分思考分流。**每个并行点至少给 2 种不同编排**——并行对象、流分组、汇合点、tag 粒度或跨阶段 overlap 不同，就是不同的候选方案。
+计算与通信串行且等待明显时，可评估独立 micro-batch 的流水，结合切分后的算子效率与 host 开销判断收益。已有 KVCache offload 或分离式部署时，检查搬运 / 通信与本地独立计算的重叠窗口，核对读写边界、带宽与额外 buffer / clone 开销。
 
-选案例先读 [`references/multi-stream-cases-index.md`](references/multi-stream-cases-index.md) 的快速选型表，找到与当前模型结构最接近的模式再派生候选。
+按当前模型结构和执行模式，查询 cannbot-knowledge 中同框架、同阶段的多流部署样例，如共享专家、Attention 前处理、KVCache 异步搬运或 micro-batch 通信计算流水。
 
-**派生维度**：每一种取值变化都是一个独立候选，完整清单见 [`references/module-decomposition.md`](references/module-decomposition.md) 的「常见派生维度」。
+常见派生维度见 [`references/module-decomposition.md`](references/module-decomposition.md)；同一编排的控核等配置调优记录在对应方案内。
 
-**实现强度是一个复杂度阶梯**，不是不同的并行方案：同一个编排可以从 **C1 最小切流** → **C2 切流 + 控核** → **C3 切流 + 控核 + 手动同步点控制** 逐级加码，先用 C1 验证核心编排是否真并行，再决定要不要上更高强度。改变并行对象 / 流分组 / 汇合点则属于另一个候选，不要塞进同一方案的强度递进里。
+**GE 调度风险**：检查副流输出在主流上的消费者及其前处理；若等待被放到原本可并行的主流计算之前，可能使两条分支串行。设计时明确依赖与汇合位置，实施后核对编译后的落流和时间线。
 
-**设计期必查**：任何一个把 op 切到副流的候选，落地前都要按 [`references/ge-reorder-design-check.md`](references/ge-reorder-design-check.md) 过一遍 GE auto-reorder 风险清单——副流输出有没有轻量 precompute 下游消费者会被 GE 拉回主流形成 barrier。这是假并行最常见的根因，在设计阶段就要预判。
+## 实施
 
-## 实现（实施方案）
+承接已有方案与依赖分析，对照当前代码及 [`references/api-routing.md`](references/api-routing.md) 确认执行路径、仓库封装及切流、同步、控核约束。
 
-动手前先读 [`references/api-routing.md`](references/api-routing.md)，确认当前执行路径对应的官方文档入口、推荐 API、控核约束和已知问题。
-
-1. **按执行路径选 API**：
-   - Ascend IR / GE 图模式：切流用 `torchair.scope.npu_stream_switch(stream_tag, ...)`，时序用 `torchair.scope.npu_wait_tensor`，已有 tagged event 风格时沿用 `torchair.ops.npu_record_tagged_stream` / `torchair.ops.npu_tagged_event_record` / `torchair.ops.npu_tagged_event_wait`（注意：切流 / 时序在 `torchair.scope`，而 record / wait / tagged event 在 `torchair.ops`，是两个不同命名空间）。
-   - npugraph_ex / aclgraph：切流用 `torch.npu.Stream()` + `with torch.npu.stream(stream)`，时序用 `torch.npu.Event()` + `Event.record()` + `Event.wait(stream)`，或 Stream 侧的 `record_event` / `wait_event` / `wait_stream`。在 `torch.compile(fullgraph=True, dynamic=True)` 下 dynamo 拦截 Stream / Event 对象（缺 `as_proxy()`）时，改用 `torch.npu.npugraph_ex.scope.npu_stream_switch(tag)` 或 `torch.npu.npugraph_ex.scope.npu_tagged_event_record` / `torch.npu.npugraph_ex.scope.npu_tagged_event_wait` 这套 string-tag / tagged-event 接口。仓内目前只用到该命名空间下的 `limit_core_num`，切流与 tagged event 接口未验证，使用前先在目标环境确认。
+1. **先做最小可验证实现**：按方案设置流与汇合点，完成必要同步，保留原路径和 enable 开关。
 2. **显式 stream 路径检查内存生命周期**：短生命周期 tensor 若被其他 stream 继续消费，补 `record_stream()`；模型权重、常驻 cache 这类长生命周期对象一般不需要。
-3. **先做最小可验证 overlap**：只改一个明确的并行点，先补同步再扩大并行窗口，始终保留原路径和 enable 开关。
-4. **overlap 成立后再评估控核**：出现明显拖尾时，Ascend IR 用算子级 `torchair.scope.limit_core_num`（优先级高于全局 `config.ge_config.aicore_num`），npugraph_ex 用 Stream 级 `torch.npu.npugraph_ex.scope.limit_core_num`。
-5. **放大改动前先做一次 warm-run 验证**：对比单流 / 多流，用 profiler 确认真出现了 overlap，而不是逻辑分流但执行仍串行（profile 至少跑 5 次，丢掉前 2-3 次 cold-start 取中位数）。
+3. **根据实测调整编排与资源**：结合等待位置、资源争抢和拖尾调整同步位置或控核配置；核数结合目标硬件与实测调整。
+4. **验证后再扩大改动**：用 profiler 检查实际落流与 overlap；充分预热后，在同负载下多次对比单流 / 多流时延，取稳定运行的中位数。
 
-## 调试与验证（实施后自检 / review）
+## 调试与验证
 
-按下面五类问题分开排查，不要混在一起。
+按现象选择排查方向：
 
 1. **依赖错误 / 同步错误**：重点查事件记录、等待顺序、跨流汇合点、共享状态写入次序；典型现象是读到未完成结果、死等、结果偶发错误。
 2. **精度 / 功能异常**：先对比优化前基线，再按 `prefill/decode → 模块 → 算子` 缩小范围，判断是不是多流引入的状态时序问题，而不是算子本身的问题。
-3. **性能无收益**——必须按 3a → 3b → 3c 顺序排查，**不允许跳过 3a/3b 直接走资源 / host 假设**：
+3. **性能无收益**：结合落流、执行时间线与资源占用定位：
 
-   - **3a 副流根本没真跑（逻辑切流失败）**：现象是副流 ops 的 `stream_id` 仍落在主流、或全退到 `sid=1`。检查 `npu_stream_switch` 的 with-block 是否在 `is_prefill / enable_multi_streams` 条件下真的走到、`switch_flag` 为 False 时是否退化成了空上下文、源码顺序有没有让 GE 把 ops 挪到 block 外。
-   - **3b 副流跑了但和主流串行（假并行 / GE auto-reorder barrier）**：现象是 Stream ID 已分裂但候选模块 wall 与 baseline 持平、并行度 ≤ 1.05×。**必须**按 [`references/timeline-overlap-check.md`](references/timeline-overlap-check.md) 重建甘特图算 `overlap_pct`，`≤ 0.05` 即判假并行。典型根因是 GE 把消费副流输出的轻量 precompute（Cast / Swish / Sigmoid / Reshape）拉到主流提前下发，卡住主流 dominator。解法是把 barrier op 显式钉在 with-block 内（自己写出 precompute，不依赖 GE 自动放置），或重新设计 op 集合让副流有真正的 dominator 可吃——这两种都是新的编排候选。
-   - **3c 真重叠（overlap_pct ≥ 0.5）但 wall 不变**：仅在 3a/3b 排除后才走这步。看 shape 变化、task 数增加、host bound、带宽争抢、流间资源抢占、拖尾。判"主 / 副是否争 cube"用 `kernel_details.csv` 的 `Block Dim` 加和 vs 设备 `ai_core_cnt`，**不要**用"算子类型是 MatMul / Vector"二元判断（MatMul 也能 blk=1 占很少核）。跨流 tensor 维度偏大时先查 `TransData` / `BroadcastTo` / `MemSet` 是否长尾。
-4. **图模式 / runtime 限制**：重点看 graph break、图模式 API 约束、stream 语义差异、运行时不支持；graph 场景按 TorchAir 路径排查，不要回退成 eager 思路硬套。
+   - **3a 未按预期切流**：检查执行阶段、enable 开关和切流上下文是否实际生效，并核对编译后的算子落流。
+   - **3b 主副流重叠不足**：按 [`references/timeline-overlap-check.md`](references/timeline-overlap-check.md) 检查执行区间、等待链和资源占用；GE 路径还需核对前处理算子的调度位置，再调整分流集合与汇合点。
+   - **3c 已有重叠但 wall 无收益**：看 shape 变化、task 数增加、host bound、带宽与核资源争抢、拖尾。资源判断结合实际核配置与 pipeline 利用率；跨流 tensor 较大时关注 `TransData` / `BroadcastTo` / `MemSet` 的耗时变化。
+4. **图模式 / runtime 限制**：按当前后端核对 graph break、图捕获 API 约束及 stream 语义。
 5. **aclgraph 生命周期错误**：重点查短生命周期 tensor 是否跨流继续使用、是否遗漏 `record_stream()`；典型现象是结果偶发错误、数据踩踏、段错误或异常内存问题。
 
-**现象 → 下一步技术方向**（不是完整规则集，要结合 profiler、`kernel_details.csv`、代码结构和模型语义判断，可基于表外现象提出新方向）：
+具体性能字段及 GE 重排、同步阻塞、跨流内存问题的排查经验，按 profiler 版本和执行模式查询 cannbot-knowledge。
+
+**现象 → 下一步技术方向**：
 
 | 现象 | 技术方向 |
 | --- | --- |
-| 改造点之外的 TransData / BroadcastTo / MemSet wall 显著上升，或单算子 max duration > 5x | 可能触发 GE 全局重排或算子上提；缩小副流、换集合划分，或先做算子合并让分流单元更独立 |
-| 副流已落 side stream，但 layer wall 几乎不变 | 先算 `overlap_pct`：≤5% 是假并行，把 GE 拉过来的 precompute 显式钉进 with-block；0.05~0.5 是部分并行，调 op 集合让副流更长 / 换 dominator；≥0.5 才走资源争抢 / shape / host 假设 |
-| 主流出现新空洞 / 拖尾，副流已提前结束 | 同步点编排不对；调整汇合点，或让副流接力到下游非 dominator 算子 |
-| 主 / 副流 cube 利用率叠加高于单流，但 wall 没降 | 资源争抢；换资源对偶性更好的集合划分，让一边偏 cube、一边偏 vector / memory |
-| 多流后某个原本未关注的 Cast / Reshape / DynamicQuant 位置变化 | 隐含 data 依赖或新瓶颈被暴露；把该算子显式纳入候选集，重做集合划分 |
+| 改造点之外的 TransData / BroadcastTo / MemSet wall 显著上升 | 结合 shape 和调度变化核对额外搬运或 GE 重排；缩小副流、换集合划分，或先做算子合并让分流单元更独立 |
+| 副流已落 side stream，但 layer wall 几乎不变 | 检查实际重叠、等待位置与资源占用，再决定调整分流集合、汇合点或资源分配 |
+| 主流出现新空洞 / 拖尾，副流已提前结束 | 核对等待与汇合位置；必要时调整汇合点，或将具备并行条件的下游算子安排到副流继续执行 |
+| 主 / 副流 cube 利用率叠加高于单流，但 wall 没降 | 结合核占用与算子耗时核对争抢；评估资源互补的集合划分，如 cube 与 vector / memory 路径组合 |
+| 多流后某个原本未关注的 Cast / Reshape / DynamicQuant 位置变化 | 核对该算子的依赖、等待和耗时，再决定是否将其纳入候选集并调整分流集合 |
 
-**选定方案前做 Profile 双重验证**（第 1、2 步都不可选）：
+**Profile 验证要点**：
 
-1. **Stream ID 落点检查**：副流算子的 `stream_id` 确实落到目标 stream、没被 GE 挪回主流；不对就回 3a。
-2. **overlap_pct 时间线验证**：按 [`references/timeline-overlap-check.md`](references/timeline-overlap-check.md) 算 `overlap_pct`。判方案成立要 `≥ 0.5`；`≤ 0.05` 是假并行；`0.05 ~ 0.5` 是部分并行，调 op 集合让副流更长或换 dominator。三档的改进方向完全不同。
-3. 控核场景下副流算子 `Block Dim` 不超过配置值，主 / 副 `Block Dim` 加和不超过设备核数。
-4. 汇合点后没有新的 `EVENT_WAIT` 空洞或明显 gap。
+1. **Stream ID 落点检查**：副流算子的 `stream_id` 确实落到目标 stream、没被 GE 挪回主流；异常时按 3a 排查。
+2. **overlap_pct 时间线验证**：按 [`references/timeline-overlap-check.md`](references/timeline-overlap-check.md) 计算实际执行重叠，并结合关键路径与 wall 变化判断收益。
+3. 控核场景下按算子 Core 类型检查核配置是否生效，结合同时段的 Cube / Vector 利用率和耗时变化判断资源争抢。
+4. 检查汇合点新增的 `EVENT_WAIT` 或空闲区间，判断等待位置对关键路径的影响。
 5. 跨流 tensor 名称和维度与设计一致，没把大 tensor 搬运变成新瓶颈。
 
-**功能 / 同步层面的 review 要点**：enable 前后输出一致、开关关闭后原路径正常；汇合点前后无缺失等待，共享状态 / KVCache / 通信结果没有读写乱序。
-
-## 实施检查清单
-
-- 已确认当前实现走 Ascend IR / GE 还是 npugraph_ex。
-- 已确认存在真实可并行分支，而不是把串行链路硬拆成多流。
-- 每个并行点已派生 ≥2 种不同编排候选。
-- 跨流依赖已显式表达，而不是依赖隐式同步；跨流 tensor 维度尽量 ≤ 数十 element / token，汇合点尽量只 1 个。
-- 显式 stream 路径里，短生命周期 tensor 的跨流使用已检查 `record_stream()`。
-- overlap 已用 `overlap_pct` 证明真实成立后，才继续评估控核 / stream limit / 预取。
-- 已通过 warm-run baseline 和 profiler 确认优化方向成立（丢前 2-3 次 cold-start）。
+**功能 / 同步复查要点**：enable 前后输出一致、开关关闭后原路径正常；汇合点前后无缺失等待，共享状态 / KVCache / 通信结果没有读写乱序。
 
 ## 参考文档索引
 
-- **整网模块 / 算子拆解与候选派生（方向级分析产物结构）**：[`references/module-decomposition.md`](references/module-decomposition.md)
+- **模块 / 算子拆解与候选派生（方向级分析产物结构）**：[`references/module-decomposition.md`](references/module-decomposition.md)
 - **多流 Plan 方案细节片段（Plan 自由块结构）**：[`references/plan-detail-fragment.md`](references/plan-detail-fragment.md)
 - **多流 / 控核 API 路由**：[`references/api-routing.md`](references/api-routing.md)
-- **overlap 时间线复盘（判真 / 假并行）**：[`references/timeline-overlap-check.md`](references/timeline-overlap-check.md)
-- **kernel_details 字段查法（设计 / post-mortem 两套字段集）**：[`references/kernel-fields-lookup.md`](references/kernel-fields-lookup.md)
-- **GE auto-reorder 风险设计清单**：[`references/ge-reorder-design-check.md`](references/ge-reorder-design-check.md)
-- **案例库与选型表**：[`references/multi-stream-cases-index.md`](references/multi-stream-cases-index.md)
-- **官方多流 / 控核文档（torchair docs/zh 离线副本）**：
-  - Ascend IR / GE 图模式：[`references/ascend_ir_multi_stream.md`](references/ascend_ir_multi_stream.md)、[`references/ascend_ir_limit_cores.md`](references/ascend_ir_limit_cores.md)
-  - npugraph_ex / aclgraph：[`references/npugraph_ex_multi_stream.md`](references/npugraph_ex_multi_stream.md)、[`references/npugraph_ex_limit_cores.md`](references/npugraph_ex_limit_cores.md)
+- **overlap 时间线复盘（执行重叠与收益）**：[`references/timeline-overlap-check.md`](references/timeline-overlap-check.md)

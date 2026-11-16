@@ -1,7 +1,7 @@
 # 独立部署模式：自管 ParallelContext 与启动模板
 
 本文件提供独立部署模式的产物模板：
-1. **ParallelContext + build_parallel_context**：替代仓内 CommManager 的轻量数据结构，inline 在 runner 内
+1. **ParallelContext + build_parallel_context**：替代仓内 CommManager 的轻量数据结构，模板放在 runner 内
 2. **Runner 多卡改造点**：dist 初始化、ParallelContext 构造、modeling 注入
 3. **modeling 代码改造**：构造签名与属性访问方式
 4. **启动脚本与入口**：torchrun + infer.sh + infer.py
@@ -12,7 +12,7 @@
 
 ## §0 复用与自管边界（按功能维度）
 
-### 自管（runner 内 inline）
+### 自管（模板放在 runner 内）
 
 | 功能 | 实现 |
 |---|---|
@@ -43,23 +43,23 @@ torch_npu 原生算子（`npu_moe_distribute_dispatch_v2` / `npu_grouped_matmul`
 | 项 | 框架部署 | 独立部署 |
 |---|---|---|
 | 进程组初始化 | ModelWorker 自动 | Runner 内 `dist.init_process_group("hccl")` |
-| 通信组管理 | `executor.core.config.comm_manager.CommManager` | `ParallelContext`（runner 内 inline） |
+| 通信组管理 | `executor.core.config.comm_manager.CommManager` | `ParallelContext`（模板放在 runner 内） |
 | 通信组接口 | `mgr.get_group(name)` / `get_group_name(name)` / `get_rank(name)` | **同左（接口对齐）** |
-| 通信组建立底层 | `executor.utils.hccl_utils.init_comm_group` | **同左** |
+| 通信组建立底层 | `executor.utils.hccl_utils.init_comm_group_by_ranks` | `executor.utils.hccl_utils.init_comm_group` |
 | 推理循环 | ExecutionEngine + Scheduler | `Runner.model_generate(prompts, warm_up)`（命名与签名对齐 framework `ModelRunner.model_generate`，独立部署 inline 实现） |
 | YAML 解析 | `InferenceConfig.from_dict` | `yaml.safe_load` 直接读 |
 | 启动 | `bash infer.sh → launch → 多卡 fork python` | `torchrun --nproc_per_node=N infer.py` |
 | ParallelLinear / FusedMoEGMM / 量化 | `from module.* import ...` | **同左** |
 | modeling 构造签名 | `(config, infer_config, comm_manager, prefix)` | `(config, parallel_ctx, prefix)` |
 | modeling 读取运行时配置 | `infer_config.scheduler_config.batch_size` 点访问 | `parallel_ctx.runtime_cfg["batch_size"]` dict 访问 |
-| modeling forward 计算 | 与独立模式一致 | 与框架模式一致 |
+| modeling forward 计算 | 遵循 infer 仓 metadata 与张量布局 | 复用计算逻辑，适配 Runner 的 metadata 与布局 |
 | YAML schema | 4 段式 | **同左** |
 
 ---
 
 ## §1 ParallelContext + build_parallel_context
 
-inline 在 `runner_{model_name}.py` 顶部，约 80 行：
+模板放在 `runner_{model_name}.py` 中；已有项目可沿用其文件组织：
 
 ```python
 from dataclasses import dataclass, field
@@ -190,7 +190,7 @@ def build_parallel_context(yaml_cfg: dict) -> ParallelContext:
 
 ## §2 Runner 多卡改造点
 
-migrator 阶段产出的 Runner 是 `world_size=1` 单卡的。本阶段加 dist 初始化 + ParallelContext 构造 + modeling 注入：
+在已有 Runner 上接入 dist 初始化、ParallelContext 和 modeling 注入；已有适用实现时直接复用：
 
 ```python
 import os
@@ -294,7 +294,9 @@ ParallelLinear 替换示例、Embedding / LMHead 并行、模块间数据重排�
 
 ### MoE EP 接入
 
-算子链（`npu_moe_init_routing_v2` / `npu_moe_re_routing` / `npu_moe_distribute_dispatch_v2` / `npu_moe_distribute_combine_v2` / `npu_grouped_matmul` / `npu_moe_finalize_routing`）与框架部署 100% 一致，参考 `framework_moe_parallel.md`。差异仅在通信组与 rank 取用方式：
+MoE 算子链与回退选择参考 `framework_moe_parallel.md`，通信组与 rank 从 `parallel_ctx` 获取。
+
+> **MC2 接入限制**：下方独立模板仍复用普通 `moe_ep_group`，未提供 MC2 独立物理组及其 buffer 配置。它不能直接作为 fullmesh_v2 接入模板；采用该路径前需补齐这些条件。
 
 ```python
 # MoE 模块 __init__ 内（独立部署版 set_mc2_kwargs 的对照）
@@ -323,7 +325,7 @@ self.combine_kwargs = {k: v for k, v in self.dispatch_kwargs.items()
                        if k not in ("scales", "quant_mode")}
 ```
 
-MoE 专家计算复用 `from module.fuse_moe_gmm import FusedMoEGMM`，`tp_size` / `tp_rank` / `ep_size` / `ep_rank` 全部从 `parallel_ctx` 取。HCCL buffer 大 batch 时通过 `infer.sh` export `HCCL_BUFFSIZE` 调高（如 512），`init_comm_group` 默认读环境变量。
+MoE 专家计算复用 `from module.fuse_moe_gmm import FusedMoEGMM`，`tp_size` / `tp_rank` / `ep_size` / `ep_rank` 全部从 `parallel_ctx` 取。HCCL buffer 按目标负载配置，`init_comm_group` 默认读取环境变量 `HCCL_BUFFSIZE`。
 
 ---
 
@@ -354,9 +356,7 @@ torchrun --nproc_per_node=${WORLD_SIZE} \
     "${SCRIPT_DIR}/infer.py" --yaml_file_path="${YAML}"
 ```
 
-> 多机：`torchrun --nnodes=N --node_rank=$NODE_RANK --master_addr=<主节点 IP> ...`，由用户在外层环境注入。HCCL_BUFFSIZE 大 batch / 大 hidden_size 可调高（如 512）。
->
-> `MASTER_PORT=29500` 是 PyTorch torchrun 默认 rendezvous 端口，与框架部署的 `MASTER_PORT=6038/6138` / `HCCL_IF_BASE_PORT=23456` 端口体系独立；混部场景仅需保证不与同机其他 rendezvous 服务冲突。
+> 上述启动模板适用于单机。多机需按每节点进程数设置 `--nproc_per_node`，结合 `--nnodes` 保持总进程数等于配置的 `world_size`，并设置 `--node_rank` / `--master_addr`；混部时确保 rendezvous 端口不冲突。
 
 `infer.py`：
 
@@ -400,5 +400,5 @@ if __name__ == "__main__":
 |---|---|---|
 | 标准 LLM（GQA / MHA）+ TP | 支持 | 复用 `QKVParallelLinear` |
 | MLA + 模块差异化 TP | 支持 | 复用 `ColumnParallelLinear` / `RowParallelLinear` 组合实现 MLA 投影；micro_batch / SP+TP 等高级特性需复用 modeling 内部 helper（如 deepseek_r1 的 `gather_prefill_outputs`、`forward_lm_head`），这些 helper 不依赖 `executor/core/`，可正常迁移 |
-| MoE EP / TP（含 Shared Expert） | 支持 | 复用 `FusedMoEGMM` + torch_npu dispatch/combine 算子 |
+| MoE EP / TP（含 Shared Expert） | 按路径适配 | 复用 `FusedMoEGMM` 和 MoE 算子链；MC2 独立通信组接入见 §3 限制 |
 | 量化（W8A8 / W4A16 / W8A8C8） | 支持 | 复用 `module.quantization` |

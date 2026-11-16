@@ -20,7 +20,7 @@
 **普通点位**一行：
 
 ```python
-torch.save(x.detach().float().cpu(), f"{DUMP}/03_L{self.layer_idx}_S{step}_fa_out.pt")
+torch.save(x.detach().cpu(), f"{DUMP}/03_L{self.layer_idx}_S{step}_fa_out.pt")
 ```
 
 零填充序号让字典序等于执行顺序，省掉额外的次序记录。层号与生成步必须进文件名——一个 `DecoderLayer` 类里的插桩对所有层每步都生效，名字写死会让后写的覆盖先写的，只剩末层末步。多卡另加 rank。
@@ -28,9 +28,9 @@ torch.save(x.detach().float().cpu(), f"{DUMP}/03_L{self.layer_idx}_S{step}_fa_ou
 **原地写回的算子**要存两侧。这类算子没有独立的输出参数，直接把结果写回某个输入张量，识别特征是函数名带尾部下划线、API 说明标注原地更新、或没有返回值：
 
 ```python
-torch.save(cache.clone().float().cpu(), f"{DUMP}/04_L{self.layer_idx}_S{step}_cache_in.pt")
+torch.save(cache.clone().cpu(), f"{DUMP}/04_L{self.layer_idx}_S{step}_cache_in.pt")
 npu_scatter_nd_update_(cache, indices, updates)
-torch.save(cache.clone().float().cpu(), f"{DUMP}/04_L{self.layer_idx}_S{step}_cache_out.pt")
+torch.save(cache.clone().cpu(), f"{DUMP}/04_L{self.layer_idx}_S{step}_cache_out.pt")
 ```
 
 两侧都要 clone。只在调用后取张量拿到的是输出，输入已被覆盖；只存引用不克隆，下一次调用会覆盖同一块内存。
@@ -41,7 +41,7 @@ torch.save(cache.clone().float().cpu(), f"{DUMP}/04_L{self.layer_idx}_S{step}_ca
 
 **图模式**：在 forward 内落盘会破坏图捕获，取值方式见 `graph_mode_debug.md`。
 
-**内存类问题**：每次落盘都触发一次设备到主机的拷贝，这个同步会改变现象。改用「低扰动异步探针」的写法。
+**观测扰动**：设备到主机拷贝引入的同步可能改变现象，此时改用「低扰动异步探针」。
 
 ### 低扰动异步探针
 
@@ -103,9 +103,9 @@ pass_ratio = np.isclose(a, g, rtol=rtol, atol=atol).sum() / a.size
 
 **参数取值**：`rtol` 按被测数据的精度格式与算子性质定，`atol` 必须给——只给 rtol 时基准侧的零值区会让相对偏差发散。
 
-**判定**：看通过率而非逐元素全等。通过率门槛与 rtol 无关，单独定——本仓单算子测试用 `0.99`。有效位出现 NaN 或 Inf 即判失败，不按占比容忍。这是张量级口径，整网层面的判定口径由调用方定下，不要混用。
+**判定**：数值计算按算子验收标准确定通过率门槛，与 rtol、atol 分别设置。有效位出现 NaN 或 Inf 即判失败，不按占比容忍。这是张量级口径，整网层面的判定口径由调用方定下，不要混用。
 
-**容差参考**：`ops/ascendc/examples/` 下各单算子测试的 `rtol` 从 `1e-5` 到 `0.01` 不等，`atol` 从 `1e-8` 到 `0.01`，个别量化测试放到 `1`；`ops/pypto/examples/` 用到 `rtol=0.005` 与 `0.03`。按被测算子选，不套一个数。
+**容差参考**：按算子、dtype 和计算路径查询 cannbot-knowledge 中的精度验收标准与比对样例。
 
 **cache 类张量**：只取有效位。无效位可能本身带 NaN 或残留脏数据，整块比对会误判。
 

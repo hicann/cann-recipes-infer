@@ -158,6 +158,7 @@ def build_tables(ins):
     for d in order(vs.get("patterns", []), "total_duration_us"):
         s0 = (d.get("representative_samples") or [{}])[0]
         ar = d.get("agent_review") or {}
+        fusion_candidate = ar.get("fusion_candidate")
         loc_parts = []
         if s0.get("phase") is not None or s0.get("layer_idx") is not None:
             loc_parts.append(f"{s0.get('phase')} L{s0.get('layer_idx')}")
@@ -168,7 +169,7 @@ def build_tables(ins):
         rows.append([f"<code>{esc(d.get('pattern_signature'))}</code>",
                      metric(f"{d.get('occurrences')}x / {d.get('total_duration_us')}", ""),
                      esc(",".join((d.get("components") or [])[:2])),
-                     esc(ar.get("fusion_candidate") or "—"), badge(conf_of(d)),
+                     esc(fusion_candidate if fusion_candidate not in (None, "") else "—"), badge(conf_of(d)),
                      esc(ar.get("semantic_summary") or "")
                      + f" <span class='muted'>[{esc(loc)}]</span>"])
     T["vector_sequence_candidates.json:patterns"] = table(

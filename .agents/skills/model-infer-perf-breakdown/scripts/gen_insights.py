@@ -152,6 +152,10 @@ def main():
     if annotations and "annotations" in annotations:
         annotations = annotations["annotations"]
     taxonomy = load(args.movement_taxonomy) if args.movement_taxonomy else None
+    if isinstance(taxonomy, list):
+        taxonomy = {"families": taxonomy}
+    elif taxonomy:
+        taxonomy = taxonomy.get("agent_taxonomy", taxonomy)
 
     os.makedirs(args.out_dir, exist_ok=True)
     ops = sorted(raw["operators"], key=lambda o: o["index"])
@@ -239,8 +243,12 @@ def main():
     json.dump({"schema_version": "insight.module_bubble.v1",
                "selection_policy": {"top_k": K, "baseline": "same_component_type",
                                     "sort": "median_bubble_us / delta_vs_type_median_us"},
-               "persistent_module_bubbles": persistent[:K],
-               "instance_bubble_outliers": inst_out[:K]},
+               "persistent_module_bubbles": topk_with_annotated(
+                   persistent, K, lambda c: f"persistent:{c['component_type']}", annotations),
+               "instance_bubble_outliers": topk_with_annotated(
+                   inst_out, K,
+                   lambda c: f"instance_bubble:{c['phase']}:{c['layer_idx']}:{c['component_type']}",
+                   annotations)},
               open(f"{args.out_dir}/module_bubble.json", "w"), ensure_ascii=False, indent=2)
 
     # ================= Insight 2: operator_jitter =================
@@ -484,8 +492,8 @@ def main():
     for s_sig, rs in patt.items():
         tot = sum(o["duration_us"] for r in rs for o in r)
         comps = sorted({(comp_by_id.get(o2c.get(str(o["index"]), ""), {}) or {}).get("type", "unmatched")
-                        for o in rs[0]})
-        clusters = sorted({cl_of(o["index"]) for o in rs[0]})
+                        for r in rs for o in r})
+        clusters = sorted({cl_of(o["index"]) for r in rs for o in r})
         samples = []
         for r in sorted(rs, key=lambda r: -sum(o["duration_us"] for o in r))[:3]:
             i0 = r[0]["index"]
@@ -511,7 +519,7 @@ def main():
     for x in pats:
         x.pop("_sort", None)
     json.dump({"schema_version": "insight.vector_sequence_candidates.v1",
-               "selection_policy": {"min_ops": 5, "min_total_us": 20.0, "top_k": K,
+               "selection_policy": {"min_ops": 5, "top_k": K,
                                     "group_by": "pattern_signature", "sort": "total_duration_us"},
                "patterns": pk},
               open(f"{args.out_dir}/vector_sequence_candidates.json", "w"), ensure_ascii=False, indent=2)
@@ -544,32 +552,29 @@ def main():
                             "定义 movement family，再带 --movement-taxonomy 重跑。"},
                   open(f"{args.out_dir}/data_movement_ops.json", "w"), ensure_ascii=False, indent=2)
     else:
-        # Accept three input shapes: top-level {"families":[...]}, a bare [...], or the
-        # nested {"agent_taxonomy":{"families":[...]}} — a common mistake is writing the
-        # input file against the output schema in insight_workflow.md.
-        if isinstance(taxonomy, list):
-            tax_families = taxonomy
-        else:
-            tax_families = (taxonomy.get("families")
-                            or taxonomy.get("agent_taxonomy", {}).get("families")
-                            or [])
+        tax_families = taxonomy.get("families") or []
         if not tax_families:
-            print('⚠ [gen_insights] 提供了 --movement-taxonomy 但解析出 0 个 family：'
-                  '输入应为顶层 {"families": [...]}，不要套用输出 schema 的 '
-                  'agent_taxonomy.families 嵌套。data_movement_ops 将为空。')
+            print('⚠ [gen_insights] movement taxonomy 的 families 为空，data_movement_ops 将为空。')
         op2fam = {op: f["family"] for f in tax_families for op in f.get("ops", [])}
+
+        stream_ops = defaultdict(list)
+        for op in ops:
+            stream_ops[str(op.get("stream_id"))].append(op)
+        stream_positions = {}
+        for same_stream in stream_ops.values():
+            same_stream.sort(key=lambda op: op.get("start_time_us", 0))
+            for position, op in enumerate(same_stream):
+                stream_positions[op["index"]] = position
 
         def neighbors(i):
             o = byidx[i]
-            sid = str(o.get("stream_id"))
-            same = sorted([x for x in ops if str(x.get("stream_id")) == sid],
-                          key=lambda x: x.get("start_time_us", 0))
-            pos = next((k for k, x in enumerate(same) if x["index"] == i), None)
+            same = stream_ops[str(o.get("stream_id"))]
+            pos = stream_positions[i]
             return {
-                "prev_same_stream": same[pos - 1]["normalized_name"] if pos and pos > 0 else None,
+                "prev_same_stream": same[pos - 1]["normalized_name"] if pos > 0 else None,
                 "next_same_stream": (
                     same[pos + 1]["normalized_name"]
-                    if pos is not None and pos + 1 < len(same) else None
+                    if pos + 1 < len(same) else None
                 ),
                 "prev_global": byidx.get(i - 1, {}).get("normalized_name"),
                 "next_global": byidx.get(i + 1, {}).get("normalized_name"),
@@ -592,7 +597,10 @@ def main():
             fam_tot[fam]["dur"] += o.get("duration_us", 0)
         for fam in sorted(fam_agg, key=lambda f: -fam_tot[f]["dur"]):
             mods = []
-            for (ct, cl), v in sorted(fam_agg[fam].items(), key=lambda kv: -kv[1]["dur"])[:K]:
+            ranked_modules = sorted(fam_agg[fam].items(), key=lambda item: -item[1]["dur"])
+            selected_modules = topk_with_annotated(
+                ranked_modules, K, lambda item: f"move:{fam}:{item[0][0]}:{item[0][1]}", annotations)
+            for (ct, cl), v in selected_modules:
                 top = sorted(v["locs"], key=lambda x: -x[0])[:K]
                 locs = [{"phase": cobj.get("phase"), "layer_idx": cobj.get("layer_idx"),
                          "duration_us": round(dur, 1), "op_indices": [i],
@@ -609,10 +617,16 @@ def main():
             families_out.append({"family": fam, "ops": fam_ops,
                                  "total_duration_us": round(fam_tot[fam]["dur"], 1),
                                  "occurrences": fam_tot[fam]["n"], "by_module": mods})
+        annotated_families = {
+            f["family"]: True for f in families_out
+            if any(f"move:{f['family']}:{m['component_type']}:{m['cluster']}" in (annotations or {})
+                   for m in f["by_module"])
+        }
         json.dump({"schema_version": "insight.data_movement_ops.v1",
                    "agent_taxonomy": {"families": tax_families,
                                       "needs_user_review": taxonomy.get("needs_user_review", [])},
-                   "families": families_out[:K]},
+                   "families": topk_with_annotated(
+                       families_out, K, lambda f: f["family"], annotated_families)},
                   open(f"{args.out_dir}/data_movement_ops.json", "w"), ensure_ascii=False, indent=2)
 
     # ================= review stub =================

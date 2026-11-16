@@ -1,12 +1,12 @@
 # NPU 模型基础优化 Agent Skills 设计文档
 
-> 本文档覆盖 `model-infer-optimize` 基础优化工作流；后续工作流引入后另行补充。
+> 本文档覆盖基础优化工作流及通用开发规范；进阶性能调优见 [SOTA 工作流设计](sota-approach-skill-design.md)。
 
 ## 1. 项目概述
 
 ### 1.1 项目定位
 
-本项目是 [cann-recipes-infer](https://gitcode.com/cann/cann-recipes-infer) 仓库的 Agent Skill 框架，基于 CANN 平台能力和仓库已有模型的优化经验，将 NPU 推理工作中的路径知识、阶段依赖和验证流程模块化，由专业 Agent 协同推进。框架以工作流为单位组织 Skill，**当前已落地「基础优化」工作流**——由 `model-infer-optimize` 编排 migrator → 并行 → KVCache → 融合 → 量化 → 图模式 → 总结的端到端优化；后续将引入更多工作流，复用同一套 Agent Team 与 `progress.md` 状态机制接入。
+本项目是 [cann-recipes-infer](https://gitcode.com/cann/cann-recipes-infer) 仓库的 Agent Skill 框架，基于 CANN 平台能力和仓库已有模型的优化经验，将 NPU 推理工作中的关键判断、阶段依赖和验证流程模块化，由专业 Agent 协同推进。基础优化工作流由 `model-infer-optimize` 编排 migrator → 并行 → KVCache → 融合 → 量化 → 图模式 → 总结；进阶性能调优工作流由 `model-infer-sota-approach` 在已有 baseline 之上探索优化方向与组合。
 
 ### 1.2 核心目标
 
@@ -27,18 +27,18 @@
 
 ```
 cann-recipes-infer/
-├── AGENTS.md              # 项目根指令（Claude Code / OpenCode 共用）
+├── AGENTS.md              # 项目根指令
 ├── docs/agent/            # Agent 体系设计文档
 ├── scripts/init-agent.sh  # 初始化脚本
 └── .agents/               # Skills / SubAgents / Hooks 源目录
     ├── README.md          # Skill 体系总览
     ├── agents/            # SubAgent 定义（3 个）
-    ├── hooks/             # Claude Code hook 脚本
-    ├── settings.json      # Claude Code settings
+    ├── hooks/             # Hook 检查脚本
+    ├── settings.json      # 客户端 Hook 注册配置
     └── skills/            # Skill 定义（详见 2.3 Skill 分类）
 ```
 
-使用前先在仓库根执行 `bash scripts/init-agent.sh`（可选 `--codex` / `--claude` / `--opencode`），脚本会把 `.agents/` 下的目录暴露到对应客户端位置——Codex 生成 `.codex/agents/*.toml`，Claude Code / OpenCode 用 symlink 暴露到 `.claude/` 和 `.opencode/`，同时创建根目录 `CLAUDE.md -> AGENTS.md` 软链，这些生成物已在 `.gitignore` 中排除。
+使用前按[安装说明](../../.agents/README.md#安装)运行 `scripts/init-agent.sh`，安装知识库查询技能并生成客户端视图。
 
 ### 2.2 Skill 调度架构
 
@@ -57,11 +57,13 @@ cann-recipes-infer/
   │
   ├── 阶段 0：模型分析与基线建立
   │   ├── analyzer ──→ 架构分析、环境确认
-  │   └── implementer ──→ model-infer-migrator（框架适配、基线采集）
+  │   ├── implementer ──→ model-infer-migrator（框架适配、基线采集）
+  │   ├── reviewer ──→ 新增或修复的部署代码与基线验收
+  │   └── analyzer ──→ model-infer-quantization（用户启用且产物已交付时初评估）
   │
   ├── 阶段 1：并行化改造（多卡部署时）
   │   ├── analyzer ──→ model-infer-parallel-analysis（策略推荐）
-  │   └── implementer ──→ model-infer-parallel-impl（代码改造）
+  │   ├── implementer ──→ model-infer-parallel-impl（代码改造）
   │   └── reviewer ──→ 验证并行正确性
   │
   ├── 阶段 2：KVCache + FA
@@ -76,7 +78,7 @@ cann-recipes-infer/
   │   └── reviewer ──→ 精度/性能验证
   │
   ├── 阶段 4：量化适配改造（如阶段 0 完成量化初评估且用户启用）
-  │   ├── analyzer ──→ model-infer-quantization（量化方案匹配）
+  │   ├── analyzer ──→ model-infer-quantization（实施前变更复核）
   │   ├── implementer ──→ model-infer-quantization（量化接入）
   │   └── reviewer ──→ 精度/性能验证
   │
@@ -88,7 +90,7 @@ cann-recipes-infer/
   └── 阶段 6：优化总结 ──→ 输出优化报告
 ```
 
-全流程中，model-infer-runtime-debug 可在任意阶段按需触发（aicore timeout、OOM、推理卡住等）。
+已完成或不适用的阶段记录依据后跳过，有效结果可复用。模型需多卡才能运行时，先完成适配准备，在阶段 1 运行与精度验收后建立首个基线。精度或运行时问题按需使用 `model-infer-precision-debug`、`model-infer-runtime-debug`。
 
 设计考虑：
 
@@ -101,6 +103,7 @@ cann-recipes-infer/
 | 类别 | Skill | 说明 |
 |------|-------|------|
 | 编排 | model-infer-optimize | 基础优化工作流编排入口，阶段 0-6 |
+| 编排 | model-infer-sota-approach | 已有 baseline 之上的进阶性能调优 |
 | 基础优化工作流 | model-infer-migrator | 框架适配与基线建立 |
 | 基础优化工作流 | model-infer-parallel-analysis | 并行策略分析 |
 | 基础优化工作流 | model-infer-parallel-impl | 并行切分实施 |
@@ -108,11 +111,12 @@ cann-recipes-infer/
 | 基础优化工作流 | model-infer-fusion | 融合算子替换 |
 | 基础优化工作流 | model-infer-quantization | 量化适配改造（可选） |
 | 基础优化工作流 | model-infer-graph-mode | 图模式适配 |
-| 调试 | model-infer-precision-debug | 推理精度诊断（当前主要覆盖 KVCache/FA） |
+| 调试 | model-infer-precision-debug | 推理精度定界、对比、定位与根因确认 |
 | 调试 | model-infer-runtime-debug | NPU 运行时错误诊断 |
+| 性能分析 | model-infer-profiling | 性能数据采集 |
+| 性能分析 | model-infer-perf-breakdown | 性能数据拆解与优化线索 |
 | 独立进阶优化 | model-infer-multi-stream | 多流并行 |
 | 独立进阶优化 | model-infer-prefetch | 权重预取 |
-| 独立进阶优化 | model-infer-superkernel | SuperKernel 适配 |
 
 ## 3. Agent 角色设计
 
@@ -120,14 +124,16 @@ cann-recipes-infer/
 
 通过分析/实施/验证的职责隔离，降低单个 Agent 同时承担多角色导致的越界与漏检问题：
 
-| 角色 | 职责 | 权限 | 挂载 Skills |
-|------|------|------|-----------|
-| 主 Agent | 阶段编排、用户确认、进度管理 | 不直接修改模型代码 | model-infer-optimize |
-| analyzer | 架构分析、方案设计 | 只读代码，只写 progress.md | parallel-analysis、kvcache、fusion、quantization、graph-mode |
-| implementer | 代码改造、调试修复 | 读写全部文件 | migrator、parallel-impl、kvcache、fusion、quantization、graph-mode、precision-debug、runtime-debug |
-| reviewer | 精度验证、性能对比 | 禁止修改模型代码 | precision-debug、runtime-debug |
+| 角色 | 职责 | 修改边界 |
+|------|------|----------|
+| 主 Agent | 阶段编排、用户确认、进度管理与验收裁决 | 维护状态与报告，模型改造交 implementer |
+| analyzer | 架构分析、方案设计 | 只读模型代码与配置，写分析产物 |
+| implementer | 按确认方案改造代码、调试修复与自验证 | 本轮实施范围内的代码、配置及产物 |
+| reviewer | 独立验证精度、性能与仓库规范 | 可准备测试文件与诊断，模型修复及回退交 implementer |
 
 三个角色共享核心原则：禁止编造解释，遇到异常数据必须先用工具调查。
+
+角色也可独立调用：按任务指定的 skill 执行相关部分，未指定时选用适用的 skill；优先读取本任务的 `progress.md`，按调用方要求交付。
 
 ### 3.2 协作信息流
 
@@ -141,8 +147,10 @@ sequenceDiagram
 
     M->>A: 派发分析任务，指定 skill
     A-->>M: 方案写入 progress.md
-    M->>U: 呈现方案，请求确认
-    U-->>M: 确认方案
+    opt 方案尚未授权或出现新增取舍
+        M->>U: 呈现方案、依据与待决事项
+        U-->>M: 确认方案
+    end
     M->>I: 派发实施任务，指定 skill
     I-->>M: 实施记录 + 自验证结果
     M->>M: 检查自验证完整性
@@ -150,28 +158,29 @@ sequenceDiagram
     R-->>M: 验证报告
 
     opt 验证未通过时进入修复循环
+        Note over M: 需要改变方案时返回分析与确认
         M->>I: 派发修复，指定调试 skill
         I-->>M: 修复记录 + 自验证
         M->>R: 重新验证
         R-->>M: 验证报告
     end
 
-    M->>U: 阶段总结，确认后 commit 进入下一阶段
+    M->>U: 阶段总结；继续推进与提交分别按授权执行
 ```
 
 每阶段遵循统一流程：
 
 1. 主 Agent 派发 analyzer 进行方案分析，结果写入 progress.md
-2. 主 Agent 将方案呈现给用户确认
+2. 主 Agent 呈现方案与依据，沿用已有授权；新增取舍或方案变更由用户确认
 3. 确认后派发 implementer 实施改造，implementer 必须完成自验证
-4. 主 Agent 检查自验证完整性，缺失则打回重派
+4. 主 Agent 核对代码加载、适用的编译检查、推理与输出证据，缺失或矛盾时交 implementer 调查补齐
 5. 派发 reviewer 进行精度和性能验证
-6. 验证未通过时，进入修复循环：派发 implementer 修复 → reviewer 重新验证
-7. 全部通过后输出阶段总结，用户确认后进入下一阶段
+6. 验证未通过时，派发 implementer 修复 → reviewer 重新验证；改变方案时返回分析与确认，修复受阻时按证据和授权决定继续、回退或停止
+7. 验收后输出阶段总结，更新当前状态；继续推进与提交分别按用户决定或已有明确授权执行
 
 ### 3.3 派发规范
 
-主 Agent 的 dispatch prompt 保持简洁：指定工作目录、任务、必须使用的 skill，不附加完整方案或实施步骤。SubAgent 通过读取 progress.md 获取上下文，由 skill 流程指导具体执行，避免 prompt 覆盖 skill 内的流程定义。
+主 Agent 的 dispatch prompt 给出本轮任务范围、工作目录、progress.md 路径、所用 skill 和输入产物位置，按需补充影响执行的上下文。SubAgent 读取共享状态，按任务范围使用 skill 的分析、实施或验证部分，待决事项返回主 Agent。
 
 ## 4. 状态管理设计
 
@@ -180,10 +189,10 @@ sequenceDiagram
 SubAgent 之间通过 `progress.md` 共享阶段结论和任务状态，实现跨 Agent、跨阶段、跨会话的上下文接力：
 
 ```
-{model_dir}/
+{model_dir}/agentic/
 ├── progress.md              ← 活跃文件，所有 SubAgent 启动时读取
-│   ├── 常驻区：阶段 0 模型分析结果，不清除
-│   │   └── 进度概览表，主 Agent 每阶段更新一行
+│   ├── 常驻区：模型信息、当前方案、原始基线与前一有效版本
+│   │   └── 进度概览表，主 Agent 随阶段推进更新
 │   ├── 分隔标记
 │   └── 工作区：当前阶段记录，阶段推进时归档清空
 │
@@ -195,26 +204,26 @@ SubAgent 之间通过 `progress.md` 共享阶段结论和任务状态，实现�
 
 ### 4.2 读写规则
 
-- **常驻区**由阶段 0 写入，后续只有主 Agent 更新概览表
+- **常驻区**由阶段 0 的 analyzer 初始化，主 Agent 维护当前方案、基线引用与进度概览，保留原始基线
 - **工作区**由各 SubAgent 追加，写入前先读取现有内容
-- **阶段推进**：主 Agent 更新概览表 → 调用归档脚本 → 清空工作区
-- **历史归档**禁止全文读取，通过关键字索引查找
+- **阶段推进**：验收或回退、跳过的决定收口后，主 Agent 更新常驻结论，再用归档脚本将工作区转入 `progress_history.md` 并清空；阶段 0 不归档
+- **历史归档**按需定位与读取，总结时汇总所需记录
 
 ## 5. Skill 标准化设计
 
 ### 5.1 遵循标准
 
-本项目遵循 [Agent Skills 规范](https://agentskills.io/home)，确保 Skill 可被支持该规范的工具（如 OpenCode 等）识别和加载。
+本项目遵循 [Agent Skills 规范](https://agentskills.io/home)，Skill 可被支持该规范的客户端识别和加载。
 
 ### 5.2 Skill 目录结构
 
-每个 Skill 采用自包含结构，所有相关资源集中在 Skill 文件夹内：
+Skill 的专用模板、流程参考和工具集中在自身目录；共享资源通过明确路径引用，技术知识按第 6 节查询：
 
 ```
 skill-name/
 ├── SKILL.md              # 技能定义文件（必需）
 ├── references/           # 参考文档（可选）
-│   ├── domain-doc-1.md   #   领域知识、参考链路等
+│   ├── domain-doc-1.md   #   必要流程、接口契约、代码样例等
 │   └── domain-doc-2.md
 ├── templates/            # 模板文件（可选）
 │   └── report-template.md
@@ -225,7 +234,7 @@ skill-name/
 | 目录/文件 | 必需 | 说明 |
 |-----------|------|------|
 | `SKILL.md` | 是 | 技能定义，包含 frontmatter 和工作流程 |
-| `references/` | 否 | 领域知识文档，供 Agent 按需读取 |
+| `references/` | 否 | 必要流程、接口契约与样例，供 Agent 按需读取 |
 | `templates/` | 否 | 报告模板、代码模板等 |
 | `scripts/` | 否 | 辅助工具脚本（调试、验证等） |
 
@@ -250,28 +259,24 @@ description: 单行描述      # 触发场景关键词，< 1024 字符
 
 ### 6.1 分层上下文
 
-知识按渐进式披露分三层组织，Agent 用到哪层才加载哪层，避免一次性占满上下文窗口：
+按任务需要加载指引与知识：
 
-| 层级 | 内容 | 加载时机 | 体量控制 |
-|------|------|---------|---------|
-| AGENTS.md | 项目概述、Skill 路由、行为约束 | 每次对话自动加载 | ~100 行 |
-| SKILL.md | 阶段流程、规则、完成标志 | 被匹配或指定时加载 | < 500 行 |
-| references/ | 配置索引、代码示例、API 文档 | Skill 流程中指定读取时 | 不限 |
+| 位置 | 内容 | 加载时机 |
+|------|------|----------|
+| AGENTS.md | 项目入口、Skill 路由、通用约束与知识库入口 | 客户端加载项目指令时 |
+| SKILL.md | 任务范围、关键判断、执行与交付要求 | 匹配或指定技能时 |
+| references/、templates/ | 必要流程、接口契约、代码样例与完整模板 | 当前步骤需要时 |
+| cannbot-knowledge | 部署样例、版本资料、优化与排障经验 | 按问题查询 |
 
-SKILL.md 控制流程，references 提供领域知识，在线文档提供接口细节。
+编排 skill 管理方案确认、派发和验收；技术 skill 按任务范围提供分析与实施指导，框架约束注明适用范围。
 
-### 6.2 在线文档引用
+### 6.2 知识查询与来源
 
-大型外部文档通过在线链接引用，不包含离线副本：
-
-| 文档来源 | 在线地址 |
-|---------|---------|
-| torch_npu 算子 API | [op-plugin/docs/context/](https://gitcode.com/Ascend/op-plugin/tree/7.3.0/docs/context/) |
-| TorchAir 图模式文档 | [torchair/docs/zh/](https://gitcode.com/Ascend/torchair/tree/master/docs/zh) |
+部署样例、接口与版本资料、细节排障经验通过 `knowledge-query` 查询 cannbot-knowledge，按目标框架、平台、版本及适用条件采用；需要官方资料时追踪对应来源。Skill 在决策点简短说明查什么，查询方法和知识根定位遵循 `knowledge-query`。已验证经验的回流入口见 [AGENTS.md](../../AGENTS.md#知识库)。
 
 ### 6.3 references 设计说明
 
-references 是对仓库内模型实现经验的结构化提炼，而非算子文档的离线副本。每个参考文档从仓库已有模型中提取标准链路和最佳实践，让 Agent 在分析新模型时能快速找到最接近的参考实现。
+references 保留支撑任务判断与执行的必要内容，包括接口契约、完整模板、仓库推荐写法和关键经验权衡；具体模型部署过程、版本索引和细节排障案例优先查询知识库。模板中的约束和重要判断可与知识库双份保留，避免检索结果不完整时丢失执行依据。
 
 ## 7. 验证设计
 
@@ -281,14 +286,14 @@ references 是对仓库内模型实现经验的结构化提炼，而非算子文
 
 - 相同模型、相同基线、相同硬件、相同 Agent 能力
 - 唯一变量：是否加载 Skill
-- 对比维度：最终性能、中间阶段质量、优化路径完整性
+- 对比维度：正确性、最终性能、任务完成度与执行成本
 
 ### 7.2 每阶段验证机制
 
-每个阶段完成后必须通过两项验证：
+每个实施阶段按已确认的验收口径验证：
 
-- **精度验证**：Prefill logits cosine similarity、Decode token match 等
-- **性能验证**：Prefill/Decode 耗时、显存占用，与上一阶段对比
+- **精度验证**：按已确认参照与达标线检查，如 Prefill logits cosine similarity、Decode token match
+- **性能验证**：按目标负载同口径实测，分别记录相对前一有效版本的增量和原始基线的累计变化；部署规模或负载变化时单列条件
 
 未通过精度验证时，触发精度调试 Skill 进行排查。
 
@@ -296,46 +301,40 @@ references 是对仓库内模型实现经验的结构化提炼，而非算子文
 
 ### 8.1 设计思路
 
-Harness 的核心目标是通过约束限制 Agent 的错误行为空间，而非替代 Agent 完成任务。写在 Skill 和 Agent 定义中的规则是"软约束"，Agent 可能不遵守；Hook 脚本提供的是"硬约束"，在工具调用前后自动执行，不依赖 Agent 自觉。
+Skill 和 Agent 定义明确任务边界、关键判断与验收依据；Hook 对可机械检查的角色修改边界和记录完整性提供辅助检查，主 Agent 负责核查真实证据与推进决策。
 
 ### 8.2 约束分类
 
 | 类型 | 机制 | 示例 |
 |------|------|------|
-| 角色权限 | Agent 定义中的 skills/tools 限制 | analyzer 禁止写代码、reviewer 禁止修改文件 |
-| 流程规则 | Skill 中的阶段前置条件和验证门禁 | 每阶段必须精度验证通过后才能进入下一阶段 |
-| Hook 约束 | 工具调用前后的脚本拦截 | 写文件前检查角色权限、commit 前检查是否已验证 |
+| 角色边界 | Agent 定义与派发任务范围 | analyzer 只读模型代码；reviewer 可准备测试文件，模型修复交 implementer |
+| 流程规则 | Skill 中的阶段前置条件和验证门禁 | 实施改动经精度、性能验收后进入下一适用阶段 |
+| Hook 检查 | 配置覆盖的工具事件触发脚本 | 角色修改边界、自验证记录完整性检查 |
 
 ### 8.3 Hook 机制
 
-Hook 脚本位于 `.agents/hooks/`，在工具调用时自动触发：
-
-- **pre_tool**：工具调用前执行，可拦截违规操作（如 analyzer 尝试写代码）
-- **post_tool**：工具调用后执行（如记录操作日志）
-
-当前 Hook：
+Hook 脚本位于 `.agents/hooks/`，接入后按匹配的角色和工具事件执行；客户端支持范围见[安装说明](../../.agents/README.md#安装)：
 
 | Hook | 触发时机 | 作用 |
 |------|---------|------|
-| 角色越界保护 | Edit/Write 前 | analyzer/reviewer 修改模型代码时阻断 |
-| 改代码前必读 progress | Edit/Write 前 | 未读 progress.md 就改代码时阻断 |
-| 自验证完整性检查 | implementer 结束时 | progress.md 缺少自验证项则打回 |
-| 外循环重试上限 | implementer/reviewer 结束时 | 同一阶段超 5 轮循环则阻断 |
-| 长时间任务提醒 | Edit/Write/Bash 前 | 超 60 分钟周期提醒，检查是否偏离 skill 流程 |
+| 角色修改边界 | 文件编辑前 | 按角色保护规则拦截对命中文件的修改 |
+| progress 路径关联 | 文件读取或修改成功后 | 记录当前 subagent 使用的 progress.md 路径，供自验证检查定位 |
+| 自验证记录检查 | implementer 结束时 | 已关联 progress.md 时，检查本轮自验证字段是否齐全 |
+| 长任务提醒 | 文件编辑或命令执行前 | 超 60 分钟后周期提醒核对方案、进展与阻塞，不阻断任务 |
 
 ## 9. 演进规划
 
 ### 9.1 演进方向
 
-- **流程完善与规模扩展**：多卡及更多模型的适配验证；多流、SuperKernel 等高阶特性加入主流程
-- **性能分析能力集成**：接入自动 Profiling 分析能力，支持更精准的切分策略评估与性能瓶颈拆解
-- **知识库自迭代**：建立反馈知识库，将执行断点及调测经验积累总结，Skill 自动迭代更新
+- **场景与框架扩展**：验证更多模型、硬件与部署框架，复用技术 skill 并明确框架约束
+- **性能调优能力完善**：基于 profiling 与性能拆解探索优化组合；SuperKernel 复用外部工作流，入口见 [AGENTS.md](../../AGENTS.md#skill-路由)
+- **知识积累**：将已验证、可复用的工程经验按知识库规范沉淀，结合实际任务反馈改进 Skill
 - **新方案设计能力拓展**：新增融合算子设计与开发能力、量化方案及实现；软硬件协同优化迭代
 
 ### 9.2 演进原则
 
 - 每个新 Skill 独立开发、独立验证，不影响已有 Skill
-- 独立进阶优化 Skill 验证成熟后，纳入 model-infer-optimize 的编排流程
+- 技术 Skill 按任务与依赖接入适合的工作流
 - 持续通过真实模型测试积累经验，迭代 Skill 编排与 references 中的参考链路
 
 ## 10. 协作与贡献
@@ -352,5 +351,8 @@ Hook 脚本位于 `.agents/hooks/`，在工具调用时自动触发：
 
 - SKILL.md frontmatter 格式正确
 - 命名规范符合 kebab-case
-- references 内容准确，在线链接有效
-- 不包含离线副本文档和二进制文件
+- 正文、references、模板与脚本一起审查，引用和接口与当前实现一致
+- 保留关键判断、真实约束、仓库规范和最小充分模板；模型或版本特例注明适用条件
+- 精简前判断该信息是否为任务所需，以及 Agent 能否从任务、代码与已有上下文可靠恢复；新增说明同样检查必要性
+- 分析返回方案与待决事项，实施承接已确认方案，验证交付证据；固定流程顺序有技术依赖支撑
+- 知识库指引就近说明查询对象；具体知识归属按第 6 节判断

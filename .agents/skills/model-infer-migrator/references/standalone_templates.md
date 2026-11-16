@@ -10,8 +10,6 @@ YAML 模板与命名规范见共用文件 `yaml_template.md`；README 模板见 
 
 替换 `{model_name}`（小写下划线）和 `{ModelName}`（驼峰）后使用。
 
-> **命名与契约对齐**：方法名 `model_generate(prompts, warm_up=False)`、yaml 单一来源、`{model_name} inference time cost of {stage} is X ms` 日志格式均与仓库 framework 部署模式对齐，便于 `scripts/collect_baseline.py` 解析与后期 promote 到 framework 模式时无缝衔接；与 framework 模式的唯一差异是不继承 `executor.model_runner.ModelRunner`，forward loop 在 runner 内自管。
-
 ---
 
 ## 1. Runner 类骨架（runner_{model_name}.py）

@@ -1,75 +1,39 @@
-# 复用策略：根据 prof 差异选档位
+# 产物复用
 
-进 `<run_dir>` 后 agent 必须做一次自动 diff，把"本次 prof vs 上一 run"分到三档之一，再按档位复用历史产物。判断完成后**复述一句结论给用户 ack**：
+优先读取已有 `HISTORY.md` 和相关产物，仅重跑受输入或规则变化影响的阶段。首次分析按完整流程执行。
 
-> 检测到 prof 相对上一 label `<X>`: 小改 / 中改 / 大改（原因：…）。打算 A / B / C 档复用，对吗？
+## 新 prof 的检查依据
 
-用户不同意时按用户给的档位走，**不要**自动再判一次。
+新 prof 先运行 Step 1，结果可写到 `raw_ops.next.json`，与上一份解析结果比较。确认复用范围后用于本次分析，保留历史报告引用的输入和规则。
 
----
+| 信号 | 检查内容 |
+|------|----------|
+| kernel 集合 | 新增或消失的 `normalized_name`，以及对应 cluster 规则 |
+| anchor count / 总 op 数 | 结合实际层数、phase 和实现变化解释数量差异 |
+| sample 锚点 | 按 op 名、shape 和 stream 内顺序定位原 sample；关键锚点消失时核对对应实现或 phase 是否变化 |
+| shape 分布 | 同名算子的 shape 是否变化、原规则是否仍对应相同语义 |
+| 模型结构 | 层数、composition、schedule 与本次运行是否一致 |
 
-## Diff 信号源
+## 新 prof 的分级与复用动作
 
-跑新 prof 的 `analyze_kernels.py` 之前不能比对（没新 raw_ops.json）。做法是 **先跑 Step 1 出新 raw_ops.json**，但落盘到临时位置 `<run_dir>/raw_ops.next.json`，然后比：
+结合差异信号与模型实现，按变化范围选择复用方式：
 
-| 信号 | 怎么算 | 用途 |
-|------|--------|------|
-| **kernel 集合 diff** | `set(new.normalized_name) Δ set(old.normalized_name)` | 出现新算子 → 至少中改 |
-| **anchor count 偏差** | 选 1-2 个 anchor kernel（HISTORY 中 stream sample 的代表算子），比 new/old 总 count | 偏差大 = 层数 / phase 变了 |
-| **总 op 数偏差** | `(\|new\| - \|old\|) / \|old\|` | > 30% 视为大改 |
-| **sample 锚点试探** | 拿上一 run 的 stream sample op 名 + shape，在新 raw_ops 的相近 stream-local 位置试探命中 | 命中位置漂移度量 |
-| **shape 分布** | 同名 anchor 的 input_shapes top-3 是否一致 | shape 漂移 = 中改 |
+| 分级 | 判断依据 | 复用动作 |
+|------|----------|----------|
+| **小改：以复用为主** | 结构、主要算子与 shape 保持一致，原 sample 的锚点和流内序列仍能命中 | 复用 `structure_spec` 和 cluster 规则，重新定位 sample，无需重新分析模型结构和分桶 |
+| **中改：局部更新** | 结构仍适用，局部算子、shape 或流编排变化，使部分 sample 或规则失效 | 复用 `structure_spec`；重新确定受影响 component 的 sample，增量调整 cluster 规则并检查匹配结果 |
+| **大改：重新分析** | 层组成、子模型等结构变化，或原 sample 与规则已大范围不适用 | 重新核对结构、schedule 和 sample；旧 cluster 规则作为参考，核对适用性后保留、修改或删除 |
 
-判断完后把 `raw_ops.next.json` rename 成 `raw_ops.json`（之前的覆盖前先看 HISTORY 有没有引用——`label_baseline` 这类初版别覆盖丢）。
+各档均使用新 raw_ops 对应的 sample 索引，重新生成 `structure_draft` 和下游统计、切片与洞察。
 
----
+## 同一份 prof 的复用范围
 
-## 三档判断 + 复用动作
+| 变化 | 复用与重跑 |
+|------|------------|
+| 仅改 label，输入与规则未变 | 复用分析结果，更新输出标识与路径 |
+| 修改结构或 sample | 复用 raw_ops；从结构检测开始更新统计、切片与洞察 |
+| 修改 cluster 规则 | 复用 raw_ops、结构检测与切片；更新分桶统计和洞察 |
+| 修改理论结果或选流依据 | 复用结构检测与切片；更新理论列或选流、报告和相关洞察 |
+| 仅修改洞察注解 | 复用解析、结构和统计结果；更新洞察及主报告回填 |
 
-### 小改 — A 档
-
-**信号**（同时满足）：
-- kernel 集合完全相同
-- 每个 anchor kernel 的总 count 偏差 = 0
-- 上一 sample 的 stream-local anchors 在新 raw_ops 中、距原位置 **±5 op** 内命中
-
-**复用动作**：
-- `structure_spec.json`：复用，**不用**问用户
-- `structure_draft.json`：先把上一轮 stream sample 平移到命中位置并重写 `sample_ack.json`，再跑 Phase 1 `detect_structure.py` 重切
-- `<network>_spec.json`：复用，**不用**对话
-- 跳过 Phase 0a / 0b 对话；新 sample 显示给用户做一次 ack 即可
-
-### 中改 — B 档
-
-**信号**（任一即可）：
-- 出现新 `normalized_name`（cluster 规则可能漏）
-- anchor count 偏差 0 < δ ≤ 10%
-- 上一 sample stream-local anchors 命中但偏移 > 5 op（层内逻辑动了，结构没变）
-- 同名 anchor 的 input_shapes 分布前后不一致
-
-**复用动作**：
-- `structure_spec.json`：复用，回显问用户 "composition 还是 X / Y 吗？"
-- `structure_draft.json`：**重走 Phase 0b**——sample 必须重出，原 sample 的偏移已经超 lookup 半径
-- `<network>_spec.json`：复用 + 增量补 rule（针对新 `normalized_name`）；render 后看 `unmatched ops` 面板非空就回 Step 3 Phase 1 补规则
-
-### 大改 — C 档
-
-**信号**（任一即可）：
-- anchor count 偏差 > 10%（层数变 / phase 增减 / sparse → dense 切换）
-- 总 op 数偏差 > 30%
-- 关键 anchor kernel 在新 prof 中**完全消失**（换了 attention 实现 / 去掉了某 phase）
-
-**复用动作**：
-- `structure_spec.json`：**重走 Phase 0a**——必须重新问用户模型结构
-- `structure_draft.json`：重走 Phase 0b
-- `<network>_spec.json`：保留作为人类可读参考，但**不要**直接 `-s` 喂进去；逐条 rule 审一遍，必要时改名 / 删除 / 新增
-
----
-
-## 首次跑（无历史）
-
-`<run_dir>` 里没有 `raw_ops.json` / `HISTORY.md` → 跳过 diff，按全量流程走 Step 1→4，最后 append 第一条 HISTORY。
-
-## label 切换 ≠ prof 切换
-
-用户给了新 `<label>` 但 prof 路径与上一 run 相同（如改了 sample 想再跑一次）→ diff 全 0，按 "无变化" 处理，所有历史产物直接复用，HISTORY 里只在"复用 / 新建"段标 "全部复用，仅改 label / sample"。
+复用范围与变更原因写入 `HISTORY.md`。各 run 的报告保存在独立的 `runs/<label>/` 下。

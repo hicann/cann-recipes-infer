@@ -11,319 +11,72 @@ description: 基于 PyTorch 框架的昇腾 NPU 模型推理图模式适配技�
 
 ## 重要原则
 
-- **前置条件**：模型必须在 NPU 上运行且已导入 `torch_npu`
-- **图模式仅适用于 Decode 阶段**：Prefill 阶段输入长度动态变化，不适合图模式，保持 eager 执行
-- **保持模型完整性**：不为适配图模式而简化模型逻辑
-- **NPU 不支持的后端**：`aot_eager`、`inductor`、`cudagraphs` 等不可用
-- **固定 tensor 图外预创建**：atten_mask、KV cache 等推理全程不变的 tensor 在图外预创建，用 `torch._dynamo.mark_static()` 标记
-- **LLM Decode 重编译注意**：`kv_len`/`actual_seq_lengths_kv` 每步变化，npugraph_ex 可能触发重编译，遇到 `hit recompile_limit` 参考重编译解决方案排查
-- **npugraph_ex decode 用 host list 长度字段**：从 `ForwardMetaData` 取 `actual_seq_lengths_list_kv/q` / `actual_seq_lengths_cu_list_kv/q`（`List[int]` 形态）传给静态图路径，普通 eager / GE 路径仍用对应的 Tensor 字段
-- **图模式验证项**：确认 warmup 阶段首次编译功能正常；正式推理 decode 阶段直接复用 warmup 编译的图，不出现重编译（检查日志中是否有 `recompile` 标识）
-- **编译缓存使用时机**：先用常规图模式确认图可稳定捕获且无非预期重编译，再按官方指南使用 `cache_compile` 降低冷启动 / 重复编译耗时
-- **精度问题调试**：遇到精度问题可调用 `model-infer-precision-debug` skill 进行排查
+- **区分捕获、编译与回放**：前端成功捕获计算图，不能据此推断设备下发减少。评估回放收益时，单独核算算子融合或 SuperKernel 的影响。
+- **保持模型完整性**：不为适配图模式而简化模型逻辑。
+- **固定存储与逻辑状态分开**：回放依赖的缓冲区须保持存储稳定，有效 KV 长度、写位置和缓存内容仍按步更新。形状标记不能证明地址稳定。
 
 ---
 
 ## 工作流程
 
-### 第一步：方案设计
+### 方案分析
 
-1. **分析模型结构**：识别模型中可能阻碍图模式的代码模式
-2. **识别问题点**：找出 Graph Break、重编译、动态 shape 等问题
-3. **设计改造方案**：
-   - 需要修改哪些文件
-   - 修改的具体内容
-   - 对现有功能的影响评估
-4. **输出设计方案文档**：以 Markdown 格式呈现
+1. 确定目标阶段和候选后端，按部署版本核对算子、通信和状态更新能否入图。
+2. 根据实际执行路径识别图中断、重编译或回放的阻断点，向调用方返回最小改造方案和待决事项。
 
-### 第二步：方案确认
+### 实施
 
-等待用户确认方案后再进行开发。有修改意见则返回第一步。
+以可运行的 eager 路径为基线，按已确认方案实施改造。需要变更方案时，将待决事项返回调用方。
 
-### 第三步：实施开发
+### 验证测试
 
-按照确认的设计方案逐步实施代码修改。
+静态分析用于判断可行性。实际适配在目标 NPU 上与同一执行路径的 eager 基线对比，使用相同输入和量化配置。
 
-### 第四步：验证测试
-
-由 Agent 实际执行以下测试，记录真实结果：
-
-- **编译验证**：运行 `torch.compile`，检查是否成功，记录编译日志
-- **功能验证**：运行模型，对比图模式前后输出
-- **性能验证**：记录 Prefill/Decode 阶段耗时
-- **编译缓存验证（可选）**：图结构稳定后可验证 `cache_compile` 是否降低二次启动编译耗时
-- **测试报告**：整理测试环境、测试用例、对比数据
+- **编译与复用**：确认已预热的输入规格在稳态执行时复用已有图。infer 仓阶段 5 还须确认已选 Decode 路径完整入图、无图中断。
+- **功能与性能**：对比目标阶段的输出和稳态耗时，区分首次编译开销与推理耗时。
 
 ---
 
 ## 图模式选择
 
-在开始适配前先确定使用哪种模式。如果用户未指定，默认采用 npugraph_ex。
+用户已指定后端时沿用其选择。infer 仓新接入图模式时优先评估 `npugraph_ex`。
 
-| 场景 | 推荐模式 | 详细文档 |
+| 场景 | 评估入口 | 详细文档 |
 |------|---------|---------|
-| **LLM 大语言模型** | npugraph_ex（优先阅读 LLM 指南） | `references/llm-model-guide.md` |
-| **通用模型** | npugraph_ex | `references/npugraph_ex-guide.md` |
-| **需要 GE 图模式** | GE（Ascend IR） | `references/ge-graph-guide.md` |
+| **LLM 稳定形状 Decode** | 核对 KV 存储稳定性及有效长度、写位置的更新 | `references/llm-model-guide.md` |
+| **固定形状通用推理** | 核对 npugraph_ex 的算子与捕获支持 | `references/npugraph_ex-guide.md` |
+| **已有 GE 部署或需 Ascend IR 图编译** | 核对 GE 后端能力与配置 | `references/ge-graph-guide.md` |
 
-两种模式的启用方式、实现原理、成熟度与版本要求对比，见 `references/ge-graph-guide.md` 的「与 npugraph_ex 对比」；各自的最小可运行示例与使用约束见对应文档的「快速上手」「使用约束」。
+选择 GE 或 npugraph_ex 时，可按部署版本查阅 cannbot-knowledge 或 TorchAir 官方文档，核对捕获限制、集合通信支持和编译选项。
 
 ---
 
 ## 编译缓存使用建议
 
-`cache_compile` 适合在图模式已跑通、输入 shape / guard / 通信域稳定后启用，用于降低冷启动或多次拉起时的编译耗时；它不用于修复 Graph Break 或非预期重编译。启用时需按官方指南改造封装函数：npugraph_ex 使用 `torch.npu.npugraph_ex.inference.cache_compile`，GE / Ascend IR 使用 `torchair.inference.cache_compile`；使用后原 `torch.compile` 编译流程不再需要。被缓存的函数应是 module method、未被其他装饰器修饰、能形成 full graph，且同一缓存函数只能触发一次 Dynamo trace；Prefill / Decode 或 guard 不同的场景应拆分封装。若模型代码、输入规格、分布式 rank/world_size、CANN/torch_npu 版本发生变化，需重新生成或清理缓存。npugraph_ex 参考 `references/npugraph_ex-guide.md`，GE / Ascend IR 参考 `references/ge-graph-guide.md`。
+图可稳定复用后，再用 `cache_compile` 对比二次启动的编译耗时。输入规格、模型代码、通信域或软件版本变化时，重新核对缓存是否适用。infer 仓框架已在 [compile_model_forward](../../../executor/utils/graph_utils.py) 中按后端选择常规编译或持久缓存。
 
 ---
 
 ## LLM 模型适配要点
 
-对于 LLM 推理模型必须严格区分 prefill 和 decode 阶段。Prefill 输入长度动态变化，保持 eager；Decode 输入长度固定、shape 稳定，对它应用图模式。改造方式是把两阶段的 forward 逻辑分离成独立方法，只对 decode 方法调 `torch.compile`。
+infer 仓优化流程阶段 5 仅适配 Decode，Prefill 沿用 eager。其他部署中，固定或分档的 Prefill 可按目标后端能力评估。
 
-改造的核心是把动态变化的东西提取为模型输入，模型内部保持静态。动态因素的完整清单、逐模块改造写法与 prefill / decode 分离的代码示例，见 `references/llm-model-guide.md` 的「核心原则」「模块改造指南」「区分 Prefill/Decode 实践指南」。
+KV、RoPE 和长度输入的适配判断，以及 infer 仓框架的阶段入口，见 [LLM 模型改造指南](references/llm-model-guide.md)。
 
 ---
 
 ## 问题定界流程
 
-> 问题定界优先基于本 skill 内置的知识进行独立分析。
+问题尚未定界时，用相同输入复现 eager 基线，按需比较前端捕获（`backend="eager"`）、功能化（`aot_eager`）和目标后端执行，从首次出现差异的层定位。npugraph_ex 可用 `force_eager` 隔离回放路径；GE 的 `run_eagerly` 用于检查 TorchAir 转换后的 FX 图，两者的结果按各自作用解释。
 
-```
-问题发生
-    │
-    ├─→ aot_eager 验证 ──失败──→ 修复用户脚本
-    │       ↓ 正常
-    │
-    ├─→ force_eager/run-eagerly ──失败──→ 修复用户脚本
-    │       ↓ 正常
-    │
-    └─→ 图模式问题
-            ├── 重编译问题 → 阅读 LLM 指南 + npugraph_ex 指南
-            ├── Graph Break 问题 → 阅读 TorchAir 在线文档中的典型案例
-            └── 其他问题 → 阅读对应模式文档（npugraph_ex-guide.md 或 ge-graph-guide.md）
-```
-
-**调试知识来源（按优先级）**：
-1. 本 SKILL.md 中的方法、原则和检查清单
-2. `references/npugraph_ex-guide.md` - npugraph_ex 详细指南
-3. `references/llm-model-guide.md` - LLM 模型改造指南
-4. `references/ge-graph-guide.md` - GE 图模式指南
-5. [TorchAir 官方文档](https://gitcode.com/Ascend/torchair/tree/master/docs/zh)
-
-**注意**：避免盲目复制其他模型的图模式配置，应基于当前模型结构独立分析。
+若 Decode 遇到 `hit recompile_limit`，每步变化的 KV 长度是可能原因之一。若日志显示 guard 失败，先按 [LLM 指南](references/llm-model-guide.md#重编译问题定位与解决) 核对失败条件。需要具体案例时，按后端、版本和实际报错查询 cannbot-knowledge 中的图中断、重编译或回放故障。仅图模式下出现的精度偏差，见 [图模式精度定位](../model-infer-precision-debug/references/graph_mode_debug.md)。
 
 ---
 
-## 图模式 + FA 融合算子快速 Debug
+## 图模式下的 FA 长度参数
 
-> 图模式与 FA 融合算子结合时，`actual_seq_lengths` 参数的处理是最常见的出错点。
-> 本节提供快速诊断和解决方案。
+按实际调用的 FA 接口、版本和 layout 核对 Q/KV 长度：逐序列有效长度与累计长度含义不同，host list 与 Tensor 是它们的传递形式。检查本轮长度在何处生成、每步 Decode 如何刷新，以及消费算子实际拿到的值。
 
-### 问题现象
+infer 仓使用 `ForwardMetaData` 提供长度字段。例如 npugraph_ex Decode 的 Qwen 路径通过 `torch.ops.npu` 给 FA v2 传累计 Q 长度和逐序列 KV 长度的 host list；GE Decode 则调用 `torchair.ops`，传入对应的 Tensor。编译的 `dynamic` 配置应结合目标后端的 shape/guard 与回放约束确定。参见 [Qwen Attention 实现](../../../models/qwen/models/modeling_qwen.py)。
 
-图模式 + FA 场景下的典型问题：
-- 编译报错：`actual_seq_lengths` 类型不匹配
-- 运行时报错：重编译（recompile）触发
-- 性能问题：动态 shape 导致无法充分优化
-
-### 关键参数：actual_seq_lengths
-
-FA 算子的 `actual_seq_lengths` / `actual_seq_qlen` / `actual_seq_kvlen` 参数在不同图模式下有不同的要求：
-
-| 图模式 | FA 接口来源 | actual_seq_lengths 类型 | dynamic 设置 | 执行模式约束 | 说明 |
-|--------|------------|------------------------|-------------|-------------|------|
-| **GE 模式（推荐）** | torchair FA 接口 | **Tensor** | `dynamic=False` | **仅支持 GE 图模式** | 最佳方案，静态图 |
-| **GE 模式（不推荐）** | torch_npu FA 接口 | list[int] | `dynamic=True` + `mark_static` | 无限制 | 需额外配置，易出错 |
-| **npugraph_ex 模式** | torch_npu FA 接口 | list[int] | `dynamic=True` | 无限制 | 动态捕获模式 |
-| **npugraph_ex 模式** | torch_npu FA 接口 | Tensor（如有） | `dynamic=False` | 无限制 | 需确认接口是否支持 |
-
-### GE 模式配置指南
-
-#### 方案一：torchair FA 接口（推荐）
-
-```python
-import torch
-import torch_npu
-import torchair
-from torchair.ge_concrete_graph.ge_graph import mark_static
-
-# 使用 torchair 提供的 FA 接口
-# actual_seq_lengths 为 Tensor 类型
-attn_output = torchair.ops.npu_fused_infer_attention_score(
-    query, key, value,
-    actual_seq_qlen=actual_seq_qlen_tensor,   # Tensor 类型
-    actual_seq_kvlen=actual_seq_kvlen_tensor, # Tensor 类型
-    # ... 其他参数
-)
-
-# 编译配置
-opt_model = torch.compile(model, backend=npu_backend, dynamic=False)
-```
-
-**优点**：
-- `dynamic=False` 可获得更好的静态图优化
-- 无需额外的 `mark_static` 配置
-- 图编译更稳定
-
-**约束**：
-- TorchAir FA 接口**仅支持 GE 图模式**，不支持 Eager 模式和 npugraph_ex 模式调用
-- 必须在 GE 图模式（`torchair.get_npu_backend()`）下使用，不可在 Eager 或 npugraph_ex 模式下调用
-
-#### 方案二：torch_npu FA 接口（不推荐）
-
-```python
-import torch
-import torch_npu
-import torchair
-from torchair.ge_concrete_graph.ge_graph import mark_static
-
-# 使用 torch_npu 的 FA 接口
-# actual_seq_lengths 为 list[int] 类型
-attn_output = torch.ops.npu.npu_fused_infer_attention_score(
-    query, key, value,
-    actual_seq_lengths=[seq_len],  # list[int] 类型
-    actual_seq_lengths_kv=[kv_len],
-    # ... 其他参数
-)
-
-# 必须配置 dynamic=True
-# 并使用 mark_static 标记除 actual_seq_lengths 外的静态输入
-mark_static(input_ids)          # 静态输入
-mark_static(position_ids)       # 静态输入
-mark_static(attention_mask)     # 静态输入
-# actual_seq_lengths 保持动态
-
-# 编译配置
-opt_model = torch.compile(model, backend=npu_backend, dynamic=True)
-```
-
-**缺点**：
-- 需要配置 `dynamic=True`，性能略逊于静态图
-- 需要手动调用 `mark_static` 标记所有静态输入
-- 配置繁琐，易遗漏导致问题
-
-### npugraph_ex 模式配置指南
-
-#### 方案一：list[int] 类型 + dynamic=True
-
-```python
-import torch
-import torch_npu
-
-# 使用 torch_npu 的 FA 接口
-# actual_seq_lengths 为 list[int] 类型
-attn_output = torch.ops.npu.npu_fused_infer_attention_score(
-    query, key, value,
-    actual_seq_lengths=[seq_len],  # list[int] 类型
-    actual_seq_lengths_kv=[kv_len],
-    # ... 其他参数
-)
-
-# 必须配置 dynamic=True
-opt_model = torch.compile(model, backend="npugraph_ex", dynamic=True)
-```
-
-#### 方案二：Tensor 类型 + dynamic=False（如有接口支持）
-
-```python
-import torch
-import torch_npu
-
-# 查询是否有 Tensor 类型的 actual_seq_lengths 接口
-# 通过 subagent 调用 model-infer-fusion 查询
-
-# 如果有支持的接口：
-attn_output = torch.ops.npu.npu_fused_infer_attention_score(
-    query, key, value,
-    actual_seq_lengths=actual_seq_lengths_tensor,  # Tensor 类型
-    actual_seq_lengths_kv=actual_seq_kvlen_tensor,
-    # ... 其他参数
-)
-
-# 可配置 dynamic=False
-opt_model = torch.compile(model, backend="npugraph_ex", dynamic=False)
-```
-
-### FA 接口查询
-
-如需查询具体的 FA 接口参数和版本支持，使用 subagent 调用 `model-infer-fusion` 技能：
-
-```
-启动 subagent（类型：general-purpose），提示词包含：
-1. 明确指示调用 model-infer-fusion 技能
-2. 询问具体问题，例如：
-   - "查询 npu_fused_infer_attention_score 的 actual_seq_lengths 参数是否支持 Tensor 类型"
-   - "查询 npu_fused_infer_attention_score_v2 在图模式下的推荐配置"
-   - "查询 torchair 提供的 FA 接口及其参数要求"
-3. 提供当前使用的图模式（GE / npugraph_ex）
-```
-
-### 常见错误与修复
-
-| 错误现象 | 根因 | 修复方案 |
-|---------|------|---------|
-| 编译报错：actual_seq_lengths 类型错误 | GE 模式下 torch_npu FA 接口传 Tensor | 改用 torchair FA 接口，或改用 list[int] + dynamic=True |
-| 运行时频繁重编译 | dynamic=False 但 actual_seq_lengths 为 list[int] | 改用 Tensor 类型 + torchair 接口，或设置 dynamic=True |
-| 性能不达预期 | dynamic=True 导致无法充分优化 | 尽量使用 torchair FA 接口 + dynamic=False |
-| npugraph_ex 模式报错 | actual_seq_lengths 为 Tensor 但接口不支持 | 确认接口支持情况，或改用 list[int] + dynamic=True |
-| Eager 或 npugraph_ex 模式调用 TorchAir FA 报错 | TorchAir FA 接口仅支持 GE 图模式 | 改用 torch_npu FA 接口，或切换到 GE 图模式 |
-
-### Debug 检查清单
-
-在图模式 + FA 场景下，按以下清单逐一排查：
-
-- [ ] 1. 确认使用的图模式：GE 还是 npugraph_ex
-- [ ] 2. 确认 FA 接口来源：torch_npu 还是 torchair
-- [ ] 3. 若使用 torchair FA 接口，确认当前为 GE 图模式（不支持 Eager 和 npugraph_ex）
-- [ ] 4. 检查 actual_seq_lengths 类型：GE+torchair→Tensor；GE+torch_npu→list[int]+dynamic=True；npugraph_ex→list[int]+dynamic=True
-- [ ] 5. 检查 dynamic 配置是否与 actual_seq_lengths 类型匹配
-- [ ] 6. 若使用 GE + torch_npu FA + list[int]，检查是否已 mark_static 标记所有静态输入
-- [ ] 7. 如有疑问，调用 `model-infer-fusion` skill 查询接口详情
-
----
-
-## TorchAir 官方文档索引
-
-> 在线文档：[gitcode.com/Ascend/torchair/docs/zh](https://gitcode.com/Ascend/torchair/tree/master/docs/zh)
-
-### 入门必读
-
-| 主题 | 在线链接 |
-|-----|---------|
-| 简介 | [overview.md](https://gitcode.com/Ascend/torchair/tree/master/docs/zh/overview.md) |
-| 支持的 ATen API 清单 | [aten_api.md](https://gitcode.com/Ascend/torchair/tree/master/docs/zh/appendix/aten_api.md) |
-
-### GE 图模式
-
-| 主题 | 在线链接 |
-|-----|---------|
-| GE 图模式总览 | [ascend_ir.md](https://gitcode.com/Ascend/torchair/tree/master/docs/zh/ascend_ir/ascend_ir.md) |
-| GE 图模式快速上手 | [quick_start.md](https://gitcode.com/Ascend/torchair/tree/master/docs/zh/ascend_ir/quick_start.md) |
-| GE 图模式功能（基础） | [basic/](https://gitcode.com/Ascend/torchair/tree/master/docs/zh/ascend_ir/features/basic) |
-| GE 图模式功能（进阶） | [advanced/](https://gitcode.com/Ascend/torchair/tree/master/docs/zh/ascend_ir/features/advanced) |
-| GE 图模式 API 参考 | [api/](https://gitcode.com/Ascend/torchair/tree/master/docs/zh/ascend_ir/api) |
-
-### 自定义算子入图
-
-| 主题 | 在线链接 |
-|-----|---------|
-| 概述 | [overview.md](https://gitcode.com/Ascend/torchair/tree/master/docs/zh/custom_op_graph/overview.md) |
-| In-place 算子开发和入图样例 | [in_place_op_cases.md](https://gitcode.com/Ascend/torchair/tree/master/docs/zh/custom_op_graph/in_place_op_cases.md) |
-| 非 In-place 算子开发和入图样例 | [non_in_place_op_cases.md](https://gitcode.com/Ascend/torchair/tree/master/docs/zh/custom_op_graph/non_in_place_op_cases.md) |
-| 算子插件化适配 | [op_plugin_adapt_torchair.md](https://gitcode.com/Ascend/torchair/tree/master/docs/zh/custom_op_graph/op_plugin_adapt_torchair.md) |
-
-### 常见案例和定位方法
-
-| 主题 | 在线链接 |
-|-----|---------|
-| 大模型图模式推理案例 | [infer_cases.md](https://gitcode.com/Ascend/torchair/tree/master/docs/zh/appendix/cases/infer_cases.md) |
-| 动/静态图概念及典型问题定位 | [dynamic_static_graph/](https://gitcode.com/Ascend/torchair/tree/master/docs/zh/appendix/cases/dynamic_static_graph) |
-| 入图失败定界与定位 | [graph_failed_cases.md](https://gitcode.com/Ascend/torchair/tree/master/docs/zh/appendix/cases/graph_failed_cases.md) |
-
-### 性能分析与精度比对
-
-| 主题 | 在线链接 |
-|-----|---------|
-| 图模式性能分析 | [perfermance_cases.md](https://gitcode.com/Ascend/torchair/tree/master/docs/zh/appendix/cases/perfermance_cases.md) |
-| 图模式精度比对 | [accuracy_cases.md](https://gitcode.com/Ascend/torchair/tree/master/docs/zh/appendix/cases/accuracy_cases.md) |
-| FAQ | [faq.md](https://gitcode.com/Ascend/torchair/tree/master/docs/zh/appendix/faq.md) |
+查询目标版本的 `torch_npu` 接口签名可用 [model-infer-fusion](../model-infer-fusion/SKILL.md)；需要对照实现时，查询 cannbot-knowledge 中同框架、同后端与 FA 接口版本的长度传递和 KV cache 样例。

@@ -4,33 +4,20 @@
 
 ---
 
-## §1 CacheEntry / ModelCacheInfo 字段详解
+## §1 缓存声明约束
 
-定义位置：`executor/core/kv_cache/cache_info.py`。
+字段定义见 `executor/core/kv_cache/cache_info.py`。以下约束配合 §2、§3 的完整模板使用。
 
 ### 1.1 CacheEntry
 
-| 参数 | 说明 |
-|-----|------|
-| `cache_name` | cache 名称，如 `"k_cache"` / `"v_cache"` / `"nope_cache"` / `"rope_cache"` |
-| `attn_type` | attention 类型（决定走哪个 `SingleTypeKVCacheManager`），从「步骤 1」确定 |
-| `dim` | 单个 attention head 的特征维度（注意 MLA 的压缩维度 = `kv_lora_rank`，与标准 head_dim 不同） |
-| `num_head` | cache 包含的 head 数量。**TP 切分后必须用 `num_key_value_heads_per_rank = max(num_kv_heads // attn_tp_size, 1)`**；MLA 类 cache 通常 `num_head=1` |
-| `dtype` | cache tensor 数据类型（`torch.bfloat16` / `torch.int8` 等） |
-| `needs_block` | 是否参与 block 分配，通常 `True` |
-| `tensor_setter` | 回调函数，用于将分配的 cache tensor 注册到 attention 类。固定写法 `lambda tensor, layer=self: setattr(layer, "<cache_name>", tensor)` |
-| `sliding_window` | 仅 `attn_type="SlidingWindow"` 需要，设置窗口大小（来自 config） |
+- `num_head` 和 `dim` 对应每卡实际存储。GQA 按 KV 头的切分或复制填写；MLA absorb 的 nope / rope 各用一个 latent head，维度分别取压缩维度和 RoPE 维度。
+- `attn_type` 选择 manager 类型；`manager_key` 决定分组及读写索引的键，默认取 `attn_type`。滑窗条目还需声明窗口大小。
+- `needs_block=True` 的条目必须声明正数 `block_size`。同一分页分组内的条目使用相同块长。
+- `tensor_setter` 将框架分配的 storage 绑定到对应 attention 实例，forward 读写同一份缓存。
 
 ### 1.2 ModelCacheInfo
 
-| 参数 | 说明 |
-|-----|------|
-| `num_layers` | 模型层数（含 MTP 层时按实际遍历总数填） |
-| `block_size` | 每个 block 的 token 容量，从 `infer_config.scheduler_config.block_size` 取 |
-| `layer_infos` | `LayerCacheInfo` 列表 |
-| `is_mla_backend` | **MLA 模型必须设 True**（默认 False）。MLA 的 latent KV 在 TP 各 rank 间复制，PD 传输等场景需要据此挑单 rank 传输；非 MLA 模型保持默认 |
-
-> attn_type 决定 cache 条目映射到哪一类 `SingleTypeKVCacheManager`。分组维度是 `attn_type`，因此本框架支持单层同时包含多个 cache 条目，也支持单层同时包含**多种 cache 类型**。
+`layer_infos` 覆盖实际接入的 attention 子层，`num_layers` 与之对应。MLA latent KV 在 TP rank 间复制时，`is_mla_backend=True` 供 PD 传输识别该布局。
 
 ---
 
@@ -44,6 +31,7 @@
 class XxxAttention(nn.Module):
     def __init__(self, config, infer_config, comm_manager, layer_idx, prefix=""):
         # ...（QKV 投影、RoPE 等）
+        self.block_size = infer_config.scheduler_config.block_size
         self.attn_type = "FullAttention"
         self.k_cache = torch.Tensor([])      # 占位 tensor，由框架在初始化时通过 tensor_setter 注入实际 storage
         self.v_cache = torch.Tensor([])
@@ -56,6 +44,7 @@ class XxxAttention(nn.Module):
                 num_head=self.num_key_value_heads_per_rank,
                 dtype=cache_dtype,
                 needs_block=True,
+                block_size=self.block_size,
                 tensor_setter=lambda tensor, layer=self: setattr(layer, "k_cache", tensor),
             ),
             CacheEntry(
@@ -65,6 +54,7 @@ class XxxAttention(nn.Module):
                 num_head=self.num_key_value_heads_per_rank,
                 dtype=cache_dtype,
                 needs_block=True,
+                block_size=self.block_size,
                 tensor_setter=lambda tensor, layer=self: setattr(layer, "v_cache", tensor),
             ),
         ]
@@ -75,6 +65,7 @@ class XxxAttention(nn.Module):
 参考来源：`models/gpt_oss/models/modeling_gpt_oss.py`。仓库中 gpt-oss 部分层是 SlidingWindow（`config.sliding_window` 存在），其他层是 FullAttention（`sliding_window=None`）。两类层在 `__init__` 内通过条件设置 `attn_type` 和 `sliding_window` 字段。
 
 ```python
+self.block_size = infer_config.scheduler_config.block_size
 self.attn_type = "SlidingWindow" if self.sliding_window else "FullAttention"
 self.cache_entries = [
     CacheEntry(
@@ -84,6 +75,7 @@ self.cache_entries = [
         num_head=self.num_key_value_heads_per_rank,
         dtype=cache_dtype,
         needs_block=True,
+        block_size=self.block_size,
         tensor_setter=lambda tensor, layer=self: setattr(layer, "k_cache", tensor),
         sliding_window=self.sliding_window if self.sliding_window else None,
     ),
@@ -94,6 +86,7 @@ self.cache_entries = [
         num_head=self.num_key_value_heads_per_rank,
         dtype=cache_dtype,
         needs_block=True,
+        block_size=self.block_size,
         tensor_setter=lambda tensor, layer=self: setattr(layer, "v_cache", tensor),
         sliding_window=self.sliding_window if self.sliding_window else None,
     ),
@@ -121,27 +114,29 @@ self.cache_entries = [
         num_head=1,                          # MLA 压缩到 1 个 head
         dtype=dtype_nope,
         needs_block=True,
+        block_size=self.block_size,
         tensor_setter=lambda tensor, layer=self: setattr(layer, "nope_cache", tensor),
     ),
     CacheEntry(
         cache_name="rope_cache",
         attn_type=self.attn_type,
-        dim=self.config.qk_rope_head_dim,    # RoPE 维度（必须 64）
+        dim=self.config.qk_rope_head_dim,    # RoPE 维度，取目标模型配置
         num_head=1,
         dtype=dtype_rope,
         needs_block=True,
+        block_size=self.block_size,
         tensor_setter=lambda tensor, layer=self: setattr(layer, "rope_cache", tensor),
     ),
 ]
 ```
 
-> 同层多 cache 条目（nope + rope）`attn_type` 相同，会被归入同一个 manager 统一管理；分配 block 时按总 token 字节合并算。
+> 本例的 nope 和 rope 条目共用默认分组键，由同一个 manager 管理；分配 block 时按总 token 字节合并算。
 
 ---
 
 ## §3 get_cache_info 完整实现
 
-模型类（如 `XxxForCausalLM`）实现 `get_cache_info()` 方法返回 `ModelCacheInfo`，被 `ModelWorker._get_cache_info()` 调用。
+模型类（如 `XxxForCausalLM`）实现 `get_cache_info()` 方法返回 `ModelCacheInfo`，被 `ModelWorker.get_cache_info()` 调用。
 
 ### 3.1 标准模型
 
@@ -159,14 +154,13 @@ def get_cache_info(self) -> ModelCacheInfo:
         )
     return ModelCacheInfo(
         num_layers=len(layer_infos),
-        block_size=self.block_size,
         layer_infos=layer_infos,
     )
 ```
 
 ### 3.2 含 MTP 的 MLA 模型（DeepSeek-R1）
 
-参考来源：`models/deepseek_r1/models/modeling_deepseek.py`。MTP 模型 `self.model.layers` 是 `dict`（按 layer_idx 索引），需用 `.values()` 遍历；MLA 模型必须设 `is_mla_backend=True`。
+参考来源：`models/deepseek_r1/models/modeling_deepseek.py`。该实现的 MTP 路径使用字典容器（按 layer_idx 索引），需用 `.values()` 遍历；latent KV 在 TP rank 间复制，设 `is_mla_backend=True`。
 
 ```python
 def get_cache_info(self) -> ModelCacheInfo:
@@ -181,15 +175,14 @@ def get_cache_info(self) -> ModelCacheInfo:
         )
     return ModelCacheInfo(
         num_layers=len(layer_infos),
-        block_size=self.block_size,
         layer_infos=layer_infos,
-        is_mla_backend=True,    # MLA 模型必须显式设 True
+        is_mla_backend=True,    # Latent KV is replicated across TP ranks.
     )
 ```
 
 ### 3.3 含 dual / multi sublayer 的模型
 
-每个 logical layer 含 N 个 attention sublayer（如 LongCat 系列）。遍历展开到 sublayer 粒度，`layer_infos` 数量与物理 sublayer 总数一致。
+每个 logical layer 含 N 个 attention sublayer（如 LongCat 系列）。遍历展开到 sublayer 粒度，`layer_infos` 数量与物理 sublayer 总数一致。下例采用 TP rank 间复制的 MLA latent KV。
 
 ```python
 def get_cache_info(self) -> ModelCacheInfo:
@@ -206,19 +199,9 @@ def get_cache_info(self) -> ModelCacheInfo:
             global_idx += 1
     return ModelCacheInfo(
         num_layers=len(layer_infos),
-        block_size=self.block_size,
         layer_infos=layer_infos,
-        is_mla_backend=True,    # 若为 MLA 架构
+        is_mla_backend=True,    # For latent KV replicated across TP ranks.
     )
-```
-
-### 3.4 必备前置：模型类持有 block_size
-
-```python
-class XxxForCausalLM(nn.Module):
-    def __init__(self, config, infer_config, comm_manager, prefix=""):
-        # ...
-        self.block_size = infer_config.scheduler_config.block_size
 ```
 
 ---
@@ -227,7 +210,7 @@ class XxxForCausalLM(nn.Module):
 
 ### 4.1 forward 顶层签名（透传）
 
-模型顶层 forward 接收 `forward_metadata`，框架在 `ExecutionEngine._build_model_inputs` 内通过 `prepare_block_tables()` / `prepare_slot_mapping()` 构造好 dict 形式的 `block_table[attn_type]` / `slot_mapping[attn_type]`，模型类透传给各层。
+以下模板采用默认分组键、单 token Decode 和未分片的 LMHead。模型顶层 forward 接收 `forward_metadata`，框架在 `ExecutionEngine._build_model_inputs` 内通过 `prepare_block_tables()` / `prepare_slot_mapping()` 构造好 dict 形式的 `block_table[attn_type]` / `slot_mapping[attn_type]`，模型类透传给各层。
 
 > **packed sequence 协议（必须遵守）**：
 > - `input_ids: [TotalTokens]` 是 packed 一维（变长 batch 串接，无 padding）
@@ -246,7 +229,10 @@ def forward(self, input_ids, position_ids, forward_metadata, **kwargs):
             hidden_states, position_ids, forward_metadata,
             slot_mapping=slot_mapping, block_table=block_table,
         )
-    return self.lm_head(hidden_states)
+    if is_prefill:
+        last = forward_metadata.actual_seq_lengths_cu_q.long() - 1
+        hidden_states = hidden_states.index_select(0, last)
+    return self.lm_head(hidden_states).unsqueeze(1)
 ```
 
 ### 4.2 attention 层按 attn_type 取出对应 tensor
@@ -255,15 +241,13 @@ def forward(self, input_ids, position_ids, forward_metadata, **kwargs):
 
 **关键事实**：
 - 写入算子用 `torch_npu.npu_scatter_nd_update_`（不是 `scatter_update_`）；操作 cache 时需先 reshape 为 `[total_slots, num_kv_heads, head_dim]`
-- ForwardMetaData 字段：FA 的 `actual_seq_qlen` 取 `forward_metadata.actual_seq_lengths_cu_q`（cumulative 形态），`actual_seq_kvlen` 取 `forward_metadata.actual_seq_lengths_kv`（直接形态）
+- 本例 Decode 读取分页 KV：FA 的 `actual_seq_qlen` 取 `forward_metadata.actual_seq_lengths_cu_q`（cumulative 形态），`actual_seq_kvlen` 取 `forward_metadata.actual_seq_lengths_kv`（直接形态）
 - Prefill 与 Decode 的 FA 调用不同：Prefill 不传 `block_table`，直接对 `key_states` / `value_states` 算注意力（再写 cache）；Decode 必须先写 cache，再以 `block_table=block_table[self.attn_type]` 读取
 
 ```python
 class XxxAttention(nn.Module):
-    def forward(self, hidden_states, position_ids, forward_metadata,
-                slot_mapping=None, block_table=None, **kwargs):
-        # ... QKV / RoPE ...
-
+    def _paged_attention(self, query_states, key_states, value_states,
+                         forward_metadata, slot_mapping, block_table):
         actual_seq_kvlen = forward_metadata.actual_seq_lengths_kv
         actual_seq_qlen = forward_metadata.actual_seq_lengths_cu_q
         attention_mask = forward_metadata.attention_mask
@@ -282,6 +266,7 @@ class XxxAttention(nn.Module):
                 actual_seq_qlen=actual_seq_qlen,
                 actual_seq_kvlen=actual_seq_qlen,    # Prefill: KV 与 Q 同
                 atten_mask=attention_mask,
+                learnable_sink=self.sinks,
             )
             self.update_cache(slot_mapping, key_states, value_states)
         else:
@@ -301,9 +286,12 @@ class XxxAttention(nn.Module):
                 actual_seq_qlen=actual_seq_qlen,
                 actual_seq_kvlen=actual_seq_kvlen,
                 atten_mask=attention_mask,
+                learnable_sink=self.sinks,
                 block_table=block_table[self.attn_type],
                 block_size=self.block_size,
             )
+
+        return attn_output
 
     def update_cache(self, slot_mapping, key_states, value_states):
         # 写入算子：npu_scatter_nd_update_，cache / states 都 view 为 [total, num_kv_heads, head_dim]
@@ -352,8 +340,8 @@ _, _, k_rope, k_nope = torch_npu.npu_kv_rmsnorm_rope_cache(
 
 | 函数 | 说明 |
 |------|------|
-| `get_num_blocks_to_allocate(request_id, num_tokens)` | 计算本次需要新增多少 block |
-| `allocate_new_blocks(request_id, block_num_to_allocate, num_tokens)` | 执行真实 block 分配，更新 `req_to_blocks` |
+| `pre_allocate_blocks(...)` | 计算本次需要新增的 block 数，并检查可用容量 |
+| `allocate_new_blocks(...)` | 执行真实 block 分配，更新 `req_to_blocks` |
 | `get_num_skipped_tokens(num_computed_tokens)` | 计算可跳过分配的 token 数 |
 | `remove_skipped_blocks(request_id, total_computed_tokens)` | （可选）特殊回收机制 |
 | `validate_and_build_kwargs(group_entries)` | （静态方法）从 `CacheEntry` 提取和校验类型特定参数 |
@@ -385,13 +373,15 @@ ATTN_TYPE_MANAGER_MAP: Dict[str, Type[SingleTypeKVCacheManager]] = {
 
 ### 6.1 单层混合 vs 跨层混合
 
+不同窗口大小的滑窗条目须使用不同的 `manager_key`。
+
 | 形态 | 示例 | 处理 |
 |---|---|---|
-| 单层多 cache 但同 attn_type（MLA：nope_cache + rope_cache） | DeepSeek-R1 | 同 manager 统一管理，按字节合并算 block |
-| 跨层不同 attn_type（gpt_oss 部分层 SW + 部分层 FA） | gpt-oss | 各层在 `__init__` 内根据条件设置 `attn_type`，框架按 attn_type 分组各自分配 |
+| 单层多 cache 但同 attn_type（MLA：nope_cache + rope_cache） | DeepSeek-R1 | 共用分组键时按总字节数计算 block |
+| 跨层不同 attn_type（gpt_oss 部分层 SW + 部分层 FA） | gpt-oss | 各层在 `__init__` 内根据条件设置 `attn_type`，使用默认分组键时两类层各自分配 |
 | 单层多 attn_type 混合 | （较少见） | 同 cache_entries 列表内不同 entry 设不同 `attn_type` 即可 |
 
-### 6.2 forward 内按 attn_type 取 block_table
+### 6.2 按默认分组键取 block_table
 
 ```python
 # 错误：用同一个 block_table 处理所有层
@@ -399,7 +389,7 @@ block_table = forward_metadata.block_table   # 这是 Dict[str, Tensor]，不能
 
 # 正确：在每层 attention 内按 self.attn_type 取出对应 tensor
 attn_output, _ = FA_OP(
-    ..., block_table=block_table[self.attn_type], ...,
+    query, key, value, block_table=block_table[self.attn_type], **fa_kwargs,
 )
 ```
 
@@ -413,14 +403,14 @@ attn_output, _ = FA_OP(
 
 ### 7.1 初始化链路验证
 
-- 模型类 `__init__` 完成后，`get_cache_info()` 能返回正确的 `ModelCacheInfo`（`num_layers` / `block_size` / `layer_infos` 数量与配置一致）
-- ModelWorker 调 `_get_cache_info()` → `KVCacheManager.allocate_cache_tensors()` 后，每层 attention 的 `k_cache` / `v_cache`（或 `nope_cache` / `rope_cache`）已被 `tensor_setter` 注入实际 storage（不再是 `torch.Tensor([])` 占位）
+- 模型类 `__init__` 完成后，`get_cache_info()` 能返回正确的 `ModelCacheInfo`（`num_layers == len(layer_infos)`，各分页条目的块长与分组一致）
+- 框架通过 `ModelWorker.get_cache_info()` 收集声明，调用 `cache_utils.allocate_cache_tensors()` 后，每层 attention 的 `k_cache` / `v_cache`（或 `nope_cache` / `rope_cache`）已被 `tensor_setter` 注入实际 storage（不再是 `torch.Tensor([])` 占位）
 
 ### 7.2 运行期链路验证
 
-- forward 内 `forward_metadata.block_table[self.attn_type]` 与 `slot_mapping[self.attn_type]` 不为 None
+- 分页路径按条目分组键取到对应的 block table 和 slot mapping
 - FA 调用前后 dtype / shape 与 `cache_entries` 声明一致
-- Prefill 后第一个 Decode step 的 `actual_seq_lengths_kv` 等于 `prompt_length + 1`
+- 普通单 token Decode 第一步的 `actual_seq_lengths_kv` 等于 `prompt_length + 1`
 
 ### 7.3 释放链路验证
 

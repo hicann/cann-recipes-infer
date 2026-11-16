@@ -5,12 +5,14 @@ description: 基于 PyTorch 框架的昇腾 NPU 模型推理运行时错误诊�
 
 # NPU 推理运行时错误诊断与修复
 
-核心理念：**先定位再修复**。不覆盖精度问题，精度调优见 model-infer-precision-debug。 —— 通过二分法逐步缩小故障范围，避免在错误方向浪费时间。
+**先定位再修复**，逐级缩小故障范围。精度问题见 model-infer-precision-debug。
 
-> **部署模式适配**：诊断流程对框架部署 / 独立部署两模式均适用，差异点：
-> - **启动协议**：框架部署走 `executor/scripts/function.sh::launch` 多卡 fork python；独立部署走 `torchrun --nproc_per_node=N infer.py`。卡住 / crash 时先确认进程模型对应。
-> - **通信组管理**：框架部署由 `executor.core.config.comm_manager.CommManager` 一次性建组，模型类用 `comm_manager.get_group(name)`；独立部署 Runner 内 inline `ParallelContext`，对外接口对齐 `get_group(name)` / `get_group_name(name)` / `get_rank(name)`。HCCL 错误诊断时确认是哪条路径。
-> - **KV cache 接入**：框架部署由 `executor/core/kv_cache/` 自动管理 `cache_entries` / `block_table[attn_type]` / `slot_mapping[attn_type]`；独立部署 Runner 自管 KV tensor + `block_table` + `slot_mapping`。详见 model-infer-kvcache。
+仅诊断时返回故障位置、证据和修复建议；包含修复的任务再实施并返回验证结果。诊断操作沿用调用方的权限约定。
+
+> **infer 仓部署参考**：框架部署 / 独立部署的实现差异：
+> - **启动协议**：框架部署走 `executor/scripts/function.sh::launch` 多卡 fork python，通过 `LOCAL_RANK` / `RANK_ID` 区分 rank；独立部署走 `torchrun --nproc_per_node=N infer.py`。卡住 / crash 时核对实际进程模型。
+> - **通信组管理**：框架部署由模型通过 `CommManager.register_group()` 注册所需通信组，用 `comm_manager.get_group(name)` 取用；独立部署 Runner 内 inline `ParallelContext`，对外接口对齐 `get_group(name)` / `get_group_name(name)` / `get_rank(name)`。HCCL 错误诊断时确认是哪条路径。
+> - **KV cache 接入**：框架部署由 `executor/core/kv_cache/` 管理 `cache_entries` 及各缓存分组的 `block_table` / `slot_mapping`；独立部署 Runner 自管 KV tensor + `block_table` + `slot_mapping`。详见 model-infer-kvcache。
 > - **权重加载**：框架部署 `enable_online_split_weight: True` 由 ParallelLinear.weight_loader 自动按 rank 切；独立部署 Runner 自管或调 `executor.model_loader.weight_utils.default_weight_loader`。
 
 ---
@@ -21,9 +23,9 @@ description: 基于 PyTorch 框架的昇腾 NPU 模型推理运行时错误诊�
 问题发生
   │
   ├── 有明确错误信息 → 通用诊断流程
-  │     ├── aicore timeout (507014) → 二分法定位
+  │     ├── aicore timeout (507014) → 逐级定位
   │     │     ├── 定位到阶段 → 层 → 模块 → 算子
-  │     │     └── 查表「常见算子约束」→ 修复策略 → 验证
+  │     │     └── 核对算子约束 → 修复策略 → 验证
   │     ├── OOM → 检查参数量 / batch_size / seq_len / 中间 buffer
   │     ├── Shape 不匹配 → 检查 TP/EP 切分维度 / Prefill vs Decode 分支
   │     └── HCCL timeout → 检查各 rank 代码路径一致性 / 通信组创建
@@ -33,40 +35,38 @@ description: 基于 PyTorch 框架的昇腾 NPU 模型推理运行时错误诊�
        │     ├── 权重加载 crash → TP 切分越界 / vocab pad
        │     ├── Config 字段缺失 → Config 兼容性
        │     └── 静默失败 → 逐 rank 检查日志
-       ├── 有进程 + HBM 不变 + CPU 100% → 推理卡住诊断 - 模型构造阶段
-       ├── 有进程 + HBM 不变 + CPU 0% → 推理卡住诊断
+       ├── 有进程 + HBM 不变 + CPU 高占用 → 检查模型构造 / 初始化进度与进程栈
+       ├── 有进程 + HBM 不变 + CPU 低占用 → 推理卡住诊断
        │     ├── 检查残留进程
        │     ├── eager 也卡 → sync+print 定位（通用流程第二步）
        │     └── 仅 graph 卡 → 比较 eager/graph 代码路径差异
-       └── 0 进程 → 查 rank 0 日志 → 通用诊断流程
+       └── 无 NPU 进程 → 核对主机进程、退出状态与各 rank 日志
 ```
 
 ### npu-smi 状态检查
 
-当没有明确错误信息时，通过设备状态判断问题类型：
+当没有明确错误信息时，用设备状态缩小排查范围，并结合进程栈和日志确认：
 
 ```bash
 npu-smi info
 ```
 
-| npu-smi 表现 | 含义 | 诊断路径 |
-|-------------|------|---------|
-| 前 N 进程存在，后面缺失，HBM 不均 | 高位 rank 在权重加载时 crash | → 多卡部署诊断 |
-| 8 进程，HBM 均匀，AICore 全 0% | 所有 rank 卡在通信等待 | → 推理卡住诊断 |
-| 有进程，HBM 不变 ~3GB，CPU 100%+ | CPU 密集操作（模型构造/权重初始化） | → 推理卡住诊断 - 模型构造阶段 |
-| 有进程，HBM 不变 ~3GB，CPU 0% | 死锁/通信等待 | → 推理卡住诊断 |
-| 8 进程，HBM 持续增长 | 权重加载中 | 等待 |
-| 0 进程 | 全部 crash | 查 rank 0 日志 → 通用诊断流程 |
+| 设备 / 进程表现 | 排查方向 | 确认方式 |
+|-----------------|---------|---------|
+| 部分 rank 进程缺失或 HBM 不均 | 部分 rank 提前退出、加载进度或分工不同 | 核对预期 rank 与日志，定位最早异常 |
+| 预期进程仍在，AICore 利用率低 | CPU 阶段、I/O 或通信等待 | 对照进程栈与各 rank 最后检查点 |
+| HBM 不变，CPU 高占用 | 模型构造、参数初始化或编译耗时 | 检查当前调用栈和阶段进展 |
+| HBM 不变，CPU 低占用 | I/O 或通信等待 | 检查阻塞位置与对端 rank 状态 |
+| HBM 持续增长 | 权重 / 缓存加载或其他分配 | 对照加载日志与内存增长阶段 |
+| 无 NPU 进程 | 尚未使用 NPU 或进程已退出 | 核对主机进程、退出状态和各 rank 日志 |
 
 ---
 
 # 通用诊断流程
 
-适用于有明确错误信息的场景（aicore timeout、HCCL error、OOM、shape mismatch 等）。按分类 → 定位 → 查表 → 修复 → 验证线性推进。
+根据已有证据选择错误分类、同步检查点或专项排查；定位到具体算子后核对约束。
 
 ## 第一步：错误分类
-
-拿到错误信息后，先判断属于哪一类。不同类别的根因和排查路径完全不同，分类错误会浪费大量时间。
 
 ### A. aicore timeout（错误码 507014）
 
@@ -75,7 +75,7 @@ npu-smi info
 **含义**：某个 NPU 算子在设备上执行时超时未返回。这是最常见也最难排查的错误，因为报错的位置（synchronize 调用处）通常不是出错的位置（某个具体算子）。
 
 **常见根因**：
-- 算子入参违反硬件约束（如 A2 上 MC2 要求 `experts_per_rank <= 24`，见「常见算子约束」）
+- 算子入参违反当前平台 / 版本约束（见第三步）
 - 算子 shape 超出硬件限制（如单次 matmul 的 M/N/K 维度超限）
 - 死锁：部分 rank 走了不同的通信路径，导致集合通信永远等不齐
 - 内存越界：slot_mapping/block_table 索引超出 KV cache 分配范围
@@ -88,11 +88,13 @@ npu-smi info
 
 **常见根因**：
 - 各 rank 进入通信操作的顺序/次数不一致（代码分支导致部分 rank 跳过某次通信，常见于 modeling forward 内有 `if forward_metadata.is_prefill` 等分支）
-- 通信组创建时参数错误：框架部署核查 `CommManager.initialize()` 的 group_stride / group_num；独立部署核查 `ParallelContext.build_parallel_context()` 内 `init_comm_group` 调用参数
-- MoE EP 场景缺 `moe_ep_group_name`：dispatch_v2 / combine_v2 算子要求 HCCL group name，框架部署用 `comm_manager.get_group_name("moe_ep_group")`；独立部署用 `parallel_ctx.get_group_name("moe_ep_group")`
+- 通信组创建时参数错误：框架部署核查模型调用 `CommManager.register_group()` 时的成员分组参数；独立部署核查 `ParallelContext.build_parallel_context()` 内 `init_comm_group` 调用参数
+- MoE EP 通信组名称缺失或不匹配：dispatch_v2 / combine_v2 所用 HCCL group name 应对应模型实际注册的通信组，通过 `get_group_name(name)` 获取
 - 网络问题（跨节点时 HCCL_IF_IP 配置错误）
-- HCCL_BUFFSIZE 不足（大 batch / 大 hidden_size 的 dispatch/combine 失败）—— 调高至 512MB 试试
+- 通信缓冲区不足（结合报错、输入规模与当前算子的缓冲区要求确认）
 - 某些 rank 已经 crash 但其他 rank 还在等它参与通信
+
+通信超时或卡住时，按实际报错、部署方式和版本查询 cannbot-knowledge 中的 HCCL 建链、通信缓冲区配置及逐 rank 日志 / 进程栈定位方法。
 
 ### C. OOM（显存不足）
 
@@ -113,28 +115,28 @@ npu-smi info
 **含义**：tensor 维度不对。
 
 **常见根因**：
-- TP 切分后维度未正确除以 tp_size：核对 ParallelLinear 的 `tp_size` / `tp_rank`（标准用 `comm_manager.get_rank("attn_tp_group")` / `parallel_ctx.get_rank("attn_tp_group")` 等取，避免硬编码）
-- KV cache 的 `num_head` 字段：必须用 `num_kv_heads_per_rank = max(num_kv_heads // attn_tp_size, 1)`，与 parallel-impl skill `attn_tp_size` 改动联动
-- EP 切分后每卡专家数计算错误：检查 `experts_per_rank = num_experts // ep_size`
-- Prefill/Decode 分支传入了错误 shape 的 tensor（阶段分支统一用 `forward_metadata.is_prefill`）
-- packed sequence 协议错误：modeling 内 `hidden_states` 被 reshape 成 `[B, S, H]`（变长 batch 不能简单 reshape，应保持 `[TotalTokens, hidden_size]` 二维，详见 model-infer-kvcache §3.1）
-- 多 attn_type 混合模型：误把 `block_table` 当 plain Tensor 传给 FA，应该取 `block_table[self.attn_type]`（dict 索引）
+- TP 切分后的维度或 rank 不匹配：核对模块的 `tp_size` / `tp_rank`；infer 仓按模块所属通信组通过 `comm_manager.get_rank(name)` 取组内 rank
+- KV cache 的 `num_head` 与每卡实际 KV 布局不匹配：标准头切分 / 复制与 MLA latent cache 的口径见 model-infer-kvcache，改变 Attention TP 后同步核对
+- EP 切分后每卡专家数计算错误：按实际专家分配核对，均匀切分时为 `experts_per_rank = num_experts // ep_size`
+- Prefill/Decode 分支传入了错误 shape 的 tensor：核对阶段标识与实际执行分支，infer 仓 modeling 使用 `forward_metadata.is_prefill`
+- packed sequence 协议错误：将 `[TotalTokens, hidden_size]` 直接 reshape 成 `[B, S, H]`，破坏变长 batch 的布局，详见 model-infer-kvcache
+- 多缓存分组模型：向 FA 传入了整个 `block_table` 字典，应按当前层的缓存分组取对应 Tensor，详见 model-infer-kvcache
 
 ### E. 算子约束违反
 
-**特征**：不直接报约束错误，通常表现为 aicore timeout 或 SIGABRT。需要通过二分法定位后，查阅算子文档确认。
+**特征**：可能直接报参数错误，也可能表现为 aicore timeout 或 SIGABRT。根据报错或检查点定位后，查阅算子文档确认。
 
 **含义**：NPU 自定义算子对入参有隐含约束（数据类型、维度范围、硬件平台限制），违反时行为未定义。
 
 ---
 
-## 第二步：二分法定位（sync+barrier 检查点法）
+## 第二步：逐级定位（同步检查点法）
 
 核心方法。当错误发生在 `torch.npu.synchronize()` 时，错误信息只告诉你"设备上有东西出错了"，不告诉你具体哪个算子。通过插入检查点逐步缩小范围。
 
 ### 2.1 定位到阶段（Prefill vs Decode）
 
-在 runner 的 `model_inference` 方法中，prefill 和 decode 调用之间插入同步检查：
+在实际推理入口的 Prefill 完成、Decode 开始处插入同步检查：
 
 ```python
 # 在 prefill 之后、decode 之前
@@ -155,7 +157,7 @@ for i, layer in enumerate(self.layers):
     logging.info(f"layer {i} passed")
 ```
 
-如果 Layer 0 就超时 —— 问题在第一层内部。如果 Layer 2 超时 —— 问题在第 2 层或其子模块。
+排查最后成功检查点至首次失败检查点之间的执行区间。
 
 ### 2.3 定位到模块
 
@@ -175,53 +177,28 @@ torch.npu.synchronize(); logging.info("  MoE passed")
 
 ### 2.4 定位到算子
 
-进入出错模块，在每个 NPU 算子调用之间插入检查点。此时通常可以定位到具体算子及其入参，结合下文「常见算子约束」判断根因。
+进入出错模块，在每个 NPU 算子调用之间插入检查点。此时通常可以定位到具体算子及其入参，按第三步核对约束。
 
 ### 2.5 注意事项
 
-- **先用 `torch.npu.synchronize()` 做单卡定位**，确认是哪个算子出错。不要一开始就加 `dist.barrier()`——barrier 会在某 rank 已崩溃时导致其他 rank 永久挂起
-- **怀疑多 rank 不同步时**，用 `dist.barrier()` 或 `torch.distributed.monitored_barrier()` 确认各 rank 是否走到同一位置。`monitored_barrier` 在超时后会报告哪个 rank 未到达
-- **查看所有 rank 的日志**，确认各 rank 到达的检查点是否一致（不一致说明有条件分支差异 → 通信死锁）
+- **先用 `torch.npu.synchronize()` 定位本 rank 的出错区间**。额外的 `dist.barrier()` 会让其他 rank 等待已失败的 rank，干扰定位
+- **怀疑多 rank 不同步时**，对照组内检查点；需要超时报告未到达的 rank 时，用独立 Gloo 组调用 `torch.distributed.monitored_barrier(group=group_gloo, timeout=...)`（[PyTorch 文档](https://docs.pytorch.org/docs/stable/distributed.html#torch.distributed.monitored_barrier)）
+- **查看所有 rank 的日志**，从最早分歧处区分提前失败与通信分支不一致
 - **不要一次插入太多检查点** —— 每次 sync 有开销，且大量 sync 可能改变时序。先粗粒度，再细粒度
 - **保留日志**：把每轮定位的检查点输出保存，供后续分析
 
 ---
 
-## 第三步：常见 NPU 算子约束速查
+## 第三步：核对算子约束
 
-以下约束来自本仓实际调试经验，定位到具体算子后应回到当前调用的 API 签名和官方文档核对，不要跨算子套用规则。违反约束的典型表现是 aicore timeout。
-
-### MoE 相关算子
-
-| 算子 | 约束 | 违反表现 | 解决方案 |
-|------|------|---------|---------|
-| `npu_moe_distribute_dispatch_v2` (MC2) | A2: `experts_per_rank = moe_expert_num // (ep_world_size - shared_expert_rank_num) <= 24`；A3 无此 24 限制 | aicore timeout，Decode 阶段挂死 | `experts_per_rank > 24` 时回退到 double_routing 路径（npu_moe_init_routing_v2 + manual all_to_all） |
-| `npu_moe_distribute_combine_v2` (MC2) | 同上 | 同上 | 同上 |
-| `npu_moe_init_routing_v2` | 无 EP 最小限制，但 `moe_chunk_max_len` 为 0 可能导致空 tensor | SIGABRT 或 shape error | 设置合理的 moe_chunk_max_len（如 1024） |
-| `npu_moe_gating_top_k` | `k` 不能超过专家总数 | 静默错误输出或 crash | 检查 reduced model 的 moe_topk 是否已调整 |
-
-### FA (Flash Attention) 算子
-
-| 约束 | 说明 |
-|------|------|
-| `head_num` 须匹配实际 Q heads | MLA 模型中 head_num = num_attention_heads，不是 kv_heads |
-| `sparse_mode` + `atten_mask` 按路径分类 | 标准 LLM TND PA 路径 Prefill+Decode 统一 sparse_mode=3 + causal mask；滑窗层统一 sparse_mode=4 + band；MLA absorb Prefill 3 / Decode 0+None。详见 model-infer-kvcache §2.7 |
-| atten_mask shape | `sparse_mode=3/4` 时固定 `[2048, 2048]` bool（用 `executor.utils.common_utils.get_init_attn_mask(2048, device)` 构造） |
-| `input_layout` 按 API 和阶段区分 | `npu_fusion_attention` 用 BSH/SBH/BSND/BNSD/TND；`npu_fused_infer_attention_score` 用复合 layout 如 TND_NTD（PA + MLA 默认推荐）、BSND_NBSD（KVP 场景），以实际 API 签名为准 |
-| Decode PA 模式下 `block_table` | shape `[batch, max_blocks]`，值不能超出 cache 分配的 block 数；框架部署是 `Dict[attn_type → Tensor]`，attention 内取 `block_table[self.attn_type]` |
-| FA v1 + BSH + Q_S=1 Decode 算子级限制 | op 内部忽略 `sparse_mode` / `pre_tokens`（实测 sparse_mode 0 vs 4 等价）；滑窗模型长序列正确性靠模型层 actual_seq_lengths_kv 截断 |
-| NZ 格式 cache | 需要 `torch_npu.npu_format_cast` 转换，且 hidden_dim 须为 16 的整数倍 |
-
-> `actual_seq_lengths` 相关参数以"当前调用算子的签名与官方 API 文档"为准，不跨算子套用规则：
-> - `torch_npu.npu_fused_infer_attention_score` / `torch_npu.npu_fusion_attention`：`actual_seq_lengths*` 为 `List[int]`（文档为 int64 语义）
-> - `torch_npu.npu_kv_quant_sparse_flash_attention`：`actual_seq_lengths_query/kv` 为 `Tensor`（文档为 int32）
+定位到算子后，按 API、硬件和部署版本查询 cannbot-knowledge 中的约束与故障案例：MoE 查专家分布、路由参数和回退实现；FA 查每卡 Q/KV heads、dtype/layout、mask/sparse_mode、序列长度参数类型与 KV cache 格式。
 
 ### 通信算子
 
 | 约束 | 说明 |
 |------|------|
 | `all_to_all_single` 的 split sizes | input_splits 和 output_splits 之和须分别等于 input 和 output 的第 0 维 |
-| 通信组内所有 rank 须同时到达 | 任何条件分支差异都可能导致部分 rank 跳过通信 → 死锁 |
+| 通信组内调用须匹配 | 参与 rank 的 collective 顺序、次数及数据收发关系须匹配；分支跳过通信会让其他 rank 等待 |
 | HCCL group 创建顺序 | 所有 rank 须以相同顺序创建相同的通信组 |
 
 ---
@@ -232,24 +209,10 @@ torch.npu.synchronize(); logging.info("  MoE passed")
 
 ### 模式 1：算子回退（Operator Fallback）
 
-当某个高性能算子在当前硬件/配置下不可用时，回退到功能等价但限制更少的替代算子。
-
-```python
-# 示例：A2 上 experts_per_rank > 24 时 MC2 算子不可用，回退到 double_routing
-def forward(self, hidden_states, is_prefill):
-    topk_indices, topk_weights, _ = self.router(hidden_states)
-    if is_prefill:
-        return self.moe_infer_double_routing(hidden_states, topk_indices, topk_weights)
-    else:
-        experts_per_rank = self.num_experts // (self.moe_ep_size - self.shared_expert_rank_num)
-        if experts_per_rank > 24:
-            # A2 MC2 dispatch_v2/combine_v2 requires experts_per_rank <= 24; fall back
-            return self.moe_infer_double_routing(hidden_states, topk_indices, topk_weights)
-        return self.moe_infer_dispatch_combine(hidden_states, topk_indices, topk_weights)
-```
+确认某个高性能算子在当前硬件 / 配置下不可用时，回退到语义等价且满足当前配置的替代路径，并验证精度与性能。
 
 **适用场景**：硬件约束、EP/TP size 不满足算子要求
-**注意**：回退通常有性能损失，需记录在优化报告中
+**注意**：回退通常有性能损失
 
 ### 模式 2：参数修正（Parameter Fix）
 
@@ -259,20 +222,7 @@ def forward(self, hidden_states, is_prefill):
 
 ### 模式 3：路径统一（Path Unification）
 
-部分 rank 走不同代码路径导致通信死锁。
-
-```python
-# 错误：不同 rank 可能在不同 step 进入 prefill/decode
-if is_prefill:
-    self.all_reduce(...)  # rank 0 执行
-# rank 1 已进入 decode，不执行 all_reduce → 死锁
-
-# 修复：确保所有 rank 同步状态后再分支
-dist.barrier()
-is_prefill_tensor = torch.tensor([int(is_prefill)], device="npu")
-dist.broadcast(is_prefill_tensor, src=0)
-is_prefill = bool(is_prefill_tensor.item())
-```
+部分 rank 因分支跳过集合通信时，从首次分歧处核对相关通信组的控制状态（如 `is_prefill`）及其来源，修正组内状态传递和 collective 调用顺序。独立处理不同请求的 DP 副本按各自请求推进。
 
 **适用场景**：多 rank 死锁、HCCL timeout
 
@@ -288,241 +238,74 @@ is_prefill = bool(is_prefill_tensor.item())
 
 修复后，按以下清单验证：
 
-- [ ] **单步验证**：在出错位置前后加 sync+barrier，确认不再超时
-- [ ] **全流程验证**：移除所有调试检查点，运行完整 warmup + inference
-- [ ] **全 rank 验证**：检查所有 rank 的日志，确认全部成功（`grep "model run success" log_*.log`）
-- [ ] **输出一致性**：各 rank 的最终输出应一致（对 DP 模式，同 DP group 内的 rank 输出应一致）
-- [ ] **性能记录**：记录修复后的 Prefill/Decode 耗时，与修复前对比
-- [ ] **回退文档**：如果使用了算子回退，记录性能影响和未来可恢复条件
+- [ ] **局部验证**：复跑原失败路径，确认错误或卡住现象消失
+- [ ] **全流程验证**：移除调试检查点，按目标输入规模、并行配置和执行模式运行完整 warmup + inference
+- [ ] **全 rank 验证**：结合本次任务进程的退出状态、各 rank 日志与推理入口的完成记录，确认所有参与 rank 正常结束
+- [ ] **输出正确性**：按请求与基准比较结果；不同 DP 副本可处理不同请求，按并行角色检查应一致的副本输出
+- [ ] **性能记录**：记录修复后的 Prefill/Decode 耗时；有可用的成功基线时，按相同负载对比
+- [ ] **回退结果**：如果使用了算子回退，在交付结果中说明性能影响和未来可恢复条件
 
 ---
 
 # 特定场景诊断
 
-以下场景有独立的诊断路径，不走通用流程。通过入口 npu-smi 表判断后直接跳转。
+按症状选择以下排查路径，必要时结合前述同步检查点定位。
 
 ## 多卡部署诊断
 
-多卡部署引入了一类单卡不存在的问题：权重加载切分、vocab 对齐、部分 rank 崩溃、config 兼容性。共同特点：**部分 rank 成功、部分 rank 失败**，错误出现在权重加载阶段而非 forward 阶段。
+本节关注多卡加载阶段的权重切分、vocab 对齐、config 兼容性，以及部分 rank 失败后其他 rank 等待的现象。
 
-> **启动协议区分**：框架部署用 `executor/scripts/function.sh::launch` 多卡 fork python（每个 rank 单独起进程，通过 `LOCAL_RANK` / `RANK_ID` 环境变量区分）；独立部署用 `torchrun --nproc_per_node=N infer.py`（torchrun 自动注入 RANK / WORLD_SIZE / LOCAL_RANK / MASTER_ADDR / MASTER_PORT）。卡 / crash 时先确认对应启动方式的进程模型。
+加载或初始化异常时，查询 cannbot-knowledge 中同推理框架、相近模型结构的 TP 分片、词表填充与加载配套、Config 字段映射及参数初始化耗时处理案例。
 
 ### 权重加载 TP 切分越界
 
-**典型错误**：
-```
-RuntimeError: start (105984) + length (35328) exceeds dimension size (131125)
-```
-或：
-```
-ValueError: 131125 is not divisible by 8
-```
+遇到 `narrow()` 越界或维度不可整除错误时，对照 checkpoint 实际维度、模型参数维度、对应 TP 度及本 rank 的切分范围。高位 rank 的切片起点更大，若仅高位 rank 失败，应优先核对其 `start + length` 是否超出源权重维度。
 
-**根因**：ColumnParallelLinear / VocabParallelEmbedding 将权重沿 output 维度切分为对应 `*_tp_size` 份。如果 checkpoint 的实际维度不等于模型参数的维度，或者不能被对应 `*_tp_size` 整除，高位 rank 的 `narrow()` 操作就会越界。
-
-**常见场景**：
-
-| 场景 | 说明 | 修复 |
-|------|------|------|
-| **多模态模型文本推理** | `embed_tokens` 用 full vocab (282624) 但 `lm_head` 用 text+special (131125)，两者维度不同 | lm_head 单独使用 `text_vocab_plus_multimodal_special_token_size` |
-| **vocab 不整除 lmhead_tp_size** | 131125 % 8 ≠ 0 | 向上 pad 到最近的 `lmhead_tp_size` 倍数：`padded = ((raw + lm_tp - 1) // lm_tp) * lm_tp` |
-| **padded 参数 vs 原始 checkpoint** | 模型参数 131128（padded）但 checkpoint 权重只有 131125 | 加载时先 pad checkpoint weight 再传给 weight_loader |
-
-**修复模板（vocab pad + weight pad）**：
-
-```python
-# 1. 创建 lm_head 时 pad vocab size，注意切分用的 lmhead_tp_size 与 attn_tp_size 可能不同
-lm_head_raw = getattr(config, "text_vocab_plus_multimodal_special_token_size", config.vocab_size)
-self.lm_head_vocab_size = ((lm_head_raw + lmhead_tp_size - 1) // lmhead_tp_size) * lmhead_tp_size
-
-# 2. 加载权重时 pad checkpoint tensor
-if "lm_head" in name and loaded_weight.shape[0] < self.lm_head_vocab_size:
-    padded = torch.zeros(self.lm_head_vocab_size, *loaded_weight.shape[1:],
-                         dtype=loaded_weight.dtype, device=loaded_weight.device)
-    padded[:loaded_weight.shape[0]] = loaded_weight
-    loaded_weight = padded
-```
-
-**排查技巧**：如果只有高位 rank (rank 3-7) crash 而低位 rank (0-2) 正常，几乎一定是切分越界 —— 因为低位 rank 的 `start_idx` 还在合法范围内。
+Embedding 与 LMHead 可能使用不同词表大小和 TP 度。均匀词表切分时，词表维度须分别满足 `embed_tp_size` / `lmhead_tp_size` 的整除要求。采用 vocab padding 时，模型参数与加载权重的填充口径须一致，并保持有效 token 范围。
 
 ### Config 兼容性问题
 
-从 HuggingFace 原始模型加载时，config.json 可能缺少代码期望的字段，或字段格式不同。
-
-**常见问题**：
-
-| 问题 | 表现 | 修复 |
-|------|------|------|
-| 缺少 `rope_parameters` | `TypeError: 'NoneType' object is not subscriptable` at RotaryEmbedding init | Config `__init__` 中当 `rope_parameters=None` 时构造 default：`{"rope_type": "default", "rope_theta": self.rope_theta}` |
-| `vocab_size` 含多模态 token | Embedding 过大 / lm_head 维度不匹配 | 区分 `vocab_size`（embedding 用）和 `text_vocab_plus_multimodal_special_token_size`（lm_head 用）|
-| `num_hidden_layers` 歧义 | Dual-sublayer 架构下 HF 可能存 28（attention 层数）但物理层只有 14 | 用 property 覆盖：`@property num_hidden_layers -> return self.num_layers` |
-| `auto_map` 指向原始模型代码 | 加载时尝试 import 原始 modeling 文件 | 传入自定义 config class 到 `from_pretrained` |
-
-**最佳实践**：在 config class 的 `__init__` 末尾为缺失字段补 defensive defaults。对有模型差异的参数（如 `rope_theta`），从 config.json 读取而非硬编码默认值，缺失时报错。
+从 HuggingFace 原始模型加载时，核对实际加载的 Config 类、config.json 字段语义与模型构造代码，按模型定义处理字段缺失、格式或层数口径差异。
 
 ### 部分 Rank 静默失败
 
 有时 rank crash 了但错误被吞掉，存活的 rank 卡在下一个 `dist.barrier()` 或集合通信上，看起来像"推理卡住"。
 
-**诊断流程**：
+对照本次任务的预期 rank、实际进程与各 rank 日志，找出最早失败的 rank 及其最后完成的阶段，再检查仍在等待的 rank 是否依赖它。
 
-```bash
-# 1. npu-smi 确认进程数
-npu-smi info | grep "Process id"
+### 多卡权重加载检查
 
-# 2. 定位本次运行的日志目录（通常是 res/<date>/<case>/log_<rank>.log）
-RES=$(ls -dt models/{model_name}/res/*/* | head -1)
+加载异常时，按失败位置核对：
 
-# 3. 逐 rank 检查日志末尾
-for f in "$RES"/log_*.log; do
-    echo "=== $f ==="
-    tail -5 "$f"
-done
-
-# 4. 检查是否所有 rank 都到达了同一个里程碑
-grep "model run success" "$RES"/log_*.log
-# 或
-grep "Loading weights took" "$RES"/log_*.log
-```
-
-### 多卡权重加载检查清单
-
-在发起多卡推理前，逐项确认：
-
-- [ ] **embed_tokens 维度**：checkpoint 里 embed_tokens.weight.shape[0] 和 config.vocab_size 一致
-- [ ] **lm_head 维度**：checkpoint 里 lm_head.weight.shape[0] 可能小于 embed_tokens（多模态模型常见）
-- [ ] **vocab 整除对应 *_tp_size**：lm_head 和 embed_tokens 的 output_size 都能被各自 `lmhead_tp_size` / `embed_tp_size` 整除（不能则 pad）
-- [ ] **per-rank head 数**：attn_tp_size 改动后，`num_kv_heads_per_rank = max(num_kv_heads // attn_tp_size, 1)`，cache_entries.num_head 字段同步更新
-- [ ] **ignore 规则覆盖**：`_keys_to_ignore_on_load_unexpected` 包含所有不需要的权重前缀（ngram、visual、audio、mtp 等）
-- [ ] **config 字段完整**：`rope_parameters`、`num_layers`、`zero_expert_num` 等代码必需字段在 config.json 中有或有 default
-- [ ] **模型路径绝对路径**：相对路径可能在不同 rank 的 cwd 下解析不同
-- [ ] **enable_online_split_weight 与 weight_loader 实现**：YAML 设 True 时 ParallelLinear / FusedMoEGMM 的 weight_loader 必须正确处理 tp_rank / ep_rank 切分
+- **ignore 规则覆盖**：加载器的忽略规则只覆盖当前推理路径不需要的权重
+- **模型路径**：核对各 rank 按其工作目录实际解析的模型路径
+- **enable_online_split_weight 与 weight_loader 实现**：infer 仓 YAML 设 True 时，ParallelLinear / FusedMoEGMM 的 weight_loader 须正确处理 tp_rank / ep_rank 切分
 
 ---
 
 ## 推理卡住诊断
 
-推理卡住与 crash 不同——进程仍在运行但不产出结果。需要区分真卡住和假卡住。先通过入口 npu-smi 表判断状态，再按以下路径排查。
+进程仍在运行但不产出结果时，结合设备状态、各 rank 日志和进程栈，区分阶段耗时与阻塞。
 
 ### eager 模式复现
 
 ```
-卡住 → 换 eager YAML 跑同样模型
-  ├── eager 也卡 → bug 在模型代码 → 用 sync+print 定位
-  ├── eager 正常 → bug 在图模式适配
-  │     ├── 看报错：ERR03007 / graph break → 找不兼容的算子
+卡住 → 保持模型、输入和并行配置，切换 eager 复现
+  ├── eager 也卡 → 用同步检查点定位共用执行路径
+  ├── eager 正常 → 重点检查图模式路径
+  │     ├── 图中断或编译报错 → 按 model-infer-graph-mode 定位具体原因
   │     └── 无报错但慢/卡 → 比较 eager 和 graph 模式代码路径差异
-  └── 两者都正常但上次卡了 → 检查是否有残留进程占 NPU
+  └── 两者都正常但上次卡了 → 对比运行条件，检查残留进程与偶发异常
 ```
 
-### 模型构造阶段卡住（CPU 密集）
+### 初始化 / 编译耗时
 
-**症状**：日志停在 HCCL init 之后，HBM 不增长，但 CPU 100%+
-
-**常见根因**：
-
-| 原因 | 机制 | 修复 |
-|------|------|------|
-| **`nn.Embedding` 大 vocab 初始化** | 大 vocab 的 `nn.Embedding` 用 `normal_()` 填充随机值，多个 embedding 累计耗时可达数分钟 | 用 `no_init_weights()` 上下文包裹，跳过将被 checkpoint 覆盖的参数初始化 |
-| **`VocabParallelEmbedding` 瞬态内存** | 继承 `nn.Embedding`，`super().__init__(full_vocab, dim)` 先创建全 vocab tensor，再用 per-partition tensor 替换，瞬态 CPU 内存远超最终占用 | 用 `nn.Module` + `torch.empty(per_partition_size)` 直接创建 per-partition 权重，避免瞬态全 vocab 分配 |
-| **`post_init()` 遍历所有参数** | HuggingFace `PreTrainedModel.post_init()` 调用 `_init_weights` 对每个参数做初始化，大模型参数量多时很慢 | 对从 checkpoint 加载的大参数模块，用 `no_init_weights()` 跳过 |
-
-**诊断技巧**：
-
-```bash
-# 区分真卡和 CPU 密集慢
-ps aux | grep "infer.py" | awk '{print $2, $3"%CPU", int($6/1024)"MB"}'
-# CPU 100%+ = 还在算（慢但没死）
-# CPU 0%    = 真卡住（等通信/IO）
-```
-
-**修复模板（大 embedding 模块）**：
-
-```python
-from transformers.modeling_utils import no_init_weights
-
-# 用 no_init_weights 包裹，避免对即将被 checkpoint 覆盖的参数做随机初始化
-with no_init_weights():
-    self.large_embeddings = LargeEmbeddingModule(config, ...)
-```
+日志暂时不更新、HBM 不增长而 CPU 持续忙碌时，结合进程栈区分模型构造、参数初始化、权重加载与编译。若耗时集中在随后会被 checkpoint 完整覆盖的参数初始化，可跳过对应随机初始化；具体处理参考前述同框架初始化案例。
 
 ### 残留进程导致 HCCL 卡住
 
 **症状**：新启动的推理卡在 HCCL init，不报错不超时
 
-**根因**：上次推理的进程未正确退出，仍占用 NPU 设备或 HCCL 端口
+**排查方向**：上次推理的进程可能未正确退出，仍占用 NPU 设备或 HCCL 端口。
 
-**修复**：
-
-```bash
-# 1. 杀死残留进程
-ps aux | grep "infer.py" | grep -v grep | awk '{print $2}' | xargs kill -9
-
-# 2. 等待 NPU 释放
-sleep 3
-
-# 3. 确认 NPU 完全空闲
-npu-smi info | grep "No running"
-# 期望输出 8 行 "No running processes found"
-
-# 4. 重新启动推理
-```
-
-**预防**：每次启动推理前，先检查并清理残留进程。
-
----
-
-# 附录
-
-## 运行监控与提效
-
-以下命令示例基于当前仓默认的日志路径和启动脚本约定，executor 或日志组织变更后需相应调整。
-
-### 核心原则
-
-**判断完成状态看进程，不看日志流**。多卡推理通过 `infer.sh` 后台启动 N 个进程再 `wait`。rank 0 的 stdout 通过 `tee` 到终端，可能缓冲截断；其他 rank 只写日志文件。
-
-### 完成检测方法
-
-下表命令中的 `$RES` 指本次运行的日志目录，框架部署下通常是 `models/{model_name}/res/<date>/<case>/`，取最近一次用 `RES=$(ls -dt models/{model_name}/res/*/* | head -1)`；独立部署按该模型 Runner 的实际落盘位置取。
-
-| 方法 | 命令 | 说明 |
-|------|------|------|
-| **查 NPU 进程** | `npu-smi info \| grep "running process"` | 无进程 = 已结束 |
-| **查非 rank0 日志** | `grep "model run success" "$RES"/log_1.log` | 非 rank 0 的日志不经 tee，完整写入。**不要只查 rank 0** |
-| **查所有 rank** | `grep -l "model run success" "$RES"/log_*.log \| wc -l` | 期望输出 = world_size |
-
-### 日志关键字判断阶段
-
-```bash
-grep "Loading safetensors" "$RES"/log_1.log     # 正在加载权重
-grep "Loading weights took" "$RES"/log_1.log    # 加载完成
-grep "inference time cost of prefill" "$RES"/log_1.log  # 推理已开始
-grep "model run success" "$RES"/log_1.log       # 推理已结束
-```
-
-### 一条命令获取全局状态
-
-```bash
-echo "=== NPU ===" && npu-smi info | grep -E "Process|HBM" | head -5 && \
-echo "=== Log ===" && tail -3 "$RES"/log_1.log && \
-echo "=== Done? ===" && grep -c "model run success" "$RES"/log_*.log 2>/dev/null
-```
-
-### 常见误判场景
-
-| 现象 | 原因 | 正确做法 |
-|------|------|---------|
-| 终端无新输出，以为在运行 | Rank 0 的 tee 管道已关闭或缓冲未刷 | 查 `npu-smi` 或查 rank 1-7 日志 |
-| Rank 0 日志没有 "model run success" | tee 截断 | **查 rank 1 的日志** |
-| `sleep 120` 后还没完成 | 模型大/首次编译慢 | 先 `npu-smi` 判断存活，再看 HBM 变化判断阶段 |
-| grep 日志找不到关键字 | 进程 crash 了没写 success | 查 `npu-smi` 确认进程不在 → 查 `tail -20 log_*.log` 看错误 |
-
-### Agent 工作模式
-
-1. **启动推理**（框架部署在仓库根 `bash executor/scripts/infer.sh --model {model_name} --yaml {yaml_name}.yaml`，独立部署 `cd models/{model_name} && bash infer.sh`；前台或 `run_in_background`）
-2. **不要盲目 sleep** —— 用 `run_in_background` 等通知，或前台直接看输出
-3. **10 分钟无进展 → 主动排查**：推理启动超过 10 分钟仍无 `model run success` 输出，不要继续等待，按「推理卡住诊断」流程排查（`npu-smi` → 判断状态 → 分流）
-4. **超时后第一步查 `npu-smi`**，不要先查日志
-5. **检查完成时查 rank 1（不是 rank 0）**—— rank 1 日志完整无截断
-6. **一次检查多个信号**：`npu-smi` + `tail log_1.log` + `grep "model run success" log_*.log` 并行执行
+**修复**：核对残留 PID 的启动命令、任务归属与 rank，仅清理本次任务遗留的进程；确认其设备与端口资源释放后重新启动。
