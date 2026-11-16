@@ -29,7 +29,7 @@ custom.inplace_partial_rotary_mul(Tensor(a!) x, Tensor r1, Tensor r2, *, str rot
 
 ## 参数说明
 
->**说明：**<br> 
+>**说明：**<br>
 >
 >- b（batch size）表示输入样本批量大小、s（sequence length）表示输入样本序列长度、n（number of heads）表示注意力头数、d（head dimension）表示注意力头的维度数，slice_size表示待执行rope运算的片段长度。
 
@@ -50,7 +50,7 @@ custom.inplace_partial_rotary_mul(Tensor(a!) x, Tensor r1, Tensor r2, *, str rot
 - 该接口支持推理场景下使用。
 - 该接口支持aclgraph入图。
 - 该接口与PyTorch配合使用时，需要保证CANN相关包与PyTorch相关包的版本匹配。
-    
+
 ## 调用示例
 
-- 详见 [test_inplace_partial_rotary_mul.py](../examples/test_inplace_partial_rotary_mul.py)
+- 详见 [test_npu_inplace_partial_rotary_mul.py](../examples/test_npu_inplace_partial_rotary_mul.py)
