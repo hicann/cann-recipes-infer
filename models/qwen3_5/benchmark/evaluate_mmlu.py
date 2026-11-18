@@ -21,6 +21,7 @@ import csv
 import json
 import os
 import logging
+import re
 import subprocess
 from pathlib import Path
 
@@ -138,13 +139,10 @@ def build_rendered_prompt_for_eval(
 
 
 def extract_choice(text: str) -> str:
+    """Read one distinct standalone option; missing or ambiguous replies have no prediction."""
     stripped = text.strip().upper()
-    if stripped in CHOICES:
-        return stripped
-    for choice in CHOICES:
-        if choice in stripped:
-            return choice
-    return stripped[:1]
+    choices = set(re.findall(r"\b[A-D]\b", stripped))
+    return choices.pop() if len(choices) == 1 else ""
 
 
 def load_config(yaml_path: str, global_rank: int, local_rank: int) -> InferenceConfig:

@@ -201,6 +201,8 @@ python3 models/qwen3_5/benchmark/evaluate_mmlu.py \
 
 评测结果默认保存到`models/qwen3_5/benchmark/${output-name}`，内容包含总准确率、分科目准确率和逐题预测详情。注意，开启`HCCL_OP_EXPANSION_MODE=AIV`可能会引入不确定计算，导致测评结果出现波动，如有需要请关闭该功能。
 
+回答解析识别单独出现的 A/B/C/D 选项，支持 `Answer: B` 等明确格式；同一选项重复出现仍有效。没有单独选项或出现多个不同选项时记录空预测，按错误回答计入准确率，不从单词或字母组合中猜选项。
+
 
 ## 优化点参考
 
