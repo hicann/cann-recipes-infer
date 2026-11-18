@@ -78,7 +78,7 @@ agent 各优化阶段过程归档在 [agentic/](agentic/) 目录：
 
 ## 推理执行
 
-1. 配置 yaml：`model_config.model_path` 改为本地权重路径（必改）；其他参数按需调整，通用字段含义见 [YAML 参数描述](../../docs/common/inference_config_guide.md)。
+1. 配置 yaml：`model_config.model_path` 改为本地权重路径（必改）；其他参数按需调整，通用字段含义见 [YAML 参数描述](https://gitcode.com/cann/cann-recipes-infer/blob/master/docs/common/inference_config_guide.md)。
 
    <!-- 本模型若在 model_config.custom_params 下有特有参数（如多流、控核、benchmark 等开关），按以下表格列出；无特有参数时整段删除 -->
 
