@@ -75,7 +75,9 @@ cd cann-recipes-infer/integration/vllm/deepseek-ocr-2
 1. 安装 Python 依赖包（einops, addict, easydict, triton-ascend, PyMuPDF, img2pdf）
 2. 克隆 DeepSeek-OCR-2 源码
 3. 应用 NPU 适配补丁
-4. 输出到 `deepseek_ocr2_npu/` 目录
+4. 将配置文件和推理脚本复制到 `deepseek_ocr2_npu/` 目录并完成 NPU 修改
+
+因此，后续步骤中使用的 `config.py` 和三个 `run_dpsk_ocr2_*.py` 推理脚本会由该转换脚本随上游源码复制到 `deepseek_ocr2_npu/` 并完成 NPU 修改；`benchmark.py` 则由脚本从本项目的 `npu_patch/` 目录复制。执行转换脚本前，这些文件不会出现在仓库目录中。
 
 ### 配置文件修改
 
