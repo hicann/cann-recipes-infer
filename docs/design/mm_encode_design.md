@@ -70,7 +70,7 @@ mm_waiting_queue
     → 从 Store 取出本批结果，执行 Prefill
 ```
 
-MM 组批使用 Processor 提供的 `mm_token_count`，不解析模型的图片尺寸、patch 或视图字段。`max_mm_encode_tokens` 是整请求打包目标，具体默认值和分摊规则见 [调度配置](../common/inference_config_guide.md#24-schedulerconfig-调度配置)。它不会拆分单个请求，也不构成峰值显存硬上限。
+MM 组批使用 Processor 提供的 `mm_token_count`，不解析模型的图片尺寸、patch 或视图字段。`max_mm_encode_tokens` 是整请求打包目标，具体默认值和分摊规则见 [调度配置](../common/inference_config_guide.md#25-schedulerconfig-调度配置)。它不会拆分单个请求，也不构成峰值显存硬上限。
 
 Prefill 仍按 `max_prefill_tokens`、`cp_mini_batch` 和 KV 槽位可用性选批。一个 MM Encode batch 可以对应多个 Prefill batch，框架不要求二者具有相同请求数。
 
