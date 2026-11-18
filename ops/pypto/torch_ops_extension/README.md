@@ -32,20 +32,9 @@ bash build_and_install.sh
 执行之后会完成源码编译与自动安装。编译完成之后，会在当前路径新生成一个dist文件夹存放新编译的wheel包。
 
 
-## 快速上手
-
-- 用例执行：
-
-执行examples路径下的测试用例，验证自定义算子的注册和执行
-
-```shell
-bash run.sh
-```
-
-
 ## 目录结构介绍
 
-主体功能代码在custom_pypto路径，编译工程在setup.py, 测试用例在test路径。
+主体功能代码在custom_pypto路径，编译工程在setup.py。
 
 ```
 ├── custom_pypto
