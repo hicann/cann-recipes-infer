@@ -222,6 +222,33 @@ bash infer.sh
   - `FBCache.rel_l1_thresh`：L1 差异阈值，越大越快，质量损失越大；
   - `TeaCache.rel_l1_thresh / coefficients / warmup`：累积 L1 阈值、多项式重缩放系数、前 N 步强制完整计算。
 
+### W8A8 量化推理
+
+W8A8 使用两个噪声专家的 Attention/FFN Linear。准备原始 BF16 checkpoint 和量化输出目录，在模型目录执行：
+
+```bash
+python -m tools.quantization.weight_convert \
+  --source /path/to/Wan2.2-I2V-A14B-BF16 \
+  --output /path/to/Wan2.2-I2V-A14B-W8A8 \
+  --ignored-layers /path/to/ignored_layers.json
+```
+
+`--ignored-layers` 可省略；提供时为保留 BF16 的层名或 glob 模式 JSON 列表，支持专家前缀。权重转换逐 shard 写出，不覆盖原始 checkpoint。输出保留两个专家的 `config.json`、safetensors 及其索引，`quantization_config` 描述静态通道权重与动态 token 激活。
+
+编辑 `config/14b_quantization.yaml`：`ckpt_dir` 指向原始 BF16 checkpoint，供 T5/VAE 和额外 BF16 回退使用；`quant_data_dir` 指向量化输出根目录。随后执行：
+
+```bash
+YAML_FILE_NAME=14b_quantization.yaml bash infer.sh
+```
+
+推理依据产物 `config.json.quantization_config` 加载 W8A8。`quant_layout` 选择 `nd_view`、`nd_contiguous` 或 `nz`；`quant_ignored_layers` 可额外指定从原始 checkpoint 恢复的 BF16 层。量化推理使用单卡、NoCache 配置。
+
+I2V 的四项量化配置统一来自启动 YAML 的 `model_args`，初始化时写入模型 `cfg`。使用 `infer.sh` 时编辑对应 YAML；直接运行 `generate.py` 时通过 `--cache_config` 选择该 YAML。通用 CLI 参数保留供启动器兼容及其他任务使用，I2V 量化配置以 YAML 为准。
+
+`quant_mode` 的取值和含义保持通用入口的 `0/1/2/3`：0 为普通推理，1 为导出校准数据，2 为导出量化模型，3 为量化推理。I2V 的 1/2 保留基线分支，不参与产物自动加载；本 W8A8 权重转换使用上述离线命令。
+
+未指定 `save_file` 时沿用推理入口按时间生成的文件名。量化策略见 [模型优化文档](../../docs/models/wan2.2-i2v/wan2.2-i2v_optimization.md#w8a8-量化)。
+
 ## CANNLab一站式开发平台的快速启动
 
 本章节面向使用CANNLab一站式开发平台的用户，平台已预置完整的 CANN 环境，按以下步骤即可在单卡上完成 Wan2.2-I2V 图生视频推理。

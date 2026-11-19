@@ -20,6 +20,7 @@ import logging
 import os
 import sys
 import warnings
+from copy import deepcopy
 from datetime import datetime
 
 warnings.filterwarnings('ignore')
@@ -29,6 +30,7 @@ import time
 
 import torch
 import torch_npu
+import yaml
 torch_npu.npu.set_compile_mode(jit_compile=False)
 torch.npu.config.allow_internal_format = False
 from torch_npu.contrib import transfer_to_npu
@@ -266,12 +268,15 @@ def _parse_args():
         type=str,
         default="./output/quant_data",
         help="Path for calibration data or weight export.")
+    parser.add_argument('--quant_layout', choices=['nd_view', 'nd_contiguous', 'nz'], default='nd_view')
+    parser.add_argument('--quant_ignored_layers', nargs='*', default=[],
+                        help='Extra exact/glob Attention/FFN prefixes to load from source BF16 weights.')
 
     parser.add_argument(
         "--cache_config",
         type=str,
         default="./config/14b_single.yaml",
-        help="Path to cache config YAML (reads the dit_cache section). Overridden by infer.sh via mm_function.sh.")
+        help="Path to YAML config (dit_cache and I2V model_args). Overridden by infer.sh via mm_function.sh.")
     args = parser.parse_args()
     _validate_args(args)
 
@@ -288,6 +293,21 @@ def _init_logging(rank):
             handlers=[logging.StreamHandler(stream=sys.stdout)])
     else:
         logging.basicConfig(level=logging.ERROR)
+
+
+def _load_model_config(task, config_path):
+    cfg = deepcopy(WAN_CONFIGS[task])
+    if task == 'i2v-A14B':
+        with open(config_path, encoding='utf-8') as stream:
+            model_args = yaml.safe_load(stream)['model_args']
+        for name, default in (('quant_mode', 0), ('quant_data_dir', './output/quant_data'),
+                              ('quant_layout', 'nd_view'), ('quant_ignored_layers', [])):
+            cfg[name] = model_args.get(name, default)
+        if cfg.quant_mode not in (0, 1, 2, 3):
+            raise ValueError('model_args.quant_mode must be 0, 1, 2, or 3')
+        if cfg.quant_layout not in ('nd_view', 'nd_contiguous', 'nz'):
+            raise ValueError('model_args.quant_layout must be nd_view, nd_contiguous, or nz')
+    return cfg
 
 
 def generate(args):
@@ -371,7 +391,7 @@ def generate(args):
             raise NotImplementedError(
                 f"Unsupported prompt_extend_method: {args.prompt_extend_method}")
 
-    cfg = WAN_CONFIGS[args.task]
+    cfg = _load_model_config(args.task, os.getenv('YAML') or args.cache_config)
     if args.ulysses_size > 1:
         if cfg.num_heads % args.ulysses_size != 0:
             raise ValueError(
@@ -573,7 +593,7 @@ def generate(args):
         # wan_i2v.low_noise_model.to("npu")
         # wan_i2v.high_noise_model.to("npu")
 
-        if args.quant_mode == 2:
+        if cfg.quant_mode == 2:
             logging.info(f"quantize weights saved, will be return")
             return
 
@@ -589,7 +609,7 @@ def generate(args):
             guide_scale=args.sample_guide_scale,
             seed=args.base_seed,
             offload_model=args.offload_model)
-
+        del video
         logging.info("Generating video ...")
         stream.synchronize()
         begin = time.time()

@@ -17,3 +17,4 @@ einops==0.8.2
 loguru==0.7.3
 decorator==5.2.1
 scipy==1.17.1
+compressed-tensors==0.6.0

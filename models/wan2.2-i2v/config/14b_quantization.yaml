@@ -1,0 +1,48 @@
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+model_args:
+  ckpt_dir: "/path/to/Wan2.2-I2V-A14B-BF16"
+  image: "examples/i2v_input.JPG"
+  prompt: "Summer beach vacation style, a white cat wearing sunglasses sits on a surfboard."
+  task: "i2v-A14B"
+  size: "640*360"
+  frame_num: 61
+  sample_steps: 40
+  sample_solver: "unipc"
+  sample_shift: 5.0
+  sample_guide_scale: 3.5
+  base_seed: 100
+  convert_model_dtype: true
+  offload_model: "True"
+  cfg_size: 1
+  ulysses_size: 1
+  ring_size: 1
+  quant_mode: 3
+  quant_data_dir: "/path/to/Wan2.2-I2V-A14B-W8A8"
+  quant_layout: "nd_view"
+  quant_ignored_layers: []
+model_name: "wan2.2-i2v-w8a8"
+world_size: 1
+master_port: 29842
+entry_script: "generate.py"
+env_vars:
+  ASCEND_RT_VISIBLE_DEVICES: "0"
+  PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
+  TASK_QUEUE_ENABLE: "2"
+  CPU_AFFINITY_CONF: "1"
+  T5_LOAD_CPU: "1"
+dit_cache:
+  method: "NoCache"
+  enable_separate_cfg: true

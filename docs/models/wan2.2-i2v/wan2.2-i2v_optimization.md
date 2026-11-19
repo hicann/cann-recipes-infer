@@ -24,7 +24,7 @@ from torch_npu.contrib import transfer_to_npu
         sparse_mode=0,
         inner_precise=0,
     )
-    
+
     attention_out = attention_out.transpose(1, 2).contiguous()
     return attention_out.to(out_dtype)
 ```
@@ -41,7 +41,7 @@ def rope_apply(x, grid_sizes, freqs_list):
         x_i = x[i, :s].reshape(1, s, n, c)
         if not x_i.is_contiguous():
             x_i=x_i.contiguous()
-        
+
         cos, sin = freqs_list[i]
 
         if cos.dim() == 3:
@@ -50,7 +50,7 @@ def rope_apply(x, grid_sizes, freqs_list):
 
         cos = cos.to(dtype=x_i.dtype, device=x_i.device)
         sin = sin.to(dtype=x_i.dtype, device=x_i.device)
-        
+
         x_i = torch_npu.npu_rotary_mul(
             input=x_i,
             r1=cos,
@@ -141,12 +141,12 @@ for step_idx, t in enumerate(tqdm(timesteps)):
     latent_model_input = [latent.to(self.device)]
     timestep = [t]
     timestep = torch.stack(timestep).to(self.device)
-    
+
     model = self._prepare_model_for_timestep(t, boundary, offload_model)
     sample_guide_scale = guide_scale[1] if t.item() >= boundary else guide_scale[0]
-    
+
     extra_kwargs = {'t_idx': step_idx} if hasattr(self, 'use_sp') and self.use_sp else {}
-    
+
     if get_classifier_free_guidance_world_size() == 2:
         noise_pred = model(
             latent_model_input, t=timestep, **arg_all, **extra_kwargs)[0].to(
@@ -165,7 +165,7 @@ for step_idx, t in enumerate(tqdm(timesteps)):
             latent_model_input, t=timestep, **arg_null, **extra_kwargs)[0]
         if offload_model:
             torch.cuda.empty_cache()
-    
+
     noise_pred = noise_pred_uncond + sample_guide_scale * (
         noise_pred_cond - noise_pred_uncond)
 ```
@@ -224,3 +224,13 @@ export YAML_FILE_NAME=14b_single.yaml
             +--- dit_cache                     # step-level 缓存实现
                 +--- cache_method.py           # CacheManager / FBCache / TeaCache / TaylorSeer / NoCache
 ```
+
+### W8A8 量化
+
+两个 DiT 噪声专家在加载阶段将 Attention 的 q/k/v/o 和 FFN 两层投影替换为 W8A8 Linear，复用仓内 `CompressedTensorsW8A8Int8LinearMethod.apply_weights` 执行动态量化与矩阵乘。Head、时间/文本嵌入、Norm、RoPE、Attention kernel、残差及 T5/VAE 沿用原有计算路径。
+
+权重使用对称、按输出通道的 INT8 量化；每个通道的 FP32 scale 由绝对最大值除以 127 得到，经过 round-to-even 和 [-127,127] 截断。全零通道保持零权重并使用 scale=1。激活在 NPU 上按 token 动态量化，矩阵乘融合原始 BF16 bias 并输出 BF16。
+
+需要保留浮点精度的投影通过 ignored 层名单保存原始 BF16 权重。运行时仅替换有 INT8 weight/scale 的目标 Linear，检查张量名称、形状、dtype 和 scale；CPU offload 保留规范权重和 FP32 scale，回到 NPU 时重建设备视图。量化方式由产物 `config.json` 的 `quantization_config` 描述。
+
+权重转换和启动说明见 [Wan2.2-I2V README](../../../models/wan2.2-i2v/README.md#w8a8-量化推理)。

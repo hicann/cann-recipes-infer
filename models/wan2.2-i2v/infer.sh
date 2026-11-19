@@ -12,11 +12,12 @@ SCRIPT_PATH=$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
 MM_FUNCTION_ABS_PATH="${SCRIPT_PATH}/../../executor/scripts/mm_function.sh"
 MM_FUNCTION_ABS_PATH=$(realpath "${MM_FUNCTION_ABS_PATH}")
 
-source ${MM_FUNCTION_ABS_PATH}
+set -o pipefail
+source "${MM_FUNCTION_ABS_PATH}"
 
 export MODEL_DIR=$(basename "$SCRIPT_PATH")
 export YAML_PARENT_PATH="${SCRIPT_PATH}/config"
-export YAML_FILE_NAME=14b_cfg2_ulysses4.yaml
+export YAML_FILE_NAME=${YAML_FILE_NAME:-14b_cfg2_ulysses4.yaml}
 export YAML=${YAML_PARENT_PATH}/${YAML_FILE_NAME}
 
 mm_launch

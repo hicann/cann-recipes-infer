@@ -35,8 +35,10 @@ model_args:
   use_prompt_extend: false          # Whether to enable prompt extension. Options: [false, true].
   prompt_extend_method: "local_qwen"
                                    # Prompt extension method. Options: ["dashscope", "local_qwen"].
-  prompt_extend_target_lang: "zh"  # Prompt extension target language. Options: ["zh", "en"].
-  quant_mode: 0                     # Quantization workflow. Options: [0, 1, 2, 3].
+  prompt_extend_target_lang: "zh"   # Prompt extension target language. Options: ["zh", "en"].
+  quant_data_dir: null              # I2V W8A8 artifact root; config.json.quantization_config selects the runtime.
+  quant_layout: "nd_view"           # Runtime device layout for the artifact weights.
+  quant_ignored_layers: []          # Optional BF16 fallback overrides from the source checkpoint.
 
 model_name: "wan2.2-i2v"            # Model name. Options: ["wan2.2-i2v"].
 world_size: 1                       # Number of launched processes. Must equal cfg_size * ulysses_size * ring_size * tp_size.
@@ -66,3 +68,17 @@ Notes:
 - `14b_single.yaml` can use DiT cache methods `NoCache`, `FBCache`, and `TeaCache`.
 - `14b_single_platform.yaml` is read by `infer_platform.sh` and patched with the local ModelScope weight path at runtime.
 - Multi-card configs and DiT cache are mutually exclusive. Keep `dit_cache.method: "NoCache"` in multi-card configs.
+### Dual-expert W8A8 configuration
+
+`14b_quantization.yaml` runs Wan2.2-I2V with W8A8 Attention/FFN Linear layers. Set `model_args.quant_data_dir` to the artifact root containing `config.json`; its `quantization_config` selects the W8A8 loading path.
+
+| Field | Description |
+|---|---|
+| `quant_mode` | I2V mode selected from YAML: 0 normal, 1 calibration export, 2 model export, 3 quantized inference. |
+| `quant_data_dir` | Artifact root containing both noise experts and their quantization configuration. |
+| `quant_layout` | Device weight layout: `nd_view`, `nd_contiguous`, or `nz`. |
+| `quant_ignored_layers` | Optional exact/glob layer names restored from the source BF16 checkpoint. |
+
+I2V reads all four quantization settings once from the launch YAML into the model config; `WanI2V` consumes that config. With `infer.sh`, use `model_args`; for direct `generate.py` invocation, select the YAML with `--cache_config`. The common CLI options remain accepted for launcher compatibility and other tasks.
+
+The common entry point keeps quantization modes 0/1/2/3: normal inference, calibration export, quantized-model export, and quantized inference. I2V modes 1/2 retain the baseline branches and do not load W8A8 artifacts automatically. Conversion and launch commands are in the [model README](../README.md#w8a8-量化推理).

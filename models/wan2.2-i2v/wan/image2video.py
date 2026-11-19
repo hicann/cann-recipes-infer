@@ -96,7 +96,24 @@ class WanI2V:
                 Convert DiT model parameters dtype to 'config.param_dtype'.
                 Only works without FSDP.
         """
-        self.device = torch.device(f"cuda:{device_id}")
+        quant_mode = config.get('quant_mode', 0)
+        quant_data_dir = config.get('quant_data_dir')
+        quant_layout = config.get('quant_layout', 'nd_view')
+        quant_ignored_layers = config.get('quant_ignored_layers', ())
+        artifact_config_path = os.path.join(quant_data_dir, 'config.json') if quant_data_dir else None
+        if quant_mode in (0, 3) and artifact_config_path and os.path.isfile(artifact_config_path):
+            from quantization.loader import validate_artifact_root
+            artifact_config = validate_artifact_root(quant_data_dir)
+            quant_config = artifact_config.get('quantization_config', {})
+            if quant_config.get('quant_method') != 'compressed-tensors':
+                raise ValueError('The artifact config.json must declare quant_method=compressed-tensors')
+            quant_mode = 3
+            if dit_fsdp or use_sp:
+                raise ValueError('Use the single-card configuration for W8A8 expert loading')
+        elif quant_mode == 3:
+            raise ValueError('W8A8 inference requires quant_data_dir with a quantized artifact config.json')
+        self.quant_mode = quant_mode
+        self.device = torch.device(f"npu:{device_id}")
         self.config = config
         self.rank = rank
         self.t5_cpu = t5_cpu
@@ -133,43 +150,37 @@ class WanI2V:
             elif world_size == 2:
                 h_split, w_split = 1, 2
             elif world_size == 4:
-                h_split, w_split = 2, 2  
+                h_split, w_split = 2, 2
             elif world_size == 8:
-                h_split, w_split = 4, 2  
+                h_split, w_split = 4, 2
             else:
                 h_split = int(math.sqrt(world_size))
                 w_split = world_size // h_split
-            
+
             all_pp_group_ranks = [[i for i in range(world_size)]]
-            
-            set_vae_patch_parallel(self.vae.model, h_split=h_split, w_split=w_split, 
+
+            set_vae_patch_parallel(self.vae.model, h_split=h_split, w_split=w_split,
                                 all_pp_group_ranks=all_pp_group_ranks,
                                 decoder_decode="decoder.forward")
-            set_vae_patch_parallel(self.vae.model, h_split=h_split, w_split=w_split, 
+            set_vae_patch_parallel(self.vae.model, h_split=h_split, w_split=w_split,
                                 all_pp_group_ranks=all_pp_group_ranks,
                                 decoder_decode="encoder.forward")
-        
+
 
         logging.info(f"Creating WanModel from {checkpoint_dir}")
-        self.low_noise_model = WanModel.from_pretrained(
-            checkpoint_dir, subfolder=config.low_noise_checkpoint)
-
-        self.low_noise_model = self._configure_model(
-            model=self.low_noise_model,
-            use_sp=use_sp,
-            dit_fsdp=dit_fsdp,
-            shard_fn=shard_fn,
-            convert_model_dtype=convert_model_dtype)
-
-        self.high_noise_model = WanModel.from_pretrained(
-            checkpoint_dir, subfolder=config.high_noise_checkpoint)
-
-        self.high_noise_model = self._configure_model(
-            model=self.high_noise_model,
-            use_sp=use_sp,
-            dit_fsdp=dit_fsdp,
-            shard_fn=shard_fn,
-            convert_model_dtype=convert_model_dtype)
+        for name, checkpoint in (('low_noise_model', config.low_noise_checkpoint),
+                                 ('high_noise_model', config.high_noise_checkpoint)):
+            if quant_mode == 3:
+                from quantization.loader import load_quantized_expert
+                model = load_quantized_expert(
+                    WanModel, quant_data_dir, checkpoint, checkpoint_dir,
+                    quant_ignored_layers, quant_layout)
+            else:
+                model = WanModel.from_pretrained(checkpoint_dir, subfolder=checkpoint)
+            model = self._configure_model(
+                model=model, use_sp=use_sp, dit_fsdp=dit_fsdp, shard_fn=shard_fn,
+                convert_model_dtype=convert_model_dtype)
+            setattr(self, name, model)
         if use_sp:
             self.sp_size = get_sequence_parallel_world_size()
         else:
@@ -247,7 +258,7 @@ class WanI2V:
         if offload_model or self.init_on_cpu:
             if next(getattr(
                     self,
-                    offload_model_name).parameters()).device.type == 'cuda':
+                    offload_model_name).parameters()).device.type == self.device.type:
                 getattr(self, offload_model_name).to('cpu')
             if next(getattr(
                     self,
@@ -444,8 +455,7 @@ class WanI2V:
 
                 timestep = torch.stack(timestep).to(self.device)
 
-                model = self._prepare_model_for_timestep(
-                    t, boundary, offload_model)
+                model = self._prepare_model_for_timestep(t, boundary, offload_model)
                 sample_guide_scale = guide_scale[1] if t.item(
                 ) >= boundary else guide_scale[0]
 

@@ -71,7 +71,7 @@ def rope_apply(x, grid_sizes, freqs_list):
         x_i = x[i, :s].reshape(1, s, n, c)
         if not x_i.is_contiguous():
             x_i = x_i.contiguous()
-        
+
         cos, sin = freqs_list[i]
 
         cos = cos.to(dtype=x_i.dtype)
@@ -219,7 +219,7 @@ class WanSelfAttention(nn.Module):
         x = self.o(x)
         return x
 
-  
+
 class WanCrossAttention(WanSelfAttention):
 
     def forward(self, x, context, context_lens):
@@ -511,7 +511,7 @@ class WanModel(ModelMixin, ConfigMixin):
             List[Tensor]:
                 List of denoised video tensors with original input shapes [C_out, F, H / 8, W / 8]
         """
-        
+
         # if self.model_type == 'i2v':
         #     assert y is not None
         # params
@@ -576,7 +576,7 @@ class WanModel(ModelMixin, ConfigMixin):
                 freqs_i = (cos, sin)
                 freqs_list.append(freqs_i)
             self.freqs_list = freqs_list
-            
+
         # arguments
         kwargs = dict(
             e=e0,
@@ -591,7 +591,7 @@ class WanModel(ModelMixin, ConfigMixin):
             x = block(x, **kwargs)
             if i == 0 and cache_manager.cache_method.should_skip:
                 break
-        
+
         cache_manager.cache_method.post_cache_update(x)
         cache_manager.cache_method.should_skip = False
         # head
