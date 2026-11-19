@@ -25,6 +25,7 @@
 - [2026/11] [Kimi K3.1 Pro](models/kimi_k3_1/README.md) 模型在昇腾 950PR/DT 系列上已 **Day0 支持推理部署**，接入 DSA 融合算子、Indexer 多流、LI MXFP8 与 SFA FP8 KV 量化，并支持 Prefill CP
 - [2026/10] [Kimi K3](models/kimi_k3_1/README.md) 在昇腾 950PR/DT 系列上新增 MegaKDA、ReplaySSM、SuperKernel 与 W8A8C8 量化支持，结合多流优化实现 **约 2.8× 推理加速**
 - [2026/10] [LongCat-Next](models/longcat_next/README.md) 多模态模型在昇腾 Atlas A3 系列完成 NPU 推理适配，支持文本、图像和语音生成。
+- [2026/09] 新增 [DeepSeek-V4.1-Flash极低时延推理样例](docs/models/deepseek_v4_1/deepseek_v4.1_low_latency_tp_guide.md)：基于GBS=1的TP部署，达成2.5ms等效时延
 - [2026/09] 新增 [DeepSeek-V4 Attention-FFN 分离样例](integration/vllm/dsv4-afd/deepseek_v4_afd_deployment_guide.md)：基于 vLLM 和 afd-plugin，提供昇腾 A5 上的 P2P 同步与 Window 异步方案，支持双 microbatch、ACLGraph 和 DSpark
 - [2026/09] [DeepSeek-V4.1-Flash](integration/vllm/dsv41-flash-single-npu-moe-offload/README.md) 模型在昇腾 950PR/DT 系列上已支持 **单卡推理部署**
 - [2026/09] [GLM-5.3-Flash](models/glm_5_3/README.md) 模型在昇腾 950DT 系列上已支持 **HiF8 推理部署**
