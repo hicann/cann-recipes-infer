@@ -46,7 +46,7 @@ from module.linear import ColumnParallelLinear, ReplicatedLinear, VocabParallelE
 
 from .modules.separate_mla import reduce_separate_mla_output
 from .configuration_deepseek import DeepseekV3Config
-from .modeling_deepseek import (PREFETCH_ATTN_EVENT_NUM, Attention, DeepseekV3ForCausalLM,
+from .modeling_deepseek import (Attention, DeepseekV3ForCausalLM,
                                 DeepseekV3Model, DeepseekV3MoE)
 from .modules import DeepseekV3RMSNorm
 from .modules.registry import OpKernel
@@ -838,6 +838,7 @@ class DeepseekV4DSparkProposalModel(DeepseekV3ForCausalLM):
             "global_rank": self.global_rank,
             "is_mtp": True,
             "comm_manager": self.comm_manager,
+            "events": self.events,
         }
         self.mtp = nn.ModuleList([
             DeepseekV4DSparkProposalLayer(config, infer_config, stage_idx, **dspark_kwargs)
@@ -847,7 +848,7 @@ class DeepseekV4DSparkProposalModel(DeepseekV3ForCausalLM):
         if self.prefetch_stream is not None:
             for block in self.mtp:
                 block.attn.prefetch_stream = self.prefetch_stream
-                block.attn.prefetch_events = [torch.npu.Event() for _ in range(PREFETCH_ATTN_EVENT_NUM)]
+                block.attn.prefetch_events = self.events["prefetch_events"]
 
     def _build_decoder(self, config: DeepseekV3Config, prefix: str, **kwargs):
         return DSparkInputModel(

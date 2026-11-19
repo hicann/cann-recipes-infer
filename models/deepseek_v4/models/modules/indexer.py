@@ -112,7 +112,7 @@ class Indexer(nn.Module):
         self.indexer_events = []
         if self.enable_multi_streams:
             # 2 is number of events used for event synchronization
-            self.indexer_events = [torch.npu.Event(), torch.npu.Event()]
+            self.indexer_events = kwargs["events"]["indexer_events"]
 
         self.cp_size = self.infer_config.parallel_config.cp_size
         self.global_rank = kwargs.get("global_rank")

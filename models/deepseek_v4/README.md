@@ -210,7 +210,7 @@ docker run -u root -itd --name cann_recipes_infer --ulimit nproc=65535:65535 --i
 
   | 参数名 | 类型 | 默认值 | 含义 |
   | --- | --- | --- | --- |
-  | `enable_multi_streams` | bool | `false` | 启用模型内多流并行，主要用于 decode 阶段 MLA、Indexer、Compressor、MoE shared expert 等模块的并行调度。 |
+  | `enable_multi_streams` | bool | `false` | 启用模型内多流并行，主要用于 decode 阶段 MLA、Indexer、Compressor、MoE shared expert 等模块的并行调度；同一模型实例内顺序执行的层（含 DSpark proposal blocks）复用同步 Event，减少逐层分配开销，无需额外配置。 |
   | `enable_limit_core` | bool | `false` | 在 Atlas A3 上配合多流使用，对部分算子限制 AI Core 数以提升多流重叠效果；开启时要求 `enable_multi_streams=True`，且不支持 `enable_pypto=True`。 |
   | `enable_pypto` | bool | `false` | 启用 PyPTO 算子路径；当前与 `enable_limit_core` 互斥。 |
   | `moe_chunk_max_len` | int | `65536` | MoE token 分发的最大 chunk 长度，用于长序列 prefill 场景规避 OOM。 |

@@ -316,8 +316,8 @@ class DeepseekV3MoE(nn.Module):
         self.npu_events = []
         self.shared_expert_event = []
         if self.enable_multi_streams:
-            self.npu_events = [torch.npu.Event(), torch.npu.Event()]
-            self.shared_expert_event = [torch.npu.Event()]
+            self.npu_events = kwargs["events"]["npu_events"]
+            self.shared_expert_event = kwargs["events"]["shared_expert_event"]
 
         self.intermediate_size_per_rank = self.intermediate_size // self.moe_tp_size
         self.shared_expert_rank_num = 0 # route and share on same card
@@ -904,7 +904,7 @@ class Attention(nn.Module):
         self.mla_events = []
         if self.enable_multi_streams:
             # 4 is number of events used for event synchronization
-            self.mla_events = [torch.npu.Event(), torch.npu.Event(), torch.npu.Event(), torch.npu.Event()]
+            self.mla_events = kwargs["events"]["mla_events"]
 
         self.enable_limit_core = self.infer_config.model_config.custom_params.get("enable_limit_core", False)
         self.enable_prefetch = self.infer_config.model_config.custom_params.get("enable_prefetch", False) \
@@ -938,7 +938,7 @@ class Attention(nn.Module):
         if self.enable_compressor_parallel:
             self.cmpr_aic_num = 16
             # 2 is number of events used for event synchronization
-            self.cmpr_events = [torch.npu.Event(), torch.npu.Event()]
+            self.cmpr_events = kwargs["events"]["cmpr_events"]
 
         self.aiv_to_aic_ratio = 2 # keep aiv_num = 2 * aic_num
         self.mm_quant_mode = (
@@ -2204,7 +2204,7 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
             # inject the stream and the shared event table into each attention
             for layer in self.layers:
                 layer.attn.prefetch_stream = self.prefetch_stream
-                layer.attn.prefetch_events = [torch.npu.Event() for _ in range(PREFETCH_ATTN_EVENT_NUM)]
+                layer.attn.prefetch_events = kwargs["events"]["prefetch_events"]
 
     def _init_decoder(self, config: DeepseekV3Config, **kwargs):
         """Construct decoder parameters; input-only subclasses override this hook."""
@@ -2679,6 +2679,25 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
         self.enable_static_kernel = self.infer_config.model_config.enable_static_kernel
         self.enable_npugraph_ex = self.infer_config.model_config.exe_mode == "npugraph_ex"
         self.enable_multi_streams = self.infer_config.model_config.custom_params.get("enable_multi_streams", False)
+        # Shared by sequential layers; submit all waits before re-recording a slot.
+        # MLA A3 prefill: 0/1 main->MLA (input/QR ready), 2/3 MLA->main (WKV/KV vectors done).
+        # MLA decode: 0 main->MLA (after WQ-A on A3, before on 950), 1/2 MLA->main (WKV/KV vectors done).
+        # DSpark: 0 main->MLA (input ready), 1 MLA->main (KV ready); slots 2/3 unused.
+        # Compressor/Indexer: 0 main->side (input ready), 1 side->main (output ready).
+        # Compressor slot 1 is also waited by the A3 Indexer before Q quantization.
+        # MoE: npu_events 0 main->shared (input), 1 shared->main (output);
+        # shared_expert_event 0 main->shared down projection (routed GMM done).
+        # Prefetch slots 0/1/2/3: main->prefetch for WQ-A/WQ-B/WO-A/WO-B.
+        event_counts = {"mla_events": 4, "cmpr_events": 2, "indexer_events": 2,
+                        "npu_events": 2, "shared_expert_event": 1}
+        self.events = {
+            name: [torch.npu.Event() for _ in range(count)] if self.enable_multi_streams else []
+            for name, count in event_counts.items()
+        }
+        self.events["prefetch_events"] = (
+            [torch.npu.Event() for _ in range(PREFETCH_ATTN_EVENT_NUM)]
+            if self.enable_multi_streams and self.enable_npugraph_ex
+            and self.infer_config.model_config.custom_params.get("enable_prefetch", False) else [])
         self.metadata_event = []
         if self.enable_multi_streams:
             self.metadata_event = [torch.npu.Event(), torch.npu.Event()]
@@ -2691,7 +2710,8 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
             raise ValueError("separate MLA requires LOCAL_RANK + RANK_OFFSET == parallel_config.global_rank.")
         kwargs = {
                     "global_rank": self.global_rank,
-                    "is_mtp": is_mtp
+                    "is_mtp": is_mtp,
+                    "events": self.events,
                 }
         self.init_parallel_comm_group()
         self.batch_size_per_rank = self.infer_config.scheduler_config.batch_size_per_dp_rank
@@ -2748,7 +2768,7 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
                     for layer in (self.model.layers.values() if is_mtp else self.model.layers):
                         attn = layer.attn
                         attn.prefetch_stream = self.prefetch_stream
-                        attn.prefetch_events = [torch.npu.Event() for _ in range(PREFETCH_ATTN_EVENT_NUM)]
+                        attn.prefetch_events = self.events["prefetch_events"]
 
             # lm_head: state lives on ForCausalLM, resolved via lm_head_ref
             lm_head_size = pf_cfg.get("LM_HEAD_FIXED_SIZE", 0)
