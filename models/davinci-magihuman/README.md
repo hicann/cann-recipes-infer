@@ -74,6 +74,8 @@ git clone https://gitcode.com/cann/cann-recipes-infer.git
 cp -rn daVinci-MagiHuman/inference cann-recipes-infer/models/davinci-magihuman/
 ```
 
+#### 复制资源并安装依赖
+
 此刻，`cann-recipes-infer/models/davinci-magihuman/inference`包含了完整的Python脚本文件，同时也包含了NPU适配与优化的代码。
 
 将daVinci-MagiHuman仓库的assets目录代码复制到本项目目录下：
@@ -503,3 +505,83 @@ dit_cache:
 |参数名|类型|默认值|含义|
 |-----|----|-----|----|
 | method | str | - | DiT cache采用的方法，本样例不开启cache |
+
+## INT8 W8A8 量化
+
+默认从 BF16 权重目录加载；将 `engine_config.load` 指向转换后的权重目录，即可根据其中的 `config.json` 自动识别混合 W8A8 量化。量化策略见[优化文档](../../docs/models/davinci-magihuman/davinci-magihuman_optimization.md#模型私有混合-w8a8-量化)。
+
+当前支持单 rank（所有并行维度为 1）、eager 模式和 BF16 输入，INT8 后端必须在 NPU 执行。以下情况会直接报错：量化方式或字段类型不受支持、并行度或编译模式超出支持范围、权重文件缺失或摘要不匹配、张量形状或 dtype 错误、量化 scale 非有限或非正。报错不会静默改用 BF16 MatMul；有限值检查仅用于离线转换和 CPU 权重加载，不在推理的激活路径执行。
+
+### 1. 转换权重
+
+先按前文合并固定版本的上游代码，在 `models/davinci-magihuman` 目录安装模型依赖及 `safetensors`。输入为完整、未压缩的 `model.safetensors`，或由 `model.safetensors.index.json` 索引的 shards；压缩的 `.zst` 文件须先解压到独立目录，保持索引中的文件名。
+
+`config/int8_conversion.json` 提供此前 A3 实测候选使用的完整 150 层 `quantization_config.ignored_layers` 清单，对应 40 层 DiT 的 160 个候选投影中保留以下 10 个 INT8 投影，其余 150 个保持 BF16：
+
+- `block.layers.0.attention.linear_qkv`
+- `block.layers.0.attention.linear_proj`
+- `block.layers.0.mlp.up_gate_proj`
+- `block.layers.{4,5,7,9,11,13,38}.attention.linear_proj`（分别对应 7 个完整层名）
+
+```bash
+python -m inference.model.quantization.checkpoint \
+  --source /path/to/models/daVinci-MagiHuman/base \
+  --output /path/to/models/daVinci-MagiHuman/int8 \
+  --config config/int8_conversion.json
+```
+
+`--config` 读取转换配方中的 `quantization_config.ignored_layers`；转换器在输出权重目录生成 `config.json`，写入量化方式及忽略层清单。推理直接读取该文件，无需在推理参数或 manifest 中重复维护忽略层。源目录已有的其他 `config.json` 字段会保留。
+
+也可不使用配方文件，改为每个敏感投影传一项 `--ignore`；`--config` 与 `--ignore` 不能同时使用，两者均不传时转换所有匹配投影。未知层名、重复忽略项、全部忽略或已量化的输入会报错。转换器不修改源权重，不覆盖已有输出目录；失败后重试须使用新的输出路径。
+
+上述命令复现层选择，但未启用输入通道平滑。此前实测候选还使用了真实校准统计及 `alpha=0.7`，复现该平滑配置需按第 3 节提供对应统计。层选择和校准统计需结合自己的输入验证质量，不能仅凭此清单认定新场景的质量或性能。
+
+转换完成后，输出目录包含混合精度权重 shards、索引、`config.json` 和 `quantization_manifest.json`。manifest 记录张量信息及文件摘要，包含 `config.json` 的摘要，不再重复保存忽略层清单。加载时需要完整目录，请勿只复制 INT8 权重或单独修改文件。本版 manifest schema 为 2；旧版产物须重新转换。转换按 shard 处理，运行前需预留可同时容纳当前输入、输出 shard 和 FP32 中间量的主机内存。
+
+### 2. 配置、加载与推理
+
+修改 `config/int8_config.json` 的资源路径，将 `engine_config.load` 设置为本次转换的输出目录。推理配置无需增加 `quantization_config`，也无需给上游 `MagiPipelineConfig` 打补丁。
+
+权重目录 `config.json` 中由转换器生成的 `quantization_config` 字段如下：
+
+| 字段 | 要求 |
+| --- | --- |
+| `ignored_layers` | 显式保持 BF16 的完整投影清单，由转换配方生成 |
+| `mode` / `activation_method` | 固定为 `w8a8` / `dynamic` |
+| `weight_granularity` / `activation_granularity` | 固定为 `per_channel` / `per_token` |
+| `symmetric` / `fallback_dtype` | 固定为 `true` / `bfloat16` |
+| `invalid_metadata_policy` | 固定为 `error` |
+
+`fallback_dtype` 仅描述显式忽略层的类型，不代表出错后的自动回退。未知字段和错误类型均拒绝。普通 BF16 权重目录没有 `quantization_config` 时继续使用原加载流程；存在量化 manifest 却缺失量化配置时直接报错，并提示重新转换。
+
+```bash
+bash infer.sh int8
+```
+
+该命令读取 `config/int8.yaml` 及其指定的 `config/int8_config.json`，从 `engine_config.load` 加载权重并自动识别量化方式。加载会校验配置和权重文件摘要、张量信息及完整层覆盖；失败时先核对产物是否完整，必要时重新转换，勿通过修改 manifest 绕过校验。与 BF16 对比时，请对齐 prompt、seed、steps、时长、分辨率及缓存设置。
+
+### 3. 可选输入通道平滑
+
+转换器可读取已有的真实输入通道统计，执行 `X/s, W*s` 平滑；未传 `--calibration` 时不启用。统计必须来自原 BF16 模型的 Linear 输入，且每个目标专家均有真实观测。
+
+```bash
+python -m inference.model.quantization.checkpoint \
+  --source /path/to/models/daVinci-MagiHuman/base \
+  --output /path/to/models/daVinci-MagiHuman/int8-smoothed \
+  --config config/int8_conversion.json \
+  --calibration /path/to/models/calibration-selected --alpha 0.7
+```
+
+`alpha` 范围为 `[0,1]`，默认 0.5；`alpha=0` 仍启用平滑。转换完成后，将 `config/int8_config.json` 中的 `engine_config.load` 改为本次输出的 `/path/to/models/daVinci-MagiHuman/int8-smoothed`，再执行 `bash infer.sh int8`。
+
+校准目录含 `calibration.json` 和 FP32 safetensors 统计文件。JSON 必需字段如下：
+
+| 字段 | 契约 |
+| --- | --- |
+| `schema_version` / `kind` | `1` / `davinci-input-channel-amax-v1` |
+| `source_sha256` | 所有源 shard 文件名到实际 SHA256 的映射 |
+| `statistics_file` / `statistics_sha256` | 本目录内统计文件名及实际 SHA256 |
+| `provenance` | `capture=forward_pre_hook_before_linear`；建议记录 `model_revision`、`prompts`、`seeds`、`diffusion_steps`、`samples` 以便复现，其余字段原样保留 |
+| `modules` | 每个目标的正整数 `experts`、`in_features`、`out_features`，以及长度为专家数、各项为正的 `observations` |
+
+统计张量键、`modules` 键必须与转换 targets 完全相同；每个张量为 `[E,K]`、FP32、有限非负。改变忽略清单后须提供对应目标子集的统计及更新后的 hash，不能伪造缺失专家的观测。转换产物保留校准副本；加载时重新验证来源、覆盖范围、维度、hash 和平滑 scale。摘要校验用于核对文件一致性，不替代可信来源认证。

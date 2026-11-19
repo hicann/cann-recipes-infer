@@ -158,6 +158,14 @@ daVinci-MagiHuman开源代码是在H100 GPU（显存80GB）设备上运行的，
 
 详细改动可以对比本仓库与开源代码仓这2个文件的差异。
 
+## 模型私有混合 W8A8 量化
+
+针对 DiT 注意力和前馈网络的线性投影，采用动态 per-token 激活量化与 per-output-channel 权重量化，以降低权重存储和矩阵计算开销。对精度敏感的投影保留 BF16，兼顾量化收益与生成质量。
+
+可选输入通道平滑利用校准统计，将激活中的异常值影响转移到权重侧，缓解激活量化误差。量化层选择与平滑参数需结合实际生成质量验证，端到端收益需通过实测确认。
+
+权重转换、加载及平滑配置步骤见 [README](../../../models/davinci-magihuman/README.md#int8-w8a8-量化)。
+
 ## FA MXFP8 动态量化（Ascend 950）
 
 daVinci-MagiHuman 的 DiT 注意力支持通过配置开关切换到 MXFP8 动态量化执行：Q/K/V 经 `module/fa_quant` 的 `npu_mxfp8_quant` 动态量化为 FP8 E4M3（scale 为 e8m0，逐 token / 每 64-token 组动态产出），注意力经 `npu_fused_infer_attention_score_v2` 以 MXFP8 quant mode 计算，输出恢复原 dtype。该能力依赖 **CANN ≥ 9.1.0** 与 Ascend 950（950PR 实测通过）。支持范围以实测为准，见下表：

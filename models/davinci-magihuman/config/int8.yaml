@@ -1,0 +1,32 @@
+# Copyright (c) 2026 Huawei Technologies Co., Ltd.
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+model_args:
+  config-load-path: "config/int8_config.json"
+  seed: 42
+  seconds: 5
+  br_width: 448
+  br_height: 256
+  output_path: "output_int8"
+
+model_name: "daVinci-MagiHuman"
+world_size: 1
+master_port: 29600
+entry_script: "sample_video.py"
+
+env_vars:
+  TORCH_COMPILE_DISABLE: "1"
+  MAGI_COMPILE_COMPILE_MODE: "NONE"
+
+dit_cache:
+  method: "NoCache"

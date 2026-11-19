@@ -19,8 +19,10 @@
 import gc
 
 import torch
+
 from inference.infra.checkpoint import load_model_checkpoint
 from inference.infra.distributed import get_cp_rank, get_pp_rank, get_tp_rank
+from inference.model.quantization.config import load_quantization_config
 from inference.utils import print_mem_info_rank_0, print_model_size, print_rank_0
 
 from .dit_module import DiTModel, MultiModalityRMSNorm
@@ -28,9 +30,21 @@ from .dit_module import DiTModel, MultiModalityRMSNorm
 
 def get_dit(model_config, engine_config, device=None):
     """Build and load DiT model."""
-    model = DiTModel(model_config=model_config)
+    if load_quantization_config(engine_config.load) is not None:
+        from inference.model.quantization.checkpoint import load_quantized
+        from inference.model.quantization.config import validate_execution
 
-    print_rank_0("Build dit model successfully")
+        validate_execution(engine_config)
+        # Avoid allocating a full BF16 copy before streaming the mixed checkpoint.
+        with torch.device("meta"):
+            model = DiTModel(model_config=model_config)
+        model = load_quantized(model, engine_config.load)
+        print_rank_0("Loaded strict W8A8 mixed checkpoint (INT8 weight / FP32 channel scale)")
+    else:
+        model = DiTModel(model_config=model_config)
+        model = load_model_checkpoint(model, engine_config)
+
+    print_rank_0("Build and load dit model successfully")
     print_rank_0(model)
     print_model_size(
         model,
@@ -38,7 +52,6 @@ def get_dit(model_config, engine_config, device=None):
         print_func=print_rank_0,
     )
 
-    model = load_model_checkpoint(model, engine_config)
     if device is None:
         model.cuda(torch.cuda.current_device())
     else:

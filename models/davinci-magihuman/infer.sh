@@ -34,11 +34,11 @@ export MODEL_DIR="$(basename "$SCRIPT_PATH")"
 export YAML_PARENT_PATH="${SCRIPT_PATH}/config"
 
 case "${MODE}" in
-    base|base_ti2v|distill|distill_ti2v|sr_540p|sr_540p_ti2v|sr_1080p|sr_1080p_ti2v|fa_mxfp8)
+    int8|base|base_ti2v|distill|distill_ti2v|sr_540p|sr_540p_ti2v|sr_1080p|sr_1080p_ti2v|fa_mxfp8)
         ;;
     *)
         echo "[ERROR] Unknown mode: ${MODE}"
-        echo "Usage: bash infer.sh <base|base_ti2v|distill|distill_ti2v|sr_540p|sr_540p_ti2v|sr_1080p|sr_1080p_ti2v|fa_mxfp8>"
+        echo "Usage: bash infer.sh <int8|base|base_ti2v|distill|distill_ti2v|sr_540p|sr_540p_ti2v|sr_1080p|sr_1080p_ti2v|fa_mxfp8>"
         exit 1
         ;;
 esac
