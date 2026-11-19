@@ -21,12 +21,12 @@
 **GLM-5.3-W8A8 模型, dataset: InfiniteBench,  prompt length: 65536**
 | 执行模式 | 配置 | 全局 batch | 缓存池容量 | 主+MTP3 延迟 | 吞吐（2.7 假设） | 吞吐（实测） | HBM Usage|
 | --- | --- | ---: | ---: | ---: | ---: | ---: |---: |
-| NPUGraph Ex | 无 Offload | 64 | - | 64.85 ms | 2,664.61 token/s | 3,038.94 token/s |
-| NPUGraph Ex | 共享 Indexer Offload | 64 | 8K | 78.80 ms | 2,192.89 token/s | 2,500.98 token/s |
-| NPUGraph Ex | 共享 Indexer Offload | 64 | 16K | 75.27 ms | 2,295.74 token/s | 2,619.73 token/s |
-| NPUGraph Ex | AVSG | 64 | 8K | 76.02 ms | 2,273.09 token/s | 2,645.72 token/s |
-| NPUGraph Ex | 共享 Indexer Offload | 128 | 8K | 99.18 ms | 3,484.57 token/s | 3,964.08 token/s |
-| NPUGraph Ex | 共享 Indexer Offload | 128 | 16K | 90.33 ms | 3,825.97 token/s | 4,353.74 token/s |
+| NPUGraph Ex | 无 Offload | 64 | - | 64.85 ms | 2,664.61 token/s | 3,038.94 token/s | - |
+| NPUGraph Ex | 共享 Indexer Offload | 64 | 8K | 78.80 ms | 2,192.89 token/s | 2,500.98 token/s | - |
+| NPUGraph Ex | 共享 Indexer Offload | 64 | 16K | 75.27 ms | 2,295.74 token/s | 2,619.73 token/s | - |
+| NPUGraph Ex | AVSG | 64 | 8K | 76.02 ms | 2,273.09 token/s | 2,645.72 token/s | - |
+| NPUGraph Ex | 共享 Indexer Offload | 128 | 8K | 99.18 ms | 3,484.57 token/s | 3,964.08 token/s | - |
+| NPUGraph Ex | 共享 Indexer Offload | 128 | 16K | 90.33 ms | 3,825.97 token/s | 4,353.74 token/s | - |
 | NPUGraph Ex | AVSG | 128 | 8K | 89.60 ms | 3,857.14 token/s | 4,489.65 token/s |57054/ 65536|
 | NPUGraph Ex | 共享 Indexer Offload | 256|-|-|-|-|-|
 | NPUGraph Ex | AVSG | 256 | 8K | 138.46 ms | 4,992.06 token/s | 4,494.38 token/s |62039/ 65536|
@@ -40,8 +40,8 @@
 | GE Graph | 共享 Indexer Offload | 128 | 8K | 101.86 ms | 3,392.89 token/s | 3,834.63 token/s |59GB|
 | GE Graph | 共享 Indexer Offload | 128 | 16K | 97.96 ms | 3,527.97 token/s | 3,988.78 token/s |62GB|
 | GE Graph | AVSG | 128 | 8K | 89.45 ms | 3,863.61 token/s | 4,367.11 token/s |57GB|
-| GE Graph | 共享 Indexer Offload | 256 | 8K | OOM|
-| GE Graph | 共享 Indexer Offload | 256 | 16K | OOM|
+| GE Graph | 共享 Indexer Offload | 256 | 8K | OOM | - | - | - |
+| GE Graph | 共享 Indexer Offload | 256 | 16K | OOM | - | - | - |
 | GE Graph | AVSG | 256 | 8K | 120.23 ms | 5,748.98 token/s | 6,608.16 token/s |62GB|
 
 ## 从数据中可归纳：

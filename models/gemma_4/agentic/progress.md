@@ -1070,7 +1070,7 @@ output = sum_r output_rank_r = sum_{all experts} weight(token, e) * expert_e(inp
 |---|------|------|-----|
 | 1 | `ModuleNotFoundError: No module named 'models.gpt_oss'` | `models/gemma4_26b_a4b/models/__init__.py` 是空文件，导致模型目录下的 `models/` 变成常规 package 遮蔽 repo 顶层 namespace package | 删掉该文件，和 `qwen3_moe`/`gpt_oss` 对齐 |
 | 2 | Prefill `aclnnGroupedMatmul` 报 `Dim 1 of x (2816) != Dim 1 of weight (1408)` | MoE weight 没被转置成 GMM 需要的 [num_experts, 2N, K] 布局 | 加 `Gemma4ForCausalLM.process_weights_after_loading()` 遍历 module 触发 `quant_method.process_weights_after_loading` |
-| 3 | Decode `aclnnFusedInferAttentionScoreV3` 报 `atten_mask batchSize (2048) != query batchSize (1)` | forward_metadata 的 attention_mask 是 prefill 的 causal，decode 不适用。Attention.forward decode 分支改 `atten_mask=None` |
+| 3 | Decode `aclnnFusedInferAttentionScoreV3` 报 `atten_mask batchSize (2048) != query batchSize (1)` | forward_metadata 的 attention_mask 是 prefill 的 causal，decode 不适用 | Attention.forward decode 分支改 `atten_mask=None` |
 | 4 | ge_graph 模式编译时 `aclnnMoeInitRouting` 报 `Dim 0 of x/row_idx mismatch` | `Gemma4SparseMoeBlock.__init__` 用了全局 batch_size=8 构造 `row_idx_decode`，但 per-rank batch 是 1。Eager dynamic shape 能工作，ge_graph 静态 shape 不行 | 改用 `infer_config.scheduler_config.batch_size_per_dp_rank` |
 | 5 | 8 卡 `infer.sh` 启动时 `ModuleNotFoundError: No module named 'models.gpt_oss'` | `models/gemma4_26b_a4b/models/__init__.py` 把 models 变成 package，cd 进 model dir 后屏蔽了仓库根的 namespace package 查找 | 删掉该 `__init__.py` |
 
