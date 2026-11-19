@@ -151,9 +151,9 @@ def load_mmmu_dataset(data_path, max_samples=0):
     return prompts,sample_ids,ground_truths
 
 def export_mmmu_results(results, sample_ids, ground_truths, output_path, suffix=""):
-    """Write MMMU predictions and references as a JSON array."""
+    """Write equally many MMMU predictions, IDs and references as a JSON array."""
     mmmu_results=[]
-    for result, sid, gt in zip(results, sample_ids,ground_truths):
+    for result, sid, gt in zip(results, sample_ids, ground_truths, strict=True):
         answer = result.output_text if result.output_text else ""
         mmmu_results.append({"id": sid, "answer": answer, "ground_truth": gt})
     res_file = os.path.join(output_path, f"mmmu_results{suffix}.json")
