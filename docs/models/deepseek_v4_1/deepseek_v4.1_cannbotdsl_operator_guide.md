@@ -1,6 +1,6 @@
 # NPU DeepSeek-V4.1 CANNBot-DSL 融合算子优化
 
-面向 DeepSeek-V4.1 架构，本次在 Ascend 950 上使用 CANNBot-DSL 实现了 `engram_gate`、`attn_prologue`、`indexer_prologue_qw`、`indexer_prologue_k`、`quant_lightning_indexer`、`quant_sparse_lightning_indexer`、`mixed_quant_sparse_flash_mla` 和 `attn_epilogue` 八个算子。在模型逐层计算中，启用 Engram 的层首先执行残差门控；Attention 前处理生成 Query 并更新原始 KV Cache，两个 Indexer Prologue 生成索引 Query、Key 和打分权重，QLI/QSLI 按层配置选择压缩 KV 位置。SMLA 根据原始窗口和可选的压缩位置读取 KV 并计算 Attention，Attention Epilogue 对结果执行 inverse RoPE 和输出矩阵乘。各算子通过 CANNBot-DSL 指定数据布局与 Buffer 复用方式，安排计算和搬运流水，减少中间结果搬运与计算等待。
+面向 DeepSeek-V4.1 架构，本次在 Ascend 950 上使用 CANNBot-DSL 实现了 `mixed_quant_sparse_flash_mla`、`engram_gate`、`attn_prologue`、`indexer_prologue_qw`、`indexer_prologue_k`、`quant_lightning_indexer`、`quant_sparse_lightning_indexer` 和 `attn_epilogue` 八个算子。在模型逐层计算中，启用 Engram 的层首先执行残差门控；Attention 前处理生成 Query 并更新原始 KV Cache，两个 Indexer Prologue 生成索引 Query、Key 和打分权重，QLI/QSLI 按层配置选择压缩 KV 位置。SMLA 根据原始窗口和可选的压缩位置读取 KV 并计算 Attention，Attention Epilogue 对结果执行 inverse RoPE 和输出矩阵乘。各算子通过 CANNBot-DSL 指定数据布局与 Buffer 复用方式，安排计算和搬运流水，减少中间结果搬运与计算等待。
 
 ## Highlights
 
@@ -14,53 +14,53 @@
 
 - [CANNBot-DSL 的关键能力](#cannbot-dsl-的关键能力)
 - [DeepSeek-V4.1 Attention 整体结构](#deepseek-v41-attention-整体结构)
-- [Engram Gate](#engram-gate)
+- [Mixed Quant Sparse Flash MLA](#mixed-quant-sparse-flash-mla)
   - [计算流程](#计算流程)
   - [Tiling 设计](#tiling-设计)
   - [优化实现](#优化实现)
-    - [向量归约](#向量归约)
-    - [Buffer 流水](#buffer-流水)
-- [Attention Prologue](#attention-prologue)
+    - [核内流水与片上数据复用](#核内流水与片上数据复用)
+    - [稀疏 KV 寻址](#稀疏-kv-寻址)
+    - [稀疏 KV 搬运：UB 直写 L1](#稀疏-kv-搬运ub-直写-l1)
+- [Engram Gate](#engram-gate)
   - [计算流程](#计算流程-1)
   - [Tiling 设计](#tiling-设计-1)
   - [优化实现](#优化实现-1)
+    - [向量归约](#向量归约)
+    - [Buffer 流水](#buffer-流水)
+- [Attention Prologue](#attention-prologue)
+  - [计算流程](#计算流程-2)
+  - [Tiling 设计](#tiling-设计-2)
+  - [优化实现](#优化实现-2)
     - [输入驻留与权重搬运](#输入驻留与权重搬运)
     - [4 Buffer 循环与跨阶段流水](#4-buffer-循环与跨阶段流水)
     - [连续权重面板](#连续权重面板)
     - [A2 批量归约](#a2-批量归约)
 - [Indexer Prologue QW](#indexer-prologue-qw)
-  - [计算流程](#计算流程-2)
-  - [Tiling 设计](#tiling-设计-2)
-  - [优化实现](#优化实现-2)
-    - [Q/W 交替计算](#qw-交替计算)
-    - [小 T 的 W 归约](#小-t-的-w-归约)
-- [Indexer Prologue K](#indexer-prologue-k)
   - [计算流程](#计算流程-3)
   - [Tiling 设计](#tiling-设计-3)
   - [优化实现](#优化实现-3)
-    - [目标行分核与 Cache 写入](#目标行分核与-cache-写入)
-    - [非对齐数据处理](#非对齐数据处理)
-- [Quant Lightning Indexer](#quant-lightning-indexer)
+    - [Q/W 交替计算](#qw-交替计算)
+    - [小 T 的 W 归约](#小-t-的-w-归约)
+- [Indexer Prologue K](#indexer-prologue-k)
   - [计算流程](#计算流程-4)
   - [Tiling 设计](#tiling-设计-4)
   - [优化实现](#优化实现-4)
+    - [目标行分核与 Cache 写入](#目标行分核与-cache-写入)
+    - [非对齐数据处理](#非对齐数据处理)
+- [Quant Lightning Indexer](#quant-lightning-indexer)
+  - [计算流程](#计算流程-5)
+  - [Tiling 设计](#tiling-设计-5)
+  - [优化实现](#优化实现-5)
     - [Channel 供给与流水](#channel-供给与流水)
     - [QK UB 错位布局](#qk-ub-错位布局)
     - [分数驻留、直方图与选择](#分数驻留直方图与选择)
 - [Quant Sparse Lightning Indexer](#quant-sparse-lightning-indexer)
-  - [计算流程](#计算流程-5)
-  - [Tiling 设计](#tiling-设计-5)
-  - [优化实现](#优化实现-5)
-    - [联合记录与稀疏搬运](#联合记录与稀疏搬运)
-    - [地址生成与 Scalar 优化](#地址生成与-scalar-优化)
-    - [多级流水与行间预取](#多级流水与行间预取)
-- [Mixed Quant Sparse Flash MLA](#mixed-quant-sparse-flash-mla)
   - [计算流程](#计算流程-6)
   - [Tiling 设计](#tiling-设计-6)
   - [优化实现](#优化实现-6)
-    - [核内流水与片上数据复用](#核内流水与片上数据复用)
-    - [稀疏 KV 寻址](#稀疏-kv-寻址)
-    - [稀疏 KV 搬运：UB 直写 L1](#稀疏-kv-搬运ub-直写-l1)
+    - [联合记录与稀疏搬运](#联合记录与稀疏搬运)
+    - [地址生成与 Scalar 优化](#地址生成与-scalar-优化)
+    - [多级流水与行间预取](#多级流水与行间预取)
 - [Attention Epilogue](#attention-epilogue)
   - [计算流程](#计算流程-7)
   - [Tiling 设计](#tiling-设计-7)
@@ -71,7 +71,7 @@
 
 ## CANNBot-DSL 的关键能力
 
-CANNBot-DSL 基于协程模型，以 Tensor、Layout、Buffer 和 Channel 作为算子编程的领域抽象。Kernel 以 Tensor 作为数据操作对象；Layout 表达 Tile 的切分及其在核间、核内的调度；Buffer 管理片上数据的存放与复用；Channel 串联异步计算与搬运，按数据的生产和消费关系自动插入同步，并在循环处理 Tile 时切换 Buffer。开发者通过这些抽象安排 Tiling、Tile 调度和计算搬运流水，在保持算子性能的同时减少手工处理地址、同步和 Buffer 切换的工作。下文以 GM 表示全局内存，以 L1、L0A/L0B/L0C 和 UB 表示片上存储。
+CANNBot-DSL 基于协程模型，以 Tensor、Layout、Buffer 和 Channel 作为算子编程的领域抽象。Kernel 以 Tensor 作为数据操作对象；Layout 表达 Tile 的切分及其在核间、核内的调度；Buffer 管理片上数据的存放与复用；Channel 串联异步计算与搬运，按数据的生产和消费关系自动插入同步，并在循环处理 Tile 时切换 Buffer。开发者通过这些抽象安排 Tiling、Tile 调度和计算搬运流水，在保持算子性能的同时减少手工处理地址、同步和 Buffer 切换的工作。CANNBot-DSL 的 Tensor、Layout、Buffer 和 Channel 抽象便于智能代理理解数据流、生成算子代码并安排计算与搬运。开发者与智能代理因此能够快速编写融合算子，同时通过片上数据复用和流水调度达成极致性能。此前融合算子的开发数量受到研发产能限制；本次借助 DSL 对智能代理友好的接口和更高的开发产能，完成多个融合算子，减少了中间结果的写回与重新读取，获得显著的融合收益。
 
 | 开发任务 | DSL 能力 | 作用 |
 | --- | --- | --- |
@@ -88,6 +88,105 @@ CANNBot-DSL 基于协程模型，以 Tensor、Layout、Buffer 和 Channel 作为
 `attn_prologue` 生成 Attention Query 并更新原始 KV Cache。模型 Compressor 形成压缩 Latent，`indexer_prologue_qw` 生成索引 Query 和打分权重，`indexer_prologue_k` 生成索引 K。索引源层使用 QLI 在可见压缩位置中选择 TopK；启用候选块时，后续指定层使用 QSLI 在候选范围内重新选择。压缩 KV 和索引结果可供后续层复用。
 
 `mixed_quant_sparse_flash_mla` 读取滑窗原始 KV 与选中的压缩 KV，两路分数使用同一归一化分母；`attn_epilogue` 对结果执行 inverse RoPE 和输出矩阵乘。
+
+## Mixed Quant Sparse Flash MLA
+
+在 `mixed_quant_sparse_flash_mla` 算子的测试配置中，MFU 已达 92.7%。该结果体现了 CANNBot-DSL 在复杂融合算子中的极致性能。
+
+### 计算流程
+
+![Mixed Quant Sparse Flash MLA 的混合量化流水](figures/mixed_quant_mla_pipeline.png)
+
+`mixed_quant_sparse_flash_mla` 使用 BF16 Attention Q，按照稀疏索引从 Paged KV Cache 中读取共享 KV。原始 KV 池使用 FP8 E4M3 存储，压缩 KV 池使用 FP4 E2M1 打包存储。计算包含只读取原始 KV 和同时读取原始、压缩 KV 两种路径。Query head 数为 64，逻辑 head dimension 为 512，KV head 数为 1；Query 按 TND 布局组织。每个 KV 向量按 `nope[448] | rope[64]` 排列，反量化后同一向量同时用作 Key 和 Value。
+
+对于同一 Query 行，两侧 KV 产生的有效 Attention 分数共同参与在线 Softmax。Attention Sink 作为额外的归一化项参与最大值与分母更新，不对应需要读取的 Value 行。在线计算保留运行中的最大值、指数和以及未归一化输出；处理完所有有效 KV tile 后再完成归一化与可选 LSE 输出。因此，原始与压缩两侧的贡献可以在同一组 Softmax 状态中累积。
+
+设当前 tile 中的 Attention 分数为 $x_j$、共享 KV 向量为 $v_j$。每个 Query head 的在线状态可写为最大值 $m$、指数和 $l$ 与未归一化输出 $o$。对于新 tile，计算
+
+$$
+\begin{aligned}
+m'&=\max\left(m,\max_j x_j\right),\\
+\alpha&=\exp(m-m'),\\
+l'&=\alpha l+\sum_j\exp(x_j-m'),\\
+o'&=\alpha o+\sum_j\exp(x_j-m')v_j.
+\end{aligned}
+$$
+
+处理第一块 KV 前，以 Sink 分数初始化 $m$，并令 $l=1,o=0$；处理完所有 KV 后，输出为 $o/l$，可选的 Log-Sum-Exp 为 $m+\log l$。有效 KV 位置为空时，输出为零，LSE 等于 Sink 分数。如果一个 Query 的 KV 被分给多个计算核，各核的状态分别为 $(m_a,l_a,o_a)$ 和 $(m_b,l_b,o_b)$，按下式合并：
+
+$$
+\begin{aligned}
+m&=\max(m_a,m_b),\\
+l&=e^{m_a-m}l_a+e^{m_b-m}l_b,\\
+o&=e^{m_a-m}o_a+e^{m_b-m}o_b.
+\end{aligned}
+$$
+
+原始 KV、压缩 KV 与不同 S2 分片因此共享一组归一化状态。
+
+### Tiling 设计
+
+以 128 个 KV 位置为一个处理 tile，按照 Query 行与两侧有效稀疏 KV 长度划分任务；一行先处理原始 KV tile，再处理压缩 KV tile。每行覆盖 64 个 Query head，逻辑 head dimension 为 512。Cube 处理 64 个头与 128 个 KV 位置组成的矩阵块；两个 Vector 子核各负责 32 个 Query head。尾块按实际有效长度屏蔽多余位置。
+
+调度阶段根据每行有效长度生成任务范围。常规路径将完整 Query 行分配给一个 Cube 核；启用 Flash Decode 时，一行的 KV tile 可分给多个 Cube 核。各核将局部输出、最大值与指数和写入 Workspace，Vector 核再按在线 Softmax 合并公式归约。Sink 只在该行的第一个分片中初始化，避免重复计入分母。未拆分的行直接完成输出。
+
+### 优化实现
+
+#### 核内流水与片上数据复用
+
+![Mixed Quant Sparse Flash MLA 的 KV tile 计算流水与 L1 复用](figures/mixed_quant_mla_tile_pipeline.png)
+
+| 阶段 | 执行内容 |
+| --- | --- |
+| V0 · Vector | 根据稀疏索引和页表读取 KV；原始池每 32 个元素共用 FP8 scale，压缩池每 16 个元素共用 FP4 scale；反量化后生成 BF16 NZ 布局的共享 Key/Value，并直接写入 L1 |
+| C1 · Cube | 从 L1 读取反量化的 KV，计算 QK 分数，并将结果交给两个 Vector 子核 |
+| V1 · Vector | 按每个子核的 32 个 Query head 更新在线 Softmax 的最大值、指数和与权重 |
+| C2 · Cube | 复用 L1 中的共享 Value，计算 PV 分块 |
+| V2 · Vector | 将 PV 分块合入 FP32 输出状态；行末归一化，写出 BF16 输出和可选的 FP32 LSE |
+
+V0 在 UB 内完成量化数据解码、scale 读取、缩放与 NZ 布局写入，随后将 BF16 KV 直接写入 L1 的三个循环 Buffer。C1 与 C2 复用同一 KV tile；CANNBot-DSL 的 Channel 与跨核同步控制生产完成、矩阵乘读取和 Buffer 释放的顺序。延迟线记录 Query 行号、KV tile 号以及首尾标志，使相邻 tile 的反量化、QK、Softmax、PV 和输出更新交叠执行。
+
+输出在 FP32 Buffer 中累加并归一化。行末将 BF16 结果打包到该 Buffer 的可复用区域，再搬运至最终输出位置，减少额外的输出缓冲区。
+
+#### 稀疏 KV 寻址
+
+稀疏 KV gather 的源地址必须先由 `sparseIndices` 和存储映射确定，再据此发出 KV 搬运。地址**计算**和地址**取值**是不同的开销：即使批量向量化算出物理行号，V0 若仍逐项从 GM 地址表执行 Scalar `getValue`，后续 KV 搬运就依赖这些取值完成。
+
+在混合量化的分页 Cache 路径中，Vector 可对适合批量处理的布局预先计算稀疏索引对应的物理 KV 行，主循环读取预计算结果。其余布局在主循环中按页表和页内偏移生成地址。批量预计算将页表查询与地址生成移到 KV tile 处理之前。
+
+以下 BF16/TND 独立测试对照三种地址策略；其数据布局与前述分页量化 Cache 路径不同。
+
+![SMLA 的物理地址预计算、UB 预取与直接索引预取路径](figures/smla_scalar_address_paths.png)
+
+| 路径 | 地址生产与消费 | 保留的主要成本 |
+| --- | --- | --- |
+| 地址预计算对照 | Vector 从索引和映射计算物理行号，MTE3 写入 GM 地址表；V0 逐项从 GM 取行号 | GM `getValue` 与 KV 搬运之间的串行依赖 |
+| 方案一：物理地址预取 | 保留预计算和 GM 地址表；每个 V0 前以 MTE2 批量搬入 UB，再从 UB 取行号 | 地址表的生成、GM 写回与再次搬入 |
+| 方案二：直接索引预取 | 在目标 TND 路径上直接将 `sparseIndices` 搬入 UB，消费时结合序列 base/prefix 得到物理行号 | UB 取索引及少量 Scalar 加法 |
+
+对方案二所测的连续 TND 存储，地址关系简化为 $p_{b,j}=\operatorname{base}_b+i_{b,j}$，其中 $i_{b,j}$ 为稀疏索引。分页 Cache 的地址还由 block table、页内偏移和物理行距共同确定。方案二去掉了地址预计算输入搬运、Vector 行号计算、GM 地址表写回与回读，以及相应的中间缓冲和同步链路；地址表原先按 `[row,0]` 交错保存，每个逻辑地址占两个 `int32`，直接索引只需一个 `int32`。
+
+寻址路径用例均为 BF16、Q/KV TND、$B=1$、$S_1=4096$、$S_2=8192$、$N_1=64$、$N_2=1$、$D=512$，原始与压缩侧有效 TopK 分别为 128 和 512。两组只改变 mask 与 TopK 模式：用例一为原始/压缩 mask 模式 4/3、TopK 模式 no/no；用例二为 0/0、fullK/fullK。
+
+#### 稀疏 KV 搬运：UB 直写 L1
+
+GM 中转路径由 AIV 按稀疏索引离散读取 KV，在 UB 中形成 ND tile，再经 MTE3 写入 GM 临时缓冲。Cube 随后用 MTE2 将数据从 GM 搬入 L1，并在搬运中完成 ND→NZ 转置，供 BMM1/QK 与 BMM2/PV 使用。
+
+L1 直写路径由 AIV 的 VF 在 UB 中完成转置，再通过 MTE3 直接写入共享 L1 Buffer。Cube 等待跨核就绪通知后从 L1 读取，无需再执行这块 KV 的 GM→L1 搬运。
+
+![稀疏 KV 经 GM 中转与 UB 直写 L1 的数据通路、槽位和同步对照](figures/smla_sparse_kv_l1_path.png)
+
+| 环节 | 旧路径：UB→GM→L1 | 新路径：UB→L1 |
+| --- | --- | --- |
+| gather 后的布局 | UB 中为 ND | UB 中先由 VF 转为 NZ |
+| 中间写入 | AIV MTE3 写 GM 临时缓冲 | AIV MTE3 直接写共享 L1 槽 |
+| Cube 侧读取 | MTE2 执行 GM→L1 及 ND→NZ | 等待跨核就绪后从 L1 读取 |
+| 稀疏 KV 中间数据的 GM 往返 | 一次写入、一次读取 | 无 |
+| 同时在途 KV 缓冲区 | 三个 GM Buffer | 三个 L1 Buffer |
+
+若一个已 gather 的稀疏 KV tile 有效载荷为 $P$ 字节，只计这条**中间交接链路**，旧路径额外产生约 $P$ 字节 GM 写入和 $P$ 字节 GM 读取；新路径将这约 $2P$ 的 GM 流量移除，代价是 AIV 额外执行 UB 内转置与直写 L1。这里不计从原始 KV 存储 gather 的读取、其他 Attention 数据以及最终输出流量，因此不能把 $2P$ 当作整个算子的总 IO 降幅。
+
+L1 直写的 d-fractal 行距采用 `Align16(s2RealSize)`，与 Cube 搬入 L0B 时的 `srcStride=Align16(singleN)/16` 配对；非满 tile 的 tail 也按同一规则处理。两个 AIV 子块的写入行区按 16 行边界切分，避免并发更新同一 L1 存储行时覆盖有效数据。AIV 写入前等待 L1 Buffer 释放，写完发出跨核就绪通知；Cube 等待就绪后消费并归还 Buffer。该同步保护“复用前已释放、读取前已写完”两个方向的依赖。
 
 ## Engram Gate
 
@@ -136,18 +235,6 @@ $T=72$、$H=4$ 时共有 288 条向量任务。56 个 Vector 核分担这些任�
 输入 $x$、Key、Value 分别使用三组 UB Buffer 循环复用。当前行计算前发出后续行的 GM→UB 搬运，使后续行预取与当前行 Vector 计算交叠；输出使用两块 Buffer 交替承接相邻行，使上一行的 UB→GM 写回与当前行计算能够交叠。预取会检查下一行是否有效以及对应的 `image_mask`。`image_mask=True` 的 token 只读取 $x$ 并将其写入输出，跳过 Key、Value、权重的读取和门控计算。mask 选择与门控计算在同一 kernel 内完成；无 mask 路径省去条件分支。
 
 ![Engram Gate 的三组输入 Buffer 轮转、计算与两组输出 Buffer 交替](figures/engram_gate_pipeline.png)
-
-**性能结果。** 以下 kernel 时延在 Ascend950DT 上采集，设备提供 56 个 Vector 核；配置为 $D=5120$、$H=4$。`partial mask` 表示奇数 token 位置屏蔽，约占一半。每个用例采集 10 组 Device Task Duration，表中取各组目标 kernel 时长的中位数；每组目标执行前运行 256 MiB FP16 ArgMax 构造缓存状态，其时间不计入目标 kernel。
-
-| Token 数 $T$ | mask | kernel 时延 / µs |
-| ---: | --- | ---: |
-| 1 | 无 | 2.8630 |
-| 72 | 无 | 5.6500 |
-| 128 | 无 | 8.4385 |
-| 512 | 部分 | 22.1720 |
-| 1024 | 无 | 43.8015 |
-| 4096 | 无 | 191.2330 |
-| 8192 | 部分 | 354.3730 |
 
 ## Attention Prologue
 
@@ -213,15 +300,11 @@ B 阶段每个 AIC 负责两个 head，各 head 的 512 列分成两个 N256 面
 
 L1 权重面板和 L0 计算块可以采用不同粒度。增大 GM→L1 请求时，还要检查拆分消费、scale 覆盖范围与 Buffer 释放时刻。
 
-split-K=4 的配置可将 Workspace 减半，同时调度转为 7 个 N 分组、28 个有效 A1 任务，K1280 的 X 需要分段装入 L0A。X 有效数据的 GM→L1 搬运从 1.5625 MiB 增至 2.734375 MiB，L1→L0A 从 1.5625 MiB 增至 10.9375 MiB。该路径已通过精度验证，性能排序仍需设备时延数据。
-
 ### 优化实现
 
 #### 输入驻留与权重搬运
 
 A1 联合调度 QA/KV，使每个 AIC 的 X K640 分片在两支投影之间复用，并驻留在两个 K320 L0A Buffer 中。实验字节模型中，X 与 scale 的 GM→L1 搬运由 3,379,200 B 降至 1,689,600 B，X 有效数据的 L1→L0A 搬运由 11,468,800 B 降至 1,638,400 B。四个 N 分组仍各自读取 X；复用发生在单个 AIC 内。
-
-B 的 QR 数据驻留 L1 后，L1→L0A 搬运仍会随 N64 计算块重复发生。将 B 面板从 N128/K1280 调整为 N256/K640，并让同一 QR 块连续服务四个 N64 MMAD，QR 的 L1→L0A 总量由 50 MiB 降至 12.5 MiB；该轮完整算子时延为 56.9290→55.2675 µs。后续 4 Buffer 循环方案保留 N256 内复用，并用 K320 权重面板让 Buffer 更早释放。
 
 Wqb 权重数据合计 40 MiB，scale 为 1.25 MiB。早期每个 N64/K320 计算块分别读取权重与 scale，产生 `2048×20 KiB` 权重请求和 `2048×640 B` scale 请求。先把 scale 合并为 `64×20 KiB`，再把权重合并为 `256×160 KiB`，减少 DMA 请求与调度开销，权重总字节数保持不变。160 KiB 大块使 Buffer 释放变晚，因此后续改为 4 个 80 KiB Buffer，按 K320 面板的消费顺序循环预取。
 
@@ -231,39 +314,11 @@ Wqb 权重数据合计 40 MiB，scale 为 1.25 MiB。早期每个 N64/K320 计�
 
 ![Attention Prologue 的 4 Buffer 循环预取和权重、scale 复用顺序](figures/attn_prologue_preload.png)
 
-仅运行 B 阶段的单核仿真保持 64 次 MMAD 和 1,457,280 B 有效 GM→L1 数据不变，数据搬运窗口内部空隙由 2695 cycles 降至 0，Cube 内部空隙由 4754 降至 1096 cycles；完整 32 核算子的同轮时延为 55.4735→53.9810 µs。“0 gap”对应 B 阶段仿真的数据搬运窗口；完整算子还包含 A1、A2 和全核屏障。
-
-N128/K320 的 8 Buffer 方案在同轮冷缓存对照中由 53.712 µs 增至 55.913 µs；N512/K320 的 2 Buffer 方案由 53.6845 µs 增至 54.4900 µs。后者的数据搬运窗口同样没有内部空隙，但首次 Cube 计算启动更晚，说明面板选择还受计算启动时间与 Buffer 复用时机约束。
-
-A1 写完分片结果并经过第一道全核屏障后，AIV 执行 A2 归约、归一化与量化；同时 AIC 预取 B 阶段首批权重与 scale，这些数据不依赖 QR。第二道屏障之后 B 才读取 QR/scale。首批每核预取四块 80 KiB 权重与四块 5 KiB scale。该轮完整时延为 55.1205→53.0900 µs；两个数据依赖屏障仍保留。
-
 #### 连续权重面板
-
-全矩阵 `FRACTAL_NZ` 布局下，一个 N256/K320 面板由十段跨步的 8 KiB 数据组成。实验将面板内部 NZ 字节保持原次序，再把 512 个面板预排为连续 ND 字节矩阵 `[512,81920]`，使每个 80 KiB 面板可连续搬入；Cube 内部仍按 NZ 消费。该轮完整时延为 52.5440→50.3880 µs。预排须在权重加载阶段完成；CPU 预排单次约 40.992 ms。按同轮每次节省 2.156 µs 估算，约需 1.9 万次调用摊销准备成本。表中收益对应权重在加载阶段预排并复用的场景。
 
 #### A2 批量归约
 
 A2 原先逐份加载 8 个 split-K 分片结果，每份调用一次 VF，并反复读写 UB 中的累加值。批量版对每个 token、每条分支用一次 strided DMA 装入全部分片结果，在一个 VF 内按 split 0→7 的原 FP32 加法顺序归约。T=72 的 Workspace DMA/VF 调用数由 1152/1152 降至 144/144；有效 GM 分片数据读取仍为 4,128,768 B，UB 归约读写量由 11,870,208 B 降至 4,644,864 B。所测配置的 Q、QR、scale 与完整 Cache 同对照逐字节一致，并通过独立 FP64 值域判据。
-
-**完整算子性能。** 下表记录 T=72、32 AIC 的特化实现所做的七轮优化实验。每行分别在同一轮测试中测量修改前后的完整算子时长，单位 µs。不同轮次的基线会变化，各行降幅分别对应本轮修改。
-
-| 优化措施 | 同轮基准 | 同轮候选 | 耗时下降 |
-| --- | ---: | ---: | ---: |
-| scale 合并搬运 | 71.8405 | 71.3190 | 0.73% |
-| 权重合并搬运 | 71.6850 | 61.8315 | 13.75% |
-| N256 面板与 L0A 复用 | 56.9290 | 55.2675 | 2.92% |
-| 4 Buffer 循环与 K scale 预取 | 55.4735 | 53.9810 | 2.69% |
-| A2 期间预取 B | 55.1205 | 53.0900 | 3.68% |
-| B 连续 panelpack | 52.5440 | 50.3880 | 4.10% |
-| A2 批量归约 | 49.5785 | 49.1355 | 0.89% |
-
-末行冷缓存差值较小，统计显著性尚未确认；同轮未主动清 L2 的 33.3240→30.8115 µs 属于另一采集条件。
-
-测试设备为 Ascend 950PR，使用 32 AIC / 64 AIV。冷缓存测试在每次目标 kernel 前执行 256 MiB FP16 ArgMax，取 10 次目标 kernel 的 NPU 时长中位数，并以极差与中位数之比不超过 10% 验收；热缓存另作预热和重复采样。A2 批量归约对应的冷缓存时延为 49.1355 µs，未主动清 L2 的时延为 30.8115 µs，分别对应两种采集条件。
-
-以 $T=72$ 计算，必要矩阵乘的有效工作量为 $F=2T(HR+HD+RN_hD)=7{,}361{,}003{,}520$ FLOPs。必要 IO 模型取 $B_{\mathrm{useful}}=57{,}990{,}784$ B。以 1.6 TB/s 名义带宽和 32 AIC 的 865.0752 TFLOP/s FP8 算力作参考，49.1355 µs 对应的模型带宽利用率（MBU）为 73.76%，模型算力利用率（MFU）为 17.32%。这两个指标由模型工作量和时长计算；1.6 TB/s 用作参考分母，设备认证带宽峰值尚未获得。
-
-4 Buffer 循环、连续面板和 A2 批量归约的时延分别对应表中的测试配置。性能结果覆盖 T=72 的算子调用，不包含其他 token 数与整模型的时延。
 
 ## Indexer Prologue QW
 
@@ -300,18 +355,6 @@ $$
 #### 小 T 的 W 归约
 
 小 $T$ 路径由同一 token tile 的多个核分别处理 W 归约轴的一段。每个核经 FIXPIPE 缩放部分和并写入 GM Workspace；各核完成计算后，Vector 按行块读取部分和、求和并写出 `w`。各核分担 `X` 的读取量，减少单个核的搬运工作。在单核只处理一个 Q head 的情况下，`wqb` 使用较短的 L1 K 窗口，使当前 head 的权重加载与矩阵乘交错。跨 tile 路径还可在当前 tile 的最后一个 Q 矩阵乘后预取下一 tile 的 `QR`。
-
-**完整算子性能。** 下表记录不同优化步骤的同轮测量。测试形状为 $H=5120$、$R=1280$、$N_h=32$、$D=128$、$D_r=64$，使用 Ascend 950 的 32 个 AIC。每个配置采集 20 次 Device Task Duration，表中取最小值。各行对应独立对照，时延变化按该行的两个数值计算。
-
-| 优化步骤 | $T$ | 对照时延 | 优化后时延 | 变化 |
-| --- | ---: | ---: | ---: | ---: |
-| W 路径的 L0 K 步长由 32 增至 80 | 4096 | 80.25 µs | 70.33 µs | 下降 12.4% |
-| 将 Q head 分配给多个 AIC | 128 | 67.80 µs | 21.03 µs | 3.2× |
-| 将 W 归约轴分给多个 AIC，缩短单 head 的 `wqb` 加载窗口 | 72 | 14.55 µs | 10.30 µs | 1.41× |
-| 将 W 归约轴分给多个 AIC，缩短单 head 的 `wqb` 加载窗口 | 128 | 21.03 µs | 12.17 µs | 1.73× |
-| 调整 Q 路径 L2 hint，跨 tile 预取 `QR` | 8192 | 143.99 µs | 137.14 µs | 下降 4.8% |
-
-这些测量中，小 $T$ 的 W 部分和通过 FIXPIPE `atomic_add` 合并。当前实现将部分和写入 Workspace，再由 Vector 归约；上表记录相应优化步骤的历史性能。按 MXFP8 865 TFLOP/s、BF16 433 TFLOP/s 的参考算力计算，$T=4096$ 的测量对应约 75% MFU；$T=8192$ 的测量对应约 76.9% MFU。MFU 由矩阵乘工作量、参考算力和 Device 时长换算。
 
 ## Indexer Prologue K
 
@@ -387,18 +430,6 @@ RoPE 从 $D-D_r$ 通道开始。起点按 8 个元素对齐时，Vector 直接�
 
 当 $D\bmod64=32$ 时，FP4 数据行末尾有 16B，Vector 使用 `scalar.vec_store_bypass` 完成逐字节写入，并在写入前执行 `vec_sync_all()`。量化结果先放入 32B 对齐的临时行，随后写入目标 Cache，避免短写覆盖相邻数据。
 
-**完整算子性能。** 以下数据来自 Ascend950DT 上 $T=72$、$H=512$、$D=128$、$D_r=64$ 的五组测试。每组执行 10 次相邻的预热与目标计算，将目标 kernel 的 Task Duration 求和，再取中位数。表中各列来自不同采集会话，单次会话内的样本极差为 17%～32%。
-
-| 场景 | 三 kernel 基线（μs） | 目标行分核（μs） | 融合后处理与写入（μs） | 融合及运行时核数（μs） | 加速比 |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| `mode0_bs64_scale` | 18.988 | 13.050 | 9.850 | 10.354 | 1.83× |
-| `mode0_bs128_noscale` | 20.163 | 12.361 | 9.493 | 8.059 | 2.50× |
-| `mode1_bs64_g8` | 12.285 | 12.331 | 10.405 | 10.557 | 1.16× |
-| `mode1_bs128_g8` | 12.095 | 12.747 | 10.347 | 10.648 | 1.14× |
-| `mode0_bs64_strided` | 19.385 | 12.917 | 9.643 | 9.200 | 2.11× |
-
-`mode0` 基线的散写由单个 AIV 执行，目标行分核缩短了这一步的耗时；`mode1` 基线已按联合记录行分核，后处理与写入融合贡献了主要收益。五组测试的加速比几何平均值约为 1.66×。运行时核数根据设备可用核心及流控配额确定；性能数据对应投影 10 个 AIC、分离存储模式后处理 56 个 AIV，以及联合记录模式后处理 9 个 AIV。
-
 ## Quant Lightning Indexer
 
 ### 计算流程
@@ -418,8 +449,6 @@ $$
 
 ### Tiling 设计
 
-QLI 的执行组织依次围绕三个环节调整：将连续 256 个 Key 从两轮 N128 合并为一轮 N256，并沿 M 轴拆成两次 M96 以保留 L0C 双缓冲；调整 FIXP→Vector 的 UB 布局和 Channel 供给；最后让分数、直方图与 TopK 的交接减少往返和等待。以下结构实验比较相邻配置，完整实现的 64.709µs 为独立多轮复测，不能将两类结果的差值归因于单项改动。
-
 ![QLI 计算粒度、UB 布局与分数交接的优化路径](figures/qli_optimization_path.png)
 
 典型 $N_1=32$、每任务六行 Query 时，逻辑计算块为 $M=6\times32=192$、$N=256$、$D=128$。Cube 将 M 轴拆为两次 $96\times256$ 计算，复用同一份 K tile。每份 FP32 L0C 结果占 $96\times256\times4=96$ KiB；两份 L0C 形成双缓冲，使 MAC 和 FIXP 在相邻 tile 上交错。两个 AIV 分别处理三行 Query，分片任务各自产生局部 TopK，必要时再合并。
@@ -433,15 +462,6 @@ QLI 的执行组织依次围绕三个环节调整：将连续 256 个 Key 从两
 ![QLI 以一个 N256 K tile 复用两次 M96 计算的执行流程](figures/qli_n256_sequence.png)
 
 Vector 将 N256 分为两个 128-token 平面。每个 AIV 对三行 Query 的两个平面各维护一条累加链，共六条；同一个 head 权重供两个平面使用。按三行 Query、32 个 head 和 256 个 Key 计，128-lane BF16 乘加次数仍为 192，权重广播或寄存器选择次数由 192 减为 96，head 循环迭代由 64 减为 32。分数在任务边界就绪后进入 TopK，不按每个 N128 块分别执行一次完整 TopK。
-
-在 B12 / S1=6 / S2=64K、Candidate 关闭、相同连续布局和双缓冲条件下，计算基本块的受控对照为：
-
-| 分块配置 | 主 kernel 均值 | 耗时下降 | 加速比 |
-| --- | ---: | ---: | ---: |
-| 六 Query / N128 | 86.430µs | - | - |
-| 六 Query / N256＋M96 分块 | 76.916µs | 11.01% | 1.124× |
-
-该对照同时改变 N、M 分块和 Vector 归约组织；Vector 活跃时间由 66.307µs 降至 44.106µs，下降 33.48%。这些管线活跃时间来自完整 kernel，不能与其他管线时长相加。完整实现的组合收益另见本算子性能表。
 
 对于 Paged K，令物理页长为 $P$，每次搬运的页内段长取 $R=\gcd(256,P)$。第 $i$ 段从逻辑位置 $t_i=t_{\mathrm{tile}}+iR$ 开始，其物理地址为
 
@@ -480,8 +500,6 @@ self.l0c = Channel(
 )
 ```
 
-以下两张时间轴显示性能分析记录中的原始事件。第一组固定 N128 和 L0C 双缓冲，仅改变 QK Channel 深度：depth=3 和 depth=2 的 FIXP 活动跨度分别为 59.178µs、65.582µs，后者出现 5.472µs 间隙。第二组固定数据布局，比较 N128 与 N256＋M96 分块：FIXP 活动跨度由 64.967µs 缩至 54.328µs，间隙由 4.721µs 变为 0。时间轴只用于观察数据供给是否连续，不代表完整算子的平均时长。
-
 ![QLI Channel 缓冲深度对流水连续性的影响](figures/qli_channel_trace.png)
 
 ![QLI 计算基本块调整前后的流水变化](figures/qli_tiling_trace.png)
@@ -489,15 +507,6 @@ self.l0c = Channel(
 #### QK UB 错位布局
 
 FIXP 向每侧 AIV 的 QK UB 写入 BF16 分数。每行有效数据为 128 个 BF16，即 256 B；布局的行步长设为 256 个 BF16，即 512 B。两份显式 Buffer 的基址分别为 0 B 和 256 B，使相邻 Buffer 的 FIXP 写入与 Vector 读取落在不同的 UB bank 相位。L0C 的 `Channel(depth=2)` 管理结果轮转；QK UB 的地址由算子显式配置，跨核交接仍遵守写入完成后消费、消费结束后才覆盖的就绪与释放关系。
-
-在相同 N256＋M96 分块下，仅改变 QK UB 布局的受控对照为：
-
-| QK UB 布局 | 主 kernel 均值 | FIXP 活跃时间 |
-| --- | ---: | ---: |
-| 连续双 Buffer | 76.916µs | 54.418µs |
-| 错位双 Buffer | 71.717µs | 49.447µs |
-
-主 kernel 下降 6.76%，FIXP 活跃时间下降 9.13%。在 N128 分支上，原始配置、连续双 Buffer 和错位双 Buffer 分别为 80.983µs、86.430µs 和 84.007µs；这组结果表明缓冲布局的收益取决于计算粒度和消费速度。
 
 #### 分数驻留、直方图与选择
 
@@ -514,15 +523,6 @@ c_b=\max_{t\in B_b\cap\mathcal V_q}s_{q,t}
 $$
 
 对有效 $c_b$ 执行块级 TopK，供后续索引层的 QSLI 使用。当前可见位置所在的未满块可通过选择阶段的特殊高分标记保留；完全不可见的块不参与选择，空缺输出填 $-1$。例如可见长度为 8191、块长为 8 时，有效块数为 1024，最后一块仅有七个有效位置；即使输出容量为 2048，也不能将剩余块纳入选择。块级与位置级选择共用一次 QK 分数计算。
-
-**完整算子性能。** 测试配置为 B12 / S1=6 / N1=32 / D128 / PA128 / TopK512、`mask_mode=3`、`cmp_ratio=2`。每组预热 3 次、有效执行 1000 次，三轮测试按主 kernel 均值统计：
-
-| Candidate 输出 | S2 | 优化前 | 当前实现 | 耗时下降 | 加速比 |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| 关闭 | 64K | 81.285µs | 64.709µs | 20.39% | 1.256× |
-| 关闭 | 128K | 153.343µs | 125.163µs | 18.38% | 1.225× |
-| 开启 | 64K | 148.389µs | 97.679µs | 34.17% | 1.519× |
-| 开启 | 128K | 284.943µs | 184.232µs | 35.34% | 1.547× |
 
 这些数据反映六 Query 任务组织、N256/M96 计算分块、Channel 流水和分数交接的组合效果。
 
@@ -621,173 +621,13 @@ V0 使用两个 UB Buffer 和四份 GM 缓冲，Cube 与 QK 结果也分别使�
 
 ![QSLI 在当前行 TopK 前发出下一行候选预取](figures/qsli_topk_prefetch.png)
 
-128K 业务用例的时间轴显示，12 个 AIV 的 Vector 活跃时间平均约为 17.3µs，其中约 12.9µs 与各自的 MTE2 搬运同时发生，约 4.4µs 发生在 MTE2 搬运之外。**约 75% 指整个 Vector 流水的重叠比例**，包含 VEC1、TopK、索引映射和结果归并，不能单独解释为 TopK 的隐藏比例。
-
-为估计局部 TopK 对整体耗时的影响，另一组测试保留 V0、Cube、FIXP、搬运和同步，只移除局部 TopK 及相关映射、输出：
-
-| 业务测量 | 主 kernel 中位数 | AIV_MTE2 中位数 |
-| --- | ---: | ---: |
-| 完整计算 | 87.270µs | 68.160µs |
-| 移除局部 TopK 与后续映射/输出 | 82.943µs | 68.131µs |
-| 差值 | 4.327µs | 0.029µs |
-
 差值衡量选择及关联尾部工作对完整 kernel 关键路径的影响；最后一行的选择与归并仍需在流水排空阶段完成。普通局部 TopK 由 AIV0 消费汇合分数，AIV1 参与 V0、VEC1 和分数写出。下一行预取始终使用该行自己的候选列表。
 
-**完整算子性能。** 典型业务配置为 B12 / S1=6 / S2=128K / N1=32 / D128 / PA128 / TopK512，每行 2048 个独立随机候选块，`mask_mode=3`、`cmp_ratio=2`、`return_value=False`。完整主 kernel 中位数为 **87.270µs**；AIV_MTE2 均值为 **68.328µs**、中位数为 **68.160µs**。
-
-128K 用例的受控对照分别隔离成对搬运发射和地址生成优化：
-
-| 优化因素与观测指标 | 对照实现 | 优化实现 | 下降 |
-| --- | ---: | ---: | ---: |
-| 联合记录上的逐条→成对发射；AIV_MTE2 均值 | 118.816µs | 69.346µs | 41.64% |
-| 同一成对发射对照；主 kernel 中位数 | 137.838µs | 87.179µs | 36.75% |
-| 逐项→批量向量化寻址；AIV Scalar 均值 | 51.381µs | 31.852µs | 38.01% |
-
-两组对照分别改变搬运发射和地址生成，不能将降幅相加；成对发射对照的两组输入均为联合记录，不能据此推断 K/scale 分离存储到联合存储的单独收益。搬运统计覆盖 64 个 AIV 的三次采样，kernel 取三次调用的中位数。
-
 ![QSLI 的成对搬运与地址向量化两项独立性能对照](figures/qsli_stage_gains.png)
-
-按 B12 / S1=6 / 每行 2048 条、每条 544B 的联合记录计算，名义 K/scale 载荷为 $12\times6\times2048\times544=80{,}216{,}064$ B。以此载荷比较搬运下限的近似模型与业务 AIV_MTE2 均值：
-
-| 指标 | 近似模型 | 当前完整算子 |
-| --- | ---: | ---: |
-| 搬运时间 / AIV_MTE2 均值 | 66.34µs | 68.328µs |
-| 按相同载荷折算的吞吐 | 约 1.209 TB/s | 约 1.174 TB/s |
-| 相对模型时间的差额 | - | 1.988µs，约 3.00% |
-| 相对模型吞吐的效率 | 100% | 约 97.1% |
-
-表中吞吐由名义有效载荷和 AIV_MTE2 活跃时间换算，**不是硬件带宽计数**。即使活跃时间接近模型下限，流水中仍可能存在等待；完整算子还包含任务切换、跨核交接和 TopK 收尾。
-
-## Mixed Quant Sparse Flash MLA
-
-### 计算流程
-
-![Mixed Quant Sparse Flash MLA 的混合量化流水](figures/mixed_quant_mla_pipeline.png)
-
-`mixed_quant_sparse_flash_mla` 使用 BF16 Attention Q，按照稀疏索引从 Paged KV Cache 中读取共享 KV。原始 KV 池使用 FP8 E4M3 存储，压缩 KV 池使用 FP4 E2M1 打包存储。计算包含只读取原始 KV 和同时读取原始、压缩 KV 两种路径。Query head 数为 64，逻辑 head dimension 为 512，KV head 数为 1；Query 按 TND 布局组织。每个 KV 向量按 `nope[448] | rope[64]` 排列，反量化后同一向量同时用作 Key 和 Value。
-
-对于同一 Query 行，两侧 KV 产生的有效 Attention 分数共同参与在线 Softmax。Attention Sink 作为额外的归一化项参与最大值与分母更新，不对应需要读取的 Value 行。在线计算保留运行中的最大值、指数和以及未归一化输出；处理完所有有效 KV tile 后再完成归一化与可选 LSE 输出。因此，原始与压缩两侧的贡献可以在同一组 Softmax 状态中累积。
-
-设当前 tile 中的 Attention 分数为 $x_j$、共享 KV 向量为 $v_j$。每个 Query head 的在线状态可写为最大值 $m$、指数和 $l$ 与未归一化输出 $o$。对于新 tile，计算
-
-$$
-\begin{aligned}
-m'&=\max\left(m,\max_j x_j\right),\\
-\alpha&=\exp(m-m'),\\
-l'&=\alpha l+\sum_j\exp(x_j-m'),\\
-o'&=\alpha o+\sum_j\exp(x_j-m')v_j.
-\end{aligned}
-$$
-
-处理第一块 KV 前，以 Sink 分数初始化 $m$，并令 $l=1,o=0$；处理完所有 KV 后，输出为 $o/l$，可选的 Log-Sum-Exp 为 $m+\log l$。有效 KV 位置为空时，输出为零，LSE 等于 Sink 分数。如果一个 Query 的 KV 被分给多个计算核，各核的状态分别为 $(m_a,l_a,o_a)$ 和 $(m_b,l_b,o_b)$，按下式合并：
-
-$$
-\begin{aligned}
-m&=\max(m_a,m_b),\\
-l&=e^{m_a-m}l_a+e^{m_b-m}l_b,\\
-o&=e^{m_a-m}o_a+e^{m_b-m}o_b.
-\end{aligned}
-$$
-
-原始 KV、压缩 KV 与不同 S2 分片因此共享一组归一化状态。
-
-### Tiling 设计
-
-以 128 个 KV 位置为一个处理 tile，按照 Query 行与两侧有效稀疏 KV 长度划分任务；一行先处理原始 KV tile，再处理压缩 KV tile。每行覆盖 64 个 Query head，逻辑 head dimension 为 512。Cube 处理 64 个头与 128 个 KV 位置组成的矩阵块；两个 Vector 子核各负责 32 个 Query head。尾块按实际有效长度屏蔽多余位置。
-
-调度阶段根据每行有效长度生成任务范围。常规路径将完整 Query 行分配给一个 Cube 核；启用 Flash Decode 时，一行的 KV tile 可分给多个 Cube 核。各核将局部输出、最大值与指数和写入 Workspace，Vector 核再按在线 Softmax 合并公式归约。Sink 只在该行的第一个分片中初始化，避免重复计入分母。未拆分的行直接完成输出。
-
-### 优化实现
-
-#### 核内流水与片上数据复用
-
-![Mixed Quant Sparse Flash MLA 的 KV tile 计算流水与 L1 复用](figures/mixed_quant_mla_tile_pipeline.png)
-
-| 阶段 | 执行内容 |
-| --- | --- |
-| V0 · Vector | 根据稀疏索引和页表读取 KV；原始池每 32 个元素共用 FP8 scale，压缩池每 16 个元素共用 FP4 scale；反量化后生成 BF16 NZ 布局的共享 Key/Value，并直接写入 L1 |
-| C1 · Cube | 从 L1 读取反量化的 KV，计算 QK 分数，并将结果交给两个 Vector 子核 |
-| V1 · Vector | 按每个子核的 32 个 Query head 更新在线 Softmax 的最大值、指数和与权重 |
-| C2 · Cube | 复用 L1 中的共享 Value，计算 PV 分块 |
-| V2 · Vector | 将 PV 分块合入 FP32 输出状态；行末归一化，写出 BF16 输出和可选的 FP32 LSE |
-
-V0 在 UB 内完成量化数据解码、scale 读取、缩放与 NZ 布局写入，随后将 BF16 KV 直接写入 L1 的三个循环 Buffer。C1 与 C2 复用同一 KV tile；CANNBot-DSL 的 Channel 与跨核同步控制生产完成、矩阵乘读取和 Buffer 释放的顺序。延迟线记录 Query 行号、KV tile 号以及首尾标志，使相邻 tile 的反量化、QK、Softmax、PV 和输出更新交叠执行。
-
-输出在 FP32 Buffer 中累加并归一化。行末将 BF16 结果打包到该 Buffer 的可复用区域，再搬运至最终输出位置，减少额外的输出缓冲区。
-
-#### 稀疏 KV 寻址
-
-稀疏 KV gather 的源地址必须先由 `sparseIndices` 和存储映射确定，再据此发出 KV 搬运。地址**计算**和地址**取值**是不同的开销：即使批量向量化算出物理行号，V0 若仍逐项从 GM 地址表执行 Scalar `getValue`，后续 KV 搬运就依赖这些取值完成。
-
-在混合量化的分页 Cache 路径中，Vector 可对适合批量处理的布局预先计算稀疏索引对应的物理 KV 行，主循环读取预计算结果。其余布局在主循环中按页表和页内偏移生成地址。批量预计算将页表查询与地址生成移到 KV tile 处理之前。
-
-以下 BF16/TND 独立测试对照三种地址策略；其数据布局与前述分页量化 Cache 路径不同。
-
-![SMLA 的物理地址预计算、UB 预取与直接索引预取路径](figures/smla_scalar_address_paths.png)
-
-| 路径 | 地址生产与消费 | 保留的主要成本 |
-| --- | --- | --- |
-| 地址预计算对照 | Vector 从索引和映射计算物理行号，MTE3 写入 GM 地址表；V0 逐项从 GM 取行号 | GM `getValue` 与 KV 搬运之间的串行依赖 |
-| 方案一：物理地址预取 | 保留预计算和 GM 地址表；每个 V0 前以 MTE2 批量搬入 UB，再从 UB 取行号 | 地址表的生成、GM 写回与再次搬入 |
-| 方案二：直接索引预取 | 在目标 TND 路径上直接将 `sparseIndices` 搬入 UB，消费时结合序列 base/prefix 得到物理行号 | UB 取索引及少量 Scalar 加法 |
-
-对方案二所测的连续 TND 存储，地址关系简化为 $p_{b,j}=\operatorname{base}_b+i_{b,j}$，其中 $i_{b,j}$ 为稀疏索引。分页 Cache 的地址还由 block table、页内偏移和物理行距共同确定。方案二去掉了地址预计算输入搬运、Vector 行号计算、GM 地址表写回与回读，以及相应的中间缓冲和同步链路；地址表原先按 `[row,0]` 交错保存，每个逻辑地址占两个 `int32`，直接索引只需一个 `int32`。
-
-寻址路径用例均为 BF16、Q/KV TND、$B=1$、$S_1=4096$、$S_2=8192$、$N_1=64$、$N_2=1$、$D=512$，原始与压缩侧有效 TopK 分别为 128 和 512。两组只改变 mask 与 TopK 模式：用例一为原始/压缩 mask 模式 4/3、TopK 模式 no/no；用例二为 0/0、fullK/fullK。
-
-| 用例与指标 | 地址预计算对照 | 方案一：物理地址预取 UB | 方案二：直接索引预取 UB | 方案二相对对照 |
-| --- | ---: | ---: | ---: | ---: |
-| 用例一 · Duration | 1149.348 µs | 1001.230 µs | 910.373 µs | −20.79% |
-| 用例一 · MFU | 69.115% | 79.340% | 87.258% | +18.143 个百分点 |
-| 用例二 · Duration | 1151.592 µs | 1010.906 µs | 909.477 µs | −21.02% |
-| 用例二 · MFU | 68.981% | 78.581% | 87.344% | +18.363 个百分点 |
-
-Pipe time 是各流水线的活跃时间，存在重叠，不能相加为 Duration。从地址预计算对照切换到方案一，用例一/二的 AIV Scalar 分别由 891.627/922.609 µs 降至 364.054/369.481 µs，下降 59.17%/59.95%；Duration 下降 12.89%/12.22%。额外的地址表预取使 AIV MTE2 由 697.760/712.977 µs 增至 805.019/830.688 µs，上升 15.37%/16.51%。这一对照将收益主要定位到地址**取值位置**的变化。
-
-方案二相对方案一，AIV Scalar 为 352.229/367.398 µs，仅再下降 3.25%/0.56%，但 Duration 继续下降 9.08%/10.03%；AIV MTE2 降至 775.190/780.550 µs，Vector 与 MTE3 活跃时间也同步缩短。这与取消地址表生产、写回、重读及同步链路的解释一致。各 Pipe 时间降幅不能相加解释为总时延收益。
-
-该组寻址测试未记录重复次数、统计方法、完整软件环境及 MFU 使用的峰值算力，数值只用于组内路径对照。算子按布局与容量选择 Vector 预计算地址或 Scalar 逐项计算地址的路径；表中的方案二为独立对照路径。
-
-#### 稀疏 KV 搬运：UB 直写 L1
-
-测量对象为 BF16、TND 的稀疏 KV gather 与 Cube 消费链，采用独立于前文 FP8/FP4 Cache 的数据布局。该路径处理 **KV 已进入 UB 后如何送达 Cube 的 L1**；前述寻址路径处理 gather 所需的物理地址。
-
-GM 中转路径由 AIV 按稀疏索引离散读取 KV，在 UB 中形成 ND tile，再经 MTE3 写入 GM 临时缓冲。Cube 随后用 MTE2 将数据从 GM 搬入 L1，并在搬运中完成 ND→NZ 转置，供 BMM1/QK 与 BMM2/PV 使用。
-
-L1 直写路径由 AIV 的 VF 在 UB 中完成转置，再通过 MTE3 直接写入共享 L1 Buffer。Cube 等待跨核就绪通知后从 L1 读取，无需再执行这块 KV 的 GM→L1 搬运。
-
-![稀疏 KV 经 GM 中转与 UB 直写 L1 的数据通路、槽位和同步对照](figures/smla_sparse_kv_l1_path.png)
-
-| 环节 | 旧路径：UB→GM→L1 | 新路径：UB→L1 |
-| --- | --- | --- |
-| gather 后的布局 | UB 中为 ND | UB 中先由 VF 转为 NZ |
-| 中间写入 | AIV MTE3 写 GM 临时缓冲 | AIV MTE3 直接写共享 L1 槽 |
-| Cube 侧读取 | MTE2 执行 GM→L1 及 ND→NZ | 等待跨核就绪后从 L1 读取 |
-| 稀疏 KV 中间数据的 GM 往返 | 一次写入、一次读取 | 无 |
-| 同时在途 KV 缓冲区 | 三个 GM Buffer | 三个 L1 Buffer |
-
-若一个已 gather 的稀疏 KV tile 有效载荷为 $P$ 字节，只计这条**中间交接链路**，旧路径额外产生约 $P$ 字节 GM 写入和 $P$ 字节 GM 读取；新路径将这约 $2P$ 的 GM 流量移除，代价是 AIV 额外执行 UB 内转置与直写 L1。这里不计从原始 KV 存储 gather 的读取、其他 Attention 数据以及最终输出流量，因此不能把 $2P$ 当作整个算子的总 IO 降幅。
-
-L1 直写的 d-fractal 行距采用 `Align16(s2RealSize)`，与 Cube 搬入 L0B 时的 `srcStride=Align16(singleN)/16` 配对；非满 tile 的 tail 也按同一规则处理。两个 AIV 子块的写入行区按 16 行边界切分，避免并发更新同一 L1 存储行时覆盖有效数据。AIV 写入前等待 L1 Buffer 释放，写完发出跨核就绪通知；Cube 等待就绪后消费并归还 Buffer。该同步保护“复用前已释放、读取前已写完”两个方向的依赖。
-
-两条路径都允许同时处理三个 KV tile，预取深度相同。GM 中转路径的 AIV 写完 GM 即可继续，Cube 再等待 L1 并执行搬运；L1 直写路径的 AIV 在写入前可能等待 Buffer 释放。测试配置的 L1 为 512 KiB、UB 为 256 KiB，三份 KV Buffer 已占满该轮片上预算。AIV 收集比 Cube 消费提前约两个处理轮次，所测用例中新增的 L1 Buffer 释放等待由这段时间覆盖，未延长关键路径；其他 tile 形状需要重新验证。
-
-4096 Query 用例采用 BF16、TND，$S_1=4096$、$S_2=8192$、$N_1=64$、$N_2=1$、$D=512$，原始/压缩侧有效 TopK 为 128/512，`cmp_ratio=4`。三组测试各采集 300 次 NPU 任务，算子平均时长如下：
-
-| 指标 | GM 中转基线 | L1 直写候选 | 变化 |
-| --- | ---: | ---: | ---: |
-| Duration | 2.200 ms | 1.318 ms | −40.1% |
-| MFU | - | 68.9% | - |
-
-表中 −40.1% 是稀疏 KV 直写 L1 和部分预处理精简共同作用的完整算子结果，不能把全部收益单独归因于直写。正确性测试覆盖全部 4096 个查询，以及 40 条 BF16/FP16 输出与 LSE 用例，包含 tail、Query padding、混合长度、G1/32/64/128、地址缓存回退和宽 64-bit 地址。该组测试未记录与前一寻址路径相同的完整环境及 MFU 分母口径，两张表不能合并比较。
-
-另一组测试中，完整 4096 用例为 927 µs；只保留 Vector、FixPipe 和跨核同步等工作的配置为 864 µs。该测试中 AIC MTE1/MTE2 活跃时间接近零，说明剩余耗时主要在 AIV 侧。这组测试条件不同于上表，927/864 µs 不能用于拆分 2.200→1.318 ms 的收益。L1 直写路径移除了 gather 后的 GM 中转和 Cube 侧的稀疏 KV MTE2；性能结果仅适用于所测 BF16/TND 配置及其布局、同步实现。
 
 ## Attention Epilogue
 
 ### 计算流程
-
-`attn_epilogue` 将 Attention 结果变回残差流使用的 Hidden 维度：先对每个 head 的旋转部分执行 inverse RoPE，再执行 QuantA、分组矩阵乘 MM1、中间结果量化 QuantY 和输出矩阵乘 MM2。以下测试采用张量并行度 TP=1，测量设备为 Ascend 950DT，使用 32 AIC / 64 AIV，覆盖 $1\le T\le256$。精度与时延结论仅适用于所测配置和输入。
 
 ![Attention Epilogue 的 inverse RoPE、QuantA、MM1、QuantY 和 MM2 数据流](figures/attn_epilogue_dataflow.png)
 
@@ -829,8 +669,6 @@ d_{\mathrm{L0C}}M_{\mathrm{base}}N_{\mathrm{base}}\cdot4&\le256\,\mathrm{KiB},\\
 \end{aligned}
 $$
 
-搜索时先估计每个候选 Tiling 需要多少轮任务，再结合计算量与搬运量排序。令 $N_{\mathrm{tiles}}$ 为任务数、$N_{\mathrm{AIC}}$ 为可用计算核数，则 $\mathrm{waves}=\lceil N_{\mathrm{tiles}}/N_{\mathrm{AIC}}\rceil$ 表示任务轮数；候选代价采用 $\mathrm{cost}=\mathrm{waves}\,K[2M_{\mathrm{base}}N_{\mathrm{base}}+256(M_{\mathrm{base}}+N_{\mathrm{base}})]$。它只用于排序，不直接预测时延。T=256 时，L0C 深度改为 1 后，$M_{\mathrm{base}}$ 可从 128 增至 256，两次矩阵乘均由两轮任务缩为一轮。
-
 QuantY 对每个 AIV 保留完整 FP32 输出 tile，再按行块完成 BF16 舍入、量化与有效行写回。设 AIV 输出列数为 $N$、完整输出补齐行数为 $p$、量化行块为 $r$、RoPE/QuantA 缓冲占用为 $R$，UB 预算为
 
 $$
@@ -855,38 +693,10 @@ MM1 的一个输出 tile 完成全部 K 累加后，就可经 FIXPIPE 送给对�
 
 MM1 提前加载两个权重 tile，MM2 提前加载一个；MM2 的权重读取可与 QuantY 重叠。QuantY 写完 GM 中的 `Yq` 和 scale 后才通知 MM2。该版本等待所有相关 `Yq`/scale 就绪后启动 MM2，尚未让 MM2 按 K 分段消费 QuantY 结果。
 
-**完整算子性能。** 测试比较五个独立算子（inverse RoPE、QuantA、MM1、QuantY、MM2）的**单次时长之和**与融合算子的时长。每个 T、每种实现采集 192 次，分别取中位数。每次执行五算子链或融合算子前，先运行 256 MiB ReduceSum 以驱逐缓存；五个小算子之间不再驱逐。输入恢复、缓存驱逐及权重预处理不计时。两种实现分别采集 kernel 的 Device 时长，关闭 AI Core PMU/L2 计数。软件驱逐不等同于硬件 cache invalidate。
-
-测试数据采集于 2026-09-24；环境为 CANN 9.2.0、cannbotdsl 0.6.0+g91e7c8f、PyTorch / torch_npu 2.12.0，TP=1、32 AIC / 64 AIV。五算子链与融合版使用相同输入、cos/sin 和预量化权重。
-
-| T | 五个 kernel 时长之和 / µs | 融合 kernel / µs | 耗时下降 | 加速比 |
-| ---: | ---: | ---: | ---: | ---: |
-| 1 | 42.749 | 34.120 | 20.19% | 1.253× |
-| 16 | 44.843 | 34.198 | 23.74% | 1.311× |
-| 72 | 54.445 | 44.287 | 18.66% | 1.229× |
-| 128 | 63.427 | 51.939 | 18.11% | 1.221× |
-| 160 | 68.560 | 58.806 | 14.23% | 1.166× |
-| 192 | 73.685 | 63.736 | 13.50% | 1.156× |
-| 224 | 79.802 | 69.744 | 12.60% | 1.144× |
-| 256 | 84.492 | 75.409 | 10.75% | 1.120× |
-
 ![Attention Epilogue 五算子链与融合 kernel 的 36 点时延对比](figures/attn_epilogue_performance.png)
-
-36 个已测 T 点均取得 10.75%–23.74% 的耗时下降；连线只显示趋势，不代表未测 T 的结果。T=256 的自适应 Tiling 诊断中，采样核组 MM1 的 Cube 首尾窗口由 33.649 µs 缩至 24.612 µs，窗口内活跃比例由 62.3% 升至 81.9%；T=72 的输入双缓冲及 MTE3 就绪发布诊断中，MM1 首次 Cube 由 9.416 µs 提前至 8.920 µs。诊断图只覆盖少量冷缓存调用与采样核组，正式时延统计以表中 192 次采样为准。
 
 ![T=256 自适应 Tiling 前后的采样核组流水](figures/attn_epilogue_tiling_trace.png)
 
 ![T=72 输入双缓冲与就绪发布前后的采样核组流水](figures/attn_epilogue_final_trace.png)
-
-不同优化轮次的受控对照进一步区分了收益来源；各行仅比较同轮旧版与候选版，百分比不能相加：
-
-| 优化组合 | T | 同轮前 / µs | 同轮后 / µs | 耗时下降 |
-| --- | ---: | ---: | ---: | ---: |
-| MM1→QuantY 片上交付、权重预取、量化精简 | 72 | 49.938 | 47.121 | 5.64% |
-| QuantA→MM1 分块流水 | 72 / 128 | 46.623 / 56.357 | 45.850 / 54.047 | 1.66% / 4.10% |
-| 自适应 Tiling、QuantY 分块 | 256 | 92.625 | 80.312 | 13.29% |
-| 输入双缓冲、MTE3 发布、向量复制 | 72 / 256 | 45.513 / 79.842 | 44.335 / 75.391 | 2.59% / 5.58% |
-
-按权重与尺度、输入与旋转参数各读一次，以及最终输出写一次估算，必要流量为 $B(T)=77{,}856{,}768+76{,}288T$ 字节。以 4 TB/s 名义峰值带宽为分母，T=72、44.287 µs 对应必要流量 83,349,504 B、等效带宽 1.882 TB/s、必要流量带宽效率 47.05%。该模型不含重复加载、padding 和中间张量往返，不能解释为 profiler 实测 HBM 利用率。
 
 已测 117 组输入的 BF16 输出与五算子基线逐比特一致，最大绝对误差为 0；输入覆盖 36 个 T 的三个随机 seed，并在 T=1/72/256 补充零值、极小值和放大值。同输入确定性完成 12,870 次检查，交替输入图回放完成 9,360 次检查；量化数据及尺度、padding、输入不变性和输出生命周期亦通过验证。该结论对应所测的 `vf(mode="raw")` 实现。
