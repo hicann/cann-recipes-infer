@@ -218,7 +218,7 @@ bash infer.sh
 │       ├── deepseek_r1
 │       ├── deepseek_v3_2_exp
 │       ├── deepseek_v4
-|       ├── deepseek_v4_1
+│       ├── deepseek_v4_1
 │       └── ...
 ├── accelerator                                 # 加速算法样例
 ├── benchmark                                   # 基于 EvalScope 的在线推理精度评测指南与脚本
