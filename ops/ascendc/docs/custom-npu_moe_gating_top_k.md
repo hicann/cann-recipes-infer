@@ -76,9 +76,9 @@ custom.npu_moe_gating_top_k(Tensor x, int k, *, Tensor? bias=None, Tensor? input
 |:---|:---|:---|
 | `x` | Tensor | 输入张量，支持2D或3D，shape为 (T, e) 或 (b, s, e)，支持`float16`、`bfloat16`和`float32` |
 | `k` | int | 选取的专家数量，取值小于等于e，且必须小于等于64 |
-| `bias` | Tensor（可选） | 偏置张量，shape为（e），dtype与x相同， 支持`float16`、`bfloat16`和`float32` |
-| `input_ids` | Tensor（可选） | 输入词表，shape为（T）， 仅支持`int64`，取值范围为[0 ,n]，n为tid2eid第一维的大小 |
-| `tid2eid` | Tensor（可选） | 词表到专家id的映射关系表，shape为（n，k）， 仅支持`int32`，取值范围为[0 ,e]，e代表专家数 |
+| `bias` | Tensor（可选） | 偏置张量，shape为（e），dtype与x相同，支持`float16`、`bfloat16`和`float32` |
+| `input_ids` | Tensor（可选） | 输入词表，shape为（T），仅支持`int64`，取值范围为[0 ,n]，n为tid2eid第一维的大小 |
+| `tid2eid` | Tensor（可选） | 词表到专家id的映射关系表，shape为（n，k），仅支持`int32`，取值范围为[0 ,e]，e代表专家数 |
 | `additional_bias` | Tensor（可选） | 附加偏置张量，shape为（e），dtype与x相同。仅在additional_token_mask同时提供时生效：additional_token_mask为true的行使用additional_bias替换bias参与gating计算 |
 | `additional_token_mask` | Tensor（可选） | 附加token标记，shape为（T），仅支持`bool`，取值为true表示该token使用additional_bias替换bias |
 | `token_mask` | Tensor（可选） | token有效标记，shape为（T），仅支持`bool`。取值为false表示该token不参与gating计算，expert_idx对应行输出k个-1，y和out对应行填0；取值为true表示按原逻辑计算。hash场景下token_mask为false的行不会访问tid2eid，因此input_ids中对应位置的值不要求在[0, n]范围内 |

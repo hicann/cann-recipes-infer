@@ -312,10 +312,10 @@ $$
 
 **实现指令和理论开销**
 以 uint32 为例，设序列长度 $S_k=16384$, 选取的 Top-$k$ 为 $512$，Top-$k$ 部分具体的实现指令和理论开销如下:
-1. `hist1`: 用 `DeInterleave` 解交织提取第一个8位，并用直方图指令 `hist` 分桶。 一条`hist`指令每个cycle处理64个数字，且需要两条指令分别处理0-127和128-255。实现过程中以 $256$ 个数字为一组进行循环处理，每组需8个cycle处理直方图。加上初始化等其他开销约 10 cycle，总计 $(S_k/256 * 9 + 10)$ cycle。
+1. `hist1`: 用 `DeInterleave` 解交织提取第一个8位，并用直方图指令 `hist` 分桶。一条`hist`指令每个cycle处理64个数字，且需要两条指令分别处理0-127和128-255。实现过程中以 $256$ 个数字为一组进行循环处理，每组需8个cycle处理直方图。加上初始化等其他开销约 10 cycle，总计 $(S_k/256 * 9 + 10)$ cycle。
 2. `find1`: 对 `hist1` 的结果，每 64 个桶一组，与临界值$S_k-k+1$做比较，将比较的结果用 `squeeze` 的 `gather` 模式拼到一起，并计算新的临界值，开销约 $(4*7 + 10)$ cycle。
 3. `hist2`: 相比于 `hist1`，每轮循环增加一次比较 `Compare`，总开销约 $(S_k/256 * 10 + 10)$ cycle。
-4. `find2`: 和 `find1` 相同， 开销 $(4 * 7 + 10)$ cycle。
+4. `find2`: 和 `find1` 相同，开销 $(4 * 7 + 10)$ cycle。
 5. `hist3`: 相比于 `hist1`，除了每轮循环增加两次比较 `Compare` 和一次 `And`，还需要增加一次 `DeInterleave` 解交织提取第三个8位，故总开销约 $(S_k/256 * 13 + 10)$ cycle。
 6. `find3`: 和 `find1` 相同，开销 $(4 * 7 + 10)$ cycle。
 7. `hist4`: 相比于 `hist1`，增加一次 `DeInterleave`，三次 `Compare` 和两次  `And`，开销估计为 $(S_k/256 * 15 + 10)$ cycle。
@@ -368,7 +368,7 @@ $$O = \text{softmax}(Q@\tilde{K}^T \cdot \text{softmax\_scale})@\tilde{V}$$
 `SparseAttnSharedKV`算子通过多种入参组合实现不同场景的 Attention 计算场景，其中关键入参为：
 
 - ori_kv: SWA对应的原始 $KV$ cache；
-- ori_win_left, ori_win_right: 表示 sliding window attention 中参与计算的 key-value 在序列轴的范围。假设 $t$ 为 query 的sequence id， 则参与计算的key/value 的sequence id 范围为 $t - \text{win\_left}, t - \text{win\_left} + 1, ..., t, ..., t + \text{win\_right}$；
+- ori_win_left, ori_win_right: 表示 sliding window attention 中参与计算的 key-value 在序列轴的范围。假设 $t$ 为 query 的sequence id，则参与计算的key/value 的sequence id 范围为 $t - \text{win\_left}, t - \text{win\_left} + 1, ..., t, ..., t + \text{win\_right}$；
 - cmp_kv: C4A 层及 C128A 层压缩后 $KV$ cache；
 - cmp_ratio: cmp_kv 中 $KV$ 的压缩比例。
 

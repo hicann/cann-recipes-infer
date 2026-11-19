@@ -60,8 +60,8 @@ torch.ops.pypto.hc_pre(
 - **hc_scale**（`Tensor`）：必选参数，对应公式中的$hc\_scale$，不支持非连续，数据格式支持ND，数据类型支持`float32`，shape为[3, ]。
 - **hc_base**（`Tensor`）：对应公式中的$hc\_base$，不支持非连续，数据格式支持ND，数据类型支持`float32`，shape为[mix_hc, ]。
 - **hc_mult**（`int`）：可选参数，表示mHC中的expansion rate，数据类型支持`int`，默认值为`4`。
-- **hc_split_sinkhorn_iters**（`int`）：可选参数，表示sinkhornde 迭代次数，数据类型支持`int`， 默认值`20`。
-- **hc_eps**（`float`）：可选参数，表示RMSNorm分母计算与Sinkhorn-Knopp计算中用于数值稳定的加法值，数据类型支持`float`， 默认值为`1e-6`。
+- **hc_split_sinkhorn_iters**（`int`）：可选参数，表示sinkhornde 迭代次数，数据类型支持`int`，默认值`20`。
+- **hc_eps**（`float`）：可选参数，表示RMSNorm分母计算与Sinkhorn-Knopp计算中用于数值稳定的加法值，数据类型支持`float`，默认值为`1e-6`。
 
 ## 返回值说明
 

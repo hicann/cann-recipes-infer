@@ -328,5 +328,5 @@ flowchart LR
 ## Future Plan
 
 
-- [**KV Offload**](./../deepseek_v3_2_exp/deepseek_v3.2_exp_inference_guide.md#kvcache-offload)： 通过将KV Cache部分存储在CPU，释放NPU内存压力，轻松支持长序列推理。
+- [**KV Offload**](./../deepseek_v3_2_exp/deepseek_v3.2_exp_inference_guide.md#kvcache-offload)：通过将KV Cache部分存储在CPU，释放NPU内存压力，轻松支持长序列推理。
 - [**SuperKernel**](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/850alpha001/opdevg/Ascendcopdevg/atlas_ascendc_10_00029.html)：使能Super Kernel进一步降低算子启动开销与调度间隙，提升计算执行效率。

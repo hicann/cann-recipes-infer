@@ -475,7 +475,7 @@ SCFA，是 sparse compressed flash attention 的缩写。在 compress_ratio = 4 
 
 ### PTO-ISA
 
-PyPTO 后端基于 PTO 虚拟指令集（PTO ISA）打造。 PTO ISA 兼容新旧核架构（A2/A3/950D），并做到“兼容不降速”，针对不同代际芯片，统一指令接口，并做到微架构高度适配。 性能方面，封装 DSA 定制优化，结合毕昇 PTO 编译器强大的 VF 融合能力，更好进行micro kernel级别的融合，充分发挥新一代芯片算力。同时PTO ISA及配套毕昇编译器，面向算法快速更新的开发需求，提供了强大的 DFX 能力，提供 TPRINT (打印 Tile 或 GlobalTensor)、算子融合信息统计等功能，方便精度调试与软件优化。
+PyPTO 后端基于 PTO 虚拟指令集（PTO ISA）打造。 PTO ISA 兼容新旧核架构（A2/A3/950D），并做到“兼容不降速”，针对不同代际芯片，统一指令接口，并做到微架构高度适配。性能方面，封装 DSA 定制优化，结合毕昇 PTO 编译器强大的 VF 融合能力，更好进行micro kernel级别的融合，充分发挥新一代芯片算力。同时PTO ISA及配套毕昇编译器，面向算法快速更新的开发需求，提供了强大的 DFX 能力，提供 TPRINT (打印 Tile 或 GlobalTensor)、算子融合信息统计等功能，方便精度调试与软件优化。
 
 ### hc_post
 
@@ -486,4 +486,3 @@ y = post.unsqueeze(-1) * x.unsqueeze(-2) + torch.sum(comb.unsqueeze(-1) * residu
 ```
 
 只会使用到 Vector 核。在已做其他优化基础上，PTO-ISA 结合毕昇 PTO 编译器强大的 VF 融合能力，通过自动融合性能（相比于未使能自动融合）提升22.7%。
-
