@@ -210,6 +210,7 @@ bash infer.sh
 │   ├── common                                  # 公共文档（推理配置指南、新模型清单等）
 │   ├── design                                  # 设计文档（executor、KV Cache、多流并行等）
 │   ├── integration                             # 外部框架集成模型文档目录
+│   │   ├── ling-3.0-flash                      # BaiLing-V3 集成模型文档
 │   │   └── sglang                              # SGLang 框架集成模型文档
 │   │       ├── dsv4-flash-single-npu-moe-offload
 │   │       ├── glm53-flash-single-npu-moe-offload
@@ -245,6 +246,7 @@ bash infer.sh
 │   │   └── deepseek-v3-ascend310p
 │   ├── sglang                                  # SGLang 框架集成
 │   │   ├── dsv4-flash-single-npu-moe-offload
+│   │   ├── glm53-flash-single-npu-moe-offload
 │   │   ├── llada2.x
 │   │   ├── qwen3-moe
 │   │   └── qwen3-next
@@ -252,6 +254,7 @@ bash infer.sh
 │       ├── deepseek-ocr-2
 │       ├── dsv4-afd                             # DeepSeek-V4 AFD 部署与启动指南
 │       ├── dsv41-flash-single-npu-moe-offload
+│       ├── ling-3.0-flash
 │       ├── minimax_m2.5_mxfp4
 │       └── pd-hybrid-dp-ep
 ├── models                                      # 模型脚本目录
@@ -294,6 +297,7 @@ bash infer.sh
 │   ├── ascendc                                 # AscendC 算子（HC、Indexer、MoE 等）
 │   ├── pypto                                   # PyPTO 算子（Lightning Indexer 等）
 │   └── ...
+├── recipes_ops                                 # KDA 等模型的算子实现（cannbot_dsl）
 ├── scripts                                     # 仓库工具脚本（Agent 客户端初始化等）
 ├── tests                                       # 核心推理模块与在线服务测试（调度、KV 传输等）
 │   ├── core                                    # 核心模块测试（序列打包、连续批处理、PD 请求字段）
