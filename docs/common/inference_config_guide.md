@@ -11,7 +11,7 @@
 ### 2.1 DataConfig (数据配置)
 管理输入数据相关的参数。
 - `dataset`: 数据集名称（默认 "default"）。
-- `dataset_path`: 数据集路径（默认 ""），非"default"数据集时必须指定。
+- `dataset_path`: 数据集基目录（默认 ""）。离线入口留空时使用仓库的 `dataset` 目录；例如 LongBench 优先使用该目录下的 `LongBench` 子目录，不存在时尝试使用 `THUDM/LongBench`。具体数据集仍需在本地或远端可用。
 - `input_truncated_len`: 最大输入序列长度（默认 256），如果prompt超过这一长度会被截断。
 - `temperature`: 采样温度（默认 0.0）。设置为 0 时使用 greedy decoding；值越大，采样随机性越强。
 - `top_p`: 采样参数-top_p（默认 1.0）。
@@ -22,7 +22,7 @@
 管理模型运行时的特有行为。
 - `model_name`: 模型名称（默认 "model"）。
 - `model_path`: 模型权重路径（默认 ""）。
-- `output_path`: 保存输出、日志、分析数据、图缓存等的目录（不指定时默认和所执行的yaml配置统一目录）。
+- `output_path`: 图编译缓存和部分结果文件（如离线 MMMU 结果）的目录；离线入口未指定时使用 `WORK_DIR` 和 `RES_PATH` 拼出的目录。`infer.sh` 写出的日志和执行器的 profiling 数据使用 `WORK_DIR` 与 `RES_PATH` 拼出的目录，不受该字段控制。
 - `dtype`: 计算使用的数据类型（默认 "bfloat16"）。
 - `with_ckpt`: 是否加载权重检查点（默认 True）。
 - `exe_mode`: 执行模式，可选 eager, ge_graph, npugraph_ex（默认 "eager"）。
@@ -93,7 +93,7 @@ speculative_config:
 
 在线/离线主入口（`executor/online/server.py`、`executor/model_runner.py`、`executor/offline/infer.py::main()`）启动时统一调用 `executor/utils/logging_config.py::setup_logging()` 完成根日志器配置，保证所有模块共享一致的格式与级别。
 
-- **日志格式**：`2026-04-25 19:35:12.345 - INFO - module:lineno - message`，时间精度到毫秒。
+- **日志格式**：`[INFO][2026-04-25 19:35:12.345][example.py:42] message`，时间精度到毫秒；位置包含文件名和行号。
 - **级别控制**：通过环境变量 `CANN_RECIPES_LOG_LEVEL` 指定，默认 `INFO`，支持 `DEBUG` / `INFO` / `WARNING` / `ERROR` / `CRITICAL`。
 - **库代码规范**：所有库模块统一使用 `logger = logging.getLogger(__name__)`，**不要**在库代码中调用 `logging.basicConfig`，避免覆盖根配置。
 - **第三方降噪**：`paramiko` / `httpx` / `httpcore` / `urllib3` 自动降级到 `WARNING`，避免 INFO 级别的握手 / 连接日志淹没业务输出。
