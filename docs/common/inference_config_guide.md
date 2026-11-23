@@ -78,7 +78,9 @@ speculative_config:
 - `batch_size`: 全局总 Batch Size（默认 1），batch_size 必须为 attn_dp_size 的整数倍。
 - `max_new_tokens`: 最大生成 token 数（默认 32）。
 - `max_prefill_tokens`: 单次 prefill batch 的最大 prompt token 预算（默认 0）。
-  当设置为 0 时，框架默认按 `input_truncated_len * batch_size_per_dp_rank` 计算预算。
+  当设置为 0 时，框架根据输入长度和 Prefill 批大小计算预算：
+  - `cp_size = 1` 时，预算为 `input_truncated_len * batch_size_per_dp_rank`。
+  - `cp_size > 1` 时，先按 `batch_size // cp_prefill_dp_size` 计算 Prefill 批大小；若 `cp_mini_batch > 0`，则取该值与 `cp_mini_batch` 的较小值，再乘以 `input_truncated_len`。
   在 executor-core 支持的模型中，prefill 默认采用 packed sequence 方式执行，该参数用于限制 packed 后单批次的 token 总量。
 - `max_mm_encode_tokens`: 单次 MM Encode 的全局多模态 token 打包目标（默认 0）。
   设置为 0 或负数时不限制该目标；正数时，每个 Prefill DP 副本使用 `ceil_div(max_mm_encode_tokens, cp_prefill_dp_size)` 作为本地目标。
