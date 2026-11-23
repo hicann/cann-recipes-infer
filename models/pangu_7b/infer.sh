@@ -20,8 +20,8 @@ source ${FUNCTION_ABS_PATH}
 export MODEL_DIR=$(basename "$SCRIPT_PATH")
 export YAML_PARENT_PATH="${SCRIPT_PATH}/config"
 export YAML_FILE_NAME="openpangu_v5_7b_mxfp8.yaml" # modify to your yaml file name
-# export YAML_FILE_NAME="openpangu_v5_7b_mxfp4.yaml" # modify to your yaml file name
-# export YAML_FILE_NAME="openpangu_v5_7b_hif8.yaml" # modify to your yaml file name
+# 说明：config/ 下当前只有 openpangu_v5_7b.yaml 与 openpangu_v5_7b_mxfp8.yaml
+# mxfp4 / hif8 量化尚未开放（见 README）
 # export YAML_FILE_NAME="openpangu_v5_7b.yaml" # modify to your yaml file name
 export YAML=${YAML_PARENT_PATH}/${YAML_FILE_NAME}
 
