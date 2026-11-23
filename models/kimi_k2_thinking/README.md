@@ -88,8 +88,8 @@
    | `--mode` | 推理模式 | `offline`（离线推理）/ `online`（在线 PD 分离推理） |
    | `--yaml` | 离线模式：yaml 文件名 | `kimi_k2_thinking.yaml` |
    | `--pd-role` | 在线模式：PD 部署角色 | `prefill` / `decode` |
-   | `--p-yaml-name` | 可选，在线模式：prefill yaml 文件名，不传则默认 `pd/prefill.yaml` | `pd/prefill.yaml` |
-   | `--d-yaml-name` | 可选，在线模式：decode yaml 文件名，不传则默认 `pd/decode.yaml` | `pd/decode.yaml` |
+   | `--p-yaml-name` | 在线模式：prefill yaml 文件名，本模型需显式指定 | `pd/prefill.yaml` |
+   | `--d-yaml-name` | 在线模式：decode yaml 文件名，本模型需显式指定 | `pd/decode.yaml` |
 
    > 在线模式 IP 等更多配置参见 [executor 设计文档 §5.1 启动方式](../../docs/design/executor_design.md#51-启动方式)。
 
@@ -97,9 +97,7 @@
    ```shell
    # offline 模式
    bash executor/scripts/infer.sh --model kimi_k2_thinking --yaml kimi_k2_thinking.yaml
-   # online 模式
-   bash executor/scripts/infer.sh --model kimi_k2_thinking --mode online --pd-role prefill
-   # online 模式（指定 prefill/decode yaml）
+   # online 模式（显式指定本模型 config/pd/ 下的配置）
    bash executor/scripts/infer.sh --model kimi_k2_thinking --mode online --pd-role prefill --p-yaml-name pd/prefill.yaml --d-yaml-name pd/decode.yaml
    ```
 
@@ -120,5 +118,3 @@
    > 说明：
    > - 如果是多机环境，需要在每个节点上执行。
    > - 推理日志和结果保存在 `models/kimi_k2_thinking/res/` 路径下。
-
-
