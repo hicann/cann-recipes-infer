@@ -44,12 +44,12 @@ class AttentionConfig:
     actual_seq: torch.Tensor = None  # Changed to torch.Tensor type
     block_table_batch: int = 0
     kv_num_blocks: int = 0
-    
+
 
 def gen_block_table(actual_seq_len, block_size, block_table_shape, cmp_ratio=128, enable_win=False):
     block_num_per_batch = []
     block_num = 0
-    
+
     if enable_win:
         cmp_ratio = 1
     # Process torch tensor type actual_seq_len
@@ -213,7 +213,7 @@ def cfa_flash_torch(q, cmp_kv, sinks, cmp_block_table, seqused_kv, out, cmp_rati
         k: Key cache [num_blocks, block_size, kv_head_num, head_size]
         v: Value cache [num_blocks, block_size, kv_head_num, head_size]
         cmp_block_table: Block mapping table for compress cmp_kv cache [batch_size, max_num_blocks_per_query]
-        start_pos: Actual start position [batch_size], satisify start_pos + s1 = original actual seq
+        start_pos: Actual start position [batch_size], satisfy start_pos + s1 = original actual seq
         out: Output [batch_size * s1, num_head, head_size]
     """
     fp32 = torch.float32
@@ -400,7 +400,7 @@ def test_compressed_flash_attention(enable_flash: bool, enable_high_perf: bool, 
 
     cfa_golden(q, cmp_kv, sinks, cmp_block_table, seqused_kv, output_flash, enable_flash=True, cmp_r=cmp_ratio, \
                is_new_sink=True, kv_win=ori_kv, blk_win=ori_block_table)
-    threhold = 5e-4
+    threshold = 5e-4
     # acl graph mode
     if enable_graph:
         import torchair as tng
@@ -416,7 +416,7 @@ def test_compressed_flash_attention(enable_flash: bool, enable_high_perf: bool, 
                                         cmp_ratio)
 
     from compare import compare
-    compare(output_flash, attention_out, "golden vs npu", rtol=threhold, atol=threhold)
+    compare(output_flash, attention_out, "golden vs npu", rtol=threshold, atol=threshold)
 
 
 def test_compress_flash_attention_kernel(enable_flash: bool = False, enable_high_perf: bool = False, enable_graph: bool = True,

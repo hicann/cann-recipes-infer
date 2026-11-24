@@ -72,11 +72,14 @@ std::string GetDataTypeStr(ge::DataType datatype) {
     }
 }
 
-ge::graphStatus CheckTensorDimNumAndDtype(const gert::StorageShape* tensorShape, const gert::CompileTimeTensorDesc* tensorDesc,
-    const uint32_t &dimNum, const ge::DataType &dataType, const uint32_t &index) {
+ge::graphStatus CheckTensorDimNumAndDtype(const gert::StorageShape* tensorShape,
+    const gert::CompileTimeTensorDesc* tensorDesc, const uint32_t &dimNum, const ge::DataType &dataType,
+    const uint32_t &index)
+{
     ge::DataType dtype = tensorDesc->GetDataType();
     if(dtype != dataType) {
-        printf("%sError:%s Lightning indexer prolog pto get invalid dtype, tensor index is: %u, it shoule be %s, get tensor dataType is: %s.\n",
+        printf("%sError:%s Lightning indexer prolog pto get invalid dtype, tensor index is: %u, "
+            "it should be %s, get tensor dataType is: %s.\n",
             RED, RESET, index, GetDataTypeStr(dataType).c_str(), GetDataTypeStr(dtype).c_str());
         return ge::GRAPH_FAILED;
     }
