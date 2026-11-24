@@ -65,7 +65,7 @@ snapshot_download(
 
 量化权重转换脚本的使用，以下以mxfp8为例子（目前仅支持mxfp8的A8W8量化，hif8和mxfp4 尚未开放）：
 ```bash
-python /cann-recipes-infer/models/pangu_7b/utils/convert_model.py --input_bf16_hf_path /dev/shm/ckpts/openPangu-Embedded-7B/ --output_hf_path /dev/shm/ckpts/openPangu-Embedded-7B-MXFP8/ --w8a8 --w_quant mxfp8
+python ./models/pangu_7b/utils/convert_model.py --input_bf16_hf_path /dev/shm/ckpts/openPangu-Embedded-7B/ --output_hf_path /dev/shm/ckpts/openPangu-Embedded-7B-MXFP8/ --w8a8 --w_quant mxfp8
 ```
 > - 注意：mxfp8量化仅支持Atlas A5硬件。
 
