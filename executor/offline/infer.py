@@ -180,6 +180,89 @@ def log_results(results, speculative_stats, infer_time, model_name, speculative_
         )
 
 
+def _prepare_mmmu_prompts(
+    config,
+    dataset_path,
+    batch_size,
+    attn_dp_size,
+    cp_size,
+    global_rank,
+):
+    if cp_size > 1:
+        raise ValueError("MMMU dataset does not support cp_size>1")
+
+    mmmu_path = os.path.abspath(os.path.join(dataset_path, "MMMU"))
+    mmmu_source = mmmu_path if os.path.isdir(mmmu_path) else "MMMU/MMMU"
+    prompts, mmmu_ids, mmmu_ground_truths = load_mmmu_dataset(mmmu_source, batch_size)
+
+    global_dp_rank = 0
+    prompt_batch_size = batch_size
+    if attn_dp_size > 1:
+        prompt_batch_size = config.scheduler_config.batch_size_per_dp_rank
+        global_dp_rank = _get_prompt_dp_rank(config, global_rank)
+        lo = global_dp_rank * prompt_batch_size
+        hi = (global_dp_rank + 1) * prompt_batch_size
+        prompts = prompts[lo:hi]
+        mmmu_ids = mmmu_ids[lo:hi]
+        mmmu_ground_truths = mmmu_ground_truths[lo:hi]
+    else:
+        prompts = prompts[:batch_size]
+        mmmu_ids = mmmu_ids[:batch_size]
+        mmmu_ground_truths = mmmu_ground_truths[:batch_size]
+    return prompts, mmmu_ids, mmmu_ground_truths, global_dp_rank, prompt_batch_size
+
+
+def _prepare_prompts(config, dataset_path, global_rank):
+    """Prepare prompts for the configured dataset.
+
+    Returns:
+        prompts: Prompts prepared for the current batch or DP rank.
+        mmmu_ids: MMMU sample IDs, or None for non-MMMU datasets.
+        mmmu_ground_truths: MMMU ground truths, or None for non-MMMU datasets.
+        global_dp_rank: Global attention-DP rank assigned to the current process.
+        prompt_batch_size: Number of prompts assigned to the current process.
+    """
+    dataset = config.data_config.dataset
+    batch_size = config.scheduler_config.batch_size
+    attn_dp_size = config.parallel_config.attn_dp_size
+    cp_size = config.parallel_config.cp_size
+
+    if batch_size % attn_dp_size != 0:
+        raise ValueError(
+            f"batch_size ({batch_size}) must be divisible by "
+            f"attn_dp_size ({attn_dp_size})"
+        )
+
+    if dataset == "MMMU":
+        return _prepare_mmmu_prompts(
+            config,
+            dataset_path,
+            batch_size,
+            attn_dp_size,
+            cp_size,
+            global_rank,
+        )
+
+    if cp_size > 1:
+        all_prompts = generate_prompt(dataset, dataset_path)
+        all_prompts = all_prompts * (batch_size // len(all_prompts) + 1)
+        prompts = all_prompts[:batch_size]
+        return prompts, None, None, 0, batch_size
+
+    if attn_dp_size > 1:
+        batch_size_per_rank = batch_size // attn_dp_size
+        global_dp_rank = _get_prompt_dp_rank(config, global_rank)
+        all_prompts = generate_prompt(dataset, dataset_path)
+        all_prompts = all_prompts * (batch_size // len(all_prompts) + 1)
+        start = global_dp_rank * batch_size_per_rank
+        end = (global_dp_rank + 1) * batch_size_per_rank
+        prompts = all_prompts[start:end]
+        return prompts, None, None, global_dp_rank, batch_size_per_rank
+
+    prompts = generate_prompt(dataset, dataset_path)[:batch_size]
+    return prompts, None, None, 0, batch_size
+
+
 def main():
     setup_logging()
     local_rank = int(os.getenv("LOCAL_RANK", "0"))
@@ -200,55 +283,8 @@ def main():
         dataset_path = config.data_config.dataset_path
 
     attn_dp_size = config.parallel_config.attn_dp_size
-    cp_size = config.parallel_config.cp_size
-    batch_size = config.scheduler_config.batch_size
-    mmmu_ids = None
-    mmmu_ground_truths = None
-    if config.data_config.dataset == "MMMU":
-        if cp_size > 1:
-            raise ValueError(
-                "MMMU dataset does not support cp_size>1"
-            )
-        mmmu_path = os.path.abspath(os.path.join(dataset_path, "MMMU"))
-        if os.path.isdir(mmmu_path):
-            mmmu_source = mmmu_path
-        else:
-            mmmu_source = "MMMU/MMMU"
-        prompts, mmmu_ids, mmmu_ground_truths = load_mmmu_dataset(mmmu_source, batch_size)
-        global_dp_rank = 0
-        if attn_dp_size > 1:
-            if batch_size % attn_dp_size != 0:
-                raise ValueError(
-                    f"batch_size ({batch_size}) must be divisible by "
-                    f"attn_dp_size ({attn_dp_size})"
-                )
-            per_rank = config.scheduler_config.batch_size_per_dp_rank
-            global_dp_rank = _get_prompt_dp_rank(config, global_rank)
-            lo = global_dp_rank * per_rank
-            hi = (global_dp_rank + 1) * per_rank
-            prompts = prompts[lo:hi]
-            mmmu_ids = mmmu_ids[lo:hi]
-            mmmu_ground_truths = mmmu_ground_truths[lo:hi]
-    elif cp_size > 1:
-        if batch_size % attn_dp_size != 0:
-            raise ValueError(f"batch_size ({batch_size}) must be divisible by attn_dp_size ({attn_dp_size})")
-        all_prompts = generate_prompt(config.data_config.dataset, dataset_path)
-        all_prompts = all_prompts * (batch_size // len(all_prompts) + 1)
-        prompts = all_prompts[:batch_size]
-    elif attn_dp_size > 1:
-        if batch_size % attn_dp_size != 0:
-            raise ValueError(
-                f"batch_size ({batch_size}) must be divisible by attn_dp_size ({attn_dp_size})"
-            )
-        batch_size_per_rank = batch_size // attn_dp_size
-        global_dp_rank = _get_prompt_dp_rank(config, global_rank)
-        all_prompts = generate_prompt(config.data_config.dataset, dataset_path)
-        all_prompts = all_prompts * (batch_size // len(all_prompts) + 1)
-        prompts = all_prompts[
-            global_dp_rank * batch_size_per_rank:(global_dp_rank + 1) * batch_size_per_rank
-        ]
-    else:
-        prompts = generate_prompt(config.data_config.dataset, dataset_path)
+    prompts, mmmu_ids, mmmu_ground_truths, global_dp_rank, batch_size = _prepare_prompts(
+        config, dataset_path, global_rank)
 
     llm = OfflineInference(config)
 
@@ -263,7 +299,8 @@ def main():
         top_logprobs=0,
         logprobs=False
     )
-    results, speculative_stats, infer_time = llm.generate(prompts=prompts, sampling_params=sampling_params)
+    results, speculative_stats, infer_time = llm.generate(
+        prompts=prompts, sampling_params=sampling_params, batch_size=batch_size)
     if llm.engine.is_afd_ffn_rank:
         return
     log_results(

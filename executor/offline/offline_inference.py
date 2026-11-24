@@ -70,7 +70,6 @@ class OfflineInference:
             input_truncated_len=self.infer_config.data_config.input_truncated_len,
             mm_processor=self.engine.mm_processor,
             enable_mm_encode=self.engine.enable_mm_encode,
-            reuse_tokenizer=self.infer_config.data_config.reuse_tokenizer,
         )
 
     def _load_model(self) -> None:
@@ -105,7 +104,8 @@ class OfflineInference:
     def generate(
         self,
         prompts: List[str],
-        sampling_params: Optional[SamplingParams] = None
+        sampling_params: Optional[SamplingParams] = None,
+        batch_size: Optional[int] = None,
     ) -> tuple[List[GenerationOutput], Optional[dict], List[float]]:
         """Generate text for a batch of prompts.
 
@@ -136,33 +136,14 @@ class OfflineInference:
 
         parallel_config = self.infer_config.parallel_config
         enable_cp = parallel_config.cp_size > 1
-        # CP prefill uses a global compute batch on every CP rank; decode still
-        # returns only this rank's owner requests.
-        batch_size = self.scheduler.config.batch_size if enable_cp else self.scheduler.config.batch_size_per_dp_rank
 
-        # Convert str prompts to chat message format for chat template tokenization
-        prompts = [
-            [{"role": "user", "content": p}] if isinstance(p, str) else p
-            for p in prompts
-        ]
-
-        # Add all requests to scheduler
-        request_ids = []
-        prompt_map = {}
-        for prompt in prompts:
-            request_id = self.scheduler.add_request(prompt=prompt, sampling_params=sampling_params)
-            request_ids.append(request_id)
-            # simplified process, to be optimized
-            prompt_map[request_id] = prompt
-            if len(request_ids) >= batch_size:
-                break
-
-        original_request_count = len(request_ids)
-        if len(request_ids) < batch_size:
-            # Pad requests to batch_size if needed
-            while len(request_ids) < batch_size:
-                request_id = self.scheduler.add_request(prompt=prompts[-1], sampling_params=sampling_params)
-                request_ids.append(request_id)
+        batch_prompt = prompts[0]
+        if isinstance(batch_prompt, str):
+            batch_prompt = [{"role": "user", "content": batch_prompt}]
+        request_ids = self.scheduler.add_batch_requests(
+            batch_prompt, batch_size, sampling_params
+        )
+        prompt_map = {request_id: batch_prompt for request_id in request_ids}
 
         # Run scheduling loop until all requests complete
         while self.scheduler.has_work():
@@ -186,17 +167,17 @@ class OfflineInference:
             "timed_spec_num_draft_tokens": [],
             "timed_decode_output_tokens": [],
         }
-        result_request_ids = request_ids[:original_request_count]
         if enable_cp:
             current_cp_rank = parallel_config.global_rank % parallel_config.cp_size
-            result_request_ids = [
-                request_id for request_id in result_request_ids
+            request_ids = [
+                request_id
+                for request_id in request_ids
                 if self.scheduler.finished_requests.get(request_id, None) is not None
                 and self.scheduler.finished_requests[request_id].cp_rank == current_cp_rank
             ]
 
         use_mm_batch_infer_time = self.engine.enable_mm_encode
-        needs_cp_infer_time_fallback = enable_cp and not result_request_ids
+        needs_cp_infer_time_fallback = enable_cp and not request_ids
         batch_infer_time = []
         if use_mm_batch_infer_time or needs_cp_infer_time_fallback:
             for request_id in request_ids:
@@ -210,7 +191,7 @@ class OfflineInference:
                             *batch_infer_time[1:],
                         ]
                     break
-        for request_id in result_request_ids:
+        for request_id in request_ids:
             request = self.scheduler.pop_finished_request(request_id)
             if request is None:
                 logger.warning(
@@ -267,22 +248,13 @@ class OfflineInference:
         self.scheduler.reset()
         if self.engine.mm_embedding_store is not None:
             self.engine.mm_embedding_store.clear()
-        batch_size = self.scheduler.config.batch_size_per_dp_rank
         prompts = [
             [{"role": "user", "content": p}] if isinstance(p, str) else p
             for p in prompts
         ]
-        request_ids = []
-        for prompt in prompts:
-            request_ids.append(self.scheduler.add_request(prompt))
-            if len(request_ids) >= batch_size:
-                break
+        request_ids = self.scheduler.add_batch_requests(prompts[0], len(prompts))
         if not request_ids:
             return [], None, []
-        # AFD FFN ranks build dummy inputs to receive hidden states from Attention ranks.
-        # Keep the FFN-side batch shape fixed by padding dummy requests when needed.
-        while len(request_ids) < batch_size:
-            request_ids.append(self.scheduler.add_request(prompts[-1]))
 
         infer_time = []
         while self.scheduler.has_work():

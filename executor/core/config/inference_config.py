@@ -88,13 +88,11 @@ class DataConfig:
         dataset_path: Path to the dataset (default: "")
         input_truncated_len: Max prompt length passed to the tokenizer for
             truncation; None disables truncation (default: 256)
-        reuse_tokenizer: Tokenize one prompt and reuse it across the batch (default: False)
         temperature: Sampling temperature. Use 0 for greedy decoding. (default: 0.0)
     """
     dataset: str = "default"
     dataset_path: str = ""
     input_truncated_len: int = 256
-    reuse_tokenizer: bool = False
     temperature: float = 0.0
     top_p: float = 1.0
     top_k: int = 0
@@ -107,9 +105,6 @@ class DataConfig:
             dataset=data_config_dict.get("dataset", "default"),
             dataset_path=data_config_dict.get("dataset_path", ""),
             input_truncated_len=data_config_dict.get("input_truncated_len", 256),
-            reuse_tokenizer=data_config_dict.get(
-                "reuse_tokenizer", data_config_dict.get("enable_reuse_tokenizer", False)
-            ),
             temperature=data_config_dict.get("temperature", 0.0),
             top_p=data_config_dict.get("top_p", 1.0),
             top_k=data_config_dict.get("top_k", 0),
