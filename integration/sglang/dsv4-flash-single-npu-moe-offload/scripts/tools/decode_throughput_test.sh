@@ -46,6 +46,15 @@ CHARS_PER_TOK="${CHARS_PER_TOK:-4.6}"
 TARGET_TOKENS_LIST="${TARGET_TOKENS_LIST:-130 1000 8000 16000 32000}"
 PY="${PY:-python}"
 
+if [[ ! "$REPEAT" =~ ^[0-9]*[1-9][0-9]*$ ]]; then
+  printf '[longseq][ERROR] REPEAT must be a positive integer, got %s\n' "$REPEAT" >&2
+  exit 2
+fi
+if [[ ! "$WARMUP" =~ ^[0-9]+$ ]]; then
+  printf '[longseq][ERROR] WARMUP must be a non-negative integer, got %s\n' "$WARMUP" >&2
+  exit 2
+fi
+
 CONTEXT_LIMIT=65536
 GEN_URL="http://${HOST}:${PORT}/generate"
 
