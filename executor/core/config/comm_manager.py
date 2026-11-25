@@ -143,12 +143,13 @@ class CommManager:
         self._physical_cache[default_key] = default_pg
         self._groups["default_pg"] = default_pg
 
-    def init_cpu_groups(self):
-        """Initialize gloo-backend CPU groups for online mode coordination.
+    def init_cpu_groups(self, enable_afd: bool = False):
+        """Initialize gloo-backend CPU groups for phase coordination.
 
         Creates:
         - dp_leader_group: cross-DP synchronization among DP leaders
-        - tp_cpu_group: DP leader -> TP workers broadcast of Python objects
+        - tp_cpu_group: DP leader -> TP workers broadcast of Python objects.
+          In AFD mode each group contains paired FFN and Attention ranks.
         """
         cfg = self.config
         global_rank = cfg.global_rank
@@ -157,9 +158,13 @@ class CommManager:
         group_size = tp_size * cp_size
         dp_size = cfg.cp_prefill_dp_size if cp_size > 1 else cfg.attn_dp_size
 
-        # dp_leader_group: ranks where global_rank % group_size == 0
+        # LongCat AFD splits ranks into equal FFN/Attention halves with 1:1
+        # pairing, so the second half starts at world_size // 2.
+        afd_half = cfg.world_size // 2 if enable_afd else 0
+
+        # AFD phase decisions are made by Attention DP leaders.
         if dp_size > 1:
-            dp_leader_ranks = [i * group_size for i in range(dp_size)]
+            dp_leader_ranks = [afd_half + i * group_size for i in range(dp_size)]
             dp_leader_group = dist.new_group(dp_leader_ranks, backend="gloo")
             if global_rank in dp_leader_ranks:
                 self._groups["dp_leader_group"] = dp_leader_group
@@ -172,16 +177,23 @@ class CommManager:
             self._groups["dp_leader_group"] = None
             self._ranks["dp_leader_group"] = 0
 
-        # tp_cpu_group: same partitioning as a full DP partition, gloo backend
-        if group_size > 1:
+        # AFD pairs each FFN partition with its corresponding Attention
+        # partition so both halves follow the Attention phase decision.
+        if group_size > 1 or enable_afd:
             for dp_idx in range(dp_size):
-                tp_ranks = [dp_idx * group_size + i for i in range(group_size)]
+                ffn_ranks = [dp_idx * group_size + i for i in range(group_size)]
+                if enable_afd:
+                    attn_ranks = [afd_half + rank for rank in ffn_ranks]
+                    tp_ranks = ffn_ranks + attn_ranks
+                else:
+                    tp_ranks = ffn_ranks
                 group = dist.new_group(tp_ranks, backend="gloo")
                 if global_rank in tp_ranks:
                     self._groups["tp_cpu_group"] = group
                     self._ranks["tp_cpu_group"] = dist.get_rank(group)
             logger.info(
-                f"tp_cpu_group initialized: tp_size={tp_size}, cp_size={cp_size}, dp_size={dp_size}"
+                f"tp_cpu_group initialized: tp_size={tp_size}, cp_size={cp_size}, "
+                f"dp_size={dp_size}, enable_afd={enable_afd}"
             )
         else:
             self._groups["tp_cpu_group"] = None

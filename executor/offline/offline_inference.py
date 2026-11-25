@@ -15,7 +15,7 @@
 
 """Offline batch inference entrypoint using Scheduler and ExecutionEngine."""
 
-from typing import List, Optional
+from typing import List, Optional, Tuple
 import logging
 
 import torch
@@ -62,6 +62,17 @@ class OfflineInference:
         # Initialize execution engine
         self.engine = ExecutionEngine(self.infer_config)
         self._load_model()
+        self.enable_afd = self.infer_config.model_config.custom_params.get("enable_afd", False)
+        self.enable_offline_afd_phase_sync = (
+            self.enable_afd
+            and self.infer_config.disagg_config.disaggregation_mode == "NONE"
+        )
+        self._compute_parallel_ranks()
+
+        # Match LongCat AFD's 1:1 FFN/Attention rank layout.
+        self.engine.comm_manager.init_cpu_groups(
+            enable_afd=self.enable_offline_afd_phase_sync
+        )
 
         # Initialize scheduler with engine's tokenizer
         self.scheduler = Scheduler(
@@ -70,6 +81,31 @@ class OfflineInference:
             input_truncated_len=self.infer_config.data_config.input_truncated_len,
             mm_processor=self.engine.mm_processor,
             enable_mm_encode=self.engine.enable_mm_encode,
+        )
+
+    def _compute_parallel_ranks(self) -> None:
+        pc = self.infer_config.parallel_config
+        self.global_rank = pc.global_rank
+        self.local_rank = pc.local_rank
+        self.world_size = pc.world_size
+        self.tp_size = pc.attn_tp_size
+        self.cp_size = pc.cp_size
+        self.group_size = self.tp_size * self.cp_size
+        self.dp_size = pc.cp_prefill_dp_size if self.cp_size > 1 else pc.attn_dp_size
+
+        logical_rank = self.global_rank
+        if self.enable_offline_afd_phase_sync:
+            logical_rank %= self.world_size // 2
+        self.dp_rank = logical_rank // self.group_size
+        self.cp_rank = (logical_rank % self.group_size) // self.tp_size
+        self.tp_rank = logical_rank % self.tp_size
+        self.is_dp_leader = logical_rank % self.group_size == 0
+        self.is_phase_leader = (
+            self.is_dp_leader
+            and (
+                not self.enable_offline_afd_phase_sync
+                or not self.engine.is_afd_ffn_rank
+            )
         )
 
     def _load_model(self) -> None:
@@ -125,6 +161,9 @@ class OfflineInference:
               or [encode, prefill, decode...] when MM Encode is enabled.
         """
         if not prompts:
+            logger.warning(
+                "no prompts on this rank; returning early. If other DP ranks have work, "
+                "phase negotiation will stall.")
             return [], None, []
         if self.engine.is_afd_ffn_rank:
             return self._generate_afd_ffn(prompts)
@@ -146,9 +185,15 @@ class OfflineInference:
         prompt_map = {request_id: batch_prompt for request_id in request_ids}
 
         # Run scheduling loop until all requests complete
-        while self.scheduler.has_work():
-            if not self.scheduler.run_step(self.engine):
-                logger.warning("Scheduler has work but no batch was scheduled. Breaking loop to avoid infinite wait.")
+        while True:
+            phase = self._negotiate_phase()
+            if phase is None:
+                break
+            local_has_work = self._has_phase_work(phase)
+            # Every rank executes the negotiated phase; ranks without local
+            # work run a dummy batch so model collectives remain aligned.
+            did_run = self.scheduler.run_step(self.engine, phase=phase)
+            if self._sync_phase_stall(phase, local_has_work and not did_run):
                 break
 
         # Collect results (only for original requests, not padded ones)
@@ -244,6 +289,122 @@ class OfflineInference:
 
         return results, speculative_stats, batch_infer_time
 
+    def _negotiate_phase(self) -> Optional[str]:
+        """Choose one phase for all DP/TP ranks in this offline step."""
+        local_mm = self.scheduler.has_mm_pending()
+        local_prefill = self.scheduler.has_prefill_ready()
+        local_decode = bool(self.scheduler.running_requests)
+
+        if self.is_phase_leader:
+            states = self._sync_dp_local_state(local_mm, local_prefill, local_decode)
+            phase = self._decide_phase(states)
+        else:
+            phase = None
+        return self._broadcast_group(phase)
+
+    def _has_phase_work(self, phase: str) -> bool:
+        if phase == "mm_encode":
+            return self.scheduler.has_mm_pending()
+        if phase == "prefill":
+            return self.scheduler.has_prefill_ready()
+        if phase == "decode":
+            return bool(self.scheduler.running_requests)
+        return False
+
+    def _sync_phase_stall(self, phase: str, local_stalled: bool) -> bool:
+        """Detect a real stall and stop the offline batch consistently.
+
+        ``run_step()`` returns ``False`` for both an expected dummy batch and
+        a real scheduling failure.  ``local_stalled`` is set only when this
+        rank has work but cannot build a batch.  Reduce that state within the
+        TP/CP group and across DP leaders so every rank exits together.  This
+        is a fail-fast guard for resource failures such as KV cache exhaustion;
+        it does not recover the pending request.
+        """
+        tp_group = self.engine.comm_manager.get_group("tp_cpu_group")
+        if tp_group is not None:
+            stall_tensor = torch.tensor([int(local_stalled)], dtype=torch.long)
+            torch.distributed.all_reduce(
+                stall_tensor,
+                op=torch.distributed.ReduceOp.MAX,
+                group=tp_group,
+            )
+            local_stalled = bool(stall_tensor.item())
+
+        if self.is_phase_leader:
+            group = self.engine.comm_manager.get_group("dp_leader_group")
+            if self.dp_size <= 1 or group is None:
+                stalled = local_stalled
+            else:
+                local_state = torch.tensor([int(local_stalled)], dtype=torch.long)
+                gathered = [torch.zeros_like(local_state) for _ in range(self.dp_size)]
+                torch.distributed.all_gather(gathered, local_state, group=group)
+                stalled = any(bool(item[0].item()) for item in gathered)
+        else:
+            stalled = None
+        stalled = bool(self._broadcast_group(stalled))
+        if stalled and self.is_phase_leader:
+            logger.warning(
+                "Offline %s phase stalled with local work pending; stopping the scheduling loop.",
+                phase,
+            )
+        return stalled
+
+    def _sync_dp_local_state(
+        self,
+        local_has_mm: bool,
+        local_has_prefill: bool,
+        local_has_decode: bool,
+    ) -> List[Tuple[bool, bool, bool]]:
+        """Gather MM Encode, Prefill and Decode state across DP leaders."""
+        group = self.engine.comm_manager.get_group("dp_leader_group")
+        if self.dp_size <= 1 or group is None:
+            return [(local_has_mm, local_has_prefill, local_has_decode)]
+
+        local_state = torch.tensor(
+            [int(local_has_mm), int(local_has_prefill), int(local_has_decode)],
+            dtype=torch.long,
+        )
+        gathered = [torch.zeros_like(local_state) for _ in range(self.dp_size)]
+        torch.distributed.all_gather(gathered, local_state, group=group)
+        return [
+            (
+                bool(item[0].item()),
+                bool(item[1].item()),
+                bool(item[2].item()),
+            )
+            for item in gathered
+        ]
+
+    @staticmethod
+    def _decide_phase(
+        states: List[Tuple[bool, bool, bool]],
+    ) -> Optional[str]:
+        """Apply the global phase priority used by offline scheduling."""
+        if any(has_prefill for _, has_prefill, _ in states):
+            return "prefill"
+        if any(has_mm for has_mm, _, _ in states):
+            return "mm_encode"
+        if any(has_decode for _, _, has_decode in states):
+            return "decode"
+        return None
+
+    def _broadcast_group(self, obj):
+        """Broadcast a phase or request payload within the local CPU group."""
+        if self.group_size == 1 and not self.enable_offline_afd_phase_sync:
+            return obj
+
+        obj_list = [obj]
+        source = self.dp_rank * self.group_size
+        if self.enable_offline_afd_phase_sync:
+            source += self.world_size // 2
+        torch.distributed.broadcast_object_list(
+            obj_list,
+            src=source,
+            group=self.engine.comm_manager.get_group("tp_cpu_group"),
+        )
+        return obj_list[0]
+
     def _generate_afd_ffn(self, prompts: List[str]) -> tuple[List[GenerationOutput], Optional[dict], List[float]]:
         self.scheduler.reset()
         if self.engine.mm_embedding_store is not None:
@@ -256,16 +417,21 @@ class OfflineInference:
         if not request_ids:
             return [], None, []
 
-        infer_time = []
-        while self.scheduler.has_work():
-            if not self.scheduler.run_step(self.engine):
-                logger.warning("AFD FFN scheduler has work but no batch was scheduled.")
+        while True:
+            phase = self._negotiate_phase()
+            if phase is None:
                 break
-            request = self.scheduler.running_requests.get(request_ids[0])
-            if request is None:
-                request = self.scheduler.finished_requests.get(request_ids[0])
-            if request is not None:
-                infer_time = request.infer_time
+
+            local_has_work = self._has_phase_work(phase)
+            did_run = self.scheduler.run_step(self.engine, phase=phase)
+            if self._sync_phase_stall(phase, local_has_work and not did_run):
+                break
+
+        request = None if not request_ids else (
+            self.scheduler.running_requests.get(request_ids[0])
+            or self.scheduler.finished_requests.get(request_ids[0])
+        )
+        infer_time = request.infer_time if request is not None else []
 
         decode_infer_time = infer_time[1:] if infer_time and len(infer_time) > 1 else []
         avg_decode_time = process_infer_time(decode_infer_time, len(decode_infer_time))

@@ -129,7 +129,7 @@ InferenceConfig
 
 **模型计算 HCCL 组**（模型侧 `init_parallel_comm_group()`）：模型根据自身结构和 YAML 并行参数，通过 `CommManager.register_group()` 显式声明所需通信域，例如 attention / ffn / moe / embedding / lm_head / MC2 独立通信域等。`CommManager` 负责根据声明完成通信域的创建、缓存与复用，不再在框架侧统一初始化所有业务 HCCL 组。
 
-**调度用 Gloo 组**（`CommManager.init_cpu_groups()`，仅在 `OnlineInference.__init__` 中追加调用，用于在 DP leader 之间或 DP leader 与 TP worker 之间广播 / 同步 Python 对象，例如请求 dict、phase 标记）：
+**调度用 Gloo 组**（由 `OfflineInference` 初始化，`OnlineInference` 通过继承使用，用于在 DP leader 之间或 DP leader 与 TP worker 之间广播 / 同步 Python 对象，例如请求 dict、phase 标记）：
 
 - `dp_leader_group`：跨 DP 组同步，各 DP 组内 `attn_tp_rank == 0` 的 rank 称为 **DP leader**，参与跨实例协商
 - `tp_cpu_group`：DP 组内同步，DP leader 向同组其他 TP worker 广播请求
@@ -343,9 +343,9 @@ bash executor/scripts/infer.sh --model <model> [--mode offline] [--yaml <name>]
     │
     ├─ scheduler.add_request(prompt)  ×N   # prepare → Processor → 最终长度校验 → 对应等待队列
     │
-    └─ 推理循环（while scheduler.has_work()）
+    └─ 推理循环（while _negotiate_phase() is not None）
             │
-            ├─ scheduler.run_step(engine)
+            ├─ scheduler.run_step(engine, phase)
             │       │
             │       ├─ 若选中 MM Encode：_schedule_mm_encode_batch()
             │       │       └─ engine.encode_mm_batch() → Store → waiting_queue，结束本 step

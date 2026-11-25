@@ -643,6 +643,10 @@ class InferenceConfig:
 
     def _update_afd_parallel_config(self):
         parallel_config = self.parallel_config
+        if parallel_config.cp_size != 1:
+            raise ValueError(
+                f"AFD does not support cp_size > 1, got {parallel_config.cp_size}."
+            )
         world_size = parallel_config.world_size
         if world_size % 2 != 0:
             raise ValueError(f"AFD requires even world_size, got {world_size}.")

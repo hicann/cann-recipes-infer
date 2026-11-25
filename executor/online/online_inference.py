@@ -20,11 +20,10 @@ import json
 import pickle
 import math
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List, Optional
 from urllib import request as urllib_request
 
 import torch
-import torch.distributed as dist
 import zmq
 
 from executor.core.config import InferenceConfig
@@ -69,11 +68,6 @@ class OnlineInference(OfflineInference):
         self.batch_size = infer_config.scheduler_config.batch_size_per_dp_rank
         self.router_port, self.pull_port = zmq_ports_for_role(self.disaggregation_mode)
 
-        # Gloo CPU groups (tp_cpu_group, dp_leader_group) are online-only.
-        self.engine.comm_manager.init_cpu_groups()
-
-        self._compute_parallel_ranks()
-
         self.kv_transfer_manager = None
         if self.disaggregation_mode in ("PREFILL", "DECODE"):
             self.kv_transfer_manager = self._build_kv_manager()
@@ -85,21 +79,6 @@ class OnlineInference(OfflineInference):
             f"Rank {self.global_rank}: dp_rank={self.dp_rank}, tp_rank={self.tp_rank}, "
             f"is_dp_leader={self.is_dp_leader}"
         )
-
-    def _compute_parallel_ranks(self) -> None:
-        pc = self.infer_config.parallel_config
-        self.global_rank = pc.global_rank
-        self.local_rank = pc.local_rank
-        self.world_size = pc.world_size
-        self.tp_size = pc.attn_tp_size
-        self.cp_size = pc.cp_size
-        self.group_size = self.tp_size * self.cp_size
-        self.dp_size = pc.cp_prefill_dp_size if self.cp_size > 1 else pc.attn_dp_size
-
-        self.dp_rank = self.global_rank // self.group_size
-        self.cp_rank = (self.global_rank % self.group_size) // self.tp_size
-        self.tp_rank = self.global_rank % self.tp_size
-        self.is_dp_leader = self.global_rank % self.group_size == 0
 
     def _build_kv_manager(self) -> KVTransferManager:
         draft_worker = self.engine.draft_worker
@@ -271,22 +250,6 @@ class OnlineInference(OfflineInference):
             if sock:
                 sock.close(linger=0)
 
-    def _broadcast_group(self, obj):
-        """Broadcast a Python object from DP leader to all TP/CP/PP followers
-        within one DP group (size = tp_size * cp_size). No-op when
-        group_size == 1 (single rank per DP group — no followers)."""
-        if self.group_size == 1:
-            return obj
-        tp_cpu_group = self.engine.comm_manager.get_group("tp_cpu_group")
-        obj_list = [obj]
-        group_leader_rank = self.dp_rank * self.group_size
-        dist.broadcast_object_list(
-            obj_list,
-            src=group_leader_rank,
-            group=tp_cpu_group,
-        )
-        return obj_list[0]
-
     def _idle_wait(self, sockets: InferenceSockets) -> None:
         """Block-wait when all DP ranks have no work.
 
@@ -297,45 +260,6 @@ class OnlineInference(OfflineInference):
             poller = zmq.Poller()
             poller.register(sockets.leader_socket, zmq.POLLIN)
             poller.poll(self.IDLE_POLL_TIMEOUT_MS)
-
-    def _sync_dp_local_state(
-        self,
-        local_has_mm: bool,
-        local_has_prefill: bool,
-        local_has_decode: bool,
-    ) -> List[Tuple[bool, bool, bool]]:
-        """Synchronize local scheduler state across DP leaders."""
-        dp_leader_group = self.engine.comm_manager.get_group("dp_leader_group")
-        if self.dp_size <= 1 or dp_leader_group is None:
-            return [(local_has_mm, local_has_prefill, local_has_decode)]
-
-        local_state = torch.tensor(
-            [int(local_has_mm), int(local_has_prefill), int(local_has_decode)],
-            dtype=torch.long,
-        )
-        gathered = [torch.zeros_like(local_state) for _ in range(self.dp_size)]
-        dist.all_gather(gathered, local_state, group=dp_leader_group)
-        return [
-            (
-                bool(item[0].item()),
-                bool(item[1].item()),
-                bool(item[2].item()),
-            )
-            for item in gathered
-        ]
-
-    def _decide_phase(
-        self,
-        states: List[Tuple[bool, bool, bool]],
-    ) -> Optional[str]:
-        """Determine the global phase from local scheduler states."""
-        if any(has_prefill for _, has_prefill, _ in states):
-            return "prefill"
-        if any(has_mm for has_mm, _, _ in states):
-            return "mm_encode"
-        if any(has_decode for _, _, has_decode in states):
-            return "decode"
-        return None
 
     # Polling timeout (ms) when globally idle (all DP ranks have no work).
     # DP leader blocks on zmq.poll; TP workers block on the torch broadcast

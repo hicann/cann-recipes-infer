@@ -247,10 +247,13 @@ function set_hccl()
 
 function launch_infer_task()
 {
+    # Pin Gloo CPU collectives to the routed IPv4 interface for both online
+    # and offline inference. Allow the caller to override the interface.
     mode=$1
+    export GLOO_IGNORE_IPV6=1
+    export GLOO_SOCKET_IFNAME=${GLOO_SOCKET_IFNAME:-$(awk '$2 == "00000000" {print $1; exit}' /proc/net/route)}
+    echo "[INFO] GLOO_SOCKET_IFNAME=${GLOO_SOCKET_IFNAME:-<auto>}"
     if [ "$mode" = "online" ]; then
-        export GLOO_IGNORE_IPV6=1
-        export GLOO_SOCKET_IFNAME=${GLOO_SOCKET_IFNAME:-$(awk '$2 == "00000000" {print $1; exit}' /proc/net/route)}
         SERVER_PATH=${PARENT_PARENT_DIR}/executor/online/server.py
         if [ "${PD_ROLE}" = "decode" ]; then
             export MASTER_PORT=6239

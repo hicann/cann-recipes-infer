@@ -164,7 +164,7 @@ sequenceDiagram
 worker_main(global_rank, local_rank, ..., disagg_config)              # in server.py
   └── OnlineInference.__init__
         ├── 父类 OfflineInference.__init__                              # 加载模型 + HCCL 组 + KV cache
-        ├── comm_manager.init_cpu_groups()                              # 追加 Gloo 调度域：tp_cpu_group / dp_leader_group
+        │     └── comm_manager.init_cpu_groups()                      # 初始化 Gloo 调度组：tp_cpu_group / dp_leader_group
         ├── KVTransferManager(disagg_config, attn_dp_size, attn_dp_rank, ...)
         │     ├── self.local_ip = disagg_config.local_ip
         │     ├── _init_rank_socket → bind PULL on 0.0.0.0:<random>，advertise local_ip
@@ -185,7 +185,7 @@ worker_main(global_rank, local_rank, ..., disagg_config)              # in serve
 worker_main(global_rank, local_rank, ..., disagg_config)              # in server.py
   └── OnlineInference.__init__
         ├── 父类 OfflineInference.__init__                              # 加载模型 + HCCL 组 + KV cache
-        ├── comm_manager.init_cpu_groups()                              # 追加 Gloo 调度域：tp_cpu_group / dp_leader_group
+        │     └── comm_manager.init_cpu_groups()                      # 初始化 Gloo 调度组：tp_cpu_group / dp_leader_group
         ├── KVTransferManager(disagg_config, attn_dp_size, attn_dp_rank, ...)
         │     ├── self.local_ip = disagg_config.local_ip
         │     ├── _init_rank_socket → bind PULL on 0.0.0.0:<random>，advertise local_ip
@@ -604,7 +604,7 @@ base `Scheduler.run_step` 在 `forward_batch` 后调用 `_log_step(output)` 钩�
 
 ### 6.6 阶段协商
 
-每轮主循环先接收请求、推进传输队列，再调用 `OnlineInference._negotiate_phase()`。各 DP Leader 同步 `(has_mm_pending, has_prefill_ready, has_decode)`，按 `prefill > mm_encode > decode` 选择阶段，再向组内 TP/CP rank 广播。协商范围是单个服务实例：P 侧执行 Prefill 或 MM Encode，D 侧只执行 Decode。
+OnlineInference 与 OfflineInference 均通过 DP Leader 同步 `(has_mm_pending, has_prefill_ready, has_decode)`，按 `prefill > mm_encode > decode` 选择阶段，并向组内 TP/CP rank 广播。本地无任务时执行 dummy batch，以保证各 rank 在模型前向过程中按相同顺序执行集合通信操作。Online PD 模式在每轮主循环中先接收请求、推进传输队列，再进行阶段协商；P 侧执行 Prefill 或 MM Encode，D 侧只执行 Decode。
 
 全局选中 MM Encode 而本地没有请求时，Scheduler 构造空的 `MMEncodeBatch(is_dummy=True)`，仍进入 Worker 的同步与计时流程，但不调用模型 Encoder、不写 Store，也不更新请求状态。Prefill/Decode 继续沿用原有 dummy token batch；全局无计算任务时返回 `phase=None`。MM 队列、选批和 Store 生命周期详见 [MM Encode 机制](mm_encode_design.md)。
 

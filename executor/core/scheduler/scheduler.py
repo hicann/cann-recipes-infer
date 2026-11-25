@@ -373,6 +373,7 @@ class Scheduler:
         max_prefill_tokens = self.config.max_prefill_tokens
         parallel_config = engine.infer_config.parallel_config
         enable_offline_cp = self.mode == 'offline' and parallel_config.cp_size > 1
+        enable_afd = engine.infer_config.model_config.custom_params.get("enable_afd", False)
         cache_owner_group_size = self._offline_cache_owner_group_size(engine)
 
         # Strict FIFO: only consider the queue head. If the head request
@@ -429,7 +430,15 @@ class Scheduler:
                         f"request_id={request.request_id}, cp_rank={request.cp_rank}, "
                         f"global_rank={parallel_config.global_rank}"
                     )
-                continue
+                if enable_afd:
+                    raise RuntimeError(
+                        "AFD offline prefill KV cache allocation failed; attention/FFN "
+                        "batch token counts would diverge and hang in AFD send/recv. "
+                        f"request_id={request.request_id}, "
+                        f"scheduled_tokens={total_prefill_tokens}, "
+                        f"global_rank={parallel_config.global_rank}"
+                    )
+                break
 
             selected.append(self.waiting_queue.popleft())
             total_prefill_tokens = next_total_prefill_tokens
