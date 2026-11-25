@@ -51,7 +51,7 @@ Indexer 通过主流、Q 流和头权重流协同准备 LI 输入，使 Q 投影
   <img src="./figures/k31_indexer_multistream.png" width="100%" alt="Indexer 主流、Q 流、权重流及 E0 至 E3 同步依赖">
 </p>
 
-该编排用于 NPU Decode 的 `npugraph_ex` 模式，由 `enable_multi_streams` 开启。实现见 [Indexer 输入准备](../../../models/kimi_k3_1/models/modeling_kimi_k3.py#L3617)。
+该编排用于 NPU Decode 的 `npugraph_ex` 模式，由 `enable_multi_streams` 开启。实现见 [Indexer 的 `project()` 方法](../../../models/kimi_k3_1/models/modeling_kimi_k3.py#L3628)。
 
 ## 量化策略
 
