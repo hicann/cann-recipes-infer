@@ -2179,7 +2179,6 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
         self.global_rank = kwargs.get("global_rank")
         self.enable_superkernel = self.infer_config.model_config.custom_params.get("enable_superkernel", False)
         self.enable_multi_streams = self.infer_config.model_config.custom_params.get("enable_multi_streams", False)
-        self.enable_prefill_skip = self.infer_config.model_config.custom_params.get("enable_prefill_skip", False)
         self.platform_version = self.infer_config.model_config.platform_version
         self.collect_layer_ids = frozenset()
         self.world_size = self.infer_config.parallel_config.world_size
@@ -2476,19 +2475,6 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
             input_ids = self.get_cp_input_ids(input_ids, attn_metadata)
             hidden_states = self.get_cp_hidden_states(inputs_embeds, attn_metadata)
             del inputs_embeds
-
-        if is_prefill and self.enable_prefill_skip:
-            # Keep the speculative-decoding output contract while skipping the
-            # decoder stack.  The values are placeholders for profiling only:
-            # MTP expects one residual stream per HC branch and DSpark expects
-            # one concatenated hidden state for each configured target layer.
-            prev_hidden_states = hidden_states.repeat(1, self.hc_mult)
-            auxiliary_hidden_states = None
-            if self.collect_layer_ids:
-                auxiliary_hidden_states = hidden_states.new_zeros(
-                    hidden_states.shape[0], hidden_states.shape[1] * len(self.collect_layer_ids)
-                )
-            return hidden_states, prev_hidden_states, auxiliary_hidden_states
 
         kv_len = attn_metadata["kv_len"]
         if is_prefill and self.cp_size > 1:

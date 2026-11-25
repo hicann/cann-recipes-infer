@@ -31,7 +31,7 @@ from executor.core.mm_processor_registry import get_mm_processor
 from executor.core.kv_cache import KVCacheManager, ModelCacheInfo, create_single_type_managers
 from executor.core.kv_cache.cache_utils import allocate_cache_tensors, calculate_block_num, \
     prepare_block_tables, prepare_slot_mapping, validate_cache_info
-from ..forward_data_info import Batch, MMEncodeBatch, Request
+from ..forward_data_info import Batch, DSparkInfo, MMEncodeBatch, Request
 from .mm_embedding_store import MMEmbeddingStore
 from .sampler import Sampler
 
@@ -68,6 +68,19 @@ class ExecutionEngine:
         self.is_online = (
             infer_config.disagg_config.disaggregation_mode in ("PREFILL", "DECODE")
         )
+        self.enable_prefill_skip = infer_config.model_config.custom_params.get("enable_prefill_skip", False)
+        if type(self.enable_prefill_skip) is not bool:
+            raise ValueError("enable_prefill_skip must be a YAML boolean")
+        if self.enable_prefill_skip and infer_config.model_config.custom_params.get("enable_afd", False):
+            raise ValueError("enable_prefill_skip cannot be used with enable_afd")
+        self.force_eplb = bool(infer_config.model_config.force_eplb)
+        if self.enable_prefill_skip and self.is_online:
+            raise ValueError("enable_prefill_skip only supports offline inference.")
+        if (self.enable_prefill_skip and infer_config.parallel_config.attn_tp_size == 1
+                and infer_config.parallel_config.moe_ep_size > 1 and not self.force_eplb):
+            raise ValueError("enable_prefill_skip requires force_eplb=True for EP inference")
+        if self.enable_prefill_skip:
+            logger.warning("enable_prefill_skip enabled; results are for offline decode profiling only")
         if self.is_online:
             # no chunk so max_prefill_tokens is the max len of kv
             self.max_total_len = self.infer_config.scheduler_config.max_prefill_tokens + self.max_new_tokens
@@ -937,8 +950,20 @@ class ExecutionEngine:
             if visual_embeddings is not None:
                 model_inputs["visual_embeddings"] = visual_embeddings
 
-        # Run inference
-        output, infer_time_main = self.main_worker.inference(model_inputs, is_prefill=batch.is_prefill)
+        skip_prefill = self.enable_prefill_skip and batch.is_prefill
+        if skip_prefill:
+            vocab_size = self.hf_config.vocab_size
+            stub_logits = torch.zeros(
+                (batch.seq_lens.numel(), 1, vocab_size), dtype=torch.float32, device=self.device
+            )
+            stub_token_id = next((i for i in range(vocab_size) if i not in self.eos_token_ids), 0)
+            stub_logits[..., stub_token_id] = 1e4
+            output = (stub_logits, None)
+            infer_time_main = 0.0
+        else:
+            output, infer_time_main = self.main_worker.inference(
+                model_inputs, is_prefill=batch.is_prefill
+            )
 
         # Handle different output formats: tuple (logits, prev_hidden_states) or tensor (logits)
         if isinstance(output, tuple):
@@ -999,13 +1024,29 @@ class ExecutionEngine:
                 model_inputs,
                 batch.is_prefill,
             )
-            infer_times_draft = worker.inference(
-                batch=batch,
-                main_next_tokens=draft_next_tokens,
-                accepted_num=accepted_num,
-                model_inputs_main=model_inputs,
-                prev_hidden_states=prev_hidden_states,
-            )
+            if not skip_prefill:
+                infer_times_draft = worker.inference(
+                    batch=batch,
+                    main_next_tokens=draft_next_tokens,
+                    accepted_num=accepted_num,
+                    model_inputs_main=model_inputs,
+                    prev_hidden_states=prev_hidden_states,
+                )
+            else:
+                accepted_num = torch.zeros(draft_next_tokens.shape[0], dtype=torch.long, device=self.device)
+                batch.draft_info = worker.state_cls(
+                    is_prefill=False,
+                    spec_tokens=draft_next_tokens.expand(-1, self.next_n).clone(),
+                    accepted_num=accepted_num,
+                )
+                if isinstance(batch.draft_info, DSparkInfo):
+                    batch.draft_info.proposal_lens = accepted_num
+                    draft_vocab_size = worker.model.config.vocab_size
+                    batch.draft_info.draft_probs = torch.full(
+                        (draft_next_tokens.shape[0], self.next_n, draft_vocab_size),
+                        1.0 / draft_vocab_size,
+                        dtype=torch.float32, device=self.device,
+                    )
 
         self.profiler.step()
 
