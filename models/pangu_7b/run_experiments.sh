@@ -32,11 +32,12 @@ for BS in "${BATCH_SIZES[@]}"; do
         echo "--- START OUTPUT FOR BS=$BS ---"
         cd "$CMD_DIR" || exit 1
         bash ./infer.sh
+        rc=$?
         echo "--- END OUTPUT FOR BS=$BS ---"
         echo -e "\n"
     } >> "$LOG_FILE" 2>&1
 
-    if [ $? -eq 0 ]; then
+    if [ $rc -eq 0 ]; then
         echo "[$BS] Finished successfully." | tee -a "$LOG_FILE"
     else
         echo "[$BS] Failed. Check log for details." | tee -a "$LOG_FILE"
