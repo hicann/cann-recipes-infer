@@ -14,10 +14,10 @@ DeepSeek团队发布了最新的模型DeepSeek-V4.1-Flash，本实践基于DeepS
 ## 环境准备
 ### Atlas A5 Docker 部署
 
-A5 使用预置 ARM 镜像，镜像中已包含本实践所需的 PyTorch、torch_npu、torchair 和 CANN 运行环境。从 [A5 ARM 镜像地址](https://cann-ai.obs.cn-north-4.myhuaweicloud.com/cann-quantization/DeepSeek/cann9.2.0.pt2.13.0_dsv4.1_aarch_a5_image_custom_20260930.tar) 下载 docker 镜像，上传到 A5 服务器的每个节点，并在每个节点执行：
+A5 使用预置 ARM 镜像，镜像中已包含本实践所需的 PyTorch、torch_npu、torchair 和 CANN 运行环境。从 [A5 ARM 镜像地址](https://cann-ai.obs.cn-north-4.myhuaweicloud.com/cann-quantization/DeepSeek/cann9.3.0.pt2.13.0_dsv4.1_aarch_a5_image_custom_20261120.tar) 下载 docker 镜像，上传到 A5 服务器的每个节点，并在每个节点执行：
 
 ```text
-docker load -i cann9.2.0.pt2.13.0_dsv4.1_aarch_a5_image_custom_20260930.tar
+docker load -i cann9.3.0.pt2.13.0_dsv4.1_aarch_a5_image_custom_20261120.tar
 ```
 
 ### DeepSeek 高性能算子库
@@ -55,7 +55,7 @@ docker run -u root -itd --name cann_recipes_infer --ulimit nproc=65535:65535 --i
     -v /etc/hixlep:/etc/hixlep -v /lib/route.conf:/lib/route.conf \
     -v /etc/hccl_rootinfo.json:/etc/hccl_rootinfo.json \
     --net=host --shm-size=128g --privileged \
-    cann9.2.0.pt2.13.0_dsv4.1_aarch_a5_image_custom_20260930:latest /bin/bash
+    cann9.3.0.pt2.13.0_dsv4.1_aarch_a5_image_custom_20261120:latest /bin/bash
 ```
 
 进入容器后，将源码挂载或放置在 `/home/code/cann-recipes-infer`，并按“修改配置”和“拉起多卡推理”章节执行。容器名和镜像 tag 必须与上述命令保持一致。

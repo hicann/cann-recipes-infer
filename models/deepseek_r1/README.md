@@ -8,6 +8,68 @@ DeepSeek-R1和Kimi-K2都是2025年开源的大语言模型，二者结构类似�
 
 ## 环境准备
 
+请选择 Docker 镜像部署或 Conda 安装中的一种方式。
+
+### Docker 镜像部署（Atlas A3，Linux ARM）
+
+#### 下载并导入镜像
+
+在各个 Atlas A3 Linux ARM 节点上，从 [A3 ARM 镜像地址](https://cann-ai.obs.cn-north-4.myhuaweicloud.com/cann-quantization/DeepSeek-V3.2-Exp/cann9.0_pt2.8.0_dsv3.2_aarch_image_v0.1.tar) 下载镜像并导入。
+
+```bash
+docker load -i cann9.0_pt2.8.0_dsv3.2_aarch_image_v0.1.tar
+```
+
+#### 启动并进入容器
+
+将 DeepSeek-R1 源码放在宿主机的 `/home/code/cann-recipes-infer`，并将权重放在 `/data` 下。在各节点执行以下命令，容器会挂载宿主机的 `/home` 和 `/data`。
+
+```bash
+docker run -u root -itd --name cann_recipes_infer --ulimit nproc=65535:65535 --ipc=host \
+    --device=/dev/davinci0     --device=/dev/davinci1 \
+    --device=/dev/davinci2     --device=/dev/davinci3 \
+    --device=/dev/davinci4     --device=/dev/davinci5 \
+    --device=/dev/davinci6     --device=/dev/davinci7 \
+    --device=/dev/davinci8     --device=/dev/davinci9 \
+    --device=/dev/davinci10    --device=/dev/davinci11 \
+    --device=/dev/davinci12    --device=/dev/davinci13 \
+    --device=/dev/davinci14    --device=/dev/davinci15 \
+    --device=/dev/davinci_manager --device=/dev/devmm_svm \
+    --device=/dev/hisi_hdc \
+    -v /home/:/home \
+    -v /data:/data \
+    -v /etc/localtime:/etc/localtime \
+    -v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
+    -v /etc/ascend_install.info:/etc/ascend_install.info -v /var/log/npu/:/usr/slog \
+    -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi -v /sys/fs/cgroup:/sys/fs/cgroup:ro \
+    -v /usr/local/dcmi:/usr/local/dcmi -v /usr/local/sbin:/usr/local/sbin \
+    -v /etc/hccn.conf:/etc/hccn.conf -v /root/.pip:/root/.pip -v /etc/hosts:/etc/hosts \
+    -v /usr/bin/hostname:/usr/bin/hostname \
+    --net=host \
+    --shm-size=128g \
+    --privileged \
+    cann9.0_pt2.8.0_dsv3.2_aarch_image:v0.1 /bin/bash
+```
+
+```bash
+docker exec -it cann_recipes_infer bash
+```
+
+#### 安装依赖并配置运行环境
+
+在容器内执行以下命令安装样例依赖。
+
+```bash
+cd /home/code/cann-recipes-infer
+python -m pip install -r ./models/deepseek_r1/requirements.txt
+```
+
+在 `executor/scripts/set_env.sh` 中配置各节点的 `IPs`，按 rank ID 排序，并将 `cann_path` 设为容器内的 CANN 安装路径，例如 `/usr/local/Ascend/ascend-toolkit/latest`。然后按[权重准备](#权重准备)和[推理执行](#推理执行)配置并运行 DeepSeek-R1。
+
+### Conda 安装
+
+请先激活 Python 3.11 Conda 环境，再执行以下安装步骤。
+
 1. 安装CANN软件包。
 
    本样例的编译执行依赖CANN开发套件包与CANN二进制算子包，支持的CANN软件版本为`CANN 9.0.0`。

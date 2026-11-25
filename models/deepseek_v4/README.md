@@ -9,7 +9,7 @@ DeepSeek团队发布了最新的模型DeepSeek-V4，本实践基于DeepSeek开�
 ## 硬件要求
 产品型号：Atlas A3 Pod 系列、Ascend 950 系列
 
-操作系统：Linux ARM（Atlas A3 Pod）、Linux x86（Ascend 950）
+操作系统：Linux ARM（Atlas A3 Pod）、Linux x86（Ascend 950）、Linux ARM（Ascend 950 Docker 部署）
 
 驱动版本：Ascend HDK 25.5.1
 > npu-smi info 检查Ascend NPU固件和驱动是否正确安装。如果已安装，通过命令`npu-smi info`确认版本是否为`25.5.1`。如果未安装或者版本不是`25.5.1`，请先下载[固件和驱动包](https://www.hiascend.com/hardware/firmware-drivers/community?product=6&model=33&cann=9.0.0-beta.2&driver=Ascend+HDK+25.5.1)，并根据[指导](https://hiascend.com/document/redirect/CannCommunityInstSoftware)自行安装。
@@ -32,7 +32,11 @@ CANNLab一站式开发平台已预置部署运行环境，使用CANNLab一站式
 
 ## 环境准备
 
-### Atlas A3 Docker 部署
+请选择 Docker 镜像部署或 Conda 安装中的一种方式。
+
+### Docker 镜像部署
+
+#### Atlas A3 Docker 部署
 
 A3 使用预置 ARM 镜像，镜像中已包含本实践所需的 PyTorch、torch_npu、torchair 和 CANN 运行环境。从 [A3 ARM 镜像地址](https://cann-ai.obs.cn-north-4.myhuaweicloud.com/cann-quantization/DeepSeek/cann9.2.0.pt2.9.0_dsv4_aarch_a3_image_custom_20260827.tar) 下载 docker 镜像，上传到 A3 服务器的每个节点，并在每个节点执行：
 
@@ -40,7 +44,7 @@ A3 使用预置 ARM 镜像，镜像中已包含本实践所需的 PyTorch、torc
 docker load -i cann9.2.0.pt2.9.0_dsv4_aarch_a3_image_custom_20260827.tar
 ```
 
-### 拉起 docker 容器
+##### 拉起 docker 容器
 
 在各个节点上通过如下脚本拉起容器，默认容器名为 `cann_recipes_infer`。请将权重路径和源码路径挂载到容器中。
 
@@ -71,7 +75,63 @@ docker run -u root -itd --name cann_recipes_infer --ulimit nproc=65535:65535 --i
 
 进入容器后，将源码挂载或放置在 `/home/code/cann-recipes-infer`，并按“修改配置”和“拉起多卡推理”章节执行。容器名和镜像 tag 必须与上述命令保持一致。
 
-### Atlas A5 部署
+#### Atlas A5 Docker 部署（Linux ARM）
+
+##### 下载并导入镜像
+
+在各个 Ascend 950 Linux ARM 节点上，从 [A5 ARM 镜像地址](https://cann-ai.obs.cn-north-4.myhuaweicloud.com/cann-quantization/DeepSeek/cann9.3.0.pt2.13.0_dsv4.1_aarch_a5_image_custom_20261120.tar) 下载镜像并导入。
+
+```bash
+docker load -i cann9.3.0.pt2.13.0_dsv4.1_aarch_a5_image_custom_20261120.tar
+```
+
+##### 启动并进入容器
+
+将 DeepSeek-V4 源码放在宿主机的 `/home/code/cann-recipes-infer`，并将权重放在 `/data` 下。在各节点执行以下命令，容器会挂载宿主机的 `/home` 和 `/data`。
+
+```bash
+docker run -u root -itd --name cann_recipes_infer --ulimit nproc=65535:65535 --ipc=host \
+    --device=/dev/davinci0 \
+    --device=/dev/davinci1 \
+    --device=/dev/davinci2 \
+    --device=/dev/davinci3 \
+    --device=/dev/davinci4 \
+    --device=/dev/davinci5 \
+    --device=/dev/davinci6 \
+    --device=/dev/davinci7 \
+    --device=/dev/davinci_manager --device=/dev/devmm_svm \
+    --device=/dev/hisi_hdc \
+    --device=/dev/ummu --device=/dev/uburma \
+    -v /usr/local/sbin/urma_perftest:/usr/local/sbin/urma_perftest \
+    -v /usr/bin/urma_admin:/usr/bin/urma_admin \
+    -v /usr/lib64:/usr/lib64 -v /usr/lib:/usr/lib \
+    -v /home/:/home -v /data:/data \
+    -v /etc/localtime:/etc/localtime \
+    -v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
+    -v /etc/ascend_install.info:/etc/ascend_install.info -v /var/log/npu/:/usr/slog \
+    -v /usr/local/sbin/npu-smi:/usr/local/sbin/npu-smi -v /sys/fs/cgroup:/sys/fs/cgroup:ro \
+    -v /usr/local/dcmi:/usr/local/dcmi -v /usr/local/sbin:/usr/local/sbin \
+    -v /etc/hccn.conf:/etc/hccn.conf -v /root/.pip:/root/.pip \
+    -v /etc/hosts:/etc/hosts -v /usr/bin/hostname:/usr/bin/hostname \
+    -v /etc/hixlep:/etc/hixlep -v /lib/route.conf:/lib/route.conf \
+    -v /etc/hccl_rootinfo.json:/etc/hccl_rootinfo.json \
+    --net=host --shm-size=128g --privileged \
+    cann9.3.0.pt2.13.0_dsv4.1_aarch_a5_image_custom_20261120:latest /bin/bash
+```
+
+```bash
+docker exec -it cann_recipes_infer bash
+```
+
+##### 配置运行环境
+
+在容器内进入 `/home/code/cann-recipes-infer`，修改 `executor/scripts/set_env.sh` 中的节点 IP，将 `cann_path` 设为 `/usr/local/Ascend/cann`，然后按[快速启动](#快速启动)准备权重和运行推理。
+
+### Conda 安装
+
+#### Atlas A5 部署
+
+以下步骤适用于 Linux x86。请先激活 Python 3.11 Conda 环境。
 
 1. 安装 PyTorch 和 Ascend Extension for PyTorch（torch_npu）。
 
