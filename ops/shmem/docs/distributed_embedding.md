@@ -264,10 +264,10 @@ cd ops/shmem/distributed_embedding
 bash test/build.sh
 
 # 编译并运行单卡测试，默认使用 Device 0
-bash test/run_rank1.sh
+bash test/d2d/run_rank1.sh
 
 # 编译并运行双卡测试，默认使用 Device 0、1
-RANK0_DEVICE=0 RANK1_DEVICE=1 bash test/run_rank2.sh
+RANK0_DEVICE=0 RANK1_DEVICE=1 bash test/d2d/run_rank2.sh
 ```
 
 常用环境变量：
