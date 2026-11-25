@@ -42,6 +42,10 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
 : "${REPEATS:=10}"
+if [[ ! "$REPEATS" =~ ^[1-9][0-9]*$ ]]; then
+  printf '[gpqa][ERROR] REPEATS must be a positive integer, got %s\n' "$REPEATS" >&2
+  exit 2
+fi
 : "${HOST:=127.0.0.1}"
 : "${PORT:=8020}"
 if [[ -z "${MODEL_PATH:-}" ]]; then
