@@ -80,10 +80,10 @@ struct InputContext
     std::vector<uint64_t> batchTokensPerRankHost;
     ParallelConfig parallelConfig;
 
-    [[deprecated("This parameter willl be canceled.")]]std::vector<int64_t> seqIdxSet;
-    [[deprecated("This parameter willl be canceled.")]]std::vector<int64_t> seqlenSet;
-    [[deprecated("This parameter willl be canceled.")]]std::vector<int64_t> curlenDict;
-    [[deprecated("This parameter willl be canceled.")]]std::vector<int32_t> seqlensKVHost;
+    [[deprecated("This parameter will be canceled.")]]std::vector<int64_t> seqIdxSet;
+    [[deprecated("This parameter will be canceled.")]]std::vector<int64_t> seqlenSet;
+    [[deprecated("This parameter will be canceled.")]]std::vector<int64_t> curlenDict;
+    [[deprecated("This parameter will be canceled.")]]std::vector<int32_t> seqlensKVHost;
 };
 
 struct OutputContext

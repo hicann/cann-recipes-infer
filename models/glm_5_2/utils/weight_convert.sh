@@ -65,7 +65,7 @@ case "${QUANT_MODE,,}" in
             --quant_type "w8a8c16"
         ;;
     *)
-        echo "Error: Unsupport Quant_mode: $QUANT_MODE"
+        echo "Error: Unsupported Quant_mode: $QUANT_MODE"
         echo "Supported Mode: bfloat16, w8a8c16"
         exit 1
         ;;

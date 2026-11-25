@@ -653,7 +653,7 @@ class DeepseekV3MoE(nn.Module):
         tokens_per_expert_group = tokens_per_expert.new_empty(tokens_per_expert.shape[0])
         # (total_experts,)->(total_ranks*n_routed_experts_per_rank)
         dist.all_to_all_single(tokens_per_expert_group, tokens_per_expert, group=self.moe_ep_group)
-        # combine tensors, do reduceSum and D2H togather
+        # combine tensors, do reduceSum and D2H together
         combine_tokens = torch.stack([tokens_per_expert_group, tokens_per_expert], dim=0)
         # view: EP, E // EP
         # sum: EP, 每个rank
@@ -1061,7 +1061,7 @@ class DeepseekV3Attention(nn.Module):
         k_nope_out = torch.matmul(k_nope.view(1, -1, self.kv_lora_rank), self.kv_b_proj_w_k.permute(0, 2, 1))
         v_out = torch.matmul(k_nope.view(1, -1, self.kv_lora_rank), self.kv_b_proj_w_v)
 
-        # NTD foramt, repeat in N
+        # NTD format, repeat in N
         k_rope = k_rope.view(1, -1, self.qk_rope_head_dim).repeat(self.num_heads_per_rank, 1, 1)
 
         assert actual_seq_lengths_kv is not None
@@ -1361,7 +1361,7 @@ class DeepseekV3Attention(nn.Module):
             "slot_mapping": slot_mapping[self.attn_type],
             "block_table": block_table[self.attn_type]
         }
-        # Only suuport PA
+        # Only support PA
         if self.kv_cache_quant_mode == "int8" and self.ckv_scale_reci is None:
             self.ckv_scale_reci = torch.reciprocal(self.ckv_scale)
             self.ckv_scale_reci_repeat = self.ckv_scale_reci.repeat(self.kv_lora_rank).view(1, -1)
@@ -2755,7 +2755,7 @@ class DeepseekV3ForCausalLM(nn.Module):
                 if "gate" in module_name:
                     # Avoid GE graph performance degradation: make gate tensor contiguous after transpose.
                     module.weight.data = module.weight.data.contiguous()
-            # Dynamic quant for input_avtivation of first grouped matmul requies complete smooth scale.
+            # Dynamic quant for input_activation of first grouped matmul requires complete smooth scale.
             # When applying expert parallel, each device only reserves smooth scales of mapping experts.
             # Need to do all gather to obtain complete smooth scale.
             if isinstance(quant_method, CompressedTensorW8A8Int8MoEGMMMethod):

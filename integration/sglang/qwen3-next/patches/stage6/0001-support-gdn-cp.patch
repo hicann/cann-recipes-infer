@@ -190,7 +190,7 @@ index 913303522..8dcc01aa8 100644
 +        Adjusts `query_start_loc` according to split sizes along the sequence length.
 +        Required because forward metadata is generated before input sequence is split
 +        when context parallelism is enabled.
-+        Assumes that queries are splitted uniformly between devices:
++        Assumes that queries are split uniformly between devices:
 +        Context: [A0, A1, A2, A3, B0, B1, B2]
 +        Dev 0: [A0, A1, B0, B1]
 +        Dev 1: [A2, A3, B2]

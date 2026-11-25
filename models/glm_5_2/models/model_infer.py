@@ -212,7 +212,7 @@ class Infer(nn.Module):
     def verify_spec_tokens(self, input_dict_main, input_dict_mtp, main_next_tokens):
         '''
         Verify spec tokens with main model's output, stop accepting tokens if rejection occurs in a batch.
-        Each batch would process verification seperately.
+        Each batch would process verification separately.
         '''
         accepted_num = torch.zeros([main_next_tokens.shape[0]], dtype=torch.int64, device="npu") # shape: (Batch,)
 

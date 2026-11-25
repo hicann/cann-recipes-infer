@@ -5,7 +5,9 @@
 # you may not use this file except in compliance with the License.
 
 # only offline need
-export IPs=('xx.xx.xx.xx' 'xx.xx.xx.xx') # IPs of all servers. Please seperate multiple servers with blank space in between. The first one is the master server.
+# IPs of all servers. Please separate multiple servers with blank space in between.
+# The first one is the master server.
+export IPs=('xx.xx.xx.xx' 'xx.xx.xx.xx')
 
 # only online need
 # When prefill and decode share the same host, set ASCEND_RT_VISIBLE_DEVICES

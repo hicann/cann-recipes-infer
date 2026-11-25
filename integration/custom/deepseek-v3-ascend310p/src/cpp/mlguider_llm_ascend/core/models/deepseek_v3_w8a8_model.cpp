@@ -558,8 +558,7 @@ bool DeepSeekV3W8A8Model::Inference(
         outputIdPtr,
         inputContext.cuSeqlensQueryHost,
         tokenNum, vocabSize / tpSize, tpSize,
-        0.6 // recommand value of temperature
-    );
+        0.6); // recommend value of temperature
 
     LOG_DEBUG("outputIds");
     for (int i = 0; i < outputIds.size(); i++)

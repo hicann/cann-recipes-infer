@@ -128,7 +128,7 @@ def main():
     parser = argparse.ArgumentParser(description="Launch the LLM inference backend")
     parser.add_argument("--config", type=str, required=True, help="Path to the config file")
     parser.add_argument("--data_path", type=str, default="", help="Path to the load dataset")
-    parser.add_argument("--batchSize", type=int, default=-1, help="The batch Size for sigle inference")
+    parser.add_argument("--batchSize", type=int, default=-1, help="The batch Size for single inference")
     parser.add_argument("--input-text", type=str, nargs="+", default=[])
 
     args = parser.parse_args()

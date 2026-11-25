@@ -884,7 +884,7 @@ class BailingMoeV25MLA(nn.Module):
         k_nope_out = torch.matmul(k_nope.view(1, -1, self.kv_lora_rank), self.kv_b_proj_w_k.permute(0, 2, 1))
         v_out = torch.matmul(k_nope.view(1, -1, self.kv_lora_rank), self.kv_b_proj_w_v)
 
-        # NTD foramt, repeat in N
+        # NTD format, repeat in N
         k_rope = k_rope.view(1, -1, self.qk_rope_head_dim).repeat(self.num_heads_per_rank, 1, 1)
 
         attn_output, _ = torch.ops.npu.npu_fused_infer_attention_score(

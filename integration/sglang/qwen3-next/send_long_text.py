@@ -24,8 +24,8 @@ def send_request():
             "temperature": 0
         }
     }
-    reponse = requests.post(URL, headers=headers, json=payload, timeout=6000)
-    result = reponse.json()
+    response = requests.post(URL, headers=headers, json=payload, timeout=6000)
+    result = response.json()
     print(json.dumps(result, indent=2, ensure_ascii=False))
 
 send_request()

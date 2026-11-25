@@ -47,11 +47,11 @@ def register_op_impl(op_type, func_key: str = None):
             for platform in support_platform:
                 func_name_update = func_name + "_" + platform
                 if func_name_update in OpKernel.KERNEL_MAP:
-                    logger.warning(f"func {func_name_update} is registed, and will be overlaped.")
+                    logger.warning(f"func {func_name_update} is registered, and will be overlapped.")
                 OpKernel.KERNEL_MAP[func_name_update] = func
         else:
             if func_name in OpKernel.KERNEL_MAP:
-                logger.warning(f"func {func_name} is registed, and will be overlaped.")
+                logger.warning(f"func {func_name} is registered, and will be overlapped.")
             OpKernel.KERNEL_MAP[func_name] = func
 
         @functools.wraps(func)
@@ -71,4 +71,4 @@ def auto_import_modules(pkg_name):
             try:
                 importlib.import_module(module_name)
             except Exception as e:
-                logger.warning(f"import mudule {module_name} failed: {str(e)}")
+                logger.warning(f"import module {module_name} failed: {str(e)}")

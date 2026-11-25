@@ -104,7 +104,7 @@ def copy_file(fp8_path, int8_path):
         try:
             # copy file
             shutil.copy2(src_path, dst_path)
-            print(f"successed: {file_name}")
+            print(f"succeeded: {file_name}")
         except Exception as e:
             print(f"failed {file_name}: {e}")
 

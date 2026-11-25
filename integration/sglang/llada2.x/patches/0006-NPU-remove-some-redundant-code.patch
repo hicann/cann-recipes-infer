@@ -1,7 +1,7 @@
 From 87072ac84cdce15274c78f50e1f76ddfc6aaa02a Mon Sep 17 00:00:00 2001
 From: Yuan Yuan <soc.yuan@gmail.com>
 Date: Mon, 9 Feb 2026 14:42:27 +0700
-Subject: [PATCH 06/16] [NPU] remove some redundent code
+Subject: [PATCH 06/16] [NPU] remove some redundant code
 
 ---
  python/sglang/srt/dllm/algorithm/low_confidence.py           | 2 +-

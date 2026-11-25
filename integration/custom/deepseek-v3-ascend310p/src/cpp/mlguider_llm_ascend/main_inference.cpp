@@ -78,7 +78,7 @@ float ComputeMedian(std::vector<float> timeCost)
     std::sort(timeCost.begin(), timeCost.end());
 
     size_t n = timeCost.size();
-    if (n % 2 == 1) { // wheather odd
+    if (n % 2 == 1) { // whether odd
         return timeCost[n / 2]; // if odd get the median
     } else {
         return (timeCost[n / 2 - 1] + timeCost[n / 2]) / 2.0f; // if even get the average of the two middle

@@ -173,7 +173,7 @@ class GlmRunner(ModelRunner):
                         requires_grad=False
                     )
 
-            # Dynamic quant for input_avtivation of first grouped matmul requies complete smooth scale.
+            # Dynamic quant for input_activation of first grouped matmul requires complete smooth scale.
             # When applying expert parallel, each device only reserves smooth scales of mapping experts.
             # Need to do all gather to obtain complete smooth scale.
             if isinstance(quant_method, CompressedTensorW8A8Int8MoEGMMMethod) or \

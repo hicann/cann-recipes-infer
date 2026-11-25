@@ -20,7 +20,7 @@ sleep 2
 rm -rf kernel_meta
 rm -rf extra-info
 rm -rf /root/ascend/
-# improve cpu performence
+# improve cpu performance
 echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
 sysctl -w vm.swappiness=0
 sysctl -w kernel.numa_balancing=0

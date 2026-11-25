@@ -435,7 +435,7 @@ class DeepseekV3MoE(nn.Module):
         if self.force_eplb:
             topk_idx = cur_topk_list
         topk_idx = topk_idx.to(torch.int32)
-        # we convert 2d to 3d, and then 3d back to 2d to adapte fusion pass rule
+        # we convert 2d to 3d, and then 3d back to 2d to adapt fusion pass rule
         hidden_states_3d = hidden_states.unsqueeze(1)
         hidden_states = hidden_states_3d.squeeze(1)
 
@@ -609,7 +609,7 @@ class DeepseekV3MoE(nn.Module):
         tokens_per_expert_group = tokens_per_expert.new_empty(tokens_per_expert.shape[0])
         # (total_experts,)->(total_ranks*n_routed_experts_per_rank)
         dist.all_to_all_single(tokens_per_expert_group, tokens_per_expert, group=moe_ep_group)
-        # combine tensors, do reduceSum and D2H togather
+        # combine tensors, do reduceSum and D2H together
         combine_tokens = torch.stack([tokens_per_expert_group, tokens_per_expert], dim=0)
         # view: EP, E // EP
         combine_tokens = combine_tokens.view(2, self.moe_ep_size, -1).sum(2)
@@ -737,7 +737,7 @@ class DeepseekV3MoE(nn.Module):
             combine_args["shared_expert_x"] = None
         elif not self.enable_npugraphex_and_multistream:
             combine_args["shared_expert_x"] = hidden_states_share
-            
+
         hidden_states = torch_npu.npu_moe_distribute_combine_v2(**combine_args)
 
         if enable_gegraph_and_multistream:
@@ -1178,7 +1178,7 @@ class DeepseekAttention(nn.Module):
     ):
         num_tokens, _ = hidden_states.shape
         enable_cp = cp_metadata is not None and cp_metadata.enabled
-        
+
         if enable_cp:
             # CP mode: create temporary PA buffer for local tokens
             cp_tmpkv_cache_num_block = (num_tokens + self.block_size) // self.block_size
@@ -1199,7 +1199,7 @@ class DeepseekAttention(nn.Module):
             nope_cache = self.nope_cache
             rope_cache = self.rope_cache
             mla_prolog_slot_mapping = slot_mapping
-        
+
         cos, sin = cos_sin
 
         cos = cos.view(-1, 1, 1, self.qk_rope_head_dim)

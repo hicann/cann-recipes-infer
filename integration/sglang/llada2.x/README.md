@@ -259,11 +259,11 @@ python test_llada2_mini_ascend.py
 |[0003-NPU-speed-up-llada2.0-on-npu-with-graph-mode.patch](patches/0003-NPU-speed-up-llada2.0-on-npu-with-graph-mode.patch)| 入图后的算子融合及优化
 |[0004-NPU-update-test_llada2_mini_ascend.py-with-graph-mod.patch](patches/0004-NPU-update-test_llada2_mini_ascend.py-with-graph-mod.patch)| 更新入图模式下的benchmark脚本
 |[0005-NPU-fix-bug-in-python-sglang-srt-server_args.py.patch](patches/0005-NPU-fix-bug-in-python-sglang-srt-server_args.py.patch)| fix bug in python/sglang/srt/server_args.py
-|[0006-NPU-remove-some-redundent-code.patch](patches/0006-NPU-remove-some-redundent-code.patch)| 删除一些无关代码
+|[0006-NPU-remove-some-redundant-code.patch](patches/0006-NPU-remove-some-redundant-code.patch)| 删除一些无关代码
 |[0007-NPU-Update-dllm-llada2.0-ci-for-npu.patch](patches/0007-NPU-Update-dllm-llada2.0-ci-for-npu.patch)|  Update dllm-llada2.0 ci for npu
 |[0008-NPU-dllm-update-format-code-with-pre-commit.patch](patches/0008-NPU-dllm-update-format-code-with-pre-commit.patch)|   dllm update: format code with pre-commit
 |[0009-NPU-update-ci-by-introducing-the-SGLANG_NPU_DISABLE_.patch](patches/0009-NPU-update-ci-by-introducing-the-SGLANG_NPU_DISABLE_.patch)|   update ci by introducing the SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT env parameter, to avoid oom with tp1
-|[0011-Update-joint_threshold.py.patch](patches/0011-Update-joint_threshold.py.patch)|   在npu上加速update-joint threhold 算法（for llada2.1
+|[0011-Update-joint_threshold.py.patch](patches/0011-Update-joint_threshold.py.patch)|   在npu上加速update-joint threshold 算法（for llada2.1
 |[0012-fuse-shared-output-into-moe-groupmatmul2-to-speedup-.patch](patches/0012-fuse-shared-output-into-moe-groupmatmul2-to-speedup-.patch)|  fuse shared output into moe groupmatmul2 to speedup on npu
 |[0013-Update-unquant.py.patch](patches/0013-Update-unquant.py.patch)|  cache the row idx for fusedMoE with NPU inference
 |[0014-update-the-ascend-dllm-accuracy-test-config.patch](patches/0014-update-the-ascend-dllm-accuracy-test-config.patch)|  update the accuracy test config file

@@ -210,7 +210,7 @@ index 895de235c..077cb9e4c 100644
 +                        )
 +                        prof.step()
 +                        logging.info(f"For forward_mode: {get_execute_stage(forward_batch)},\
-+                                    draft extend after deocde inference time cost {(inference_time)*1000:.2f} ms")
++                                    draft extend after decode inference time cost {(inference_time)*1000:.2f} ms")
 +                else:
 +                    out, inference_time = self.model_runner.model.time_decorator_forward_draft_extend(
 +                        self.forward_batch[self.bs].input_ids,
@@ -218,7 +218,7 @@ index 895de235c..077cb9e4c 100644
 +                        self.forward_batch[self.bs],
 +                    )
 +                    logging.info(f"For forward_mode: {get_execute_stage(forward_batch)},\
-+                                    draft extend after deocde inference time cost {(inference_time)*1000:.2f} ms")
++                                    draft extend after decode inference time cost {(inference_time)*1000:.2f} ms")
 +                probs = torch.softmax(out.next_token_logits, dim=-1)
 +                out.topk_p, out.topk_index = fast_topk(probs, self.topk, dim=-1)
 +        # npu need start
@@ -374,7 +374,7 @@ index 895de235c..077cb9e4c 100644
 +                    empty_cache=False,
 +                )
 +                compile_range.set_description(
-+                    f"Capturing draft extend after deocde model batches ({bs=} {avail_mem=:.2f} GB)"
++                    f"Capturing draft extend after decode model batches ({bs=} {avail_mem=:.2f} GB)"
 +                )
 +            num_tokens = bs * self.num_tokens_per_bs
 +            self.forward_batch[bs] = self.prepare_forward_batch(bs, num_tokens)

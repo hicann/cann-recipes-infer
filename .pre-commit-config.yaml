@@ -7,9 +7,9 @@ repos:
       - id: check-symlinks
       - id: destroyed-symlinks
       - id: trailing-whitespace
-        exclude: \.patch$
+        exclude: \.(patch|diff)$
       - id: end-of-file-fixer
-        exclude: \.patch$
+        exclude: \.(patch|diff)$
       - id: check-yaml
         args: [--allow-multiple-documents]
       - id: check-json

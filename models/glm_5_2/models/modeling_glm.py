@@ -453,7 +453,7 @@ class GlmMoeDsaMoE(nn.Module):
         if self.perfect_eplb:
             topk_idx = cur_topk_list
         topk_idx = topk_idx.to(torch.int32)
-        # we convert 2d to 3d, and then 3d back to 2d to adapte fusion pass rule
+        # we convert 2d to 3d, and then 3d back to 2d to adapt fusion pass rule
         hidden_states_3d = hidden_states.unsqueeze(1)
         hidden_states = hidden_states_3d.squeeze(1)
 
@@ -573,7 +573,7 @@ class GlmMoeDsaMoE(nn.Module):
         tokens_per_expert_group = tokens_per_expert.new_empty(tokens_per_expert.shape[0])
         # (total_experts,)->(total_ranks*n_routed_experts_per_rank)
         dist.all_to_all_single(tokens_per_expert_group, tokens_per_expert, group=moe_ep_group)
-        # combine tensors, do reduceSum and D2H togather
+        # combine tensors, do reduceSum and D2H together
         combine_tokens = torch.stack([tokens_per_expert_group, tokens_per_expert], dim=0)
         # view: EP, E // EP
         combine_tokens = combine_tokens.view(2, self.moe_ep_size, -1).sum(2)

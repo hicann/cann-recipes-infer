@@ -553,7 +553,7 @@ index 779960d41..c3428f5a0 100644
                  "Only silu is supported for now."
              )
  
--        # fused_topk_npu() by defualt conduct norm before scale with routed_scaling_factor
+-        # fused_topk_npu() by default conduct norm before scale with routed_scaling_factor
 +        # fused_topk_npu() conducting norm before scale with routed_scaling_factor by default
          # norm_topk_prob=True will renorm the routed_scaling_factor thus need to keep norm_topk_prob=False
          if _is_npu:

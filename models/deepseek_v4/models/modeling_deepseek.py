@@ -674,7 +674,7 @@ class DeepseekV3MoE(nn.Module):
         tokens_per_expert_group = tokens_per_expert.new_empty(tokens_per_expert.shape[0])
         # (total_experts,)->(total_ranks*n_routed_experts_per_rank)
         dist.all_to_all_single(tokens_per_expert_group, tokens_per_expert, group=moe_ep_group)
-        # combine tensors, do reduceSum and D2H togather
+        # combine tensors, do reduceSum and D2H together
         combine_tokens = torch.stack([tokens_per_expert_group, tokens_per_expert], dim=0)
         # view: EP, E // EP
         combine_tokens = combine_tokens.view(2, self.moe_ep_size, -1).sum(2)
@@ -1894,7 +1894,7 @@ class Attention(nn.Module):
     ):
         '''
         oproj_tp: split on group dim, o: [B, S, G, N, D/G] -> [B, S, G/tp_size, N, D/G]
-        transpose to make the splitted dim to be the primary
+        transpose to make the split dim to be the primary
         split o_a on group dim (batch); split o_b on group dim (reduce)
         '''
         num_tokens = o.shape[0]
@@ -2852,7 +2852,7 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
         OpKernel.OP_TYPE: List, contain ops with different impls
         OpKernel.KERNEL_MAP: Dict, contain op_impls {op_impl_name: op_impl}
         """
-        # import all mudules under models.modules.op_impls files
+        # import all modules under models.modules.op_impls files
         auto_import_modules(f"{__package__}.modules.op_impls")
         custom_params = self.infer_config.model_config.custom_params
         kernel_config = custom_params.get("kernel_config", {})

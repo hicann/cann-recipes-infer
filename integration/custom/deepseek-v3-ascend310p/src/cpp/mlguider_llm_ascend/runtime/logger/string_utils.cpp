@@ -39,7 +39,7 @@ std::string Vformat(const char* format, va_list args)
         throw std::runtime_error("Format string error");
     }
 
-    if (size > 1000000) // Default vaule
+    if (size > 1000000) // Default value
     {
         throw std::length_error("Formatted string too large");
     }
