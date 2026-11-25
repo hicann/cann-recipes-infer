@@ -720,7 +720,7 @@ class DeepseekV3MoE(nn.Module):
         elif "a4mxfloat4" in self.gmm_quant_mode:
             moe_init_routing = torch_npu.npu_moe_init_routing_v2
             routing_args.update({
-                "quant_mode": 6,
+                "quant_mode": -1,
                 "row_idx_type": 0,
                 "drop_pad_mode": 0,
             })
@@ -757,7 +757,7 @@ class DeepseekV3MoE(nn.Module):
 
             if self.is_a4w4_mxfp4:
                 expanded_x, pertoken_scale = torch_npu.npu_dynamic_mx_quant(
-                    expanded_x.bfloat16(), dst_type=torch_npu.float4_e2m1fn_x2)
+                    expanded_x, dst_type=torch_npu.float4_e2m1fn_x2)
 
             tokens_per_expert_group, gathered_tokens, gathered_pertoken_scale, input_splits, output_splits =\
                 self.dispatch_double_routing(tokens_per_expert, expanded_x, pertoken_scale)
