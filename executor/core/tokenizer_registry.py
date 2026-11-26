@@ -27,6 +27,7 @@ from transformers import AutoTokenizer
 logger = logging.getLogger(__name__)
 
 _TOKENIZER_SPECS = {
+    "gemma_4_e2b": ("models.gemma_4_e2b.models.tokenization_gemma4_e2b", "Gemma4E2BTokenizer"),
     "deepseek_v4": ("models.deepseek_v4.utils.tokenizer", "DeepseekV4Tokenizer"),
     "deepseek_v4_1": ("models.deepseek_v4_1.utils.tokenizer", "DeepseekV41Tokenizer"),
     "kimi_k3": ("models.kimi_k3_1.utils.tokenizer", "KimiK3Tokenizer"),

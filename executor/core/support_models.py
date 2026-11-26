@@ -46,6 +46,10 @@ _specs: dict[str, list[tuple[str, str]]] = {
         ("models.deepseek_r1.models.modeling_deepseek", "DeepseekV3ForCausalLM"),
         ("models.deepseek_r1.models.configuration_deepseek", "DeepseekV3Config"),
     ],
+    "gemma_4_e2b": [
+        ("models.gemma_4_e2b.models.modeling_gemma4_e2b", "Gemma4E2BForCausalLM"),
+        ("models.gemma_4_e2b.models.configuration_gemma4_e2b", "Gemma4E2BConfig"),
+    ],
     "gemma_4": [
         ("models.gemma_4.models.modeling_gemma4", "Gemma4ForCausalLM"),
         ("models.gemma_4.models.configuration_gemma4", "Gemma4TextConfig"),

@@ -1,0 +1,15 @@
+torch==2.8.0
+torch-npu==2.8.0.post4
+transformers==5.5.0
+safetensors==0.8.0
+huggingface-hub==1.33.0
+PyYAML==6.0.3
+psutil==7.2.2
+einops==0.8.2
+numpy==1.26.4
+datasets==3.6.0
+pyarrow==20.0.0
+pandas==2.2.3
+scipy==1.15.3
+protobuf==6.31.0
+compressed-tensors==0.6.0

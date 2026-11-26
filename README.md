@@ -190,6 +190,7 @@ bash infer.sh
 | [DeepSeek-V3.2-Exp](models/deepseek_v3_2_exp/README.md) |基于Transformers库，在Atlas A3环境中Prefill阶段采用了长序列亲和的CP并行策略，Decode阶段沿用大EP并行，同时从整网上设计了新的NPU融合Kernel和多流并行优化，实现了较高的吞吐推理性能。
 | [Hy3](models/hy3/README.md)                             |基于Transformers库，在Atlas A3和Ascend 950PR/DT环境中完成腾讯混元 Hy3（295B MoE，激活约21B/token）模型的NPU推理适配。
 | [Gemma-4](models/gemma_4/README.md)                     |基于Transformers库，在NPU上完成Google开源的多模态稀疏MoE大模型Gemma-4的Language MoE Decoder路径推理优化适配。
+| [Gemma-4-E2B](models/gemma_4_e2b/README.md)             |在Atlas A2单逻辑设备上完成Gemma-4-E2B BF16纯文本Offline推理适配，支持逐层输入、跨层KV共享、双宽MLP以及eager/npugraph_ex执行模式。
 | [LongCat-Flash-Lite](models/longcat_flash_lite/README.md)|基于Transformers库，在NPU上完成基于MLA + Sparse MoE + N-gram Embedding架构的LongCat-Flash-Lite模型适配，覆盖Paged Attention缓存管理、融合算子替换、图模式加速、专家并行、W8A8量化与Decode多流重叠优化。
 | [LongCat-Next](models/longcat_next/README.md)              |基于Transformers库，在Atlas A3环境中完成LongCat-Next模型的NPU推理适配，支持图像和音频输入，支持文本、图像与语音的多模态生成，支持TP/EP并行部署。
 | [Step-3.7-Flash](models/step3p7_flash/README.md)        |基于Transformers库，在Atlas A3环境中完成多模态MoE大模型Step-3.7-Flash（视觉编码器+MoE文本主干+3层MTP，约197B参数）的8卡/16 rank推理实现，支持纯文本与图文输入。
@@ -264,6 +265,7 @@ bash infer.sh
 │   ├── deepseek_r1                             # DeepSeek-R1 的模型脚本及执行配置
 │   ├── deepseek_v3_2_exp                       # DeepSeek-V3.2-Exp 的模型脚本及执行配置
 │   ├── gemma_4                                 # Gemma4 模型脚本及执行配置
+│   ├── gemma_4_e2b                             # Gemma-4-E2B 模型脚本及执行配置
 │   ├── glm_5                                   # GLM-5 的模型脚本及执行配置
 │   ├── glm_5_2                                 # GLM-5.2 的模型脚本及执行配置
 │   ├── gpt_oss                                 # GPT-OSS 的模型脚本及执行配置
