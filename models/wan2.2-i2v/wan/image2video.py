@@ -52,6 +52,7 @@ from .utils.fm_solvers import (
     retrieve_timesteps,
 )
 from .utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
+from .cache.wan_cache_adapter import wan_cache_request, reset_wan_shape
 
 
 class WanI2V:
@@ -69,6 +70,7 @@ class WanI2V:
         init_on_cpu=True,
         convert_model_dtype=False,
         use_vae_parallel=False,
+        reuse_offload_memory=False,
     ):
         r"""
         Initializes the image-to-video generation model components.
@@ -95,7 +97,20 @@ class WanI2V:
             convert_model_dtype (`bool`, *optional*, defaults to False):
                 Convert DiT model parameters dtype to 'config.param_dtype'.
                 Only works without FSDP.
+            reuse_offload_memory (`bool`, *optional*, defaults to False):
+                Retain cached NPU allocations before denoising and between experts.
+                Only active with model offloading in one process without parallelism.
+                Request-end, VAE and exception cleanup remain unchanged.
         """
+        if type(reuse_offload_memory) is not bool:
+            raise ValueError("reuse_offload_memory must be a bool")
+        if reuse_offload_memory:
+            world_size = dist.get_world_size() if dist.is_initialized() else int(os.getenv("WORLD_SIZE", 1))
+            if world_size != 1 or rank != 0 or t5_fsdp or dit_fsdp or use_sp or use_vae_parallel:
+                raise ValueError(
+                    "reuse_offload_memory requires one process without FSDP or parallelism"
+                )
+        self.reuse_offload_memory = reuse_offload_memory
         quant_mode = config.get('quant_mode', 0)
         quant_data_dir = config.get('quant_data_dir')
         quant_layout = config.get('quant_layout', 'nd_view')
@@ -260,12 +275,17 @@ class WanI2V:
                     self,
                     offload_model_name).parameters()).device.type == self.device.type:
                 getattr(self, offload_model_name).to('cpu')
+                if (get_classifier_free_guidance_world_size() == 1
+                        and not (self.reuse_offload_memory and offload_model)):
+                    # Retired tensors are on CPU; the opt-in retains their allocator blocks for reuse.
+                    torch.cuda.empty_cache()
             if next(getattr(
                     self,
                     required_model_name).parameters()).device.type == 'cpu':
                 getattr(self, required_model_name).to(self.device)
         return getattr(self, required_model_name)
 
+    @wan_cache_request
     def generate(self,
                  input_prompt,
                  img,
@@ -336,6 +356,12 @@ class WanI2V:
         max_seq_len = ((F - 1) // self.vae_stride[0] + 1) * lat_h * lat_w // (
             self.patch_size[1] * self.patch_size[2])
         max_seq_len = int(math.ceil(max_seq_len / self.sp_size)) * self.sp_size
+
+        shape_signature = (F, lat_h, lat_w, max_seq_len, str(self.param_dtype), str(self.device))
+        reset_wan_shape(self, shape_signature)
+        cache_context = getattr(self, "_wan_cache", None)
+        if cache_context is not None:
+            cache_context.prepare_shape((1, max_seq_len, self.high_noise_model.dim))
 
         seed = seed if seed >= 0 else random.randint(0, sys.maxsize)
         seed_g = torch.Generator(device=self.device)
@@ -425,6 +451,9 @@ class WanI2V:
             else:
                 raise NotImplementedError("Unsupported solver.")
 
+            if cache_context is not None:
+                cache_context.bind_timesteps(timesteps)
+
             # sample videos
             latent = noise
 
@@ -446,7 +475,7 @@ class WanI2V:
                 'y': [y],
             }
 
-            if offload_model:
+            if offload_model and not self.reuse_offload_memory:
                 torch.cuda.empty_cache()
 
             for step_idx, t in enumerate(tqdm(timesteps)):
@@ -455,6 +484,9 @@ class WanI2V:
 
                 timestep = torch.stack(timestep).to(self.device)
 
+                if cache_context is not None:
+                    expert_id = "high" if t.item() >= boundary else "low"
+                    cache_context.begin_step(step_idx, expert_id)
                 model = self._prepare_model_for_timestep(t, boundary, offload_model)
                 sample_guide_scale = guide_scale[1] if t.item(
                 ) >= boundary else guide_scale[0]
@@ -471,14 +503,14 @@ class WanI2V:
                     if offload_model:
                         torch.cuda.empty_cache()
                 else:
+                    if cache_context is not None:
+                        cache_context.begin_branch(True)
                     noise_pred_cond = model(
                         latent_model_input, t=timestep, **arg_c, **extra_kwargs)[0]
-                    if offload_model:
-                        torch.cuda.empty_cache()
+                    if cache_context is not None:
+                        cache_context.begin_branch(False)
                     noise_pred_uncond = model(
                         latent_model_input, t=timestep, **arg_null, **extra_kwargs)[0]
-                    if offload_model:
-                        torch.cuda.empty_cache()
 
                 noise_pred = noise_pred_uncond + sample_guide_scale * (
                     noise_pred_cond - noise_pred_uncond)
@@ -490,6 +522,10 @@ class WanI2V:
                     return_dict=False,
                     generator=seed_g)[0]
                 latent = temp_x0.squeeze(0)
+                if cache_context is not None:
+                    cache_context.check_tensor(noise_pred)
+                    cache_context.check_tensor(latent)
+                    cache_context.finish_step()
 
                 x0 = [latent]
                 del latent_model_input, timestep
@@ -502,6 +538,9 @@ class WanI2V:
             if self.rank < 8:
                 with VAE_patch_parallel():
                     videos = self.vae.decode(x0)
+                    if cache_context is not None:
+                        for video in videos:
+                            cache_context.check_tensor(video)
 
         del noise, latent, x0
         del sample_scheduler

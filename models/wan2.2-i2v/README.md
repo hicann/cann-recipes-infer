@@ -330,3 +330,69 @@ bash infer_platform.sh
 | `prompt` | 文本提示词 |
 | `base_seed` | 随机种子 |
 | `convert_model_dtype` | 单卡场景将模型权重转换至推理精度，降低显存占用 |
+
+## 单卡 TaylorSeer、缓存 Offload 与 Prefetch
+
+TaylorSeer 适用于 Atlas A3 单卡、BF16 `i2v-A14B`、batch 1 和串行请求。各并行度均设为 1，关闭 FSDP、VAE 并行、量化和图捕获。
+
+按前文准备环境、权重、输入图片和上游 Wan 源码。复现固定五场景结果时，补充的上游 `Wan-Video/Wan2.2` 源码使用提交 `42bf4cfaa384bc21833865abc2f9e6c0e67233dc`，按[依赖安装](#依赖安装)的非覆盖方式复制。
+
+```bash
+cd models/wan2.2-i2v
+cp config/14b_taylorseer.yaml config/14b_taylorseer_local.yaml
+```
+
+编辑本地 YAML 中的 `model_args.ckpt_dir`、`image` 和 `prompt`，然后在模型目录执行：
+
+```bash
+WAN_CONFIG=config/14b_taylorseer_local.yaml bash infer.sh
+```
+
+`WAN_CONFIG` 支持绝对路径和相对于模型目录的路径。模板默认启用 TaylorSeer 预测，缓存 `offload` 和 `prefetch` 均为 `false`。需要缓存搬运时将 `dit_cache.params.offload` 设为 `true`，同时设 `prefetch: true` 可启用异步预取。回退到 NoCache 时可使用 `14b_single.yaml`，或将本地配置的 `dit_cache.method` 改为 `NoCache` 并删除 `dit_cache.params`。参数范围见[配置参考](config/README.md#taylorseer-parameters)，实现与实测结果见[技术文档](../../docs/models/wan2.2-i2v/wan2.2-i2v_optimization.md#taylorseer)。
+
+### 四档复现
+
+从上述本地 YAML 复制四份配置。四档使用相同的权重、输入图片、prompt、seed、分辨率、帧数和采样步数。复现技术文档的 A3 数据时，保留模板的 `size: "640*360"`、`frame_num: 61`、`sample_steps: 40` 和 `base_seed: 100`。四档均启用 `model_args.offload_model: true` 和 `model_args.reuse_offload_memory: true`，分别控制模型权重迁移和显存池复用。
+
+```bash
+cp config/14b_taylorseer_local.yaml config/14b_taylorseer_B0_local.yaml
+cp config/14b_taylorseer_local.yaml config/14b_taylorseer_B1_local.yaml
+cp config/14b_taylorseer_local.yaml config/14b_taylorseer_B2_local.yaml
+cp config/14b_taylorseer_local.yaml config/14b_taylorseer_B3_local.yaml
+mkdir -p output/taylorseer/sample-id
+```
+
+| 档位 | `dit_cache.method` | `params.offload` | `params.prefetch` |
+| --- | --- | --- | --- |
+| B0 | `NoCache` | — | — |
+| B1 | `TaylorSeer` | `false` | `false` |
+| B2 | `TaylorSeer` | `true` | `false` |
+| B3 | `TaylorSeer` | `true` | `true` |
+
+B0 删除整个 `dit_cache.params` 映射。B1–B3 在已有的 `dit_cache.params` 中应用下列 A3 场景参数，再按表切换 `offload` 和 `prefetch`。其余参数沿用模板。
+
+```yaml
+n_derivatives: 1
+skip_interval_steps: 5
+warmup: 3
+cutoff_steps: 2
+cache_group_size: 20
+```
+
+在每档已有的 `model_args` 中补充以下字段。此处以 B0 为例，B1–B3 使用各自的档位名。
+
+```yaml
+sample_solver: unipc
+sample_shift: 5.0
+reuse_offload_memory: true
+save_file: "output/taylorseer/sample-id/B0.mp4"
+```
+
+```bash
+WAN_CONFIG=config/14b_taylorseer_B0_local.yaml bash infer.sh
+WAN_CONFIG=config/14b_taylorseer_B1_local.yaml bash infer.sh
+WAN_CONFIG=config/14b_taylorseer_B2_local.yaml bash infer.sh
+WAN_CONFIG=config/14b_taylorseer_B3_local.yaml bash infer.sh
+```
+
+每个样本使用独立的输出目录。启动脚本完成常规预热与生成，并将结果写入本档的 `save_file`。

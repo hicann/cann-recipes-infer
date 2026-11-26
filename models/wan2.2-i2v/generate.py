@@ -42,7 +42,6 @@ import wan
 from wan.configs import MAX_AREA_CONFIGS, SIZE_CONFIGS, SUPPORTED_SIZES, WAN_CONFIGS
 from wan.distributed.util import init_distributed_group
 from wan.utils.prompt_extend import DashScopePromptExpander, QwenPromptExpander
-from wan.utils.utils import save_video, str2bool
 from wan.distributed.parallel_mgr import ParallelConfig, init_parallel_env, finalize_parallel_env
 from wan.cache import first_block_forward
 import wan.cache.cache_block
@@ -110,6 +109,8 @@ def _validate_args(args):
 
 
 def _parse_args():
+    from wan.utils.utils import str2bool
+
     parser = argparse.ArgumentParser(
         description="Generate a image or video from a text prompt or image using Wan"
     )
@@ -144,8 +145,18 @@ def _parse_args():
     parser.add_argument(
         "--offload_model",
         type=str2bool,
+        nargs="?",
+        const=True,
         default=None,
         help="Whether to offload the model to CPU after each model forward, reducing GPU memory usage."
+    )
+    parser.add_argument(
+        "--reuse_offload_memory",
+        type=str2bool,
+        nargs="?",
+        const=True,
+        default=False,
+        help="Reuse cached NPU allocations before denoising and between experts; single-process I2V only."
     )
     parser.add_argument(
         "--cfg_size",
@@ -311,11 +322,26 @@ def _load_model_config(task, config_path):
 
 
 def generate(args):
+    # Load helpers after the module's torch_npu initialization and transfer patch.
+    from wan.cache.wan_cache_adapter import configure_wan_cache, validate_wan_cache_options
+    from wan.video_export import save_video
+
     rank = int(os.getenv("RANK", 0))
     world_size = int(os.getenv("WORLD_SIZE", 1))
     local_rank = int(os.getenv("LOCAL_RANK", 0))
     device = local_rank
     _init_logging(rank)
+    cfg = _load_model_config(args.task, os.getenv('YAML') or args.cache_config)
+    validate_wan_cache_options(args, world_size, model_config=cfg)
+    reuse_offload_memory = getattr(args, "reuse_offload_memory", False)
+    if type(reuse_offload_memory) is not bool:
+        raise ValueError("reuse_offload_memory must be a bool")
+    if reuse_offload_memory and (
+            args.task != "i2v-A14B" or world_size != 1 or rank != 0
+            or args.t5_fsdp or args.dit_fsdp or args.vae_parallel
+            or args.cfg_size != 1 or args.ulysses_size != 1
+            or args.ring_size != 1 or args.tp_size != 1):
+        raise ValueError("reuse_offload_memory requires single-process I2V without sharding or parallelism")
     stream = torch.npu.Stream()
     if args.offload_model is None:
         args.offload_model = False if world_size > 1 else True
@@ -391,7 +417,6 @@ def generate(args):
             raise NotImplementedError(
                 f"Unsupported prompt_extend_method: {args.prompt_extend_method}")
 
-    cfg = _load_model_config(args.task, os.getenv('YAML') or args.cache_config)
     if args.ulysses_size > 1:
         if cfg.num_heads % args.ulysses_size != 0:
             raise ValueError(
@@ -569,19 +594,10 @@ def generate(args):
             t5_cpu=args.t5_cpu,
             convert_model_dtype=args.convert_model_dtype,
             use_vae_parallel=args.vae_parallel,
+            reuse_offload_memory=reuse_offload_memory,
         )
-        cache_manager.from_config(
-                config_path=args.cache_config,
-                cache_params={"num_steps": args.sample_steps})
-        if world_size > 1:
-            logging.info("Cannot enable both Multi-NPU and DIT-Cache. DIT-Cache has been disabled")
-            logging.info("Now apply Dit-Cache method: NoCache!")
-            cache_manager.cache_method = NoCache()
-        else:
-            cache_block = wan_i2v.high_noise_model.blocks[0]
-            cache_block.forward = first_block_forward.__get__(cache_block, type(cache_block))
-            cache_block = wan_i2v.low_noise_model.blocks[0]
-            cache_block.forward = first_block_forward.__get__(cache_block, type(cache_block))
+        configure_wan_cache(args.cache_config, wan_i2v,
+                            num_steps=args.sample_steps, world_size=world_size)
 
         transformer_low = wan_i2v.low_noise_model
         transformer_high = wan_i2v.high_noise_model

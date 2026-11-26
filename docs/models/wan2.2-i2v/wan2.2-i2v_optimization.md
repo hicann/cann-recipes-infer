@@ -183,7 +183,7 @@ for step_idx, t in enumerate(tqdm(timesteps)):
 
 DIT-Cache作为扩散模型推理加速的缓存框架，通过复用/预测已有的结果，减少冗余前向计算。其加速逻辑可清晰的分为Step-level和Block-level范式，Step-level通过判断不同采样步数step间的特定特征差异，通过阈值比较，决定是否跳过完整的step计算，直接复用或者预测缓存结果；Block-level以block为粒度（通常是attention模块和mlp模块）判断是否直接复用或者预测缓存结果。
 
-本样例集成了Step-level的Dit-Cache方案，支持[FBCache](https://github.com/chengzeyi/ParaAttention) 以及 [TeaCache](https://liewfeng.github.io/TeaCache/)。
+本样例集成了Step-level的Dit-Cache方案，支持 [FBCache](https://github.com/chengzeyi/ParaAttention)、[TeaCache](https://liewfeng.github.io/TeaCache/) 和 [TaylorSeer](#taylorseer)。
 
 
 **Step-level典型方法：** 在Step-level加速范畴内，[FBCache](https://arxiv.org/pdf/2411.19108)的原理是基于First Block L1误差，比较第一个Block输出残差与上一步的第一个Block输出残差之间的差异，如果首块输出误差与上一轮首块输出误差差异小于指定阈值，就跳过当前步计算，复用残差，对当前步的输出进行估计。
@@ -224,6 +224,66 @@ export YAML_FILE_NAME=14b_single.yaml
             +--- dit_cache                     # step-level 缓存实现
                 +--- cache_method.py           # CacheManager / FBCache / TeaCache / TaylorSeer / NoCache
 ```
+
+### TaylorSeer
+
+TaylorSeer 利用相邻去噪步的组残差及其有限差分预测特征，减少完整 DiT 计算。Host Offload 将缓存因子保存在 CPU 内存。异步 Prefetch 提前搬入下一组因子，使传输有机会与当前组计算重叠。
+
+当前支持 Atlas A3 单卡、BF16 `i2v-A14B` 双专家、batch 1 和串行请求。缓存因子为连续的 `[B,S,C_hidden]` FP32 张量，模型计算保持 BF16。使用方法见[模型 README](../../../models/wan2.2-i2v/README.md#四档复现)。
+
+#### 组残差预测
+
+每个专家的连续 block 按 `cache_group_size` 分组。完整计算（full）步执行原 block，保存组残差 `F = float32(x_out) - float32(x_in)`；预测（predict）步在组首将预测残差加回输入，跳过同组剩余 block，后续组、输出 head、CFG 和 scheduler 继续执行。
+
+若相邻 full 步间隔为 Δ，因子按有限差分更新：`D_new[0] = F`，`D_new[r] = (D_new[r-1] - D_prev[r-1]) / Δ`。距最近 full 步 h 步时，预测残差为 `Σ D[r] * h^r / r!`。首次 full 初始化零阶，历史不足时只使用已有阶数；预测结果不进入导数历史。
+
+以当前专家的局部步数 k、全请求步数 s、总步数 T 表示，以下任一条件触发 full：
+
+- `k < warmup`；
+- `(k - warmup) % skip_interval_steps == 0`；
+- `s >= T - cutoff_steps`；
+- 新专家激活，或所需组/CFG 缺少历史。
+
+每次专家切换从 k=0 重新建立历史；请求、专家、CFG 分支及 block 组之间的缓存独立。下述 A3 场景在 high 15 步、low 25 步的固定 40 步调度中执行 15 个 full 步和 25 个 predict 步。CFG 双分支不重复计为 scheduler 步数。
+
+#### Host Offload
+
+关闭缓存 offload 时，当前专家的因子常驻 NPU；开启后，完整因子保存在普通 Host 内存，通过有限数量的 pinned buffer 搬运：
+
+1. 计算流产生新因子后记录事件，D2H 流等待事件并将因子拷入一个 pinned staging buffer。
+2. Host writer 等待 D2H 完成，将数据复制到普通 Host 缓存后发布新 generation。发布完成前不允许复用 staging 或提交下一份更新。
+3. 读取历史时，将 Host 因子经 pinned staging 搬入 NPU slot。H2D/D2H 使用 `Tensor.copy_(..., non_blocking=True)`，计算流等待对应的完成事件后使用数据。
+4. 消费结束记录 `last_use` 事件，slot 再次写入前等待该事件。专家切换、请求结束及异常路径均清理缓存和在途传输。
+
+设单份 FP32 特征大小为 `b = 4 * B * S * C_hidden`，最高阶为 q，组数为 G，单组因子大小上限为 `U = (q+1)*b`，双 CFG 因子总量为 `C = 2*G*U`：
+
+| 缓存路径 | 普通 Host 预算 | pinned 预算 | NPU 缓存及 scratch 预算 |
+| --- | --- | --- | --- |
+| 因子常驻 NPU | 0 | 0 | `C + U + 4b` |
+| Host Offload | `C + U` | `3U` | `3U + 4b` |
+
+预算为 `null` 时按实际形状计算有限上限，显式上限不足时直接报错。模型权重、激活、VAE/T5、其他 workspace 和 allocator reserved 容量需要另外预留。
+
+#### 异步 Prefetch
+
+开启 `prefetch` 后，当前组计算入队时提前加载同一专家、同一 CFG 分支的下一组已发布因子。两个 H2D/NPU slot 交替使用，消费流通过 `h2d_ready` 等待所需 generation，避免读取尚未完成的传输。未命中预取时按需加载；关闭 prefetch 后所有因子均按需加载。
+
+预取距离固定为一组，不跨专家或 CFG 分支。实际收益取决于计算窗口和传输耗时，预测计算过短时无法完全隐藏拷贝。可通过 `WanTaylor/PrefetchH2D`、`DemandH2D`、`AcquireWait` 等 profiler 范围检查搬算重叠及消费等待。
+
+#### 性能与内存结果
+
+以下为 Atlas A3、CANN 8.5.0、PyTorch 2.7.1、torch_npu 2.7.1.post2 下的固定五场景测试：`blackswan`、`breakdance`、`bmx-trees`、`car-roundabout`、`horsejump-high`。使用 `size=640*360`、61 帧、40 步、seed=100，实际输出为 `[3,61,352,640]`；四档均开启模型 offload 和 `reuse_offload_memory`，三个 Taylor 档均采用 q=1、K=5、w=3、c=2、g=20。
+
+每个场景先取三次正式生成的均值，再对五个场景等权平均，保留全部慢样本。降时按 `1 - 当前档均值 / B0均值` 计算；NPU peak allocated 为各档 15 次正式请求中，框架统计的最大分配峰值。
+
+| 档位 | 组合 | 平均时延（s） | 相对 B0 降时 | NPU peak allocated（GiB） |
+| --- | --- | ---: | ---: | ---: |
+| B0 | NoCache | 226.391 | — | 30.676 |
+| B1 | TaylorSeer | 103.867 | 54.121% | 33.093 |
+| B2 | TaylorSeer + Host Offload | 118.679 | 47.578% | 32.019 |
+| B3 | TaylorSeer + Host Offload + Prefetch | 112.504 | 50.305% | 32.019 |
+
+本批次中，Host Offload 将 NPU 分配峰值从 33.093 GiB 降至 32.019 GiB，同时增加了传输开销。B3 的平均时延比 B2 低 6.175 s。实际搬算重叠可结合上文的 profiler 范围观察。端到端计时从模型加载后开始，到生成结束并完成设备同步为止，覆盖生成、缓存与模型搬运及清理。
 
 ### W8A8 量化
 
