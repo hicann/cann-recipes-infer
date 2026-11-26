@@ -2650,14 +2650,14 @@ def view_bf16_nz(weight):
 
 
 def pack_mxfp8_nz(weight):
-    """Checkpoint [O, K] E4M3 -> explicit [O/32, K, 32]."""
-    output, k = weight.shape
-    return weight.view(torch.uint8).reshape(output // 32, 32, k).transpose(1, 2).contiguous().view(weight.dtype)
+    """Checkpoint [O, K] E4M3 -> true FRACTAL_NZ with logical [K, O]."""
+    return torch_npu.npu_format_cast(weight.t().contiguous(), 29)
 
 
 def logical_mx_scale(scale, output, k):
-    """Keep the actual E8M0 bytes: one exponent for each group of 32 K."""
-    return scale.view(torch.uint8).reshape(output, k // 64, 2).contiguous().view(torch.float8_e8m0fnu)
+    """Keep the actual E8M0 bytes in true FRACTAL_NZ: logical [K/64, O, 2]."""
+    logical_scale = scale.view(torch.uint8).reshape(output, k // 64, 2).permute(1, 0, 2).contiguous()
+    return torch_npu.npu_format_cast(logical_scale.view(torch.float8_e8m0fnu), 29)
 
 
 def write_fp8_cache(merged, cache, slots, descale):
@@ -2836,14 +2836,24 @@ class KimiMLAAttention(nn.Module):
 
     def prepare_prolog_weights(self) -> None:
         """Prepare DSL Prolog weights once, outside graph capture."""
+        if self.q_a_layernorm.variance_epsilon != self.kv_a_layernorm.variance_epsilon:
+            raise ValueError("DSL Prolog requires identical Q/KV RMSNorm epsilon")
         if self.use_w8a8c8:
-            from ops.quant_mla_prolog import quant_mla_prolog_op
+            from ops import quant_mla_prolog as _prolog
 
-            self.mla_prolog_op = quant_mla_prolog_op
+            self.mla_prolog_op = _prolog.quant_mla_prolog
+            # Q/Cache both FP8 E4M3: Q per-token/head, KV/KR per-tensor.
+            self._mla_prolog_qkv_mode = _prolog.QkvQuantMode(2)
+            self._mla_prolog_w_qr_mode = _prolog.WQrQuantMode.A8W8_MXFP8
+            self._mla_prolog_cache_mode = _prolog.CacheMode.PA_NZ
+            self._mla_prolog_rope_mode = _prolog.RopeMode.NO_ROPE
         else:
-            from ops.mla_prolog import mla_prolog
+            from ops import mla_prolog_v4 as _prolog
 
-            self.mla_prolog_op = mla_prolog
+            self.mla_prolog_op = _prolog.mla_prolog_v2
+            self._mla_prolog_qkv_mode = _prolog.QkvQuantMode.A16C16
+            self._mla_prolog_cache_mode = _prolog.CacheMode.PA_NZ
+            self._mla_prolog_rope_mode = _prolog.RopeMode.NO_ROPE
         for name, linear in (("qa", self.q_a_proj), ("qb", self.q_b_proj_decode),
                              ("kva", self.kv_a_proj_with_mqa)):
             weight = linear.weight.detach()
@@ -2858,9 +2868,13 @@ class KimiMLAAttention(nn.Module):
         self.register_buffer("mla_gamma_qa", self.q_a_layernorm.weight.detach().float().contiguous())
         self.register_buffer("mla_gamma_kva", self.kv_a_layernorm.weight.detach().float().contiguous())
         if self.use_w8a8c8:
-            self.register_buffer("mla_kv_scale", torch.tensor(
+            kv_descale = torch.tensor(
                 [1.0], dtype=torch.float32, device=self.q_a_proj.weight.device,
-            ))
+            )
+            self.register_buffer("mla_kv_scale", kv_descale)
+            # 0.8 Prolog consumes a quantization multiplier (1 / descale);
+            # Flash MLA keeps the descale for dequantization.
+            self.register_buffer("mla_kv_quant_scale", 1.0 / kv_descale)
 
     def _flash_mla_attention(
         self,
@@ -2955,21 +2969,30 @@ class KimiMLAAttention(nn.Module):
         slots = forward_metadata["slot_mapping"][self.attn_type].reshape(-1).to(torch.int64).contiguous()
         if self.use_w8a8c8:
             x, sx = torch_npu.npu_dynamic_mx_quant(x, dst_type=torch.float8_e4m3fn)
-            sx = sx.view(torch.uint8).reshape(tokens, hidden_states.shape[-1] // 64, 2).view(torch.float8_e8m0fnu)
-            outs = self.mla_prolog_op(
+            sx = sx.view(torch.uint8).reshape(tokens, hidden_states.shape[-1] // 32).view(torch.float8_e8m0fnu)
+            q, q_descale, _, _ = self.mla_prolog_op(
                 x, self.mla_w_qa, self.mla_w_qb, self.mla_w_kva,
                 self.kv_b_proj_decode_w_k, sx, self.mla_s_qa, self.mla_s_qb, self.mla_s_kva,
-                self.mla_gamma_qa, self.mla_gamma_kva, cache, slots, self.mla_kv_scale,
-                norm_eps=1e-6, quant_mode_aw=1, quant_mode_c=1,
+                self.mla_gamma_qa, self.mla_gamma_kva, cache, slots, self.mla_kv_quant_scale,
+                norm_eps=self.q_a_layernorm.variance_epsilon,
+                w_qr_quant_mode=self._mla_prolog_w_qr_mode,
+                qkv_quant_mode=self._mla_prolog_qkv_mode,
+                cache_mode=self._mla_prolog_cache_mode,
+                rope_mode=self._mla_prolog_rope_mode,
+                return_qr=False,
             )
-            q, q_descale = outs[0], outs[1]
+            q_descale = q_descale.squeeze(-1)
         else:
-            outs = self.mla_prolog_op(
+            q, _, _ = self.mla_prolog_op(
                 x, self.mla_w_qa, self.mla_w_qb, self.mla_w_kva,
                 self.kv_b_proj_decode_w_k, self.mla_gamma_qa, self.mla_gamma_kva,
-                cache, slots, self.q_a_layernorm.variance_epsilon,
+                cache, slots,
+                norm_eps=self.q_a_layernorm.variance_epsilon,
+                qkv_quant_mode=self._mla_prolog_qkv_mode,
+                cache_mode=self._mla_prolog_cache_mode,
+                rope_mode=self._mla_prolog_rope_mode,
+                return_qr=False,
             )
-            q, _ = outs[0], outs[1]
         full_hidden = None
         if self.use_output_gate and self.enable_multi_streams:
             # Wait for Prolog on device before starting AllGather on the gate
@@ -3902,13 +3925,14 @@ class KimiDSAAttention(KimiMLAAttention):
                     "CANNBot DSA Prolog requires identical Q/KV RMSNorm epsilon"
                 )
             if self.enable_dsa_quant:
-                from ops.mla_prolog import CacheMode, QkvQuantMode, RopeMode, mla_prolog
+                from ops import mla_prolog_v4 as _prolog
 
                 self.mla_prolog_op = partial(
-                    mla_prolog,
-                    qkv_quant_mode=QkvQuantMode.KV_FP8_PER_TOKEN_GROUP,
-                    cache_mode=CacheMode.PA_BSND,
-                    rope_mode=RopeMode.NONE,
+                    _prolog.mla_prolog_v2,
+                    # Q stays BF16; KV is FP8 per token/group, KR stays BF16.
+                    qkv_quant_mode=_prolog.QkvQuantMode(1),
+                    cache_mode=_prolog.CacheMode.PA_BSND,
+                    rope_mode=_prolog.RopeMode.NO_ROPE,
                     return_qr=True,
                 )
             else:
@@ -3921,9 +3945,8 @@ class KimiDSAAttention(KimiMLAAttention):
                 # The BF16 Prolog reuses Linear's [K, O] NZ weights.
                 weight = linear.weight.detach()
                 if self.enable_dsa_quant:
-                    # The DSL Prolog takes true NZ [O, K].
-                    weight = torch_npu.npu_format_cast(weight, 2)
-                    weight = torch_npu.npu_format_cast(weight.T.contiguous(), 29)
+                    # 0.8 mla_prolog_v2 takes true NZ with logical [K, O].
+                    weight = view_bf16_nz(weight)
                 self.register_buffer(f"mla_w_{name}", weight)
             gamma_dtype = torch.float32 if self.enable_dsa_quant else self.q_a_proj.weight.dtype
             self.register_buffer(
