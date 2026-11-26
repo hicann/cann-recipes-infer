@@ -31,6 +31,14 @@
 - `enable_dynamic_graph`: 在 npugraph_ex 图模式下是否使能动态图编译（默认 True），在 eager 和 ge_graph 模式下无效。
 - `force_eplb`: 是否为 MoE 模型开启强制的专家负载均衡（默认 False）。
 - `enable_profiler`: 是否启用性能分析器（默认 False）。
+- `profiler_config`：分别配置 mm_encode、prefill 和 decode profiling 窗口。`skip_first` 表示跳过的 step 数，`active` 表示随后采集的连续 step 数，例如：
+    ```yaml
+    profiler_config:
+      mm_encode: {skip_first: 0, active: 1}
+      prefill: {skip_first: 0, active: 1}
+      decode: {skip_first: 3, active: 3}
+    ```
+    未配置时保持旧行为：mm_encode/prefill 采集 1 个 step，decode 跳过 3 步后采集 3 步。只有启用可能产生多个 prefill 的 `cp_mini_batch` 或 `max_prefill_tokens`，以及启用 `max_mm_encode_tokens` 后，才能为对应阶段配置非默认窗口。
 - `enable_weight_nz`: 是否启用权重 NZ 格式（默认 True）。
 - `platform_version`：指定运行推理的平台，支持配置为 A2、A3 或 950。不传入时使用torch.npu.get_device_name()获取设备名，如果获取失败，则指定为A3。不建议传入此参数。
 - `custom_params`：存放模型特有特性的字典（默认{}）。

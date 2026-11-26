@@ -23,17 +23,13 @@ import os
 from enum import Enum
 
 import torch_npu
+from executor.core.config.inference_config import DEFAULT_PROFILER_CONFIG
 
 
 class ProfilerPhase(Enum):
     MM_ENCODE = "mm_encode"
     PREFILL = "prefill"
     DECODE = "decode"
-
-
-# Decode profiling window. Timing starts after the skipped and active steps.
-DECODE_PROFILE_ACTIVE_STEPS = 3
-DECODE_PROFILE_SKIP_FIRST = 3
 
 
 class FakeContextManager:
@@ -55,9 +51,9 @@ class FakeContextManager:
 def create_profiler(
     enable_profiler=False,
     profile_save_path="prof",
-    active=DECODE_PROFILE_ACTIVE_STEPS,
+    active=DEFAULT_PROFILER_CONFIG["decode"]["active"],
     repeat=1,
-    skip_first=DECODE_PROFILE_SKIP_FIRST,
+    skip_first=DEFAULT_PROFILER_CONFIG["decode"]["skip_first"],
 ):
     if enable_profiler:
         os.makedirs(profile_save_path, exist_ok=True)
@@ -94,9 +90,10 @@ class ProfilerManager:
     Profiler manager for profiling using torch_npu.profiler.
     This class provides a manager for profiling NPU operations during inference.
     """
-    def __init__(self, enable_profiler, profile_save_path):
+    def __init__(self, enable_profiler, profile_save_path, profiler_config=None):
         self.enable_profiler = enable_profiler
         self.profile_save_path = profile_save_path
+        self.profiler_config = profiler_config
         self.profiler_status = None
         self.current_profiler = FakeContextManager()
         self.decode_profile_steps = 0
@@ -122,9 +119,7 @@ class ProfilerManager:
             return
         if self.profiler_status is not None:
             self.current_profiler.stop()
-        profiler_kwargs = {}
-        if cur_status in (ProfilerPhase.MM_ENCODE, ProfilerPhase.PREFILL):
-            profiler_kwargs = {"active": 1, "repeat": 1, "skip_first": 0}
+        profiler_kwargs = {"repeat": 1, **self.profiler_config[cur_status.value]}
         self.current_profiler = create_profiler(
             enable_profiler=True,
             profile_save_path=os.path.join(self.profile_save_path, "prof", cur_status.value),
@@ -140,9 +135,7 @@ class ProfilerManager:
         self.current_profiler.step()
         if self.enable_profiler and self.profiler_status == ProfilerPhase.DECODE:
             self.decode_profile_steps += 1
-            profile_window_steps = (
-                DECODE_PROFILE_SKIP_FIRST + DECODE_PROFILE_ACTIVE_STEPS
-            )
+            profile_window_steps = sum(self.profiler_config["decode"].values())
             # Timing starts after the skipped and active profiling steps.
             self.decode_profile_complete = (
                 self.decode_profile_steps >= profile_window_steps

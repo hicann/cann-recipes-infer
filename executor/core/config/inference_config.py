@@ -33,6 +33,24 @@ import torch
 import torch_npu  # noqa: F401  # Registers torch.npu device APIs.
 
 
+# Default profiling windows: decode skips the first 3 steps and profiles the next 3;
+# prefill and multimodal encoding each profile one scheduler step.
+DEFAULT_PROFILER_CONFIG = {
+    "decode": {
+        "skip_first": 3,
+        "active": 3,
+    },
+    "prefill": {
+        "skip_first": 0,
+        "active": 1,
+    },
+    "mm_encode": {
+        "skip_first": 0,
+        "active": 1,
+    },
+}
+
+
 class PlatformVersion(Enum):
     """Supported platform versions for the refactored executor."""
 
@@ -77,6 +95,25 @@ class PlatformVersion(Enum):
             raise ValueError(
                 f"platform_version={value!r} is not supported, expected one of {expected}"
             ) from exc
+
+
+def parse_profiler_config(raw_config=None):
+    """Validate phase windows and merge defaults without mutating the input."""
+    raw_config = {} if raw_config is None else raw_config
+    if not isinstance(raw_config, dict) or raw_config.keys() - DEFAULT_PROFILER_CONFIG.keys():
+        raise ValueError("model_config.profiler_config must be a mapping of decode, prefill, mm_encode")
+    result = {}
+    for phase, defaults in DEFAULT_PROFILER_CONFIG.items():
+        window = raw_config.get(phase, {})
+        if not isinstance(window, dict) or window.keys() - {"skip_first", "active"}:
+            raise ValueError(f"model_config.profiler_config.{phase} must be a mapping of skip_first, active")
+        window = {**defaults, **window}
+        if type(window["skip_first"]) is not int or window["skip_first"] < 0:
+            raise ValueError(f"model_config.profiler_config.{phase}.skip_first must be an integer >= 0")
+        if type(window["active"]) is not int or window["active"] < 1:
+            raise ValueError(f"model_config.profiler_config.{phase}.active must be an integer >= 1")
+        result[phase] = window
+    return result
 
 
 @dataclass
@@ -152,6 +189,7 @@ class ModelConfig:
         force_eplb: Whether to enable force expert load balancing for MoE models (default: False)
 
         enable_profiler: Enable profiler (default: False)
+        profiler_config: Profiler windows (default: (skip_first, active): decode=(3, 3), prefill/mm_encode=(0, 1))
         enable_weight_nz: Whether to enable NZ format for weights (default: True)
         enable_hadamard: Whether to enable Hadamard transform for supported quantized models (default: False)
         hadamard_weight_path: Path to offline Hadamard transform weights (default: "")
@@ -171,6 +209,7 @@ class ModelConfig:
     force_eplb: bool = False
 
     enable_profiler: bool = False
+    profiler_config: dict = field(default_factory=dict)
 
     enable_weight_nz: bool = True
     enable_hadamard: bool = False
@@ -208,6 +247,7 @@ class ModelConfig:
             enable_dynamic_graph=model_config_dict.get("enable_dynamic_graph", True),
             force_eplb=model_config_dict.get("force_eplb", False),
             enable_profiler=model_config_dict.get("enable_profiler", False),
+            profiler_config=parse_profiler_config(model_config_dict.get("profiler_config")),
             enable_weight_nz=model_config_dict.get("enable_weight_nz", True),
             enable_hadamard=model_config_dict.get("enable_hadamard", False),
             hadamard_weight_path=model_config_dict.get("hadamard_weight_path", ""),
@@ -607,6 +647,28 @@ class InferenceConfig:
             scheduler_config=SchedulerConfig.from_dict(yaml_dict.get("scheduler_config", {})),
             disagg_config=disagg_config or DisaggConfig(),
         )
+
+        windows = infer_config.model_config.profiler_config
+        scheduler = infer_config.scheduler_config
+        cp_split = infer_config.parallel_config.cp_size > 1 and scheduler.cp_mini_batch > 0
+        default_window = {"skip_first": 0, "active": 1}
+        if windows["prefill"] != default_window and (scheduler.max_prefill_tokens <= 0 and not cp_split):
+            raise ValueError("model_config.profiler_config.prefill window cannot be produced by the scheduler")
+        if scheduler.max_new_tokens <= windows["decode"]["skip_first"]:
+            logging.warning(
+                "model_config.profiler_config.decode produces no profile data: "
+                "max_new_tokens=%s <= skip_first=%s", scheduler.max_new_tokens, windows["decode"]["skip_first"]
+            )
+        decode_window_steps = windows["decode"]["skip_first"] + windows["decode"]["active"]
+        if decode_window_steps >= scheduler.max_new_tokens:
+            raise ValueError(
+                f"window_steps={decode_window_steps}, max_new_tokens={scheduler.max_new_tokens}; "
+                f"requires max_new_tokens > window_steps; increase max_new_tokens or reduce skip_first/active"
+            )
+        if windows["mm_encode"] != default_window and scheduler.max_mm_encode_tokens <= 0:
+            raise ValueError(
+                "model_config.profiler_config.mm_encode requires max_mm_encode_tokens for nondefault windows"
+            )
 
         attn_dp_size = infer_config.parallel_config.attn_dp_size
         if infer_config.model_config.custom_params.get("enable_afd", False):

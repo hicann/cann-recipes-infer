@@ -120,7 +120,11 @@ class ExecutionEngine:
         # Profiling configuration
         self.enable_profiler = self.infer_config.model_config.enable_profiler
         self.output_path = os.path.join(os.getenv("WORK_DIR", "."), os.getenv("RES_PATH", ""))
-        self.profiler = ProfilerManager(self.enable_profiler, self.output_path)
+        self.profiler = ProfilerManager(
+                self.enable_profiler,
+                self.output_path,
+                self.infer_config.model_config.profiler_config,
+            )
 
     def _init_device(self):
         """Initialize NPU device and the dist process group.
