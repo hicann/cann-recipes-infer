@@ -19,27 +19,20 @@
 
 1. 安装 CANN 软件包。
 
-   本样例的编译执行依赖 CANN 开发套件包（toolkit）与昇腾 950 对应的二进制算子包（ops）。支持9.2.0版本cann包，下载选择[weekly版本](https://www.hiascend.com/cann/download)， 并参考链接中的指导方式完成安装。
+   本样例的编译执行依赖 CANN 开发套件包（toolkit）与昇腾 950 对应的二进制算子包（ops）。请从 [CANN Weekly 下载页](https://www.hiascend.com/cann/download?currentTab=1) 选择昇腾 950PR/DT 对应的软件包，并按页面指引安装。
 
    Kimi K3 / K3.1 使用 KDA、MLA/DSA 和 MoE 相关昇腾算子，建议所有节点使用相同的 CANN、驱动和固件版本。当前实现面向昇腾 950PR/DT，不支持在其他产品上直接运行。
 
 2. 安装 Ascend Extension for PyTorch（torch_npu）。
 
-   `torch_npu` 为 PyTorch 在 NPU 上运行提供适配。请安装与当前 CANN 和 Python 版本匹配的 `torch_npu`、PyTorch 及其依赖；本目录的依赖版本记录在 `models/kimi_k3_1/requirements.txt` 中。安装[torch_npu](https://pypi.org/project/torch-npu/2.10.0.post4/)时，按照链接中的指导方法完成安装，建议安装对应python版本为3.12。或者通过命令行完成安装：
+   `torch_npu` 为 PyTorch 在 NPU 上运行提供适配。请安装与当前 CANN 和 Python 版本匹配的 `torch_npu`、PyTorch 及其依赖；本目录的依赖版本记录在 `models/kimi_k3_1/requirements.txt` 中。安装[torch_npu](https://pypi.org/project/torch-npu/2.10.0.post7/)时，按照链接中的指导方法完成安装，建议安装对应python版本为3.12。或者通过命令行完成安装：
     ```bash
    # 推荐2.10.0版本
    pip install torch==2.10.0
-   pip install torch_npu==2.10.0.post4
+   pip install torch_npu==2.10.0.post7
    ```
 
-3. 安装 CANNBot-DSL 算子依赖包
-
-    CANNBot-DSL 提供 Kimi K3 / K3.1 所需的高性能融合算子，算子编译依赖 `ninja==1.13.0`，该版本已列入 `requirements.txt`。
-    ```bash
-   pip install cannbot-dsl
-   ```
-
-4. 下载项目源码并安装 Python 依赖。
+3. 下载项目源码并安装 Python 依赖。
 
    ```bash
    # 下载项目源码
@@ -47,7 +40,31 @@
    cd cann-recipes-infer
 
    # Kimi K3 / K3.1 共用依赖
-   pip3 install -r ./models/kimi_k3_1/requirements.txt
+   python -m pip install -r ./models/kimi_k3_1/requirements.txt
+   ```
+
+4. 安装 CANNBot-DSL 并编译安装 Native 算子包。
+
+   使用运行推理的同一 Python 环境安装 CANNBot-DSL 0.8.4 并拉取算子源码。上一步已安装算子编译所需的 `ninja==1.13.0`。
+
+   ```bash
+   # 先卸载 CANN 软件包随附的 DSL、算子包和 opkit
+   pip uninstall cannbot-dsl cannbot-arena-net opkit
+   python -m pip install cannbot-dsl==0.8.4
+   python -c 'import cannbotdsl; print(cannbotdsl.__version__)'
+   git clone -b master https://gitcode.com/cann/cannbot-dsl.git ../cannbot-dsl
+   ```
+
+   加载 CANN 环境并安装打包工具后，在 `cannbot-dsl` 仓库根目录构建并安装 `k3` 算子组（已同时覆盖 Kimi K3 与 Kimi K3.1 所需的全部 DSL 算子）。实际 wheel 路径以构建输出的 `Wheel:` 为准，更多构建参数见 [CANNBot-DSL Native 打包说明](https://gitcode.com/cann/cannbot-dsl/blob/master/packaging/README.md)。
+
+   ```bash
+   source /usr/local/Ascend/cann/set_env.sh
+   python3 -m pip install 'setuptools>=70.1' wheel
+   cd ../cannbot-dsl
+   python3 packaging/native/build.py --group=k3 --no-partial
+   python3 -m pip install --force-reinstall --no-deps packaging/native/output/*.whl
+   python3 -c 'import ops; print(ops.__file__)'
+   cd -
    ```
 
 5. 安装 SiTU 自定义算子（`situ_and_mul_sparse` 与融合算子 `grouped_situ_mx_quant`）。
@@ -194,7 +211,7 @@ model_config:
   pa_block_size: 128
   custom_params:
     enable_multi_streams: True
-    enable_superkernel: True  # Requires npugraph_ex, static kernels and multi-streams.
+    enable_superkernel: False  # Requires npugraph_ex, static kernels and multi-streams.
     enable_dspark_confidence_head: False
     enable_mega_kda: True
     enable_mega_kda_replayssm: True
@@ -235,7 +252,7 @@ parallel_config:
 - K3 MLA Decode 支持 BF16 和 C8/W8A8C8，使用与所选精度路径兼容的 checkpoint；不支持 MLA 投影部分量化或 MLA 层间混用 BF16/MXFP8。量化方案见[K3 技术报告](../../docs/models/kimi_k3/kimi_k3_inference_guide.md#量化策略)。
 - K3.1 DSA 保留 BF16 投影，`enable_dsa_quant=True` 时，LI 的 Q/K 使用 MXFP8，SFA 的 latent KV 使用 FP8、辅助 64 维保留 BF16，SFA 的 Query 保持 BF16；该开关同时作用于 Prefill 和 Decode。切换开关后清理对应编译缓存。
 - 切换权重、输入形状、算子路径或编译选项后，应重新生成对应的编译缓存。
-- Decode 支持 `eager` 和 `npugraph_ex`；Prefill 固定 eager。当前 YAML 开启 SuperKernel，切换 eager 时需同时设置 `custom_params.enable_superkernel=False`。
+- Decode 支持 `eager` 和 `npugraph_ex`；Prefill 固定 eager。两份 YAML 默认关闭 SuperKernel。
 - 默认开启 MegaKDA ReplaySSM。关闭 ReplaySSM 后使用 MegaKDA snapshot；两者均关闭时使用 snapshot fused recurrent。
 - ReplaySSM 要求启用 DSpark、`next_n=7`、950 平台、每个 Attention DP group 的 batch 不超过 16、本地 KDA heads 为 6，以及模型的 hidden size 7168、head dim 128、ShortConv kernel 4 和全秩输出 gate；默认 YAML 满足这些约束。
 - ReplaySSM 需要同时安装 `ops.mega_recurrent_kda_replayssm` 和 `ops.commit_recurrent_kda_replayssm`。AttnRes 和 ReplaySSM 的归一化 epsilon 沿用模型配置中的 `rms_norm_eps`。
@@ -264,7 +281,7 @@ parallel_config:
 | `prefill_chunk_size` | int | K3：`8192`；K3.1：`0` | 每个请求单次 Prefill 的 token chunk 上限；`0` 表示不分块。 |
 | `pa_block_size` | int | `128` | MLA/DSA paged cache 的 block size。 |
 | `enable_multi_streams` | bool | `True` | 控制 Decode 多流执行；MoE Decode 使用 router/shared/shared_comm 流，K3.1 在 `npugraph_ex` 下还启用 Indexer 多流；MoE Prefill 固定在当前流执行。 |
-| `enable_superkernel` | bool | `True` | 控制 MoE Decode 融合 scope、编译选项及缓存目录；开启要求 `npugraph_ex`、静态 kernel、多流和 shared experts。省略此参数时默认 `False`。 |
+| `enable_superkernel` | bool | `False` | 控制 MoE Decode 融合 scope、编译选项及缓存目录；开启要求 `npugraph_ex`、静态 kernel、多流和 shared experts。省略此参数时默认 `False`。 |
 | `enable_dspark_confidence_head` | bool | `False` | 是否使用 DSpark confidence head；开启要求草稿 checkpoint 提供对应模块。 |
 | `enable_mega_kda` | bool | `True` | Decode 是否进入 MegaKDA 路径；与 ReplaySSM 同时关闭时使用 snapshot fused recurrent。 |
 | `enable_mega_kda_replayssm` | bool | `True` | MegaKDA 是否使用 ReplaySSM；要求 DSpark、`next_n=7` 及两个 ReplaySSM 算子包。 |

@@ -24,7 +24,7 @@ model_config:
     enable_multi_streams: True
     # LI MXFP8 + SFA FP8 KV; False selects BF16. Clear compile_cache after toggling.
     enable_dsa_quant: True
-    enable_superkernel: True  # Requires npugraph_ex, static kernels and multi-streams.
+    enable_superkernel: False  # Requires npugraph_ex, static kernels and multi-streams.
     enable_dspark_confidence_head: False
     enable_mega_kda: True
     enable_mega_kda_replayssm: True

@@ -10,6 +10,7 @@ FUNCTION_ABS_PATH=$(realpath "${SCRIPT_PATH}/../../executor/scripts/function.sh"
 
 source "${SET_ENV_ABS_PATH}"
 source "${FUNCTION_ABS_PATH}"
+export PYTHONPATH="$(python3 -E -c 'import sysconfig; print(sysconfig.get_path("purelib"))')${PYTHONPATH:+:$PYTHONPATH}"
 
 export MODEL_DIR=$(basename "${SCRIPT_PATH}")
 export YAML_PARENT_PATH="${SCRIPT_PATH}/config"
