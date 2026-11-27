@@ -86,13 +86,13 @@ cat > "$S/dsv41.env" <<EOE
 export DSV41_ROOT=$ROOT                       # work directory
 export DSV41_SCRIPTS=$S                       # this guide-scripts directory
 export DSV41_PREBUILT=$PREBUILT               # custom_transformer operator package
-export DSV41_STAGE_DIR=/dev/shm/engram_stage  # engram staging directory, fixed in engram_staging.py
+export DSV41_STAGE_DIR=/dev/shm/engram_stage  # RAM staging/check directory; SSD uses the runtime backend variables
 export DSV41_VLLM_REPO=https://github.com/wenxuewuhd/vllm.git  # vllm repository
 export DSV41_VLLM_BRANCH=dsv41-moe-offload    # vllm branch, for reference only
 export DSV41_VLLM_SHA=a9686bc6e6809a49cb3e3c592a337d0721c3619f  # vllm pinned commit
-export DSV41_ASCEND_REPO=https://github.com/wenxuewuhd/vllm-ascend.git  # vllm-ascend repository
-export DSV41_ASCEND_BRANCH=dsv41-moe-offload-pr  # vllm-ascend branch, for reference only
-export DSV41_ASCEND_SHA=59ce1e18a4f93c20a872e4450bd14e891c556cb7  # vllm-ascend pinned commit
+export DSV41_ASCEND_REPO=https://github.com/Pan-Boyi/vllm-ascend.git  # vllm-ascend repository
+export DSV41_ASCEND_BRANCH=codex/dsv41-token-id-benchmark-20261119  # vllm-ascend branch, for reference only
+export DSV41_ASCEND_SHA=3609547566ef4aa753b105b5a071244777a1bdca  # includes single-card DSpark and SSD Engram
 export DSV41_KT_REPO=https://github.com/kvcache-ai/ktransformers.git  # ktransformers upstream repository
 export DSV41_KT_SHA=$KT_SHA                   # ktransformers baseline commit
 export DSV41_KT_TREE_HASH=393d8d5d99afef42449e4e804467c668d71a40c4  # expected git write-tree after the 10 patches

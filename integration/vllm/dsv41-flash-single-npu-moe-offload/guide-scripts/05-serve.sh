@@ -36,10 +36,65 @@ if curl -s --max-time 5 --noproxy '*' "http://127.0.0.1:$PORT/v1/models" >/dev/n
   echo "[$N] FAIL 端口 $PORT 上已有服务在应答。换 --port 重跑第 1 步，或先 bash -l 05-serve.sh stop"; exit 1
 fi
 
+profile=${PROFILE:-lowlatency}
+if [[ -z ${KT_CONFIG:-} && ( $profile == lowlatency || $profile == throughput ) ]]; then
+  KT_CONFIG=$(python3 - "$profile" <<'PY'
+import json
+import os
+from pathlib import Path
+import sys
+
+allowed_cpus = os.sched_getaffinity(0)
+status = Path("/proc/self/status").read_text().splitlines()
+node_ranges = next(line.split(":", 1)[1].strip() for line in status if line.startswith("Mems_allowed_list:"))
+allowed_nodes = set()
+for interval in node_ranges.split(","):
+    first, _, last = interval.partition("-")
+    allowed_nodes.update(range(int(first), int(last or first) + 1))
+
+cores_by_node = {}
+for node in Path("/sys/devices/system/node").glob("node[0-9]*"):
+    node_id = int(node.name[4:])
+    if node_id not in allowed_nodes:
+        continue
+    cores = {
+        (cpu / "topology/thread_siblings_list").read_text().strip()
+        for cpu in node.glob("cpu[0-9]*")
+        if int(cpu.name[3:]) in allowed_cpus
+    }
+    if cores:
+        cores_by_node[node_id] = len(cores)
+if not cores_by_node:
+    sys.exit("[拉起] FAIL 找不到同时允许 CPU 和内存的 NUMA 节点")
+
+ranked = sorted(cores_by_node, key=lambda node: (-cores_by_node[node], node))[:2]
+nodes = sorted(node for node in ranked if cores_by_node[node] > 1) or ranked[:1]
+cores_per_pool = min(cores_by_node[node] for node in nodes)
+threads_per_pool = max(1, min(48, cores_per_pool * 3 // 4))
+lowlatency = sys.argv[1] == "lowlatency"
+print(json.dumps({"kt_offload_config": {
+    "enabled": True,
+    "resident_strategy": "prefix",
+    "num_resident_experts": int(os.environ.get("RESIDENT") or 100),
+    "cpuinfer_threads": len(nodes) * threads_per_pool,
+    "threadpool_count": len(nodes),
+    "numa_nodes": nodes,
+    "packed_transfer": False,
+    "stream_prefill": lowlatency,
+    "dynamic_resident": lowlatency,
+    "zerocopy_w13": True,
+    "zerocopy_node_fraction": [1.0] * len(nodes),
+    "zerocopy_streaming_node": nodes[-1],
+}}))
+PY
+)
+  export KT_CONFIG
+fi
+
 : > "$LOG"
 cd "$ASCEND_TREE/examples/kt_moe_offload"
 nohup setsid env VLLM_LOG_STATS_INTERVAL="${VLLM_LOG_STATS_INTERVAL:-5}" \
-  bash "serve_${PROFILE:-lowlatency}.sh" > "$LOG" 2>&1 &
+  bash "serve_$profile.sh" > "$LOG" 2>&1 &
 T0=$(date +%s)
 for _ in $(seq 1 150); do
   sleep 10

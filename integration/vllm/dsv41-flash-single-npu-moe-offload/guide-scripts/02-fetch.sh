@@ -35,22 +35,47 @@ retry_net() {
   done
 }
 
-# Shallow-fetch a pinned SHA into dir. If HEAD already is that SHA, only reset the tree and index.
+check_source_tree() {
+  local dir=$1 sha=$2
+  [ ! -e "$dir" ] && [ ! -L "$dir" ] && return 0
+  if [ -d "$dir" ] && [ ! -L "$dir" ] &&
+     [ "$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null)" -ef "$dir" ] &&
+     [ "$(git -C "$dir" rev-parse --verify HEAD 2>/dev/null)" = "$sha" ]; then
+    return 0
+  fi
+  echo "[$N] FAIL $dir 已存在，无法确认是基线 $sha 的源码树。请用新的 --root 重新执行 01-config.sh" >&2
+  return 1
+}
+
+# Shallow-fetch a pinned SHA, or reset the existing tree at that SHA.
 fetch_pinned() {
   local dir=$1 url=$2 sha=$3
-  if [ "$(git -C "$dir" rev-parse HEAD 2>/dev/null)" = "$sha" ]; then
+  if [ -e "$dir" ] || [ -L "$dir" ]; then
+    check_source_tree "$dir" "$sha"
     git -C "$dir" reset -q --hard HEAD
     git -C "$dir" clean -fdq -e third_party
     echo "[$N] SKIP $(basename "$dir") 已是 $sha，工作区与索引已复位"
     return 0
   fi
-  rm -rf "$dir"; mkdir -p "$dir"
-  git init -q "$dir"
-  git -C "$dir" remote add origin "$url"
-  retry_net "取 $url" git -C "$dir" fetch -q --depth 1 --no-tags origin "$sha" || exit 1
-  git -C "$dir" checkout -q FETCH_HEAD
-  [ "$(git -C "$dir" rev-parse HEAD)" = "$sha" ] || { echo "[$N] FAIL $dir HEAD 不是 $sha"; exit 1; }
+  (
+    stage=$(mktemp -d -- "${dir}.fetch.XXXXXX")
+    trap 'rm -rf -- "$stage"' EXIT
+    tree=$stage/source
+    git init -q "$tree"
+    git -C "$tree" remote add origin "$url"
+    retry_net "取 $url" git -C "$tree" fetch -q --depth 1 --no-tags origin "$sha" || exit 1
+    git -C "$tree" checkout -q FETCH_HEAD
+    [ "$(git -C "$tree" rev-parse HEAD)" = "$sha" ] || { echo "[$N] FAIL $dir HEAD 不是 $sha"; exit 1; }
+    if ! mv -nT -- "$tree" "$dir" || [ -e "$tree" ]; then
+      echo "[$N] FAIL 无法写入 $dir，请检查目录或改用新的 --root" >&2
+      exit 1
+    fi
+  )
 }
+
+check_source_tree "$VLLM_TREE" "$DSV41_VLLM_SHA"
+check_source_tree "$ASCEND_TREE" "$DSV41_ASCEND_SHA"
+check_source_tree "$KT_TREE" "$DSV41_KT_SHA"
 
 fetch_pinned "$VLLM_TREE"   "$DSV41_VLLM_REPO"   "$DSV41_VLLM_SHA"
 echo "[$N] PASS vllm        $DSV41_VLLM_SHA"

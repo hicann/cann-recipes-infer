@@ -38,7 +38,7 @@ if [ "$ACTION" = setup ]; then
   [ -d "$A/venv" ] || python3 -m venv "$A/venv"
   PIP_OPTS=(--timeout "${PIP_TIMEOUT:-30}" --retries "${PIP_RETRIES:-10}")
   "$A/venv/bin/pip" install -q "${PIP_OPTS[@]}" -U pip
-  (cd "$A/benchmark" && "$A/venv/bin/pip" install -q "${PIP_OPTS[@]}" -e . -r requirements/api.txt -r requirements/extra.txt)
+  (cd "$A/benchmark" && "$A/venv/bin/pip" install -q "${PIP_OPTS[@]}" "numpy==1.26.4" "pyarrow==20.0.0" -e . -r requirements/api.txt -r requirements/extra.txt)
   "$A/venv/bin/ais_bench" --help >/dev/null
   echo "[$N] PASS ais_bench 可执行"
   D=$A/benchmark/ais_bench/datasets

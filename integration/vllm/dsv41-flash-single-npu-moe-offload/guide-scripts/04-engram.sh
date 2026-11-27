@@ -37,7 +37,7 @@ PY
 }
 
 do_verify() {
-  python3 - <<'PY'
+  PYTHONPATH="$ASCEND_TREE:$VLLM_TREE${PYTHONPATH:+:$PYTHONPATH}" python3 - <<'PY'
 import importlib.util, os, sys
 p = os.path.join(os.environ["ASCEND_TREE"],
                  "vllm_ascend/models/deepseek_v4_1/engram_staging.py")

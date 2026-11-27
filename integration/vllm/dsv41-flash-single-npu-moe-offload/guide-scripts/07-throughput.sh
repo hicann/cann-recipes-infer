@@ -1,11 +1,8 @@
 #!/usr/bin/env bash
-# Single-request latency and throughput.
+# Forward benchmark parameters to the source-tree entrypoint.
 set -euo pipefail
-N=吞吐
 : "${ASCEND_TREE:?先 source dsv41.env}"
-cd "$ASCEND_TREE/examples/kt_moe_offload"
-PORT=$PORT \
-CONCURRENCY=${CONCURRENCY:-1} REQUESTS=${REQUESTS:-5} \
-PROMPT_TOKENS=${PROMPT_TOKENS:-4096} GEN_TOKENS=${GEN_TOKENS:-128} \
-  bash bench_latency.sh
-echo "=== $N 完成 ==="
+export REQUESTS=${REQUESTS:-5}
+export OUTPUT_DIR=${OUTPUT_DIR:-$DSV41_ROOT/throughput/$(date -u +%Y%m%dT%H%M%S%NZ)}
+bash "$ASCEND_TREE/examples/kt_moe_offload/bench_latency.sh"
+echo "=== 吞吐 完成 ==="

@@ -1,8 +1,9 @@
 # DeepSeek-V4.1-Flash 单卡推理部署指南（Ascend 950PR + x86 CPU MoE）
 
 把 DeepSeek-V4.1-Flash 部署到一张 Ascend 950PR 上。注意力、稠密层和 100 个常驻专家在卡上，
-其余路由专家以 MXFP4 常驻主机内存由 kt-kernel 计算，layers.1 与 layers.14 的 engram 表以
-只读映射常驻 `/dev/shm`。本文从容器已创建、已进入容器 shell 开始。
+其余路由专家以 MXFP4 常驻主机内存由 kt-kernel 计算。layers.1 与 layers.14 的 Engram 表默认
+只读映射 `/dev/shm` 中的 RAM 文件，也可选择 [SSD offload](#42-ssd-offload)。
+完成基础部署后，可选启用 [DSpark K2/K5 推测解码](#51-可选dspark-k2k5)。本文从容器已创建、已进入容器 shell 开始。
 
 方案的容量划分、两类权重的卸载机制、CPU–NPU 副流重叠与热专家标定置换见
 [技术设计文档](../../../docs/models/deepseek_v4_1/dsv41-flash-950-single-card.md)。
@@ -13,14 +14,17 @@
 |---|---|
 | NPU | 1× Ascend 950PR，`soc_version` 260。单卡 HBM 131072 MiB，启动时需 ≥ 116000 MiB 空闲 |
 | CPU | x86_64，AVX512-BF16；验证机 2× AMD EPYC 9575F，256 线程、2 NUMA |
-| 主机内存 | ≥ 560 GiB，且每个 NUMA node ≥ 240 GiB。来自 engram 表 189 GiB（`/dev/shm` tmpfs）+ 路由专家权重约 370 GiB（node0 ≈135 / node1 ≈235）|
-| `/dev/shm` | ≥ 200 GiB 可用，容器需 `--ipc=host` |
+| 主机内存（DRAM） | RAM 模式 ≥ 560 GiB，且每个 NUMA node ≥ 240 GiB；SSD 模式省去约 188.83 GiB 的 Engram 常驻表，CPU 专家仍约需 370 GiB，另加运行和文件缓存余量 |
+| `/dev/shm` | RAM 模式需 ≥ 200 GiB 可用；SSD 模式不暂存全量 Engram 表 |
 | 容器 | `--privileged=true`、`--ipc=host`、`--network host`，挂载 `/dev/davinci*`、`/dev/davinci_manager`、`/dev/hisi_hdc` |
 | CANN | 9.2.0-beta.2，位于 `/usr/local/Ascend/cann-9.2.0-beta.2` |
 | Python | 3.12.13 / torch 2.10.0+cpu / torch_npu 2.10.0.post4.dev20260715 / triton 3.2.0 |
 | 构建工具链 | C++20 编译器（验证机 g++ 13.3.0）、cmake ≥ 3.24、OpenMP、`libhwloc-dev`、`libnuma-dev`、`pkg-config` |
 | 权重 | DeepSeek-V4.1-Flash，MXFP4，磁盘 475 GiB（48 个 shard 共 510296708312 B）|
 | `$DSV41_ROOT` 磁盘 | ≥ 30 GiB |
+| SSD（可选） | 除 checkpoint 外，另需约 189 GiB；使用支持 hard link 的文件系统，例如 XFS |
+
+DSpark 权重额外占用约 7.39 GiB HBM。
 
 下列三项由 Ascend vendor 提供，须预置于容器内：CANN 9.2.0-beta.2、ds41 算子包
 （`/usr/local/Ascend/ds41_site`）、custom_transformer 算子包（`/usr/local/Ascend/dsv41_prebuilt`）。
@@ -30,6 +34,8 @@ vllm、vllm-ascend、kt-kernel 三棵源码树由第 2 步从公开仓库拉取�
 <https://cann-ai.obs.cn-north-4.myhuaweicloud.com:443/vllm-cann/DeepSeekV4.1-Flash-SingleCard/dsv41-singlecard-2026-09-26-clean.tar.gz?AccessKeyId=HPUAZLVQNN603FBK9RLL&Expires=1821795413&Signature=HycDv8AjGBOJOvfTA%2BwIWXdswWM%3D>
 下载（6951073109 B，sha256 `e18753276c116891f42d24c74d710a44009430d4792b5c0b41868a3f40f406f0`），
 `docker load` 导入后即含上述三项。
+
+如果用 `sleep` 启动空容器，进入容器前可在宿主机执行 `docker top <容器名> -eo pid,comm`，确认进程列表只有一条 `sleep` 记录。
 
 ```bash
 git clone https://gitcode.com/cann/cann-recipes-infer.git
@@ -86,7 +92,10 @@ source ./dsv41.env
 
 ## 2. 取码
 
-取三棵源码树，初始化 kt 的两个子模块，按序打 10 个 patch，铺 custom_transformer 算子包。约 35 秒。
+取三棵源码树，初始化 kt 的两个子模块，按序打 10 个 patch，铺 custom_transformer 算子包。
+
+更换源码版本时，用新的 `--root` 重新执行 `01-config.sh`，`--model` 可沿用原权重目录。
+同一版本重跑取码会重置源码，有本地改动时也用新的 `--root`。
 
 ```bash
 bash -l 02-fetch.sh
@@ -110,7 +119,7 @@ DSV41_FETCH_TRIES=16 DSV41_FETCH_TIMEOUT=1800 bash -l 02-fetch.sh
 
 ```
 [取码] PASS vllm        a9686bc6e6809a49cb3e3c592a337d0721c3619f
-[取码] PASS vllm-ascend 59ce1e18a4f93c20a872e4450bd14e891c556cb7
+[取码] PASS vllm-ascend 3609547566ef4aa753b105b5a071244777a1bdca
 [取码] PASS ktransformers 105359b4bf70073af9fab992ad29920666acccc9
 [取码] PASS 子模块 llama.cpp a94e6ff / pybind11 bb05e08
 [取码] PASS patch 已应用 10 个
@@ -174,7 +183,17 @@ CPUINFER_PARALLEL=32 bash -l 03-build.sh kt
 
 ---
 
-## 4. 排布 engram
+## 4. 选择 Engram 存储方式
+
+RAM 与 SSD 选一种，完成后进入第 5 步。切换前先执行 `bash -l 05-serve.sh stop`。
+
+### 4.1 RAM（默认）
+
+使用 RAM 时清除 SSD 设置：
+
+```bash
+unset VLLM_ASCEND_DSV41_ENGRAM_BACKEND VLLM_ASCEND_DSV41_ENGRAM_STAGE_DIR
+```
 
 把 `layers.1` 与 `layers.14` 的 embed weight/scale 从权重逐字节拷进 `/dev/shm/engram_stage`，
 再校验大小与内容指纹。三轮实测 131 / 336 / 344 秒，取决于权重文件的 page cache 状态。
@@ -196,7 +215,7 @@ bash -l 04-engram.sh verify
 | `verify` | 只校验，读满 189 GiB，约 21 秒 |
 | `release` | 释放这 188.83 GiB，必须先停服务；仍有进程映射时脚本报 FAIL 拒绝执行 |
 
-暂存目录固定 `/dev/shm/engram_stage`，写死在 `engram_staging.py`，不是脚本参数。
+RAM 暂存目录默认为 `DSV41_STAGE_DIR=/dev/shm/engram_stage`。
 排布好后不会自动释放：停服务、删容器都不释放，只有 `release` 或宿主重启才归还。
 
 **预期**
@@ -212,6 +231,54 @@ bash -l 04-engram.sh verify
 [engram] /dev/shm 205G 已用 / 174G 可用
 === engram 完成 ===
 ```
+
+### 4.2 SSD offload
+
+把 Engram 表存到 SSD。权重目录中的索引文件和 Engram 所在的 shard 必须是普通文件，不能是软链接；使用 Hugging Face 缓存中的 snapshot 时先检查这一限制。
+
+```bash
+export SSD_STAGE=/mnt/nvme/dsv41-engram
+python3 "$ASCEND_TREE/examples/kt_moe_offload/prepare_engram_ssd.py" \
+  --checkpoint "$MODEL" --output "$SSD_STAGE"
+
+# 校验已准备的表。
+python3 "$ASCEND_TREE/examples/kt_moe_offload/prepare_engram_ssd.py" \
+  --checkpoint "$MODEL" --output "$SSD_STAGE" --verify
+```
+
+| 参数 | 默认值 | 含义 |
+|---|---|---|
+| `--checkpoint` | 必填 | 权重目录 |
+| `--output` | 必填 | SSD 表的最终目录，首次准备时使用空目录 |
+| `--verify` | 不启用 | 校验已有表 |
+| `--chunk-mib` | `8` | 每次读写的缓冲大小，单位 MiB |
+
+将目录设为只读，并选择 SSD 后端：
+
+```bash
+(
+set -eu
+mount --bind "$SSD_STAGE" "$SSD_STAGE"
+mount -o remount,bind,ro "$SSD_STAGE" "$SSD_STAGE"
+findmnt -rn -M "$SSD_STAGE" -o TARGET,OPTIONS
+findmnt -rn -M "$SSD_STAGE" -o OPTIONS | tr ',' '\n' | grep -qx ro
+)
+ssd_mount_status=$?
+if [ "$ssd_mount_status" -eq 0 ]; then
+  export VLLM_ASCEND_DSV41_ENGRAM_BACKEND=ssd
+  export VLLM_ASCEND_DSV41_ENGRAM_STAGE_DIR="$SSD_STAGE"
+else
+  echo "SSD 只读挂载失败，请检查后重试"
+  false
+fi
+```
+
+确认准备、校验和只读挂载均成功后，若已暂存 RAM 表，再执行 `bash -l 04-engram.sh release`。
+
+**预期**
+
+准备和校验的末行分别含 `"status": "prepared"`、`"status": "verified"`，
+`total_bytes` 为 `202758032400`。`findmnt` 打印 SSD 目录，挂载选项含 `ro`。
 
 ---
 
@@ -261,9 +328,51 @@ PROFILE=throughput MAXSEQS=8 bash -l 05-serve.sh start
 === 拉起 完成 ===
 ```
 
+### 5.1 可选：DSpark K2/K5
+
+开启 DSpark K5，使用低时延档、并发 1：
+
+```bash
+bash -l 05-serve.sh stop
+export PROFILE=lowlatency MAXSEQS=1 MAXLEN=8192 MAXBATCH=4096
+unset KT_CONFIG  # 使用低时延档默认值，stream_prefill_min_tokens=512、dynamic_resident=true
+export K=5
+export EXTRA_ARGS="--language-model-only --seed 0 --compilation-config {\"cudagraph_capture_sizes\":[1,2,3,6],\"max_cudagraph_capture_size\":6} --speculative-config {\"method\":\"dspark\",\"num_speculative_tokens\":$K,\"enforce_eager\":true}"
+bash -l 05-serve.sh start
+```
+
+| 参数 | 默认值 | 含义 |
+|---|---|---|
+| `K` | `5` | 每轮草稿 token 数，可选 `2` 或 `5`；修改后重新执行本节启动命令 |
+| `KT_CONFIG` | 低时延档默认配置 | 自定义时使用完整 JSON，设置 `stream_prefill=true`、`stream_prefill_min_tokens=512`、`dynamic_resident=true` |
+
+检查启动日志：
+
+```bash
+grep -F 'keeps all 128 draft experts in HBM' "$DSV41_ROOT/serve.log"
+```
+
+**预期**（日志节选）
+
+```
+kt_offload: model.layers.40.ffn.experts keeps all 128 draft experts in HBM
+kt_offload: model.layers.41.ffn.experts keeps all 128 draft experts in HBM
+kt_offload: model.layers.42.ffn.experts keeps all 128 draft experts in HBM
+```
+
+关闭 DSpark：
+
+```bash
+bash -l 05-serve.sh stop
+unset EXTRA_ARGS
+bash -l 05-serve.sh start
+```
+
 ---
 
 ## 6. 验收
+
+RAM 模式使用 `06-verify.sh`；SSD 模式使用第 6.1 节。
 
 ```bash
 bash -l 06-verify.sh
@@ -289,9 +398,27 @@ bash -l 06-verify.sh
 === 验收 完成 ===
 ```
 
+### 6.1 SSD 后端验收
+
+检查两个 Engram 层的 SSD 路径，并发送一个请求：
+
+```bash
+grep -F "Engram layer 1: backend=ssd path=$VLLM_ASCEND_DSV41_ENGRAM_STAGE_DIR bytes=" "$DSV41_ROOT/serve.log"
+grep -F "Engram layer 14: backend=ssd path=$VLLM_ASCEND_DSV41_ENGRAM_STAGE_DIR bytes=" "$DSV41_ROOT/serve.log"
+curl --noproxy '*' -fsS "http://127.0.0.1:$PORT/v1/chat/completions" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"dsv41","messages":[{"role":"user","content":"What is 17 * 23?"}],"max_tokens":64,"temperature":0,"chat_template_kwargs":{"thinking":false}}'
+```
+
+**预期**
+
+两条日志均含 `backend=ssd` 和设置的 SSD 目录，回答包含 `391`。
+
 ---
 
 ## 7. 吞吐
+
+调用 `bench_latency.sh`，打印 TTFT、TPOT 和请求总耗时，结果写入 `OUTPUT_DIR`。
 
 ```bash
 bash -l 07-throughput.sh
@@ -310,26 +437,71 @@ CONCURRENCY=4 REQUESTS=20 PROMPT_TOKENS=1024 GEN_TOKENS=256 bash -l 07-throughpu
 | `PROMPT_TOKENS` | 正整数 | `4096` | 每请求 prompt token 数 |
 | `GEN_TOKENS` | 正整数 | `128` | 每请求生成 token 数 |
 | `MODEL_NAME` | 字符串 | `dsv41` | 请求里的 model 字段，与 `--served-model-name` 一致 |
+| `PROMPT_FILE` | 文本文件路径 | 内置英文语料 | 用文件内容校准输入长度 |
+| `OUTPUT_DIR` | 新目录路径 | `$DSV41_ROOT/throughput/<UTC时间戳>` | 本次测量结果目录 |
 
-**预期**（三轮实测 TTFT 21.66 / 22.12 / 22.53 s，TPOT 24.55 / 26.10 / 26.39 ms）
+**预期**（2026-11-14 实测：DSpark OFF、SSD Engram；4096 输入 / 128 输出，并发 1、5 次请求）
 
 ```
-prompt: 4096 tokens of English prose (built-in sample, 276 distinct words in the source)
-
-concurrency 1   requests 5/5   prompt 4096   gen 128   wall 126.9s
-  TTFT  mean    22.12 s   min  21.74   p50  22.20   max  22.65
-  TPOT  mean    26.10 ms  min  25.85   p50  26.01   max  26.63
-  output 5.0 tok/s aggregate
-  spread: TTFT sd 0.38 s, TPOT sd 0.31 ms   <- quote this next to any mean
-  5 request(s) stopped before 128 tokens; ignore_eos did not hold and the run is not comparable
+prompt: 4096 tokens of English prose (276 distinct source words)
+{
+  "status": "pass",
+  "wall_s": 121.35536438300187,
+  "requests": 5,
+  "ttft_ids_s": {
+    "mean": 20.882050534399603,
+    "min": 20.525561056001607,
+    "p50": 21.0033001160009,
+    "max": 21.18487472599736,
+    "sample_sd": 0.32815274986156673
+  },
+  "e2e_done_s": {
+    "mean": 24.269457305399555,
+    "min": 23.832427784000174,
+    "p50": 24.32105287200102,
+    "max": 24.774687264998647,
+    "sample_sd": 0.4180651633020037
+  },
+  "tpot_delivery_ms": {
+    "mean": 26.671676228344705,
+    "min": 25.955000834646782,
+    "p50": 26.262183322829717,
+    "max": 28.45740940945574,
+    "sample_sd": 1.0226653440021436
+  },
+  "aggregate_e2e_output_tokens_per_s": 5.273767692544164
+}
+evidence: <OUTPUT_DIR>
 === 吞吐 完成 ===
 ```
+
+| 输出字段 | 含义 |
+|---|---|
+| `ttft_ids_s` | 等到首批输出 token 的时间，单位秒 |
+| `tpot_delivery_ms` | 首末输出批次的时间差 /（输出 token 数 − 1），单位毫秒 |
+| `e2e_done_s` | 请求到完成的总耗时，单位秒 |
+
+**K5 性能参考**：上述硬件，SSD Engram、每层 100 个 hot expert、thinking OFF、prefill 门槛 512。
+HumanEval 前 10 题拼成一条 1331-token 输入，输出 128 tokens，并发 1，1 次预热＋3 次正式测量，外部 1 Hz 资源采样。
+
+| 模式 | Decode TPOT 均值 | 样本标准差 | 草稿接受率 |
+|---|---:|---:|---:|
+| DSpark K5 | **16.70 ms/token** | 0.60 ms | 64.52% |
+
+此表 TPOT = `request_decode_time_seconds_sum` 增量 / 127。
 
 ---
 
 ## 8. 精度评测
 
-精度走吞吐档，一次拉起、两个数据集依次各跑一次。`setup` 需要访问 github、PyPI 与语料所在的
+关闭 DSpark，清除低时延档设置：
+
+```bash
+bash -l 05-serve.sh stop
+unset EXTRA_ARGS MAXSEQS MAXLEN MAXBATCH
+```
+
+使用吞吐档启动服务，两个数据集依次各跑一次。`setup` 需要访问 github、PyPI 与语料所在的
 对象存储（地址见附录 F），实测 673 秒，装出 299 个包、6.5 GiB 的 venv。
 
 ```bash
@@ -363,8 +535,6 @@ PIP_INDEX_URL=https://repo.huaweicloud.com/repository/pypi/simple bash -l 08-acc
 [精度] PASS gpqa_diamond 语料
 === 精度 完成 ===
 ```
-
-`setup` 的四个 PASS 之间会夹一段 `ERROR: pip's dependency resolver ...`，判成败看末行与退出码。
 
 ### 8.1 GSM8K
 
@@ -442,7 +612,7 @@ CONCURRENCY=4 THINKING=1 REASONING_EFFORT=high bash -l 08-accuracy.sh gpqa
 | 组件 | 来源 | 基线提交号 | 形态 |
 |---|---|---|---|
 | vllm | `github.com/wenxuewuhd/vllm`，分支 `dsv41-moe-offload` | `a9686bc6e6809a49cb3e3c592a337d0721c3619f` | 第 2 步 `git fetch --depth 1 <SHA>` |
-| vllm-ascend | `github.com/wenxuewuhd/vllm-ascend`，分支 `dsv41-moe-offload-pr` | `59ce1e18a4f93c20a872e4450bd14e891c556cb7` | 第 2 步 `git fetch --depth 1 <SHA>` |
+| vllm-ascend | `github.com/Pan-Boyi/vllm-ascend`，分支 `codex/dsv41-token-id-benchmark-20261119` | `3609547566ef4aa753b105b5a071244777a1bdca` | 第 2 步 `git fetch --depth 1 <SHA>` |
 | kt-kernel | `github.com/kvcache-ai/ktransformers` 主仓 | `105359b4bf70073af9fab992ad29920666acccc9` | 第 2 步取基线 + `ktransformers-patches/` 10 个 patch，第 3 步编译 |
 | `llama.cpp`（kt 子模块） | `github.com/ggerganov/llama.cpp` | `a94e6ff8774b7c9f950d9545baf0ce35e8d1ed2f` | 由 kt 基线的 gitlink 固定 |
 | `pybind11`（kt 子模块） | `github.com/pybind/pybind11` | `bb05e0810b87e74709d9f4c4545f1f57a1b386f5` | 由 kt 基线的 gitlink 固定 |
@@ -461,7 +631,7 @@ patch 逐个说明见 [`ktransformers-patches/README.md`](ktransformers-patches/
 | `DSV41_ROOT` | 工作目录 |
 | `DSV41_SCRIPTS` | guide-scripts 目录 |
 | `DSV41_PREBUILT` | custom_transformer 算子包 |
-| `DSV41_STAGE_DIR` | engram 暂存目录，固定 `/dev/shm/engram_stage` |
+| `DSV41_STAGE_DIR` | RAM 表目录，默认 `/dev/shm/engram_stage` |
 | `DSV41_VLLM_REPO` / `DSV41_VLLM_BRANCH` / `DSV41_VLLM_SHA` | vllm 来源与基线 |
 | `DSV41_ASCEND_REPO` / `DSV41_ASCEND_BRANCH` / `DSV41_ASCEND_SHA` | vllm-ascend 来源与基线 |
 | `DSV41_KT_REPO` / `DSV41_KT_SHA` | ktransformers 主仓与基线 |
@@ -478,6 +648,13 @@ patch 逐个说明见 [`ktransformers-patches/README.md`](ktransformers-patches/
 | `VLLM_TREE` / `ASCEND_TREE` | 第 2 步拉取的 vllm 与 vllm-ascend 源码树 |
 | `CARD` / `PORT` | NPU 逻辑序号与 HTTP 端口 |
 
+以下变量需在每个新 shell 中重新导出：
+
+| 变量 | 默认值 | 含义 |
+|---|---|---|
+| `VLLM_ASCEND_DSV41_ENGRAM_BACKEND` | `ram` | 选择 `ram` 或 `ssd` |
+| `VLLM_ASCEND_DSV41_ENGRAM_STAGE_DIR` | `/dev/shm/engram_stage` | SSD 模式设为已准备表的绝对路径 |
+
 ## 附录 C 量化
 
 权重为 MXFP4，量化方式由权重目录 `config.json` 的 `quantization_config` 决定，不通过脚本参数控制。
@@ -493,7 +670,7 @@ vllm、vllm-ascend、ktransformers 为上游代码，各自许可证见其仓库
 [`ktransformers-tests/README.md`](ktransformers-tests/README.md)。
 
 ```bash
-env -u LD_PRELOAD PYTHONPATH="$KT_SITE" python3 ktransformers-tests/dsv41_mxfp4_offload_check.py
+env -u LD_PRELOAD PYTHONPATH="$KT_SITE" python3 ../ktransformers-tests/dsv41_mxfp4_offload_check.py
 ```
 
 末行 `VERDICT: PASS`，实测墙钟 27 秒；加 `--roundtrip-only` 只做字节回读与权重落点审计，5 秒。
