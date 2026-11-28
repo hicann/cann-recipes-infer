@@ -366,7 +366,13 @@ def precompute_freqs_cis(dim, seqlen, original_seq_len, base, factor, beta_fast,
     Precomputes frequency-based complex exponential values for rotary positional embeddings.
 
     Args:
-        args (ModelArgs): Model arguments containing positional embedding parameters.
+        dim (int): Hidden dimension per head for rotary embeddings.
+        seqlen (int): Target sequence length.
+        original_seq_len (int): Original pretrained context length.
+        base (float): Base frequency for RoPE.
+        factor (float): YaRN scaling factor.
+        beta_fast (int): Fast rotation boundary parameter.
+        beta_slow (int): Slow rotation boundary parameter.
 
     Returns:
         torch.Tensor: Precomputed complex exponential values for positional embeddings.
@@ -798,7 +804,7 @@ class Expert(nn.Module):
         self.w1 = Linear(dim, inter_dim)
         self.w2 = Linear(inter_dim, dim)
         self.w3 = Linear(dim, inter_dim)
-        
+
     @torch.compile
     def forward(self, x: torch.Tensor, weights: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
@@ -851,7 +857,7 @@ class MoE(nn.Module):
                                       for i in range(self.n_routed_experts)])
         assert args.n_shared_experts == 1
         self.shared_experts = Expert(args.dim, args.moe_inter_dim)
-    
+
     def run_gate(self, x, input_ids: Optional[torch.Tensor] = None):
         return self.gate(x, input_ids)
 

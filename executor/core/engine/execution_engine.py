@@ -45,7 +45,7 @@ class ExecutionEngine:
         """Initialize engine with configuration.
 
         Args:
-            config: Inference configuration.
+            infer_config: Inference configuration.
         """
         self.infer_config = infer_config
         self.device = None

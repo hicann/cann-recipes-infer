@@ -149,7 +149,7 @@ def add_optional_chunk_mask(xs: torch.Tensor,  # pylint: disable=huawei-too-many
 
     Args:
         xs (torch.Tensor): padded input, (B, L, D), L for max length
-        mask (torch.Tensor): mask for xs, (B, 1, L)
+        masks (torch.Tensor): mask for xs, (B, 1, L)
         use_dynamic_chunk (bool): whether to use dynamic chunk or not
         use_dynamic_left_chunk (bool): whether to use dynamic left chunk for
             training.

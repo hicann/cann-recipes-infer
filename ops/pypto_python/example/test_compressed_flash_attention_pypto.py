@@ -216,11 +216,15 @@ def cfa_flash_torch(q, cmp_kv, sinks, cmp_block_table, seqused_kv, out, cmp_rati
     """
     Args:
         q: Query [batch_size * s1, num_head, head_size]
-        k: Key cache [num_blocks, block_size, kv_head_num, head_size]
-        v: Value cache [num_blocks, block_size, kv_head_num, head_size]
+        cmp_kv: Compressed key-value cache tensor.
+        sinks: Attention sink tensor.
         cmp_block_table: Block mapping table for compress cmp_kv cache [batch_size, max_num_blocks_per_query]
-        start_pos: Actual start position [batch_size], satisfy start_pos + s1 = original actual seq
+        seqused_kv: Actual sequence lengths of KV cache [batch_size].
         out: Output [batch_size * s1, num_head, head_size]
+        cmp_ratio (int): Compression ratio for KV cache (default: 128).
+        is_new_sink (bool): Whether new attention sink mode is enabled.
+        ori_kv: Optional original uncompressed KV cache.
+        ori_block_table: Optional block mapping table for original KV cache.
     """
     fp32 = torch.float32
     q_shape = q.shape
