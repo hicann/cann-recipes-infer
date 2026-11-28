@@ -1,6 +1,10 @@
 <h1 align="center">CANN-RECIPES-INFER</h1>
 
 <p align="center">
+  <strong>简体中文</strong> | <a href="README_EN.md">English</a>
+</p>
+
+<p align="center">
   基于 CANN 平台的大模型推理优化实践<br>
   覆盖 DeepSeek、Qwen、GLM、Hunyuan 等主流模型，克隆即用，快速上手昇腾 NPU 推理，复现生产级高性能
 </p>
