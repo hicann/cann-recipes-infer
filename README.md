@@ -136,6 +136,8 @@ cann-recipes-infer 仓库旨在针对 LLM 与多模态模型推理业务中的�
 
 **大语言模型（以 Qwen3-MoE 为例）**
 
+环境和权重准备见 [Qwen3-MoE 部署指南](models/qwen3_moe/README.md)。
+
 ```bash
 # Step 1: 克隆仓库
 git clone https://gitcode.com/cann/cann-recipes-infer.git
@@ -145,7 +147,8 @@ cd cann-recipes-infer
 cd models/qwen3_moe
 pip install -r requirements.txt
 
-# Step 3: 执行根目录下的脚本一键启动推理
+# Step 3: 准备权重，将 config/qwen3_235b_16tp.yaml 的 model_path 改为实际权重目录
+# 然后执行仓库统一入口
 bash ../../executor/scripts/infer.sh --model qwen3_moe --yaml qwen3_235b_16tp.yaml
 ```
 
