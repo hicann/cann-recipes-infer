@@ -54,7 +54,7 @@ class DeepGemmContext:
 
         if num_max_tokens_per_rank <= 0:
             raise ValueError(
-                "enable_mega_moe=True requires a positive max_prefill_tokens, "
+                "DeepGEMM MegaMoE requires a positive prefill token capacity per rank, "
                 f"got {num_max_tokens_per_rank}."
             )
 
@@ -86,7 +86,7 @@ class DeepGemmBackend:
         self.deep_gemm = context.deep_gemm
         self.sym_buffer = context.sym_buffer
 
-    def prefill(
+    def forward_megamoe(
         self,
         moe,
         x: torch.Tensor,

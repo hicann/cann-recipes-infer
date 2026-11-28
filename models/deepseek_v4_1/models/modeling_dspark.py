@@ -53,7 +53,8 @@ from .modeling_deepseek import (
     DeepseekV41Model,
     DeepseekV41ForCausalLM,
     KVCache,
-    get_max_position_embeddings
+    get_max_position_embeddings,
+    get_megamoe_mode,
 )
 from .modules import DeepseekV41RMSNorm, _init_rope
 from .modules import PACKED_KV_COMPUTE_DTYPE, get_kv_cache_dim
@@ -673,9 +674,16 @@ class DeepseekV41DSparkProposalModel(DeepseekV41ForCausalLM):
     are intentionally not emulated with the existing token-by-token MTP path.
     """
 
+    megamoe_ep_group_name = "dspark_megamoe_ep_group"
+
     @staticmethod
     def update_model_cfg(config, infer_config: InferenceConfig):
         """Validate DSpark-only model metadata before draft construction."""
+        if (not infer_config.model_config.custom_params.get("low_latency_tp", False)
+                and get_megamoe_mode(infer_config) in ("ascendc", "decode_ascendc")):
+            # Size the MegaMoE buffer for the draft expert layout.
+            config.n_routed_experts = config.dspark_n_routed_experts or config.n_routed_experts
+            config.num_experts_per_tok = config.dspark_n_activated_experts or config.num_experts_per_tok
         config.n_mtp_layers = resolve_dspark_proposal_num_layers(config, infer_config)
         target_layer_ids = config.dspark_target_layer_ids
         next_n = infer_config.speculative_config.num_speculative_tokens
@@ -727,9 +735,9 @@ class DeepseekV41DSparkProposalModel(DeepseekV41ForCausalLM):
                 platform_version=self.platform_version,
             )
 
-        # create independent ep group for dspark megamoe and mc2
+        # Create an independent EP group for DSpark MC2 dispatch/combine.
         platform_version = self.platform_version
-        if not self.low_latency_tp:
+        if not self.low_latency_tp and not self.decode_megamoe:
             moe_ep_mc2_group_type = None if self.platform_version != PlatformVersion.ASCEND_950 else 3
             is_full_mesh_v2 = self.platform_version != PlatformVersion.ASCEND_950
             hccl_buffer_size = calc_moe_hccl_buffer_size(
@@ -744,16 +752,6 @@ class DeepseekV41DSparkProposalModel(DeepseekV41ForCausalLM):
                 allow_physical_reuse=False,
                 hccl_buffer_size=hccl_buffer_size,
                 group_type=moe_ep_mc2_group_type,
-                platform_version=platform_version,
-            )
-        if self.enable_mega_moe and self.moe_ep_size > 1:
-            self.comm_manager.register_group(
-                name="dspark_megamoe_ep_group",
-                group_num=self.moe_tp_size,
-                group_size=self.moe_ep_size,
-                group_stride=self.moe_tp_size,
-                return_name=True,
-                allow_physical_reuse=False,
                 platform_version=platform_version,
             )
 
@@ -774,15 +772,18 @@ class DeepseekV41DSparkProposalModel(DeepseekV41ForCausalLM):
             "is_mtp": True,
             "comm_manager": self.comm_manager,
         }
+        if self.decode_megamoe:
+            dspark_kwargs.update(megamoe_backend=self.megamoe_backend, enable_decode_megamoe=True)
         self.model = DeepseekV41DSparkModel(
             config, infer_config, **dspark_kwargs,
         )
         self.mtp = self.model.layers
         self.kv_cache = self.model.kv_cache
         self.lm_head = None
-        self.top_k = config.dspark_n_activated_experts
-        self.num_experts_per_tok = config.dspark_n_activated_experts
-        self.num_experts = config.dspark_n_routed_experts
+        if not self.decode_megamoe:
+            self.top_k = config.dspark_n_activated_experts
+            self.num_experts_per_tok = config.dspark_n_activated_experts
+            self.num_experts = config.dspark_n_routed_experts
 
     def get_cache_info(
             self,

@@ -180,6 +180,12 @@ def get_max_local_prefill_tokens(infer_config: InferenceConfig, segment_min_len:
     return 2 * segment_len + 2 * extra_requests * (segment_min_len + 1)
 
 
+def get_megamoe_mode(infer_config: InferenceConfig) -> str:
+    parallel = infer_config.parallel_config
+    default = "ascendc" if parallel.moe_ep_size > 1 and parallel.moe_tp_size == 1 else "native"
+    return infer_config.model_config.custom_params.get("kernel_config", {}).get("megamoe", default)
+
+
 class DeepseekV41SharedExpert(nn.Module):
     def __init__(
         self,
@@ -347,7 +353,8 @@ class DeepseekV41MoE(nn.Module):
         self.exe_mode = self.infer_config.model_config.exe_mode
         self.enable_multi_streams = self.infer_config.model_config.custom_params.get("enable_multi_streams", False)
         self.megamoe_backend = kwargs.get("megamoe_backend")
-        self.enable_mega_moe = self.megamoe_backend is not None
+        self.enable_prefill_megamoe = kwargs.get("enable_prefill_megamoe", False)
+        self.enable_decode_megamoe = kwargs.get("enable_decode_megamoe", False)
         self.force_eplb = self.infer_config.model_config.force_eplb
         self.n_routed_experts, self.num_experts_per_tok = self.get_moe_config(self.layer_idx)
         # Total expert counts are layer-specific: DSpark/MTP layers may use a
@@ -504,6 +511,7 @@ class DeepseekV41MoE(nn.Module):
         shared_expert_events = moe_events.get("shared_expert", [])
         _, h = hidden_states.shape
         shared_merged_x = None
+        use_megamoe = self.enable_prefill_megamoe if is_prefill else self.enable_decode_megamoe
         if self.low_latency_tp:
             hidden_states_share = None
             if self.n_shared_experts > 0:
@@ -516,12 +524,12 @@ class DeepseekV41MoE(nn.Module):
         elif is_prefill:
             # With MegaMoE the shared experts run inside the operator, so the
             # model-side computation must be skipped to avoid double counting.
-            if self.n_shared_experts > 0 and not self.enable_mega_moe:
+            if self.n_shared_experts > 0 and not use_megamoe:
                 hidden_states_share = self.forward_shared_expert(
                     hidden_states, shared_expert_stream, shared_expert_events)
             else:
                 hidden_states_share = None
-        else:
+        elif not use_megamoe:
             record_stream(self.enable_multi_streams, hidden_states, shared_expert_stream)
             record_event(self.enable_multi_streams, shared_expert_events, 0)
 
@@ -543,14 +551,12 @@ class DeepseekV41MoE(nn.Module):
                 moe_events, engram_resource_events, shared_expert_stream, shared_merged_x)
 
         # MOE EP
+        if use_megamoe:
+            output = self.megamoe_backend.forward_megamoe(self, hidden_states, topk_idx, topk_weight)
+            if engram_resource_events is not None:
+                record_event(True, engram_resource_events, 5, self.exe_mode)
+            return output
         if is_prefill:
-            if self.enable_mega_moe:
-                return self.megamoe_backend.prefill(
-                    self,
-                    hidden_states,
-                    topk_idx,
-                    topk_weight,
-                )
             return self.moe_infer_double_routing(
                 hidden_states, topk_idx, topk_weight, hidden_states_share,
                 shared_expert_events, prefill_moe_global_chunks)
@@ -2494,6 +2500,7 @@ class DeepseekV41Model(DeepseekV41PreTrainedModel):
 
 class DeepseekV41ForCausalLM(DeepseekV41PreTrainedModel):
     _tied_weights_keys = ["lm_head.weight"]
+    megamoe_ep_group_name = "megamoe_ep_group"
 
     def set_auxiliary_hidden_layers(self, layer_ids) -> None:
         """Enable generic intermediate hidden-state collection for a consumer."""
@@ -2535,11 +2542,14 @@ class DeepseekV41ForCausalLM(DeepseekV41PreTrainedModel):
             self.infer_config.model_config.custom_params.get("low_latency_tp", False)
         )
         self.disagg_mode = self.infer_config.disagg_config.disaggregation_mode
-        self.enable_mega_moe = (
-            self.infer_config.model_config.custom_params.get("enable_mega_moe", False)
-            and self.disagg_mode in ("NONE", "PREFILL")
-            and not self.is_mtp
+        mode = get_megamoe_mode(infer_config)
+        # DSpark passes is_mtp=True when constructing its draft model.
+        self.prefill_megamoe = (
+            not is_mtp and self.disagg_mode != "DECODE" and mode in ("ascendc", "prefill_ascendc", "deepgemm")
         )
+        # DSpark also runs a Decode proposal immediately after target Prefill on a P worker.
+        runs_decode = is_mtp or self.disagg_mode != "PREFILL"
+        self.decode_megamoe = runs_decode and mode in ("ascendc", "decode_ascendc")
         self.li_cache_quant_mode = config.quant_config.li_cache_quant_mode
         self.attention_data = AttnMetaData(self.config, comm_manager, self.infer_config, is_mtp)
         self.enable_cache_compile = self.infer_config.model_config.enable_cache_compile
@@ -2578,16 +2588,31 @@ class DeepseekV41ForCausalLM(DeepseekV41PreTrainedModel):
         self.megamoe_context = None
         self.megamoe_backend = None
         self.selected_op_kernels = {}
-        if self.enable_mega_moe:
-            self.update_op_kernel_dict(("megamoe",))
-            self.megamoe_context, self.megamoe_backend = OpKernel.megamoe(
-                config,
-                get_max_local_prefill_tokens(self.infer_config, config.sliding_window),
-                self.comm_manager,
-                ep_group_name="dspark_megamoe_ep_group" if is_mtp else "megamoe_ep_group",
-            )
-            kwargs["megamoe_backend"] = self.megamoe_backend
         self.batch_size_per_rank = self.infer_config.scheduler_config.batch_size_per_dp_rank
+        if self.prefill_megamoe or self.decode_megamoe:
+            backend = "deepgemm" if mode == "deepgemm" else "ascendc"
+            self.update_op_kernel_dict(("megamoe",), {"megamoe": backend})
+            max_tokens = 0
+            if self.prefill_megamoe:
+                max_tokens = get_max_local_prefill_tokens(infer_config, config.sliding_window)
+            if self.decode_megamoe:
+                tokens_per_request = (
+                    config.dspark_block_size if is_mtp else 1 + infer_config.speculative_config.num_speculative_tokens
+                )
+                max_decode_batch = self.batch_size_per_rank
+                if is_mtp and self.cp_size > 1 and self.disagg_mode != "DECODE":
+                    # CP Prefill proposes a draft block for the whole mini-batch before DP slicing.
+                    max_decode_batch = max(max_decode_batch, infer_config.scheduler_config.cp_mini_batch)
+                max_tokens = max(max_tokens, max_decode_batch * tokens_per_request)
+            self.megamoe_context, self.megamoe_backend = OpKernel.megamoe(
+                config, max_tokens, self.comm_manager,
+                ep_group_name=self.megamoe_ep_group_name,
+            )
+            kwargs.update(
+                megamoe_backend=self.megamoe_backend,
+                enable_prefill_megamoe=self.prefill_megamoe,
+                enable_decode_megamoe=self.decode_megamoe,
+            )
         if not is_mtp:
             self.model = DeepseekV41Model(config, self.infer_config, self.comm_manager, prefix, **kwargs)
 
@@ -2664,28 +2689,6 @@ class DeepseekV41ForCausalLM(DeepseekV41PreTrainedModel):
                     "storage remains non-redundant."
                 )
 
-        if (custom_params.get("enable_mega_moe", False)
-                and infer_config.disagg_config.disaggregation_mode in ("NONE", "PREFILL")):
-            if parallel_config.moe_ep_size <= 1:
-                raise ValueError(
-                    f"enable_mega_moe=True with moe_ep_size={parallel_config.moe_ep_size} "
-                    "is not supported yet."
-                )
-            if parallel_config.moe_tp_size != 1:
-                raise ValueError(
-                    f"enable_mega_moe=True with moe_tp_size={parallel_config.moe_tp_size} "
-                    "is not supported yet."
-                )
-            quant_config = getattr(config, "quant_config", None)
-            gmm_quant_mode = None if quant_config is None else quant_config.gmm_quant_mode
-            # "w4a8float4" is accepted because update_gmm_quant_mode normalizes it
-            # to "w4a8mxfloat4" during model construction (MegaMoE only runs there).
-            if gmm_quant_mode not in ("w4a8mxfloat4", "w4a8float4"):
-                raise ValueError(
-                    f"enable_mega_moe=True with gmm_quant_mode={gmm_quant_mode} "
-                    "is not supported yet."
-                )
-
         exe_mode = model_config.exe_mode
         enable_cache_compile = model_config.enable_cache_compile
         enable_superkernel = custom_params.get("enable_superkernel", False)
@@ -2745,6 +2748,27 @@ class DeepseekV41ForCausalLM(DeepseekV41PreTrainedModel):
             raise ValueError(f"{parallel_config.attn_tp_size=} is not supported yet! "
                              "Set low_latency_tp=True to enable the low-latency TP path.")
 
+        megamoe_mode = get_megamoe_mode(infer_config)
+        modes = ("native", "ascendc", "prefill_ascendc", "decode_ascendc", "deepgemm")
+        if megamoe_mode not in modes:
+            raise ValueError(f"kernel_config.megamoe={megamoe_mode!r} must be one of {', '.join(modes)}.")
+        if megamoe_mode != "native":
+            if parallel_config.moe_ep_size <= 1 or parallel_config.moe_tp_size != 1:
+                raise ValueError("MegaMoE requires MoE EP (moe_ep_size > 1 and moe_tp_size == 1).")
+            if config.n_routed_experts % parallel_config.moe_ep_size:
+                raise ValueError("MegaMoE requires the routed expert count to be divisible by moe_ep_size.")
+            if not 0 < config.num_experts_per_tok <= config.n_routed_experts:
+                raise ValueError("MegaMoE requires top-k between 1 and the routed expert count.")
+            quant_config = getattr(config, "quant_config", None)
+            gmm_quant_mode = None if quant_config is None else quant_config.gmm_quant_mode
+            # "w4a8float4" is accepted because update_gmm_quant_mode normalizes it
+            # to "w4a8mxfloat4" during model construction (MegaMoE only runs there).
+            if gmm_quant_mode not in ("w4a8mxfloat4", "w4a8float4"):
+                raise ValueError(
+                    f"MegaMoE with gmm_quant_mode={gmm_quant_mode} "
+                    "is not supported yet."
+                )
+
         dynamo_feat = enable_cache_compile or enable_superkernel
         if exe_mode == "eager" and dynamo_feat:
             raise ValueError(f"{exe_mode=} does not support cache compile or superkernel!")
@@ -2755,10 +2779,13 @@ class DeepseekV41ForCausalLM(DeepseekV41PreTrainedModel):
     def check_model_settings(self):
         self.update_op_kernel_dict(("hc_pre", "hc_post", "gate_topk", "indexer_prolog_qw"))
 
-    def update_op_kernel_dict(self, op_types):
+    def update_op_kernel_dict(self, op_types, kernel_overrides=None):
         """Bind requested implementations using kernel_config."""
         auto_import_modules(f"{__package__}.modules.op_impls")
-        kernel_config = self.infer_config.model_config.custom_params.get("kernel_config", {})
+        kernel_config = {
+            **self.infer_config.model_config.custom_params.get("kernel_config", {}),
+            **(kernel_overrides or {}),
+        }
         platform_version = self.infer_config.model_config.platform_version.value.lower()
 
         for op_type in op_types:
@@ -2860,7 +2887,7 @@ class DeepseekV41ForCausalLM(DeepseekV41PreTrainedModel):
             is_weight_nz = enable_weight_nz and not (
                 ("compressor" in module_name and not is_c1a_compressor)
                 or module_name.endswith(".ffn.gate")
-                or (self.enable_mega_moe and ".shared_experts." in module_name)
+                or (self.megamoe_backend is not None and ".shared_experts." in module_name)
                 or (is_wq_b_transpose and "attn.wq_b" in module_name)
                 or ("markov_w2" in module_name)
                 or ("confidence_head" in module_name)
@@ -3042,7 +3069,7 @@ class DeepseekV41ForCausalLM(DeepseekV41PreTrainedModel):
                     allow_physical_reuse=False,
                 )
 
-        if not self.low_latency_tp:
+        if not self.low_latency_tp and not self.decode_megamoe:
             # The low-latency TP path uses AllReduce, never MC2 dispatch/combine.
             moe_ep_mc2_group_type = None if self.platform_version != PlatformVersion.ASCEND_950 else 3
             is_full_mesh_v2 = self.platform_version != PlatformVersion.ASCEND_950
@@ -3060,14 +3087,15 @@ class DeepseekV41ForCausalLM(DeepseekV41PreTrainedModel):
                 group_type=moe_ep_mc2_group_type,
                 platform_version=platform_version,
             )
-        if self.enable_mega_moe and self.moe_ep_size > 1:
+        if self.prefill_megamoe or self.decode_megamoe:
             # MegaMoE path does not support MoE TP yet; check_model_config_before_loading
             # guarantees self.moe_tp_size == 1 before communication groups are built.
             self.comm_manager.register_group(
-                name="megamoe_ep_group",
+                name=self.megamoe_ep_group_name,
                 group_num=self.moe_tp_size,
                 group_size=self.moe_ep_size,
                 group_stride=self.moe_tp_size,
+                group_type=3 if get_megamoe_mode(self.infer_config) == "deepgemm" else None,
                 return_name=True,
                 allow_physical_reuse=False,
                 platform_version=platform_version,

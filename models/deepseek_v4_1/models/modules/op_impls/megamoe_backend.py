@@ -52,11 +52,10 @@ class MegaMoEContext:
                 f"MegaMoE backend requires communication group {ep_group_name!r}."
             )
 
-        # Per-rank upper bound for one mega_moe call, which feeds the whole
-        # local prefill batch in a single call (no chunking).
+        # Per-rank upper bound for one mega_moe call.
         if num_max_tokens_per_rank <= 0:
             raise ValueError(
-                "enable_mega_moe=True requires a positive max_prefill_tokens, "
+                "MegaMoE requires a positive token capacity per rank, "
                 f"got {num_max_tokens_per_rank}."
             )
 
@@ -84,14 +83,14 @@ class MegaMoEContext:
 
 
 class MegaMoEBackend:
-    """DeepSeek-V4 MegaMoE prefill backend."""
+    """DeepSeek-V4 MegaMoE prefill and decode backend."""
 
     def __init__(self, context: MegaMoEContext) -> None:
         self.context = context
         self.mega_moe = context.mega_moe
         self.sym_buffer = context.sym_buffer
 
-    def prefill(
+    def forward_megamoe(
         self,
         moe,
         x: torch.Tensor,
@@ -110,9 +109,9 @@ class MegaMoEBackend:
 
         if num_tokens == 0:
             # mega_moe is a collective op and documents num_tokens >= 1, so an
-            # empty prefill batch is padded with a 1-token dummy (ids = arange,
+            # empty local batch is padded with a 1-token dummy (ids = arange,
             # distinct experts) whose output is discarded. The call itself must
-            # still happen to keep per-chunk collectives aligned across ranks.
+            # still happen to keep collectives aligned across ranks.
             # Shared experts run inside the op on the dummy token as well.
             dummy_x, dummy_ids, dummy_weight = moe._megamoe_dummy_chunk
             self._run_mega_moe(moe, dummy_x, dummy_ids, dummy_weight)

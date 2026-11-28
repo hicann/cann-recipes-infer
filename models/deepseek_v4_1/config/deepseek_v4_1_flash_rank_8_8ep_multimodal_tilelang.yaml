@@ -12,10 +12,10 @@ model_config:
   custom_params:
     enable_engram: True
     enable_multi_streams: True
-    enable_mega_moe: True
     enable_engram_offload: True
     engram_tp_size: 8
     kernel_config:
+      megamoe: ascendc  # ascendc (both), native (off), prefill_ascendc, decode_ascendc, deepgemm (Prefill; native EP Decode).
       gate_topk: tilelang
       hc_post: tilelang
       engram: tilelang

@@ -21,7 +21,6 @@ model_config:
       swiglu: custom
     enable_engram: True
     enable_multi_streams: True
-    enable_mega_moe: False
     enable_engram_offload: True
     engram_tp_size: 8
     # Routing emits the sparse [E, 2] (expert_id, count) grouplist directly;

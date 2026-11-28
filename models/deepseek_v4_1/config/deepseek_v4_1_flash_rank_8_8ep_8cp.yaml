@@ -15,7 +15,7 @@ model_config:
     kernel_config:
       # Options: ascendc (indexer_prologue_qw fused op) or native (original op chain).
       indexer_prolog_qw: ascendc
-      megamoe: ascendc  # ascendc or deepgemm (DeepSeek opensource MegaMoE kernel)
+      megamoe: ascendc  # ascendc (both), native (off), prefill_ascendc, decode_ascendc, deepgemm (Prefill; native EP Decode).
       gate_topk: ascendc
       hc_post: ascendc
       # swiglu kernel: custom (repo op) or cann_ops_nn (mainline).
@@ -23,7 +23,6 @@ model_config:
     enable_multi_streams: True
     # Only applies to npugraph_ex; leave unset or False for eager/ge_graph.
     unsafe_skip_npugraph_capture_validation: False
-    enable_mega_moe: True
     enable_superkernel: False
     enable_engram_offload: True
     engram_tp_size: 8
@@ -31,7 +30,7 @@ model_config:
 
 speculative_config:  # Speculative decoding
   num_speculative_tokens: 5  # Maximum draft tokens per proposal
-  method: "dspark"  # ["mtp", "dspark"]
+  method: "dspark"  # DeepSeek V4.1 supports DSpark for speculative decoding.
   markov_lmhead_tp_size: 1
   draft_model_path: ""  # Empty: reuse model_path
   confidence_threshold: 0.0  # 0 disables confidence truncation

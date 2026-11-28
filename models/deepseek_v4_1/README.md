@@ -163,7 +163,6 @@ scheduler_config:
 | `low_latency_tp` | bool | `false` | 开启低时延 TP 路径。要求 `world_size` 为偶数、`attn_tp_size == world_size` 且 `attn_tp_size > 1`，仅支持 `eager` 或 `npugraph_ex`。开启后会将相关 TP 配置统一为 `world_size`。 |
 | `enable_multi_streams` | bool | `false` | 开启模型内多流并行，用于 attention metadata、MoE shared expert 和 Engram 等计算的并行调度。 |
 | `enable_engram_multi_stream` | bool | 跟随 `enable_multi_streams` | 单独控制 Engram 预计算是否使用独立流；未配置时继承 `enable_multi_streams` 的值。 |
-| `enable_mega_moe` | bool | `false` | 开启 MegaMoE 融合路径。当前要求 `moe_ep_size > 1`、`moe_tp_size == 1`，并使用 W4A8 MXFP4 的 GMM 量化模式。 |
 | `enable_superkernel` | bool | `false` | 开启 SuperKernel。不支持 `eager` 模式，需与图模式配合使用。 |
 | `moe_chunk_max_len` | int | `65536` | MoE token 分发的最大 chunk 长度，必须为正整数；可用于长序列 prefill 场景降低峰值显存。 |
 | `enable_engram_offload` | bool | `false` | 将 Engram Table offload 到 Host。单机多卡时需设置 `engram_tp_size == world_size`；多机时 `engram_tp_size` 至少为单机的 NPU 数。 |
@@ -179,7 +178,7 @@ scheduler_config:
 | `hc_post` | `ascendc` / `tilelang` | `ascendc` | mHC 后处理。 |
 | `gate_topk` | `ascendc` / `tilelang` | `ascendc` | MoE gate TopK。 |
 | `indexer_prolog_qw` | `native` / `ascendc` | `ascendc` | Lightning Indexer QW 前处理。 |
-| `megamoe` | `ascendc` / `deepgemm` | `ascendc` | 仅在 `enable_mega_moe: true` 时生效。 |
+| `megamoe` | `native` / `ascendc` / `prefill_ascendc` / `decode_ascendc` / `deepgemm` | MoE EP 默认 `ascendc`，其他默认 `native` | `ascendc` 开启 Prefill 和 Decode（不支持 MoE TP），`native` 关闭，`prefill_ascendc` 和 `decode_ascendc` 仅开启对应阶段，`deepgemm` 仅用于主模型 Prefill，主模型 Decode 和 DSpark 均走原生 EP 的 MC2 dispatch/combine，执行模式沿用 `exe_mode`。 |
 | `engram` | `native` / `tilelang` | `native` | TileLang 实现仅在 prefill 阶段生效，decode 仍走 native 路径。 |
 
 ### 拉起多卡推理
