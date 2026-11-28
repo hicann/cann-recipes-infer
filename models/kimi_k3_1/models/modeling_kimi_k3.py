@@ -2106,20 +2106,33 @@ class KimiDeltaAttention(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # TND consumes the real packed tokens and existing int32 request offsets.
         # The kernel handles tail chunks; no per-request padding or launch is needed.
-        q, k, v, g, b = (tensor.contiguous() for tensor in inputs)
-        metadata = _flash_kda_metadata_impl(
-            q, v, initial_state, layout_qkv="TND", cu_seqlens=query_start_loc,
-        )
-        return _flash_kda_impl(
-            q, k, v, g=g, beta=b,
-            scale=1.0 / math.sqrt(q.shape[-1]),
-            initial_state=initial_state,
-            A_log=gate_params.a_log.data,
-            dt_bias=gate_params.dt_bias,
-            lower_bound=gate_params.lower_bound,
-            layout_qkv="TND",
-            metadata=metadata,
-        )
+        q, k, v, g, beta = (tensor.contiguous() for tensor in inputs)
+        cu_seqlens = query_start_loc.to(dtype=torch.int32).contiguous()
+
+        with torch.inference_mode():
+            metadata = _flash_kda_metadata_impl(
+                cu_seqlens=cu_seqlens,
+                batch_size=cu_seqlens.numel() - 1,
+                nheads_qk=q.shape[1],
+                nheads_v=v.shape[1],
+                seqlens=q.shape[0],
+                headdim_qk=q.shape[-1],
+                headdim_v=v.shape[-1],
+                layout="TND",
+            )
+            output, final_state, _ = _flash_kda_impl(
+                q, k, v, g, beta,
+                metadata=metadata,
+                initial_state=initial_state,
+                A_log=gate_params.a_log.data,
+                dt_bias=gate_params.dt_bias,
+                cu_seqlens=cu_seqlens,
+                scale=q.shape[-1] ** -0.5,
+                lower_bound=gate_params.lower_bound,
+                layout="TND",
+                output_final_state=True,
+            )
+        return output, final_state
 
     def forward(
         self,

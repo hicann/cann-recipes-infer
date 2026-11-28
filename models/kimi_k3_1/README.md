@@ -48,6 +48,7 @@
    使用运行推理的同一 Python 环境安装 CANNBot-DSL 0.8.4 并拉取算子源码。上一步已安装算子编译所需的 `ninja==1.13.0`。
 
    ```bash
+   source /usr/local/Ascend/cann/set_env.sh
    # 先卸载 CANN 软件包随附的 DSL、算子包和 opkit
    pip uninstall cannbot-dsl cannbot-arena-net opkit
    python -m pip install cannbot-dsl==0.8.4
@@ -55,10 +56,9 @@
    git clone -b master https://gitcode.com/cann/cannbot-dsl.git ../cannbot-dsl
    ```
 
-   加载 CANN 环境并安装打包工具后，在 `cannbot-dsl` 仓库根目录构建并安装 `k3` 算子组（已同时覆盖 Kimi K3 与 Kimi K3.1 所需的全部 DSL 算子）。实际 wheel 路径以构建输出的 `Wheel:` 为准，更多构建参数见 [CANNBot-DSL Native 打包说明](https://gitcode.com/cann/cannbot-dsl/blob/master/packaging/README.md)。
+   安装打包工具后，在 `cannbot-dsl` 仓库根目录构建并安装 `k3` 算子组（已同时覆盖 Kimi K3 与 Kimi K3.1 所需的全部 DSL 算子）。实际 wheel 路径以构建输出的 `Wheel:` 为准，更多构建参数见 [CANNBot-DSL Native 打包说明](https://gitcode.com/cann/cannbot-dsl/blob/master/packaging/README.md)。
 
    ```bash
-   source /usr/local/Ascend/cann/set_env.sh
    python3 -m pip install 'setuptools>=70.1' wheel
    cd ../cannbot-dsl
    python3 packaging/native/build.py --group=k3 --no-partial

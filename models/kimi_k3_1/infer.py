@@ -197,24 +197,9 @@ def check_settings(world_size, settings):
     )
     if enable_mega_kda_replayssm:
         linear = target_config.linear_attn_config
-        local_kda_heads = linear["num_heads"] // attn_tp
         if model.get("platform_version") != "950":
             raise ValueError(
                 "enable_mega_kda_replayssm requires platform_version='950'"
-            )
-        if not 1 <= batch_size_per_rank <= 16:
-            raise ValueError(
-                "enable_mega_kda_replayssm requires batch_size_per_rank in [1, 16]"
-            )
-        if (
-            target_config.hidden_size != 7168
-            or local_kda_heads != 6
-            or linear["head_dim"] != 128
-            or linear["short_conv_kernel_size"] != 4
-        ):
-            raise ValueError(
-                "enable_mega_kda_replayssm requires hidden_size=7168, six "
-                "local KDA heads, head_dim=128 and ShortConv kernel=4"
             )
         if not linear.get("use_full_rank_gate", False):
             raise ValueError(
@@ -269,8 +254,6 @@ def check_settings(world_size, settings):
                 "enable_dspark_confidence_head requires checkpoint "
                 "enable_confidence_head=True"
             )
-        if draft_config.block_size != next_n:
-            raise ValueError("DSpark checkpoint block_size must equal next_n")
         if draft_model_type == DRAFT_MODEL_DSPARK_GQA:
             if draft_config.num_attention_heads != 64:
                 raise ValueError("DSpark GQA requires num_attention_heads=64")
